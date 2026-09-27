@@ -6901,20 +6901,11 @@ class TurnRunner:
         # teardown never blocks the gateway event loop or the cache lock
         # the session-expiry watcher needs (#52197).
         if _xproc_evicted_agent is not None:
-            try:
-                threading.Thread(
-                    target=self._runner._release_evicted_agent_soft,
-                    args=(_xproc_evicted_agent,),
-                    daemon=True,
-                    name=f"agent-xproc-evict-{str(ctx.session_key)[:24]}",
-                ).start()
-            except Exception:
-                # Interpreter shutdown or thread-spawn failure — release
-                # inline as a best-effort fallback.
-                try:
-                    self._runner._release_evicted_agent_soft(_xproc_evicted_agent)
-                except Exception:
-                    pass
+            self._runner._release_agent_off_loop(
+                self._runner._release_evicted_agent_soft,
+                _xproc_evicted_agent,
+                name=f"agent-xproc-evict-{str(ctx.session_key)[:24]}",
+            )
 
         if agent is None:
             # Config changed or first message — create fresh agent
@@ -33738,9 +33729,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"\n- … and {omitted} more completion(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
-        lines.append(
-            "If a result does not change the current conclusion, absorb it silently.]"
-        )
+        from tools.process_registry import COMPLETION_SILENCE_HINT
+        lines.append(f"{COMPLETION_SILENCE_HINT}]")
         return "\n".join(lines)
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
@@ -34117,12 +34107,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _format_coalesced_async_delegations(blocks: list[str]) -> str:
         """Join per-delegation formatted blocks into one consolidated turn."""
+        from tools.process_registry import COMPLETION_SILENCE_HINT
         header = (
             f"[IMPORTANT: {len(blocks)} background subagent delegations "
             "completed for this session. Treat these results as one "
             "completion batch and send at most one consolidated user-facing "
-            "response. If a result does not change the current conclusion, "
-            "absorb it silently.]"
+            "response. "
+            + COMPLETION_SILENCE_HINT + "]"
         )
         return "\n\n".join([header, *blocks])
 
@@ -36139,20 +36130,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if id(agent) in running_ids:
             return
 
+        self._release_agent_off_loop(
+            self._release_evicted_agent_soft,
+            agent,
+            name=f"agent-evict-{str(session_key)[:24]}",
+        )
+
+    @staticmethod
+    def _release_agent_off_loop(target: Any, *args: Any, name: str) -> None:
+        """Run an evicted-agent release on a daemon thread.
+
+        Every eviction path funnels here because its callers are mostly
+        coroutines (/model, /reasoning, /compress, the config toggles, the
+        expiry watcher). The release can fall back to ``close()`` ->
+        ``cleanup_browser`` -> CDP discovery (``requests.get``), so running
+        it on the caller's thread can hold the event loop for seconds.
+
+        If the thread cannot start (interpreter shutdown, or thread
+        exhaustion: ``RuntimeError: can't start new thread``) the release
+        runs inline on the caller's thread. Dropping it would lose the
+        pressure valve's end-of-session memory commit (#11205) and its
+        ``trim_memory``; a slow release beats lost memory.
+        """
         try:
             threading.Thread(
-                target=self._release_evicted_agent_soft,
-                args=(agent,),
-                daemon=True,
-                name=f"agent-evict-{str(session_key)[:24]}",
+                target=target, args=args, daemon=True, name=name,
             ).start()
-        except Exception:
-            # If we can't spawn a thread (interpreter shutdown), release
-            # inline as a best-effort fallback.
-            try:
-                self._release_evicted_agent_soft(agent)
-            except Exception:
-                pass
+            return
+        except Exception as exc:
+            logger.warning(
+                "Agent release thread %s did not start (%s); releasing "
+                "inline on the caller's thread",
+                name, exc,
+            )
+        try:
+            target(*args)
+        except Exception as exc:
+            logger.debug("Inline agent release %s failed: %s", name, exc)
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -36466,15 +36480,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             rss_mb, bounds.memory_high_mb, evicted_count,
             ", ".join(key for key, _ in plan),
         )
-        try:
-            threading.Thread(
-                target=self._release_pressure_batch,
-                args=(plan,),
-                daemon=True,
-                name="agent-cache-pressure",
-            ).start()
-        except Exception:
-            self._release_pressure_batch(plan)
+        self._release_agent_off_loop(
+            self._release_pressure_batch, plan, name="agent-cache-pressure",
+        )
         # NOTE: _release_pressure_batch drains `plan` in place (so the trim
         # runs with no lingering agent references) — len(plan) is 0 by the
         # time the daemon thread finishes, hence the pre-captured count.

@@ -58,6 +58,10 @@ CARD_REF = "t_2e382a4b"
 # which is a different problem with a different owner.
 _UNPRICED_STATUSES = frozenset({"unknown"})
 
+# Virtual composite providers whose turns/rows carry a preset identity rather
+# than a physical route (see plugins.blackbox.store.insert_composite_calls).
+_COMPOSITE_PROVIDERS = frozenset({"moa"})
+
 # Retain references to in-flight alert threads so they are observable in tests
 # and can't be garbage-collected mid-send.
 _PENDING: set = set()
@@ -208,6 +212,12 @@ def observe_turn(
         if not model_name:
             return False
         provider_name = str(provider or "").strip()
+        # A composite sub-harness identity (MoA: provider 'moa', model
+        # 'moa/<preset>') is a grouping key, not a priceable route; it never
+        # has a rate, so it must never page. The caller observes the
+        # composite's physical calls instead (card t_02323499).
+        if provider_name.lower() in _COMPOSITE_PROVIDERS:
+            return False
 
         from agent.usage_pricing import is_known_model
 

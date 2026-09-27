@@ -2283,6 +2283,12 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Deliberate single-sub pin (``--pin-sub "<reason>"``, t_957ca870). Set
+    # only when ``provider_override`` is one claude-bpx-N / claude-apx-N sub.
+    # ``pin_sub_fallback`` lets a capped pinned sub fall back to its family
+    # pool; the default is to WAIT for the sub.
+    pin_sub_reason: Optional[str] = None
+    pin_sub_fallback: bool = False
     next_eligible_at: Optional[int] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
@@ -2398,6 +2404,14 @@ class Task:
                 row["reasoning_effort"]
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
+            ),
+            pin_sub_reason=(
+                row["pin_sub_reason"]
+                if "pin_sub_reason" in keys and row["pin_sub_reason"]
+                else None
+            ),
+            pin_sub_fallback=bool(
+                row["pin_sub_fallback"] if "pin_sub_fallback" in keys else 0
             ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
@@ -2584,6 +2598,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Deliberate single-sub pin (t_957ca870): the operator's --pin-sub reason
+    -- when provider_override is claude-bpx-N / claude-apx-N. NULL = no pin.
+    pin_sub_reason       TEXT,
+    -- 1 = a capped/cooling pinned sub may fall back to its family pool
+    -- (claude-bpr / claude-apr); 0 (default) = the card waits for the sub.
+    pin_sub_fallback     INTEGER NOT NULL DEFAULT 0,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2761,6 +2781,7 @@ CREATE TABLE IF NOT EXISTS lane_model_overrides (
     reasoning_effort TEXT,
     reason       TEXT,
     firepower    TEXT,               -- justification when the model is flagship-class
+    pin_sub_reason TEXT,             -- --pin-sub reason when provider is claude-bpx-N/apx-N
     created_by   TEXT,
     created_at   INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL
@@ -4345,6 +4366,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "lane_model_overrides", "reasoning_effort", "reasoning_effort TEXT"
         )
+        _add_column_if_missing(
+            conn, "lane_model_overrides", "pin_sub_reason", "pin_sub_reason TEXT"
+        )
+
+    if "pin_sub_reason" not in cols:
+        # Deliberate single-sub pin (t_957ca870). NULL = no pin; existing
+        # rows had none (#1116 refused every pin at write time).
+        _add_column_if_missing(conn, "tasks", "pin_sub_reason", "pin_sub_reason TEXT")
+    if "pin_sub_fallback" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "pin_sub_fallback", "pin_sub_fallback INTEGER NOT NULL DEFAULT 0"
+        )
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -5699,6 +5732,23 @@ def record_foreign_action(
         "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if actor.operator:
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if last is not None and last["kind"] == "operator_override":
+            try:
+                prev = json.loads(last["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                prev = {}
+            if (
+                isinstance(prev, dict)
+                and prev.get("action") == action
+                and prev.get("reason") == actor.operator
+            ):
+                # The mutator already recorded this override itself
+                # (request-changes' operator send-back); one event per call.
+                return
         with write_txn(conn, allow_nested=True):
             _append_event(
                 conn,
@@ -5965,6 +6015,8 @@ def create_task(
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -6038,13 +6090,20 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
-    from hermes_cli.model_policy import validate_route_provider
+    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
 
-    validate_route_provider(model_override, provider_override)
+    pin_sub_error = pin_sub_arg_error(
+        model_override, provider_override, pin_sub_reason,
+        pin_sub_fallback=bool(pin_sub_fallback),
+    )
+    if pin_sub_error:
+        raise ValueError(pin_sub_error)
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
     )
-    validate_route_provider(model_override, provider_override)
+    validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
     from hermes_cli.model_policy import validate_worker_model
 
     flagship_override_reason = validate_worker_model(
@@ -6377,9 +6436,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
+                        reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6402,6 +6461,8 @@ def create_task(
                         model_override,
                         provider_override,
                         reasoning_effort,
+                        pin_sub_reason,
+                        1 if (pin_sub_reason and pin_sub_fallback) else 0,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -6435,8 +6496,21 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **({"pin_sub_reason": pin_sub_reason,
+                            "pin_sub_fallback": bool(pin_sub_fallback)}
+                           if pin_sub_reason else {}),
                     },
                 )
+                if pin_sub_reason:
+                    from hermes_cli.model_policy import sub_pin_comment
+
+                    add_comment(
+                        conn,
+                        task_id,
+                        created_by or "operator",
+                        sub_pin_comment(provider_override, pin_sub_reason,
+                                        fallback=bool(pin_sub_fallback)),
+                    )
                 if near_dups:
                     forced = force_reason and bool(same)
                     _append_event(
@@ -6687,6 +6761,9 @@ def set_model_override(
     audit_comment_body: Optional[str] = None,
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
+    pin_sub_author: Optional[str] = None,
 ) -> bool:
     """Set (or clear) the per-task model/provider override.
 
@@ -6717,12 +6794,17 @@ def set_model_override(
         model, provider,
         audit_comment_author=audit_comment_author,
         audit_comment_body=audit_comment_body,
+        pin_sub_reason=pin_sub_reason,
+        pin_sub_fallback=pin_sub_fallback,
     )
     with write_txn(conn):
         if not _set_model_override_locked(
             conn, task_id, model, provider,
             audit_comment_author=audit_comment_author,
             audit_comment_body=audit_comment_body,
+            pin_sub_reason=pin_sub_reason,
+            pin_sub_fallback=pin_sub_fallback,
+            pin_sub_author=pin_sub_author,
         ):
             return False
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
@@ -6736,6 +6818,8 @@ def _validate_model_override_args(
     *,
     audit_comment_author: Optional[str] = None,
     audit_comment_body: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
 ) -> tuple[Optional[str], Optional[str]]:
     """Normalise + validate a route pair WITHOUT touching the database.
 
@@ -6754,11 +6838,17 @@ def _validate_model_override_args(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
-    from hermes_cli.model_policy import validate_route_provider
+    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
 
-    validate_route_provider(model, provider)
+    pin_sub_error = pin_sub_arg_error(
+        model, provider, pin_sub_reason, pin_sub_fallback=bool(pin_sub_fallback),
+    )
+    if pin_sub_error:
+        raise ValueError(pin_sub_error)
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    validate_route_provider(model, provider, pin_sub_reason=pin_sub_reason)
     model, provider = _resolve_stored_model_pair(model, provider)
-    validate_route_provider(model, provider)
+    validate_route_provider(model, provider, pin_sub_reason=pin_sub_reason)
     # Main's flagship ban (model_policy) is the one predicate. A flagship
     # route is only writable together with the ``flagship override:`` comment
     # the dispatcher's flagship gate accepts, so a route this layer writes can
@@ -6811,8 +6901,15 @@ def _set_model_override_locked(
     *,
     audit_comment_author: Optional[str] = None,
     audit_comment_body: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
+    pin_sub_author: Optional[str] = None,
 ) -> bool:
     """Write one route override. MUST already be inside a ``write_txn``.
+
+    Every route write also (re)writes the pin columns: a route written
+    without ``pin_sub_reason`` clears any earlier pin, so a pin can never
+    outlive the route it authorized.
 
     The status re-read happens here, inside the caller's transaction, so it
     is the row state the write commits against — not a stale pre-check. A
@@ -6830,20 +6927,30 @@ def _set_model_override_locked(
         return False
     if row["status"] == "archived":
         raise RuntimeError(f"cannot set model override on archived task {task_id}")
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    pin_sub_fallback = bool(pin_sub_reason and pin_sub_fallback)
     conn.execute(
-        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-        (model, provider, task_id),
+        "UPDATE tasks SET model_override = ?, provider_override = ?, "
+        "pin_sub_reason = ?, pin_sub_fallback = ? WHERE id = ?",
+        (model, provider, pin_sub_reason, 1 if pin_sub_fallback else 0, task_id),
     )
-    _append_event(
-        conn, task_id, "model_override_set",
-        {"model": model, "provider": provider},
-    )
+    payload = {"model": model, "provider": provider}
+    if pin_sub_reason:
+        payload.update(pin_sub_reason=pin_sub_reason, pin_sub_fallback=pin_sub_fallback)
+    _append_event(conn, task_id, "model_override_set", payload)
     if audit_comment_body:
         add_comment(
             conn,
             task_id,
             audit_comment_author or "",
             audit_comment_body,
+        )
+    if pin_sub_reason:
+        from hermes_cli.model_policy import sub_pin_comment
+
+        add_comment(
+            conn, task_id, pin_sub_author or audit_comment_author or "operator",
+            sub_pin_comment(provider, pin_sub_reason, fallback=pin_sub_fallback),
         )
     return True
 
@@ -6915,6 +7022,10 @@ class BatchRouteWrite:
     audit_comment_body: Optional[str] = None
     touch_effort: bool = False
     effort: Optional[str] = None
+    # Deliberate single-sub pin (``--pin-sub``); only with ``touch_model``.
+    pin_sub_reason: Optional[str] = None
+    pin_sub_fallback: bool = False
+    pin_sub_author: Optional[str] = None
     # The selection predicate that chose this card, re-checked under the
     # batch's writer lock. ``None`` means "no constraint on that column".
     require_statuses: Optional[frozenset] = None
@@ -6924,6 +7035,44 @@ class BatchRouteWrite:
     # stopped matching aborts the whole batch, exactly as it would have at
     # selection time — an operator naming five cards must not get four.
     skip_if_unmatched: bool = False
+    # ``set-model --live`` (t_033a3bb1): when the card is RUNNING, also append
+    # a run-scoped ``route_changed`` event in the SAME transaction. The live
+    # worker polls for it at its next loop iteration and switches in place
+    # (no abort, conversation kept). Not running => plain next-dispatch write.
+    live: bool = False
+
+
+# Run-scoped trigger for a live route switch (``set-model --live``). The card
+# row stays the authority on the route; the event only says "re-read it now".
+ROUTE_CHANGED_EVENT = "route_changed"
+
+
+def _append_live_route_changed_locked(
+    conn: sqlite3.Connection, task_id: str, *, touch_model: bool, touch_effort: bool,
+) -> Optional[int]:
+    """Append ``route_changed`` for the card's live run; in-txn only.
+
+    Returns the run id the event is scoped to, or None when the card has no
+    live run (not ``running``), in which case the write is next-dispatch only.
+    The payload snapshots the route just written, for the audit trail; the
+    worker still re-reads the card row, which is the authority.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, model_override, provider_override, "
+        "reasoning_effort FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or (row["status"] or "").lower() != "running" or not row["current_run_id"]:
+        return None
+    run_id = int(row["current_run_id"])
+    _append_event(conn, task_id, ROUTE_CHANGED_EVENT, {
+        "live": True,
+        "model": row["model_override"],
+        "provider": row["provider_override"],
+        "reasoning_effort": row["reasoning_effort"],
+        "touch_model": bool(touch_model),
+        "touch_effort": bool(touch_effort),
+    }, run_id=run_id)
+    return run_id
 
 
 def _batch_write_mismatch(conn: sqlite3.Connection, write: BatchRouteWrite) -> Optional[str]:
@@ -6948,6 +7097,7 @@ def apply_batch_route_writes(
     writes: Sequence[BatchRouteWrite],
     *,
     skipped: Optional[dict[str, str]] = None,
+    live_runs: Optional[dict[str, int]] = None,
 ) -> list[str]:
     """Apply every route/effort write in ONE transaction, or none of them.
 
@@ -6987,6 +7137,8 @@ def apply_batch_route_writes(
                 write.model, write.provider,
                 audit_comment_author=write.audit_comment_author,
                 audit_comment_body=write.audit_comment_body,
+                pin_sub_reason=write.pin_sub_reason,
+                pin_sub_fallback=write.pin_sub_fallback,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
         prepared.append((write, model, provider, effort))
@@ -7002,6 +7154,7 @@ def apply_batch_route_writes(
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
+    live_now: dict[str, int] = {}
     with write_txn(conn):
         for write, model, provider, effort in prepared:
             mismatch = _batch_write_mismatch(conn, write)
@@ -7018,6 +7171,9 @@ def apply_batch_route_writes(
                     conn, write.task_id, model, provider,
                     audit_comment_author=write.audit_comment_author,
                     audit_comment_body=write.audit_comment_body,
+                    pin_sub_reason=write.pin_sub_reason,
+                    pin_sub_fallback=write.pin_sub_fallback,
+                    pin_sub_author=write.pin_sub_author or write.audit_comment_author,
                 ):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("model_override", "provider_override")
@@ -7028,8 +7184,17 @@ def apply_batch_route_writes(
             if changed:
                 written.append(write.task_id)
                 fields[write.task_id] = changed
+                if write.live:
+                    run_id = _append_live_route_changed_locked(
+                        conn, write.task_id,
+                        touch_model=write.touch_model, touch_effort=write.touch_effort,
+                    )
+                    if run_id is not None:
+                        live_now[write.task_id] = run_id
     if skipped is not None:
         skipped.update(skipped_now)
+    if live_runs is not None:
+        live_runs.update(live_now)
     # Observers fire only AFTER the whole batch commits, so a rolled-back
     # batch never announces a mutation that did not happen.
     for task_id in written:
@@ -9689,8 +9854,19 @@ def complete_task(
     # is OPEN by definition and the land queue merges it from that record.
     if candidate.status != 'review' and not approve_head_sha:
         from hermes_cli import kanban_open_pr as _open_pr
+        # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
+        # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
+        foreign = _open_pr.foreign_pr_refs(
+            result, summary, metadata=metadata, survivor_pr=survivor_pr,
+        )
+        if foreign:
+            metadata = dict(metadata or {}, mentioned_foreign_prs=[
+                f"{r.repo}#{r.number}" for r in foreign
+            ])
+        _pr_query = _open_pr.memo_query()
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
+            query_fn=_pr_query,
         )
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
@@ -9736,7 +9912,27 @@ def complete_task(
                         conn, task_id, "completion_routed_to_review",
                         {"open_prs": routed_meta["auto_routed_open_prs"], "note": note},
                     )
+                # One durable line on the card (t_36d0114e): why it is not done,
+                # and the PR refs the review-card closer resolves on merged=true.
+                add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
+        # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
+        # without merge (e.g. auto-closed when its stacked base was deleted), so
+        # the work is not on default. Refuse done unless the handoff names the
+        # superseding merged PR / SHA. Raises before any mutation.
+        try:
+            _open_pr.enforce_not_closed_unmerged(
+                task_id, result, summary, metadata=metadata,
+                survivor_pr=survivor_pr, superseded_by=superseded_by,
+                query_fn=_pr_query,
+            )
+        except _open_pr.ClosedUnmergedPrError as closed_err:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_closed_unmerged_pr",
+                    {"prs": closed_err.prs},
+                )
+            raise
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -12682,6 +12878,50 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     return None
 
 
+def _operator_caller_profiles() -> frozenset[str]:
+    """Profiles the current caller holds, for the operator send-back check.
+
+    The bound actor (CLI / tool surface) resolves through
+    :func:`_actor_profiles` like the home-session guard; an unbound caller
+    (the dashboard server) falls back to its profile env, then the active
+    profile.
+    """
+    actor = _EVENT_ACTOR.get()
+    if actor is not None:
+        names = set(_actor_profiles(actor))
+    else:
+        profile, _sid = _event_actor()
+        names = {profile} if profile else set()
+    if not names:
+        try:
+            from .profiles import get_active_profile_name
+
+            active = get_active_profile_name()
+        except Exception:
+            active = None
+        if active:
+            names.add(active)
+    return frozenset(names)
+
+
+def _operator_send_back_refusal(task_id: str, reason: str) -> Optional[str]:
+    """Why an ``--operator`` send-back is refused, or ``None`` if allowed."""
+    profiles = _operator_caller_profiles()
+    if not (profiles & OPERATOR_PROFILES):
+        return (
+            f"refused request-changes on {task_id}: --operator is for operator "
+            f"profiles ({', '.join(sorted(OPERATOR_PROFILES))}); caller "
+            f"profile(s): {', '.join(sorted(profiles)) or 'unknown'}. A "
+            f"reviewer sends back with a full review_coverage record."
+        )
+    if not _valid_operator_reason(reason):
+        return (
+            f"refused request-changes on {task_id}: --operator needs "
+            f"\"<who: why>\" (e.g. \"Ace via Apollo: wrong repo\")."
+        )
+    return None
+
+
 class _SendBackRefused(Exception):
     """Roll back a send-back's own review claim when the handoff is refused."""
 
@@ -12700,6 +12940,7 @@ def request_changes(
     claimer: Optional[str] = None,
     coverage: Optional[str] = None,
     session_ref: Optional[str] = None,
+    operator: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -12729,10 +12970,24 @@ def request_changes(
     ``session_ref`` (trusted runtime context, never model args) is recorded on
     the opened run's ``claimed`` event, as ``claim_review_task`` does for
     ``claim --review``.
+
+    ``operator`` (``"<who: why>"``, the home-guard #1074 vocabulary) is the
+    operator send-back: an operator profile (:data:`OPERATOR_PROFILES`)
+    bouncing a card for a non-review reason ("wrong repo", "rebase first").
+    It waives the coverage requirement for that call only and records an
+    ``operator_override`` event on the closed run. A non-operator caller or a
+    reason without ``who: why`` is refused before anything is written. The
+    coverage gate is unchanged for every call without it.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    # Same normalization as the home-guard actor, so its dedupe matches.
+    operator_reason = (str(operator).strip() or None) if operator else None
+    if operator_reason is not None:
+        refusal = _operator_send_back_refusal(task_id, operator_reason)
+        if refusal is not None:
+            return False, refusal
     coverage_text = str(redact_review_value(coverage or "")).strip()
     coverage_body = f"review_coverage: {coverage_text}" if coverage_text else None
     comment_author = str(claimer or "reviewer").strip() or "reviewer"
@@ -12749,7 +13004,7 @@ def request_changes(
             return False, "task not found"
         current_run_id = task_row["current_run_id"]
         if claimer and expected_run_id is None and task_row["status"] == "review":
-            if coverage_body is None:
+            if coverage_body is None and operator_reason is None:
                 # Same message the gate gives; refused before any claim churn.
                 return False, _REVIEW_COVERAGE_MISSING
             if _prior_worker_still_alive(conn, task_id) is not None:
@@ -12823,7 +13078,10 @@ def request_changes(
                 run_id=int(current_run_id),
             )
             posted.append((int(comment_cur.lastrowid or 0), int(current_run_id), now))
-        coverage_error = _validate_review_coverage(conn, task_id, int(current_run_id))
+        coverage_error = (
+            None if operator_reason is not None
+            else _validate_review_coverage(conn, task_id, int(current_run_id))
+        )
         if coverage_error:
             return False, coverage_error
         reviewer = task_row["assignee"]
@@ -12867,9 +13125,30 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **({"operator": operator_reason} if operator_reason else {}),
             },
             run_id=run_id,
         )
+        if operator_reason is not None:
+            by_profile, _sid = _event_actor()
+            bound = _EVENT_ACTOR.get()
+            home_row = conn.execute(
+                "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _append_event(
+                conn,
+                task_id,
+                "operator_override",
+                {
+                    "action": "request-changes",
+                    "reason": operator_reason,
+                    "coverage_waived": True,
+                    "by_sessions": list(bound.session_ids) if bound else [],
+                    "by_profile": by_profile,
+                    "home": home_row["session_id"] if home_row is not None else None,
+                },
+                run_id=run_id,
+            )
         return True, implementer
 
     try:
@@ -12969,8 +13248,8 @@ def reopen_task(
 
     Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
     """
-    if to_status not in ("ready", "todo"):
-        return False, f"invalid target status {to_status!r} (use 'ready' or 'todo')"
+    if to_status not in ("ready", "todo", "review"):
+        return False, f"invalid target status {to_status!r} (use 'ready', 'todo' or 'review')"
     if not (reason or "").strip():
         return False, "a reason is required to reverse a terminal state"
 
@@ -12985,14 +13264,18 @@ def reopen_task(
             f"'done' tasks (use unblock/promote for other states)"
         )
 
+    # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
+    # OPEN goes back to the review lane -- owned by kanban.review_assignee --
+    # where the review-card closer completes it on REST merged=true.
+    review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
             "       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-            "       current_run_id = NULL "
+            "       current_run_id = NULL, assignee = COALESCE(?, assignee) "
             " WHERE id = ? AND status = 'done'",
-            (to_status, task_id),
+            (to_status, review_assignee, task_id),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
@@ -15100,8 +15383,8 @@ def set_task_model(
         resolved_provider = None
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? "
-            "WHERE id = ?",
+            "UPDATE tasks SET model_override = ?, provider_override = ?, "
+            "pin_sub_reason = NULL, pin_sub_fallback = 0 WHERE id = ?",
             (resolved_model, resolved_provider, task_id),
         )
     return int(cur.rowcount or 0)
@@ -20249,6 +20532,42 @@ def _dispatch_once_locked(
         if payload is None:
             admitted_routes[task_id] = circuit_pool
             return False, None
+        from hermes_cli.model_policy import is_sub_pin_route, sub_pin_family_pool
+
+        if task.pin_sub_reason and is_sub_pin_route(task.model_override, route_provider):
+            # A deliberate pin (t_957ca870) bypasses the pool, not the
+            # governors: a capped / cooling / circuit-open pinned sub WAITS. It
+            # never drifts onto the profile ladder; only --pin-sub-fallback lets
+            # it ride its family pool (claude-bpr / claude-apr), and only while
+            # that pool is itself admissible.
+            pool = sub_pin_family_pool(route_provider) if task.pin_sub_fallback else None
+            if pool is not None:
+                from dataclasses import replace as _dc_replace
+
+                pool_task = _dc_replace(task, provider_override=pool)
+                pool_blocked = (
+                    pool_key(pool) in circuits
+                    or pool in cooling
+                    or capped_provider(
+                        pool_task, health_probes, health_cache, min_eligible=min_eligible,
+                        pool_urls=pool_urls, box_health=box_health,
+                    ) is not None
+                    or pool_budget(pool) is not None
+                )
+                if not pool_blocked:
+                    admitted_routes[task_id] = pool_key(pool)
+                    return False, ((task.model_override, pool), payload)
+            payload = {**payload, "pin": route_provider,
+                       "pin_fallback": pool if task.pin_sub_fallback else "wait"}
+            result.respawn_guarded.append((task_id, payload["reason"]))
+            _log.info(
+                "PHASE=kanban_dispatch_pin_held task=%s pin=%s reason=%s fallback=%s",
+                task_id, route_provider, payload["reason"], payload["pin_fallback"],
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "deferred", payload)
+            return True, None
         skipped: list = []
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
@@ -20638,6 +20957,7 @@ def _dispatch_once_locked(
         note_lane_route(claimed, route_source)
         route_source = route_source or (
             "card-override" if claimed.model_override else "profile-default")
+        route_source = _pin_route_source(claimed, route_source)
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             route_source = fallback_route_source(route_source, fallback_selection)
@@ -20836,6 +21156,7 @@ def _dispatch_once_locked(
         note_lane_route(claimed, review_route_source)
         review_route_source = review_route_source or (
             "card-override" if claimed.model_override else "profile-default")
+        review_route_source = _pin_route_source(claimed, review_route_source)
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = fallback_route_source(review_route_source, fallback_selection)
@@ -21391,6 +21712,7 @@ class LaneModelOverride:
     created_by: Optional[str] = None
     created_at: int = 0
     expires_at: int = 0
+    pin_sub_reason: Optional[str] = None
 
     @property
     def route(self) -> str:
@@ -21414,6 +21736,9 @@ def _lane_model_row(row) -> LaneModelOverride:
         created_by=row["created_by"],
         created_at=int(row["created_at"]),
         expires_at=int(row["expires_at"]),
+        pin_sub_reason=(
+            row["pin_sub_reason"] if "pin_sub_reason" in row.keys() else None
+        ) or None,
     )
 
 
@@ -21429,39 +21754,47 @@ def set_lane_model_override(
     firepower: Optional[str] = None,
     created_by: Optional[str] = None,
     now: Optional[int] = None,
+    pin_sub_reason: Optional[str] = None,
 ) -> LaneModelOverride:
     """Install (or replace) the lane override for ``assignee``.
+
+    ``pin_sub_reason`` (``--pin-sub``) authorizes a claude-bpx-N / apx-N lane;
+    without it a single-sub lane is refused exactly as on a card.
 
     ``assignee=None`` sets the board-wide lane. Re-setting the same lane is an
     upsert, so an operator extending a window never stacks duplicate rows.
     """
 
-    from hermes_cli.model_policy import validate_route_provider
+    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
 
-    validate_route_provider(model, provider)
+    pin_sub_error = pin_sub_arg_error(model, provider, pin_sub_reason)
+    if pin_sub_error:
+        raise ValueError(pin_sub_error)
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    validate_route_provider(model, provider, pin_sub_reason=pin_sub_reason)
     created = int(time.time()) if now is None else int(now)
     key = (assignee or "").strip()
     with write_txn(conn):
         conn.execute(
             "INSERT INTO lane_model_overrides "
             "(assignee, provider, model, reasoning_effort, reason, firepower, created_by, "
-            " created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            " created_at, expires_at, pin_sub_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(assignee) DO UPDATE SET "
             "  provider=excluded.provider, model=excluded.model, "
             "  reasoning_effort=excluded.reasoning_effort, "
             "  reason=excluded.reason, firepower=excluded.firepower, "
             "  created_by=excluded.created_by, created_at=excluded.created_at, "
-            "  expires_at=excluded.expires_at",
+            "  expires_at=excluded.expires_at, pin_sub_reason=excluded.pin_sub_reason",
             (
                 key, provider, model, reasoning_effort, reason, firepower, created_by,
-                created, int(expires_at),
+                created, int(expires_at), pin_sub_reason,
             ),
         )
     return LaneModelOverride(
         assignee=(key or None), provider=provider, model=model,
         reasoning_effort=reasoning_effort, reason=reason, firepower=firepower, created_by=created_by,
-        created_at=created, expires_at=int(expires_at),
+        created_at=created, expires_at=int(expires_at), pin_sub_reason=pin_sub_reason,
     )
 
 
@@ -21630,7 +21963,26 @@ def apply_lane_model_override(
     task.provider_override = override.provider
     if task.reasoning_effort is None:
         task.reasoning_effort = override.reasoning_effort
-    return f"lane-override({override.ttl_remaining(now)}s remaining)"
+    source = f"lane-override({override.ttl_remaining(now)}s remaining)"
+    if override.pin_sub_reason:
+        # In-memory only, like the route itself: the lane pin governs this
+        # spawn's admission (wait, never a silent profile fallback).
+        task.pin_sub_reason = override.pin_sub_reason
+        task.pin_sub_fallback = False
+        return f"pin({source})"
+    return source
+
+
+def _pin_route_source(task: Task, source: Optional[str]) -> Optional[str]:
+    """``pin`` for a card's deliberate single-sub pin (t_957ca870), so the
+    dispatcher route line reads ``route=claude-bpx-N/<model> source=pin``.
+    Lane pins already carry ``pin(lane-override(...))``."""
+    from hermes_cli.model_policy import is_sub_pin_route
+
+    if (source == "card-override" and task.pin_sub_reason
+            and is_sub_pin_route(task.model_override, task.provider_override)):
+        return "pin"
+    return source
 
 
 def effective_worker_route(task: Task) -> str:

@@ -203,3 +203,89 @@ def test_dispatch_fallback_rung_off_the_pin_keeps_runtime_fallback(board):
                            [{"provider": "claude-apx-1", "model": "claude-opus-5-5"}])
     assert _failover(agent, FailoverReason.server_error) is True
     assert _events(tid, "worker_route_pin_refused") == []
+
+
+# --- t_6ea895ca: a POOL-face pin may fail over to the sibling pool, same model
+
+def _pin_card(tid, provider, model):
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET provider_override=?, model_override=? WHERE id=?",
+                     (provider, model, tid))
+        conn.commit()
+
+
+def _pool_agent(provider, chain, model="claude-opus-5-5"):
+    agent = _runtime_agent(provider, chain)
+    agent.model = model
+    agent._primary_runtime["model"] = model
+    return agent
+
+
+def test_pool_pin_fails_over_to_sibling_pool_same_model(board):
+    """claude-bpr pin -> claude-apr, identical model: allowed, recorded."""
+    from agent.error_classifier import FailoverReason
+
+    tid, run_id = board
+    _pin_card(tid, "claude-bpr", "claude-opus-5-5")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-apr", "model": "claude-opus-5-5"}])
+    assert _failover(agent, FailoverReason.overloaded) is True
+    assert agent.provider == "claude-apr"
+    assert _events(tid, "worker_route_pin_refused") == []
+    sub = _events(tid, "worker_route_substituted")
+    assert [r for r, _ in sub] == [run_id]
+    assert sub[0][1]["stage"] == "runtime"
+    assert sub[0][1]["from_provider"] == "claude-bpr"
+    assert sub[0][1]["from_model"] == "claude-opus-5-5"
+    assert sub[0][1]["to_provider"] == "claude-apr"
+    assert sub[0][1]["to_model"] == "claude-opus-5-5"
+
+
+def test_pool_pin_refuses_sibling_pool_with_a_different_model(board):
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-opus-5-5")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-apr", "model": "claude-sonnet-5"}])
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert agent.provider == "claude-bpr"
+    refused = _events(tid, "worker_route_pin_refused")
+    assert refused[0][1]["to_provider"] == "claude-apr"
+    assert _events(tid, "worker_route_substituted") == []
+
+
+def test_pool_pin_refuses_non_pool_provider(board):
+    """claude-bpr pin -> openai-codex: still refused."""
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-opus-5-5")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "openai-codex", "model": "claude-opus-5-5"}])
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert agent.provider == "claude-bpr"
+    refused = _events(tid, "worker_route_pin_refused")
+    assert refused[0][1]["provider"] == "claude-bpr"
+    assert refused[0][1]["to_provider"] == "openai-codex"
+    assert _events(tid, "worker_route_substituted") == []
+
+
+@pytest.mark.parametrize("pin, target", [
+    ("claude-apx-3", "claude-apr"),   # single sub -> its own pool
+    ("claude-apx-3", "claude-bpr"),   # single sub -> the other pool
+    ("claude-bpx-7", "claude-apr"),
+])
+def test_single_sub_pin_refuses_pool_failover(board, pin, target):
+    """A pin to ONE sub is not a pool face: no pool substitution, same model or not."""
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, pin, "claude-opus-5-5")
+    agent = _pool_agent(pin, [{"provider": target, "model": "claude-opus-5-5"}])
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert agent.provider == pin
+    refused = _events(tid, "worker_route_pin_refused")
+    assert refused[0][1]["provider"] == pin
+    assert refused[0][1]["to_provider"] == target
+    assert _events(tid, "worker_route_substituted") == []
