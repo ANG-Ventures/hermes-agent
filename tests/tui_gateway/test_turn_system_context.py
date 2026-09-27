@@ -183,3 +183,136 @@ def test_session_create_advertises_the_capability():
     from tui_gateway import methods_session
 
     assert '"turn_system_context": True' in inspect.getsource(methods_session)
+
+
+class TestAdvertisedOnResumeAndInfo:
+    """A resumed session must advertise the capability too (t_4ab7901d).
+
+    session.create was the only payload carrying the key, so a client that
+    feature-detects on a resumed session (or on a session.info event) read the
+    feature as unsupported and kept the metadata in the user text.
+    """
+
+    def test_session_info(self):
+        agent = types.SimpleNamespace(model="m", provider="p", session_id="k")
+        info = server._session_info(agent, _session(agent=agent))
+        assert info["turn_system_context"] is True
+
+    def test_lazy_resume_info(self):
+        assert server._lazy_resume_info("/tmp")["turn_system_context"] is True
+
+    def test_fallback_info_for_unbuilt_session(self):
+        session = _session()
+        session["agent"] = None
+        assert server._fallback_session_info(session)["turn_system_context"] is True
+
+
+class _FakeSupervisor:
+    def __init__(self):
+        self.frames = []
+        self.callback = None
+
+    def submit_turn(self, frame, *, on_complete=None):
+        self.frames.append(frame)
+        self.callback = on_complete
+        return frame["request_id"]
+
+
+class TestComputeHostTurns:
+    """turn_isolation turns carry system_context to the child (t_4ab7901d).
+
+    With dashboard.turn_isolation on, prompt.submit hands the turn to the
+    compute host as a ``turn.start`` frame and the child runs
+    _run_prompt_submit against ITS OWN session record. The context therefore
+    has to ride the frame and be re-applied in the child, or the model never
+    sees it.
+    """
+
+    @pytest.fixture
+    def isolated(self, monkeypatch):
+        sup = _FakeSupervisor()
+        session = _session()
+        session["agent"] = None
+        session["agent_ready"] = threading.Event()
+        server._sessions["iso-sid"] = session
+        monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+        monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: sup)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _s: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda _s: None)
+        yield sup
+        server._sessions.pop("iso-sid", None)
+
+    def _submit(self, **params):
+        return server.handle_request(
+            {
+                "id": "submit",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-sid", "text": "Reply with pong.", **params},
+            }
+        )
+
+    def test_frame_carries_the_context(self, isolated):
+        resp = self._submit(system_context=ROOM_LINE)
+        assert resp["result"]["turn_isolation"] is True
+        assert isolated.frames[0]["system_context"] == ROOM_LINE
+        assert "origin_room" not in isolated.frames[0]["text"]
+
+    def test_frame_without_context_is_empty(self, isolated):
+        self._submit()
+        assert isolated.frames[0]["system_context"] == ""
+
+    @staticmethod
+    def _run_in_child(monkeypatch, frame, child_session):
+        from tui_gateway.compute_host import ComputeHost
+
+        emitted = []
+        host = ComputeHost(heartbeat_secs=0)
+        monkeypatch.setattr(host, "emit", emitted.append)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _s: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda _s: None)
+        monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+        server._sessions[frame["sid"]] = child_session
+        try:
+            host._run_real_turn(frame)
+        finally:
+            server._sessions.pop(frame["sid"], None)
+        return emitted
+
+    def test_child_applies_frame_context_to_the_model(self, turn_env, monkeypatch):
+        agent, seen = _recording_agent("PROFILE PERSONA")
+        frame = {
+            "type": "turn.start",
+            "sid": "child-sid",
+            "request_id": "r1",
+            "session_key": "gw-session-key",
+            "text": "Reply with pong.",
+            "system_context": ROOM_LINE,
+        }
+        emitted = self._run_in_child(monkeypatch, frame, _session(agent=agent))
+        assert [f["type"] for f in emitted][-1] == "turn.end", emitted
+        assert seen["user_message"] == "Reply with pong."
+        assert seen["ephemeral_during_turn"] == "PROFILE PERSONA\n\n" + ROOM_LINE
+        assert agent.ephemeral_system_prompt == "PROFILE PERSONA"
+
+    def test_child_clears_stale_context_when_frame_omits_it(self, turn_env, monkeypatch):
+        agent, seen = _recording_agent("PROFILE PERSONA")
+        frame = {
+            "type": "turn.start",
+            "sid": "child-sid",
+            "request_id": "r2",
+            "session_key": "gw-session-key",
+            "text": "go",
+        }
+        child = _session(agent=agent, turn_system_context=ROOM_LINE)
+        self._run_in_child(monkeypatch, frame, child)
+        assert seen["ephemeral_during_turn"] == "PROFILE PERSONA"
+        assert child["turn_system_context"] == ""
+
+    def test_parent_frame_round_trips_through_the_child(self, isolated, turn_env, monkeypatch):
+        self._submit(system_context=ROOM_LINE)
+        frame = dict(isolated.frames[0])
+        frame["sid"] = "child-sid"
+        agent, seen = _recording_agent(None)
+        self._run_in_child(monkeypatch, frame, _session(agent=agent))
+        assert seen["ephemeral_during_turn"] == ROOM_LINE
+        assert seen["user_message"] == "Reply with pong."
