@@ -14244,7 +14244,6 @@ def decompose_triage_task(
     return child_ids
 
 
-@_home_session_guarded("archive")
 def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:
     """Refuse to archive a card whose own PR was closed without merge (t_a1550189).
 
@@ -14288,6 +14287,7 @@ def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=Non
         raise
 
 
+@_home_session_guarded("archive")
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Archive ``task_id``. Raises :class:`kanban_open_pr.ClosedUnmergedPrError` (no state change) when
     the card's own PR is closed-unmerged with no recorded superseder or close decision (t_a1550189)."""
