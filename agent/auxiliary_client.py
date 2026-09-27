@@ -2586,7 +2586,14 @@ class _AnthropicCompletionsAdapter:
 
         usage = None
         if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            # OpenAI chat shape: prompt_tokens INCLUDES cached tokens and the
+            # details object breaks them out. Anthropic's input_tokens excludes
+            # both cache buckets, so fold them in or every aux ledger row and
+            # compaction price reads cache as 0 (C7 k74/k75).
+            input_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            prompt_tokens = input_tokens + cache_read + cache_write
             completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
             total_tokens = getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
             usage = SimpleNamespace(
@@ -2594,6 +2601,10 @@ class _AnthropicCompletionsAdapter:
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
             )
+            if cache_read or cache_write:
+                usage.prompt_tokens_details = SimpleNamespace(
+                    cached_tokens=cache_read, cache_write_tokens=cache_write,
+                )
 
         choice = SimpleNamespace(
             index=0,

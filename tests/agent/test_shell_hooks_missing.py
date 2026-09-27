@@ -321,7 +321,11 @@ def test_restore_never_rewrites_an_existing_file(home, monkeypatch, damage):
         (hooks / "other.py").unlink()
     else:
         edited.write_text("raise ImportError('work in progress')\n")
-    before = {f: f.read_bytes() for f in (edited, untracked)}
+        # The present entry hook carries a live edit too; it must survive (C7 k130).
+        entry = hooks / "policy.py"
+        entry.write_text(entry.read_text() + "# UNCOMMITTED ENTRY EDIT\n")
+    before = {f: f.read_bytes() for f in (edited, untracked, hooks / "policy.py") if f.exists()}
+    assert (hooks / "policy.py" in before) == (damage == "present_but_broken")
     pages = []
     monkeypatch.setattr(shell_hooks, "_page_missing_hook", lambda p, *a: pages.append((p, a)) or True)
     result = shell_hooks._make_callback(_spec(hooks / "policy.py", "restore_then_fail_closed"))(tool_name="terminal")

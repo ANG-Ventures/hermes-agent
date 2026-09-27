@@ -241,6 +241,20 @@ def _build_turn_handoff(agent, messages, turn_start_idx, reason):
     }
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Persist a rename's directory entry where the platform supports it."""
+    try:
+        dfd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
 def write_turn_handoff(
     session_key: str,
     handoff: Optional[Dict[str, Any]],
@@ -257,7 +271,11 @@ def write_turn_handoff(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(handoff, fh)
+                # Durable before the saved notice goes out (C7 k86).
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
+            _fsync_dir(path.parent)
         except Exception:
             try:
                 os.unlink(tmp)
@@ -513,7 +531,7 @@ def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
     if calls:
         lines.append("\nTool calls issued this turn:")
         for call in calls:
-            status = "completed" if call.get("completed") else "NEVER COMPLETED"
+            status = "completed" if call.get("completed") else "NO RESULT RECORDED"
             args = _redact_tool_text(call.get("arguments"))
             lines.append(f"- {call.get('name')}({args}) [{status}]")
             if call.get("result_preview"):
@@ -524,7 +542,8 @@ def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
         for todo in todos:
             lines.append(f"- [{todo.get('status')}] {todo.get('content')}")
     lines.append(
-        "\nContinue from here. Do not redo completed tool calls; re-issue the "
-        "one that never completed."
+        "\nContinue from here. Do not redo completed tool calls. A call with no "
+        "result recorded may still have run its side effect before the cut: "
+        "verify its outcome before re-issuing it."
     )
     return "\n".join(lines)
