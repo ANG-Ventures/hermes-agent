@@ -615,6 +615,23 @@ hermes kanban set-model t_abcd --clear-effort    # back to the profile's own set
 
 The dispatcher spawns the worker with `--reasoning <level>`, which overrides the profile's `agent.reasoning_effort` for that run only. The two knobs are deliberately independent: `set-model <id> --effort xhigh` leaves an existing model override untouched, and clearing the model (`set-model <id> none`) never resets the effort.
 
+### Switching a running worker in place (`--live`)
+
+Without a flag, `set-model` on a running card applies at the next dispatch. `--reclaim` makes it immediate, but it aborts the worker, and the next run starts a fresh session. `--live` switches the running worker **without aborting it**. The process, the conversation and the workspace all stay the same:
+
+```bash
+hermes kanban set-model t_abcd gpt-6-luna-900k --provider openai-codex --live
+hermes kanban set-model t_abcd --effort xhigh --live      # effort only
+```
+
+- The route is written to the card as usual, with every gate (`--allow-flagship`, `--pin-sub`, aliases). In the same transaction a `route_changed` event is recorded on the card's live run. The receipt shows `applies=live(run N)`. A card that is not running just gets the next-dispatch write.
+- The worker checks for the event before each provider call and switches at the next one. It re-applies the flagship and pin gates, then calls the same in-place swap `/model` uses. The board records `route_switched {from, to, iteration}`, or `route_switch_refused {reason}` when a gate or credential resolution refuses the switch. The worker then stays on its old route.
+- Cost: a model or provider change means one cold-cache call on the new provider, and the next call is warm again. Switching back to a provider whose prefix is still cached is a hit. Cross-vendor tool history (Claude ↔ Codex) carries over. An effort-only change keeps the same client, model and system prompt; only the request's reasoning parameter changes.
+- A long-running tool call delays the switch until it returns.
+- Clears are refused with `--live` (`none`, `--clear-effort`), because a clear resolves through lane overrides at dispatch time. `--live` cannot be combined with `--reclaim`. A live switch goes straight to the route you name, and the dispatcher's capped-pool fallback does not run. Use `--reclaim` if you want the dispatcher to place the card.
+
+Design and measured costs: `docs/specs/kanban-set-model-live.md`.
+
 ### Pinning a kanban card/worker: provider, model, effort
 
 This is the canonical reference for routing one card's worker. Any card can be pinned to any provider + model + effort; it is a supported operator capability, not a workaround. Workers ride the pool providers (`claude-bpr` / `claude-apr`) by default, and a pin to ONE Claude subscription needs a stated reason.
@@ -634,6 +651,7 @@ hermes kanban set-model <card> --model M --provider P --effort L \
 | `--pin-sub-fallback` | With `--pin-sub`: when the pinned sub is capped/cooling, ride its family pool (`bpx-N` → `claude-bpr`, `apx-N` → `claude-apr`) instead of waiting. |
 | `--allow-flagship "<reason>"` | Required for flagship models (Fable/Astra, `kanban.banned_worker_model_substrings`). Recorded as a `flagship override:` comment. Alias `--firepower`. |
 | `--reclaim` | Also abort a RUNNING worker so the next dispatch respawns it on the new route. Without it, a running worker keeps its old route until it finishes; the pin applies to the next run. |
+| `--live` | Switch a RUNNING worker to the new route/effort at its next turn WITHOUT aborting it (same conversation and workspace). See [Switching a running worker in place](#switching-a-running-worker-in-place---live). Exclusive with `--reclaim`. |
 
 `create` takes the same `--model/--provider/--reasoning/--pin-sub/--pin-sub-fallback/--allow-flagship` flags, and `lane-model set <provider>/<model> --ttl … --reason … --pin-sub "<reason>"` pins a whole lane (time-boxed). Examples:
 
@@ -648,7 +666,7 @@ hermes kanban pins                    # every live pin (cards + lanes), with age
 hermes kanban pins --stale-hours 24   # exits 1 if a card pin is older (daily lint)
 ```
 
-**What `--reclaim` does to context.** Reclaim terminates the running worker and closes its run with outcome `reclaimed`. The NEXT run is a fresh agent session on the new route. It is seeded from the card body, every comment (including prior runs' handoff summaries), and the same workspace/branch. The in-flight conversation is **not** carried over: anything the old worker had only in its head is lost. So before reclaiming a card mid-task, post a checkpoint comment (`kanban_comment` / `hermes kanban comment`) with what has been done and what is next.
+**What `--reclaim` does to context.** Reclaim terminates the running worker and closes its run with outcome `reclaimed`. The NEXT run is a fresh agent session on the new route. It is seeded from the card body, every comment (including prior runs' handoff summaries), and the same workspace/branch. The in-flight conversation is **not** carried over: anything the old worker had only in its head is lost. So before reclaiming a card mid-task, post a checkpoint comment (`kanban_comment` / `hermes kanban comment`) with what has been done and what is next. To change the route and keep the conversation, use `--live` instead.
 
 **Rules for single-sub pins:**
 

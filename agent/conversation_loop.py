@@ -2650,6 +2650,16 @@ def run_conversation(
                 )
             agent._persist_session(messages, conversation_history)
 
+        # Kanban ``set-model --live`` (t_033a3bb1): switch this worker's
+        # provider/model/effort in place between two provider calls. No-op
+        # (one env read) outside a kanban worker; never raises.
+        from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+        active_system_prompt = apply_pending_live_route(
+            agent, iteration=api_call_count + 1,
+            active_system_prompt=active_system_prompt,
+        )
+
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 

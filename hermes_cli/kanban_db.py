@@ -7035,6 +7035,44 @@ class BatchRouteWrite:
     # stopped matching aborts the whole batch, exactly as it would have at
     # selection time — an operator naming five cards must not get four.
     skip_if_unmatched: bool = False
+    # ``set-model --live`` (t_033a3bb1): when the card is RUNNING, also append
+    # a run-scoped ``route_changed`` event in the SAME transaction. The live
+    # worker polls for it at its next loop iteration and switches in place
+    # (no abort, conversation kept). Not running => plain next-dispatch write.
+    live: bool = False
+
+
+# Run-scoped trigger for a live route switch (``set-model --live``). The card
+# row stays the authority on the route; the event only says "re-read it now".
+ROUTE_CHANGED_EVENT = "route_changed"
+
+
+def _append_live_route_changed_locked(
+    conn: sqlite3.Connection, task_id: str, *, touch_model: bool, touch_effort: bool,
+) -> Optional[int]:
+    """Append ``route_changed`` for the card's live run; in-txn only.
+
+    Returns the run id the event is scoped to, or None when the card has no
+    live run (not ``running``), in which case the write is next-dispatch only.
+    The payload snapshots the route just written, for the audit trail; the
+    worker still re-reads the card row, which is the authority.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, model_override, provider_override, "
+        "reasoning_effort FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or (row["status"] or "").lower() != "running" or not row["current_run_id"]:
+        return None
+    run_id = int(row["current_run_id"])
+    _append_event(conn, task_id, ROUTE_CHANGED_EVENT, {
+        "live": True,
+        "model": row["model_override"],
+        "provider": row["provider_override"],
+        "reasoning_effort": row["reasoning_effort"],
+        "touch_model": bool(touch_model),
+        "touch_effort": bool(touch_effort),
+    }, run_id=run_id)
+    return run_id
 
 
 def _batch_write_mismatch(conn: sqlite3.Connection, write: BatchRouteWrite) -> Optional[str]:
@@ -7059,6 +7097,7 @@ def apply_batch_route_writes(
     writes: Sequence[BatchRouteWrite],
     *,
     skipped: Optional[dict[str, str]] = None,
+    live_runs: Optional[dict[str, int]] = None,
 ) -> list[str]:
     """Apply every route/effort write in ONE transaction, or none of them.
 
@@ -7115,6 +7154,7 @@ def apply_batch_route_writes(
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
+    live_now: dict[str, int] = {}
     with write_txn(conn):
         for write, model, provider, effort in prepared:
             mismatch = _batch_write_mismatch(conn, write)
@@ -7144,8 +7184,17 @@ def apply_batch_route_writes(
             if changed:
                 written.append(write.task_id)
                 fields[write.task_id] = changed
+                if write.live:
+                    run_id = _append_live_route_changed_locked(
+                        conn, write.task_id,
+                        touch_model=write.touch_model, touch_effort=write.touch_effort,
+                    )
+                    if run_id is not None:
+                        live_now[write.task_id] = run_id
     if skipped is not None:
         skipped.update(skipped_now)
+    if live_runs is not None:
+        live_runs.update(live_now)
     # Observers fire only AFTER the whole batch commits, so a rolled-back
     # batch never announces a mutation that did not happen.
     for task_id in written:
