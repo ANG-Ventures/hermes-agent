@@ -20,7 +20,7 @@ entry points, each a CLI subcommand:
     ``until:`` is evidence-free (the veto path).
 
 ``lint``
-    Schema check: ``owner``/``until`` present and well formed, ``until`` at most
+    Schema check: ``owner``/``card``/``until`` present and well formed, ``until`` at most
     14 days out. Expiry is NOT a lint failure: an expired entry simply stops
     being active and the test gates again.
 
@@ -55,11 +55,19 @@ SCHEMA = 1
 MAX_TTL_DAYS = 14
 EVIDENCE_WINDOW_DAYS = 14
 MIN_PAIRS = 2
-MIN_DISTINCT_DAYS = 2
+# 1 since t_162ffd04: a same-SHA red->green pair already proves unchanged code,
+# and a 2-day floor let one flake eject the merge queue for two days first.
+MIN_DISTINCT_DAYS = 1
 EVIDENCE_EVENTS = frozenset({"push", "merge_group", "schedule"})
 LIST_PATH = "scripts/ci/flake_quarantine.json"
 SLICE_ARTIFACT_RE = r"^ci-slice-result-\d+-a{attempt}$"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Every quarantine names the kanban card that owns the fix (never silent).
+_CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
+
+
+def _card_ok(value: Any) -> bool:
+    return isinstance(value, str) and bool(_CARD_RE.match(value))
 
 
 # ── list parsing / lint ─────────────────────────────────────────────────────
@@ -110,6 +118,8 @@ def lint(data: dict, today: dt.date) -> list[str]:
         owner = e.get("owner")
         if not isinstance(owner, str) or not owner.strip():
             problems.append(f"{where}: missing owner")
+        if not _card_ok(e.get("card")):
+            problems.append(f"{where}: missing or malformed card (t_xxxxxxxx fix card)")
         until = _date(e.get("until"))
         if until is None:
             problems.append(f"{where}: missing or malformed until (YYYY-MM-DD)")
@@ -131,6 +141,8 @@ def active_entries(data: dict, today: dt.date) -> dict[str, dict]:
         node = e.get("node_id")
         owner = e.get("owner")
         if until is None or not isinstance(node, str) or not isinstance(owner, str) or not owner.strip():
+            continue
+        if not _card_ok(e.get("card")):
             continue
         if until >= today:
             out[node] = e
@@ -228,7 +240,7 @@ def slice_verdict(result: dict | None, junit_dir: Path, qlist: dict, today: dt.d
                 ok = False
                 msgs.append(f"{node}: FAILED (not quarantined)")
             else:
-                msgs.append(f"{node}: failed but QUARANTINED (non-gating; owner {e['owner']}, until {e['until']})")
+                msgs.append(f"{node}: failed but QUARANTINED (non-gating; card {e['card']}, owner {e['owner']}, until {e['until']})")
     return ok, msgs
 
 

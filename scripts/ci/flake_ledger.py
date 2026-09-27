@@ -17,8 +17,14 @@ Classifier (the table the spec asks for):
     red -> red                        => real
 
 Subcommands:
-    scan    print candidate entries as JSON (``--apply`` merges them into the list)
-    digest  every active entry with owner + until; warns 3 days before expiry
+    scan    print candidate entries as JSON. ``--apply --assign FILE`` merges
+            ONLY candidates that FILE maps to ``{"card": "t_...", "owner": ...}``;
+            an unassigned candidate is reported, never quarantined (t_162ffd04:
+            every quarantine names a fix card and an owner).
+    rearm   drop entries whose fix card is closed (``--closed t_a,t_b``), so the
+            test gates again as soon as its fix lands, not at TTL expiry.
+            Deleting an entry is evidence-free (the veto path).
+    digest  every active entry with card + owner + until; warns 3 days before expiry
 """
 
 from __future__ import annotations
@@ -154,7 +160,6 @@ def candidates(api: fq.ApiLike, repo: str, now: dt.datetime, existing: dict) -> 
             continue
         entry = {
             "node_id": node,
-            "owner": "flake-ledger",
             "until": (now.date() + dt.timedelta(days=fq.MAX_TTL_DAYS)).isoformat(),
             "reason": f"flake-ledger: {len(ev)} same-SHA red->green pairs on {len(days)} days",
             "evidence": [{k: v for k, v in e.items() if not k.startswith("_")} for e in ev],
@@ -170,8 +175,36 @@ def digest(data: dict, today: dt.date) -> list[str]:
     for e in sorted(fq.active_entries(data, today).values(), key=lambda e: e["until"]):
         left = (dt.date.fromisoformat(e["until"]) - today).days
         warn = " ⚠️ expires in <= 3 days — re-gates automatically" if left <= EXPIRY_WARN_DAYS else ""
-        lines.append(f"{e['node_id']} — owner {e['owner']}, until {e['until']} ({left} d){warn}")
+        lines.append(f"{e['node_id']} — card {e['card']}, owner {e['owner']}, until {e['until']} ({left} d){warn}")
     return lines
+
+
+def assign(found: list[dict], mapping: dict) -> tuple[list[dict], list[str]]:
+    """(entries ready to merge, nodes left unassigned). Never invents an owner."""
+    ready: list[dict] = []
+    missing: list[str] = []
+    for e in found:
+        a = mapping.get(e["node_id"]) if isinstance(mapping, dict) else None
+        card = a.get("card") if isinstance(a, dict) else None
+        owner = a.get("owner") if isinstance(a, dict) else None
+        if not fq._card_ok(card) or not isinstance(owner, str) or not owner.strip():
+            missing.append(e["node_id"])
+            continue
+        ready.append({"node_id": e["node_id"], "card": card, "owner": owner.strip(),
+                      **{k: v for k, v in e.items() if k != "node_id"}})
+    return ready, missing
+
+
+def rearm(data: dict, closed_cards: set[str]) -> list[str]:
+    """Remove entries whose fix card is closed; return the removed node IDs."""
+    keep, gone = [], []
+    for e in data.get("entries") or []:
+        if isinstance(e, dict) and e.get("card") in closed_cards:
+            gone.append(e.get("node_id"))
+        else:
+            keep.append(e)
+    data["entries"] = keep
+    return gone
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,7 +213,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("scan")
     p.add_argument("--repo", required=True)
     p.add_argument("--list", default=fq.LIST_PATH)
-    p.add_argument("--apply", action="store_true", help="merge candidates into --list")
+    p.add_argument("--apply", action="store_true", help="merge ASSIGNED candidates into --list")
+    p.add_argument("--assign", help='JSON file: {node_id: {"card": "t_...", "owner": "..."}}')
+    p.add_argument("--fail-on-candidates", action="store_true",
+                   help="exit 1 when an unquarantined candidate exists (weekly digest pages)")
+    p = sub.add_parser("rearm")
+    p.add_argument("--list", default=fq.LIST_PATH)
+    p.add_argument("--closed", required=True, help="comma-separated closed fix cards")
     p = sub.add_parser("digest")
     p.add_argument("--list", default=fq.LIST_PATH)
     args = ap.parse_args(argv)
@@ -191,12 +230,30 @@ def main(argv: list[str] | None = None) -> int:
         lines = digest(data, now.date())
         print("\n".join(lines) if lines else "no active quarantine entries")
         return 0
+    if args.cmd == "rearm":
+        gone = rearm(data, {c.strip() for c in args.closed.split(",") if c.strip()})
+        for node in gone:
+            print(f"re-armed (fix card closed): {node}")
+        if gone:
+            path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+        return 0
     api = fq.Api(os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
     found, counts = candidates(api, args.repo, now, data)
     print(json.dumps({"counts": counts, "candidates": found}, indent=1))
-    if args.apply and found:
-        data.setdefault("entries", []).extend(found)
-        path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+    if args.apply:
+        if not args.assign:
+            print("--apply needs --assign: every quarantine names a fix card + owner", file=sys.stderr)
+            return 2
+        ready, missing = assign(found, json.loads(Path(args.assign).read_text(encoding="utf-8")))
+        for node in missing:
+            print(f"NOT quarantined (no card/owner assigned): {node}", file=sys.stderr)
+        if ready:
+            data.setdefault("entries", []).extend(ready)
+            path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+    if args.fail_on_candidates and found:
+        for e in found:
+            print(f"::error::flake candidate needs a fix card + owner: {e['node_id']} ({e['reason']})")
+        return 1
     return 0
 
 

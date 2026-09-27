@@ -22,6 +22,9 @@ on:
       # Non-gating detector (spec L6): PR runs are paths-scoped, so a flake
       # break from a source-only change first shows on push:main. Page it.
       - "Nix flake check"
+      # Weekly flake digest (t_162ffd04): red = a flake qualifies for
+      # quarantine but has no fix card + owner yet.
+      - "Flake quarantine digest"
       # Scheduled / dispatch workflows: a red run otherwise pages nobody
       # (ci-speed-lint R5). The three NousResearch-guarded ones are skipped on
       # the fork, so they only notify if that guard is ever lifted.
