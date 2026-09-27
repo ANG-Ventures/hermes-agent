@@ -150,6 +150,78 @@ def test_ledger_row_pooled_keeps_quota_seat_and_unknowns(hosts):
     assert row.get("seat") is None and row.get("hop") is None
 
 
+V2_HEADERS = {"x-relay-error-class": "quota_seat", "x-relay-error-hop": "relay",
+              "x-relay-seat": "sub-vps-7", "x-relay-seats-tried": "3",
+              "x-relay-eligible": "4"}
+
+
+def _v2_agent(provider, headers, body=None, *, status=429, text=FABLE_TEXT):
+    err = types.SimpleNamespace(
+        response=types.SimpleNamespace(headers=headers),
+        body=body if body is not None else {"error": {"message": text}})
+    agent = types.SimpleNamespace(provider=provider, session_id="s1",
+                                  _current_turn_id="s1:t1")
+    fbe.stash_api_error(agent, err, status, {"message": text})
+    return agent
+
+
+def _pooled_row(agent):
+    return fbe.build_row(agent, "failover", from_provider="claude-bpr",
+                         from_model="claude-fable-5-1", to_provider="claude-bpr",
+                         to_model="claude-opus-5-5", reason="rate_limit")
+
+
+def test_ledger_row_pooled_with_v2_headers_fills_seat_and_hop(hosts):
+    """t_dbdd08c3: the relay's x-relay-error-hop / x-relay-seat survive the
+    stash and land on the pooled row, so the notice names hop and sub."""
+    row = _pooled_row(_v2_agent("claude-bpr", V2_HEADERS))
+    assert row["class_source"] == "relay_header"
+    assert row["trigger_class"] == "quota_seat"
+    assert (row["seat"], row["hop"]) == ("sub-vps-7", "relay")
+    rider = fp.format_cause_rider(row, tz=UTC)
+    assert "at the relay on sub-vps-7" in rider
+    assert "unknown" not in rider
+
+
+@pytest.mark.parametrize("raw,enum", [("relay->bridge", "relay→bridge"),
+                                      ("bridge->upstream", "bridge→anthropic")])
+def test_v2_hop_ascii_normalized_to_notice_enum(hosts, raw, enum):
+    row = _pooled_row(_v2_agent("claude-bpr", dict(V2_HEADERS, **{"x-relay-error-hop": raw})))
+    assert row["hop"] == enum
+
+
+@pytest.mark.parametrize("seat", ["none", "unknown", ""])
+def test_v2_unstated_seat_stays_sub_unknown(hosts, seat):
+    """The relay sends ``none`` when no seat was tried; that is not a seat."""
+    row = _pooled_row(_v2_agent("claude-bpr", dict(V2_HEADERS, **{"x-relay-seat": seat})))
+    assert row.get("seat") is None
+    assert fp.format_cause_rider(row, tz=UTC).endswith(
+        "at the relay (sub unknown), " + fp._hms(row["ts"], UTC).strftime("%H:%M:%S"))
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_v2_stream_error_body_fills_seat_and_hop(hosts, nested):
+    """Stream-phase failure: no v2 headers, the relay fields ride the SSE
+    error event (Anthropic top level, or inside ``error`` for OpenAI SDK)."""
+    fields = {"relay_error_class": "quota_seat", "relay_error_hop": "relay->bridge",
+              "relay_seat": "sub-vps-8", "relay_seats_tried": 2}
+    body = ({"error": dict({"message": FABLE_TEXT}, **fields)} if nested
+            else dict({"type": "error", "error": {"message": FABLE_TEXT}}, **fields))
+    row = _pooled_row(_v2_agent("claude-bpr", {}, body))
+    assert row["class_source"] == "relay_stream"
+    assert (row["seat"], row["hop"]) == ("sub-vps-8", "relay→bridge")
+    assert "to sub-vps-8 bridge" in fp.format_cause_rider(row, tz=UTC)
+
+
+def test_v2_headers_never_override_recorded_fields(hosts):
+    agent = _v2_agent("claude-bpr", V2_HEADERS)
+    row = fbe.build_row(agent, "failover", from_provider="claude-bpr",
+                        from_model="claude-fable-5-1", to_provider="claude-bpr",
+                        to_model="claude-opus-5-5", reason="rate_limit",
+                        extra={"seat": "sub-vps-5", "hop": "client→relay"})
+    assert (row["seat"], row["hop"]) == ("sub-vps-5", "client→relay")
+
+
 def test_live_fable_text_on_pin_uses_class_default_cooldown():
     """The live text carries no reset: the pin's quota_model cooldown is the
     class default (6h base x jitter; row 8 = 22461 s = 6h x 1.04), not a
