@@ -122,6 +122,7 @@ jobs:
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       test_scope: ${{ steps.classify.outputs.test_scope }}
+      changed_files: ${{ steps.classify.outputs.changed_files }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       event_name: ${{ github.event_name }}
@@ -169,6 +170,10 @@ jobs:
       # is what merge_group runs. Rollback: set CI_MERGE_GROUP_SLICES=8.
       slice_count: ${{ github.event_name == 'merge_group' && (vars.CI_MERGE_GROUP_SLICES == '' && 16 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) < 4 && 4 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) > 16 && 16 || fromJSON(vars.CI_MERGE_GROUP_SLICES)))) || 16 }}
       test_scope: ${{ needs.detect.outputs.test_scope }}
+      # pull_request is a pre-filter: test-impact-selected files only. The
+      # merge_group run is the only required gate and always runs full, so a
+      # PR run is never the only gate (t_e8c5045e).
+      changed_files: ${{ needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.changed_files || '[]' }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the

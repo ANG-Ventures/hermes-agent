@@ -1666,6 +1666,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--files-from",
+        metavar="PATH",
+        help=(
+            "Like --files, but read newline-separated test files from PATH. "
+            "Used for the test-impact-selected pull_request matrix, whose "
+            "file list can exceed the per-argument size limit."
+        ),
+    )
+    parser.add_argument(
         "--self-hosted-slots",
         metavar="K",
         default=None,
@@ -1820,7 +1829,7 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--files", "--files-from",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
@@ -2016,7 +2025,12 @@ def main() -> int:
     # --strict-noop. A default-discovery marker-filtered 0-collect file is
     # legitimate and only ⚠-surfaced.
     explicit_files: set[Path] = set()
-    if args.files:
+    if args.files_from:
+        listed = Path(args.files_from).read_text(encoding="utf-8").splitlines()
+        files = [repo_root / f.strip() for f in listed if f.strip()]
+        roots = []
+        explicit_files = {f.resolve() for f in files}
+    elif args.files:
         files = [repo_root / f for f in _split_pathspec(args.files)]
         roots = []
         explicit_files = {f.resolve() for f in files}
