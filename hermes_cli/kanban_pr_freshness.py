@@ -152,8 +152,15 @@ ArmFn = Callable[[str, int, str, str], Optional[str]]
 
 
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
-          arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX) -> dict:
+          arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
+          armable=None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
+
+    ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
+    (``metadata.pr_url``/``pr``/``pr_urls`` or ``--survivor-pr``). Only those
+    are ever armed for merge: a PR merely MENTIONED in summary/result prose is
+    context, not merge authorization. ``complete_task`` always passes it;
+    ``None`` (direct callers) keeps the legacy every-ref behavior.
 
     Returns a report ``{"prs": {"o/r#n": {...}}}`` for the handoff metadata.
     All draft checks run before any mutation, so a refused handoff has changed
@@ -171,6 +178,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         if gh is None:
             return report
     arm = arm or spawn_arm
+    armable_keys = None if armable is None else {str(k).lower() for k in armable}
 
     views = []
     drafts = []
@@ -208,7 +216,9 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             entry["update_branch"] = "requested" if upd is not None else "failed (fail-open)"
             # The new head has fresh CI; arming is fleet-merge's job once it is green.
             continue
-        if allow_arm and automerge_enabled() and _ci_green(gh, ref.repo, head):
+        if allow_arm and armable_keys is not None and key.lower() not in armable_keys:
+            entry["automerge"] = "not armed: PR only mentioned, not this card's handoff PR"
+        elif allow_arm and automerge_enabled() and _ci_green(gh, ref.repo, head):
             log = arm(ref.repo, ref.number, head, task_id)
             entry["automerge"] = f"fleet-merge spawned ({log})" if log else "not spawned"
         elif allow_arm and automerge_enabled():

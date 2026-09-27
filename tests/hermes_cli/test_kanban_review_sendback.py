@@ -308,7 +308,16 @@ def test_cli_parked_send_back_refused_without_bindable_session(
         assert len(_kinds(conn, tid)) == before
 
 
-def test_tool_request_changes_sends_back_parked_review(board: Path) -> None:
+@pytest.fixture
+def chat_session(monkeypatch: pytest.MonkeyPatch) -> str:
+    """A bindable chat session: the only caller that may open a human-lane
+    review run from the tool (FleetReview #1081, same rule as the CLI)."""
+    sid = "20260926_070000_chat"
+    monkeypatch.setenv("HERMES_SESSION_ID", sid)
+    return sid
+
+
+def test_tool_request_changes_sends_back_parked_review(board: Path, chat_session) -> None:
     from tools import kanban_tools as tools
 
     with kb.connect() as conn:
@@ -325,7 +334,7 @@ def test_tool_request_changes_sends_back_parked_review(board: Path) -> None:
 
 
 def test_tool_send_back_from_gateway_session_attributes_active_profile(
-    board: Path, monkeypatch: pytest.MonkeyPatch,
+    board: Path, monkeypatch: pytest.MonkeyPatch, chat_session,
 ) -> None:
     """An orchestrator in a gateway session has no HERMES_PROFILE (only dispatched
     workers do): the review claim and coverage comment name the active profile."""
@@ -345,7 +354,7 @@ def test_tool_send_back_from_gateway_session_attributes_active_profile(
         _assert_sent_back(conn, tid, "default")
 
 
-def test_tool_send_back_without_coverage_is_refused(board: Path) -> None:
+def test_tool_send_back_without_coverage_is_refused(board: Path, chat_session) -> None:
     from tools import kanban_tools as tools
 
     with kb.connect() as conn:
@@ -355,6 +364,31 @@ def test_tool_send_back_without_coverage_is_refused(board: Path) -> None:
         "task_id": tid, "reason": "add the boundary test",
     }))
     assert "missing review_coverage" in out["error"]
+    with kb.connect() as conn:
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+@pytest.mark.parametrize("session", [None, "cron_abc123_20260926_070000"])
+def test_tool_parked_send_back_refused_without_bindable_session(
+    board: Path, monkeypatch: pytest.MonkeyPatch, session,
+) -> None:
+    """FleetReview #1081: the tool path had no session check, so a sessionless
+    or cron caller could open and close a human-lane review run the CLI
+    refuses. Now refused identically, before any write."""
+    from tools import kanban_tools as tools
+
+    if session is None:
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_SESSION_ID", session)
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+    out = json.loads(tools._handle_request_changes({
+        "task_id": tid, "reason": "add the boundary test",
+        "coverage": json.loads(COVERAGE),
+    }))
+    assert "human-lane review claim" in out["error"]
     with kb.connect() as conn:
         _assert_untouched(conn, tid, before, runs_before)
 
