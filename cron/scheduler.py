@@ -5200,9 +5200,7 @@ def _run_job_script(
 
 def _is_shutdown_kill_returncode(returncode: Any) -> bool:
     """True for a child ended by SIGTERM/SIGKILL (negative Popen returncode)."""
-    kill_signals = {signal.SIGTERM}
-    if hasattr(signal, "SIGKILL"):
-        kill_signals.add(signal.SIGKILL)
+    kill_signals = {signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)}
     return returncode in {-int(sig) for sig in kill_signals}
 
 

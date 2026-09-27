@@ -57,7 +57,7 @@ echo never
 def env(hermes_env):
     import cron.scheduler as sched
     sched.clear_shutdown()
-    (hermes_env / "scripts" / "long.sh").write_text(SCRIPT)
+    (hermes_env / "scripts" / "long.sh").write_text(SCRIPT, encoding="utf-8")
     yield hermes_env
     sched.clear_shutdown()
     with sched._script_procs_lock:
