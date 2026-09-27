@@ -489,3 +489,86 @@ def test_app_server_worker_marks_run_and_live_write_is_not_promised(worker_card)
     assert "applies on next dispatch" in out
     assert "switches at its next turn" not in out
     assert len(_events(task_id, kb.ROUTE_CHANGED_EVENT)) == 1  # only the pre-turn one
+
+
+# ---------------------------------------------------------------------------
+# FleetReview #1342 follow-ups (t_c2214f98)
+# ---------------------------------------------------------------------------
+
+
+def test_gated_live_model_does_not_drop_a_later_live_effort(worker_card, monkeypatch):
+    """A model refused by a gate is refused alone; the effort write still applies."""
+    task_id, run_id = worker_card
+    agent = _worker_agent()
+    from hermes_cli import model_policy
+
+    monkeypatch.setattr(model_policy, "flagship_model_match",
+                        lambda model, config=None: "flag" if "flag" in (model or "") else None)
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET model_override='flag-model' WHERE id=?", (task_id,))
+            kb._append_event(conn, task_id, kb.ROUTE_CHANGED_EVENT, {
+                "live": True, "touch_model": True, "touch_effort": False,
+                "model": "flag-model", "provider": "custom"}, run_id=run_id)
+    _set_live(task_id, touch_effort=True, effort="low")
+
+    with patch.object(agent, "switch_model") as switch:
+        kwr.apply_pending_live_route(agent, iteration=1)
+
+    switch.assert_not_called()
+    assert agent.model == "model-a"
+    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+    refused = _events(task_id, kwr.LIVE_ROUTE_SWITCH_REFUSED_EVENT)
+    assert len(refused) == 1 and "flagship" in refused[0][1]["reason"]
+    assert refused[0][1]["to"]["effort"] is None
+    switched = _events(task_id, kwr.LIVE_ROUTE_SWITCHED_EVENT)
+    assert len(switched) == 1 and switched[0][1]["kind"] == "effort"
+
+
+def test_unresolvable_live_model_does_not_drop_a_live_effort(worker_card):
+    task_id, _ = worker_card
+    agent = _worker_agent()
+    _set_live(task_id, touch_model=True, model="model-b", provider="custom-b")
+    _set_live(task_id, touch_effort=True, effort="high")
+    refused = SimpleNamespace(success=False, error_message="no credentials for custom-b")
+    with patch(f"{kc.__name__.rsplit('.', 1)[0]}.model_switch.switch_model", return_value=refused), \
+            patch.object(agent, "switch_model") as switch:
+        kwr.apply_pending_live_route(agent, iteration=1)
+
+    switch.assert_not_called()
+    assert (agent.model, agent.provider) == ("model-a", "custom")
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    ev = _events(task_id, kwr.LIVE_ROUTE_SWITCH_REFUSED_EVENT)
+    assert len(ev) == 1 and "no credentials" in ev[0][1]["reason"]
+    ev = _events(task_id, kwr.LIVE_ROUTE_SWITCHED_EVENT)
+    assert len(ev) == 1 and ev[0][1]["kind"] == "effort"
+
+
+def test_app_server_marker_write_failure_is_retried_until_it_lands(worker_card, monkeypatch):
+    task_id, run_id = worker_card
+    agent = _worker_agent()
+    monkeypatch.setattr(kwr, "_MARKER_RETRY_DELAYS", (0.0,))
+    kwr._live_state["marker_retry"] = None
+    real_connect = kb.connect
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) <= 2:
+            raise RuntimeError("database is locked")
+        return real_connect()
+
+    try:
+        with patch.object(kb, "connect", side_effect=flaky):
+            kwr.mark_live_route_unsupported(agent, reason="codex_app_server: no switch point")
+            thread = kwr._live_state["marker_retry"]
+            assert thread is not None
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert len(calls) == 3
+        assert [r for r, _ in _events(task_id, kb.ROUTE_LIVE_UNSUPPORTED_EVENT)] == [run_id]
+        out = kc.run_slash(f"set-model {task_id} --effort high --live")
+        assert "applies on next dispatch" in out
+        assert _events(task_id, kb.ROUTE_CHANGED_EVENT) == []
+    finally:
+        kwr._live_state["marker_retry"] = None
