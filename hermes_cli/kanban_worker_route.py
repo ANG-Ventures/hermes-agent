@@ -157,6 +157,19 @@ PINNED_PROVIDER_FAILURE_REASON = "pinned_provider_unavailable"
 _RATE_LIMIT_REASONS = frozenset({"rate_limit", "billing", "upstream_rate_limit"})
 _card_pin_cache: dict = {}
 
+# The two Claude relay POOL faces. A card pinned to one means "this model on
+# the pool", not one wire, so failing over to the SIBLING pool for the SAME
+# model keeps the pin's meaning (t_6ea895ca). A single-sub pin
+# (claude-apx-N / claude-bpx-N) is not a pool face and stays strict.
+_SIBLING_POOL = {"claude-bpr": "claude-apr", "claude-apr": "claude-bpr"}
+
+
+def _is_sibling_pool_same_model(pinned, to_provider, from_model, to_model) -> bool:
+    if _SIBLING_POOL.get(pinned) != str(to_provider or "").strip().lower():
+        return False
+    src = str(from_model or "").strip().lower()
+    return bool(src) and src == str(to_model or "").strip().lower()
+
 
 def card_pinned_provider() -> Optional[str]:
     """The provider pinned on THIS worker's card row, else None.
@@ -201,7 +214,10 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     Refuses only when (a) the card pins a provider, (b) this run is actually
     serving on that pin (a dispatch fallback rung may have moved it), and
     (c) the fallback target is a different provider. Same-provider entries
-    (another model / key on the pinned lane) stay allowed. The first refusal
+    (another model / key on the pinned lane) stay allowed, and so does the
+    sibling Claude pool for the identical model when the pin is a pool face
+    (claude-bpr <-> claude-apr); that swap is recorded by the normal
+    ``worker_route_substituted`` (stage=runtime) event. The first refusal
     per agent writes one ``worker_route_pin_refused`` run event and marks the
     agent so a failed result exits retry-preserving
     (:func:`apply_pin_refusal_to_result`).
@@ -215,6 +231,9 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     if serving != pinned:
         return False
     if str(to_provider or "").strip().lower() == pinned:
+        return False
+    serving_model = primary.get("model") or getattr(agent, "model", None)
+    if _is_sibling_pool_same_model(pinned, to_provider, serving_model, to_model):
         return False
     reason_value = str(getattr(reason, "value", reason) or "") or None
     if not isinstance(getattr(agent, "_kanban_pin_refused_failover", None), dict):
