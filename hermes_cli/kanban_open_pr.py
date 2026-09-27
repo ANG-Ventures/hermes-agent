@@ -14,9 +14,16 @@ a completion to ``review`` instead of ``done`` so dependants stay gated.
 :func:`find_done_with_open_pr` is the board lint for cards that already slipped
 through (``kanban home-lint --open-prs``).
 
-Fail-OPEN by design: a lookup error is logged and treated as "not open", so a
-GitHub outage never wedges completion. Bare ``#N`` refs are ignored (no repo
-context is guessed) -- the same rule as :mod:`hermes_cli.kanban_pr_gate`.
+Lookup failures on the completion path fail CLOSED (t_36d0114e, 2026-09-27):
+14 of 80 fresh PRs sat "green CI, card done, PR open" because the worker lane's
+``gh`` read cap made every lookup time out, the old fail-open read that as
+"not open", and ``complete`` wrote ``done``. A PR whose state cannot be read is
+now treated like an open one -- the card goes to ``review``, which is not a
+wedge: the review-card closer completes it on REST ``merged=true``. A definite
+404 (the ref names no PR) is still "not open". The board lint
+(:func:`find_done_with_open_pr`) reports only PRs positively read as OPEN.
+Bare ``#N`` refs are ignored (no repo context is guessed) -- the same rule as
+:mod:`hermes_cli.kanban_pr_gate`.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import time
 from typing import Callable, Iterable, Optional
 
@@ -41,6 +49,39 @@ MAX_LINT_LOOKUPS = 60
 QueryFn = Callable[[str, int], Optional[dict]]
 
 
+QUERY_TIMEOUT_SECONDS = 10
+NOT_FOUND = "NOT_FOUND"
+
+
+def query_pr_state(repo: str, number: int) -> Optional[dict]:
+    """REST PR state: ``{"state": OPEN|CLOSED|MERGED|NOT_FOUND}`` or None.
+
+    Unlike :func:`kanban_pr_gate.query_pr` this separates a definite 404
+    (``NOT_FOUND``: the ref names no PR, e.g. an upstream number qualified with
+    the fork's slug) from "cannot tell" (None: timeout, rate/READ cap, auth).
+    Completion routing fails closed on None and must not on a 404.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "api", f"repos/{repo}/pulls/{number}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=QUERY_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        if "HTTP 404" in (proc.stderr or "") or '"status":"404"' in (proc.stdout or "").replace(" ", ""):
+            return {"state": NOT_FOUND}
+        return None
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("state"):
+        return None
+    return {"state": "MERGED" if payload.get("merged_at") else str(payload["state"]).upper()}
+
+
 def _default_query() -> Optional[QueryFn]:
     """The real ``gh``-backed oracle, or None inside pytest.
 
@@ -50,7 +91,7 @@ def _default_query() -> Optional[QueryFn]:
     """
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return None
-    return _prg.query_pr
+    return query_pr_state
 
 
 def _iter_strings(value) -> Iterable[str]:
@@ -109,17 +150,66 @@ def open_refs(refs, *, query_fn: Optional[QueryFn] = None,
     return found
 
 
+def unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None,
+                  limit: int = MAX_LOOKUPS_PER_COMPLETION, primary=()) -> tuple:
+    """``(open, unverified)`` among ``refs``: the completion-path verdict.
+
+    ``open`` = read OPEN (a merge-queued PR is OPEN over REST). ``unverified``
+    = the lookup raised or returned no state -- fail CLOSED, the caller treats
+    it like open. A definite NOT_FOUND / CLOSED / MERGED is neither.
+    ``primary`` refs (the card's own ``--survivor-pr`` / ``metadata.pr_url``)
+    are always looked up; the per-completion ``limit`` only caps prose refs,
+    whose overflow stays unchecked as before.
+    """
+    if query_fn is None:
+        query_fn = _default_query()
+        if query_fn is None:
+            return [], []
+    primary_keys = {(r.repo.lower(), r.number) for r in primary}
+    opened, unverified = [], []
+    prose_seen = 0
+    for ref in refs:
+        if (ref.repo.lower(), ref.number) not in primary_keys:
+            if prose_seen >= limit:
+                _log.warning("kanban open-pr check: lookup cap %d reached; %s unchecked", limit, ref)
+                continue
+            prose_seen += 1
+        try:
+            payload = query_fn(ref.repo, ref.number)
+        except Exception as exc:
+            _log.warning("kanban open-pr check: lookup %s failed (fail-closed -> review): %s", ref, exc)
+            unverified.append(ref)
+            continue
+        state = str(payload.get("state") or "").upper() if isinstance(payload, dict) else ""
+        if not state:
+            _log.warning("kanban open-pr check: lookup %s returned no state (fail-closed -> review)", ref)
+            unverified.append(ref)
+        elif state == "OPEN":
+            opened.append(ref)
+    return opened, unverified
+
+
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                  survivor_pr=None, query_fn: Optional[QueryFn] = None) -> list:
-    """Extract + resolve: the OPEN PRs named by a completion's evidence."""
+    """Extract + resolve: the PRs that block ``done`` -- OPEN or unreadable."""
     refs = extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr)
     if not refs:
         return []
-    return open_refs(refs, query_fn=query_fn)
+    primary = extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr)
+    opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
+    return opened + unverified
+
+
+ROUTE_COMMENT = "survivor PR open; card closes on merged=true"
 
 
 def route_note(refs) -> str:
     return "auto-routed: " + ", ".join(f"PR {r.repo}#{r.number}" for r in refs) + " still open"
+
+
+def route_comment(refs) -> str:
+    """The ONE comment a routed completion leaves (the closer reads PR refs from it)."""
+    return f"{ROUTE_COMMENT} ({', '.join(f'{r.repo}#{r.number}' for r in refs)})"
 
 
 def find_done_with_open_pr(conn: sqlite3.Connection, *, days: int = LINT_WINDOW_DAYS,
