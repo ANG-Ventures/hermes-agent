@@ -165,18 +165,21 @@ _EXCLUDED_PATH_GLOBS = (
 # board's ``kanban/workspaces`` 7.4M (the ``kanban/boards/*/workspaces`` glob above
 # does not cover the default board, which lives at the root), ``.worktrees/argus``
 # 4.4M, two dead 09-25 ``var/ramscratch-stage-*`` evacuation copies 5.1M and
-# ``var/subvps-stage`` 0.5M; after those, root ``wt/`` + ``worktrees/`` (ad-hoc git
-# worktrees) were the largest remaining at ~0.25M each. All are regenerable scratch: git checkouts/worktrees
+# ``var/subvps-stage`` 0.5M. All are regenerable scratch: git checkouts/worktrees
 # created and reaped by the kanban/review runtimes, one-off staging copies, and the
 # sub-VPS rsync stage (its contents are backed up from the boxes by restic).
+#
+# Root ``wt/`` and ``worktrees/`` are deliberately NOT listed (~0.25M files each): they
+# are hand-made operator worktrees, not runtime-reaped. A 2026-09-27 census found 30 of
+# 77 entries holding work that exists nowhere else (dirty tracked edits, untracked
+# evidence/tests, commits on no remote), and Time Machine excludes both trees, so the
+# full tier is their only copy (t_e95deca8).
 _EXCLUDED_ROOT_PATH_GLOBS = (
     ("kanban", "workspaces"),       # default-board per-task scratch workspaces
     ("kanban", "worktrees"),        # default-board per-task git worktrees
     (".worktrees",),                # review/verifier worktrees (argus, per-task)
     ("var", "ramscratch-stage-*"),  # RAM-disk evacuation staging copies
     ("var", "subvps-stage"),        # sub-VPS rsync staging mount (restic-covered)
-    ("wt",),                        # ad-hoc operator git worktrees (0.25M files)
-    ("worktrees",),                 # ad-hoc operator git worktrees (0.25M files)
 )
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE

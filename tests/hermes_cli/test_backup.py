@@ -197,8 +197,6 @@ class TestShouldExclude:
             ".worktrees/argus/t_064c65a9/head/setup.py",
             "var/ramscratch-stage-20260925-0512/worktrees/f.txt",
             "var/subvps-stage/sub-vps-1/etc/hosts",
-            "wt/alerts-day-media-20260911/run_agent.py",
-            "worktrees/compression-refusal/cli.py",
         ):
             assert _should_exclude(Path(p)), p
         # the walk prunes the DIR itself (prune sites pass a trailing "_" sentinel)
@@ -216,6 +214,12 @@ class TestShouldExclude:
         assert not _should_exclude(Path("profiles/p/var/subvps-stage/a.txt"))
         assert not _should_exclude(Path("skills/git/worktrees/SKILL.md"))
         assert not _should_exclude(Path("plans/wt/notes.md"))
+        # root wt/ + worktrees/ are operator worktrees holding unique uncommitted work
+        # (t_e95deca8) — backed up, and never pruned from the walk
+        assert not _should_exclude(Path("wt/alerts-day-media-20260911/run_agent.py"))
+        assert not _should_exclude(Path("worktrees/compression-refusal/.local-evidence/HANDOFF.md"))
+        assert not _matches_path_glob(("wt", "_"))
+        assert not _matches_path_glob(("worktrees", "_"))
         # a FILE literally named like the dir is not an ancestor — keep it
         assert not _should_exclude(Path(".worktrees"))
         assert not _should_exclude(Path("kanban/workspaces"))
@@ -227,14 +231,16 @@ class TestShouldExclude:
         home = tmp_path / "home"
         for rel in ("config.yaml", "kanban/workspaces/t_1/repo/a.py",
                     ".worktrees/argus/t_2/f.py", "var/ramscratch-stage-20260925-0444/g.txt",
-                    "var/subvps-stage/sub-vps-1/h.txt", "var/keep.txt", "kanban/meta.json"):
+                    "var/subvps-stage/sub-vps-1/h.txt", "var/keep.txt", "kanban/meta.json",
+                    "wt/op-a/dirty.py", "worktrees/op-b/.local-evidence/HANDOFF.md"):
             f = home / rel
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text("x")
         out = tmp_path / "out.zip"
         assert _write_full_zip_backup_locked(out, home) == out
         names = set(zipfile.ZipFile(out).namelist())
-        assert {"config.yaml", "var/keep.txt", "kanban/meta.json"} <= names
+        assert {"config.yaml", "var/keep.txt", "kanban/meta.json",
+                "wt/op-a/dirty.py", "worktrees/op-b/.local-evidence/HANDOFF.md"} <= names
         assert not any(n.startswith((".worktrees/", "kanban/workspaces/", "var/ramscratch-stage-",
                                      "var/subvps-stage/")) for n in names), names
 
