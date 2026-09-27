@@ -1765,15 +1765,23 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 
 # Known non-answer placeholders a provider can hand back as the whole final
 # text (t_887f9584). "No response requested." is the Claude Code CLI's synthetic
-# turn closer; a CLI-backed provider can surface it, and a model that has seen
-# it in its own history can echo it. Delivered verbatim it reads like a reply;
-# it is not one. The backstop routes it into the SAME once-only post-tool nudge
-# the empty-response path already uses, and if the model hands it back again
-# (or there were no tool results to re-process) the user sees a plain notice
-# instead. Genuinely empty text and "[SILENT]" are not placeholders: silent
-# cron / no_agent turns keep their existing path untouched.
-_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested."})
+# turn closer; "Proceeding." is the text closer claude-bpx#248 wrote after a
+# parallel-batch repair (retired by the text-less closer, but records already on
+# disk stay for the life of a session: removing them moves the cached prefix).
+# A model that has seen either in its own history echoes it as its whole reply.
+# Delivered verbatim it reads like a reply; it is not one. The backstop routes
+# it into the SAME once-only post-tool nudge the empty-response path already
+# uses, and if the model hands it back again (or there were no tool results to
+# re-process) the user sees a plain notice instead. Genuinely empty text and
+# "[SILENT]" are not placeholders: silent cron / no_agent turns keep their
+# existing path untouched.
+_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested.", "Proceeding."})
 _TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
+# Shape of a scaffold closer we have not seen yet: a final text of at most
+# three words ending in "." right after tool results. It gets the once-only
+# nudge (auto-continue once) but is never replaced by the notice: a real short
+# reply ("Done.") must still reach the user if the model repeats it.
+_CLOSER_SHAPE_MAX_WORDS = 3
 
 
 def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
@@ -1783,10 +1791,20 @@ def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
     post-tool response (the once-only nudge fires), ``"notice"`` when it must
     be replaced by :data:`_TURN_ENDED_WITHOUT_REPLY`, and ``None`` for every
     other text — including the empty string, which keeps its own ladder.
+    An unknown closer-shaped text (<= 3 words ending in ".") after tool
+    results returns ``"empty"`` once and ``None`` after that.
     """
     if not isinstance(text, str):
         return None
-    if text.strip() not in _PLACEHOLDER_FINAL_TEXTS:
+    stripped = text.strip()
+    if stripped not in _PLACEHOLDER_FINAL_TEXTS:
+        if (
+            prior_was_tool
+            and not already_nudged
+            and stripped.endswith(".")
+            and 0 < len(stripped.split()) <= _CLOSER_SHAPE_MAX_WORDS
+        ):
+            return "empty"
         return None
     if prior_was_tool and not already_nudged:
         return "empty"
