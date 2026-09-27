@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1080,6 +1081,12 @@ def cmd_install(
     console.print()
 
 
+def _shell_quoted_source(install_record: dict) -> str:
+    """Recorded install source as ONE inert argv item for a copy-paste remedy."""
+    source = install_record.get("source")
+    return shlex.quote(str(source)) if source else "<source>"
+
+
 def cmd_update(name: str) -> None:
     """Update an installed plugin by pulling latest from its git remote."""
     from rich.console import Console
@@ -1101,7 +1108,7 @@ def cmd_update(name: str) -> None:
         sys.exit(1)
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
-        recorded_source = escape(str(install_record.get("source", "<source>")))
+        recorded_source = escape(_shell_quoted_source(install_record))
         console.print(
             f"[red]Error:[/red] Plugin '{name}' is pinned to "
             f"{install_record.get('revision')}. To move it, run "
@@ -2848,7 +2855,7 @@ def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
-        recorded_source = install_record.get("source", "<source>")
+        recorded_source = _shell_quoted_source(install_record)
         return {
             "ok": False,
             "error": (
