@@ -4870,6 +4870,29 @@ def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
         pending["home_before"] = _read_home_session(conn, pending["task_id"])
 
 
+def _record_pending_foreign_action(conn: sqlite3.Connection, changes_at_begin: int) -> None:
+    """Write a guarded mutator's takeover/override audit in the SAME
+    transaction as the mutation (C5 #23, PR #951 review): a crash or a
+    concurrent reader between two commits can no longer see the foreign
+    mutation without its takeover event and comment. Only a transaction
+    that actually changed rows records it; a refused (no-op) mutation
+    leaves no audit, matching ``_mutation_succeeded``."""
+    pending = _PENDING_HOME_CHECK.get()
+    if (
+        pending is None
+        or not pending["done"]
+        or pending.get("recorded")
+        or pending["result"] is None
+        or conn.total_changes == changes_at_begin
+    ):
+        return
+    pending["recorded"] = True
+    pending["new_home"] = record_foreign_action(
+        conn, pending["task_id"], pending["action"], pending["result"],
+        home_before=pending["home_before"], subscribe=False,
+    )
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """Context manager for an IMMEDIATE write transaction.
@@ -4920,7 +4943,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         _recheck_pending_home_session(conn)
+        changes_at_begin = conn.total_changes
         yield conn
+        _record_pending_foreign_action(conn, changes_at_begin)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -5885,8 +5910,8 @@ def _read_home_session(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 
 def record_foreign_action(
     conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor,
-    *, home_before: Any = _HOME_UNREAD,
-) -> None:
+    *, home_before: Any = _HOME_UNREAD, subscribe: bool = True,
+) -> Optional[str]:
     """Append the audit comment for an overridden foreign-session mutation.
 
     An ``--operator`` override records an ``operator_override`` event only:
@@ -5895,6 +5920,10 @@ def record_foreign_action(
     ``home_before`` is the home read BEFORE the guarded mutation ran; the
     mutation itself may have re-stamped ``tasks.session_id`` (``update
     --session``), and the audit must name the displaced home (C7 k103).
+
+    Returns the new home session when the takeover re-homed the card.
+    ``subscribe=False`` (the in-transaction caller) leaves the post-commit
+    chat subscription to the caller.
     """
     sess = ", ".join(actor.session_ids) or "no-session"
     prev_home = (
@@ -5918,7 +5947,7 @@ def record_foreign_action(
             ):
                 # The mutator already recorded this override itself
                 # (request-changes' operator send-back); one event per call.
-                return
+                return None
         with write_txn(conn, allow_nested=True):
             _append_event(
                 conn,
@@ -5932,7 +5961,7 @@ def record_foreign_action(
                     "home": prev_home,
                 },
             )
-        return
+        return None
     new_home = (
         actor.session_ids[0]
         if action in REHOME_ON_TAKEOVER_ACTIONS
@@ -5976,15 +6005,20 @@ def record_foreign_action(
         ),
         session_ref=session_ref,
     )
-    if new_home:
-        # Pings follow the new home: subscribe the taker's chat. Best effort --
-        # notification bookkeeping must never fail the mutation.
-        try:
-            from tools.kanban_tools import subscribe_calling_session
+    if new_home and subscribe:
+        _subscribe_new_home(conn, task_id)
+    return new_home
 
-            subscribe_calling_session(conn, task_id)
-        except Exception:
-            pass
+
+def _subscribe_new_home(conn: sqlite3.Connection, task_id: str) -> None:
+    # Pings follow the new home: subscribe the taker's chat. Best effort --
+    # notification bookkeeping must never fail the mutation.
+    try:
+        from tools.kanban_tools import subscribe_calling_session
+
+        subscribe_calling_session(conn, task_id)
+    except Exception:
+        pass
 
 
 def _home_session_guarded(action: str, task_param: str = "task_id"):
@@ -6030,7 +6064,10 @@ def _home_session_guarded(action: str, task_param: str = "task_id"):
                 _PENDING_HOME_CHECK.reset(pending_token)
                 _MUTATION_ACTOR.reset(token)
             override = pending["result"]
-            if override is not None and _mutation_succeeded(result):
+            if pending.get("recorded"):
+                if pending.get("new_home"):
+                    _subscribe_new_home(conn, str(task_id))
+            elif override is not None and _mutation_succeeded(result):
                 record_foreign_action(
                     conn, str(task_id), action, override,
                     home_before=pending["home_before"],
@@ -6321,9 +6358,11 @@ def create_task(
     # no card can land without a home (never NULL) or without an origin line.
     parents = tuple(parents or ())
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
-    session_id, inherited_origin = _resolve_birth_session(
+    requested_session_id, unstamped_body = session_id, body
+    birth = _resolve_birth_session(
         conn, session_id, parents, explicit=session_explicit
     )
+    session_id, inherited_origin = birth
     body = stamp_origin_body(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
@@ -6617,6 +6656,20 @@ def create_task(
                             "--force <reason> / force_reason to file anyway",
                             same,
                         )
+                # C5 #44 (PR #987): a parent re-homed between the birth
+                # resolution above and this write lock must still be the
+                # home the child is born with. Re-resolve under the lock.
+                rebirth = _resolve_birth_session(
+                    conn, requested_session_id, parents, explicit=session_explicit
+                )
+                if rebirth != birth:
+                    birth = rebirth
+                    session_id, inherited_origin = rebirth
+                    body = stamp_origin_body(
+                        unstamped_body,
+                        inherited_origin
+                        or format_origin_line(session_id, created_by=created_by),
+                    )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -13358,7 +13411,8 @@ def request_changes(
 
     def _in_txn() -> tuple[bool, Optional[str]]:
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, claim_lock, claim_expires "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -13403,6 +13457,16 @@ def request_changes(
             claimed_payload = {}
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
+        if claimer and expected_run_id is None and not opened:
+            # C5 #70 (PR #1081): a claimer send-back with no run id must not
+            # close ANOTHER reviewer's live run. Only its own claim, or a run
+            # whose claim has lapsed with no live owner, may be closed here.
+            holder = task_row["claim_lock"]
+            if holder != str(claimer) and (
+                (holder and int(task_row["claim_expires"] or 0) > int(time.time()))
+                or _prior_worker_still_alive(conn, task_id) is not None
+            ):
+                return False, "another reviewer's live review run holds this task"
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "
