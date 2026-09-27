@@ -132,19 +132,35 @@ def _state(key: StickyKey) -> Optional[StickyState]:
 
 # ── eligibility (§4.3 Discovery) ─────────────────────────────────────────
 
-def _eligibility_fn(agent: Any):
-    """At most one ``/eligibility`` GET per turn, relay lanes only. Non-relay
-    primaries get None (warm_seat / fallback_failed fail closed)."""
+def _eligibility_route(agent: Any):
+    """Live ``(provider, model, base_url, sid)`` for the primary's ``/eligibility``
+    query, or None when the primary is not a relay lane / has no base_url."""
     provider, model = primary_route(agent)
     if provider.strip().lower() not in RELAY_PROVIDERS:
         return None
     rt = getattr(agent, "_primary_runtime", None) or {}
     base_url = str(rt.get("base_url") or "")
-    sid = str(getattr(agent, "session_id", "") or "")
     if not base_url:
+        return None
+    return provider, model, base_url, str(getattr(agent, "session_id", "") or "")
+
+
+def _eligibility_fn(agent: Any):
+    """At most one ``/eligibility`` GET per turn, relay lanes only. Non-relay
+    primaries get None (warm_seat / fallback_failed fail closed).
+
+    The per-agent cache outlives this call and compression rotates
+    ``agent.session_id`` on the same agent, so the route (session / model /
+    base_url) is resolved at fetch time and is part of the cache key, never
+    captured once when the cache is first built."""
+    if _eligibility_route(agent) is None:
         return None
 
     def _fetch():
+        route = _eligibility_route(agent)
+        if route is None:
+            return None
+        provider, model, base_url, sid = route
         if provider.strip().lower() == "claude-apr":
             return fp.fetch_eligibility(base_url, model=model, session=sid or None)
         return fp.fetch_eligibility(base_url, model=model,
@@ -159,7 +175,9 @@ def _eligibility_fn(agent: Any):
                 agent._fallback_turn_eligibility = cache
             except Exception:  # noqa: BLE001
                 pass
-        return cache.get(turn)
+        # A rotated session/route within the same turn (mid-turn compression)
+        # must not reuse the old session's answer either.
+        return cache.get((turn, _eligibility_route(agent)))
 
     return _cached
 

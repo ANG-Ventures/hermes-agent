@@ -1424,3 +1424,46 @@ def test_wiring_warm_refusal_arm_config_and_ledger_columns(wired, monkeypatch):
     assert _restore(a) is True
     [rec] = _rows(home, "recovery")
     assert rec["return_branch"] == "warm_seat" and rec["warm_refusal_arm"] == 0
+
+
+# ── t_00fda99a: cached TurnEligibility must follow a rotated session_id ────
+
+@pytest.mark.parametrize("provider,kwarg,expect", [
+    ("claude-apr", "session", lambda sid: sid),
+    ("claude-bpr", "user", lambda sid: f"hermes-sess:{sid}"),
+])
+def test_eligibility_cache_follows_session_rotation(monkeypatch, provider, kwarg, expect):
+    """Compression rotates agent.session_id on the SAME agent; the per-agent
+    TurnEligibility cache must query /eligibility for the live session, not the
+    one captured when the cache was first built."""
+    from types import SimpleNamespace
+    from agent import fallback_wiring as _fw
+
+    seen = []
+
+    def _fake_fetch(base_url, *, model, session=None, user=None, **_kw):
+        seen.append({"base_url": base_url, "model": model, "session": session, "user": user})
+        return None
+
+    monkeypatch.setattr(fp, "fetch_eligibility", _fake_fetch)
+    agent = SimpleNamespace(
+        session_id="sid-old", _current_turn_id=1,
+        _primary_runtime={"provider": provider, "model": "claude-fable-5-1",
+                          "base_url": "http://relay.local"},
+    )
+    _fw._eligibility_fn(agent)()
+    assert isinstance(agent._fallback_turn_eligibility, fp.TurnEligibility)
+    _fw._eligibility_fn(agent)()          # same turn, same session -> cached
+    assert len(seen) == 1 and seen[0][kwarg] == expect("sid-old")
+
+    agent.session_id = "sid-new"          # compression rotation
+    agent._current_turn_id = 2
+    _fw._eligibility_fn(agent)()
+    assert len(seen) == 2 and seen[1][kwarg] == expect("sid-new")
+
+    # Mid-turn rotation (same turn id) must not reuse the old session's answer.
+    agent.session_id = "sid-newer"
+    _fw._eligibility_fn(agent)()
+    assert len(seen) == 3 and seen[2][kwarg] == expect("sid-newer")
+    _fw._eligibility_fn(agent)()          # still at most one GET per (turn, route)
+    assert len(seen) == 3
