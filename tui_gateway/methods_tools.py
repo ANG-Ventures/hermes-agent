@@ -153,6 +153,7 @@ def _(rid, params: dict) -> dict:
                 refresh_agent_mcp_tools(
                     agent,
                     enabled_override=_load_enabled_toolsets(),
+                    disabled_override=_load_disabled_toolsets(),
                     quiet_mode=True,
                 )
             except Exception as _exc:
@@ -1620,10 +1621,15 @@ def _(rid, params: dict) -> dict:
             if session
             else _load_enabled_toolsets()
         )
+        disabled = (
+            getattr(session["agent"], "disabled_toolsets", None)
+            if session
+            else _load_disabled_toolsets()
+        )
         # Pre-assembly list: /tools is a discovery surface and must show
         # tools deferred behind the tool_search bridge (same as the CLI).
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True,
-                                     skip_tool_search_assembly=True)
+        tools = get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled,
+                                     quiet_mode=True, skip_tool_search_assembly=True)
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):

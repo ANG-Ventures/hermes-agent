@@ -6427,6 +6427,20 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     return surfaces
 
 
+def _surface_fold_in(platform: str) -> set[str]:
+    """Client-surface toolsets minus ``agent.disabled_toolsets``.
+
+    The fold-in happens after ``_get_platform_tools`` already subtracted
+    ``agent.disabled_toolsets``, so the same subtraction is applied to the
+    fold-in itself; otherwise ``disabled_toolsets: [project]`` is a no-op here,
+    the only surface where the toolset exists (upstream #54433). ``desktop_ui``
+    is kept regardless: it is the client's own control surface.
+    """
+    surfaces = _gui_surface_toolsets(platform)
+    disabled = set(_load_disabled_toolsets() or [])
+    return surfaces - (disabled - {"desktop_ui"})
+
+
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     session_platform = platform or _resolve_session_platform()
     explicit = [
@@ -6453,7 +6467,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 # coding posture returns before the fallback path that normally
                 # adds them — without this the desktop loses its pane/project
                 # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+                return sorted({*selection, *_surface_fold_in(session_platform)})
         except Exception:
             pass
 
@@ -6570,7 +6584,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
+        return sorted(enabled | _surface_fold_in(session_platform))
     except Exception:
         if fallback_notice is not None:
             print(
@@ -6578,6 +6592,27 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 file=sys.stderr,
                 flush=True,
             )
+        return None
+
+
+def _load_disabled_toolsets() -> list[str] | None:
+    """``agent.disabled_toolsets`` from config.yaml, or ``None``.
+
+    The classic CLI and the messaging gateway both forward this list to
+    AIAgent, where ``get_tool_definitions`` strips the named toolsets even out
+    of composite defaults (#17309). The TUI/serve gateway dropped it, so a
+    profile denylist silently had no effect on any session built here
+    (upstream #44499; clanker-warm-client desktop_project, t_3f53bfd7).
+    """
+    try:
+        from agent.skill_utils import parse_config_string_list
+
+        from hermes_cli.config import load_config
+
+        agent_cfg = load_config().get("agent") or {}
+        disabled = parse_config_string_list(agent_cfg.get("disabled_toolsets"))
+        return [str(ts) for ts in disabled] or None
+    except Exception:
         return None
 
 
@@ -9103,6 +9138,8 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         # their toolsets against that same platform rather than the gateway
         # process's, so they never carry GUI schema they cannot use.
         or _load_enabled_toolsets("tui"),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None)
+        or _load_disabled_toolsets(),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -9600,6 +9637,7 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        disabled_toolsets=_load_disabled_toolsets(),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
