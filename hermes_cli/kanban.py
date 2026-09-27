@@ -1100,9 +1100,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reopen.add_argument(
         "--to",
         dest="to_status",
-        choices=("ready", "todo"),
+        choices=("ready", "todo", "review"),
         default="ready",
-        help="Status to return the task to (default: ready)",
+        help="Status to return the task to (default: ready; review = done-with-open-PR, owned by kanban.review_assignee)",
     )
     p_reopen.add_argument(
         "--json",

@@ -9654,6 +9654,9 @@ def complete_task(
                         conn, task_id, "completion_routed_to_review",
                         {"open_prs": routed_meta["auto_routed_open_prs"], "note": note},
                     )
+                # One durable line on the card (t_36d0114e): why it is not done,
+                # and the PR refs the review-card closer resolves on merged=true.
+                add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
@@ -12881,8 +12884,8 @@ def reopen_task(
 
     Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
     """
-    if to_status not in ("ready", "todo"):
-        return False, f"invalid target status {to_status!r} (use 'ready' or 'todo')"
+    if to_status not in ("ready", "todo", "review"):
+        return False, f"invalid target status {to_status!r} (use 'ready', 'todo' or 'review')"
     if not (reason or "").strip():
         return False, "a reason is required to reverse a terminal state"
 
@@ -12897,14 +12900,18 @@ def reopen_task(
             f"'done' tasks (use unblock/promote for other states)"
         )
 
+    # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
+    # OPEN goes back to the review lane -- owned by kanban.review_assignee --
+    # where the review-card closer completes it on REST merged=true.
+    review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
             "       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-            "       current_run_id = NULL "
+            "       current_run_id = NULL, assignee = COALESCE(?, assignee) "
             " WHERE id = ? AND status = 'done'",
-            (to_status, task_id),
+            (to_status, review_assignee, task_id),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
