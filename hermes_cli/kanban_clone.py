@@ -182,7 +182,7 @@ def _git_env() -> dict:
 
 def _git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *args], text=True, capture_output=True, check=False, env=_git_env()
+        ["git", *args], text=True, encoding="utf-8", errors="replace", capture_output=True, check=False, env=_git_env()
     )
 
 

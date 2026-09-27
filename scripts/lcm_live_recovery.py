@@ -235,7 +235,7 @@ class LiveAegisDriver(RecoveryDriver):
         proc = subprocess.run(
             [*self.command, prompt],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=self.timeout_seconds,
             env=env,
             check=False,
@@ -332,7 +332,7 @@ class LiveAegisSessionDriver(RecoveryDriver):
         cmd.extend([*args, "-q", prompt])
         return subprocess.run(
             cmd,
-            capture_output=True, text=True, timeout=self.timeout_seconds,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.timeout_seconds,
             env=env, check=False,
         )
 

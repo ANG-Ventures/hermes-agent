@@ -1644,7 +1644,7 @@ def _sysctl_value(name: str) -> str:
         return subprocess.check_output(
             ["/usr/sbin/sysctl", "-n", name],
             stderr=subprocess.DEVNULL,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=2,
         ).strip()
     except Exception:
@@ -2070,7 +2070,7 @@ def _convert_caf_to_wav(file_path: str) -> Optional[str]:
     if ffmpeg:
         try:
             subprocess.run([ffmpeg, "-y", "-i", file_path, wav_path],
-                check=True, capture_output=True, text=True,
+                check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=300, stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags())
             return wav_path
@@ -2080,7 +2080,7 @@ def _convert_caf_to_wav(file_path: str) -> Optional[str]:
     if afconvert:
         try:
             subprocess.run([afconvert, file_path, wav_path, "-d", "LEI16", "-f", "WAVE"],
-                check=True, capture_output=True, text=True,
+                check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=300, stdin=subprocess.DEVNULL)
             return wav_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:

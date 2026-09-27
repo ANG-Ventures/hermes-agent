@@ -61,7 +61,7 @@ def _git_toplevel(shared_root: Path) -> Optional[Path]:
     try:
         out = subprocess.run(
             ["git", "-C", str(shared_root), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except (OSError, subprocess.SubprocessError):
@@ -76,7 +76,7 @@ def _git(repo: Path, *args: str, timeout: int = 30) -> Tuple[int, str, str]:
     try:
         p = subprocess.run(
             ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
         return p.returncode, p.stdout, p.stderr

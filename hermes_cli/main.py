@@ -7705,7 +7705,7 @@ def _desktop_macos_has_valid_real_signature(app: Path) -> bool:
         return False
     try:
         info = subprocess.run(
-            [codesign, "-dv", str(app)], check=False, capture_output=True, text=True
+            [codesign, "-dv", str(app)], check=False, capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         output = f"{info.stdout}\n{info.stderr}"
         if info.returncode != 0 or "TeamIdentifier=" not in output \
@@ -7891,7 +7891,7 @@ def _desktop_macos_relaunchable_fixup(
         # safeStorage can read the old key. Tracked as follow-up.
         result = subprocess.run(
             [codesign, "--force", "--deep", "--sign", "-", str(app)],
-            check=False, capture_output=True, text=True,
+            check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode != 0:
             print(
@@ -7901,7 +7901,7 @@ def _desktop_macos_relaunchable_fixup(
             return False
         verify = subprocess.run(
             [codesign, "--verify", "--deep", "--strict", str(app)],
-            check=False, capture_output=True, text=True,
+            check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if verify.returncode != 0:
             print(
@@ -7929,7 +7929,7 @@ def _macos_codesigning_identity_valid(security: str, identity: str) -> bool:
     try:
         result = subprocess.run(
             [security, "find-identity", "-v", "-p", "codesigning"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
     except Exception:
         return False
@@ -8024,7 +8024,7 @@ def _desktop_macos_setup_tcc_identity(identity: str = "Hermes Local Signing") ->
                         "-P", "hermeslocal",
                         "-T", codesign, "-T", "/usr/bin/codesign_allocate",
                     ],
-                    capture_output=True, text=True, check=False,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
                 )
 
             _export_p12([])
@@ -8049,7 +8049,7 @@ def _desktop_macos_setup_tcc_identity(identity: str = "Hermes Local Signing") ->
             # front-load.
             trusted = subprocess.run(
                 [security, "add-trusted-cert", "-r", "trustRoot", "-p", "codeSign", "-k", keychain, str(crt)],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
             if trusted.returncode != 0:
                 print(

@@ -2201,7 +2201,7 @@ async def _download_video_via_ytdlp(url: str, dest_dir: Path) -> Path:
         proc = subprocess.run(
             base + extra + [url],
             stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
         )
         return proc
 

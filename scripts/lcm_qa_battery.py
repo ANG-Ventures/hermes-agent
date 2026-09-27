@@ -72,7 +72,7 @@ def run_tier0(json_out: Path) -> dict:
             "tests/context_engine",
             "-q", "--no-header",
         ],
-        cwd=REPO, capture_output=True, text=True,
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     passed = proc.returncode == 0
     tail = proc.stdout.strip().splitlines()[-3:] if proc.stdout else []

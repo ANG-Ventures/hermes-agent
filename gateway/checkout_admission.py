@@ -467,7 +467,7 @@ def default_directory(code_root: Optional[Path] = None) -> Optional[Path]:
     try:
         out = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=True,
         ).stdout.strip()
     except Exception:
         return None
@@ -697,7 +697,7 @@ def _gh_check_runs(slug: str) -> Callable[[str], list]:
         out = subprocess.run(
             ["gh", "api", "--paginate", "--jq", ".check_runs[] | {name, status, conclusion}",
              f"repos/{slug}/commits/{sha}/check-runs"],
-            capture_output=True, text=True, timeout=60, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=True,
         ).stdout
         return [json.loads(line) for line in out.splitlines() if line.strip()]
     return fetch
