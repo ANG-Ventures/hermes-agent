@@ -203,6 +203,10 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--reasoning", dest="reasoning_effort", metavar="LEVEL",
+             help="Per-task reasoning effort (passed as --reasoning <level> to the "
+                  "worker): none|minimal|low|medium|high|xhigh|max|ultra. 'none' "
+                  "turns thinking off. Omit to inherit the profile's setting."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -256,7 +260,25 @@ _SPECS = [
         _arg("--provider",
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
-    ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+        _arg("--effort", dest="reasoning_effort", metavar="LEVEL",
+             help="Per-task reasoning effort (worker is spawned with --reasoning "
+                  "<level>). 'none' is a real level: thinking off. Independent of "
+                  "the model: with --effort alone the model override is left "
+                  "untouched, and clearing the model never resets the effort."),
+        _arg("--clear-effort", action="store_true", dest="clear_effort",
+             help="Clear the per-task reasoning effort; the worker falls back to "
+                  "its profile's agent.reasoning_effort."),
+        _arg("--reclaim", action="store_true",
+             help="If the task is running, release its claim (terminating the "
+                  "worker) so the next dispatch respawns it on the new route. "
+                  "The respawn is a fresh session seeded from the task body, "
+                  "comments and workspace; the in-flight conversation is not "
+                  "carried over. Without this a running worker keeps its old "
+                  "route until it finishes."),
+    ], help="Set or clear a task's model/provider/effort override (takes effect on the next dispatch)",
+       description="Pin a task's worker to a model, provider and reasoning effort. "
+                   "Changes apply on the next dispatch; pass --reclaim to restart "
+                   "a running worker on the new route now."),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

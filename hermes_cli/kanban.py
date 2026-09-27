@@ -370,6 +370,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
@@ -515,6 +516,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.reasoning_effort:
+        field("effort", task.reasoning_effort)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -579,21 +582,42 @@ def _cmd_assign(args: argparse.Namespace) -> int:
 
 def _cmd_set_model(args: argparse.Namespace) -> int:
     model = args.model
+    provider = getattr(args, "provider", None)
+    effort = getattr(args, "reasoning_effort", None)
+    clear_effort = bool(getattr(args, "clear_effort", False))
+    if effort is not None and clear_effort:
+        return _err("kanban: --effort and --clear-effort are mutually exclusive", 2)
+    effort_only = model is None and provider is None and (effort is not None or clear_effort)
     if model is not None and model.lower() in {"none", "-", "null", ""}:
         model = None
-    provider = getattr(args, "provider", None)
     try:
         with kbc.connect_closing() as conn:
-            ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
+            # --effort / --clear-effort alone leaves the model override untouched;
+            # a bare ``set-model <id>`` still clears it (pre-existing contract).
+            ok = True if effort_only else kb.set_model_override(conn, args.task_id, model, provider=provider)
+            if ok and (effort is not None or clear_effort):
+                ok = kb.set_reasoning_effort(conn, args.task_id, None if clear_effort else effort)
+            if not ok:
+                return _err(f"no such task: {args.task_id}")
+            reclaimed = False
+            if getattr(args, "reclaim", False):
+                task = kb.get_task(conn, args.task_id)
+                if task is not None and task.status == "running":
+                    reclaimed = bool(kb.reclaim_task(conn, args.task_id,
+                                                     reason="set-model --reclaim: route changed"))
     except (ValueError, RuntimeError) as exc:
         return _err(f"kanban: {exc}", 2)
-    if not ok:
-        return _err(f"no such task: {args.task_id}")
-    if model:
-        label = f"{provider}:{model}" if provider else model
-        print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
-    else:
-        print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    when = "worker reclaimed; respawns on the new route" if reclaimed else "applies on next dispatch"
+    if not effort_only:
+        if model:
+            label = f"{provider}:{model}" if provider else model
+            print(f"Set model override on {args.task_id}: {label} ({when})")
+        else:
+            print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    if effort is not None:
+        print(f"Set reasoning effort on {args.task_id}: {kb.normalize_reasoning_effort(effort)} ({when})")
+    elif clear_effort:
+        print(f"Cleared reasoning effort on {args.task_id} (worker uses its profile setting)")
     return 0
 
 

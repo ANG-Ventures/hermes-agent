@@ -668,6 +668,30 @@ hermes kanban set-model t_abcd none    # clear the override
 
 The dispatcher spawns the worker with the pinned model (`--provider <name>` is passed when set; `--provider` requires a model). The dashboard's per-task model dropdown drives the same `model_override` field. With no override, the worker uses its profile's configured model.
 
+### Per-task reasoning effort
+
+Pin the worker's reasoning depth independently of its model, at creation (`--reasoning`) or later (`set-model --effort`). Both take effect on the next dispatch:
+
+```bash
+hermes kanban create "review migration safety" --assignee reviewer --reasoning high
+hermes kanban set-model t_abcd --effort xhigh
+hermes kanban set-model t_abcd --effort none      # thinking OFF (a real level, not a clear)
+hermes kanban set-model t_abcd --clear-effort     # back to the profile's own setting
+hermes kanban set-model t_abcd claude-opus-4.6 --provider anthropic --effort high   # whole route at once
+```
+
+Accepted levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. The dispatcher spawns the worker with `--reasoning <level>`, overriding the profile's `agent.reasoning_effort` for that run. The two knobs are independent: `--effort` alone leaves a model override untouched, and clearing the model (`set-model <id> none`) never resets the effort. `show` prints the effort and `show --json` exposes `reasoning_effort`.
+
+### Changing the route of a running task (`--reclaim`)
+
+`set-model` never interrupts a running worker by default: it finishes on its old route and the override applies to the next run. Add `--reclaim` to release the claim now (the worker is terminated) so the next dispatch respawns it on the new route:
+
+```bash
+hermes kanban set-model t_abcd claude-opus-4.6 --provider anthropic --effort high --reclaim
+```
+
+The respawned worker is a **fresh session**. It is seeded from the task body, every comment (including prior runs' handoff summaries) and the same workspace/branch. The in-flight conversation is not carried over, so post a checkpoint comment (`hermes kanban comment t_abcd "..."`) before reclaiming a task mid-work.
+
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
 Kanban's per-profile configs make the planner/worker cost split natural. Decomposing a project into well-scoped cards takes frontier-level judgment; executing a card that already carries a clear goal, context, and handoff evidence usually doesn't — and the workers are where the vast majority of tokens are spent, so the worker model is where the cost lives. Run your orchestrator/dispatcher profile on a frontier model and point worker profiles at inexpensive models. Each profile has its own `config.yaml` under `~/.hermes/profiles/<name>/`, and the dispatcher injects the profile-scoped `HERMES_HOME` when it spawns `hermes -p <assignee>`, so each worker reads its own profile's model settings:
