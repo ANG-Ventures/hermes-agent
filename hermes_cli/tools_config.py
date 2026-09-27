@@ -123,6 +123,8 @@ CONFIGURABLE_TOOLSETS = [
     # Fork-custom (Kyzcreig) — preserve across upstream parity merges.
     ("messaging",       "📨 Cross-Platform Messaging",  "send_message"),
     ("moa",             "🧠 Mixture of Agents",         "mixture_of_agents"),
+    ("file_read",       "📖 File Read-Only",            "read, search (no write/patch)"),
+    ("skills_read",     "📘 Skills Read-Only",          "list, view (no manage)"),
 ]
 
 
@@ -156,6 +158,10 @@ def gui_toolset_label(label: str) -> str:
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
 _DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "moa"}
+# Read-only subsets of ``file``/``skills``: explicit opt-in only. Without this
+# the subset inference would auto-enable them wherever ``file``/``skills`` is,
+# so unchecking File Operations would no longer remove read_file.
+_DEFAULT_OFF_TOOLSETS |= {"file_read", "skills_read"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
