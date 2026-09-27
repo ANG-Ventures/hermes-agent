@@ -9689,6 +9689,15 @@ def complete_task(
     # is OPEN by definition and the land queue merges it from that record.
     if candidate.status != 'review' and not approve_head_sha:
         from hermes_cli import kanban_open_pr as _open_pr
+        # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
+        # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
+        foreign = _open_pr.foreign_pr_refs(
+            result, summary, metadata=metadata, survivor_pr=survivor_pr,
+        )
+        if foreign:
+            metadata = dict(metadata or {}, mentioned_foreign_prs=[
+                f"{r.repo}#{r.number}" for r in foreign
+            ])
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
         )

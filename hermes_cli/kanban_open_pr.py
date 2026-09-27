@@ -24,6 +24,14 @@ wedge: the review-card closer completes it on REST ``merged=true``. A definite
 (:func:`find_done_with_open_pr`) reports only PRs positively read as OPEN.
 Bare ``#N`` refs are ignored (no repo context is guessed) -- the same rule as
 :mod:`hermes_cli.kanban_pr_gate`.
+
+Only FLEET-owned PRs gate (t_06dccfe3, decided on t_f38605be): a PR on a repo
+whose owner is not in :data:`FLEET_OWNERS` (e.g. an upstream
+``stephenschoettler/hermes-lcm#638`` or ``NousResearch/*``) is a MENTION.
+The fleet cannot merge it, so routing on it would park the card in review
+waiting on a ``merged=true`` nobody here controls. Foreign refs are never looked
+up, never routed, never handed to the freshness gate (no update-branch / arm on a
+third-party PR); ``complete_task`` records them as ``mentioned_foreign_prs``.
 """
 
 from __future__ import annotations
@@ -47,6 +55,30 @@ LINT_WINDOW_DAYS = 7
 MAX_LINT_LOOKUPS = 60
 
 QueryFn = Callable[[str, int], Optional[dict]]
+
+# Repo owners whose PRs the fleet merges. Lower-case; matched case-insensitively.
+FLEET_OWNERS = frozenset({"ang-ventures", "kyzcreig"})
+
+
+def is_fleet_ref(ref) -> bool:
+    """True when ``ref.repo`` is owned by one of :data:`FLEET_OWNERS`."""
+    owner = str(getattr(ref, "repo", "") or "").split("/", 1)[0].strip().lower()
+    return owner in FLEET_OWNERS
+
+
+def split_fleet(refs) -> tuple:
+    """``(fleet, foreign)`` partition of ``refs``, order preserved."""
+    fleet, foreign = [], []
+    for ref in refs:
+        (fleet if is_fleet_ref(ref) else foreign).append(ref)
+    return fleet, foreign
+
+
+def foreign_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
+                    survivor_pr=None) -> list:
+    """The non-fleet PR refs a completion names: mentions, never a gate."""
+    refs = extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr)
+    return split_fleet(refs)[1]
 
 
 QUERY_TIMEOUT_SECONDS = 10
@@ -191,11 +223,14 @@ def unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None,
 
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                  survivor_pr=None, query_fn: Optional[QueryFn] = None) -> list:
-    """Extract + resolve: the PRs that block ``done`` -- OPEN or unreadable."""
-    refs = extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr)
+    """Extract + resolve: the FLEET PRs that block ``done`` -- OPEN or unreadable.
+
+    Foreign-owner refs are dropped before any lookup (see :data:`FLEET_OWNERS`).
+    """
+    refs = split_fleet(extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not refs:
         return []
-    primary = extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr)
+    primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
     opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
     return opened + unverified
 
@@ -215,7 +250,9 @@ def route_comment(refs) -> str:
 def find_done_with_open_pr(conn: sqlite3.Connection, *, days: int = LINT_WINDOW_DAYS,
                            query_fn: Optional[QueryFn] = None,
                            now: Optional[float] = None) -> list:
-    """``done`` cards completed in the last ``days`` whose evidence names an OPEN PR."""
+    """``done`` cards completed in the last ``days`` whose evidence names an OPEN
+    FLEET PR. Foreign-owner refs are mentions here too, so the lint agrees with
+    the completion gate."""
     if query_fn is None:
         query_fn = _prg.query_pr
     cutoff = int((now if now is not None else time.time()) - days * 86400)
@@ -238,8 +275,8 @@ def find_done_with_open_pr(conn: sqlite3.Connection, *, days: int = LINT_WINDOW_
             meta = json.loads(run["metadata"]) if run and run["metadata"] else None
         except (TypeError, ValueError):
             meta = None
-        refs = extract_pr_refs(row["result"], summary,
-                               metadata=meta if isinstance(meta, dict) else None)
+        refs = split_fleet(extract_pr_refs(row["result"], summary,
+                                           metadata=meta if isinstance(meta, dict) else None))[0]
         opened = []
         for ref in refs:
             key = (ref.repo.lower(), ref.number)

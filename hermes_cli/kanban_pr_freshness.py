@@ -160,6 +160,10 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     nothing on GitHub.
     """
     report: dict = {"prs": {}, "checked_at": int(time.time())}
+    # Never update-branch or arm a third-party PR (t_06dccfe3): the caller
+    # already passes fleet refs only; this keeps the actuator safe on its own.
+    from hermes_cli.kanban_open_pr import is_fleet_ref
+    refs = [ref for ref in (refs or []) if is_fleet_ref(ref)]
     if not refs or not enabled():
         return report
     if gh is None:
