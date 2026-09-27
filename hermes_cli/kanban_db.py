@@ -9924,6 +9924,12 @@ def complete_task(
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
+            # The card's OWN PRs (metadata + --survivor-pr), persisted so a later approval/archive is
+            # gated on them; prose mentions in auto_routed_open_prs are not (FleetReview #1352).
+            own = _open_pr.split_fleet(_open_pr.extract_pr_refs(
+                metadata=metadata, survivor_pr=survivor_pr))[0]
+            if own:
+                routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):
                 routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
