@@ -454,6 +454,14 @@ class ThreadParticipationTracker:
         if self._remember(thread_id):
             await asyncio.to_thread(self._save)
 
+    async def discard_async(self, thread_id: str) -> None:
+        """Forget *thread_id* (e.g. the thread was deleted) and persist off-loop."""
+        with self._lock:
+            if thread_id not in self._threads:
+                return
+            del self._threads[thread_id]
+        await asyncio.to_thread(self._save)
+
     def __contains__(self, thread_id: str) -> bool:
         with self._lock:
             return thread_id in self._threads
