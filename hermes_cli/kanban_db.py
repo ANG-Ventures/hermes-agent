@@ -7045,6 +7045,10 @@ class BatchRouteWrite:
 # Run-scoped trigger for a live route switch (``set-model --live``). The card
 # row stays the authority on the route; the event only says "re-read it now".
 ROUTE_CHANGED_EVENT = "route_changed"
+# Run-scoped marker a worker writes when its runtime cannot switch in place
+# (``codex_app_server``: the turn runs in a subprocess, no loop-boundary
+# poll). A live write to such a run is next-dispatch only, never promised.
+ROUTE_LIVE_UNSUPPORTED_EVENT = "route_live_unsupported"
 
 
 def _append_live_route_changed_locked(
@@ -7064,6 +7068,11 @@ def _append_live_route_changed_locked(
     if row is None or (row["status"] or "").lower() != "running" or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? LIMIT 1",
+        (task_id, run_id, ROUTE_LIVE_UNSUPPORTED_EVENT),
+    ).fetchone():
+        return None
     _append_event(conn, task_id, ROUTE_CHANGED_EVENT, {
         "live": True,
         "model": row["model_override"],

@@ -2630,6 +2630,14 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # No loop boundary here, so ``set-model --live`` cannot apply in
+        # place: mark the run so the write side stops promising it.
+        from hermes_cli.kanban_worker_route import mark_live_route_unsupported
+
+        mark_live_route_unsupported(
+            agent, reason="codex_app_server runtime has no in-run switch point; "
+            "the route applies on the next dispatch (use --reclaim to apply now)",
+        )
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,

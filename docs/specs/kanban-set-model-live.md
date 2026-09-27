@@ -23,7 +23,12 @@ hermes kanban set-model <card...> [<model>] [--provider P] [--effort L] --live
 - In that transaction, for each selected card that is `running` with a
   `current_run_id`, it appends a `route_changed` event scoped to that run. The
   payload `{live, model, provider, reasoning_effort, touch_model, touch_effort}`
-  is an audit snapshot. The card row stays the authority.
+  records what THAT live write asked for. Every explicit `--live` request
+  appends a new event, even when the stored route is unchanged, so repeating a
+  refused request retries it.
+- A run whose worker has recorded `route_live_unsupported` (the
+  `codex_app_server` runtime) gets no `route_changed` event; the receipt says
+  `applies=next-dispatch` instead of promising a switch.
 - Cards that are not running get the plain next-dispatch write. The receipt
   says so per card: `applies=live(run N)` vs `applies=next-dispatch`.
 - Refused with exit 2 and nothing written:
@@ -43,9 +48,14 @@ provider calls, after the previous tool results were appended.
    `owns_kanban_worker_authority()`). A non-worker pays one env read.
 2. Only the first top-level agent in the process follows the card. Delegation
    children (`_delegate_depth > 0`), review forks and helpers are ignored.
-3. One indexed read: the newest `route_changed` event for `(task, run)` newer
-   than the cursor. With no event it stops there.
+3. One indexed read: every `route_changed` event for `(task, run)` newer than
+   the cursor. With no event it stops there. The cursor advances only once the
+   events are handled (switched, refused, or already on the route); a failed
+   read leaves them pending for the next iteration.
 4. Re-read the card row. If `current_run_id` no longer equals this run, stop.
+   Coalesce the pending events: only fields an event touched (`touch_model`,
+   `touch_effort`) change, each taking the value from the latest pending event
+   that touched it. A card field written without `--live` never rides along.
 5. Re-apply the gates on the route about to go live:
    - Flagship model: requires the card's `flagship override:` comment. This is
      the dispatcher's spawn gate.
@@ -122,7 +132,9 @@ in the `daedalus-opus` agent.log.
   is capped, the worker's normal runtime failover and pin rules apply. Use
   `--reclaim` when you want the dispatcher to choose.
 - The `codex_app_server` runtime. It bypasses the conversation loop, so the
-  hook never runs.
+  hook never runs. Its worker writes a run-scoped `route_live_unsupported`
+  marker at turn start: pending live events are refused on the board, and later
+  `--live` writes to that run land as next-dispatch. Use `--reclaim`.
 - Surfaces: CLI only. The dashboard model dropdown and the `kanban_*` tools
   keep next-dispatch semantics.
 - The "model switched" user-message note the interactive `/model` adds. A
