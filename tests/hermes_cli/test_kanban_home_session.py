@@ -670,6 +670,10 @@ EXECUTION_LANE = {
         "done, the same result the next dispatcher tick produces"),
     "claim_review_task": (
         "callers: dispatcher only (no CLI verb, tool or slash path)"),
+    "_reallocate_retired_scratch_workspace": (
+        "callers: _workspace_admission_refused only (dispatcher tick; no CLI "
+        "verb, tool or slash path). Writes only workspace_path=NULL on a "
+        "scratch card; the regex hit is the WHERE status=? re-check"),
     "_open_review_run": (
         "callers: claim_review_task (this lane) and request_changes, whose "
         "@_home_session_guarded has already run for the send-back"),

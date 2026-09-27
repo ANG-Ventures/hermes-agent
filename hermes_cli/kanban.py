@@ -80,11 +80,28 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+# Statuses on which an open workspace-refusal episode is still live news.
+_REFUSAL_VISIBLE_STATUSES = frozenset({"todo", "ready", "review"})
+
+
+def _fmt_refusal(state: Optional[dict]) -> str:
+    """``WORKSPACE REFUSED (<reason>) since <ts>`` or ``""``."""
+    if not state:
+        return ""
+    return (
+        f"WORKSPACE REFUSED ({state.get('reason')}) since "
+        f"{_fmt_ts(state.get('since'))}"
+    )
+
+
+def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    flag = ""
+    if refusal and t.status in _REFUSAL_VISIBLE_STATUSES:
+        flag = f"  [{_fmt_refusal(refusal)}]"
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{flag}"
 
 
 def _fmt_links(links: list[tuple[str, str]]) -> str:
@@ -2570,6 +2587,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
             stranded = kb.find_stranded_by_triage(conn)
         except Exception:
             triage_ids, stranded = [], []
+        try:
+            refusals = kb.workspace_refusal_state(
+                conn, [t.id for t in tasks if t.status in _REFUSAL_VISIBLE_STATUSES],
+            )
+        except Exception:
+            refusals = {}
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
@@ -2598,9 +2621,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         caller = _caller_session_id()
     if not caller:
         for t in tasks:
-            print(_fmt_task_line(t))
+            print(_fmt_task_line(t, refusals.get(t.id)))
         return 0
-    print(_format_session_grouped(tasks, kb.home_ids(caller)))
+    print(_format_session_grouped(tasks, kb.home_ids(caller), refusals))
     return 0
 
 
@@ -2644,7 +2667,7 @@ def _cmd_home_lint(args: argparse.Namespace) -> int:
     return 1 if ids else 0
 
 
-def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
+def _format_session_grouped(tasks, home: "frozenset[str]", refusals=None) -> str:
     """Session-first listing: this session's cards in full, every other
     session's cards collapsed to one ``id · status · title`` line each.
 
@@ -2654,7 +2677,8 @@ def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
     mine = [t for t in tasks if t.session_id and t.session_id in home]
     others = [t for t in tasks if not (t.session_id and t.session_id in home)]
     lines = [f"THIS SESSION ({len(mine)})"]
-    lines += [_fmt_task_line(t) for t in mine] or ["  (none)"]
+    refusals = refusals or {}
+    lines += [_fmt_task_line(t, refusals.get(t.id)) for t in mine] or ["  (none)"]
     lines.append("")
     lines.append(
         f"OTHER SESSIONS ({len(others)}) -- not yours: comment, don't act "
@@ -2662,6 +2686,8 @@ def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
     )
     for t in others:
         tag = " [unhomed]" if t.unhomed else ""
+        if refusals.get(t.id) and t.status in _REFUSAL_VISIBLE_STATUSES:
+            tag += f" [{_fmt_refusal(refusals[t.id])}]"
         lines.append(f"  {t.id} \u00b7 {t.status} \u00b7 {t.title}{tag}")
     return "\n".join(lines)
 
@@ -2720,6 +2746,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        refusal = (
+            kb.workspace_refusal_state(conn, [task.id]).get(task.id)
+            if task.status in _REFUSAL_VISIBLE_STATUSES else None
+        )
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -2728,6 +2758,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "task": _task_to_dict(task),
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "latest_summary": latest_summary,
+            "workspace_refusal": refusal,
             "parents": parents,
             "children": children,
             "parent_links": [
@@ -2779,7 +2810,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Task {task.id}: {task.title}")
-    print(f"  status:    {task.status}")
+    print(f"  status:    {task.status}"
+          + (f"  [{_fmt_refusal(refusal)}]" if refusal else ""))
     print(f"  assignee:  {task.assignee or '-'}")
     print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
     print(f"  home:      {_home_label(task.session_id, unhomed=task.unhomed)}")

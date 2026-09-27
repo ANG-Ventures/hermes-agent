@@ -14409,6 +14409,104 @@ def _stranded_event_payload(reason: str) -> dict:
     return payload
 
 
+# Refusals a retired root can cause: the old volume is gone/unwritable, or it is
+# mounted but the card's tree is gone. ``workspaces_root_invalid`` (symlink
+# escape, traversal, alias) is a policy fault and is never healed.
+_RETIRED_ROOT_HEALABLE_REASONS = (
+    "workspaces_root_unmounted:",
+    "workspaces_root_unwritable:",
+    "stranded_by_mount_loss:",
+)
+
+
+def _retired_scratch_root(conn, task: Task) -> Optional[Path]:
+    """The recorded mount root a scratch card's path sits under, when that
+    root is no longer the configured ``kanban.workspaces_root``; else None.
+
+    A root drops out of config when the operator retires it (e.g.
+    /Volumes/ramscratch, 2026-09-26) but its ``workspace_mount_roots`` row
+    keeps fencing every card persisted under it, so the card is refused
+    every tick forever. Only ``scratch`` qualifies: dir/worktree paths are
+    operator-owned and must never be moved.
+    """
+    from hermes_cli.kanban_workspace_policy import (
+        WorkspaceUnavailable, configured_root,
+    )
+
+    if (task.workspace_kind or "scratch") != "scratch" or not task.workspace_path:
+        return None
+    try:
+        current, _required = configured_root()
+    except WorkspaceUnavailable:
+        return None  # config itself is broken; do not guess
+    path = Path(task.workspace_path).expanduser()
+    recorded = sorted(
+        (Path(row["root"]) for row in conn.execute(
+            "SELECT root FROM workspace_mount_roots")),
+        key=lambda root: len(root.parts), reverse=True,
+    )
+    for root in recorded:
+        if _lexical_root_anchor(path, root) is None:
+            continue
+        # Most specific recorded root wins (same rule as admission).
+        if current is not None and _recorded_root_alias(current, {root: root}) is not None:
+            return None
+        return root
+    return None
+
+
+def _reallocate_retired_scratch_workspace(conn, task: Task, retired: Path, reason: str) -> bool:
+    """Drop a scratch card's path under a retired root so the next admission
+    places it under the current root. Scratch content is disposable."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_path = NULL WHERE id = ? "
+            "AND workspace_path = ? AND status = ? "
+            "AND COALESCE(workspace_kind, 'scratch') = 'scratch'",
+            (task.id, task.workspace_path, task.status),
+        )
+        if not cur.rowcount:
+            return False
+        baseline = _reset_survivor_baseline(conn, task.id)
+        _append_event(conn, task.id, "workspace_reallocated", {
+            "actor": "dispatcher",
+            "reason": reason,
+            "retired_root": str(retired),
+            "previous_path": task.workspace_path,
+            "survivor_baseline": baseline,
+        })
+    add_comment(
+        conn, task.id, "dispatcher",
+        f"Workspace reallocated: {task.workspace_path} sits under retired "
+        f"workspaces_root {retired} ({reason}). The dispatcher creates an EMPTY "
+        "scratch workspace under the current root; resume from your remote branch/PR.",
+    )
+    return True
+
+
+def _reset_survivor_baseline(conn, task_id: str) -> str:
+    """Clear the record-once survivor baseline of a discarded scratch tree.
+
+    The old ``bases`` describe repos in the discarded tree. A recorded
+    survivor pointer / hold is evidence and is kept (``bases`` reset only).
+    Caller holds the write transaction.
+    """
+    survivor = conn.execute(
+        "SELECT held_reason, survivor FROM task_workspace_survivors WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if survivor is None:
+        return "none"
+    if survivor[0] is None and survivor[1] is None:
+        conn.execute("DELETE FROM task_workspace_survivors WHERE task_id=?", (task_id,))
+        return "cleared"
+    conn.execute(
+        "UPDATE task_workspace_survivors SET bases='{}' WHERE task_id=?",
+        (task_id,),
+    )
+    return "bases_reset_survivor_kept"
+
+
 def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
     from hermes_cli.kanban_workspace_policy import (
         STRANDED_RECOVERY_COMMAND, WorkspaceUnavailable, auto_unstrand_enabled,
@@ -14421,6 +14519,23 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
         _validate_workspace_admission(task, board=board, conn=conn, dry_run=dry_run)
     except WorkspaceUnavailable as exc:
         reason = str(exc)
+        if (
+            not dry_run
+            and task.status in ("ready", "review")
+            and reason.startswith(_RETIRED_ROOT_HEALABLE_REASONS)
+        ):
+            retired = _retired_scratch_root(conn, task)
+            if retired is not None and _reallocate_retired_scratch_workspace(
+                conn, task, retired, reason,
+            ):
+                _log.warning(
+                    "kanban dispatch: workspace_reallocated task=%s "
+                    "(retired root %s: %s)", task_id, retired, reason,
+                )
+                # Path is now NULL: re-admit against the CURRENT root.
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
         if (
             not dry_run
             and reason.startswith("stranded_by_mount_loss:")
@@ -14597,21 +14712,7 @@ def reset_stranded_workspace(
         )
         if not cur.rowcount:
             return False, f"task {task_id} changed during reset; retry"
-        survivor = conn.execute(
-            "SELECT held_reason, survivor FROM task_workspace_survivors WHERE task_id=?",
-            (task_id,),
-        ).fetchone()
-        if survivor is None:
-            baseline = "none"
-        elif survivor[0] is None and survivor[1] is None:
-            conn.execute("DELETE FROM task_workspace_survivors WHERE task_id=?", (task_id,))
-            baseline = "cleared"
-        else:
-            conn.execute(
-                "UPDATE task_workspace_survivors SET bases='{}' WHERE task_id=?",
-                (task_id,),
-            )
-            baseline = "bases_reset_survivor_kept"
+        baseline = _reset_survivor_baseline(conn, task_id)
         _append_event(conn, task_id, "workspace_reset", {
             "actor": actor,
             "reason": reason or "stranded_by_mount_loss",
@@ -14625,6 +14726,46 @@ def reset_stranded_workspace(
         "workspace on the next tick; resume from your remote branch/PR.",
     )
     return True, None
+
+
+_REFUSAL_EVENT_KINDS = ("workspace_refused", "stranded_by_mount_loss")
+_REFUSAL_CLEARING_KINDS = ("claimed", "spawned", "workspace_reset", "workspace_reallocated")
+
+
+def workspace_refusal_state(conn, task_ids) -> dict[str, dict]:
+    """Open workspace-admission refusal episodes, keyed by task id.
+
+    A card the dispatcher refuses every tick stays ``ready`` in the status
+    column, which reads as "waiting for a slot". This names the refusal so
+    ``kanban show``/``list`` can say so. An episode is open from the first
+    refusal event after the last claim/spawn/reset/reallocation and carries
+    ``{"reason", "since", "last"}``.
+    """
+    ids = [tid for tid in task_ids if tid]
+    if not ids:
+        return {}
+    kinds = _REFUSAL_EVENT_KINDS + _REFUSAL_CLEARING_KINDS
+    out: dict[str, dict] = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        rows = conn.execute(
+            f"SELECT task_id, kind, payload, created_at FROM task_events "
+            f"WHERE task_id IN ({','.join('?' * len(chunk))}) "
+            f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id",
+            (*chunk, *kinds),
+        ).fetchall()
+        for task_id, kind, payload, created_at in rows:
+            if kind in _REFUSAL_CLEARING_KINDS:
+                out.pop(task_id, None)
+                continue
+            try:
+                reason = (json.loads(payload) or {}).get("reason") or kind
+            except (TypeError, ValueError):
+                reason = kind
+            state = out.setdefault(task_id, {"since": created_at})
+            state["reason"] = str(reason)
+            state["last"] = created_at
+    return out
 
 
 def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
