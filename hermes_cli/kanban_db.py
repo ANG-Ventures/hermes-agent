@@ -2532,6 +2532,10 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+    # Session that wrote the event (``task_events.actor_session_id``). The
+    # notifier uses it to skip waking the chat whose own session made the
+    # transition (t_a4890a77).
+    actor_session_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -23475,6 +23479,9 @@ def unseen_events_for_sub(
             id=r["id"], task_id=r["task_id"], kind=r["kind"],
             payload=payload, created_at=r["created_at"],
             run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+            actor_session_id=(
+                (r["actor_session_id"] or None) if "actor_session_id" in r.keys() else None
+            ),
         ))
         max_id = max(max_id, int(r["id"]))
     return max_id, out
