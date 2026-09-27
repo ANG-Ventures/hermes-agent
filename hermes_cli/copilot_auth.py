@@ -142,6 +142,43 @@ def _gh_cli_candidates() -> list[str]:
     return candidates
 
 
+# A gh "shim" (a PATH wrapper that brokers short-lived lane tokens) refuses
+# ``gh auth token`` by design, so probing through it can never succeed and only
+# spams the shim's refusal log (2-3 REFUSE lines per agent start). The shim lives
+# in a ``gh-shim`` directory; an intercept wrapper installed as the system ``gh``
+# forwards to it when the caller carries an agent/lane marker (mirrors the
+# wrapper's own test). ``GH_SHIM_REAL`` is the shim's loop guard: set, every
+# wrapper execs the real binary.
+_GH_SHIM_DIRNAME = "gh-shim"
+_GH_SHIM_AGENT_MARKERS = ("AI_AGENT", "HERMES_PROFILE", "HERMES_GH_LANE", "GH_SHIM_LANE")
+_TRUTHY = {"1", "true", "yes"}
+
+
+def gh_is_shim_fronted(gh_path: Optional[str], env: Optional[dict] = None) -> bool:
+    """True when running ``gh_path`` would land in a gh-shim that refuses ``gh auth token``."""
+    if not gh_path:
+        return False
+    env = os.environ if env is None else env
+    if env.get("GH_SHIM_REAL"):
+        return False
+    try:
+        real = os.path.realpath(gh_path)
+    except OSError:
+        return False
+    if _GH_SHIM_DIRNAME in Path(real).parts or _GH_SHIM_DIRNAME in Path(gh_path).parts:
+        return True
+    try:
+        with open(real, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    if not head.startswith(b"#!") or _GH_SHIM_DIRNAME.encode() not in head:
+        return False
+    if str(env.get("HERMES_AGENT", "")).strip().lower() in _TRUTHY:
+        return True
+    return any(env.get(k) for k in _GH_SHIM_AGENT_MARKERS)
+
+
 # ``gh auth token`` result cache. The probe shells out to the gh CLI, and when
 # gh has no credential store for this HOME (fresh profile, desktop-spawned
 # backend, CI) it can block for its full 5s subprocess timeout — on keyring /
@@ -200,6 +237,9 @@ def _probe_gh_cli_token() -> Optional[str]:
 
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     for gh_path in _gh_cli_candidates():
+        if gh_is_shim_fronted(gh_path, clean_env):
+            logger.debug("skipping `gh auth token` via %s: gh-shim refuses it", gh_path)
+            continue
         cmd = [gh_path, "auth", "token"]
         if hostname:
             cmd += ["--hostname", hostname]
