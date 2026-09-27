@@ -248,7 +248,7 @@ def test_workspace_refusal_sender_uses_default_profile_error_route(tmp_path, mon
 
     script = tmp_path / ".hermes" / "scripts" / "notify.py"
     script.parent.mkdir(parents=True)
-    script.write_text("")
+    script.write_text("", encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(script.parent.parent))  # the active root
     calls = []
@@ -326,7 +326,7 @@ def test_guard_stuck_sender_routes_to_alerts(tmp_path, monkeypatch):
     from gateway.kanban_watchers import _send_guard_stuck_alert
     script = tmp_path / ".hermes" / "scripts" / "notify.py"
     script.parent.mkdir(parents=True)
-    script.write_text("")
+    script.write_text("", encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(script.parent.parent))  # the active root
     calls = []
@@ -415,7 +415,7 @@ def test_dispatcher_alerts_resolve_notify_from_the_active_root(tmp_path, monkeyp
     for root in (user_home / ".hermes", user_home / ".hermes"):
         live = root / "scripts" / "notify.py"
         live.parent.mkdir(parents=True, exist_ok=True)
-        live.write_text("")
+        live.write_text("", encoding="utf-8")
     sandbox = tmp_path / "sandbox"
     monkeypatch.setattr(Path, "home", lambda: user_home)
     monkeypatch.setenv("HERMES_HOME", str(sandbox))
@@ -433,6 +433,6 @@ def test_dispatcher_alerts_resolve_notify_from_the_active_root(tmp_path, monkeyp
     assert send() is False and calls == []  # sandbox has no notify.py: no live page
     mine = sandbox / "skills-shared" / "general" / "scheduler" / "scripts" / "notify.py"
     mine.parent.mkdir(parents=True)
-    mine.write_text("")
+    mine.write_text("", encoding="utf-8")
     assert send() is True
     assert calls[-1][1] == str(mine)

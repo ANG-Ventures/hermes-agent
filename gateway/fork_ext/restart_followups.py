@@ -139,14 +139,13 @@ def _read_spool_key(path: Path) -> Tuple[Optional[bytes], bool]:
 @contextlib.contextmanager
 def _key_rotation_lock(path: Path):
     """Exclusive cross-process lock for rotating an invalid spool key."""
-    with open(path.with_name(f".{SPOOL_KEY_NAME}.lock"), "a+b") as fh:
+    fd = os.open(str(path.with_name(f".{SPOOL_KEY_NAME}.lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
         if fcntl is not None:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(fh, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
 
 
 def _spool_key(home: Optional[Path] = None, *, create: bool) -> Optional[bytes]:
