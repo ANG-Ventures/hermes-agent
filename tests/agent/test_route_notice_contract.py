@@ -35,8 +35,8 @@ _CAUSE_TEXT = {
     "unclassified": "weird thing",
 }
 _CAUSE_RE = re.compile(r"[a-zA-Z]{3,}")
-_HOP_RE = re.compile(r"(to the relay|at the relay|bridge|\(Anthropic [^)]+\)|proxy|hop \?)")
-_SUB_RE = re.compile(r"(sub-vps-\d+|claude-[ab]px-\d+|all subs|sub \?)")
+_HOP_RE = re.compile(r"(to the relay|at the relay|bridge|\(Anthropic [^)]+\)|proxy|CLI|hop unknown)")
+_SUB_RE = re.compile(r"(sub-vps-\d+|claude-[abc]px-\d+|all subs|sub unknown)")
 _TIME_RE = re.compile(r"\d\d:\d\d:\d\d(-\d\d(:\d\d:\d\d)?)?$")
 _COUNT_RE = re.compile(r"^\d+x ")
 
@@ -58,10 +58,11 @@ def test_rider_carries_all_four_fields(cls, hop, seat, attempts):
     assert _SUB_RE.search(rider), rider
     assert _TIME_RE.search(rider), rider
     assert bool(_COUNT_RE.match(rider)) is (attempts > 1)
+    assert "?" not in rider, rider  # t_246ce7d6: words, never a bare "?"
     if hop is None:
-        assert "hop ?" in rider
+        assert "hop unknown" in rider
     if seat is None and cls != "quota_model":
-        assert "sub ?" in rider
+        assert "sub unknown" in rider
 
 
 def test_pinned_spec_examples():
@@ -90,7 +91,7 @@ def test_relay_ascii_hops_normalize():
 
 def test_hop_agrees_with_row():
     # relay_synthetic rows carry relay / relay→bridge; an unattributable relay
-    # response renders hop ?, never bridge→anthropic (pass-4 B4).
+    # response renders hop unknown, never bridge→anthropic (pass-4 B4).
     synthetic = fp.format_cause_rider({"trigger_class": "conn", "hop": "relay→bridge",
                                        "relay_synthetic": 1, "seat": "sub-vps-2",
                                        "first_err_ts": _ts(1, 2, 3)}, tz=UTC)
@@ -98,7 +99,7 @@ def test_hop_agrees_with_row():
     unknown = fp.format_cause_rider({"trigger_class": "unclassified", "hop": None,
                                      "class_source": "text", "seat": None,
                                      "first_err_ts": _ts(1, 2, 3)}, tz=UTC)
-    assert "hop ? on sub ?" in unknown and "Anthropic" not in unknown
+    assert "(hop unknown, sub unknown)" in unknown and "Anthropic" not in unknown
 
 
 def test_seat_names_off_renders_a_sub():
