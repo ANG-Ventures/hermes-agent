@@ -9814,8 +9814,10 @@ def complete_task(
             metadata = dict(metadata or {}, mentioned_foreign_prs=[
                 f"{r.repo}#{r.number}" for r in foreign
             ])
+        _pr_query = _open_pr.memo_query()
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
+            query_fn=_pr_query,
         )
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
@@ -9865,6 +9867,23 @@ def complete_task(
                 # and the PR refs the review-card closer resolves on merged=true.
                 add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
+        # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
+        # without merge (e.g. auto-closed when its stacked base was deleted), so
+        # the work is not on default. Refuse done unless the handoff names the
+        # superseding merged PR / SHA. Raises before any mutation.
+        try:
+            _open_pr.enforce_not_closed_unmerged(
+                task_id, result, summary, metadata=metadata,
+                survivor_pr=survivor_pr, superseded_by=superseded_by,
+                query_fn=_pr_query,
+            )
+        except _open_pr.ClosedUnmergedPrError as closed_err:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_closed_unmerged_pr",
+                    {"prs": closed_err.prs},
+                )
+            raise
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,

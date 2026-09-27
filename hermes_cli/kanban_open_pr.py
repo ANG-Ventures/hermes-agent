@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -233,6 +234,141 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
     primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
     opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
     return opened + unverified
+
+
+# --------------------------------------------------------------------------- closed-unmerged done gate
+# Card t_a1550189 (2026-09-27): a PR stacked on a branch that was deleted after a squash is auto-CLOSED
+# by GitHub, and the card that named it went ``done`` anyway (t_ddb3938c -> hermes-home#341,
+# t_a3b910ce -> ace-media-homelab#81): the content never reached the default branch. ``done`` is
+# refused when the card's OWN PR ref (``metadata.pr_url``/``pr``/``pr_urls`` or ``--survivor-pr``) is
+# closed-unmerged, unless the handoff names the superseding work: a PR that is MERGED, or a commit
+# SHA that is on the repo's default branch.
+
+_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+ShaCheckFn = Callable[[str, str], Optional[bool]]
+
+
+class ClosedUnmergedPrError(ValueError):
+    """A completion's own PR ref is closed without merge and no superseder is named."""
+
+    def __init__(self, task_id: str, prs: list):
+        self.task_id = task_id
+        self.prs = list(prs)
+        super().__init__(
+            f"done refused: {', '.join(self.prs)} "
+            f"{'is' if len(self.prs) == 1 else 'are'} CLOSED WITHOUT MERGE, so the work is not on "
+            f"the default branch (a stacked PR auto-closed when its base branch was deleted looks "
+            f"exactly like this). Reopen/retarget and land it, or name what superseded it in the "
+            f"result: a MERGED PR (owner/repo#N) or a commit SHA on the default branch "
+            f"(--result 'superseded by owner/repo#N' / --superseded-by <sha>). "
+            f"{task_id} is still in-flight (no state change)."
+        )
+
+
+def sha_on_default(repo: str, sha: str) -> Optional[bool]:
+    """True iff ``sha`` is reachable from ``repo``'s default branch; None when GitHub cannot tell."""
+    def _get(path):
+        try:
+            proc = subprocess.run(["gh", "api", path], capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=QUERY_TIMEOUT_SECONDS, check=False)
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return None, False
+        if proc.returncode != 0:
+            return None, "HTTP 404" in (proc.stderr or "") or "HTTP 422" in (proc.stderr or "")
+        try:
+            return json.loads(proc.stdout or "{}"), False
+        except ValueError:
+            return None, False
+    meta, _ = _get(f"repos/{repo}")
+    default = (meta or {}).get("default_branch")
+    if not default:
+        return None
+    cmp_, missing = _get(f"repos/{repo}/compare/{default}...{sha}")
+    if cmp_ is None:
+        return False if missing else None
+    return str(cmp_.get("status") or "") in ("identical", "behind")
+
+
+def memo_query(query_fn: Optional[QueryFn] = None) -> Optional[QueryFn]:
+    """One lookup per PR per completion: the open-PR route and the closed-unmerged gate share it."""
+    base = query_fn or _default_query()
+    if base is None:
+        return None
+    cache: dict = {}
+
+    def _q(repo: str, number: int):
+        key = (repo.lower(), number)
+        if key not in cache:
+            cache[key] = base(repo, number)
+        return cache[key]
+    return _q
+
+
+def closed_unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None) -> list:
+    """The subset of ``refs`` GitHub positively reports CLOSED (not merged). Unreadable -> not listed
+    (the open-PR gate already routes an unreadable primary ref to review)."""
+    if query_fn is None:
+        query_fn = _default_query()
+        if query_fn is None:
+            return []
+    out = []
+    for ref in list(refs)[:MAX_LOOKUPS_PER_COMPLETION]:
+        try:
+            payload = query_fn(ref.repo, ref.number)
+        except Exception as exc:
+            _log.warning("kanban closed-pr check: lookup %s failed: %s", ref, exc)
+            continue
+        if isinstance(payload, dict) and str(payload.get("state") or "").upper() == "CLOSED":
+            out.append(ref)
+    return out
+
+
+def names_superseder(closed, *texts: Optional[str], query_fn: Optional[QueryFn] = None,
+                     sha_check: Optional[ShaCheckFn] = None) -> bool:
+    """Does the handoff text name a MERGED PR, or a SHA on the default branch of a closed PR's repo?"""
+    if query_fn is None:
+        query_fn = _default_query()
+    if sha_check is None and not os.environ.get("PYTEST_CURRENT_TEST"):
+        sha_check = sha_on_default
+    closed_keys = {(r.repo.lower(), r.number) for r in closed}
+    blob = "\n".join(t for t in texts if isinstance(t, str))
+    for ref in extract_pr_refs(blob)[:MAX_LOOKUPS_PER_COMPLETION]:
+        if (ref.repo.lower(), ref.number) in closed_keys or query_fn is None:
+            continue
+        try:
+            payload = query_fn(ref.repo, ref.number)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and str(payload.get("state") or "").upper() == "MERGED":
+            return True
+    if sha_check is None:
+        return False
+    repos = sorted({r.repo for r in closed})
+    for sha in list(dict.fromkeys(_SHA_RE.findall(blob)))[:6]:
+        if not re.search(r"[a-f]", sha):  # all-digit tokens (PR numbers, timestamps) are not SHAs
+            continue
+        for repo in repos:
+            if sha_check(repo, sha):
+                return True
+    return False
+
+
+def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: Optional[dict] = None,
+                                survivor_pr=None, superseded_by: Optional[str] = None,
+                                query_fn: Optional[QueryFn] = None,
+                                sha_check: Optional[ShaCheckFn] = None) -> list:
+    """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged and the handoff
+    (``texts`` + ``superseded_by``) names no merged superseder. Returns the closed refs it accepted."""
+    # Fleet-owned refs only: a foreign (upstream / third-party) PR is a mention the fleet cannot land.
+    primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
+    if not primary:
+        return []
+    closed = closed_unmerged_refs(primary, query_fn=query_fn)
+    if not closed:
+        return []
+    if names_superseder(closed, *texts, superseded_by, query_fn=query_fn, sha_check=sha_check):
+        return closed
+    raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed])
 
 
 ROUTE_COMMENT = "survivor PR open; card closes on merged=true"

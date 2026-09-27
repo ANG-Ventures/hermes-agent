@@ -32,6 +32,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
+from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -4518,7 +4519,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
