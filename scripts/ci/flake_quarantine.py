@@ -354,6 +354,7 @@ def verify_evidence(entry: dict, api: ApiLike, repo: str, now: dt.datetime) -> l
     problems: list[str] = []
     days: set[str] = set()
     seen: set[tuple] = set()
+    verified_reds: set[tuple] = set()
     good = 0
     for i, pair in enumerate(pairs):
         where = f"{node}: pair {i}"
@@ -405,6 +406,14 @@ def verify_evidence(entry: dict, api: ApiLike, repo: str, now: dt.datetime) -> l
         if r_out != "failed" or g_out != "passed":
             problems.append(f"{where}: junit says red={r_out} green={g_out}, need failed->passed (condition 3)")
             continue
+        # Count observed failures, not pairs: with MIN_DISTINCT_DAYS=1 one red
+        # paired with two greens would otherwise pass as two pairs (t_e9af888f).
+        red_key = (red.get("id"), red.get("run_attempt"))
+        if red_key in verified_reds:
+            problems.append(f"{where}: red attempt {red_key[0]}/{red_key[1]} already counted by another pair; "
+                            "each pair needs a distinct red attempt")
+            continue
+        verified_reds.add(red_key)
         days.add(started_at.date().isoformat())
         good += 1
     if good < MIN_PAIRS:

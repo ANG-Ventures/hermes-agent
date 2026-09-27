@@ -401,6 +401,25 @@ def test_two_pairs_same_day_is_sufficient():
     assert fq.verify_evidence(_entry(evidence=ev), api, REPO, NOW) == []
 
 
+def test_d_one_red_with_two_greens_is_insufficient():
+    # t_e9af888f: one observed failure re-paired with a second green must not
+    # satisfy MIN_PAIRS now that MIN_DISTINCT_DAYS no longer forces two reds.
+    api, ev = _good_world()
+    _add_attempt(api, 501, 3, conclusion="success", sha="a" * 40, day="2026-09-20", outcome="passed")
+    ev = [ev[0], {"red": {"run_id": 501, "attempt": 1}, "green": {"run_id": 501, "attempt": 3}}]
+    problems = fq.verify_evidence(_entry(evidence=ev), api, REPO, NOW)
+    assert any("distinct red attempt" in p for p in problems), problems
+    assert any("1 verified pair(s)" in p for p in problems), problems
+
+
+def test_two_distinct_reds_same_run_same_day_is_sufficient():
+    api, ev = _good_world()
+    _add_attempt(api, 501, 3, conclusion="failure", sha="a" * 40, day="2026-09-20", outcome="failed")
+    _add_attempt(api, 501, 4, conclusion="success", sha="a" * 40, day="2026-09-20", outcome="passed")
+    ev = [ev[0], {"red": {"run_id": 501, "attempt": 3}, "green": {"run_id": 501, "attempt": 4}}]
+    assert fq.verify_evidence(_entry(evidence=ev), api, REPO, NOW) == []
+
+
 def test_d_one_pair_is_still_insufficient():
     api, ev = _good_world()
     problems = fq.verify_evidence(_entry(evidence=ev[:1]), api, REPO, NOW)
