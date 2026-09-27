@@ -954,6 +954,8 @@ _FALLBACK_EVENT_COLUMNS = (
     # return or refusal (doomed / warm_return_raced / cap_expiry reporting).
     "warm_rank_effective", "warm_refusal", "warm_seat", "warm_age_s",
     "warm_window_s", "warm_eligible", "warm_refusal_arm", "warm_gate",
+    # t_90d3bd12: box contention behind a "warm_seat: bound box full" refusal.
+    "bound_box_free", "warm_box_free",
 )
 # Additive columns on fallback_events (Phase 2 + warm-seat P3); migrated per column.
 _FALLBACK_EVENT_PHASE2_COLUMNS = (
@@ -964,6 +966,7 @@ _FALLBACK_EVENT_PHASE2_COLUMNS = (
     ("warm_rank_effective", "TEXT"), ("warm_refusal", "TEXT"), ("warm_seat", "TEXT"),
     ("warm_age_s", "REAL"), ("warm_window_s", "REAL"), ("warm_eligible", "INT"),
     ("warm_refusal_arm", "INT"), ("warm_gate", "TEXT"),
+    ("bound_box_free", "INT"), ("warm_box_free", "INT"),
 )
 FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused", "sticky_resume")
 

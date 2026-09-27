@@ -1595,6 +1595,27 @@ def test_wiring_warm_refusal_arm_config_and_ledger_columns(wired, monkeypatch):
     assert rec["return_branch"] == "warm_seat" and rec["warm_refusal_arm"] == 0
 
 
+def test_wiring_bound_box_full_refusal_persists_box_free(wired, monkeypatch):
+    """t_90d3bd12 E2E through restore_primary_runtime: the bound box reads
+    free==0 -> refused with "warm_seat: bound box full", the restore_refused
+    row carries bound_box_free; once the box has room the return goes through."""
+    home, _ = wired
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0, "warm_box_free": 1}
+    cur = {"e": fp.parse_eligibility(obj)}
+    monkeypatch.setattr(_fw, "_eligibility_fn", lambda agent: (lambda: cur["e"]))
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=10 * 60)
+    assert _restore(a) is False
+    [row] = _rows(home, "restore_refused")
+    assert row["reason"] == "warm_seat: bound box full"
+    assert row["bound_box_free"] == 0 and row["warm_box_free"] == 1
+    cur["e"] = fp.parse_eligibility({**obj, "bound_box_free": 2})
+    assert _restore(a) is True
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "warm_seat" and rec["bound_box_free"] == 2
+
+
 # ── t_00fda99a: cached TurnEligibility must follow a rotated session_id ────
 
 @pytest.mark.parametrize("provider,kwarg,expect", [
