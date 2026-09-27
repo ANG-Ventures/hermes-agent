@@ -14768,6 +14768,76 @@ def workspace_refusal_state(conn, task_ids) -> dict[str, dict]:
     return out
 
 
+
+# Durable post-on-change latch for the workspace-refusal #alerts page.
+_REFUSAL_PAGED_KIND = "workspace_refusal_paged"
+
+
+def claim_workspace_refusal_pages(conn, refused, *, channel: str = "alerts"):
+    """Claim the (card, reason) refusals that have not been paged yet.
+
+    The watcher used to latch in memory per board and re-arm on any tick
+    whose refused list was empty. A card only reaches admission after the
+    cap / respawn-guard / provider gates, so a tick that skipped it for one
+    of those reasons looked healthy, re-armed the latch, and the next refused
+    tick paged again; every gateway restart and every failover dispatcher
+    re-paged too (t_ff4197d3: 5 pages in 28 min on 2026-09-27, t_ca81dfe2).
+    The latch now lives on the card: one page per (card, reason) per refusal
+    episode. An episode ends on any ``_REFUSAL_CLEARING_KINDS`` event, so a
+    card that is admitted and later refused again pages again, and so does a
+    new reason inside one episode.
+
+    Returns ``[(task_id, reason, event_id)]`` for the pairs claimed now. The
+    caller pages them and passes the ids to
+    :func:`release_workspace_refusal_pages` when delivery fails.
+    """
+    kinds = _REFUSAL_CLEARING_KINDS + (_REFUSAL_PAGED_KIND,)
+    marks = ",".join("?" * len(kinds))
+    claimed = []
+    with write_txn(conn):
+        for task_id, reason in refused or []:
+            task_id, reason = str(task_id), str(reason)
+            already = False
+            for kind, payload in conn.execute(
+                f"SELECT kind, payload FROM task_events WHERE task_id=? "
+                f"AND kind IN ({marks}) ORDER BY id DESC",
+                (task_id, *kinds),
+            ):
+                if kind != _REFUSAL_PAGED_KIND:
+                    break  # episode boundary
+                try:
+                    data = json.loads(payload) or {}
+                except (TypeError, ValueError):
+                    data = {}
+                if data.get("channel") == channel and data.get("reason") == reason:
+                    already = True
+                    break
+            if already:
+                continue
+            _append_event(
+                conn, task_id, _REFUSAL_PAGED_KIND,
+                {"channel": channel, "reason": reason},
+            )
+            event_id = conn.execute(
+                "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind=?",
+                (task_id, _REFUSAL_PAGED_KIND),
+            ).fetchone()[0]
+            claimed.append((task_id, reason, event_id))
+    return claimed
+
+
+def release_workspace_refusal_pages(conn, event_ids) -> None:
+    """Undo claims whose page was not delivered, so the next tick retries."""
+    ids = [int(event_id) for event_id in event_ids or [] if event_id is not None]
+    if not ids:
+        return
+    with write_txn(conn):
+        conn.execute(
+            f"DELETE FROM task_events WHERE kind=? "
+            f"AND id IN ({','.join('?' * len(ids))})",
+            (_REFUSAL_PAGED_KIND, *ids),
+        )
+
 def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
     """Undo a claim when the mount changes during the claim/resolve window."""
     task = get_task(conn, task_id)

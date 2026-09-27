@@ -137,8 +137,31 @@ def test_workspace_refused_summary_names_recovery_only_when_stranded():
     assert stranded.endswith(cmd)
 
 
-def test_workspace_refusal_notifier_delivers_once_per_outage_and_rearms():
-    notifier = _WorkspaceRefusalOutageNotifier()
+class _FakeLatch:
+    """In-memory stand-in for the durable per-card claim/release."""
+
+    def __init__(self):
+        self.paged = set()
+        self.next_id = 0
+
+    def claim(self, board, entries):
+        out = []
+        for task_id, reason in entries:
+            if (board, task_id, reason) in self.paged:
+                continue
+            self.next_id += 1
+            self.paged.add((board, task_id, reason))
+            out.append((task_id, reason, (board, task_id, reason)))
+        return out
+
+    def release(self, board, ids):
+        for key in ids:
+            self.paged.discard(key)
+
+
+def test_workspace_refusal_notifier_pages_once_per_card_across_healthy_ticks():
+    latch = _FakeLatch()
+    notifier = _WorkspaceRefusalOutageNotifier(latch.claim, latch.release)
     deliveries = []
 
     def send(board, summary):
@@ -147,18 +170,24 @@ def test_workspace_refusal_notifier_delivers_once_per_outage_and_rearms():
 
     refused = [("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch")]
     assert notifier.observe("default", [], send) is False
-    assert len(deliveries) == 0
     assert notifier.observe("default", refused, send) is True
-    assert len(deliveries) == 1
+    assert notifier.observe("default", refused, send) is False
+    # A tick that did not admission-check the card (cap/guard skip) is NOT
+    # recovery: it must not re-arm the page (t_ff4197d3, t_ca81dfe2).
+    assert notifier.observe("default", [], send) is False
     assert notifier.observe("default", refused, send) is False
     assert len(deliveries) == 1
-    assert notifier.observe("default", [], send) is False
-    assert notifier.observe("default", refused, send) is True
-    assert len(deliveries) == 2
+    assert "hermes kanban show t_missing" in deliveries[0][1]
+    # A second card joining the outage is a change: it pages, alone.
+    both = refused + [("t_other", "workspaces_root_unmounted: /Volumes/ramscratch")]
+    assert notifier.observe("default", both, send) is True
+    assert "t_other" in deliveries[1][1] and "t_missing" not in deliveries[1][1]
+    assert "+1 already paged" in deliveries[1][1]
 
 
 def test_workspace_refusal_notifier_retries_until_delivery_succeeds():
-    notifier = _WorkspaceRefusalOutageNotifier()
+    latch = _FakeLatch()
+    notifier = _WorkspaceRefusalOutageNotifier(latch.claim, latch.release)
     outcomes = iter([False, True])
     attempts = []
 
@@ -169,7 +198,21 @@ def test_workspace_refusal_notifier_retries_until_delivery_succeeds():
     refused = [("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch")]
     assert notifier.observe("default", refused, send) is False
     assert notifier.observe("default", refused, send) is True
+    assert notifier.observe("default", refused, send) is False
     assert len(attempts) == 2
+
+
+def test_workspace_refusal_notifier_falls_back_to_process_latch_when_db_fails():
+    def broken(board, entries):
+        raise RuntimeError("db locked")
+
+    notifier = _WorkspaceRefusalOutageNotifier(broken, broken)
+    deliveries = []
+    send = lambda board, summary: deliveries.append(summary) or True  # noqa: E731
+    refused = [("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch")]
+    for _ in range(3):
+        notifier.observe("default", refused, send)
+    assert len(deliveries) == 1
 
 
 def test_workspace_refusal_tick_observer_uses_delivery_latch(monkeypatch):
@@ -182,7 +225,8 @@ def test_workspace_refusal_tick_observer_uses_delivery_latch(monkeypatch):
         return True
 
     monkeypatch.setattr(kw, "_send_workspace_refusal_alert", send)
-    notifier = _WorkspaceRefusalOutageNotifier()
+    latch = _FakeLatch()
+    notifier = _WorkspaceRefusalOutageNotifier(latch.claim, latch.release)
     refused = _FakeResult(workspace_refused=[
         ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch"),
     ])
@@ -190,10 +234,9 @@ def test_workspace_refusal_tick_observer_uses_delivery_latch(monkeypatch):
 
     assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 1
     assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 0
-    assert len(deliveries) == 1
     assert _observe_workspace_refusal_outages(notifier, [("default", healthy)]) == 0
-    assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 1
-    assert len(deliveries) == 2
+    assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 0
+    assert len(deliveries) == 1
 
 
 def test_workspace_refusal_sender_uses_default_profile_error_route(tmp_path, monkeypatch):
@@ -353,64 +396,3 @@ def test_stall_none_results_bare_stall_is_bad():
     assert _stall_streak_is_bad(True, False, [("b", None)]) is True
 
 
-
-# --- per-card refusal page (t_bc32ac90) -------------------------------------
-# One card refused every tick inside an otherwise healthy board read as plain
-# 'ready' for 2.7h (t_4b9809f4). It pages once after N consecutive refusals.
-
-from gateway.kanban_watchers import (  # noqa: E402
-    WORKSPACE_REFUSAL_CARD_PAGE_TICKS,
-    _WorkspaceRefusalCardNotifier,
-)
-
-_REASON = "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"
-
-
-def _refused(*ids):
-    return [("default", _FakeResult(workspace_refused=[(i, _REASON) for i in ids]))]
-
-
-def test_card_refusal_pages_once_at_threshold():
-    sent = []
-    notifier = _WorkspaceRefusalCardNotifier()
-    send = lambda *a: sent.append(a) or True  # noqa: E731
-    for _ in range(WORKSPACE_REFUSAL_CARD_PAGE_TICKS - 1):
-        assert notifier.observe(_refused("t_4b9809f4"), send) == 0
-    assert notifier.observe(_refused("t_4b9809f4"), send) == 1
-    assert sent == [("default", "t_4b9809f4", _REASON, WORKSPACE_REFUSAL_CARD_PAGE_TICKS)]
-    for _ in range(5):
-        notifier.observe(_refused("t_4b9809f4"), send)
-    assert len(sent) == 1
-
-
-def test_card_refusal_streak_resets_when_card_admitted():
-    sent = []
-    notifier = _WorkspaceRefusalCardNotifier(threshold=3)
-    send = lambda *a: sent.append(a) or True  # noqa: E731
-    notifier.observe(_refused("t_a"), send)
-    notifier.observe(_refused("t_a"), send)
-    notifier.observe(_refused(), send)  # admitted this tick
-    notifier.observe(_refused("t_a"), send)
-    notifier.observe(_refused("t_a"), send)
-    assert not sent
-    notifier.observe(_refused("t_a"), send)
-    assert len(sent) == 1
-
-
-def test_card_refusal_unobserved_board_neither_counts_nor_resets():
-    sent = []
-    notifier = _WorkspaceRefusalCardNotifier(threshold=2)
-    send = lambda *a: sent.append(a) or True  # noqa: E731
-    notifier.observe(_refused("t_a"), send)
-    notifier.observe([("default", _FakeResult(skipped_locked=True)), ("default", None)], send)
-    assert not sent
-    notifier.observe(_refused("t_a"), send)
-    assert len(sent) == 1
-
-
-def test_card_refusal_failed_send_retries_next_tick():
-    attempts = []
-    notifier = _WorkspaceRefusalCardNotifier(threshold=1)
-    notifier.observe(_refused("t_a"), lambda *a: attempts.append(a) and False)
-    assert notifier.observe(_refused("t_a"), lambda *a: attempts.append(a) or True) == 1
-    assert len(attempts) == 2
