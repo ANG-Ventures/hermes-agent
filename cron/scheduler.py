@@ -4884,6 +4884,28 @@ def _script_path_admitted(
     return lexically_in_profile and _path_within(path, shared)
 
 
+# Fleet default GitHub lane for cron script children (t_f0780685). A plain script
+# that ran a bare `gh` without naming a lane spent the shared stored login, and
+# every new agent-authored cron script re-opened that until someone noticed.
+# When this home ships the gh shim (var/gh-shim/gh), the child gets the shim
+# first on PATH plus a DEFAULT lane the shim uses only when the script sets no
+# lane itself (export / setdefault still win), and the script's path so the shim
+# keeps audited stored-login sites (gh-stored-login-scopes.json) on the stored
+# login. No shim -> the env is untouched. github-apps-lint reads this constant.
+CRON_SCRIPT_DEFAULT_GH_LANE = "watchers"
+
+
+def _apply_cron_default_gh_lane(env: dict, script: Path) -> None:
+    shim_dir = _get_hermes_home() / "var" / "gh-shim"
+    if not os.access(shim_dir / "gh", os.X_OK):
+        return
+    first = str(shim_dir)
+    rest = [p for p in env.get("PATH", "").split(os.pathsep) if p and p != first]
+    env["PATH"] = os.pathsep.join([first] + rest)
+    env.setdefault("HERMES_GH_LANE_DEFAULT", CRON_SCRIPT_DEFAULT_GH_LANE)
+    env["HERMES_CRON_SCRIPT"] = str(script)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -5056,6 +5078,7 @@ def _run_job_script(
         from hermes_cli.process_env_files import strip_overlay
 
         strip_overlay(env)
+        _apply_cron_default_gh_lane(env, path)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
