@@ -162,6 +162,9 @@ def _(rid, params: dict) -> dict:
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
+                # prompt.submit accepts ``system_context`` (per-turn system
+                # metadata). Clients feature-detect on this key.
+                "turn_system_context": True,
             },
         },
     )

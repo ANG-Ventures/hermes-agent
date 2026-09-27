@@ -342,6 +342,12 @@ def _(rid, params: dict) -> dict:
     # in turn: a stale "hud" would tell the model the user is still floating
     # over another app when they are back in Hermes.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    # Caller-owned turn metadata (e.g. the voice satellite a spoken turn came
+    # from) that the model must see but the user did not say. It rides in the
+    # SYSTEM prompt for this turn instead of the user text: a header line in
+    # the user message gets mirrored into a share of replies (t_c6793d84).
+    # Rewritten on every submit, so omitting it clears the previous value.
+    session["turn_system_context"] = _turn_system_context(params.get("system_context"))
     has_truncation = (
         truncate_user_ordinal is not None
         or params.get("truncate_before_row_id") is not None
