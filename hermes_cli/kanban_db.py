@@ -5699,6 +5699,23 @@ def record_foreign_action(
         "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if actor.operator:
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if last is not None and last["kind"] == "operator_override":
+            try:
+                prev = json.loads(last["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                prev = {}
+            if (
+                isinstance(prev, dict)
+                and prev.get("action") == action
+                and prev.get("reason") == actor.operator
+            ):
+                # The mutator already recorded this override itself
+                # (request-changes' operator send-back); one event per call.
+                return
         with write_txn(conn, allow_nested=True):
             _append_event(
                 conn,
@@ -12685,6 +12702,50 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     return None
 
 
+def _operator_caller_profiles() -> frozenset[str]:
+    """Profiles the current caller holds, for the operator send-back check.
+
+    The bound actor (CLI / tool surface) resolves through
+    :func:`_actor_profiles` like the home-session guard; an unbound caller
+    (the dashboard server) falls back to its profile env, then the active
+    profile.
+    """
+    actor = _EVENT_ACTOR.get()
+    if actor is not None:
+        names = set(_actor_profiles(actor))
+    else:
+        profile, _sid = _event_actor()
+        names = {profile} if profile else set()
+    if not names:
+        try:
+            from .profiles import get_active_profile_name
+
+            active = get_active_profile_name()
+        except Exception:
+            active = None
+        if active:
+            names.add(active)
+    return frozenset(names)
+
+
+def _operator_send_back_refusal(task_id: str, reason: str) -> Optional[str]:
+    """Why an ``--operator`` send-back is refused, or ``None`` if allowed."""
+    profiles = _operator_caller_profiles()
+    if not (profiles & OPERATOR_PROFILES):
+        return (
+            f"refused request-changes on {task_id}: --operator is for operator "
+            f"profiles ({', '.join(sorted(OPERATOR_PROFILES))}); caller "
+            f"profile(s): {', '.join(sorted(profiles)) or 'unknown'}. A "
+            f"reviewer sends back with a full review_coverage record."
+        )
+    if not _valid_operator_reason(reason):
+        return (
+            f"refused request-changes on {task_id}: --operator needs "
+            f"\"<who: why>\" (e.g. \"Ace via Apollo: wrong repo\")."
+        )
+    return None
+
+
 class _SendBackRefused(Exception):
     """Roll back a send-back's own review claim when the handoff is refused."""
 
@@ -12703,6 +12764,7 @@ def request_changes(
     claimer: Optional[str] = None,
     coverage: Optional[str] = None,
     session_ref: Optional[str] = None,
+    operator: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -12732,10 +12794,24 @@ def request_changes(
     ``session_ref`` (trusted runtime context, never model args) is recorded on
     the opened run's ``claimed`` event, as ``claim_review_task`` does for
     ``claim --review``.
+
+    ``operator`` (``"<who: why>"``, the home-guard #1074 vocabulary) is the
+    operator send-back: an operator profile (:data:`OPERATOR_PROFILES`)
+    bouncing a card for a non-review reason ("wrong repo", "rebase first").
+    It waives the coverage requirement for that call only and records an
+    ``operator_override`` event on the closed run. A non-operator caller or a
+    reason without ``who: why`` is refused before anything is written. The
+    coverage gate is unchanged for every call without it.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    # Same normalization as the home-guard actor, so its dedupe matches.
+    operator_reason = (str(operator).strip() or None) if operator else None
+    if operator_reason is not None:
+        refusal = _operator_send_back_refusal(task_id, operator_reason)
+        if refusal is not None:
+            return False, refusal
     coverage_text = str(redact_review_value(coverage or "")).strip()
     coverage_body = f"review_coverage: {coverage_text}" if coverage_text else None
     comment_author = str(claimer or "reviewer").strip() or "reviewer"
@@ -12752,7 +12828,7 @@ def request_changes(
             return False, "task not found"
         current_run_id = task_row["current_run_id"]
         if claimer and expected_run_id is None and task_row["status"] == "review":
-            if coverage_body is None:
+            if coverage_body is None and operator_reason is None:
                 # Same message the gate gives; refused before any claim churn.
                 return False, _REVIEW_COVERAGE_MISSING
             if _prior_worker_still_alive(conn, task_id) is not None:
@@ -12826,7 +12902,10 @@ def request_changes(
                 run_id=int(current_run_id),
             )
             posted.append((int(comment_cur.lastrowid or 0), int(current_run_id), now))
-        coverage_error = _validate_review_coverage(conn, task_id, int(current_run_id))
+        coverage_error = (
+            None if operator_reason is not None
+            else _validate_review_coverage(conn, task_id, int(current_run_id))
+        )
         if coverage_error:
             return False, coverage_error
         reviewer = task_row["assignee"]
@@ -12870,9 +12949,30 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **({"operator": operator_reason} if operator_reason else {}),
             },
             run_id=run_id,
         )
+        if operator_reason is not None:
+            by_profile, _sid = _event_actor()
+            bound = _EVENT_ACTOR.get()
+            home_row = conn.execute(
+                "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _append_event(
+                conn,
+                task_id,
+                "operator_override",
+                {
+                    "action": "request-changes",
+                    "reason": operator_reason,
+                    "coverage_waived": True,
+                    "by_sessions": list(bound.session_ids) if bound else [],
+                    "by_profile": by_profile,
+                    "home": home_row["session_id"] if home_row is not None else None,
+                },
+                run_id=run_id,
+            )
         return True, implementer
 
     try:

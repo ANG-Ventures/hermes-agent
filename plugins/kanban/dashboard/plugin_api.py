@@ -981,7 +981,9 @@ class UpdateTaskBody(BaseModel):
 _REVIEW_EXIT_STATUSES = frozenset({"done", "blocked", "archived"})
 _REVIEW_EXIT_REFUSAL = (
     "Claim review and request changes with a full coverage comment "
-    "(POST /tasks/{id}/request-changes); direct review reopening is retired"
+    "(POST /tasks/{id}/request-changes); direct review reopening is retired. "
+    "An operator bounce without a review sends {\"operator\": \"<who: why>\"} "
+    "to the same route"
 )
 
 
@@ -2013,6 +2015,9 @@ class RequestChangesBody(BaseModel):
     # review_coverage JSON text; required for a card parked in ``review``.
     coverage: Optional[str] = None
     author: Optional[str] = None
+    # ``"<who: why>"``: operator send-back without a review (coverage waived,
+    # recorded as an ``operator_override`` event). Operator profiles only.
+    operator: Optional[str] = None
 
 
 @router.post("/tasks/{task_id}/request-changes")
@@ -2041,6 +2046,7 @@ def request_changes_endpoint(
             reason=payload.reason,
             claimer=(payload.author or "dashboard"),
             coverage=payload.coverage,
+            operator=payload.operator,
         )
         if not ok:
             raise HTTPException(
