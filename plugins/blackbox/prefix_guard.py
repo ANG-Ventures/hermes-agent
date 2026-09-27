@@ -10,7 +10,7 @@ compressor tags so it is EXCLUDED here rather than allowlisted.
 
 This module is a read-only observer over the outbound request dict: it
 produces a fingerprint (hashes + byte sizes, never text), compares two
-fingerprints, and renders/dispatches the once-per-session #alerts page.
+fingerprints, and renders/dispatches the once-per-session #logs notice.
 Persistence lives in ``store.record_prefix_check``; the wiring from the
 transport chokepoint lives in ``agent.chat_completion_helpers`` →
 ``plugins.blackbox.record_api_call``. Nothing here alters a request.
@@ -247,7 +247,7 @@ def render_alert(
     messages_after: int, cache_read_before: int | None, cache_read_after: int | None,
     suppressed: int = 0,
 ) -> str:
-    """The #alerts message body. Pure, so it is directly assertable."""
+    """The #logs message body. Pure, so it is directly assertable."""
     lines = [
         "🧬 Prompt-cache prefix mutation (history rewritten mid-session)",
         f"• Profile: {profile or '(unknown)'} · lane: {provider or '(empty)'}/{model or '(empty)'}",
@@ -266,10 +266,16 @@ def render_alert(
     return "\n".join(lines)
 
 
+# Discord #logs. A prefix mutation is an observation (the row is already durable in
+# blackbox prefix_mutations), not an operator-actionable fault, so the once-per-session
+# notice goes to #logs; #alerts is reserved for failures (noise r4, t_6bedca00).
+LOGS_CHANNEL_ID = "1480525090331561984"
+
+
 def send_alert(body: str) -> bool:
-    """Deliver ``body`` to Discord #alerts via notify.py. Never raises."""
+    """Deliver ``body`` to Discord #logs via notify.py. Never raises."""
     try:
-        from plugins.blackbox.sentinel import ALERTS_CHANNEL_ID, _notify_script
+        from plugins.blackbox.sentinel import _notify_script
 
         script = _notify_script()
         if script is None:
@@ -277,7 +283,7 @@ def send_alert(body: str) -> bool:
             return False
         proc = subprocess.run(
             [sys.executable, str(script), "--send", body,
-             "--channel", "discord", "--target", ALERTS_CHANNEL_ID],
+             "--channel", "discord", "--target", LOGS_CHANNEL_ID],
             check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=30,
         )
