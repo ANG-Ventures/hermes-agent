@@ -182,4 +182,4 @@ def test_monitor_script_passes_job_ceiling(hermes_env, monkeypatch):
     job = {"id": "m1", "name": "monitor-job", "monitor_script": "m.sh", "timeout_s": 45,
            "schedule": {"kind": "interval", "minutes": 30}}
     _run_monitor_source(job)
-    assert calls == [{"timeout_seconds": 45, "job_name": "monitor-job"}]
+    assert calls == [{"timeout_seconds": 45, "job_name": "monitor-job", "job_id": "m1"}]

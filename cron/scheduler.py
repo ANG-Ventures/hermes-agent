@@ -1078,6 +1078,13 @@ _shutdown_event = threading.Event()
 # need to track.
 _active_script_procs: dict = {}
 _script_procs_lock = threading.Lock()
+# Job IDs whose script was killed by a signal while the scheduler was shutting
+# down (gateway restart drain). ``run_one_job`` consumes its own entry after
+# the run's bookkeeping and persists a one-shot re-fire request
+# (cron.jobs.request_restart_requeue), so a restart-killed daily job re-fires
+# on the next boot instead of sitting at last_status=error for a day
+# (t_1f4598ad). Guarded by ``_script_procs_lock``.
+_restart_killed_job_ids: set = set()
 
 
 def signal_shutdown(reason: str = "") -> None:
@@ -4913,6 +4920,7 @@ def _run_job_script(
     *,
     timeout_seconds: Optional[int] = None,
     job_name: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -5165,6 +5173,19 @@ def _run_job_script(
 
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
+            if (
+                job_id
+                and is_shutting_down()
+                and _is_shutdown_kill_returncode(proc.returncode)
+            ):
+                # Killed by the gateway shutdown drain (or its backstop), not a
+                # script failure: flag it so run_one_job re-queues one fire.
+                with _script_procs_lock:
+                    _restart_killed_job_ids.add(str(job_id))
+                parts.append(
+                    "Killed by gateway shutdown mid-run; eligible for one "
+                    "re-fire after restart."
+                )
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -5177,13 +5198,36 @@ def _run_job_script(
         return False, f"Script execution failed: {exc}"
 
 
+def _is_shutdown_kill_returncode(returncode: Any) -> bool:
+    """True for a child ended by SIGTERM/SIGKILL (negative Popen returncode)."""
+    kill_signals = {signal.SIGTERM}
+    if hasattr(signal, "SIGKILL"):
+        kill_signals.add(signal.SIGKILL)
+    return returncode in {-int(sig) for sig in kill_signals}
+
+
+def _consume_restart_killed(job_id: Any) -> bool:
+    """Pop and return whether ``job_id``'s script was killed by shutdown."""
+    key = str(job_id)
+    with _script_procs_lock:
+        if key in _restart_killed_job_ids:
+            _restart_killed_job_ids.discard(key)
+            return True
+    return False
+
+
 def _job_script_kwargs(job: dict) -> dict[str, Any]:
-    """Per-job ceiling + name for ``_run_job_script`` (see resolve_job_script_timeout)."""
+    """Per-job ceiling + name + id for ``_run_job_script`` (see resolve_job_script_timeout)."""
     timeout, _source = scheduler_ext.resolve_job_script_timeout(
         job, _get_script_timeout()
     )
     name = job.get("name") or job.get("id") if isinstance(job, dict) else None
-    return {"timeout_seconds": timeout, "job_name": str(name) if name else None}
+    job_id = job.get("id") if isinstance(job, dict) else None
+    return {
+        "timeout_seconds": timeout,
+        "job_name": str(name) if name else None,
+        "job_id": str(job_id) if job_id else None,
+    }
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -8267,6 +8311,26 @@ def run_one_job(
             ),
         )
     finally:
+        # After this execution's own last_status write (or the shutdown path's
+        # interrupted mark): persist a single re-fire request if its script
+        # was killed by the gateway shutdown. mark_job_run never clears the
+        # marker, so a later interrupted-mark cannot erase it (t_1f4598ad).
+        if _consume_restart_killed(job["id"]):
+            try:
+                from cron.jobs import request_restart_requeue
+
+                if request_restart_requeue(
+                    job["id"], "script killed by gateway shutdown drain"
+                ):
+                    logger.warning(
+                        "Job '%s': script killed by gateway shutdown — "
+                        "re-queued to fire once after restart",
+                        job.get("name", job["id"]),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Job '%s': restart re-queue failed: %s", job["id"], e,
+                )
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
             if executions is not None:
