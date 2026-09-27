@@ -239,6 +239,18 @@ def apply_quota_gate(
     ``_quota_gate_soonest_reset_text`` when the whole tail was skipped so the
     caller can fail fast with a real time.
     """
+    # A seat-level quota on a pool relay (`quota_seat`) is not evidence about
+    # the fallback chain: the relay rotates seats itself. Skip WITHOUT marking
+    # the turn as gated, so a later genuine quota failover in the same turn
+    # still prunes (fallback spec §4.1 / Phase 1b). Single choke point for both
+    # callers (try_activate_fallback and rate_limited_status_line).
+    try:
+        from agent.fallback_events import quota_seat_on_relay
+
+        if quota_seat_on_relay(agent):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
     if getattr(agent, "_quota_gate_applied", False):
         return None
     agent._quota_gate_applied = True

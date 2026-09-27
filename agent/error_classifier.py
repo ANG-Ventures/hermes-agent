@@ -1173,6 +1173,54 @@ def classify_api_error(
         )
         return _result(reason, **plugin_classification)
 
+    # ── 0.5 Relay-stated error class (fallback spec D2, Phase 1b) ───
+    #
+    # A claude pool relay that negotiated error-class-v2 states WHY it failed
+    # (``x-relay-error-class`` pre-stream, ``relay_error_class`` in the SSE
+    # error JSON). The status code lies (a connect timeout used to arrive as
+    # 429), so the stated class wins over status and text for the classes
+    # whose recovery differs. ``auth``, ``upstream_passthrough`` and unknown
+    # values fall through to the normal pipeline (text table).
+    try:
+        from agent.fallback_events import relay_error_class as _relay_error_class
+
+        _rc, _rc_src = _relay_error_class(error)
+    except Exception:  # noqa: BLE001
+        _rc, _rc_src = None, None
+    if _rc == "conn":
+        # 503 + conn: retry in place (the loop's transport branch retries and
+        # only falls back after repeated failures), never an immediate
+        # fallback and never the rate_limit -> apply_quota_gate path.
+        return _result(
+            FailoverReason.timeout,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=False,
+        )
+    if _rc == "pool_pressure":
+        return _result(
+            FailoverReason.overloaded,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=False,
+        )
+    if _rc == "quota_model":
+        return _result(
+            FailoverReason.pool_exhausted,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+    if _rc in ("quota_seat", "rate_upstream"):
+        # Fallback flow unchanged here; try_activate_fallback skips the model
+        # bench and the quota-registry gate for quota_seat on a relay.
+        return _result(
+            FailoverReason.rate_limit,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
     if isinstance(error, ProviderStreamParseError):
