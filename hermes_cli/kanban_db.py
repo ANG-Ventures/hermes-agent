@@ -5852,8 +5852,8 @@ def find_near_duplicates(
 ) -> list[dict]:
     """Non-archived cards created in the window that look like ``title``/``body``.
 
-    Returns ``[{"id", "title", "score", "same_title", "created_at"}]`` sorted
-    by score, best first. ``same_title`` marks the refusal class.
+    Returns ``[{"id", "title", "score", "same_title", "created_at", "status"}]``
+    sorted by score, best first. ``same_title`` marks the refusal class.
     """
     title_toks = _title_tokens(title)
     if len(title_toks) < NEAR_DUP_MIN_TITLE_TOKENS:
@@ -5862,7 +5862,7 @@ def find_near_duplicates(
     since = int(now if now is not None else time.time()) - int(window_seconds)
     rows = conn.execute(
         # Only the head of a body is compared; don't page whole bodies in.
-        "SELECT id, title, substr(body, 1, 2000) AS body, created_at FROM tasks "
+        "SELECT id, title, substr(body, 1, 2000) AS body, created_at, status FROM tasks "
         "WHERE created_at >= ? AND status != 'archived' AND tenant IS ?",
         (since, tenant),
     ).fetchall()
@@ -5877,6 +5877,7 @@ def find_near_duplicates(
             "score": round(score, 3),
             "same_title": _title_tokens(row["title"]) == title_toks,
             "created_at": row["created_at"],
+            "status": row["status"],
         })
     hits.sort(key=lambda h: (-h["score"], -int(h["created_at"] or 0)))
     return hits
@@ -5983,7 +5984,10 @@ def create_task(
     title scoring >= :data:`NEAR_DUP_THRESHOLD` raises
     :class:`NearDuplicateError` unless ``force_reason`` is given (ledgered as a
     ``near_duplicate_forced`` event); other hits are recorded as a
-    ``near_duplicate_warning`` event on the new card.
+    ``near_duplicate_warning`` event on the new card. A same-title hit only
+    warns when the matched card is ``done`` (a refile after completion) or when
+    the caller passed an ``idempotency_key`` that matched no live card (the
+    documented recurring-automation pattern owns its own dedup).
     """
     force_reason = (force_reason or "").strip() or None
     model_override = (model_override or "").strip() or None
@@ -6300,11 +6304,18 @@ def create_task(
                             branch_name = None
 
                 near_dups: list[dict] = []
+                same: list[dict] = []
                 if duplicate_guard:
                     near_dups = find_near_duplicates(
                         conn, title=title, body=body, tenant=tenant, now=now,
                     )
-                    same = [d for d in near_dups if d["same_title"]]
+                    # An explicit idempotency_key that matched nothing is the
+                    # caller's own dedup decision (recurring automation), and a
+                    # done card is a refile, not a race: both only warn.
+                    same = [] if idempotency_key else [
+                        d for d in near_dups
+                        if d["same_title"] and d.get("status") != "done"
+                    ]
                     if same and not force_reason:
                         best = same[0]
                         raise NearDuplicateError(
@@ -6384,7 +6395,7 @@ def create_task(
                     },
                 )
                 if near_dups:
-                    forced = force_reason and any(d["same_title"] for d in near_dups)
+                    forced = force_reason and bool(same)
                     _append_event(
                         conn,
                         task_id,

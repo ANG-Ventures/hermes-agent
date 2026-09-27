@@ -27,6 +27,9 @@ BODY_B = (
     "private repos (hosted minutes cost money there) but NEVER tonight's stall."
 )
 
+# Per-day dedup tokens from the documented nightly automation pattern.
+NIGHTLY_D1 = "nightly-ops-2026-09-26"
+NIGHTLY_D2 = "nightly-ops-2026-09-27"
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -77,6 +80,59 @@ def test_force_reason_files_and_ledgers(kanban_home):
         "reason": "re-filed after scope change",
     }]
     assert forced[0]["duplicates"][0]["score"] >= kb.NEAR_DUP_THRESHOLD
+
+
+def test_fresh_idempotency_key_bypasses_refusal_but_warns(kanban_home):
+    # Documented recurring pattern: same title, new per-day key, < 24h apart.
+    with kb.connect_closing() as conn:
+        first = kb.create_task(
+            conn, title=TITLE, body=BODY_A, assignee="daedalus",
+            idempotency_key=NIGHTLY_D1,
+        )
+        second = kb.create_task(
+            conn, title=TITLE, body=BODY_B, assignee="daedalus",
+            idempotency_key=NIGHTLY_D2, duplicate_guard=True,
+        )
+        warned = _events(conn, second, "near_duplicate_warning")
+        # Same key still dedups to the existing card, guard or not.
+        again = kb.create_task(
+            conn, title=TITLE, body=BODY_B, assignee="daedalus",
+            idempotency_key=NIGHTLY_D2, duplicate_guard=True,
+        )
+    assert second != first and again == second
+    assert warned[0]["duplicates"][0] == {
+        "id": first, "score": warned[0]["duplicates"][0]["score"], "same_title": True,
+    }
+
+
+def test_refile_after_done_warns_not_refused(kanban_home):
+    with kb.connect_closing() as conn:
+        first = kb.create_task(conn, title=TITLE, body=BODY_A, assignee="daedalus")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (first,))
+        conn.commit()
+        second = kb.create_task(
+            conn, title=TITLE, body=BODY_B, assignee="daedalus",
+            duplicate_guard=True,
+        )
+        warned = _events(conn, second, "near_duplicate_warning")
+        forced = _events(conn, second, "near_duplicate_forced")
+    assert second != first
+    assert [d["id"] for d in warned[0]["duplicates"]] == [first]
+    assert forced == []
+
+
+def test_live_card_still_refused_when_done_sibling_exists(kanban_home):
+    with kb.connect_closing() as conn:
+        done = kb.create_task(conn, title=TITLE, body=BODY_A, assignee="daedalus")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done,))
+        conn.commit()
+        live = kb.create_task(conn, title=TITLE, body=BODY_B, assignee="daedalus")
+        with pytest.raises(kb.NearDuplicateError) as exc:
+            kb.create_task(
+                conn, title=TITLE, body=BODY_A, assignee="daedalus",
+                duplicate_guard=True,
+            )
+    assert [d["id"] for d in exc.value.duplicates] == [live]
 
 
 def test_shard_siblings_warn_but_are_not_refused(kanban_home):
