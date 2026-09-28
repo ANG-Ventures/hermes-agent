@@ -10141,9 +10141,10 @@ class EmptyDraftOverrideError(ValueError):
 
 
 def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list]:
-    """``["o/r#N @ <merge sha>", ...]`` when EVERY fleet PR the handoff owns
-    (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST ``merged=true``;
-    None when there is none, any is not merged, or a lookup cannot tell.
+    """``[("o/r#N @ <merge sha>", "<pr head sha>"), ...]`` when EVERY fleet PR
+    the handoff owns (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST
+    ``merged=true``; None when there is none, any is not merged, or a lookup
+    cannot tell. The head sha ("" when unknown) ties the PR to a checkout.
     """
     from hermes_cli import kanban_open_pr as _open_pr
 
@@ -10162,7 +10163,7 @@ def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list
         if not isinstance(state, dict) or str(state.get("state") or "").upper() != "MERGED":
             return None
         sha = str(state.get("merge_commit_sha") or "")[:12] or "?"
-        merged.append(f"{ref.repo}#{ref.number} @ {sha}")
+        merged.append((f"{ref.repo}#{ref.number} @ {sha}", str(state.get("head_sha") or "")))
     return merged
 
 
@@ -10180,7 +10181,10 @@ def _enforce_branch_base(
     stale post-merge workspace branch is measured against a trunk that holds
     the squash of that very PR, so the "foreign" commit and the conflict are
     the merge itself. Recorded as ``base_guard_survivor_merged``. An OPEN PR
-    keeps the guard -- that is the branch that will not land.
+    keeps the guard -- that is the branch that will not land. The merged PR
+    must be TIED to each failing checkout (FleetReview #1394): its head sha
+    must contain the checkout's HEAD, else naming any unrelated merged PR
+    would excuse foreign commits and conflicts.
     """
     from hermes_cli import kanban_branch_base as _bb
 
@@ -10196,16 +10200,23 @@ def _enforce_branch_base(
     except _bb.StaleBaseError as err:
         failures = {r.repo: r.failures for r in err.reports}
         merged = _merged_survivor_prs(metadata, survivor_pr)
+        untied: list = []
         if merged:
-            with write_txn(conn):
-                _append_event(conn, task.id, "base_guard_survivor_merged", {
-                    "survivor_merged": merged, "failures": failures,
-                })
-            return
+            heads = [head for _, head in merged if head]
+            untied = [r.repo for r in err.reports
+                      if not _bb.head_landed_in(Path(r.repo), r.head, heads)]
+            if not untied:
+                with write_txn(conn):
+                    _append_event(conn, task.id, "base_guard_survivor_merged", {
+                        "survivor_merged": [label for label, _ in merged],
+                        "failures": failures,
+                    })
+                return
+        payload = {"failures": failures}
+        if untied:
+            payload["survivor_merged_untied"] = untied
         with write_txn(conn):
-            _append_event(conn, task.id, "completion_blocked_stale_base", {
-                "failures": failures,
-            })
+            _append_event(conn, task.id, "completion_blocked_stale_base", payload)
         raise
     except Exception as exc:  # the guard must never break a handoff by crashing
         _log.warning("branch-base guard skipped for %s: %s", task.id, exc)

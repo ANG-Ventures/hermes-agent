@@ -297,8 +297,11 @@ def check_checkout(
     # one on trunk -- the squash/queue merge of this branch's own PR. The
     # branch adds nothing, so "foreign commit" and "does not merge cleanly"
     # (trunk moved on over the same lines) are measurements of the merge itself.
+    # ``git cherry`` omits merge commits while ``ahead`` counts them
+    # (FleetReview #1394): only skip when cherry accounts for EVERY ahead
+    # commit, so a merge commit carrying extra changes is still measured.
     cherry = _lines(repo, "cherry", trunk, "HEAD")
-    if cherry and all(ln.startswith("- ") for ln in cherry):
+    if cherry and len(cherry) == rep.ahead and all(ln.startswith("- ") for ln in cherry):
         rep.skipped = f"already landed on {trunk} ({len(cherry)} commit(s) patch-equivalent)"
         return rep
     rep.own_files = _lines(repo, "diff", "--name-only", rep.merge_base, "HEAD")
@@ -332,6 +335,24 @@ def check_checkout(
             f"{len(rep.tree_delta_files)} files differ from trunk vs {len(rep.own_files)} this branch changed"
         )
     return rep
+
+
+def head_landed_in(repo: Path, head: Optional[str], pr_heads: Sequence[str]) -> bool:
+    """True when ``head`` is (an ancestor of) one of ``pr_heads``: the merged PR
+    carried every commit this checkout has. False when it cannot be shown
+    (no head, unknown sha, git error) -- the caller keeps the guard."""
+    if not head:
+        return False
+    for sha in pr_heads:
+        if not sha:
+            continue
+        try:
+            proc = _git(Path(repo), "merge-base", "--is-ancestor", head, sha)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            return True
+    return False
 
 
 def workspace_checkouts(root: Path, depth: int = 2) -> list[Path]:
