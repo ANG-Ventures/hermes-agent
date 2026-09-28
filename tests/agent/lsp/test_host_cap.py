@@ -79,7 +79,9 @@ def test_idle_server_is_stopped_and_frees_its_slot(repo):
         svc.snapshot_baseline(str(repo.path / "x.py"))
         assert svc.get_status()["clients"] and host_slots.held_count(6) == 1
         assert _wait_until(lambda: not svc.get_status()["clients"]), "idle server was never reaped"
-        assert host_slots.held_count(6) == 0
+        # The slot is released only after the reaped server's shutdown
+        # completes (#30), so it frees shortly after the client is gone.
+        assert _wait_until(lambda: host_slots.held_count(6) == 0), "slot never freed"
     finally:
         svc.shutdown()
 
