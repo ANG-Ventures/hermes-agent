@@ -566,9 +566,23 @@ class CaptureRouter:
     # -- staged write -------------------------------------------------------
     @staticmethod
     def _default_write(path: str, content: str) -> None:
+        # Publish atomically: route_turn treats an existing <turn_id>.md as a completed stage,
+        # so a crash mid-write must never leave a truncated file at the final path. The temp
+        # name does not end in .md, so neither that lookup nor an inbox sweep can pick it up.
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _stage_world_facts(self, facts: List[Dict[str, Any]], dest_dir: str, *,
                            turn_id: str, session: str, ts: Optional[str]) -> str:

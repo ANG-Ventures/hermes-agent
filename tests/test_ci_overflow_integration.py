@@ -273,3 +273,15 @@ def test_full_rerun_blocks_when_a_prior_job_disappeared():
     result = integ.full_rerun_verdict(A1, fresh, logs, attempt=2)
     assert result["status"] == "BLOCK"
     assert result["evidence"]["absent_jobs"] == ["Python tests / Run tests a"]
+
+
+def test_full_rerun_blocks_when_a_prior_job_is_skipped_in_the_rerun():
+    """FleetReview #1371 fb763f44: slice a ran in attempt 1 but was skipped (never started) in
+    attempt 2; the matching slice b must not certify a full re-run."""
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    fresh = [{**j, "runner_name": None, "started_at": None} if j["name"].endswith("Run tests a") else j
+             for j in fresh]
+    logs = {"Python tests / Run tests b": "PROBE slice=b executing_attempt=2 planned_attempt=2"}
+    result = integ.full_rerun_verdict(A1, fresh, logs, attempt=2)
+    assert result["status"] == "BLOCK"
+    assert result["evidence"]["newly_skipped"] == ["Python tests / Run tests a"]
