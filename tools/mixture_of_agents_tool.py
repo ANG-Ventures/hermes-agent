@@ -340,7 +340,7 @@ async def mixture_of_agents_tool(
     
     try:
         logger.info("Starting Mixture-of-Agents processing...")
-        logger.info("Query: %s", user_prompt[:100])
+        logger.info("Query: %d chars", len(user_prompt))
         
         # Validate API key availability
         if not check_openrouter_api_key():  # scope-aware, like check_moa_requirements
