@@ -5283,6 +5283,35 @@ _EVENT_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
 )
 
 
+def _process_is_gateway() -> bool:
+    """True only when THIS process is the running gateway.
+
+    ``_HERMES_GATEWAY=1`` is inherited by gateway descendants and is also set
+    at import time by ``gateway.run``, which CLI-side code imports lazily
+    (send_message, platform actions, compression, tui_gateway). Neither the
+    marker nor the import proves ownership. Require positive evidence: a live
+    ``GatewayRunner`` (``gateway.run._gateway_runner_ref``), or the gateway PID
+    record naming this process (FleetReview 09c07e5eb0a9).
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return False
+    run_mod = sys.modules.get("gateway.run")
+    if run_mod is None:
+        return False
+    ref = getattr(run_mod, "_gateway_runner_ref", None)
+    try:
+        if callable(ref) and ref() is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        from gateway.status import get_running_pid
+
+        return get_running_pid(cleanup_stale=False) == os.getpid()
+    except Exception:
+        return False
+
+
 def _event_actor() -> tuple[Optional[str], Optional[str]]:
     """``(actor_profile, actor_session_id)`` for a ``task_events`` row.
 
@@ -5294,7 +5323,7 @@ def _event_actor() -> tuple[Optional[str], Optional[str]]:
     if actor is not None:
         return actor.profile, (actor.session_ids[0] if actor.session_ids else None)
     session_id: Optional[str] = None
-    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    in_gateway = _process_is_gateway()
     try:
         from gateway.session_context import resolve_current_session_id
 
@@ -10318,10 +10347,11 @@ class EmptyDraftOverrideError(ValueError):
 
 
 def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list]:
-    """``[("o/r#N @ <merge sha>", "<pr head sha>"), ...]`` when EVERY fleet PR
-    the handoff owns (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST
-    ``merged=true``; None when there is none, any is not merged, or a lookup
-    cannot tell. The head sha ("" when unknown) ties the PR to a checkout.
+    """``[("o/r#N @ <merge sha>", "<pr head sha>", "<merge sha>"), ...]`` when
+    EVERY fleet PR the handoff owns (``--survivor-pr`` + metadata
+    pr_url/pr_urls/pr) is REST ``merged=true``; None when there is none, any is
+    not merged, or a lookup cannot tell. The full head and merge shas ("" when
+    unknown) tie the PR to a checkout's trunk and content.
     """
     from hermes_cli import kanban_open_pr as _open_pr
 
@@ -10339,8 +10369,9 @@ def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list
             return None
         if not isinstance(state, dict) or str(state.get("state") or "").upper() != "MERGED":
             return None
-        sha = str(state.get("merge_commit_sha") or "")[:12] or "?"
-        merged.append((f"{ref.repo}#{ref.number} @ {sha}", str(state.get("head_sha") or "")))
+        merge_sha = str(state.get("merge_commit_sha") or "")
+        merged.append((f"{ref.repo}#{ref.number} @ {merge_sha[:12] or '?'}",
+                       str(state.get("head_sha") or ""), merge_sha))
     return merged
 
 
@@ -10359,9 +10390,11 @@ def _enforce_branch_base(
     the squash of that very PR, so the "foreign" commit and the conflict are
     the merge itself. Recorded as ``base_guard_survivor_merged``. An OPEN PR
     keeps the guard -- that is the branch that will not land. The merged PR
-    must be TIED to each failing checkout (FleetReview #1394): its head sha
-    must contain the checkout's HEAD, else naming any unrelated merged PR
-    would excuse foreign commits and conflicts.
+    must be TIED to each failing checkout (FleetReview #1394, #1434): its head
+    contains the checkout's HEAD, its merge commit is on the checkout's own
+    trunk, and the checkout's change is present in that merge commit
+    (:func:`kanban_branch_base.pr_landed_checkout`), else naming an unrelated,
+    fork-merged or reverted PR would excuse foreign commits and conflicts.
     """
     from hermes_cli import kanban_branch_base as _bb
 
@@ -10379,13 +10412,12 @@ def _enforce_branch_base(
         merged = _merged_survivor_prs(metadata, survivor_pr)
         untied: list = []
         if merged:
-            heads = [head for _, head in merged if head]
-            untied = [r.repo for r in err.reports
-                      if not _bb.head_landed_in(Path(r.repo), r.head, heads)]
+            prs = [(head, merge_sha) for _, head, merge_sha in merged]
+            untied = [r.repo for r in err.reports if not _bb.pr_landed_checkout(r, prs)]
             if not untied:
                 with write_txn(conn):
                     _append_event(conn, task.id, "base_guard_survivor_merged", {
-                        "survivor_merged": [label for label, _ in merged],
+                        "survivor_merged": [m[0] for m in merged],
                         "failures": failures,
                     })
                 return
@@ -10565,6 +10597,26 @@ def complete_task(
     # ``review`` is a reviewer/human approval and is left alone; so is a
     # claimed reviewer run approving with ``head_sha`` -- the PR it approved
     # is OPEN by definition and the land queue merges it from that record.
+    # Negative-handoff gate (t_4209baaa): a handoff that SAYS it did not land
+    # is Needs-Apollo, not done. Only an implementer's live run is gated: a
+    # review/claimed-review approval is not a handoff, and a ``blocked`` or
+    # ``ready`` card cannot enter review (request_review accepts
+    # running/ready only; operator closes of blocked cards must still work).
+    # A human/reviewer who claimed the parked card (review -> running) and now
+    # approves it is not an implementer handoff either (FleetReview #1447).
+    review_claimed = (
+        candidate.status == "running"
+        and candidate.current_run_id is not None
+        and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
+    )
+    negative_trigger: Optional[str] = None
+    if (
+        candidate.status == 'running' and not review_claimed
+        and not approve_head_sha and not superseded_by
+        and configured_negative_handoff_review()
+    ):
+        from hermes_cli import kanban_negative_handoff as _neg
+        negative_trigger = _neg.match(_neg.handoff_texts(summary, result), metadata)
     from hermes_cli import kanban_open_pr as _open_pr
     _pr_query = None
     if candidate.status != 'review' and not approve_head_sha:
@@ -10632,11 +10684,24 @@ def complete_task(
             routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):
                 routed_meta["handoff_freshness"] = freshness
-            routed_summary = "\n".join(filter(None, [note, summary or result]))
+            from hermes_cli import kanban_negative_handoff as _neg
+            open_pr_reviewer = None
+            if negative_trigger:
+                # The handoff also says it did not land: escalate to Apollo
+                # with the marker instead of the ordinary reviewer.
+                note = "\n".join([_neg.route_note(negative_trigger), note])
+                routed_meta["negative_handoff"] = negative_trigger
+                open_pr_reviewer = _neg.REVIEWER
+            routed_summary = _neg.routed_summary(note, summary, result)
+            routed_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, routed_meta, summary=summary, result=result,
+            )
             ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
+                reviewer=open_pr_reviewer,
                 expected_run_id=expected_run_id, force=True, with_reason=True,
             )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
             if not ok:
                 # complete_task returns a bare bool, so callers can only say
                 # "unknown id or already terminal". Leave the real refusal on
@@ -10653,10 +10718,44 @@ def complete_task(
                         conn, task_id, "completion_routed_to_review",
                         {"open_prs": routed_meta["auto_routed_open_prs"], "note": note},
                     )
+                    if negative_trigger:
+                        _append_event(
+                            conn, task_id, "completion_routed_negative_handoff",
+                            {"trigger": negative_trigger, "reason": None,
+                             "open_prs": routed_meta["auto_routed_open_prs"]},
+                        )
                 # One durable line on the card (t_36d0114e): why it is not done,
                 # and the PR refs the review-card closer resolves on merged=true.
                 add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
+    # Negative handoff with no open PR (t_d0aee724, t_b6eb2944): route to
+    # human:apollo. Default-off: kanban.negative_handoff_review.
+    if negative_trigger:
+        from hermes_cli import kanban_negative_handoff as _neg
+        trigger = negative_trigger
+        note = _neg.route_note(trigger)
+        routed_meta, staged = _stage_routed_scratch_artifacts(
+            conn, task_id, dict(metadata or {}, negative_handoff=trigger),
+            summary=summary, result=result,
+        )
+        ok, route_reason = request_review(
+            conn, task_id,
+            summary=_neg.routed_summary(note, summary, result),
+            metadata=routed_meta,
+            reviewer=_neg.REVIEWER, expected_run_id=expected_run_id,
+            force=True, with_reason=True,
+        )
+        _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+        with write_txn(conn):
+            _append_event(
+                conn, task_id,
+                "completion_routed_negative_handoff" if ok
+                else "completion_route_refused",
+                {"trigger": trigger, "reason": route_reason},
+            )
+        if ok:
+            add_comment(conn, task_id, "kanban", note)
+        return bool(ok)
     # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
     # without merge (e.g. auto-closed when its stacked base was deleted), so
     # the work is not on default. Refuse done unless the handoff carries a
@@ -10715,6 +10814,8 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if candidate.status == "review" or review_claimed:
+        metadata = _carry_routed_artifacts(conn, task_id, metadata)
     if superseded_by:
         metadata = dict(metadata or {}, superseded_by=superseded_by)
         if not (summary or "").strip() and not (result or "").strip():
@@ -11060,6 +11161,104 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
+
+
+def _stage_routed_scratch_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+) -> tuple[dict, list[tuple[str, int]]]:
+    """Copy declared scratch artifacts out before a completion is routed to review.
+
+    A review route returns before the ``done`` path's artifact persistence. A
+    later approval that does not repeat the implementer's metadata has no
+    artifact list, and its cleanup deletes the scratch workspace with the
+    files in it (FleetReview #1447, t_daa1f3bf). The routed run records the
+    copies under ``routed_artifacts`` so :func:`_carry_routed_artifacts` can
+    put them on the approving ``completed`` event;
+    :func:`_settle_routed_scratch_artifacts` registers them once the route
+    lands. Sizes are measured here, while the copy is known to exist.
+    """
+    # Same order as the done path: promote prose-named scratch files first.
+    staged_meta = dict(_merge_completion_prose_artifacts(
+        conn, task_id, dict(metadata), summary=summary, result=result,
+    ) or {})
+    _persist_scratch_completion_artifacts(conn, task_id, staged_meta)
+    staged = [
+        (str(p), Path(p).stat().st_size)
+        for p in staged_meta.pop("_staged_artifacts", [])
+    ]
+    artifacts = staged_meta.get("artifacts")
+    if isinstance(artifacts, (list, tuple)) and artifacts:
+        staged_meta["routed_artifacts"] = [str(a) for a in artifacts]
+    return staged_meta, staged
+
+
+def _settle_routed_scratch_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    staged: list[tuple[str, int]],
+    ok: bool,
+) -> None:
+    """Register staged copies when the review route landed; drop them if refused.
+
+    The route is already committed when this runs, so a copy that vanished in
+    between is recorded as an event rather than raised (which would report a
+    failed completion for a card that is in fact in review).
+    """
+    if not staged:
+        return
+    if not ok:
+        for stored_path, _size in staged:
+            try:
+                Path(stored_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
+    now = int(time.time())
+    with write_txn(conn):
+        for stored_path, size in staged:
+            path = Path(stored_path)
+            if not path.is_file():
+                _append_event(
+                    conn, task_id, "routed_artifact_missing",
+                    {"stored_path": stored_path},
+                )
+                continue
+            _insert_completion_attachment(
+                conn, task_id, filename=path.name, stored_path=str(path),
+                size=size, created_at=now,
+            )
+
+
+def _carry_routed_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """An approval without its own artifacts inherits the routed run's copies.
+
+    The gateway uploads files from the ``completed`` event only, so a bare
+    approval of a routed card would otherwise deliver nothing.
+    """
+    if isinstance(metadata, dict) and metadata.get("artifacts"):
+        return metadata
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        routed = json.loads(row["metadata"]) if row and row["metadata"] else {}
+    except (TypeError, ValueError):
+        return metadata
+    carried = routed.get("routed_artifacts") if isinstance(routed, dict) else None
+    if not isinstance(carried, list) or not carried:
+        return metadata
+    return dict(metadata or {}, artifacts=[str(a) for a in carried])
 
 
 def _insert_completion_attachment(
@@ -12902,6 +13101,15 @@ def configured_max_review_rounds() -> int:
     except Exception:
         return DEFAULT_MAX_REVIEW_ROUNDS
     return rounds if rounds >= 0 else DEFAULT_MAX_REVIEW_ROUNDS
+
+
+def configured_negative_handoff_review() -> bool:
+    """``kanban.negative_handoff_review`` — route negative handoffs to review (default off)."""
+    try:
+        value, _source = _kanban_review_setting("negative_handoff_review", False)
+    except Exception:
+        return False
+    return value is True or str(value).strip().casefold() in ("1", "true", "yes", "on")
 
 
 def configured_review_policy() -> str:

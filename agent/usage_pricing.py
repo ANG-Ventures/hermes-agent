@@ -993,6 +993,22 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
+    # Claude Sonnet 5.5 (launched 2026-09-28). Sonnet 5.5 launch 2026-09-28, same list
+    # as Sonnet 5's announced rate: $2/$10 per MTok in/out, cache read $0.20; cache
+    # write $2.50 (1.25x input, 5-minute TTL).
+    # Source: https://www.anthropic.com/claude-sonnet-5-5
+    (
+        "anthropic",
+        "claude-sonnet-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://www.anthropic.com/claude-sonnet-5-5",
+        pricing_version="anthropic-sonnet-5-5-2026-09",
+    ),
     # Claude Sonnet 5 (released 2026-06-30). List price $3/$15; cache read $0.30 (0.1x input).
     # Intro pricing $2/$10 in/out runs through 2026-08-31 — the cost-book uses the
     # standing LIST rate (as the rest of this table does), so it does not under-count
@@ -1450,6 +1466,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="anthropic-list-2026-07",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-sonnet-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://www.anthropic.com/claude-sonnet-5-5",
+        pricing_version="anthropic-sonnet-5-5-2026-09",
     ),
     (
         "bedrock",

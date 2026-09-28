@@ -1955,3 +1955,24 @@ def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
     result = estimate_usage_cost("moonshotai/kimi-k3", usage, provider="openrouter")
     # 3.00 + 15.00 + 0.30
     assert result.amount_usd is not None and float(result.amount_usd) == 18.30  # type: ignore[arg-type]
+
+
+# ── Anthropic Claude Sonnet 5.5 (launched 2026-09-28) ────────────────────────
+# Behaviour contracts from the announcement: 1M context, $2/$10 in/out, $0.20
+# cache read. The older claude-sonnet-5 row must keep pricing (ADD-KEEP).
+
+def test_sonnet_5_5_has_1m_context():
+    from agent.model_metadata import get_model_context_length
+
+    assert get_model_context_length("claude-sonnet-5-5") == 1_000_000
+
+
+def test_sonnet_5_5_prices_at_launch_rates_and_sonnet_5_still_prices():
+    usage = CanonicalUsage(
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000
+    )
+    new = estimate_usage_cost("claude-sonnet-5-5", usage, provider="anthropic")
+    # 2.00 + 10.00 + 0.20
+    assert new.amount_usd is not None and float(new.amount_usd) == 12.20  # type: ignore[arg-type]
+    old = estimate_usage_cost("claude-sonnet-5", usage, provider="anthropic")
+    assert old.amount_usd is not None and old.amount_usd > 0
