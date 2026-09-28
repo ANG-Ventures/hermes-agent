@@ -6513,13 +6513,21 @@ class TurnRunner:
                 res = fut.result()
             except Exception as exc:
                 _warn_route_drop("adapter_send_exception", type(exc).__name__)
+                if is_route_change:
+                    self._queue_undelivered_route_notice(event_type, prepared_message)
                 return
             if is_route_change and not getattr(res, "success", False):
                 error = _redact_gateway_user_facing_secrets(
                     str(getattr(res, "error", "") or type(res).__name__)
                 )[:160]
                 _warn_route_drop("adapter_send_failed", error)
+                # A hop the user never saw is the worst outcome: queue the
+                # line and redeliver it on the next turn in this chat.
+                self._queue_undelivered_route_notice(event_type, prepared_message)
                 return
+            if is_route_change:
+                # The platform is reachable again: flush anything queued.
+                self._flush_route_notice_outbox()
             # Route announcements are durable messages, not temporary progress.
             if ctx._cleanup_progress and not is_route_change:
                 mid = getattr(res, "message_id", None)
@@ -6529,6 +6537,78 @@ class TurnRunner:
         if is_route_change or ctx._cleanup_progress:
             _fut.add_done_callback(_track_status_result)
         return True if is_route_change else None
+
+    def _route_notice_chat_key(self) -> str:
+        from gateway.route_notice_outbox import chat_key
+
+        ctx = self._ctx
+        return chat_key(ctx.source.platform, ctx._status_chat_id,
+                        ctx._status_thread_metadata)
+
+    def _queue_undelivered_route_notice(self, event_type: str, message: str) -> None:
+        """Queue a route-change line the adapter failed to send (t_b2e9bb23).
+        Best-effort: never raises."""
+        try:
+            from gateway.route_notice_outbox import default_outbox
+
+            default_outbox().enqueue(
+                self._route_notice_chat_key(), message,
+                self._ctx._status_thread_metadata, event_type=event_type,
+            )
+        except Exception:
+            logger.debug("route notice enqueue failed", exc_info=True)
+
+    def _flush_route_notice_outbox(self) -> int:
+        """Redeliver queued route-change lines for this chat, oldest first,
+        each marked delayed. A failed redelivery goes back on the queue.
+        Returns the number scheduled. Best-effort: never raises."""
+        ctx = self._ctx
+        try:
+            from gateway.route_notice_outbox import default_outbox, delayed_text
+
+            outbox = default_outbox()
+            key = self._route_notice_chat_key()
+            if not outbox.pending(key):
+                return 0
+            resolver = ctx._current_status_adapter
+            adapter = resolver() if callable(resolver) else None
+            if not adapter:
+                return 0
+            entries = outbox.take(key)
+            scheduled = 0
+            for entry in entries:
+                text = delayed_text(str(entry.get("message") or ""),
+                                    float(entry.get("dropped_at") or time.time()))
+                fut = safe_schedule_threadsafe(
+                    _send_or_update_status_coro(
+                        adapter, ctx._status_chat_id,
+                        entry.get("event_type") or "info", text,
+                        ctx._status_thread_metadata, durable=True,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="route notice redelivery scheduling error",
+                )
+                if fut is None:
+                    outbox.restore(key, entry)
+                    continue
+                scheduled += 1
+
+                def _done(f, _entry=entry):
+                    try:
+                        ok = bool(getattr(f.result(), "success", False))
+                    except Exception:
+                        ok = False
+                    if ok:
+                        logger.info("route notice redelivered: chat=%s", key)
+                    else:
+                        outbox.restore(key, _entry)
+
+                fut.add_done_callback(_done)
+            return scheduled
+        except Exception:
+            logger.debug("route notice flush failed", exc_info=True)
+            return 0
 
     def run_sync(self):
         ctx = self._ctx
@@ -7017,6 +7097,9 @@ class TurnRunner:
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
+        # An inbound message just arrived, so the platform is reachable:
+        # redeliver any route-change line a previous send dropped (t_b2e9bb23).
+        self._flush_route_notice_outbox()
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
         # standalone push: render to a single plaintext line and deliver via
@@ -7085,7 +7168,16 @@ class TurnRunner:
             # announces the return with the stashed recovery row (G2).
             from agent import fallback_wiring as _fw
 
-            _fw.decide_rebuild_for_agent(agent)
+            # A /model this turn (stamp set by _set_session_model_override,
+            # consumed below by the re-init announce) is an explicit route: it
+            # closes any sticky episode instead of resuming it (t_b2e9bb23).
+            try:
+                _user_route = bool(getattr(
+                    self._runner, "_override_target_just_changed", {}
+                ).get(ctx.session_key))
+            except Exception:
+                _user_route = False
+            _fw.decide_rebuild_for_agent(agent, user_route=_user_route)
             self._runner._announce_reinit_recovery(
                 agent=agent,
                 session_key=ctx.session_key,

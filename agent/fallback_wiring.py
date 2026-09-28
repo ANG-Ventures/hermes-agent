@@ -33,7 +33,7 @@ from agent.fallback_sticky_store import StickyKey, StickyState
 
 logger = logging.getLogger(__name__)
 
-RELAY_PROVIDERS = frozenset(("claude-apr", "claude-bpr"))
+RELAY_PROVIDERS = fp.RELAY_PROVIDERS
 PRIMARY_NOTE_MIN_INTERVAL_S = 30.0
 
 _purge_lock = threading.Lock()
@@ -440,19 +440,55 @@ def resume_sticky_fallback(agent: Any, state: StickyState) -> bool:
     return True
 
 
-def decide_rebuild_for_agent(agent: Any) -> str:
+def close_episodes_for_user_route(lineage_root: str,
+                                  now: Optional[float] = None) -> int:
+    """An explicit user route (``/model``) wins over an automatic one: close
+    EVERY active sticky episode on this lineage, whatever primary it is keyed
+    on (a later ``/model`` back to that primary must not resurrect it).
+    Returns the number closed. Best-effort, never raises."""
+    if not lineage_root:
+        return 0
+    closed = 0
+    try:
+        now = time.time() if now is None else now
+        st = store()
+        for key in st.keys_for_lineage(lineage_root):
+            state = _state(key)
+            if state is not None and state.active:
+                fp.record_return(st, key, now, fp.USER_ROUTE_BRANCH)
+                closed += 1
+    except Exception:  # noqa: BLE001
+        logger.debug("sticky user-route close failed (best-effort)", exc_info=True)
+    return closed
+
+
+def live_fallback_active(agent: Any) -> bool:
+    """Whether a live agent is currently on an automatic fallback route."""
+    if agent is None:
+        return False
+    return bool(getattr(agent, "_provider_fallback_active", False) is True
+                or getattr(agent, "_fallback_activated", False) is True)
+
+
+def decide_rebuild_for_agent(agent: Any, *, user_route: bool = False) -> str:
     """Gateway pre-run site for a FRESH agent, before ``_announce_reinit_recovery``.
     Returns ``primary`` | ``resume`` | ``return`` | ``store_unreadable``.
 
     ``return`` stashes the recovery-row fields on ``agent._sticky_recovery_row``;
     the re-init announce that runs next folds them into its one ledger row and
-    its notice rider (one decision, one notice: G2)."""
+    its notice rider (one decision, one notice: G2).
+
+    ``user_route`` (the user just ran ``/model``): close every active episode on
+    the lineage and start on the requested primary, never resume."""
     try:
         if not sticky_policy_enabled():
             return "primary"
         now = time.time()
         key = key_for(agent)
         if not key.lineage_root:
+            return "primary"
+        if user_route:
+            close_episodes_for_user_route(key.lineage_root, now)
             return "primary"
         sid = str(getattr(agent, "session_id", "") or "") or None
         rd = fp.decide_rebuild(store(), key, now, live_session_id=sid,

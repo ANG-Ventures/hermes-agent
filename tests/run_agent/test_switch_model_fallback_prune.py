@@ -107,3 +107,32 @@ def test_switch_within_same_provider_preserves_chain():
         )
 
     assert agent._fallback_chain == chain
+
+
+def test_switch_closes_persisted_sticky_episode(tmp_path, monkeypatch):
+    """t_b2e9bb23 B: an explicit /model beats an automatic fallback. The
+    in-place switch (every /model surface) must close the persisted sticky
+    episode, or the agent rebuilt after cache eviction resumes the fallback
+    ("/model k3 immediately reverts to opus")."""
+    import time
+
+    from agent import fallback_policy as fp
+    from agent import fallback_sticky_store as fss
+
+    store = fss.StickyStore(db_path=tmp_path / "turns.db")
+    monkeypatch.setattr(fss, "_DEFAULT", store)
+    agent = _make_agent([{"provider": "nous", "model": "hermes-4"}])
+    agent.session_id = "sess-root"
+    agent._session_db = None
+    key = fss.StickyKey.build("sess-root", "openrouter", "x-ai/grok-4")
+    fp.arm_sticky(store, key, cls="quota_model", now=time.time(),
+                  failing=("openrouter", "x-ai/grok-4"), fallback=("nous", "hermes-4"),
+                  jitter=1.0)
+    assert store.get(key).active is True
+
+    _switch_to_anthropic(agent)
+
+    st = store.get(key)
+    assert st.active is False and st.return_branch == fp.USER_ROUTE_BRANCH
+    assert agent._sticky_rebuild_refusal_pending is False
+

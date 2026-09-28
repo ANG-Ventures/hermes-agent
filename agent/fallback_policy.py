@@ -53,6 +53,16 @@ STICKY_CLASSES = frozenset({"conn", "pool_pressure", "quota_seat", "quota_model"
 QUOTA_GATE_CLASSES = frozenset({"quota_model", "rate_upstream", "refusal", "unclassified"})
 # §4.3 fallback_failed: quota classes only.
 FALLBACK_FAILED_CLASSES = frozenset({"quota_seat", "quota_model", "rate_upstream"})
+# Transient causes (connection drop / timeout). Their cooldown is a retry
+# delay, not a real quota window: a restart never resumes one, and on a
+# primary with no seat signal (not relay, not direct pin) the episode returns
+# on the ``transient`` branch once ``until`` passes (t_b2e9bb23: a host network
+# blip pinned an OpenRouter-primary session to its fallback for 90 min because
+# warm_seat is unreachable for a non-relay primary and an active user never
+# lets the fallback go cold). Relay primaries keep the warm-seat gate.
+TRANSIENT_CLASSES = frozenset({"conn"})
+TRANSIENT_BRANCH = "transient"
+USER_ROUTE_BRANCH = "user_route"
 
 MIN = 60.0
 HOUR = 3600.0
@@ -96,6 +106,16 @@ def direct_pin(provider: Optional[str]) -> Optional[Tuple[str, int]]:
 
 def is_direct_pin(provider: Optional[str]) -> bool:
     return direct_pin(provider) is not None
+
+
+RELAY_PROVIDERS = frozenset(("claude-apr", "claude-bpr"))
+
+
+def has_seat_signal(provider: Optional[str]) -> bool:
+    """Whether ``warm_seat`` can ever be evaluated for this primary: a relay
+    lane (``/eligibility``) or a direct pin (seat == provider)."""
+    p = str(provider or "").strip().lower()
+    return p in RELAY_PROVIDERS or is_direct_pin(p)
 
 
 # ── direct-pin seat + hop (§4.8; t_246ce7d6) ──────────────────────────────
@@ -753,6 +773,14 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         return Decision(True, None, "no active sticky state")
     if now < state.until_epoch:
         return Decision(False, None, f"until: {state.until_epoch - now:.0f}s remaining")
+    if (state.cls in TRANSIENT_CLASSES
+            and not has_seat_signal(primary_provider or state.primary_provider)):
+        # No warm_seat signal can ever exist for this primary (not a relay,
+        # not a direct pin), so without this branch an active user is held on
+        # the fallback until it idles 60 min (t_b2e9bb23, measured 90 min).
+        return Decision(True, TRANSIENT_BRANCH,
+                        f"transient cause ({state.cls}); cooldown elapsed, "
+                        "primary has no seat signal")
     reasons: List[str] = []
     exp: Optional[float] = None
     verdict: Optional[str] = None
@@ -878,6 +906,13 @@ def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
         return RebuildDecision("store_unreadable", None, None)
     if state is None or not state.active:
         return RebuildDecision("primary", state, None)
+    if state.cls in TRANSIENT_CLASSES:
+        # A restart never resumes a transient episode, even inside its
+        # cooldown: the rebuilt session starts on the primary and the normal
+        # per-turn failover decides again.
+        d = Decision(True, TRANSIENT_BRANCH,
+                     f"transient cause ({state.cls}); restart resumes on primary")
+        return RebuildDecision("return", record_return(store, key, now, TRANSIENT_BRANCH), d)
     d = restore_allowed(state, now, probe=True, live_session_id=live_session_id,
                         primary_provider=key.primary_provider, eligibility=eligibility,
                         direct_pin_benched=direct_pin_benched, refusal_arm=refusal_arm)
@@ -1107,6 +1142,10 @@ def format_recovery_rider(row: Mapping[str, Any], *, seat_names: bool = True) ->
     if branch == "fallback_failed":
         return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible on "
                 f"{seat} ({expect}), {dwell}")
+    if branch == TRANSIENT_BRANCH:
+        return f"cause was transient (connection); retrying primary ({expect}), {dwell}"
+    if branch == USER_ROUTE_BRANCH:
+        return f"cleared by /model ({expect}), {dwell}"
     return f"branch ? on {seat} ({expect}), {dwell}"
 
 

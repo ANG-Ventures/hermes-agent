@@ -32,6 +32,15 @@ def key():
     return StickyKey.build("root-sid", *FABLE)
 
 
+@pytest.fixture
+def conn_resumes_on_rebuild(monkeypatch):
+    """Rebuild/resume-mechanics tests below arm with the ``conn`` class as a
+    generic sticky vehicle. Since t_b2e9bb23 a transient class never resumes
+    on restart (covered by the test_transient_* tests at the end); these pin
+    the class-agnostic resume machinery, so they opt conn back in."""
+    monkeypatch.setattr(fp, "TRANSIENT_CLASSES", frozenset())
+
+
 def _arm(store, key, cls="conn", now=T0, **kw):
     kw.setdefault("jitter", 1.0)
     return fp.arm_sticky(store, key, cls=cls, now=now, failing=FABLE, fallback=OPUS, **kw)
@@ -306,6 +315,7 @@ def test_note_compaction_ignores_inactive_episode(store, key):
     assert fp.note_compaction(store, key, T0 + 20).last_compaction_epoch is None
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_compaction_marker_survives_db_only_restart(tmp_path, key):
     """pass-10 G1: the marker is write-through, so a restarted process
     (DB only) still evaluates the compaction branch."""
@@ -527,6 +537,7 @@ def test_resume_decision_on_three_evictions_leaves_state_untouched(tmp_path, key
     assert (after.until_epoch, after.n, after.active) == (before.until_epoch, before.n, True)
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_resume_after_gateway_restart_db_only(tmp_path, key):
     s1 = StickyStore(db_path=tmp_path / "t.db")
     _sticky_on_fallback(s1, key)
@@ -550,6 +561,7 @@ def test_B1a_fallback_failed_return_then_evict_stays_on_primary(store, key):
     assert r.action == "primary" and r.decision is None
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_B1b_rebuild_after_until_fallback_warm_binding_expired_stays(store, key):
     st = _sticky_on_fallback(store, key, last_primary=T0 - 40 * 60)
     until = store.get(key).until_epoch
@@ -568,6 +580,7 @@ def test_B1b_rebuild_after_until_fallback_warm_binding_expired_stays(store, key)
     assert store.get(key).active is False
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_db_only_restart_fallback_cold_compaction_and_dwell(tmp_path, key):
     s1 = StickyStore(db_path=tmp_path / "t.db")
     _sticky_on_fallback(s1, key)
@@ -909,6 +922,7 @@ def test_wiring_recovery_row_names_served_route_after_fb1_fb2_walk(wired):
     assert "turns on gpt-5.5" in rec["notice_text"]
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_reinit_recovery_row_names_served_route_after_walk(wired):
     """Same, gateway construction-time return: the stashed
     _sticky_recovery_row must not overwrite prev_route (last served = fb2)."""
@@ -1037,6 +1051,7 @@ def _fresh_rebuild(home, calls, state_before):
     return b
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_resume_after_three_evictions_and_restart(wired):
     """resume_sticky_fallback (§4.2 normative): evict 3x -> each rebuilt agent's
     first call goes to the fallback; until/n_c/_rate_limited_until unchanged,
@@ -1058,6 +1073,7 @@ def test_wiring_resume_after_three_evictions_and_restart(wired):
     assert (b.provider, b.model) == FABLE and b.client.tag == "primary"
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_resume_chain_head_when_entry_removed(wired):
     home, calls = wired
     a = _wired_agent()
@@ -1114,6 +1130,7 @@ def _prerun(runner, key, agent):
     _fw.flush_unconsumed_recovery_row(agent)
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_g2_one_decision_one_notice_per_rebuild(wired):
     """G2: gate true at rebuild -> exactly one recovery row, one route-change
     line and one Model recovery notice on the bound sink; gate false ->
@@ -1152,6 +1169,7 @@ def test_wiring_g2_one_decision_one_notice_per_rebuild(wired):
 
 
 @pytest.mark.parametrize("warm_refusal", [False, True])
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_rebuild_refusal_is_once_per_turn(wired, monkeypatch, warm_refusal):
     """A fresh resume and its turn-start restore are one refused decision;
     a cached agent makes a new decision on the next turn."""
@@ -1181,6 +1199,7 @@ def test_wiring_rebuild_refusal_is_once_per_turn(wired, monkeypatch, warm_refusa
     assert len(_rows(home, "sticky_resume")) == 1
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_db_only_restart_fallback_cold_and_compaction(wired):
     """pass-10 G1: map empty, DB row -> fallback_cold at 61 min idle; a rotated
     session id -> compaction. Dwell in the notice comes from the DB row."""
@@ -1197,6 +1216,7 @@ def test_wiring_db_only_restart_fallback_cold_and_compaction(wired):
     assert "after " in _rows(home, "recovery")[-1]["notice_text"]
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_wiring_i3_turn_completes_with_db_unwritable(wired):
     """I3: blackbox dir unwritable -> failover, restore gate and rebuild all
     complete; nothing raises; the in-process map still holds the episode."""
@@ -1666,6 +1686,7 @@ def test_warm_refusal_arm_hash_and_pct():
     assert not fp.warm_refusal_arm("", 100) and not fp.warm_refusal_arm("x", "junk")
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_warm_rebuild_site_passes_refusal_arm(store, key):
     _sticky_on_fallback(store, key)
     rd = fp.decide_rebuild(store, key, T0 + 200, live_session_id="sid-a",
@@ -1824,6 +1845,7 @@ def test_failed_activation_restores_before_trying_next_entry(wired, monkeypatch)
     assert (row["from_provider"], row["from_model"]) == FABLE
 
 
+@pytest.mark.usefixtures("conn_resumes_on_rebuild")
 def test_resume_reports_primary_truthfully_when_activation_raises(wired, monkeypatch):
     """resume_sticky_fallback treats False as 'stayed on primary'; the rebuilt
     agent must then actually BE on the primary route."""
@@ -1837,4 +1859,120 @@ def test_resume_reports_primary_truthfully_when_activation_raises(wired, monkeyp
     assert _fw.decide_rebuild_for_agent(b) == "primary"
     assert _route_fields(b) == before
     assert b._fallback_index == 0
+    assert _rows(home, "sticky_resume") == []
+
+
+# ── t_b2e9bb23: transient episodes and explicit user routes ──────────────
+
+OR_K3 = ("openrouter", "moonshotai/kimi-k3")
+
+
+def _or_key():
+    return StickyKey.build("root-sid", *OR_K3)
+
+
+def _arm_or(store, key, cls, now=T0):
+    return fp.arm_sticky(store, key, cls=cls, now=now, failing=OR_K3, fallback=OPUS,
+                         jitter=1.0)
+
+
+@pytest.mark.parametrize("key_fn", [lambda: StickyKey.build("root-sid", *FABLE), _or_key])
+def test_transient_rebuild_never_resumes_even_inside_cooldown(store, key_fn):
+    """A (restart): a conn episode is not re-applied on rebuild, relay or not,
+    even before ``until``; the episode closes on the ``transient`` branch."""
+    key = key_fn()
+    fp.arm_sticky(store, key, cls="conn", now=T0, failing=(key.primary_provider, key.primary_model),
+                  fallback=OPUS, jitter=1.0)
+    store.evict_memory()                       # restart: DB only
+    r = fp.decide_rebuild(store, key, T0 + 5, live_session_id="sid-a",
+                          eligibility=lambda: None)
+    assert r.action == "return" and r.decision.branch == fp.TRANSIENT_BRANCH
+    assert store.get(key).active is False
+    assert store.get(key).return_branch == fp.TRANSIENT_BRANCH
+
+
+@pytest.mark.parametrize("cls", ["quota_model", "quota_seat", "pool_pressure"])
+def test_non_transient_rebuild_still_resumes(store, cls):
+    """Quota / pool classes keep their real cooldown across a restart."""
+    key = _or_key()
+    _arm_or(store, key, cls)
+    store.evict_memory()
+    r = fp.decide_rebuild(store, key, T0 + 1, live_session_id="sid-a", eligibility=lambda: None)
+    assert r.action == "resume"
+
+
+def test_transient_non_relay_primary_returns_after_until_while_fallback_busy(store):
+    """Measured gap: OpenRouter primary, conn episode, fallback used every
+    turn. warm_seat is unreachable (no seat signal), fallback never goes cold,
+    so the old gate refused forever. After ``until`` it now returns."""
+    key = _or_key()
+    st = _arm_or(store, key, "conn")
+    fp.note_fallback_success(store, key, st.until_epoch + 50, "sid-a")
+    st = store.get(key)
+    before = fp.restore_allowed(st, st.until_epoch - 1, probe=True, live_session_id="sid-a",
+                                primary_provider="openrouter")
+    assert not before.allowed
+    after = fp.restore_allowed(st, st.until_epoch + 60, probe=True, live_session_id="sid-a",
+                               primary_provider="openrouter")
+    assert after.allowed and after.branch == fp.TRANSIENT_BRANCH
+
+
+def test_transient_relay_primary_keeps_warm_seat_gate(store):
+    """Relay primaries keep the spec's warm-seat gate at the turn boundary."""
+    key = StickyKey.build("root-sid", *FABLE)
+    st = _sticky_on_fallback(store, key, last_primary=T0 - 70 * 60)
+    d = fp.restore_allowed(st, st.until_epoch + 60, probe=True, live_session_id="sid-a",
+                           primary_provider="claude-bpr", eligibility=lambda: None)
+    assert not d.allowed
+
+
+def test_quota_non_relay_primary_stays_sticky_after_until(store):
+    key = _or_key()
+    st = _arm_or(store, key, "quota_model")
+    fp.note_fallback_success(store, key, st.until_epoch + 50, "sid-a")
+    st = store.get(key)
+    d = fp.restore_allowed(st, st.until_epoch + 60, probe=True, live_session_id="sid-a",
+                           primary_provider="openrouter")
+    assert not d.allowed
+
+
+def test_recovery_rider_names_transient_and_user_route():
+    row = {"return_branch": fp.TRANSIENT_BRANCH, "dwell_s": 600, "dwell_turns": 3,
+           "from_model": "claude-opus-5-5"}
+    assert "transient" in fp.format_recovery_rider(row)
+    row["return_branch"] = fp.USER_ROUTE_BRANCH
+    assert "/model" in fp.format_recovery_rider(row)
+
+
+def test_user_route_closes_every_episode_on_the_lineage(tmp_path, monkeypatch):
+    """B: /model closes all active episodes on the lineage, whatever primary
+    they are keyed on, so /model back to that primary cannot resurrect one."""
+    s = StickyStore(db_path=tmp_path / "t.db")
+    monkeypatch.setattr(fss, "_DEFAULT", s)
+    k1, k2 = _or_key(), StickyKey.build("root-sid", *FABLE)
+    other = StickyKey.build("other-root", *OR_K3)
+    _arm_or(s, k1, "quota_model")
+    fp.arm_sticky(s, k2, cls="quota_seat", now=T0, failing=FABLE, fallback=OPUS, jitter=1.0)
+    _arm_or(s, other, "quota_model")
+    s.evict_memory()
+    assert _fw.close_episodes_for_user_route("root-sid", T0 + 5) == 2
+    assert s.get(k1).active is False and s.get(k1).return_branch == fp.USER_ROUTE_BRANCH
+    assert s.get(k2).active is False
+    assert s.get(other).active is True
+    s.evict_memory()
+    assert fp.decide_rebuild(s, k1, T0 + 6, live_session_id="sid-a").action == "primary"
+
+
+def test_decide_rebuild_for_agent_user_route_never_resumes(wired):
+    """B at the gateway rebuild site: the /model stamp makes the fresh agent
+    start on the requested primary even with a quota episode active."""
+    home, _ = wired
+    a = _wired_agent()
+    k = _fw.key_for(a)
+    fp.arm_sticky(fss.default_store(), k, cls="quota_model", now=_time.time(),
+                  failing=FABLE, fallback=OPUS, jitter=1.0)
+    b = _wired_agent()
+    assert _fw.decide_rebuild_for_agent(b, user_route=True) == "primary"
+    assert _fw.on_fallback(b) is False
+    assert fss.default_store().get(k).active is False
     assert _rows(home, "sticky_resume") == []
