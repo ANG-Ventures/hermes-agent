@@ -180,6 +180,10 @@ async def _loop_ticks_while_rename_is_held(held, do_mark):
     task = asyncio.create_task(sibling())
     do_mark()
     await task
+    # The witness is only meaningful if the write actually reached the held
+    # rename; otherwise _release_later times out and the sibling trivially
+    # ticks first (C7 k135).
+    assert held.entered.wait(5.0), "no write reached the rename barrier"
     return order["ticked_before_release"]
 
 
@@ -194,6 +198,8 @@ def test_stalled_rename_does_not_stall_the_loop(tmp_path, monkeypatch):
     ), "the loop could not run another task while the rename was held"
     held.gate.set()
     assert s._writer.wait_idle()
+    data = json.loads((tmp_path / "gateway" / "discord_restart_recovery.json").read_text(encoding="utf-8"))
+    assert "x" in data["active_channels"]
 
 
 def test_gate_proof_inline_write_does_stall_the_loop(tmp_path, monkeypatch):

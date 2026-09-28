@@ -121,7 +121,9 @@ def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
             return cls
     if exc_name in _CONN_EXC_NAMES:
         return "conn"
-    if http_status == 401:
+    # Last resort, same as the runtime classifier (error_classifier routes an
+    # otherwise-unrecognized 403 to FailoverReason.auth) (C7 k80).
+    if http_status in (401, 403):
         return "auth"
     return "unclassified"
 

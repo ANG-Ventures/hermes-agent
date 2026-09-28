@@ -1361,7 +1361,12 @@ def _handle_attach(args: dict, **kw) -> str:
     import hashlib
     expected = args.get("expected_sha256")
     if expected is not None and (not isinstance(expected, str) or not expected.strip()):
-        expected = None
+        # A supplied digest the caller meant to verify against must never be
+        # silently discarded into an unverified store (C7 k138).
+        return tool_error(
+            "expected_sha256 must be a non-empty hex SHA-256 string when "
+            "supplied (omit it to attach a path unverified); nothing stored"
+        )
     if has_path:
         # The bytes never pass through the model. A model that has to
         # re-emit a file as base64 transcribes it token by token and drops

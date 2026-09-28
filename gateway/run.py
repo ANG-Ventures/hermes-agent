@@ -4468,7 +4468,9 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
     """Track visible root child names and immediate directory mtimes.
 
     Category mtimes detect skill additions/removals within categories; child
-    names detect flat skill additions/removals. Hidden telemetry/curator files
+    names detect flat skill additions/removals; second-level directory mtimes
+    detect SKILL.md added to/removed from an existing category/skill directory.
+    Hidden telemetry/curator files
     and directories never invalidate the index. /reload-skills picks up deeper
     edits such as a frontmatter rename.
     """
@@ -4481,8 +4483,21 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
                     if entry.name.startswith("."):
                         continue
                     try:
-                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        is_dir = entry.is_dir()
+                        mtime = entry.stat().st_mtime_ns if is_dir else -1
                         out.append((entry.path, mtime))
+                    except OSError:
+                        continue
+                    if not is_dir:
+                        continue
+                    # category/skill dirs: adding or removing SKILL.md inside
+                    # one changes only that dir's mtime (C7 k99).
+                    try:
+                        with os.scandir(entry.path) as children:
+                            for child in children:
+                                if child.name.startswith(".") or not child.is_dir():
+                                    continue
+                                out.append((child.path, child.stat().st_mtime_ns))
                     except OSError:
                         continue
         except OSError:
@@ -34634,7 +34649,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
             }
-            cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
+            # from_global_config re-reads the file: memoize only if it still
+            # holds the bytes the key was hashed from (C7 k102).
+            try:
+                import hashlib as _hashlib
+                recheck = _hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                recheck = None
+            if recheck == digest:
+                cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)
         except Exception:
             return cls._empty_honcho_cache_busting_config()

@@ -5726,18 +5726,34 @@ def _can_adopt_home(session_id: str) -> bool:
         return not os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")
 
 
+_HOME_UNREAD = object()
+
+
+def _read_home_session(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row["session_id"] if row is not None else None
+
+
 def record_foreign_action(
-    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor
+    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor,
+    *, home_before: Any = _HOME_UNREAD,
 ) -> None:
     """Append the audit comment for an overridden foreign-session mutation.
 
     An ``--operator`` override records an ``operator_override`` event only:
     no comment, so nothing pages the home session.
+
+    ``home_before`` is the home read BEFORE the guarded mutation ran; the
+    mutation itself may have re-stamped ``tasks.session_id`` (``update
+    --session``), and the audit must name the displaced home (C7 k103).
     """
     sess = ", ".join(actor.session_ids) or "no-session"
-    home_row = conn.execute(
-        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
+    prev_home = (
+        _read_home_session(conn, task_id)
+        if home_before is _HOME_UNREAD else home_before
+    )
     if actor.operator:
         last = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -5766,11 +5782,10 @@ def record_foreign_action(
                     "reason": actor.operator,
                     "by_sessions": list(actor.session_ids),
                     "by_profile": actor.profile,
-                    "home": (home_row["session_id"] if home_row is not None else None),
+                    "home": prev_home,
                 },
             )
         return
-    prev_home = home_row["session_id"] if home_row is not None else None
     new_home = (
         actor.session_ids[0]
         if action in REHOME_ON_TAKEOVER_ACTIONS
@@ -5846,13 +5861,19 @@ def _home_session_guarded(action: str, task_param: str = "task_id"):
                 return fn(conn, *args, **kwargs)
             task_id = sig.bind_partial(conn, *args, **kwargs).arguments.get(task_param)
             override = check_home_session(conn, str(task_id), action)
+            home_before = (
+                _read_home_session(conn, str(task_id))
+                if override is not None else _HOME_UNREAD
+            )
             token = _MUTATION_ACTOR.set(None)
             try:
                 result = fn(conn, *args, **kwargs)
             finally:
                 _MUTATION_ACTOR.reset(token)
             if override is not None and _mutation_succeeded(result):
-                record_foreign_action(conn, str(task_id), action, override)
+                record_foreign_action(
+                    conn, str(task_id), action, override, home_before=home_before
+                )
             return result
 
         wrapper.__home_session_action__ = action
@@ -8480,7 +8501,7 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
             pid = int(payload["pid"])
         except (TypeError, ValueError, KeyError):
             continue
-        token = payload.get("start_token") if isinstance(payload, dict) else None
+        token = _spawn_start_token(payload)
         candidates.append((pid, spawned["run_id"] is None,
                            spawned["created_at"], token))
     for pid, late, spawned_at, token in candidates:
@@ -8545,6 +8566,36 @@ def _pid_start_token(pid: int) -> Optional[float]:
         return float(psutil.Process(int(pid))._proc.create_time(monotonic=True))
     except Exception:  # optional psutil, private-API drift, or process gone
         return None
+
+
+def _boot_id() -> Optional[str]:
+    """This boot's identity, or None where the start token is not boot-relative.
+
+    A Linux start token is /proc starttime ticks SINCE BOOT, so after a reboot a
+    new process at a reused PID can carry the very token a pre-boot worker
+    recorded. The ``spawned`` event stamps this id next to the token so a token
+    from another boot is never read as identity (C7 k109).
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _spawn_start_token(payload: Any) -> Any:
+    """The ``start_token`` a ``spawned`` payload recorded, if still meaningful.
+
+    A token stamped under a different boot proves nothing about a live PID
+    now, so it is dropped and the causal-window check decides instead.
+    """
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("start_token")
+    recorded_boot = payload.get("boot_id")
+    if token is not None and recorded_boot and recorded_boot != _boot_id():
+        return None
+    return token
 
 
 def _pid_create_time(pid: int) -> Optional[float]:
@@ -8703,7 +8754,7 @@ def _worker_owner_window(
             payload = json.loads(ev["payload"] or "{}")
             if int(payload["pid"]) == int(pid):
                 spawned_at = ev["created_at"]
-                start_token = payload.get("start_token")
+                start_token = _spawn_start_token(payload)
                 break
         except (TypeError, ValueError, KeyError, AttributeError):
             continue
@@ -9924,6 +9975,12 @@ def complete_task(
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
+            # The card's OWN PRs (metadata + --survivor-pr), persisted so a later approval/archive is
+            # gated on them; prose mentions in auto_routed_open_prs are not (FleetReview #1352).
+            own = _open_pr.split_fleet(_open_pr.extract_pr_refs(
+                metadata=metadata, survivor_pr=survivor_pr))[0]
+            # Always written (even []): its presence marks the run as post-#1352 (no legacy fallback).
+            routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):
                 routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
@@ -13192,7 +13249,10 @@ def request_changes(
     try:
         with write_txn(conn):
             ok, detail = _in_txn()
-            if not ok and opened:
+            # A refusal rolls back everything this call wrote: the opened
+            # claim AND a posted coverage comment the gate just rejected
+            # (C7 k107) -- a refused record must not persist on the run.
+            if not ok and (opened or posted):
                 raise _SendBackRefused(detail)
     except _SendBackRefused as exc:
         return False, exc.detail
@@ -15957,12 +16017,17 @@ def _notify_rate_limit_circuit(
         if same_episode and int(prior) >= until:
             return
         seen[pool] = max(int(prior), until) if same_episode else until
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps(seen), encoding="utf-8")
+
+        def _latch() -> None:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(seen), encoding="utf-8")
+
         if same_episode:
+            _latch()
             return  # hold extended; already announced
         script = _kbudget._notify_script_path()
         if script is None:
+            _latch()
             return
         import sys as _sys
         body = (
@@ -15971,10 +16036,14 @@ def _notify_rate_limit_circuit(
             f"Holding {pool} spawns until "
             f"{time.strftime('%H:%M:%S', time.localtime(until))}; other pools unaffected."
         )
-        _kbudget._run_notify([
+        delivered = _kbudget._run_notify([
             _sys.executable, script, "--channel", "discord",
             "--target", _kbudget.RECOVERY_TARGET, "--send", body,
         ])
+        # Latch the episode only once the page went out: a failed send
+        # must be retried on the next tick, not silently swallowed (C7 k105).
+        if delivered is not False:
+            _latch()
     except Exception as exc:
         _log.warning("kanban rate-limit circuit notify failed (%s: %s)", type(exc).__name__, exc)
 
@@ -17681,7 +17750,8 @@ def end_orphaned_terminal_runs(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
         "SELECT r.id, r.task_id, r.worker_pid, r.claim_lock, r.started_at, "
-        "       r.last_heartbeat_at, r.max_runtime_seconds, t.status AS task_status "
+        "       r.last_heartbeat_at, r.max_runtime_seconds, r.metadata, "
+        "       t.status AS task_status "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NULL AND t.status IN ('done', 'archived')"
     ).fetchall()
@@ -17709,6 +17779,13 @@ def end_orphaned_terminal_runs(
             "max_runtime_seconds": limit,
             "now": now,
         }
+        # Merge, never replace: the open run may already carry metadata
+        # (``pool`` from _stamp_run_pool) that the ledger reads (C7 k110).
+        try:
+            prior_meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        except (json.JSONDecodeError, TypeError):
+            prior_meta = {}
+        run_meta = {**prior_meta, **payload} if isinstance(prior_meta, dict) else payload
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE task_runs SET status = 'reclaimed', outcome = ?, "
@@ -17718,7 +17795,7 @@ def end_orphaned_terminal_runs(
                 (
                     ORPHANED_TERMINAL_TASK_OUTCOME,
                     f"run left open on a {row['task_status']} card; ended by reaper",
-                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(run_meta, ensure_ascii=False),
                     now,
                     run_id,
                 ),
@@ -18845,6 +18922,9 @@ def _set_worker_pid(
     start_token = _pid_start_token(int(pid))
     if start_token is not None:
         spawn_payload["start_token"] = start_token
+        boot_id = _boot_id()
+        if boot_id:
+            spawn_payload["boot_id"] = boot_id
     if pool is not None:
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool

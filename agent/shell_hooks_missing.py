@@ -27,6 +27,7 @@ import logging
 import os
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -111,17 +112,19 @@ def _sparse_note(root: Path) -> str:
 def _publish_absent(dest: Path, data: bytes, mode: int) -> bool:
     """Atomically create ``dest`` only if it does not exist; never a partial file, never a clobber.
 
-    The bytes go to a temp file in the same directory, which is then hard-linked into place.
-    ``os.link`` refuses an existing destination (including a dangling symlink), so a file
-    that appeared since the absence check is left untouched.
+    The bytes go to an exclusively created, unpredictably named temp file in the same
+    directory (``mkstemp``: ``O_CREAT|O_EXCL``, so a planted symlink is never followed), which
+    is then hard-linked into place. ``os.link`` refuses an existing destination (including a
+    dangling symlink), so a file that appeared since the absence check is left untouched.
     """
-    tmp = dest.with_name(f".{dest.name}.hook-restore-{os.getpid()}-{threading.get_ident()}")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.hook-restore-", dir=dest.parent)
+    tmp = Path(tmp_name)
     try:
-        with open(tmp, "wb") as fh:
+        with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
+            os.chmod(tmp, mode)  # path chmod (os.fchmod is absent on Windows <3.13), before fsync so the link publishes a durable mode
             os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
         try:
             os.link(tmp, dest)
         except FileExistsError:
