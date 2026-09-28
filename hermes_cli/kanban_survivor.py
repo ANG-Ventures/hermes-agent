@@ -1528,6 +1528,43 @@ def _base(repo, published):
     return min(candidates)[1]
 
 
+def _recorded_base(repo, recorded, published, base):
+    """``recorded`` when it is a safe, NEWER base than ``base``; else ``base``.
+
+    ``_base`` can only rank published heads present in the local object store.
+    When a remote branch has moved past what this checkout fetched, its tip
+    is absent and the nearest ranked head can be far older than the fork
+    point, so the patch drags in the published history between them
+    (t_93fba703: 111 files, 5.2 MB for a one-file card). The recorded base
+    (HEAD at dispatch) is the fork point. It is used only when it is
+    ``base`` or a descendant of it, an ancestor of HEAD, and contained in the
+    local remote-tracking ref of a branch the durable remote still advertises
+    -- a recoverer can then fetch it from that branch. Otherwise nothing changes.
+    """
+    if not recorded or recorded == base:
+        return base
+    if not _present_commits(repo, [recorded]):
+        return base
+    if _git(repo, "merge-base", "--is-ancestor", recorded, "HEAD", check=False).returncode:
+        return base
+    if base is not None and _git(repo, "merge-base", "--is-ancestor", base, recorded,
+                                 check=False).returncode:
+        return base
+    tracked = []
+    for ref in published:
+        name = f"refs/remotes/{ref['remote']}/{ref['branch']}"
+        sha = _git(repo, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}", check=False)
+        if sha.returncode == 0:
+            tracked.append(sha.stdout.decode().strip())
+    tracked = _present_commits(repo, sorted(set(tracked)))
+    if not tracked:
+        return base
+    walked = _rev_list(repo, recorded, tracked)
+    if walked.returncode or walked.stdout.strip():
+        return base
+    return recorded
+
+
 def _snapshot(repo, base, prefix, *, irreversible_delete=False):
     """A bundle when ``base`` is None, else a binary patch against ``base``.
 
@@ -1584,11 +1621,12 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
 _SNAPSHOT_TIMEOUT = 300
 
 
-def _capture(repo, key, workspace):
+def _capture(repo, key, workspace, recorded=None):
     """One repository's survivor material: (remote ref, base, snapshot bytes).
 
     Extracted verbatim from `preserve`'s loop so the object-reading steps sit
-    inside a single `try` the caller can classify. Behaviour is unchanged.
+    inside a single `try` the caller can classify. ``recorded`` is the
+    repository's dispatch-time base from `bases` (see `_recorded_base`).
     """
     storage_cache = {}
     published = list(_published_refs(repo, workspace, storage_cache))
@@ -1611,7 +1649,7 @@ def _capture(repo, key, workspace):
                 })
         if ref:
             return ref, None, None
-    base = _base(repo, published)
+    base = _recorded_base(repo, recorded, published, _base(repo, published))
     prefix = "" if key == "." else key + "/"
     return None, base, _snapshot(repo, base, prefix)
 
@@ -2840,7 +2878,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 refs.append(dict(stub_ref, repository=key))
                 continue
             try:
-                ref, base, data = _capture(repo, key, workspace)
+                ref, base, data = _capture(repo, key, workspace, (bases or {}).get(key))
                 irreversible = False
                 if base is not None and data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
                     # Only deleted-file preimages are dropped, and those are
