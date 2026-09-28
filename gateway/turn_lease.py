@@ -155,6 +155,7 @@ class TurnLeaseToken:
         "generation",
         "released",
         "tool_name_hint",
+        "owner_task",
     )
 
     def __init__(
@@ -171,6 +172,11 @@ class TurnLeaseToken:
         # PHASE=stale_lease_holder detector can name the tool this turn is
         # parked in. Diagnostic only; never read on any correctness path.
         self.tool_name_hint: Optional[Callable[[], Optional[str]]] = None
+        # Optional: the asyncio task whose ``finally`` releases this token, set
+        # by the dispatch layer. Once that task is done() nothing can release
+        # the token any more, so a waiter may reclaim it
+        # (``_reclaim_dead_holder``). None = never reclaimed (standalone use).
+        self.owner_task: Optional["asyncio.Task[Any]"] = None
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
@@ -286,6 +292,53 @@ class SessionTurnLeaseRegistry:
             logger.debug("turn lease currency predicate failed", exc_info=True)
             return False
 
+    def is_holder(self, token: Optional[TurnLeaseToken]) -> bool:
+        """True when ``token`` is the current holder of its session's lease."""
+        if token is None:
+            return False
+        lease = self._leases.get(token.session_id)
+        return lease is not None and lease.holder is token
+
+    def _reclaim_dead_holder(
+        self,
+        session_id: str,
+        lease: _SessionLease,
+        token: TurnLeaseToken,
+    ) -> bool:
+        """Hand a lease whose holder's task is done() to ``token``.
+
+        A holder releases only from its own task's ``finally``. When that task
+        is already done() and the token is still the holder, the release was
+        skipped (e.g. a CancelledError landing on an await in the finally,
+        2026-09-27) and nothing will ever free it. The lock stays locked and
+        ownership moves to ``token``; queued waiters keep waiting on the same
+        lock. Refused while the holder's task is still running.
+        """
+        holder = lease.holder
+        task = getattr(holder, "owner_task", None) if holder is not None else None
+        if holder is None or task is None or not task.done():
+            return False
+        if not lease.lock.locked():
+            return False
+        held = time.time() - lease.acquired_at if lease.acquired_at else -1.0
+        logger.warning(
+            "PHASE=turn_lease_reclaimed session=%s key=%s gen=%s held=%.0fs "
+            "new_key=%s new_gen=%s: the holder's task finished without "
+            "releasing the turn lease",
+            session_id,
+            holder.owner_key,
+            holder.generation,
+            held,
+            token.owner_key,
+            token.generation,
+        )
+        holder.released = True
+        lease.holder = token
+        lease.acquired_at = time.time()
+        lease.last_used = lease.acquired_at
+        lease.stale_logged = False
+        return True
+
     def _log_stale_holder(
         self,
         session_id: str,
@@ -350,6 +403,9 @@ class SessionTurnLeaseRegistry:
         token = TurnLeaseToken(session_id, owner_key, int(generation))
         lease = self._get_or_create(session_id)
 
+        if self._reclaim_dead_holder(session_id, lease, token):
+            return token
+
         if lease.lock.locked():
             holder = lease.holder
             held = time.time() - lease.acquired_at if lease.acquired_at else -1.0
@@ -363,7 +419,7 @@ class SessionTurnLeaseRegistry:
                     "key %s (gen %s) is waiting behind routing key %s "
                     "(gen %s, held %.0fs) whose generation was already "
                     "invalidated — that turn was stopped and is still "
-                    "draining a tool call, so this is NOT alias-key "
+                    "draining (tool=%s), so this is NOT alias-key "
                     "contention; waiting at most %.0fs before rejecting",
                     session_id,
                     owner_key,
@@ -371,6 +427,7 @@ class SessionTurnLeaseRegistry:
                     holder.owner_key,
                     holder.generation,
                     held,
+                    _holder_tool_name(holder) or "none",
                     wait,
                 )
                 self._log_stale_holder(session_id, lease, holder, held)
@@ -382,6 +439,7 @@ class SessionTurnLeaseRegistry:
                         generation=holder.generation,
                         held_seconds=held,
                         wait_seconds=wait,
+                        tool_name=_holder_tool_name(holder),
                     )
             else:
                 logger.warning(
@@ -407,6 +465,8 @@ class SessionTurnLeaseRegistry:
         try:
             await asyncio.wait_for(lease.lock.acquire(), timeout=wait)
         except asyncio.TimeoutError:
+            if self._reclaim_dead_holder(session_id, lease, token):
+                return token
             holder = lease.holder
             logger.error(
                 "turn lease wait timed out after %.0fs on session %s "
