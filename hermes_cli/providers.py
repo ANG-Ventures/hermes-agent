@@ -600,8 +600,11 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     return None
 
 
-def get_label(provider_id: str) -> str:
-    """Get a human-readable display name for a provider."""
+def get_label(provider_id: str, *, allow_network: bool = True) -> str:
+    """Get a human-readable display name for a provider.
+
+    ``allow_network=False`` never fetches models.dev (a cold cache falls back
+    to the canonical id); see ``switch_model(probe_catalog=False)``."""
     canonical = normalize_provider(provider_id)
 
     # Check label overrides first
@@ -609,7 +612,7 @@ def get_label(provider_id: str) -> str:
         return _LABEL_OVERRIDES[canonical]
 
     # Try models.dev
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical) if allow_network else get_provider(canonical, allow_network=False)
     if pdef:
         return pdef.name
 
@@ -777,7 +780,9 @@ def nous_api_mode(model: str = "") -> str:
     return "chat_completions"
 
 
-def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> str:
+def determine_api_mode(
+    provider: str, base_url: str = "", model: str = "", *, allow_network: bool = True
+) -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 
     Resolution order:
@@ -802,7 +807,7 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     if provider_norm in {"nous", "nous-portal", "nousresearch"}:
         return nous_api_mode(model)
 
-    pdef = get_provider(provider)
+    pdef = get_provider(provider) if allow_network else get_provider(provider, allow_network=False)
     if pdef is not None:
         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
 

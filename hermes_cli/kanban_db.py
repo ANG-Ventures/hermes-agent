@@ -16223,6 +16223,12 @@ def cooling_providers(
                 continue
             if not isinstance(payload, dict) or payload.get("rate_limited") is not True:
                 continue
+            # A runtime-stage refusal is one mid-turn 429 on a pinned (often
+            # pooled) provider; the worker keeps retrying it. Only an auth-stage
+            # refusal (the provider was unusable at startup) cools the provider
+            # (FleetReview #1198). Legacy events without a stage were auth.
+            if payload.get("stage", "auth") != "auth":
+                continue
             provider = payload.get("provider")
             if not isinstance(provider, str) or not provider.strip():
                 continue

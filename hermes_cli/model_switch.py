@@ -1941,7 +1941,7 @@ def switch_model(
                     is_global=is_global,
                     error_message=(
                         f"Provider '{_explicit_norm}' is an alias that routes "
-                        f"through {get_label(target_provider)}, which "
+                        f"through {get_label(target_provider, allow_network=probe_catalog)}, which "
                         f"has no credentials configured.{_hint}"
                     ),
                 )
@@ -2191,7 +2191,7 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    provider_label = get_label(target_provider, allow_network=probe_catalog)
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
@@ -2259,7 +2259,7 @@ def switch_model(
         elif target_provider == "custom" and current_base_url:
             api_key = current_api_key
             base_url = current_base_url
-            api_mode = determine_api_mode(target_provider, base_url)
+            api_mode = determine_api_mode(target_provider, base_url, allow_network=probe_catalog)
         else:
             try:
                 runtime = resolve_runtime_provider(
@@ -2318,7 +2318,7 @@ def switch_model(
             # provider, causing validation to probe the wrong model-list URL.
             api_key = current_api_key or "no-key-required"
             base_url = current_base_url
-            api_mode = determine_api_mode(current_provider, base_url)
+            api_mode = determine_api_mode(current_provider, base_url, allow_network=probe_catalog)
             validation_headers = ollama_headers
         else:
             try:
@@ -2394,7 +2394,7 @@ def switch_model(
     if _mandated_mode is not None:
         api_mode = _mandated_mode
     elif not api_mode:
-        api_mode = determine_api_mode(target_provider, base_url)
+        api_mode = determine_api_mode(target_provider, base_url, allow_network=probe_catalog)
 
     # --- Normalize model name for target provider ---
     new_model = _resolve_named_custom_model_id(
@@ -2564,7 +2564,7 @@ def switch_model(
     # --- Determine api_mode if not already set ---
     if not api_mode:
         api_mode = determine_api_mode(
-            target_provider, base_url, model=new_model
+            target_provider, base_url, model=new_model, allow_network=probe_catalog
         )
 
     # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the

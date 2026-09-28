@@ -5191,6 +5191,10 @@ def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     return not final_response or final_response == error_text
 
 
+#: Sentinel: clear whatever resume mark is present (legacy callers).
+_ANY_RESUME_MARK = object()
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -14558,7 +14562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             entry["armed"] = False
             counts[session_key] = entry
 
-    def _apply_post_turn_resume_gate(self, session_key: str) -> None:
+    def _apply_post_turn_resume_gate(self, session_key: str, *, marked_at=_ANY_RESUME_MARK) -> None:
         """Post-(clean-turn) replay-loop gate for the F2 circuit-breaker.
 
         Called when a turn completed cleanly enough to clear ``resume_pending``.
@@ -14605,9 +14609,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             deferred = False
+        _clear_kw = {} if marked_at is _ANY_RESUME_MARK else {"marked_at": marked_at}
         if deferred:
             getattr(self, "_session_initiated_restart", {}).pop(session_key, None)
-            self.session_store.clear_resume_pending(session_key)
+            self.session_store.clear_resume_pending(session_key, **_clear_kw)
             return
 
         flag = bool(
@@ -14625,7 +14630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the two must not leave a set marker beside a zeroed counter, which
         # would hand the session a whole extra budget of unattended replays.
         try:
-            self.session_store.clear_resume_pending(session_key)
+            self.session_store.clear_resume_pending(session_key, **_clear_kw)
         except Exception as exc:
             logger.debug("clear_resume_pending failed for %s: %s", session_key, exc)
         if initiated_restart:
@@ -26749,7 +26754,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _hyg_old_sid = session_entry.session_id
                                 try:
                                     _hyg_session_row = await self._session_db.get_session(
-                                        session_entry.session_id
+                                        _hyg_old_sid
                                     )
                                 except Exception as exc:
                                     _hyg_session_row = None
@@ -26796,7 +26801,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         quiet_mode=True,
                                         skip_memory=not _hyg_checkpoint_required,
                                         enabled_toolsets=["memory"],
-                                        session_id=session_entry.session_id,
+                                        # The snapshot, never the live entry: this
+                                        # runs in a worker thread after awaits, and
+                                        # a /new or rotation can move
+                                        # session_entry.session_id meanwhile
+                                        # (FleetReview #976).
+                                        session_id=_hyg_old_sid,
                                         session_db=_hyg_session_db,
                                     )
                                     _seed_hygiene_system_prompt(_a, _hyg_session_row)
@@ -27711,6 +27721,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            # The resume mark this turn recovers from. A mark written while the
+            # turn runs (a concurrent shutdown drain) is newer and must survive
+            # the post-turn clear (FleetReview #1043).
+            _run_start_resume_marked_at = getattr(session_entry, "last_resume_marked_at", None)
             # Same rule as the context-prompt pin: an internal event reuses
             # the last human turn's channel_prompt / parent_chat_id, which
             # its rebuilt source lacks, so combined_ephemeral cannot toggle.
@@ -27828,7 +27842,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
-                await asyncio.to_thread(self._apply_post_turn_resume_gate, session_key)
+                await asyncio.to_thread(
+                    self._apply_post_turn_resume_gate, session_key,
+                    marked_at=_run_start_resume_marked_at,
+                )
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
