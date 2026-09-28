@@ -127,6 +127,11 @@ def test_approval_from_review_is_not_rerouted(conn, armed):
     "the relay could notify Apollo, so wired it",
     "you could note the SHA; landed as a682b93c",
     "CANNOT_DEPLOYED_FLAG untouched",  # substring of a longer identifier
+    "merged; t_x unblocked on main",
+    "the probe could notice the drift; fixed",
+    "no STOP finding; admission measured 39 legs",
+    "no longer blocked on bpx#288; landed",
+    "could not reproduce the flake in 50 runs; closing as green",
 ])
 def test_phrases_need_word_boundaries(text):
     assert neg.match([text]) is None
@@ -209,3 +214,33 @@ def test_refused_route_leaves_no_orphan_copies(conn, armed):
     att_dir = kb.task_attachments_dir(tid)
     assert not att_dir.exists() or list(att_dir.iterdir()) == []
     assert artifact.exists()
+
+
+def test_routed_handoff_keeps_summary_and_result(conn, armed):
+    tid = _claimed(conn)
+    details = "journal_legs=39 legs_total=0; root cause: x-hermes-lane not forwarded"
+    assert kb.complete_task(conn, tid, summary=STOP_FINDING,
+                            result=details, metadata={"no_pr": True})
+    assert _status(conn, tid)["status"] == "review"
+    routed = kb.latest_run(conn, tid)
+    assert STOP_FINDING in routed.summary and details in routed.summary
+
+
+def test_claimed_review_approval_is_not_rerouted(conn, armed):
+    tid = _claimed(conn)
+    assert kb.complete_task(conn, tid, summary=NOT_DEPLOYED, metadata={"outcome": "partial"})
+    assert _status(conn, tid)["status"] == "review"
+    review = kb.claim_review_task(conn, tid)
+    assert review is not None and _status(conn, tid)["status"] == "running"
+    # The claimed approval quotes the negative handoff and keeps outcome=partial.
+    assert kb.complete_task(conn, tid, summary=NOT_DEPLOYED, metadata={"outcome": "partial"},
+                            expected_run_id=review.current_run_id)
+    assert _status(conn, tid)["status"] == "done"
+
+
+def test_negative_route_promotes_prose_named_artifact(conn, armed):
+    tid, ws, artifact = _scratch_task(conn)
+    assert kb.complete_task(conn, tid, summary=f"{STOP_FINDING} Readout: {artifact}",
+                            metadata={"no_pr": True})
+    assert _status(conn, tid)["status"] == "review"
+    _assert_artifact_survives_bare_approval(conn, tid, ws, artifact)

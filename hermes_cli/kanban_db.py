@@ -10620,8 +10620,11 @@ def complete_task(
             routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):
                 routed_meta["handoff_freshness"] = freshness
-            routed_summary = "\n".join(filter(None, [note, summary or result]))
-            routed_meta, staged = _stage_routed_scratch_artifacts(conn, task_id, routed_meta)
+            from hermes_cli import kanban_negative_handoff as _neg
+            routed_summary = _neg.routed_summary(note, summary, result)
+            routed_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, routed_meta, summary=summary, result=result,
+            )
             ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
                 expected_run_id=expected_run_id, force=True, with_reason=True,
@@ -10650,17 +10653,29 @@ def complete_task(
     # Negative-handoff gate (t_4209baaa): a handoff that SAYS it did not land
     # ("NOT DEPLOYED", "STOP finding", outcome=partial, ...) is Needs-Apollo,
     # not done (t_d0aee724, t_b6eb2944). Default-off: kanban.negative_handoff_review.
-    if candidate.status != 'review' and not approve_head_sha and not superseded_by:
+    # A human/reviewer who claimed the parked card (review -> running) and now
+    # approves it is not an implementer handoff either, even if the approval
+    # quotes the negative summary (FleetReview #1447, t_daa1f3bf).
+    review_claimed = (
+        candidate.status == "running"
+        and candidate.current_run_id is not None
+        and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
+    )
+    if (
+        candidate.status != 'review' and not review_claimed
+        and not approve_head_sha and not superseded_by
+    ):
         from hermes_cli import kanban_negative_handoff as _neg
         trigger = _neg.match(_neg.handoff_texts(summary, result), metadata)
         if trigger and configured_negative_handoff_review():
             note = _neg.route_note(trigger)
             routed_meta, staged = _stage_routed_scratch_artifacts(
                 conn, task_id, dict(metadata or {}, negative_handoff=trigger),
+                summary=summary, result=result,
             )
             ok, route_reason = request_review(
                 conn, task_id,
-                summary="\n".join(filter(None, [note, summary or result])),
+                summary=_neg.routed_summary(note, summary, result),
                 metadata=routed_meta,
                 reviewer=_neg.REVIEWER, expected_run_id=expected_run_id,
                 force=True, with_reason=True,
@@ -11085,6 +11100,9 @@ def _stage_routed_scratch_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
 ) -> tuple[dict, list[str]]:
     """Copy declared scratch artifacts out before a completion is routed to review.
 
@@ -11095,7 +11113,10 @@ def _stage_routed_scratch_artifacts(
     carries the attachment paths; :func:`_settle_routed_scratch_artifacts`
     registers them once the route lands.
     """
-    staged_meta = dict(metadata)
+    # Same order as the done path: promote prose-named scratch files first.
+    staged_meta = dict(_merge_completion_prose_artifacts(
+        conn, task_id, dict(metadata), summary=summary, result=result,
+    ) or {})
     _persist_scratch_completion_artifacts(conn, task_id, staged_meta)
     return staged_meta, list(staged_meta.pop("_staged_artifacts", []))
 

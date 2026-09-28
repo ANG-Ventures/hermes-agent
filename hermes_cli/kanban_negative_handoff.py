@@ -20,11 +20,16 @@ REVIEWER = "human:apollo"
 SETTING = "negative_handoff_review"
 
 # Word-bounded on both sides: "unblocked once" / "could notify" are positive
-# handoffs, not "blocked on" / "could not" (FleetReview #1447, t_daa1f3bf).
+# handoffs, not "blocked on" / "could not". A negated phrase ("no STOP
+# finding", "no longer blocked on") is positive too, and "could not
+# reproduce" is the usual wording of a clean flake verdict
+# (FleetReview #1447, t_daa1f3bf).
+_NEGATED = r"(?<!\bno\s)(?<!\bnot\s)(?<!\bnever\s)(?<!\blonger\s)(?<!\bwithout\s)"
 PHRASES = re.compile(
-    r"\b(?:NOT\s+DEPLOYED"
+    _NEGATED
+    + r"\b(?:NOT\s+DEPLOYED"
     r"|STOP\s+finding"
-    r"|could\s+not"
+    r"|could\s+not(?!\s+reproduce)"
     r"|blocked\s+on"
     r"|nothing\s+was\s+(?:armed|measured))\b",
     re.IGNORECASE,
@@ -55,6 +60,15 @@ def match(texts: Iterable[Optional[str]], metadata: Optional[dict] = None) -> Op
         if isinstance(outcome, str) and outcome.strip().casefold() in PARTIAL_OUTCOMES:
             return f"outcome={outcome.strip()}"
     return None
+
+
+def routed_summary(note: str, summary: Optional[str], result: Optional[str]) -> str:
+    """The review handoff keeps the note, the summary AND the result (deduped)."""
+    parts: list[str] = [note]
+    for text in (summary, result):
+        if text and text.strip() and text not in parts:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def route_note(trigger: str) -> str:
