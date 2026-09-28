@@ -102,6 +102,19 @@ def test_ledger_admits_a_plan_that_names_blacksmith():
     assert sum(1 for j in row["jobs"] if j["labels"] == BLACKSMITH) == 2
 
 
+@pytest.mark.parametrize("daily_limit,expected", [(6000, 3), (195, 0), (230, 1)])
+def test_ledger_summary_counts_only_admitted_blacksmith_jobs(daily_limit, expected):
+    """Admission can demote a planned Blacksmith job to POOL; the committed summary must not still count it."""
+    api = _Contents()
+    led = Ledger(api, daily_limit=daily_limit, clock=lambda: datetime(2026, 9, 28, 1, tzinfo=timezone.utc))
+    res = led.reserve((1, 2, 1), decide(bs=3))
+    assert getattr(res, "reason", None) is None, res
+    admitted = sum(1 for j in res.plan.jobs if j.labels == BLACKSMITH)
+    assert admitted == expected
+    assert res.plan.summary["blacksmith"] == expected
+    assert next(iter(api.state["attempts"].values()))["plan"]["summary"]["blacksmith"] == expected
+
+
 def _record(p, matrix):
     jobs = [{"job_id": j.job_id, "labels": j.labels, "reason": j.reason, "reserved_minutes": j.reserved_minutes}
             for j in p.jobs]

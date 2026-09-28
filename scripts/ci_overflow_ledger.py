@@ -294,7 +294,9 @@ class Ledger:
                 else:
                     jobs.append(job)
             summary = dict(plan.summary)
+            # blacksmith recounted from the ADMITTED jobs: a demoted Blacksmith job is now POOL (t_66370599).
             summary.update(remaining_allowance=remaining, reserved_minutes=sum(j.reserved_minutes for j in jobs),
+                           blacksmith=sum(1 for j in jobs if j.labels == BLACKSMITH),
                            budget_overrides_cloud_only=any(j.reason == "budget-overrides-cloud-only" for j in jobs))
             if estimating:
                 summary.update(admission_estimate=dict(cost, headroom=self.headroom, samples={
