@@ -82,9 +82,14 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
+# ``review_requested``: a ready card handed straight to review leaves the
+# ready-lane guard behind; its old hold is history, not the review hold.
 _GUARD_DISPLAY_RESET_KINDS = frozenset(
-    {"claimed", "spawned", *kb._RESPAWN_GUARD_FAILURE_RESET_KINDS}
+    {"claimed", "spawned", "review_requested", *kb._RESPAWN_GUARD_FAILURE_RESET_KINDS}
 )
+# Guard reasons the review lane never records (it skips ``active_pr``), so a
+# review card showing one would be displaying a stale ready-lane hold.
+_READY_ONLY_GUARD_REASONS = frozenset({"active_pr"})
 
 
 def _fmt_current_respawn_guard(status: str, events) -> str:
@@ -107,6 +112,8 @@ def _fmt_current_respawn_guard(status: str, events) -> str:
     if held is None:
         return ""
     payload = held.payload if isinstance(held.payload, dict) else {}
+    if status == "review" and payload.get("reason") in _READY_ONLY_GUARD_REASONS:
+        return ""
     line = str(payload.get("reason") or "?")
     pr = payload.get("pr")
     if pr:
