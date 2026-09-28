@@ -2793,7 +2793,11 @@ def _clear_scan_started(
 
 
 def _run_background_integrity_scan(
-    db_path: str, spec: ExternalContentFtsSpec, started_at: float, deep: bool = True
+    db_path: str,
+    spec: ExternalContentFtsSpec,
+    started_at: float,
+    deep: bool = True,
+    parity: bool = True,
 ) -> None:
     """Daemon-thread body: deep-check ``spec`` on a private connection.
 
@@ -2819,7 +2823,9 @@ def _run_background_integrity_scan(
             # (longer) interval is due.
             if _fts_needs_rebuild_structural(scan_conn, spec):
                 result = {"status": "fail", "detail": _SCAN_DETAIL_STRUCTURAL}
-            elif _fts_count_parity_mismatch(scan_conn, spec):
+            elif parity and _fts_count_parity_mismatch(scan_conn, spec):
+                # Only when ITS interval is due: a deep-only dispatch must not
+                # run the O(rows) COUNTs (``<0`` = never on startup, #45).
                 result = {"status": "fail", "detail": _SCAN_DETAIL_PARITY}
             elif deep:
                 result = check_external_content_fts_integrity(scan_conn, spec)
@@ -2832,7 +2838,7 @@ def _run_background_integrity_scan(
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             status = result.get("status")
-            if status in ("pass", "parity_pass", "fail"):
+            if parity and status in ("pass", "parity_pass", "fail"):
                 _record_parity_checked(meta_conn, spec, now=started_at)
             if status == "pass":
                 _record_integrity_checked(meta_conn, spec, now=started_at)
@@ -2894,6 +2900,7 @@ def _dispatch_background_integrity_scan(
     *,
     now: float | None = None,
     deep: bool = True,
+    parity: bool = True,
 ) -> bool:
     """Try to run the deep FTS integrity-check on a daemon thread.
 
@@ -2941,7 +2948,7 @@ def _dispatch_background_integrity_scan(
 
         thread = threading.Thread(
             target=_run_background_integrity_scan,
-            args=(db_path, spec, current, deep),
+            args=(db_path, spec, current, deep, parity),
             name=f"lcm-fts-integrity-{spec.table_name}",
             daemon=True,
         )
@@ -3006,13 +3013,16 @@ def _fts_needs_rebuild(
     if not parity_due and not deep_due:
         return False
     if _background_integrity_enabled():
-        if _dispatch_background_integrity_scan(conn, spec, now=now, deep=deep_due):
+        if _dispatch_background_integrity_scan(
+            conn, spec, now=now, deep=deep_due, parity=parity_due
+        ):
             return False
     # Kill-switch / non-file DB: synchronous fallback, still marker-throttled.
-    if _fts_count_parity_mismatch(conn, spec):
+    if parity_due:
+        if _fts_count_parity_mismatch(conn, spec):
+            _record_parity_checked(conn, spec, now=now)
+            return True
         _record_parity_checked(conn, spec, now=now)
-        return True
-    _record_parity_checked(conn, spec, now=now)
     if not deep_due:
         return False
     result = check_external_content_fts_integrity(conn, spec)
