@@ -2518,6 +2518,11 @@ class _AnthropicCompletionsAdapter:
         if _opts and hasattr(_client, "with_options"):
             try:
                 _client = _client.with_options(**_opts)
+                # The SDK copy re-reads ANTHROPIC_API_KEY when api_key is
+                # None; a bearer-only client must stay bearer-only or the
+                # Anthropic key is sent to a non-Anthropic endpoint.
+                if getattr(self._client, "api_key", "") is None:
+                    _client.api_key = None
             except Exception:
                 _client = self._client  # never break the call over an options quirk
 

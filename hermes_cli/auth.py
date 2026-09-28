@@ -9282,15 +9282,42 @@ def kimi_oauth_token_sha256(token: Any) -> Optional[str]:
     return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
 
 
+def _kimi_jwt_device_id(token: Any) -> Optional[str]:
+    if not isinstance(token, str) or token.count(".") != 2:
+        return None
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(part.encode()).decode())
+    except Exception:
+        return None
+    value = claims.get("device_id") if isinstance(claims, dict) else None
+    return str(value) if value else None
+
+
 def kimi_oauth_login_issued_token(token: Any) -> bool:
-    """True when *token* is (or was) an access token of the stored kimi-oauth login."""
+    """True when *token* is (or was) an access token of the stored kimi-oauth login.
+
+    Matches the current token, an earlier one in the hash history, or any
+    token bound to this host's login ``device_id``. Kimi puts the device id
+    the client sent into every access token it issues, and re-login keeps
+    it, so a session holding a token older than the history (or from before
+    a re-login) still routes to the managed login. The device id is a random
+    uuid stored only in auth.json (0600); knowing it already means read
+    access to the login's tokens, unlike the public client_id or user_id.
+    """
     digest = kimi_oauth_token_sha256(token)
     if digest is None:
         return False
     state = get_provider_auth_state("kimi-oauth") or {}
+    if not (state.get("access_token") or state.get("refresh_token")):
+        return False
     if kimi_oauth_token_sha256(state.get("access_token")) == digest:
         return True
-    return digest in (state.get("issued_access_sha256") or [])
+    if digest in (state.get("issued_access_sha256") or []):
+        return True
+    stored_device = str(state.get("device_id") or "")
+    return bool(stored_device) and _kimi_jwt_device_id(token) == stored_device
 
 
 def _kimi_state_from_token_payload(
@@ -9447,7 +9474,10 @@ def _kimi_oauth_login(
             sleep=sleep,
         )
 
-    base = {k: v for k, v in prior.items() if k in ("inference_base_url", "label")}
+    # access_token/issued_access_sha256 carry the hash history across a
+    # re-login (the prior token's digest is appended, never stored raw).
+    base = {k: v for k, v in prior.items()
+            if k in ("inference_base_url", "label", "access_token", "issued_access_sha256")}
     base["device_id"] = device_id
     if label:
         base["label"] = label

@@ -515,3 +515,80 @@ def test_static_sk_kimi_key_still_sent_as_x_api_key():
     seen = _capture_messages_headers(build_anthropic_client(key, KIMI_OAUTH_INFERENCE_BASE_URL))
     assert seen["x-api-key"] == key
     assert "authorization" not in seen
+
+
+def _device_jwt(exp: int, *, device_id: str, tag: str) -> str:
+    def enc(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    claims = {"exp": exp, "client_id": KIMI_OAUTH_CLIENT_ID, "jti": tag, "device_id": device_id}
+    return f"{enc({'alg': 'HS256'})}.{enc(claims)}.sig"
+
+
+def test_session_token_outside_history_routes_by_login_device_id(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    state = _logged_in_state(access_ttl=800)
+    _write_store(home, state)
+    exp = int(time.time()) - 3600  # long-expired token a live session still holds
+    mine = _device_jwt(exp, device_id=state["device_id"], tag="day-old")
+    other = _device_jwt(exp, device_id="99999999-2222-4333-8444-555555555555", tag="x")
+    assert _kimi_oauth_token_provider_for(mine) is not None
+    assert _kimi_oauth_token_provider_for(other) is None
+
+
+def test_relogin_keeps_issued_token_history(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    old = _logged_in_state(access_ttl=800, refresh="r-1", access_tag="pre-login")
+    old["issued_access_sha256"] = ["f" * 64]
+    _write_store(home, old)
+    monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
+        (200, {"device_code": "dc", "user_code": "X", "verification_uri": "u", "interval": 1}),
+        (200, {"access_token": _jwt(int(time.time()) + 900, tag="post-login"),
+               "refresh_token": "r-2", "expires_in": 900}),
+    ]))
+    auth_mod._kimi_oauth_login(open_browser=False, sleep=lambda _s: None)
+    history = get_provider_auth_state("kimi-oauth")["issued_access_sha256"]
+    assert "f" * 64 in history
+    assert auth_mod.kimi_oauth_token_sha256(old["access_token"]) in history
+    assert _kimi_oauth_token_provider_for(old["access_token"]) is not None
+
+
+def test_aux_with_options_copy_stays_bearer_only(home, monkeypatch):
+    import httpx
+
+    from agent.auxiliary_client import resolve_provider_client
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-leak")
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    key = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    client, _model = resolve_provider_client("kimi-oauth", "k3", explicit_api_key=key)
+    seen = {}
+
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "k3", "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "ok"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"output_tokens": 1}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    sse = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
+
+    def _handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse.encode())
+
+    client._real_client._client = httpx.Client(transport=httpx.MockTransport(_handler))
+    # timeout forces the adapter's with_options() copy.
+    client.chat.completions.create(
+        model="k3", messages=[{"role": "user", "content": "hi"}], max_tokens=8, timeout=5,
+    )
+    assert seen["authorization"] == f"Bearer {key}"
+    assert "x-api-key" not in seen
