@@ -1490,3 +1490,16 @@ def test_circuit_charges_the_pool_recorded_at_spawn_not_the_current_pin(home):
         conn.execute("UPDATE tasks SET provider_override='claude-bpr' WHERE id=?", (tid,))
         conn.commit()
         assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": now - 50 + 600}
+
+
+def test_pool_budget_pinned_route_honours_an_explicit_probe(pool, bpr):
+    """FleetReview #9: an explicit provider probe takes precedence for a
+    PINNED route too (as in capped_provider). The pinned branch answered 1
+    from the relay's reachability and never read the explicit probe."""
+    pool.eligible = 0
+    bpr.eligible = 7
+    got = ph.pool_budget_eligible("claude-bpx-22", {"claude-bpx-22": pool.url}, {},
+                                  _urls(None, bpr.url))
+    assert got == 0
+    # No explicit probe: the pinned lane still spends one subscription.
+    assert ph.pool_budget_eligible("claude-bpx-22", {}, {}, _urls(None, bpr.url)) == 1
