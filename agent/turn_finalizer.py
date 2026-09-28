@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -1033,29 +1034,58 @@ def emit_session_end(
         # Mark BEFORE invoking: the run_agent forwarder's backstop
         # (emit_unfinalized_session_end) must never fire a second hook for a
         # turn whose finalizer already attempted one.
-        if not provisional:
-            agent._session_end_emitted_turn_id = turn_id
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            provider=getattr(agent, "provider", None) or "",
-            chat_id=getattr(agent, "_chat_id", None) or "",
-            chat_name=getattr(agent, "_chat_name", None) or "",
-            user_message=original_user_message,
-            final_response=final_response,
-            turn_usage=_turn_usage,
-            cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
-        )
+        # The marker check and the hook write are one critical section per
+        # agent: a provisional (shutdown) emit racing the turn's own finalize
+        # must either land first (and be upserted over) or see the real
+        # marker and stand down -- never write interrupted AFTER the real row.
+        with _session_end_lock(agent):
+            if provisional:
+                if getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+                    return False
+            else:
+                agent._session_end_emitted_turn_id = turn_id
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                provider=getattr(agent, "provider", None) or "",
+                chat_id=getattr(agent, "_chat_id", None) or "",
+                chat_name=getattr(agent, "_chat_name", None) or "",
+                user_message=original_user_message,
+                final_response=final_response,
+                turn_usage=_turn_usage,
+                cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
+            )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+    return True
+
+
+_SESSION_END_LOCKS_GUARD = threading.Lock()
+_SESSION_END_FALLBACK_LOCK = threading.RLock()
+
+
+def _session_end_lock(agent):
+    """Per-agent RLock serializing on_session_end emits for that agent."""
+    lock = getattr(agent, "_session_end_emit_lock", None)
+    if lock is not None:
+        return lock
+    with _SESSION_END_LOCKS_GUARD:
+        lock = getattr(agent, "_session_end_emit_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            try:
+                agent._session_end_emit_lock = lock
+            except Exception:
+                return _SESSION_END_FALLBACK_LOCK
+        return lock
 
 
 def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, abandoned_reason=None):
@@ -1130,7 +1160,7 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
             else:
                 reason = "early_return"
                 final_response = res.get("final_response") or ""
-        emit_session_end(
+        emitted = emit_session_end(
             agent,
             turn_id=turn_id,
             effective_task_id=getattr(agent, "_current_task_id", None),
@@ -1143,9 +1173,9 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
             turn_calls=turn_calls,
             provisional=bool(abandoned_reason),
         )
-        if abandoned_reason:
+        if abandoned_reason and emitted:
             agent._session_end_abandoned_turn_id = turn_id
-        return True
+        return bool(emitted)
     except Exception:
         logging.getLogger(__name__).warning(
             "unfinalized on_session_end backstop failed", exc_info=True

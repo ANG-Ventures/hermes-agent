@@ -13998,7 +13998,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         try:
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
-            agents.extend(list(getattr(adapter, "_active_run_agents", {}).values()))
+            # /v1/runs agents AND the _run_agent() turns (session chat, chat
+            # completions, responses) -- same two registries the drain
+            # interrupt walks; the helper de-duplicates by identity.
+            for _reg in ("_active_run_agents", "_shutdown_interruptible_agents"):
+                agents.extend(
+                    a for a in list(getattr(adapter, _reg, {}).values()) if a is not None
+                )
         except Exception:
             pass
         if not agents:

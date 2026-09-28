@@ -183,3 +183,51 @@ def test_api_server_run_agents_are_covered(ledger, monkeypatch):
     asyncio.run(runner._finalize_shutdown_agents({}))
 
     assert _orphan_ids(ledger) == []
+
+
+def test_non_runs_api_server_agents_are_covered(ledger, monkeypatch):
+    from gateway.config import Platform
+
+    tid = "20260928_094807_1b51c4:fb588fe4:b677bdac"
+    _in_flight_call(tid, http_status=200)
+    runner = _runner(monkeypatch, restart=False)
+    agent = _agent(tid)
+    runner.adapters = {Platform.API_SERVER: SimpleNamespace(
+        _active_run_agents={}, _shutdown_interruptible_agents={id(agent): agent})}
+
+    asyncio.run(runner._finalize_shutdown_agents({}))
+
+    assert _orphan_ids(ledger) == []
+
+
+def test_provisional_emit_waiting_on_a_real_finalize_stands_down(ledger, monkeypatch):
+    """Real finalize holds the per-agent emit lock; the shutdown emit must
+    block, then see the real marker and write nothing after the real row."""
+    from agent import turn_finalizer as tf
+
+    fired = []
+    from hermes_cli import lifecycle
+
+    monkeypatch.setattr(lifecycle, "invoke_hook",
+                        lambda name, **kw: fired.append(kw["interrupted"]) or [])
+    tid = "20260927_164338_fe9027:91e688c1:3cf9fd87"
+    agent = _agent(tid)
+    lock = tf._session_end_lock(agent)
+    result = {}
+    with lock:
+        # Real finalize in progress: marker set, hook not yet returned.
+        agent._session_end_emitted_turn_id = tid
+        t = threading.Thread(target=lambda: result.setdefault(
+            "r", tf.emit_abandoned_session_ends([agent], "gateway_restart")))
+        # The pre-lock fast path would skip too; force the in-lock re-check
+        # by clearing the marker the early guard reads, then restoring it
+        # before the lock is released.
+        agent._session_end_emitted_turn_id = None
+        t.start()
+        t.join(0.3)
+        assert t.is_alive(), "provisional emit must wait on the lock"
+        agent._session_end_emitted_turn_id = tid
+    t.join(5)
+    assert result["r"] == 0
+    assert fired == []
+    assert getattr(agent, "_session_end_abandoned_turn_id", None) is None
