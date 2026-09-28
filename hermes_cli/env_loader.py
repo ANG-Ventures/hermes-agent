@@ -98,6 +98,10 @@ def _home_key(home: Path) -> str:
 # (or differ from it), so they keep falling through as before.
 _DOTENV_SEEN: dict[tuple[str, str], set[str]] = {}
 _DOTENV_SEEN_LOCK = threading.Lock()
+# The environment this process inherited, captured before any .env load. A
+# value already exported there did not come from the file, so removing the
+# line cannot revoke it (C3 #1217: value equality alone is not provenance).
+_PROCESS_START_ENV = dict(os.environ)
 
 
 def _env_path_key(path: str | os.PathLike) -> str:
@@ -119,16 +123,17 @@ def dotenv_value_revoked(path: str | os.PathLike, key: str, fallback: str) -> bo
 
     Callers ask this only after ``path`` came back without a non-blank ``key``.
     The fallback is treated as dotenv-sourced (and therefore revoked by the
-    removal) when it equals any value that file carried in this process, or
-    when the file carried an ``op://`` reference whose resolution is what the
-    fallback holds.
+    removal) when it equals a value that file carried in this process, including
+    the recorded resolution of an ``op://`` reference it carried (the resolver
+    notes it). Any other value, e.g. a later secrets.onepassword block or a
+    shell export this process started with, is left alone (C3 #1217).
     """
     fallback = (fallback or "").strip()
-    if not fallback:
+    if not fallback or (_PROCESS_START_ENV.get(key) or "").strip() == fallback:
         return False
     with _DOTENV_SEEN_LOCK:
         seen = set(_DOTENV_SEEN.get((_env_path_key(path), key), ()))
-    return fallback in seen or any(v.startswith("op://") for v in seen)
+    return fallback in seen
 
 
 def _mark_dotenv_loaded(home: Path) -> None:

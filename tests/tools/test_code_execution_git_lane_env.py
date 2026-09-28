@@ -59,3 +59,33 @@ def test_count_mismatch_or_garbage_drops_group():
 def test_secret_git_vars_still_blocked():
     out = _scrub({"GIT_ASKPASS_TOKEN": "x", "GH_TOKEN": "y", "GITHUB_TOKEN": "z"})
     assert out == {} or not {"GIT_ASKPASS_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} & set(out)
+
+
+# -- C3 #1254 ------------------------------------------------------------------------------
+def test_helper_value_with_inline_secret_drops_group():
+    for bad in ("!f() { echo password=hunter2; }; f", "!/usr/bin/helper ghp_abc123DEF456",
+                "store --file=/tmp/creds"):
+        env = _lane_env()
+        env["GIT_CONFIG_VALUE_1"] = bad
+        out = _scrub(env)
+        assert not [k for k in out if k.startswith("GIT_CONFIG_")], bad
+
+
+def test_secondary_profile_gets_its_own_home_and_no_launch_lane(monkeypatch):
+    import hermes_constants
+
+    active = "/home/u/.h/profiles/argus"
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", lambda: active)
+    out = _scrub(_lane_env())
+    assert out["HERMES_HOME"] == active
+    assert not [k for k in out if k.startswith(("GIT_CONFIG_", "GIT_AUTHOR_", "GIT_COMMITTER_"))]
+
+
+def test_launch_profile_override_keeps_lane(monkeypatch):
+    import hermes_constants
+
+    env = _lane_env()
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", lambda: env["HERMES_HOME"])
+    out = _scrub(env)
+    for k, v in env.items():
+        assert out.get(k) == v, k

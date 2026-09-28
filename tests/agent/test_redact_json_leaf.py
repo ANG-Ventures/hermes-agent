@@ -181,3 +181,10 @@ def test_no_serialize_then_redact_text_call_sites():
         "redact serialized JSON per leaf with agent.redact.redact_sensitive_json, "
         f"not redact_sensitive_text(json.dumps(...)): {offenders}"
     )
+
+
+def test_masked_key_collision_keeps_every_value():
+    # C3 #1052: distinct keys that redact to the same text must not overwrite.
+    out = redact_sensitive_json({"PASS=abcdef12": 1, "PASS=ghijkl34": 2}, force=True)
+    assert sorted(out.values()) == [1, 2]
+    assert "abcdef12" not in repr(out) and "ghijkl34" not in repr(out)

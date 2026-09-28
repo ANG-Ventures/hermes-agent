@@ -142,6 +142,25 @@ def test_router_dispatch_prefs_to_mem0_world_to_staged(tmp_path):
     assert not os.path.exists(str(tmp_path / "inbox"))
 
 
+@pytest.mark.parametrize("staging_mode", [True, False])
+def test_router_scrubs_secret_world_facts_before_any_write(tmp_path, staging_mode):
+    # C3 #1213: a world/event fact carrying a credential is dropped before the staged file
+    # or the brain inbox is written; the clean fact still lands.
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    assert scrub.is_secret(secret)
+    http = FakeHTTP(
+        prefs_cands=[],
+        world_cands=[{"content": f"The deploy bot token is {secret}", "class": "world_entity"},
+                     {"content": "gbrain uses PGLite by default", "class": "world_entity"}],
+    )
+    router = make_router(tmp_path, http, staging_mode=staging_mode)
+    res = router.route_turn("u", "a", turn_id="t009", session="s")
+    assert res["world_scrubbed"] == 1
+    assert [f["content"] for f in res["world_facts"]] == ["gbrain uses PGLite by default"]
+    written = "".join(p.read_text(encoding="utf-8") for p in tmp_path.rglob("*.md"))
+    assert "PGLite" in written and secret not in written
+
+
 def test_router_drops_out_of_domain_class_labels(tmp_path):
     # a prefs pass that (wrongly) emits a world_entity, and a world pass that emits a preference:
     # the deterministic class filter drops the cross-domain leakage on each side.

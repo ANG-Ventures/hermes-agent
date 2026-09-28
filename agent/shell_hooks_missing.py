@@ -305,11 +305,12 @@ def missing_hook_verdict(spec: Any, r: Dict[str, Any], *, page: bool, display: s
         page_once(path, outcome)
     if not closed:
         return None
-    owner = owning_checkout(Path(path))
+    # The checkout path goes to the operator log only; it is unfiltered and never model-facing (C3 #1000).
+    logger.error("shell hook %s: owning checkout %s", display, owning_checkout(Path(path)) or "<none>")
     return {
         "action": "block",
-        "message": (f"hook {display} infrastructure failure: hook missing and unrecoverable "
-                    f"(owning checkout {owner or '<none>'}); this is not a policy verdict. "
+        "message": (f"hook {display} infrastructure failure: hook missing and unrecoverable; "
+                    "this is not a policy verdict. "
                     "The hook never ran. Restore its files, do not disable the guard."),
         "error_class": "hook_infrastructure_failure",
     }

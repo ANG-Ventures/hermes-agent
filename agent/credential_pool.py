@@ -3523,6 +3523,15 @@ def get_env_prefer_dotenv(key: str) -> str:
     # config block.  For every non-op:// value the original
     # .env-takes-precedence behaviour is preserved unchanged.
     if raw.startswith("op://") and scoped_value:
+        # Remember what this line resolved to, so removing it revokes exactly
+        # that value and nothing else (C3 #1217).
+        try:
+            from hermes_cli.config import get_env_path
+            from hermes_cli.env_loader import note_dotenv_values
+
+            note_dotenv_values(get_env_path(), {key: scoped_value})
+        except Exception:  # noqa: BLE001 - bookkeeping must never break a read
+            pass
         return scoped_value
     if raw:
         return raw
