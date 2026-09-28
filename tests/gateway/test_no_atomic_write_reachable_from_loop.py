@@ -116,11 +116,11 @@ REACHABLE_BASELINE = frozenset({
     # masking the status sink and re-running the walk.
     "gateway/run.py _platform_reconnect_watcher -> os.fsync",
     "gateway/run.py _restore_resume_pending_sessions_at_startup -> os.fsync",
-    "gateway/run.py _stop_impl -> atomic_json_write",
+    # stop/_stop_impl -> atomic_json_write left 2026-09-28 (t_e9ca7d13): the
+    # write sat in the nested _kill_tool_subprocesses, run only via to_thread.
     "gateway/run.py _stop_impl_body -> atomic_json_write",
     "gateway/run.py start -> atomic_json_write",
     "gateway/run.py start_gateway -> atomic_json_write",
-    "gateway/run.py stop -> atomic_json_write",
 })
 
 
