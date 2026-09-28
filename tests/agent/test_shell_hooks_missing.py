@@ -171,7 +171,7 @@ def test_unrecoverable_missing_hook_blocks_with_infra_reason_and_pages(home, mon
     assert pages == [str(path)]
 
 
-def test_untracked_hook_in_checkout_stays_closed(home, monkeypatch):
+def test_untracked_hook_in_checkout_stays_closed(home, monkeypatch, caplog):
     subprocess.run(["git", "init", "-q", str(home)], check=True, stdin=subprocess.DEVNULL)
     (home / "README").write_text("fixture")
     subprocess.run(["git", "-C", str(home), "add", "README"], check=True, stdin=subprocess.DEVNULL)
@@ -183,7 +183,9 @@ def test_untracked_hook_in_checkout_stays_closed(home, monkeypatch):
         event="pre_tool_call", command=f"{sys.executable} {path}", fail_closed=True,
     ))(tool_name="terminal")
     assert result["action"] == "block"
-    assert f"owning checkout {home}" in result["message"]
+    # C3 #1000: the checkout path is logged for the operator, never shown to the model.
+    assert str(home) not in result["message"]
+    assert f"owning checkout {home}" in caplog.text
     assert not path.exists() and pages == [str(path)]
 
 
