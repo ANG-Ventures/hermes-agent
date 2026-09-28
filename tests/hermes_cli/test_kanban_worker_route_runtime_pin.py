@@ -446,3 +446,30 @@ def test_next_dispatch_write_does_not_change_running_policy(board):
     assert _failover(agent, FailoverReason.overloaded) is False
     assert agent.model == "claude-fable-5-1"
     assert _events(tid, "worker_route_substituted") == []
+
+
+def test_live_pin_on_the_serving_route_refreshes_the_snapshot(board):
+    """``set-model --live`` onto the route already serving switches nothing but
+    still pins the run: a later failover to another model is refused."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+    tid, run_id = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET provider_override=NULL, model_override=NULL, "
+                     "current_run_id=? WHERE id=?", (run_id, tid))
+        conn.commit()
+    agent = _runtime_agent("openai-codex",
+                           [{"provider": "openai-codex", "model": "gpt-6-astra"}])
+    agent._delegate_depth = 0
+    apply_pending_live_route(agent, iteration=0)  # snapshot: no pin
+    _pin_card(tid, "openai-codex", "gpt-6-sol-900k")
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kb.ROUTE_CHANGED_EVENT, {
+                "touch_model": True, "touch_effort": False,
+                "model": "gpt-6-sol-900k", "provider": "openai-codex"}, run_id=run_id)
+    apply_pending_live_route(agent, iteration=1)
+    assert agent.model == "gpt-6-sol-900k"
+    assert _failover(agent, FailoverReason.server_error) is False
+    assert agent.model == "gpt-6-sol-900k"
