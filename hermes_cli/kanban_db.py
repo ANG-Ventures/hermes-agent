@@ -5669,9 +5669,11 @@ OPERATOR_TOKEN_FILENAME = "operator-token"
 OPERATOR_FLAG_GATED_ACTIONS: frozenset[str] = frozenset({
     "complete", "block", "unblock", "reassign", "archive", "request-review",
     # Also end a live run under ``--takeover``/``--operator`` (t_920c6b4a):
-    # ``schedule_task``, ``request_changes`` and ``triage_resolve_task`` all
-    # call ``_end_run``, so an ungated flag there parks a live worker's card.
-    "schedule", "request-changes", "triage-resolve",
+    # ``schedule_task`` and ``triage_resolve_task`` call ``_end_run``, so an
+    # ungated flag there parks a live worker's card. ``request-changes`` is
+    # deliberately absent: it ends only a review run the calling session
+    # holds (or none, on a parked card) and refuses every other holder itself.
+    "schedule", "triage-resolve",
 })
 # Actions where ONLY ``--operator`` is gated: on ``reclaim`` it overrides the
 # dead-claimer liveness hold (t_6451e7c9), which must not be reachable with an
@@ -9937,7 +9939,7 @@ def reclaim_task(
         # operator token (or the card's own dispatcher grant). A bare
         # ``--operator`` string is not authority (FleetReview on #1404).
         token = _operator_token_state()
-        if token == "ok" or _caller_holds_grant_for(task_id):
+        if token == "ok" or _caller_holds_grant_for(conn, task_id):
             override_ok = True
         else:
             termination["operator_override_refused"] = f"token_{token}"
