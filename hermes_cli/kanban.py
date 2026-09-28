@@ -4924,20 +4924,18 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
-            if not kb.unblock_task(conn, tid):
+            # The "UNBLOCK:" comment commits atomically with the transition
+            # and only if it lands: no comment on a refused/failed unblock, and
+            # no window where a respawned worker sees the card without the
+            # reason (C5 #20, FleetReview e6af55d359f5 / aa67ba1c7513).
+            comment = None
+            if reason:
+                _run_id, _sess_ref = safe_comment_provenance(tid)
+                comment = (author, f"UNBLOCK: {reason}", _run_id, _sess_ref)
+            if not kb.unblock_task(conn, tid, comment=comment):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
-                if reason:
-                    # Only after the transition landed: a refused or failed
-                    # unblock leaves no "UNBLOCK:" comment (C5 #20, FleetReview
-                    # e6af55d359f5). Written right after, on the same
-                    # connection; a respawned worker reads the thread later.
-                    kb.add_comment(
-                        conn, tid, author, f"UNBLOCK: {reason}",
-                        run_id=_run_id, session_ref=_sess_ref,
-                    )
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 

@@ -339,6 +339,32 @@ def test_cli_successful_status_verb_writes_status_comment(kanban_home, monkeypat
         assert _comments(conn, tid)[-1] == f"{prefix} why not"
 
 
+def test_unblock_comment_commits_with_the_transition(kanban_home):
+    """FleetReview aa67ba1c7513: the card never becomes dispatchable without
+    its UNBLOCK: reason — the comment is in the same transaction."""
+    seen = []
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        real = kb.add_comment
+
+        def spy(c, t, *a, **k):
+            # Inside the unblock txn: the status write is not yet committed.
+            seen.append(c.in_transaction)
+            return real(c, t, *a, **k)
+
+        kb.add_comment = spy
+        try:
+            assert kb.unblock_task(conn, tid, comment=("apollo", "UNBLOCK: go", None, None))
+        finally:
+            kb.add_comment = real
+        assert seen == [True]
+        assert _comments(conn, tid)[-1] == "UNBLOCK: go"
+        assert kb.get_task(conn, tid).status == "ready"
+        # A failed unblock (card no longer blocked) writes nothing.
+        assert not kb.unblock_task(conn, tid, comment=("apollo", "UNBLOCK: again", None, None))
+        assert _comments(conn, tid)[-1] == "UNBLOCK: go"
+
+
 def test_cli_schedule_wake_reset_on_scheduled_card_writes_comment(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", HOME)
     monkeypatch.setenv("HERMES_PROFILE", "apollo")

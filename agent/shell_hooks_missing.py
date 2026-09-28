@@ -284,7 +284,7 @@ def page_once(path: str, outcome: str) -> None:
                     stamps = {}
                 try:
                     last = float(stamps.get(path, 0))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     # A malformed stamp is "never paged", not an exception that
                     # replaces the hook verdict (C5 #45, PR #1000).
                     last = 0.0

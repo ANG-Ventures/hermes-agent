@@ -401,11 +401,13 @@ def test_publish_absent_syncs_mode_before_linking(tmp_path, monkeypatch):
     assert events.index("chmod") < max(i for i, e in enumerate(events) if e == "fsync") < events.index("link")
 
 
-@pytest.mark.parametrize("stamp", ['"garbage"', "NaN", "Infinity", "-Infinity", "1e300"])
+@pytest.mark.parametrize("stamp", ['"garbage"', "NaN", "Infinity", "-Infinity", "1e300",
+                                   "9" * 400])
 def test_malformed_page_stamp_still_fails_open_and_pages(home, monkeypatch, stamp):
     """C5 #45 (PR #1000): a malformed stamp must not raise out of the verdict,
     and a non-finite or future one (json.loads accepts NaN/Infinity) must not
-    suppress the page forever (FleetReview 41486fc0cadb)."""
+    suppress the page forever (FleetReview 41486fc0cadb); a huge int overflows
+    float() (FleetReview 8a8bbfe65e62)."""
     import json
     pages = []
     monkeypatch.setattr(shell_hooks, "_page_missing_hook", lambda path, *args: pages.append(path) or True)
