@@ -34,6 +34,30 @@ def test_find_git_worktree_finds_dotgit(tmp_path: Path):
     assert find_git_worktree(str(sub)) == str(repo)
 
 
+def test_find_git_worktree_stops_at_tripwire_gitfile(tmp_path: Path):
+    # kanban/workspaces/.git is a tripwire gitfile pointing nowhere. It must
+    # NOT become an LSP root (pyright indexed every workspace -> V8-OOM),
+    # and the walk must not continue up into the enclosing real repo.
+    (tmp_path / ".git").mkdir()  # enclosing real repo (~/.hermes)
+    ws = tmp_path / "workspaces"
+    (ws / "t_x").mkdir(parents=True)
+    (ws / ".git").write_text("gitdir: /nonexistent/kanban-scratch-workspace-is-not-a-repo\n")
+    assert find_git_worktree(str(ws / "t_x")) is None
+    # A real clone inside a scratch workspace still resolves to itself.
+    clone = ws / "t_x" / "repo"
+    (clone / ".git").mkdir(parents=True)
+    assert find_git_worktree(str(clone)) == str(clone)
+
+
+def test_find_git_worktree_accepts_live_worktree_gitfile(tmp_path: Path):
+    gitdir = tmp_path / "main" / ".git" / "worktrees" / "wt"
+    gitdir.mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {gitdir}\n")
+    assert find_git_worktree(str(wt)) == str(wt)
+
+
 
 
 
