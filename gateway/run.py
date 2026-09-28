@@ -25246,21 +25246,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
+                # Through the once-helper (FleetReview #101): it records the
+                # echoed count on the event, so a pending/busy path that later
+                # echoes the same event's transcripts sends only the unsent tail.
                 if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                        await self._echo_pending_stt_transcripts_once(
+                            event,
+                            _echo_adapter,
+                            source,
+                            _successful_transcripts,
+                            metadata=self._thread_metadata_for_source(
+                                source, self._reply_anchor_for_event(event)
+                            ),
+                        )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the

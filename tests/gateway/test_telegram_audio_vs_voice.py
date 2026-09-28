@@ -125,3 +125,30 @@ async def test_audio_attachment_context_note_format():
 # 4. Telegram gateway: msg.audio → MessageType.AUDIO (not VOICE)
 # ---------------------------------------------------------------------------
 
+
+
+@pytest.mark.asyncio
+async def test_inline_voice_echo_is_counted_so_a_later_pending_echo_does_not_repeat():
+    """FleetReview #101: the inline STT echo loop bypassed
+    _echo_pending_stt_transcripts_once, so a busy/pending path echoing the same
+    event later sent the transcript a second time."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    runner = _make_runner(stt_enabled=True)
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda *a, **k: None
+    runner._reply_anchor_for_event = lambda _e: None
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+    event = _voice_event("/tmp/voice.ogg")
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "hello world", "provider": "whisper"},
+    ):
+        await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+    await runner._echo_pending_stt_transcripts_once(event, adapter, source, ["hello world"])
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args[0][1] == '🎙️ "hello world"'
