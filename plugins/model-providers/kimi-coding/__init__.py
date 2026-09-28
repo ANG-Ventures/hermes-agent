@@ -140,5 +140,29 @@ kimi_cn = KimiProfile(
     default_aux_model="kimi-k2-turbo-preview",
 )
 
+# Kimi Code membership via OAuth device flow (auth.kimi.com). Tokens live in
+# auth.json providers.kimi-oauth; inference speaks Anthropic Messages at
+# api.kimi.com/coding with a per-request bearer (see hermes_cli.auth).
+kimi_oauth = KimiProfile(
+    name="kimi-oauth",
+    aliases=("kimi_oauth", "kimi-membership", "kimi-code-oauth"),
+    api_mode="anthropic_messages",
+    display_name="Kimi Code (OAuth)",
+    description="Kimi Code membership (K3) via device-code login — no API key",
+    signup_url="https://www.kimi.com/code",
+    env_vars=(),  # OAuth — tokens in auth.json, not env
+    base_url="https://api.kimi.com/coding",
+    auth_type="oauth_external",
+    fixed_temperature=OMIT_TEMPERATURE,
+    default_max_tokens=32000,
+    default_headers={
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+    },
+    default_aux_model="kimi-for-coding",
+)
+
 register_provider(kimi)
 register_provider(kimi_cn)
+register_provider(kimi_oauth)

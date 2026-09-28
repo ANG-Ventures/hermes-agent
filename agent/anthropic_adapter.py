@@ -693,6 +693,40 @@ def _common_betas_for_base_url(
     return betas
 
 
+def _kimi_coding_attribution_headers() -> dict:
+    """Attribution headers Kimi asked us to send on api.kimi.com/coding."""
+    return {
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+    }
+
+
+def _kimi_oauth_token_provider_for(api_key):
+    """Return a per-request token provider when *api_key* is a kimi-oauth JWT.
+
+    Kimi membership access tokens are JWTs whose ``client_id`` claim is the
+    public Kimi CLI client id. ``sk-kimi-`` API keys and anything else return
+    None and keep the static-key path.
+    """
+    if not isinstance(api_key, str) or api_key.count(".") != 2:
+        return None
+    try:
+        import base64 as _b64
+        import json as _json
+
+        from hermes_cli.auth import KIMI_OAUTH_CLIENT_ID, build_kimi_oauth_token_provider
+
+        part = api_key.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        claims = _json.loads(_b64.urlsafe_b64decode(part.encode()).decode())
+        if not isinstance(claims, dict) or claims.get("client_id") != KIMI_OAUTH_CLIENT_ID:
+            return None
+        return build_kimi_oauth_token_provider()
+    except Exception:  # noqa: BLE001 — not a decodable kimi-oauth JWT
+        return None
+
+
 def _build_anthropic_client_with_bearer_hook(
     token_provider,
     base_url: str = None,
@@ -765,6 +799,18 @@ def _build_anthropic_client_with_bearer_hook(
     )
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+    if _is_kimi_coding_endpoint(normalized_base_url):
+        # kimi-oauth (membership) bearer: same attribution headers as the
+        # static-key Kimi branch, plus the per-login X-Msh-* identity set.
+        headers = dict(kwargs.get("default_headers") or {})
+        headers.update(_kimi_coding_attribution_headers())
+        try:
+            from hermes_cli.auth import kimi_oauth_identity_headers
+
+            headers.update(kimi_oauth_identity_headers())
+        except Exception:  # noqa: BLE001 — headers are identity, not auth
+            pass
+        kwargs["default_headers"] = headers
 
     client = _anthropic_sdk.Anthropic(**kwargs)
     # Same env-inference trap as build_anthropic_client: auth_token-only
@@ -813,6 +859,15 @@ def build_anthropic_client(
             "The 'anthropic' package is required for the Anthropic provider. "
             "Install it with: pip install 'anthropic>=0.39.0'"
         )
+
+    # A kimi-oauth access token is a 15-minute JWT. Every rebuild site
+    # (agent init, /model switch, fallback activation, credential rotation,
+    # auxiliary clients) funnels through here, so swap a static one for the
+    # per-request token provider at this single choke point.
+    if _is_kimi_coding_endpoint(base_url):
+        _kimi_provider = _kimi_oauth_token_provider_for(api_key)
+        if _kimi_provider is not None:
+            api_key = _kimi_provider
 
     # Callable api_key → Entra ID bearer provider path. Delegated to a
     # helper so the existing static-key code below stays unchanged.
@@ -865,9 +920,7 @@ def build_anthropic_client(
         # HTTP-Referer + X-Title + HermesAgent User-Agent.
         kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
-            "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-            "X-Title": "Hermes Agent",
-            "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+            **_kimi_coding_attribution_headers(),
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
     elif _requires_bearer_auth(normalized_base_url):

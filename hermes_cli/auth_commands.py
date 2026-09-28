@@ -35,7 +35,7 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth", "kimi-oauth"}
 
 
 def _get_custom_provider_entries() -> list[dict]:
@@ -516,6 +516,23 @@ def auth_add_command(args) -> None:
         )
         pool.add_entry(entry)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        return
+
+    if provider == "kimi-oauth":
+        # ONE device login per host: the refresh token rotates, so the pool
+        # holds no independent copy. The login writes auth.json
+        # providers.kimi-oauth; load_pool() re-seeds the single "oauth" entry
+        # from it.
+        state = auth_mod._kimi_oauth_login(
+            open_browser=not getattr(args, "no_browser", False),
+            timeout_seconds=getattr(args, "timeout", None) or 15.0,
+        )
+        label = (getattr(args, "label", None) or "").strip()
+        if label:
+            state["label"] = label
+            auth_mod._kimi_oauth_write_state(state)
+        load_pool(provider)
+        print(f"Saved {provider} OAuth credentials (expires {state.get('expires_at')}).")
         return
 
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")

@@ -49,6 +49,7 @@ _ACCOUNTS_AUTH_TYPES: frozenset[str] = frozenset(
         "oauth_device_code",
         "oauth_external",
         "oauth_minimax",
+        "oauth_kimi",        # kimi-oauth: Kimi Code membership device flow
         "external_process",  # copilot-acp: spawns `copilot --acp --stdio`
         "copilot",           # GitHub Copilot token / gh auth
     }

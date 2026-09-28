@@ -894,6 +894,59 @@ def _model_flow_minimax_oauth(config, current_model="", args=None):
     print(f"\u2713 Using MiniMax model: {selected}")
 
 
+def _model_flow_kimi_oauth(config, current_model="", args=None):
+    """Kimi Code OAuth (membership): ensure logged in, then pick model."""
+    from hermes_cli.auth import (
+        get_provider_auth_state,
+        _prompt_model_selection,
+        _save_model_choice,
+        _update_config_for_provider,
+        resolve_kimi_oauth_runtime_credentials,
+        AuthError,
+        format_auth_error,
+        _login_kimi_oauth,
+    )
+
+    g = provider_seam.snapshot()
+    state = get_provider_auth_state("kimi-oauth")
+    if not state or not state.get("refresh_token"):
+        print("Not logged into Kimi Code. Starting device-code login...")
+        print()
+        try:
+            mock_args = argparse.Namespace(
+                no_browser=bool(getattr(args, "no_browser", False)),
+                timeout=getattr(args, "timeout", None) or 15.0,
+            )
+            _login_kimi_oauth(mock_args, g.PROVIDER_REGISTRY["kimi-oauth"])
+        except SystemExit:
+            print("Login cancelled or failed.")
+            return
+        except Exception as exc:
+            print(f"Login failed: {exc}")
+            return
+
+    try:
+        creds = resolve_kimi_oauth_runtime_credentials()
+    except AuthError as exc:
+        print(format_auth_error(exc))
+        return
+
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    model_ids = g.get("_PROVIDER_MODELS", _PROVIDER_MODELS).get("kimi-oauth", [])
+    selected = _prompt_model_selection(
+        model_ids,
+        current_model,
+        confirm_provider="kimi-oauth",
+        confirm_base_url=creds["base_url"],
+    )
+    if not selected:
+        return
+    _save_model_choice(selected)
+    _update_config_for_provider("kimi-oauth", creds["base_url"])
+    print(f"\u2713 Using Kimi Code model: {selected}")
+
+
 def _model_flow_custom(config):
     """Custom endpoint: collect URL, API key, and model name.
 

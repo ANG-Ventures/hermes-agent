@@ -127,6 +127,22 @@ MINIMAX_OAUTH_CN_BASE = "https://api.minimaxi.com"
 MINIMAX_OAUTH_GLOBAL_INFERENCE = "https://api.minimax.io/anthropic"
 MINIMAX_OAUTH_CN_INFERENCE = "https://api.minimaxi.com/anthropic"
 MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
+# Kimi Code membership (K3) — RFC 8628 device flow against auth.kimi.com.
+# Public client id (no secret), shared with kimi-cli / CLIProxyAPI.
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_OAUTH_AUTH_BASE = "https://auth.kimi.com"
+KIMI_OAUTH_DEVICE_AUTHORIZATION_URL = f"{KIMI_OAUTH_AUTH_BASE}/api/oauth/device_authorization"
+KIMI_OAUTH_TOKEN_URL = f"{KIMI_OAUTH_AUTH_BASE}/api/oauth/token"
+KIMI_OAUTH_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+# Anthropic Messages surface of the membership endpoint (/v1/messages).
+KIMI_OAUTH_INFERENCE_BASE_URL = "https://api.kimi.com/coding"
+# Access tokens live 900 s (measured 2026-09-27: JWT exp-iat=900). Refresh
+# with 5 min to spare so a long request never starts on a dying bearer.
+KIMI_OAUTH_REFRESH_SKEW_SECONDS = 300
+# Identity headers the grant's client (kimi-cli) sends; CLIProxyAPI's
+# reference implementation sends the same platform/version pair.
+KIMI_OAUTH_MSH_PLATFORM = "kimi_cli"
+KIMI_OAUTH_MSH_VERSION = "1.10.6"
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
@@ -409,6 +425,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = _LazyProviderRegistry(__name__, "
         scope=MINIMAX_OAUTH_SCOPE,
         extra={"region": "global", "cn_portal_base_url": MINIMAX_OAUTH_CN_BASE,
                "cn_inference_base_url": MINIMAX_OAUTH_CN_INFERENCE},
+    ),
+    "kimi-oauth": ProviderConfig(
+        id="kimi-oauth",
+        name="Kimi Code (OAuth · membership)",
+        auth_type="oauth_kimi",
+        portal_base_url=KIMI_OAUTH_AUTH_BASE,
+        inference_base_url=KIMI_OAUTH_INFERENCE_BASE_URL,
+        client_id=KIMI_OAUTH_CLIENT_ID,
     ),
     "anthropic": ProviderConfig(
         id="anthropic",
@@ -2311,6 +2335,7 @@ def resolve_provider(
         "actual-computer": "actual", "actualcomputer": "actual", "aci": "actual",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
+        "kimi_oauth": "kimi-oauth", "kimi-membership": "kimi-oauth", "kimi-code-oauth": "kimi-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
         "claude": "anthropic", "claude-code": "anthropic",
@@ -7389,6 +7414,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
+    if target == "kimi-oauth":
+        return get_kimi_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
@@ -9135,6 +9162,411 @@ def _login_minimax_oauth(args, pconfig: ProviderConfig) -> None:
     try:
         _minimax_oauth_login(
             region=region, open_browser=open_browser, timeout_seconds=timeout,
+        )
+    except AuthError as exc:
+        print(format_auth_error(exc))
+        raise SystemExit(1)
+
+
+# ==================== Kimi Code membership OAuth (device flow) ====================
+#
+# One authority: ``providers.kimi-oauth`` in auth.json. The refresh token
+# ROTATES on every refresh, so every refresh runs sync -> POST -> write-back
+# inside ``_provider_state_transaction`` (cross-process auth-store flock) and
+# writes back to the store the state was read from (profile or global root).
+# Runtime callers get a per-request token provider (same seam as MiniMax
+# OAuth) so a 15-minute access token never goes stale inside a long session.
+
+_KIMI_OAUTH_ERROR_BODY_LIMIT = 4 * 1024
+_KIMI_OAUTH_TERMINAL_REFRESH_ERRORS = frozenset({
+    "invalid_grant", "invalid_token", "expired_token", "unauthorized_client",
+    "invalid_client", "access_denied",
+})
+
+
+def _kimi_device_model() -> str:
+    import platform as _plat
+
+    system = _plat.system() or "unknown"
+    if system == "Darwin":
+        release = _plat.mac_ver()[0] or _plat.release()
+        system = "macOS"
+    else:
+        release = _plat.release()
+    return f"{system} {release} {_plat.machine()}".strip()
+
+
+def kimi_oauth_identity_headers(device_id: Optional[str] = None) -> Dict[str, str]:
+    """Return the five ``X-Msh-*`` identity headers Kimi expects on every call.
+
+    ``device_id`` is persisted per login in ``providers.kimi-oauth``; a fresh
+    id per request looks like device churn to Kimi. When not supplied it is
+    read from the stored state.
+    """
+    import platform as _plat
+
+    if not device_id:
+        try:
+            state = get_provider_auth_state("kimi-oauth") or {}
+        except Exception:
+            state = {}
+        device_id = str(state.get("device_id") or "")
+    headers = {
+        "X-Msh-Platform": KIMI_OAUTH_MSH_PLATFORM,
+        "X-Msh-Version": KIMI_OAUTH_MSH_VERSION,
+        "X-Msh-Device-Name": _plat.node() or "hermes",
+        "X-Msh-Device-Model": _kimi_device_model(),
+    }
+    if device_id:
+        headers["X-Msh-Device-Id"] = device_id
+    return headers
+
+
+def _kimi_post_form(
+    client: httpx.Client, url: str, *, data: Dict[str, Any], device_id: str,
+) -> tuple:
+    """POST a Kimi OAuth form. Returns ``(status_code, payload, bounded_text)``."""
+    response = client.post(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            **kimi_oauth_identity_headers(device_id),
+        },
+    )
+    text = response.text or ""
+    try:
+        payload = response.json() if text else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if len(text) > _KIMI_OAUTH_ERROR_BODY_LIMIT:
+        text = text[:_KIMI_OAUTH_ERROR_BODY_LIMIT] + "...[truncated]"
+    return response.status_code, payload, text
+
+
+def _kimi_access_token_expiry_unix(payload: Dict[str, Any], now: float) -> float:
+    """Expiry of an issued access token: ``expires_in`` first, JWT ``exp`` second."""
+    raw = payload.get("expires_in")
+    try:
+        ttl = float(raw)
+        if ttl > 0:
+            return now + ttl
+    except (TypeError, ValueError):
+        pass
+    token = str(payload.get("access_token") or "")
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(part.encode()).decode()).get("exp")
+        if exp:
+            return float(exp)
+    except Exception:
+        pass
+    # Unknown lifetime: assume the measured 900 s so refresh still happens.
+    return now + 900.0
+
+
+def _kimi_state_from_token_payload(
+    payload: Dict[str, Any], *, prior: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now = time.time()
+    expires_at_unix = _kimi_access_token_expiry_unix(payload, now)
+    state = dict(prior or {})
+    state.update({
+        "provider": "kimi-oauth",
+        "auth_mode": "oauth_device_code",
+        "client_id": KIMI_OAUTH_CLIENT_ID,
+        "inference_base_url": state.get("inference_base_url") or KIMI_OAUTH_INFERENCE_BASE_URL,
+        "token_type": payload.get("token_type") or "Bearer",
+        "scope": payload.get("scope") or state.get("scope") or "",
+        "access_token": payload["access_token"],
+        # Rotation: always persist the refresh token the server just issued.
+        "refresh_token": payload.get("refresh_token") or state.get("refresh_token"),
+        "obtained_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        "expires_at": datetime.fromtimestamp(expires_at_unix, tz=timezone.utc).isoformat(),
+        "expires_in": max(0, int(expires_at_unix - now)),
+        "last_refresh": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+    })
+    state.pop("last_auth_error", None)
+    return state
+
+
+def _kimi_oauth_write_state(
+    state: Dict[str, Any], *, source_path: Optional[Path] = None,
+    set_active: bool = False,
+) -> None:
+    """Persist kimi-oauth state to the store it came from (0600, atomic).
+
+    Unlike ``_save_provider_state`` this does not clobber ``active_provider``
+    on every token refresh.
+    """
+    active_path = _auth_file_path()
+    target = source_path or active_path
+    if _same_path(target, active_path):
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            _store_provider_state(auth_store, "kimi-oauth", dict(state), set_active=set_active)
+            _save_auth_store(auth_store)
+        return
+    _persist_provider_state_to_store("kimi-oauth", state, target, set_active=set_active)
+
+
+def _kimi_request_device_code(client: httpx.Client, *, device_id: str) -> Dict[str, Any]:
+    status, payload, text = _kimi_post_form(
+        client, KIMI_OAUTH_DEVICE_AUTHORIZATION_URL,
+        data={"client_id": KIMI_OAUTH_CLIENT_ID}, device_id=device_id,
+    )
+    if status != 200:
+        raise AuthError(
+            f"Kimi device authorization failed (HTTP {status}): {text or 'no body'}",
+            provider="kimi-oauth", code="authorization_failed",
+        )
+    for field_name in ("device_code", "user_code"):
+        if not payload.get(field_name):
+            raise AuthError(
+                f"Kimi device authorization response missing field: {field_name}",
+                provider="kimi-oauth", code="authorization_incomplete",
+            )
+    return payload
+
+
+def _kimi_poll_device_token(
+    client: httpx.Client, *, device_code: str, device_id: str,
+    interval: float, expires_in: float, sleep: Callable[[float], None] = time.sleep,
+) -> Dict[str, Any]:
+    """Poll the token endpoint per RFC 8628 until approval, denial or expiry."""
+    deadline = time.monotonic() + max(1.0, float(expires_in))
+    interval = max(1.0, float(interval))
+    while time.monotonic() < deadline:
+        sleep(interval)
+        status, payload, text = _kimi_post_form(
+            client, KIMI_OAUTH_TOKEN_URL,
+            data={
+                "grant_type": KIMI_OAUTH_DEVICE_GRANT_TYPE,
+                "device_code": device_code,
+                "client_id": KIMI_OAUTH_CLIENT_ID,
+            },
+            device_id=device_id,
+        )
+        if status == 200 and payload.get("access_token"):
+            if not payload.get("refresh_token"):
+                raise AuthError(
+                    "Kimi token response has no refresh_token.",
+                    provider="kimi-oauth", code="token_incomplete",
+                )
+            return payload
+        error = str(payload.get("error") or "").strip().lower()
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            interval += 5.0
+            continue
+        if error == "access_denied":
+            raise AuthError("Kimi login was denied in the browser.",
+                            provider="kimi-oauth", code="authorization_denied")
+        if error in {"expired_token", "invalid_grant"}:
+            raise AuthError("Kimi device code expired before approval. Run the login again.",
+                            provider="kimi-oauth", code="device_code_expired")
+        raise AuthError(
+            f"Kimi token polling failed (HTTP {status}): {text or 'no body'}",
+            provider="kimi-oauth", code="token_exchange_failed",
+        )
+    raise AuthError("Kimi login timed out before authorization completed.",
+                    provider="kimi-oauth", code="timeout")
+
+
+def _kimi_oauth_login(
+    *, open_browser: bool = True, timeout_seconds: float = 15.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Dict[str, Any]:
+    """Run the Kimi device flow, persist tokens to auth.json, return the state."""
+    prior = get_provider_auth_state("kimi-oauth") or {}
+    # Re-login keeps the host's device id so Kimi sees one stable device.
+    device_id = str(prior.get("device_id") or uuid.uuid4())
+    if _is_remote_session():
+        open_browser = False
+
+    print("Starting Hermes login via Kimi Code (membership) device flow...")
+    with httpx.Client(timeout=httpx.Timeout(timeout_seconds), follow_redirects=True) as client:
+        code = _kimi_request_device_code(client, device_id=device_id)
+        user_code = str(code["user_code"])
+        verification_url = str(
+            code.get("verification_uri_complete") or code.get("verification_uri") or ""
+        )
+        print()
+        print("To continue:")
+        print(f"  1. Open: {verification_url}")
+        print(f"  2. Confirm the code: {user_code}")
+        if open_browser and verification_url and _can_open_graphical_browser():
+            if webbrowser.open(verification_url):
+                print("  (Opened browser for verification)")
+        print("Waiting for approval...")
+        token = _kimi_poll_device_token(
+            client,
+            device_code=str(code["device_code"]),
+            device_id=device_id,
+            interval=float(code.get("interval") or 5),
+            expires_in=float(code.get("expires_in") or 1800),
+            sleep=sleep,
+        )
+
+    base = {k: v for k, v in prior.items() if k in ("inference_base_url", "label")}
+    base["device_id"] = device_id
+    state = _kimi_state_from_token_payload(token, prior=base)
+    _kimi_oauth_write_state(state, set_active=False)
+    mark_provider_active_if_unset("kimi-oauth")
+    print("✓ Kimi Code OAuth login successful.")
+    return state
+
+
+def _kimi_state_needs_refresh(state: Dict[str, Any], skew_seconds: float) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(str(state.get("expires_at") or "")).timestamp()
+    except Exception:
+        return True
+    return (expires_at - time.time()) <= skew_seconds
+
+
+def _kimi_quarantine_state(state: Dict[str, Any], exc: AuthError) -> Dict[str, Any]:
+    dead = dict(state)
+    for key in ("access_token", "refresh_token", "expires_at", "expires_in", "obtained_at"):
+        dead.pop(key, None)
+    dead["last_auth_error"] = {
+        "provider": "kimi-oauth",
+        "code": exc.code or "refresh_failed",
+        "message": str(exc),
+        "reason": "runtime_refresh_failure",
+        "relogin_required": True,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    return dead
+
+
+def refresh_kimi_oauth_state(
+    *, force: bool = False, skew_seconds: float = KIMI_OAUTH_REFRESH_SKEW_SECONDS,
+    timeout_seconds: float = 15.0,
+) -> Dict[str, Any]:
+    """Refresh the stored Kimi token when it is within ``skew_seconds`` of expiry.
+
+    The whole read -> POST -> write-back runs under the auth-store lock and
+    re-reads the state inside it, so a waiter adopts the token a concurrent
+    refresher already rotated instead of replaying the spent refresh token.
+    A terminal refusal (``invalid_grant`` & co.) quarantines the state so the
+    next call fails fast with ``relogin_required`` instead of retrying.
+    """
+    with _provider_state_transaction("kimi-oauth") as (_store, state, source_path):
+        if not state or not state.get("refresh_token"):
+            raise AuthError(
+                "Not logged into Kimi Code OAuth. Run `hermes auth add kimi-oauth`.",
+                provider="kimi-oauth", code="not_logged_in", relogin_required=True,
+            )
+        if not force and state.get("access_token") and not _kimi_state_needs_refresh(state, skew_seconds):
+            return state
+        device_id = str(state.get("device_id") or "")
+        with httpx.Client(timeout=httpx.Timeout(timeout_seconds), follow_redirects=True) as client:
+            status, payload, text = _kimi_post_form(
+                client, KIMI_OAUTH_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": state["refresh_token"],
+                    "client_id": KIMI_OAUTH_CLIENT_ID,
+                },
+                device_id=device_id,
+            )
+        if status == 200 and payload.get("access_token"):
+            new_state = _kimi_state_from_token_payload(payload, prior=state)
+            _kimi_oauth_write_state(new_state, source_path=source_path)
+            return new_state
+        error = str(payload.get("error") or "").strip().lower()
+        terminal = error in _KIMI_OAUTH_TERMINAL_REFRESH_ERRORS or status == 401
+        exc = AuthError(
+            f"Kimi OAuth refresh failed (HTTP {status}): {text or 'no body'}",
+            provider="kimi-oauth", code=error or "refresh_failed",
+            relogin_required=terminal,
+        )
+        if terminal:
+            try:
+                _kimi_oauth_write_state(_kimi_quarantine_state(state, exc), source_path=source_path)
+            except Exception as save_exc:  # noqa: BLE001
+                logger.debug("Kimi OAuth: failed to persist quarantined state: %s", save_exc)
+        raise exc
+
+
+def build_kimi_oauth_token_provider() -> Callable[[], str]:
+    """Zero-arg callable returning a live Kimi access token (refreshing as needed).
+
+    Installed as the Anthropic client's per-request bearer hook, so each
+    outbound request re-reads auth.json (one file read + one timestamp
+    compare in steady state) and a refresh persisted by any process — the
+    keeper, a gateway, a cron job — is picked up immediately.
+    """
+    def _provide() -> str:
+        state = get_provider_auth_state("kimi-oauth") or {}
+        if not state.get("access_token") or _kimi_state_needs_refresh(
+            state, KIMI_OAUTH_REFRESH_SKEW_SECONDS,
+        ):
+            state = refresh_kimi_oauth_state()
+        token = state.get("access_token")
+        if not token:
+            raise AuthError(
+                "Kimi OAuth state has no access_token after refresh.",
+                provider="kimi-oauth", code="no_access_token", relogin_required=True,
+            )
+        return str(token)
+
+    return _provide
+
+
+def resolve_kimi_oauth_runtime_credentials(
+    *, as_token_provider: bool = False, refresh: bool = True,
+) -> Dict[str, Any]:
+    """Return ``{provider, api_key, base_url, source}`` for kimi-oauth.
+
+    ``refresh=False`` never touches the network (pool seeding, status).
+    """
+    state = get_provider_auth_state("kimi-oauth") or {}
+    if not state.get("access_token") and not (refresh and state.get("refresh_token")):
+        raise AuthError(
+            "Not logged into Kimi Code OAuth. Run `hermes auth add kimi-oauth`.",
+            provider="kimi-oauth", code="not_logged_in", relogin_required=True,
+        )
+    if refresh and _kimi_state_needs_refresh(state, KIMI_OAUTH_REFRESH_SKEW_SECONDS):
+        state = refresh_kimi_oauth_state()
+    api_key: Any = build_kimi_oauth_token_provider() if as_token_provider else state["access_token"]
+    return {
+        "provider": "kimi-oauth",
+        "api_key": api_key,
+        "base_url": str(state.get("inference_base_url") or KIMI_OAUTH_INFERENCE_BASE_URL).rstrip("/"),
+        "source": "oauth",
+        "expires_at": state.get("expires_at"),
+    }
+
+
+def get_kimi_oauth_auth_status() -> Dict[str, Any]:
+    """Auth status for kimi-oauth. A live refresh token counts as logged in."""
+    state = get_provider_auth_state("kimi-oauth") or {}
+    if not state.get("refresh_token"):
+        status: Dict[str, Any] = {"logged_in": False, "provider": "kimi-oauth"}
+        if state.get("last_auth_error"):
+            status["error"] = (state["last_auth_error"] or {}).get("message")
+        return status
+    return {
+        "logged_in": True,
+        "provider": "kimi-oauth",
+        "expires_at": state.get("expires_at"),
+        "access_token_valid": not _kimi_state_needs_refresh(state, 0),
+    }
+
+
+def _login_kimi_oauth(args, pconfig: ProviderConfig) -> None:
+    """CLI entry for Kimi Code OAuth login."""
+    try:
+        _kimi_oauth_login(
+            open_browser=not getattr(args, "no_browser", False),
+            timeout_seconds=getattr(args, "timeout", None) or 15.0,
         )
     except AuthError as exc:
         print(format_auth_error(exc))

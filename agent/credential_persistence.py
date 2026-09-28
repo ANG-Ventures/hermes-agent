@@ -19,6 +19,7 @@ from typing import Any, Dict, Mapping
 # so future external secret providers fail closed at the disk boundary.
 _PERSISTABLE_PROVIDER_SOURCES = frozenset({
     ("anthropic", "hermes_pkce"),
+    ("kimi-oauth", "oauth"),
     ("minimax-oauth", "oauth"),
     ("nous", "device_code"),
     ("openai-codex", "device_code"),
