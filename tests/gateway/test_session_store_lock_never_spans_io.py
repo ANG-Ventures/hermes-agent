@@ -29,7 +29,8 @@ from gateway.session import SessionSource, SessionStore, _StoreLock
 class _RecordingDB:
     """Proxy for SessionDB that records lock state at every method call."""
 
-    def __init__(self, real, store_ref, violations, *, gate=None, gated=()):
+    def __init__(self, real, store_ref, violations, *, gate=None, gated=(), entered=None):
+        self._entered = entered
         self._real = real
         self._store_ref = store_ref
         self._violations = violations
@@ -51,6 +52,8 @@ class _RecordingDB:
                     )
                 )
             if self._gate is not None and name in self._gated:
+                if self._entered is not None:
+                    self._entered.set()
                 self._gate.wait(timeout=10)
             return attr(*args, **kwargs)
 
@@ -121,9 +124,12 @@ def test_no_sqlite_or_fsync_under_store_lock(tmp_path, fsync_violations):
 
         # A fresh store over the same files: the cold load (state.db
         # gateway_routing + sessions.json) must also read outside the lock.
-        store2, real2 = _make_store(tmp_path / "second", violations)
+        # FleetReview #114: the SAME files (it was built on tmp_path/"second",
+        # an empty home, so the cold load read nothing).
+        store2, real2 = _make_store(tmp_path, violations)
         stores.append(store2)
         store2._ensure_loaded()
+        assert other.session_key in store2._entries, "cold load did not read the saved sessions"
         real2.close()
     finally:
         real.close()
@@ -136,11 +142,13 @@ def test_stuck_routing_write_does_not_stall_other_threads(tmp_path):
     """The 06:57 incident shape: SQLite stuck in a worker, loop needs the lock."""
     violations: list[str] = []
     gate = threading.Event()
+    entered = threading.Event()
     store, real = _make_store(
         tmp_path,
         violations,
         gate=gate,
         gated=("replace_gateway_routing_entries", "save_gateway_routing_entry"),
+        entered=entered,
     )
     worker = None
     try:
@@ -148,15 +156,16 @@ def test_stuck_routing_write_does_not_stall_other_threads(tmp_path):
         entry = store.get_or_create_session(_source())
         key = entry.session_key
         gate.clear()
+        entered.clear()
 
         worker = threading.Thread(
             target=store.mark_resume_pending, args=(key,), daemon=True,
         )
         worker.start()
-        # Let the worker reach the gated SQLite write.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not store._entries[key].resume_pending:
-            time.sleep(0.01)
+        # FleetReview #89: wait until the worker is INSIDE the gated SQLite
+        # write (resume_pending flips before it, so polling that let the lock
+        # check run first and pass vacuously).
+        assert entered.wait(5), "worker never reached the gated routing write"
 
         started = time.monotonic()
         acquired = store._lock.acquire(timeout=2)

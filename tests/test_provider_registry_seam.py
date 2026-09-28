@@ -216,6 +216,10 @@ def test_t3_parked_publication_is_whole_before_then_whole_after():
     reader = threading.Thread(target=read, args=(5000,))
     reader.start()
     reader.join(60)
+    # FleetReview #90: a reader still running (or one that saw nothing) made
+    # the all() below vacuous.
+    assert not reader.is_alive(), "reader did not finish within 60 s"
+    assert len(seen) == 5000, len(seen)
     assert all(s == {False} for s in seen), "a surface of the parked pin leaked before the swap"
     release.set()
     pub.join(30)
