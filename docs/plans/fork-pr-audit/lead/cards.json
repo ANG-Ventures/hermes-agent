@@ -869,23 +869,6 @@
   "assignee": "daedalus"
  },
  {
-  "name": "#1031",
-  "verdict": "DROP",
-  "keys": [
-   "#1031"
-  ],
-  "followers": [],
-  "tranches": [
-   "gateway"
-  ],
-  "branches": [],
-  "conflict_syncs": 3,
-  "registry": [
-   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
-  ],
-  "assignee": "daedalus-opus"
- },
- {
   "name": "#1007",
   "verdict": "DROP",
   "keys": [
