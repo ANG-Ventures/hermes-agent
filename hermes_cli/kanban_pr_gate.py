@@ -1227,6 +1227,10 @@ def _closed_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
 
 
 _PREFETCH_WORKERS = 6
+# Wall budget for one tick's deploy-ancestry probes (FleetReview #32). A probe
+# past it is not run; the locked pass reads the missing answer as
+# "unverified" and holds the card for the next tick.
+_PREFETCH_DEPLOY_BUDGET_S = 30.0
 
 
 def _gate_candidates(
@@ -1393,6 +1397,7 @@ def _prefetch_deploys(
     SHA-less refs are skipped: they cannot be deployed yet.
     """
     out: dict[tuple[str, str], bool] = {}
+    deadline = time.monotonic() + _PREFETCH_DEPLOY_BUDGET_S
     for ref, tree in checks:
         if tree is None:
             continue  # unmapped repo: no tree to probe; the locked pass holds it
@@ -1408,6 +1413,8 @@ def _prefetch_deploys(
                 sha = entry.sha
         if not sha or (tree, sha) in out:
             continue
+        if time.monotonic() >= deadline:
+            break  # budget spent: the rest stay unanswered (unverified)
         try:
             out[(tree, sha)] = bool(deploy_fn(tree, sha))
         except Exception:  # defensive seam: unprovable deploy = not deployed
