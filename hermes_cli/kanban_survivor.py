@@ -1553,12 +1553,15 @@ def _recorded_base(repo, recorded, published, base):
     # once (a missing object exits non-zero). A per-published-head loop here
     # starves the terminal transition on a many-headed fork
     # (test_kanban_terminal_transition_ref_cost), so it is checked first.
-    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}" for ref in published}
+    # Keep each ref's (remote, branch): a remote name may itself contain `/`,
+    # so the pair cannot be re-parsed from the tracking ref name.
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": (ref["remote"], ref["branch"])
+                  for ref in published}
     listed = _git(repo, "for-each-ref", "--contains", recorded, "--format=%(refname)",
                   "refs/remotes", check=False)
     if listed.returncode:
         return base
-    matched = advertised.intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+    matched = set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
     if not matched:
         return base
     if _git(repo, "merge-base", "--is-ancestor", recorded, "HEAD", check=False).returncode:
@@ -1574,7 +1577,7 @@ def _recorded_base(repo, recorded, published, base):
     # Network only here, after every cheap local check passed; one fetch per
     # matched branch (normally one), never per published head.
     for ref in sorted(matched):
-        remote, _, branch = ref.removeprefix("refs/remotes/").partition("/")
+        remote, branch = advertised[ref]
         if _reachable_from_live(repo, remote, branch, recorded):
             return recorded
     return base

@@ -39,7 +39,8 @@ def commit(repo, name, text):
     return git(repo, "rev-parse", "HEAD")
 
 
-def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False, prune=True):
+def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False, prune=True,
+                         remote_name="origin"):
     """old -> fork (recorded base) -> work; remote main has moved past `fork`."""
     tid = kb.create_task(conn, title="implement fixture")
     ws = kb.resolve_workspace(kb.get_task(conn, tid))
@@ -50,12 +51,12 @@ def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False,
     old = commit(ws, "code.py", "value = 1\n")
     remote = tmp_path / "remote.git"
     git(tmp_path, "init", "--bare", str(remote))
-    git(ws, "remote", "add", "origin", str(remote))
-    git(ws, "push", "origin", "HEAD:refs/heads/old")
+    git(ws, "remote", "add", remote_name, str(remote))
+    git(ws, "push", remote_name, "HEAD:refs/heads/old")
     fork = commit(ws, "history.txt", "main's own history\n")
     if track_main:
-        git(ws, "push", "origin", "HEAD:refs/heads/main")
-        git(ws, "fetch", "origin")
+        git(ws, "push", remote_name, "HEAD:refs/heads/main")
+        git(ws, "fetch", remote_name)
     kb.set_workspace_path(conn, tid, ws)       # records bases[.] = fork
     # Main moves on elsewhere; its new tip never reaches this object store.
     other = tmp_path / "other"
@@ -84,8 +85,17 @@ def patch_of(conn, tid):
     return Path(patch.stored_path).read_text()
 
 
-def test_patch_is_cut_against_recorded_base_not_older_published_head(board, tmp_path):
-    tid, ws, old, fork, work = stale_base_workspace(board, tmp_path)
+# A remote name may contain `/` (FleetReview P1 on #1449): the tracking ref
+# refs/remotes/team/origin/main must resolve to remote team/origin, branch main.
+@pytest.mark.parametrize("remote_name", ["origin", "team/origin"])
+def test_patch_is_cut_against_recorded_base_not_older_published_head(board, tmp_path, monkeypatch,
+                                                                    remote_name):
+    if remote_name != "origin":
+        # Only `origin` may be a local-path durable remote; stand in for a
+        # hosted remote so the slash name reaches the base selection.
+        import hermes_cli.kanban_survivor as survivor
+        monkeypatch.setattr(survivor, "_durable_remote", lambda *a, **k: True)
+    tid, ws, old, fork, work = stale_base_workspace(board, tmp_path, remote_name=remote_name)
     assert kb.complete_task(board, tid, metadata={"changed_files": ["card.py"]})
     survivor = kb.latest_run(board, tid).metadata["survivor"]
     assert survivor["kind"] == "patch"
