@@ -474,3 +474,44 @@ def test_auxiliary_resolver_uses_explicit_key_without_a_stored_login(home):
     assert model == "k3"
     assert client._real_client.auth_token != "entra-id-bearer-via-http-hook"
     assert client.base_url.rstrip("/") == KIMI_OAUTH_INFERENCE_BASE_URL
+
+
+def _capture_messages_headers(client):
+    import httpx
+
+    seen = {}
+
+    def _handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "k3",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+            "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    # Swap the transport in place: with_options() would rebuild the client
+    # and re-read ANTHROPIC_API_KEY from the env.
+    client._client = httpx.Client(transport=httpx.MockTransport(_handler))
+    client.messages.create(model="k3", max_tokens=8, messages=[{"role": "user", "content": "hi"}])
+    return seen
+
+
+def test_unmanaged_kimi_jwt_is_sent_as_bearer_not_x_api_key(home, monkeypatch):
+    from agent.auxiliary_client import resolve_provider_client
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-leak")
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    key = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    client, _model = resolve_provider_client("kimi-oauth", "k3", explicit_api_key=key)
+    seen = _capture_messages_headers(client._real_client)
+    assert seen["authorization"] == f"Bearer {key}"
+    assert "x-api-key" not in seen
+
+
+def test_static_sk_kimi_key_still_sent_as_x_api_key():
+    from agent.anthropic_adapter import build_anthropic_client
+
+    key = "sk-kimi-" + "x" * 40
+    seen = _capture_messages_headers(build_anthropic_client(key, KIMI_OAUTH_INFERENCE_BASE_URL))
+    assert seen["x-api-key"] == key
+    assert "authorization" not in seen

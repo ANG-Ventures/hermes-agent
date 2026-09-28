@@ -938,7 +938,13 @@ def build_anthropic_client(
         # traffic correctly. Send the same attribution header set we send to
         # OpenRouter, Vercel AI Gateway, and Fireworks:
         # HTTP-Referer + X-Title + HermesAgent User-Agent.
-        kwargs["api_key"] = api_key
+        if _kimi_jwt_claims(api_key) is not None:
+            # A membership JWT this host's login did not issue (the managed
+            # login was swapped for the bearer hook above) is still an OAuth
+            # bearer token: send Authorization: Bearer, not X-Api-Key.
+            kwargs["auth_token"] = api_key
+        else:
+            kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
             **_kimi_coding_attribution_headers(),
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
