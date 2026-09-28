@@ -2578,6 +2578,19 @@ def _pricing_entry_from_metadata(
     )
 
 
+def _is_unpriced_proxy_route(route: BillingRoute) -> bool:
+    """True for a proxy-lane route whose served vendor has no pricing lane.
+
+    ``resolve_billing_route`` re-routes a proxy turn to its vendor's notional
+    lane (``_PROXY_VENDOR_PRICING_LANE``); a route still carrying the proxy's
+    own provider name is one it refused. Such a turn must stay unpriced: the
+    M1 vendor fallback in ``_lookup_official_docs_pricing`` would otherwise
+    price e.g. ``claude-*`` via ``cpa`` at Anthropic rates the proxy has no
+    lane for.
+    """
+    return route.provider in NOTIONAL_PROXY_PROVIDERS
+
+
 def get_pricing_entry(
     model_name: str,
     provider: Optional[str] = None,
@@ -2585,6 +2598,8 @@ def get_pricing_entry(
     api_key: Optional[str] = None,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    if _is_unpriced_proxy_route(route):
+        return None
     if route.billing_mode == "subscription_included":
         return PricingEntry(
             input_cost_per_million=_ZERO,
@@ -2669,6 +2684,8 @@ def is_known_model(
     except Exception:
         # Never let a probe raise into a caller on the record path.
         return True
+    if _is_unpriced_proxy_route(route):
+        return False
     if route.billing_mode == "subscription_included":
         return True
     # Dynamic-catalog and endpoint-metadata routes are out of scope (see above).
