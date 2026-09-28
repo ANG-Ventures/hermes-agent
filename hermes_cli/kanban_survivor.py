@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
@@ -1575,20 +1576,25 @@ def _recorded_base(repo, recorded, published, base):
     # neither the tracking ref nor object presence proves a fresh clone of the
     # branch can reach it. Prove reachability from the live tip instead.
     # Network only here, after every cheap local check passed; one fetch per
-    # matched branch (normally one), never per published head.
+    # matched branch (normally one), never per published head, and ONE
+    # overall budget: a hung remote must not cost 120 s per matched branch.
+    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
     for ref in sorted(matched):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         remote, branch = advertised[ref]
-        if _reachable_from_live(repo, remote, branch, recorded):
+        if _reachable_from_live(repo, remote, branch, recorded, timeout=remaining):
             return recorded
     return base
 
 
-#: Budget for proving the recorded base against a live branch. A timeout just
+#: TOTAL budget for proving the recorded base against live branches. A timeout just
 #: keeps the older published base: a larger patch, never a lost one.
 _LIVE_BASE_TIMEOUT = 120
 
 
-def _reachable_from_live(repo, remote, branch, sha):
+def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOUT):
     """True only if ``sha`` is an ancestor of ``remote``'s LIVE ``branch`` tip.
 
     Fetches the branch into a throwaway bare repository that borrows
@@ -1615,7 +1621,7 @@ def _reachable_from_live(repo, remote, branch, sha):
                 "fetch", "-q", "--no-tags", "candidate",
                 f"+refs/heads/{branch}:refs/heads/candidate",
                 env=dict(env, KANBAN_FETCH_URL=url.stdout.decode().strip()),
-                check=False, timeout=_LIVE_BASE_TIMEOUT,
+                check=False, timeout=timeout,
             )
             if fetched.returncode:
                 return False

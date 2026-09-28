@@ -137,3 +137,33 @@ def test_recorded_base_off_the_live_branch_is_not_trusted(board, tmp_path, prune
     data = patch_of(board, tid)
     assert f"base={old}" in data
     assert "diff --git a/history.txt b/history.txt" in data
+
+
+def test_live_probes_share_one_time_budget(tmp_path, monkeypatch):
+    # FleetReview P1 on #1449: with the recorded base on many advertised
+    # branches and a hung remote, each probe must not get a fresh 120 s.
+    import hermes_cli.kanban_survivor as survivor
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    git(ws, "init", "-q", "-b", "main")
+    git(ws, "config", "user.name", "Test")
+    git(ws, "config", "user.email", "test@example.invalid")
+    base = commit(ws, "a.txt", "a\n")
+    recorded = commit(ws, "b.txt", "b\n")
+    commit(ws, "c.txt", "c\n")
+    published = [{"remote": "origin", "branch": f"b{i}", "sha": "0" * 40} for i in range(60)]
+    for ref in published:
+        git(ws, "update-ref", f"refs/remotes/origin/{ref['branch']}", recorded)
+    clock = {"now": 1000.0}
+    import time
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    budgets = []
+
+    def hung(repo, remote, branch, sha, *, timeout=survivor._LIVE_BASE_TIMEOUT):
+        budgets.append(timeout)
+        clock["now"] += timeout          # the fetch burns its whole budget
+        return False
+
+    monkeypatch.setattr(survivor, "_reachable_from_live", hung)
+    assert survivor._recorded_base(ws, recorded, published, base) == base
+    assert budgets and sum(budgets) <= survivor._LIVE_BASE_TIMEOUT
