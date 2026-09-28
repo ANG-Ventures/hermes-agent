@@ -523,14 +523,13 @@ def auth_add_command(args) -> None:
         # holds no independent copy. The login writes auth.json
         # providers.kimi-oauth; load_pool() re-seeds the single "oauth" entry
         # from it.
+        # The label rides in the login's own write: writing the returned
+        # state again could restore a refresh token rotated in between.
         state = auth_mod._kimi_oauth_login(
             open_browser=not getattr(args, "no_browser", False),
             timeout_seconds=getattr(args, "timeout", None) or 15.0,
+            label=(getattr(args, "label", None) or "").strip() or None,
         )
-        label = (getattr(args, "label", None) or "").strip()
-        if label:
-            state["label"] = label
-            auth_mod._kimi_oauth_write_state(state)
         load_pool(provider)
         print(f"Saved {provider} OAuth credentials (expires {state.get('expires_at')}).")
         return

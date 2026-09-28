@@ -47,6 +47,37 @@ def test_proceeding_is_a_real_reply_on_every_other_provider():
                 ) is None, (prov, prior, nudged)
 
 
+def test_legacy_bridge_closer_in_history_survives_provider_switch():
+    history = [
+        {"role": "user", "content": "Run the tools"},
+        {"role": "assistant", "content": PROCEEDING},
+        {"role": "user", "content": "What happened?"},
+    ]
+    for prov in ("claude-apr", "openai-codex"):
+        assert cl.classify_placeholder_final_text(
+            PROCEEDING, prior_was_tool=True, already_nudged=False,
+            provider=prov, history=history,
+        ) == "empty"
+        assert cl.classify_placeholder_final_text(
+            PROCEEDING, prior_was_tool=False, already_nudged=False,
+            provider=prov, history=history,
+        ) == "notice"
+
+
+def test_nonbridge_proceeding_with_no_assistant_closer_remains_a_reply():
+    history = [{"role": "user", "content": PROCEEDING}]
+    assert cl.classify_placeholder_final_text(
+        PROCEEDING, prior_was_tool=True, already_nudged=False,
+        provider="claude-apr", history=history,
+    ) is None
+
+
+def test_switch_seam_passes_retained_history():
+    src = _loop_source()
+    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = assistant_message.content or ""'))
+    assert "history=messages" in src[i:i + 450]
+
+
 def test_cli_closer_stays_global_for_every_provider():
     for prov in (None, "anthropic", "claude-bpr", "openrouter"):
         assert cl.classify_placeholder_final_text(
@@ -131,4 +162,4 @@ def test_backstop_is_wired_at_the_final_text_seam():
 def test_classifier_signature_is_keyword_only():
     tree = ast.parse(_loop_source())
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "classify_placeholder_final_text")
-    assert [a.arg for a in fn.args.kwonlyargs] == ["prior_was_tool", "already_nudged", "provider"]
+    assert [a.arg for a in fn.args.kwonlyargs] == ["prior_was_tool", "already_nudged", "provider", "history"]
