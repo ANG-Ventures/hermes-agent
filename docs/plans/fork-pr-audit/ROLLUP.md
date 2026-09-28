@@ -4,7 +4,7 @@
 
 | tranche | KEEP | UPSTREAM | SUPERSEDED-BY-UPSTREAM | DROP | UNRESOLVED | total |
 |---|---|---|---|---|---|---|
-| gateway | 95 | 19 | 27 | 40 | 0 | 181 |
+| gateway | 96 | 19 | 27 | 39 | 0 | 181 |
 | agent | 118 | 20 | 85 | 17 | 0 | 240 |
 | hermes_cli | 141 | 7 | 17 | 12 | 0 | 177 |
 | plugins | 69 | 7 | 4 | 4 | 0 | 84 |
@@ -13,11 +13,11 @@
 | auto | 134 | 5 | 17 | 11 | 0 | 167 |
 | auto-cherry-pick | 0 | 0 | 2 | 0 | 0 | 2 |
 | auto-desktop-retired | 0 | 0 | 0 | 37 | 0 | 37 |
-| **all** | **680** | **97** | **176** | **163** | **0** | **1116** |
+| **all** | **681** | **97** | **176** | **162** | **0** | **1116** |
 
 ## 2. Fork lines that DROP / SUPERSEDED would delete
 
-Census `loc` (add+del of the original PR, an upper bound — later rows edit the same lines): DROP 53,571, SUPERSEDED-BY-UPSTREAM 88,557, UPSTREAM (deleted once merged upstream) 30,711, KEEP 342,361, UNRESOLVED 0; all rows 515,200.
+Census `loc` (add+del of the original PR, an upper bound — later rows edit the same lines): DROP 53,416, SUPERSEDED-BY-UPSTREAM 88,557, UPSTREAM (deleted once merged upstream) 30,711, KEEP 342,516, UNRESOLVED 0; all rows 515,200.
 
 Real `git diff --shortstat <merge-base> <branch>` of every revert branch on origin (lead run 2026-09-25):
 
@@ -159,7 +159,7 @@ Census `conflict_files` is file-level (the PR touches a file named in a sync led
 | RESOLUTION-LEDGER-20260807.md | 117 | 87 | 14 |
 | RESOLUTION-LEDGER-2026-08-29.md | 123 | 87 | 16 |
 
-Row view: 241/795 ledger-touching rows are DROP/SUPERSEDED; they hold 569/1,727 (33%) of all row×conflict-file incidences. Freed files (all ledgers, deduped): 33 — apps/desktop/src/lib/reasoning-effort.ts, hermes_cli/tools_config.py, locales/ar.yaml, scripts/install.sh, scripts/iso-certify.py, tests/agent/test_compaction_threshold_reresolve.py, tests/agent/test_fallback_announce.py, tests/agent/test_i18n.py, tests/agent/test_redact.py, tests/cron/test_lifecycle_guard_heredoc_data.py, tests/gateway/test_config_env_bridge_authority.py, tests/gateway/test_cron_session_contextvar.py, tests/gateway/test_no_gateway_session_env_writes.py, tests/hermes_cli/test_model_switch_custom_providers.py, tests/hermes_cli/test_web_server.py, tests/hermes_cli/test_web_server_cron_profiles.py, tests/run_agent/test_partial_stream_finish_reason.py, tests/run_agent/test_run_agent.py, tests/run_agent/test_run_agent_conversation.py, tests/test_code_skew.py, tests/test_web_server.py, tests/tools/test_cron_subagent_session.py, tests/tools/test_mcp_tool.py, tests/tui_gateway/test_compute_host_phase1.py, tests/tui_gateway/test_iso_certify_seam.py, tui_gateway/compute_host.py, tui_gateway/host_supervisor.py, tui_gateway/methods_session.py, tui_gateway/synthetic_turn.py, tui_gateway/ws.py, web/src/lib/gatewayClient.test.ts, web/src/lib/gatewayClient.ts, website/docs/user-guide/features/browser.md. The god files (gateway/run.py, agent/*helpers, hermes_state.py, cron/scheduler.py) stay conflicted: KEEP rows still touch them, so the win there is fewer hunks, not fewer files.
+Row view: 240/795 ledger-touching rows are DROP/SUPERSEDED; they hold 567/1,727 (33%) of all row×conflict-file incidences. Freed files (all ledgers, deduped): 33 — apps/desktop/src/lib/reasoning-effort.ts, hermes_cli/tools_config.py, locales/ar.yaml, scripts/install.sh, scripts/iso-certify.py, tests/agent/test_compaction_threshold_reresolve.py, tests/agent/test_fallback_announce.py, tests/agent/test_i18n.py, tests/agent/test_redact.py, tests/cron/test_lifecycle_guard_heredoc_data.py, tests/gateway/test_config_env_bridge_authority.py, tests/gateway/test_cron_session_contextvar.py, tests/gateway/test_no_gateway_session_env_writes.py, tests/hermes_cli/test_model_switch_custom_providers.py, tests/hermes_cli/test_web_server.py, tests/hermes_cli/test_web_server_cron_profiles.py, tests/run_agent/test_partial_stream_finish_reason.py, tests/run_agent/test_run_agent.py, tests/run_agent/test_run_agent_conversation.py, tests/test_code_skew.py, tests/test_web_server.py, tests/tools/test_cron_subagent_session.py, tests/tools/test_mcp_tool.py, tests/tui_gateway/test_compute_host_phase1.py, tests/tui_gateway/test_iso_certify_seam.py, tui_gateway/compute_host.py, tui_gateway/host_supervisor.py, tui_gateway/methods_session.py, tui_gateway/synthetic_turn.py, tui_gateway/ws.py, web/src/lib/gatewayClient.test.ts, web/src/lib/gatewayClient.ts, website/docs/user-guide/features/browser.md. The god files (gateway/run.py, agent/*helpers, hermes_state.py, cron/scheduler.py) stay conflicted: KEEP rows still touch them, so the win there is fewer hunks, not fewer files.
 
 ## 5. D2b registry write-backs owed (docs/sync/fork-features.json)
 
@@ -174,11 +174,11 @@ Row view: 241/795 ledger-touching rows are DROP/SUPERSEDED; they hold 569/1,727 
 
 ## 6. The three answers Ace asked for
 
-**What still provides value.** 680 rows (342,361 loc) KEEP on a measurement: the restart/resume/admission family (boot_resume_scheduled 1,190, dropbox_resume 1,410, turn_slot_acquire 2,208, restart_notice 455 fires), blackbox cost accounting (19k–47k turns/api-calls priced), relay-lane headers/pricing (16,913 bpx/bpr calls/7d), the footer and route/compaction announce families (registry 3/22/23/24, live config), Discord restart backfill (425 re-injected messages), cron fallback/pins (17 opt-in jobs, 521-job stores). Plus 97 UPSTREAM rows that are needed AND generic — value that should stop being ours.
+**What still provides value.** 681 rows (342,516 loc) KEEP on a measurement: the restart/resume/admission family (boot_resume_scheduled 1,190, dropbox_resume 1,410, turn_slot_acquire 2,208, restart_notice 455 fires), blackbox cost accounting (19k–47k turns/api-calls priced), relay-lane headers/pricing (16,913 bpx/bpr calls/7d), the footer and route/compaction announce families (registry 3/22/23/24, live config), Discord restart backfill (425 re-injected messages), cron fallback/pins (17 opt-in jobs, 521-job stores). Plus 97 UPSTREAM rows that are needed AND generic — value that should stop being ours.
 
-**What solves problems that no longer exist.** 176 rows are fixed upstream (take theirs at the next sync) and 163 rows DROP: never fired in the window, dormant surfaces (desktop D9 ×37, gemini/yunwu lanes, MoA/send_message tools dormant since July, /undo 2 uses, /merge 0), one-shot June LCM campaign harnesses, and a write-only reaction journal. 0 rows stay UNRESOLVED: the 24 the lead left were measured and ruled by t_63023f77 (UNRESOLVED.md).
+**What solves problems that no longer exist.** 176 rows are fixed upstream (take theirs at the next sync) and 162 rows DROP: never fired in the window, dormant surfaces (desktop D9 ×37, gemini/yunwu lanes, MoA/send_message tools dormant since July, /undo 2 uses, /merge 0), one-shot June LCM campaign harnesses, and a write-only reaction journal. 0 rows stay UNRESOLVED: the 24 the lead left were measured and ruled by t_63023f77 (UNRESOLVED.md).
 
-**What the maintenance burden actually is (measured).** 515,200 fork lines across 1,116 rows; 795 rows sit on files named in the sync ledgers and 458 on files that conflicted in all three syncs. DROP+SUPERSEDED rows carry 569 of 1,727 (33%) row×conflict-file incidences and 142,128 census loc; but only 33 ledger files are fully freed because KEEP rows still sit on the god files. The real reduction comes in two steps: (1) this audit's DROP/SUPERSEDED (fewer hunks per sync), (2) landing the UPSTREAM rows + registry 22/23/24, which is what empties gateway/run.py of fork hunks.
+**What the maintenance burden actually is (measured).** 515,200 fork lines across 1,116 rows; 795 rows sit on files named in the sync ledgers and 458 on files that conflicted in all three syncs. DROP+SUPERSEDED rows carry 567 of 1,727 (33%) row×conflict-file incidences and 141,973 census loc; but only 33 ledger files are fully freed because KEEP rows still sit on the god files. The real reduction comes in two steps: (1) this audit's DROP/SUPERSEDED (fewer hunks per sync), (2) landing the UPSTREAM rows + registry 22/23/24, which is what empties gateway/run.py of fork hunks.
 
 ## 7. Open prerequisites before the sync takes upstream
 

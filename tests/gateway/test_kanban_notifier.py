@@ -801,7 +801,7 @@ def _self_caused_completion(actor_session_id, delivery_mode="notify+wake"):
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
-            chat_type="dm", delivery_mode=delivery_mode,
+            chat_type="dm", delivery_mode=delivery_mode, user_id="u1",
         )
         kb.complete_task(conn, tid, summary="merged and closed")
         with kb.write_txn(conn):
@@ -824,7 +824,7 @@ def _origins(monkeypatch, mapping):
 def test_self_caused_completion_posts_line_but_does_not_wake(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "self-echo.db"))
     kb.init_db()
-    _origins(monkeypatch, {"sess-chat-1": ("telegram", "chat-1", "")})
+    _origins(monkeypatch, {"sess-chat-1": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "", "user_id": "u1", "profile": "default"}})
     tid = _self_caused_completion("sess-chat-1")
 
     adapter = RecordingAdapter()
@@ -839,7 +839,7 @@ def test_self_caused_completion_posts_line_but_does_not_wake(tmp_path, monkeypat
 def test_completion_from_another_chat_still_wakes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "other-chat.db"))
     kb.init_db()
-    _origins(monkeypatch, {"sess-other": ("telegram", "chat-2", "")})
+    _origins(monkeypatch, {"sess-other": {"platform": "telegram", "chat_id": "chat-2", "thread_id": "", "user_id": "u1", "profile": "default"}})
     tid = _self_caused_completion("sess-other")
 
     adapter = RecordingAdapter()
@@ -857,18 +857,71 @@ def test_self_caused_event_ids_matching_rules():
         return kb.Event(id=i, task_id="t", kind="completed", payload=None,
                         created_at=0, actor_session_id=actor)
 
-    sub = {"platform": "Discord", "chat_id": "c1", "thread_id": ""}
+    sub = {"platform": "Discord", "chat_id": "c1", "thread_id": "",
+           "user_id": "u1", "notifier_profile": None}
+    base = {"platform": "discord", "chat_id": "c1", "thread_id": "",
+            "user_id": "u1", "profile": "default"}
     origins = {
-        "same": ("discord", "c1", ""),
-        "thread": ("discord", "c1", "th9"),
-        "other": ("discord", "c2", ""),
+        "same": dict(base),
+        "alt": dict(base, user_id="", user_id_alt="u1"),
+        "thread": dict(base, thread_id="th9"),
+        "other": dict(base, chat_id="c2"),
+        # Same group chat, different participant: per-user group sessions
+        # mean the wake targets u1's session, not u2's (c62d95fdcbb8).
+        "other_user": dict(base, user_id="u2"),
+        # Same chat + user, different bot profile (daed91426bf1).
+        "other_profile": dict(base, profile="apollo2"),
+        "no_profile": {k: v for k, v in base.items() if k != "profile"},
     }
     events = [ev(1, "same"), ev(2, "thread"), ev(3, "other"), ev(4, None),
-              ev(5, "unknown"), ev(6, "c1")]
+              ev(5, "unknown"), ev(6, "c1"), ev(7, "other_user"),
+              ev(8, "other_profile"), ev(9, "no_profile"), ev(10, "alt")]
     got = self_caused_event_ids(sub, events, origin_of=origins.get)
     # 6: an actor id that merely equals chat_id is NOT proof of the same
     # chat (FleetReview e014c9b89f4e); only a recorded origin match counts.
-    assert got == {1}
+    assert got == {1, 10}
+    # A sub with no recorded participant can't prove self: fail open.
+    anon = dict(sub, user_id=None)
+    assert self_caused_event_ids(anon, events, origin_of=origins.get) == set()
+
+
+def test_self_caused_event_whose_line_was_not_sent_still_wakes(tmp_path, monkeypatch):
+    """The wake is dropped only for events whose passive line was confirmed
+    sent (6c26d69da6e0). A self-caused failure event the lane planner keeps
+    silent (directive None: no send) must still wake the subscriber."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "unsent.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"sess-chat-1": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "", "user_id": "u1", "profile": "default"}})
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="self crash", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            chat_type="dm", delivery_mode="notify+wake", user_id="u1",
+        )
+        kb._append_event(conn, tid, kind="crashed")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET actor_session_id=? "
+                "WHERE task_id=? AND kind='crashed'",
+                ("sess-chat-1", tid),
+            )
+    finally:
+        conn.close()
+
+    class SilentPlanner:
+        def plan(self, deliveries, now=None):
+            for d in deliveries:
+                d["failure_directives"] = {ev.id: None for ev in d["events"]}
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_lane_dedupe = SilentPlanner()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "planner kept the line silent"
+    assert tid in _wake_text(adapter), "unsent self-caused event must still wake"
+
 
 
 def test_self_caused_event_on_wake_only_sub_still_wakes(tmp_path, monkeypatch):
@@ -876,7 +929,7 @@ def test_self_caused_event_on_wake_only_sub_still_wakes(tmp_path, monkeypatch):
     delivery, so a self-caused event must still wake (FleetReview d9c37a52d911)."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-only.db"))
     kb.init_db()
-    _origins(monkeypatch, {"sess-chat-1": ("telegram", "chat-1", "")})
+    _origins(monkeypatch, {"sess-chat-1": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "", "user_id": "u1", "profile": "default"}})
     tid = _self_caused_completion("sess-chat-1", delivery_mode="wake")
 
     adapter = RecordingAdapter()
@@ -894,7 +947,7 @@ def test_self_caused_event_on_apiserver_sub_still_wakes(tmp_path, monkeypatch):
     (FleetReview d9c37a52d911, delegated child completion case)."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-self.db"))
     kb.init_db()
-    _origins(monkeypatch, {"origin-session": ("api_server", "origin-session", "")})
+    _origins(monkeypatch, {"origin-session": {"platform": "api_server", "chat_id": "origin-session", "thread_id": "", "user_id": "u1", "profile": "default"}})
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="child work", assignee="worker")

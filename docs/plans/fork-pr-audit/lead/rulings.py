@@ -185,6 +185,10 @@ POST_RULING_2026_09_27 = {
     '#22': ('t_8ff394b6', 'apollo@daemonarchy.local entry only: not stale, Apollo committed under it on 2026-09-22 and PR #872\'s '
             'attribution check passed only via this mapping. The 2 nopr:40a6040932 lines stay DROP on '
             'audit/scripts_misc/revert-author-map-stale @4053ee9081.'),
+    '#1031': ('t_a00223ec', 'Ace 2026-09-27 16:38 PT via Apollo: #1043 (d4b4323ec9, merged after the audit) builds on #1031, '
+              'keeps _persisted_session_route_identity / lookup_persisted_route_identity in BLOCKING_CALLEES, and records a '
+              'measured ~100 s event-loop stall on Apollo 2026-09-24; the rebased revert fails its ratchet (3 on-loop hits). '
+              'Revert PR #1156 closed unmerged; branch audit/gateway/revert-1031 must not merge.'),
 }
 
 # t_63023f77 measured and ruled the 24 rows the lead left UNRESOLVED (UNRESOLVED.md). The ruling file is the source;
