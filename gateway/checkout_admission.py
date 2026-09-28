@@ -140,7 +140,21 @@ def _preserve_unreadable(src: Path) -> Path:
             out.flush()
             os.fsync(out.fileno())
         dest = directory / f"hold.unreadable.{time.time_ns()}.{uuid.uuid4().hex[:8]}.json"
-        os.link(tmp, dest)
+        try:
+            os.link(tmp, dest)
+        except FileExistsError:
+            raise
+        except OSError:
+            # Filesystem without hard links (some SMB/FUSE mounts): reserve
+            # the unique name with O_EXCL (fails rather than overwrite), then
+            # atomically swap the complete temp over our own placeholder.
+            os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            try:
+                os.replace(tmp, dest)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(dest)
+                raise
         _fsync_dir(directory)
         return dest
     finally:
