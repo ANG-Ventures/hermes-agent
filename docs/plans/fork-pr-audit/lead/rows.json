@@ -13572,8 +13572,8 @@
   "auditor": "KEEP",
   "adv": "keep-unproven",
   "adv_new": "KEEP-UNPROVEN",
-  "final": "DROP",
-  "why": "LEAD: KEEP-UNPROVEN with no positive fire count, no executed upstream RED, no live knob/consumer/registry entry found in the row evidence -> DROP per rule (unmeasured \"still needed\" is not a KEEP).",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): Ace 2026-09-27 16:38 PT via Apollo: #1043 (d4b4323ec9, merged after the audit) builds on #1031, keeps _persisted_session_route_identity / lookup_persisted_route_identity in BLOCKING_CALLEES, and records a measured ~100 s event-loop stall on Apollo 2026-09-24; the rebased revert fails its ratchet (3 on-loop hits). Revert PR #1156 closed unmerged; branch audit/gateway/revert-1031 must not merge. (slice card t_a00223ec)",
   "x": {
    "verdict": "KEEP",
    "problem": "persisted route lookup on the event loop",
