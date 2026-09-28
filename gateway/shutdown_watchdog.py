@@ -116,19 +116,26 @@ def describe_blocked_loop_thread(thread_ident: Optional[int]) -> tuple[str, str]
     external profiler. Never raises.
     """
     try:
-        import traceback
-
         frame = sys._current_frames().get(thread_ident) if thread_ident else None
         if frame is None:
             return "unknown", "(loop thread frame unavailable)"
-        summary = traceback.extract_stack(frame)
+        # Walk the frames directly. traceback.extract_stack/format_list go
+        # through linecache (a stat and a source read per file), and this runs
+        # in the HARD-EXIT watchdog, where a stuck disk must not block the exit
+        # (C5 #34, PR #969). Names and line numbers need no I/O.
+        frames = []
+        while frame is not None:
+            frames.append((frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name))
+            frame = frame.f_back
+        frames.reverse()
         site = "unknown"
-        for fs in summary:
-            fn = fs.filename or ""
+        for fn, lineno, name in frames:
+            fn = fn or ""
             if fn.startswith(_REPO_ROOT) and "/site-packages/" not in fn and "/.venv/" not in fn:
                 rel = os.path.relpath(fn, _REPO_ROOT)
-                site = f"{rel}:{fs.lineno} {fs.name}"
-        stack = "".join(traceback.format_list(summary[-30:]))
+                site = f"{rel}:{lineno} {name}"
+        stack = "".join(f'  File "{fn}", line {lineno}, in {name}\n'
+                        for fn, lineno, name in frames[-30:])
         return site, stack
     except Exception:
         return "unknown", "(loop thread stack capture failed)"

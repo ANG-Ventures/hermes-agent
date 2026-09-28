@@ -281,7 +281,13 @@ def page_once(path: str, outcome: str) -> None:
                         stamps = {}
                 except (OSError, ValueError):
                     stamps = {}
-                if now - float(stamps.get(path, 0)) >= PAGE_INTERVAL_SECONDS and shell_hooks._page_missing_hook(path, outcome):
+                try:
+                    last = float(stamps.get(path, 0))
+                except (TypeError, ValueError):
+                    # A malformed stamp is "never paged", not an exception that
+                    # replaces the hook verdict (C5 #45, PR #1000).
+                    last = 0.0
+                if now - last >= PAGE_INTERVAL_SECONDS and shell_hooks._page_missing_hook(path, outcome):
                     stamps[path] = now
                     tmp = state_file.with_suffix(".json.tmp")
                     tmp.write_text(json.dumps(stamps), encoding="utf-8")

@@ -7492,6 +7492,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
+# Removing an edge re-promotes the child: a status write on it, same as link
+# (C5 #21, PR #951).
+@_home_session_guarded("unlink", task_param="child_id")
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(

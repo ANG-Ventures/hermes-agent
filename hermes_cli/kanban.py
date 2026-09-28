@@ -1975,7 +1975,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
-    "request-changes", "link", "specify", "decompose", "workspace",
+    "request-changes", "link", "unlink", "specify", "decompose", "workspace",
 })
 
 
@@ -4777,6 +4777,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
+                # The guard's refusal first: a refused block must not leave a
+                # "BLOCKED:" status comment behind (C5 #20, PR #951).
+                kb.check_home_session(conn, tid, "block")
                 _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"BLOCKED: {reason}",
@@ -4844,6 +4847,9 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 and wake_at is not None
             )
             if reason:
+                # The guard's refusal first: a refused schedule must not leave a
+                # "SCHEDULED:" status comment behind (C5 #20, PR #951).
+                kb.check_home_session(conn, tid, "schedule")
                 _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"SCHEDULED: {reason}",
@@ -4887,6 +4893,9 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
+                # The guard's refusal first: a refused unblock must not leave a
+                # "UNBLOCK:" status comment behind (C5 #20, PR #951).
+                kb.check_home_session(conn, tid, "unblock")
                 _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"UNBLOCK: {reason}",

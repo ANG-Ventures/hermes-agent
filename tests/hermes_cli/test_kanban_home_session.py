@@ -283,6 +283,22 @@ def test_cli_foreign_complete_refused_then_override(kanban_home, monkeypatch):
         )
 
 
+@pytest.mark.parametrize("verb,blocked", [("block", False), ("unblock", True),
+                                           ("schedule", False)])
+def test_cli_refused_status_verb_leaves_no_status_comment(kanban_home, monkeypatch,
+                                                          verb, blocked):
+    """C5 #20 (PR #951): the guard refuses BEFORE the status comment is written."""
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=blocked)
+        before = _comments(conn, tid)
+    out = kc.run_slash(f"{verb} {tid} 'why not'")
+    assert f"refused {verb}" in out, out
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid) == before
+
+
 def test_cli_comment_on_foreign_card_is_unaffected(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
     with kb.connect_closing() as conn:
@@ -403,6 +419,24 @@ def _link(conn, tid):
     kb.link_tasks(conn, parent, tid)
 
 
+_LINKED_PARENT: dict = {}
+
+
+def _linked(conn, **kw):
+    """A ready card demoted to todo by an open parent (no actor bound)."""
+    tid = _ready(conn, **kw)
+    parent = kb.create_task(conn, title="p", assignee="x", session_id=OTHER)
+    kb.link_tasks(conn, parent, tid)
+    _LINKED_PARENT[tid] = parent
+    return tid
+
+
+def _unlink(conn, tid):
+    # C5 #21/#22/#24 (PR #951): removing the edge re-promotes the child, so it
+    # is a status write on the child exactly like link.
+    kb.unlink_tasks(conn, _LINKED_PARENT[tid], tid)
+
+
 # (setup, mutation) for every newly guarded status writer. Each mutation is
 # first proven to CHANGE the card with no actor bound, so a refusal is real.
 _ROUND2 = {
@@ -412,6 +446,7 @@ _ROUND2 = {
         c, t, summary="s", reviewer="argus", force=True)),
     "request-changes": (_review_run, lambda c, t: covered_request_changes(c, t, reason="fix")),
     "link": (_ready, _link),
+    "unlink": (_linked, _unlink),
     "specify": (_triage, lambda c, t: kb.specify_triage_task(c, t, body="spec")),
     "decompose": (_triage, lambda c, t: kb.decompose_triage_task(
         c, t, root_assignee="worker-a",
