@@ -76,6 +76,27 @@ def test_cards_on_every_board_one_read(home):
     assert hi.resync(check_only=True)["drift"] == 0
 
 
+def test_list_home_spans_every_board_via_the_index(home, monkeypatch):
+    """C5 #32: the home-cards overflow hint `kanban list --home` must show the
+    same cross-board set the block does, not just the current board."""
+    from hermes_cli import kanban as kc
+
+    hi.resync()
+    with _conn(home) as conn:
+        here = kb.create_task(conn, title="on default", session_id=SID)
+    with _conn(home, "b-one") as conn:
+        there = kb.create_task(conn, title="on b-one", session_id=SID)
+        foreign = kb.create_task(conn, title="not mine", session_id=OTHER)
+    monkeypatch.setenv("HERMES_SESSION_ID", SID)
+    out = kc.run_slash("list --home")
+    assert here in out
+    assert "OTHER BOARDS (1 open home card):" in out
+    assert f"{there}  ready  on b-one  [board b-one]" in out
+    assert foreign not in out
+    # --status narrows the other-board section too.
+    assert there not in kc.run_slash("list --home --status blocked")
+
+
 def test_restamp_moves_card_between_homes(home):
     hi.resync()
     with _conn(home) as conn:
