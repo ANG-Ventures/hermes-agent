@@ -324,10 +324,14 @@ def read_pause_marker(board_dir) -> Optional[dict]:
         return None
 
 
-def _run_notify(argv: list[str]) -> None:
-    """Fire notify.py out-of-agent. Best-effort by contract."""
+def _run_notify(argv: list[str]) -> bool:
+    """Fire notify.py out-of-agent. Best-effort by contract.
+
+    Returns whether the send exited 0, so a caller that latches "already
+    announced" state can refuse to latch a page that never went out.
+    """
     try:
-        subprocess.run(
+        proc = subprocess.run(
             argv,
             check=False,
             stdin=subprocess.DEVNULL,
@@ -336,7 +340,8 @@ def _run_notify(argv: list[str]) -> None:
             timeout=30,
         )
     except Exception:
-        pass
+        return False
+    return proc.returncode == 0
 
 
 def _notify_script_path(home=None) -> Optional[str]:
