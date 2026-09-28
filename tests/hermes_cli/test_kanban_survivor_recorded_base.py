@@ -39,7 +39,7 @@ def commit(repo, name, text):
     return git(repo, "rev-parse", "HEAD")
 
 
-def stale_base_workspace(conn, tmp_path, *, track_main=True):
+def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False):
     """old -> fork (recorded base) -> work; remote main has moved past `fork`."""
     tid = kb.create_task(conn, title="implement fixture")
     ws = kb.resolve_workspace(kb.get_task(conn, tid))
@@ -62,11 +62,19 @@ def stale_base_workspace(conn, tmp_path, *, track_main=True):
     git(tmp_path, "clone", "-b", "old", str(remote), str(other))
     git(other, "config", "user.name", "Test")
     git(other, "config", "user.email", "test@example.invalid")
-    if track_main:
+    if track_main and not rewrite_main:
         git(other, "fetch", "origin", "main")
         git(other, "reset", "--hard", "origin/main")
+    if rewrite_main:
+        # Live main force-pushed to unrelated history and the old commits
+        # pruned: the local tracking ref still (stale-ly) contains `fork`.
+        git(other, "checkout", "-q", "--orphan", "rewritten")
+        git(other, "rm", "-rq", "--cached", ".")
     commit(other, "later.txt", "later main\n")
     git(other, "push", "-f", "origin", "HEAD:refs/heads/main")
+    if rewrite_main:
+        git(remote, "reflog", "expire", "--expire=now", "--all")
+        git(remote, "gc", "-q", "--prune=now")
     work = commit(ws, "card.py", "card = True\n")
     return tid, ws, old, fork, work
 
@@ -98,6 +106,18 @@ def test_unpublished_recorded_base_is_not_trusted(board, tmp_path):
     # The recorded base never reached any remote-tracking ref of a published
     # branch, so a patch against it could not be applied by a recoverer.
     tid, ws, old, fork, work = stale_base_workspace(board, tmp_path, track_main=False)
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["card.py"]})
+    data = patch_of(board, tid)
+    assert f"base={old}" in data
+    assert "diff --git a/history.txt b/history.txt" in data
+
+
+def test_recorded_base_the_remote_no_longer_holds_is_not_trusted(board, tmp_path):
+    # The local tracking ref still contains the recorded base, but the live
+    # branch was force-pushed away and the remote pruned it: a recoverer could
+    # not fetch it, so the patch must stay on a base the remote still serves.
+    tid, ws, old, fork, work = stale_base_workspace(board, tmp_path, rewrite_main=True)
+    assert git(ws, "merge-base", "--is-ancestor", fork, "refs/remotes/origin/main") == ""
     assert kb.complete_task(board, tid, metadata={"changed_files": ["card.py"]})
     data = patch_of(board, tid)
     assert f"base={old}" in data

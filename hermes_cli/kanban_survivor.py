@@ -1543,8 +1543,11 @@ def _recorded_base(repo, recorded, published, base):
     (t_93fba703: 111 files, 5.2 MB for a one-file card). The recorded base
     (HEAD at dispatch) is the fork point. It is used only when it is
     ``base`` or a descendant of it, an ancestor of HEAD, and contained in the
-    local remote-tracking ref of a branch the durable remote still advertises
-    -- a recoverer can then fetch it from that branch. Otherwise nothing changes.
+    local remote-tracking ref of a branch the durable remote still advertises,
+    AND that remote confirms it holds the commit (protocol-v2
+    ``--negotiate-only``; a server acks objects it stores, which covers the
+    normal case of the fork point still on the live branch). Otherwise
+    nothing changes.
     """
     if not isinstance(recorded, str) or not _OBJECT_ID.fullmatch(recorded) or recorded == base:
         return base
@@ -1555,15 +1558,32 @@ def _recorded_base(repo, recorded, published, base):
     advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}" for ref in published}
     listed = _git(repo, "for-each-ref", "--contains", recorded, "--format=%(refname)",
                   "refs/remotes", check=False)
-    if listed.returncode or not advertised.intersection(
-            listed.stdout.decode("utf-8", "replace").splitlines()):
+    if listed.returncode:
+        return base
+    matched = advertised.intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+    if not matched:
         return base
     if _git(repo, "merge-base", "--is-ancestor", recorded, "HEAD", check=False).returncode:
         return base
     if base is not None and _git(repo, "merge-base", "--is-ancestor", base, recorded,
                                  check=False).returncode:
         return base
-    return recorded
+    # A tracking ref is only what this checkout LAST fetched; the live branch
+    # may since have been force-pushed to unrelated history (FleetReview P1 on
+    # #1449). Ask the remote itself: protocol-v2 negotiation acknowledges the
+    # tip only if the server holds that commit, and transfers no objects.
+    # One network call per matched remote (normally one), never per head.
+    remotes = sorted({ref["remote"] for ref in published
+                      if f"refs/remotes/{ref['remote']}/{ref['branch']}" in matched})
+    for remote in remotes:
+        try:
+            acked = _git(repo, "-c", "protocol.version=2", "fetch", "--negotiate-only",
+                         f"--negotiation-tip={recorded}", remote, check=False)
+        except subprocess.TimeoutExpired:
+            continue
+        if acked.returncode == 0 and recorded in acked.stdout.decode("utf-8", "replace").split():
+            return recorded
+    return base
 
 
 def _snapshot(repo, base, prefix, *, irreversible_delete=False):
