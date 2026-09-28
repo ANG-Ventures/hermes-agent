@@ -237,11 +237,20 @@ def test_landed_branch_is_skipped_not_failed(origin, tmp_path):
                               scope=[], created_at=created_at) is None
 
 
-def _states(**by_number):
+def _states(head_sha: str | None = None, merge_sha: str = "abc123def4567", **by_number):
     def q(repo, number):
         st = by_number.get(f"n{number}")
-        return None if st is None else {"state": st, "merge_commit_sha": "abc123def4567"}
+        if st is None:
+            return None
+        out = {"state": st, "merge_commit_sha": merge_sha}
+        if head_sha:
+            out["head_sha"] = head_sha
+        return out
     return lambda: q
+
+
+def _squash_sha(origin: Path) -> str:
+    return _git(origin, "log", "-1", "--format=%H", "--grep=card squash")
 
 
 def _card(conn, ws: Path) -> tuple[str, int]:
@@ -253,11 +262,13 @@ def _card(conn, ws: Path) -> tuple[str, int]:
 
 def test_e2e_merged_survivor_pr_completes_without_override(board, origin, tmp_path, monkeypatch):
     from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
-    monkeypatch.setattr(op, "_default_query", _states(n7="MERGED"))
     # survivor capture/remote verification is a later, separate gate (network)
     monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
     # multi-commit squash: git cherry cannot match it, only the PR state can
     work, _ = _squash_merged_branch(origin, tmp_path, n_commits=2)
+    # the merged PR's head IS this checkout's HEAD: the PR carried these commits
+    monkeypatch.setattr(op, "_default_query", _states(_git(work, "rev-parse", "HEAD"),
+                                                      _squash_sha(origin), n7="MERGED"))
     with kb.connect() as conn:
         tid, run = _card(conn, work.parent)
         with pytest.raises(bb.StaleBaseError):  # same checkout, no merged PR named
@@ -267,7 +278,7 @@ def test_e2e_merged_survivor_pr_completes_without_override(board, origin, tmp_pa
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "done"
         ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
                           (tid, "base_guard_survivor_merged")).fetchone()
-        assert ev and "ANG-Ventures/hermes-agent#7 @ abc123def456" in ev[0]
+        assert ev and f"ANG-Ventures/hermes-agent#7 @ {_squash_sha(origin)[:12]}" in ev[0]
 
 
 def test_e2e_open_survivor_pr_with_foreign_commit_still_refuses(board, origin, tmp_path, monkeypatch):
@@ -280,3 +291,108 @@ def test_e2e_open_survivor_pr_with_foreign_commit_still_refuses(board, origin, t
             kb.complete_task(conn, tid, summary="done", expected_run_id=run,
                              survivor_pr="ANG-Ventures/hermes-agent#7")
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+
+
+# --- FleetReview #1394 P1: a merged PR must be tied to the checkout ----------
+
+
+def test_e2e_unrelated_merged_pr_does_not_bypass_guard(board, origin, tmp_path, monkeypatch):
+    """Naming ANY merged PR must not excuse a stale checkout whose commits that
+    PR never carried (key c2b6863a508d)."""
+    from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
+    monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
+    with kb.connect() as conn:
+        work, _ = _stale_branch(origin, tmp_path)
+        unrelated = _git(origin, "rev-parse", "HEAD")  # a trunk sha, not this branch
+        for head in (unrelated, None):  # wrong head / no head evidence at all
+            monkeypatch.setattr(op, "_default_query", _states(head, n7="MERGED"))
+            tid, run = _card(conn, work.parent)
+            with pytest.raises(bb.StaleBaseError):
+                kb.complete_task(conn, tid, summary="done", expected_run_id=run,
+                                 survivor_pr="ANG-Ventures/hermes-agent#7")
+            assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+            ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                              (tid, "completion_blocked_stale_base")).fetchone()
+            assert ev and "survivor_merged_untied" in ev[0]
+
+
+def test_merge_commit_ahead_is_not_already_landed(origin, tmp_path):
+    """git cherry omits merge commits; a patch-equivalent commit plus a merge
+    commit carrying new changes is NOT already landed (key 16b979e96639)."""
+    work, created_at = _squash_merged_branch(origin, tmp_path)
+    # side branch: a commit patch-equivalent to one trunk already has
+    _git(work, "checkout", "-q", "-b", "side", "HEAD~1")
+    _commit(work, {"docs/n0.md": "0\n"}, "side, same patch as trunk 0")
+    _git(work, "checkout", "-q", "daedalus/t_x")
+    # evil merge: the merge commit itself introduces an unpublished change
+    _git(work, "merge", "-q", "--no-ff", "--no-commit", "side")
+    (work / "gateway" / "run.py").write_text("x = 1  # only in the merge commit\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "merge side")
+    _git(work, "fetch", "-q", "origin")
+    cherry = _git(work, "cherry", "origin/main", "HEAD").splitlines()
+    assert cherry and all(ln.startswith("- ") for ln in cherry)  # the blind spot
+    rep = bb.check_checkout(work, scope=["hermes_cli/foo.py"], since=created_at,
+                            max_behind=None)
+    assert not rep.skipped, rep.render()
+    assert not rep.ok and "gateway/run.py" in rep.out_of_scope, rep.render()
+
+
+# --- FleetReview #1434 P1: merged PR must carry the content, on this trunk ---
+
+
+def _complete_refused(conn, work: Path) -> str:
+    tid, run = _card(conn, work.parent)
+    with pytest.raises(bb.StaleBaseError):
+        kb.complete_task(conn, tid, summary="done", expected_run_id=run,
+                         survivor_pr="ANG-Ventures/hermes-agent#7")
+    assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+    ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                      (tid, "completion_blocked_stale_base")).fetchone()
+    assert ev and "survivor_merged_untied" in ev[0]
+    return tid
+
+
+def test_e2e_merged_pr_that_reverted_the_checkout_does_not_bypass_guard(
+        board, origin, tmp_path, monkeypatch):
+    """The PR head descends from the checkout HEAD but a later PR commit
+    reverted its change; the squash that landed holds none of it (key
+    8db3d1e0e4ce). Ancestry alone would excuse the failures."""
+    from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
+    monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
+    work = _clone(origin, tmp_path / "ws" / "repo")
+    _git(work, "checkout", "-q", "-b", "daedalus/t_x")
+    _commit(work, {"hermes_cli/foo.py": "a = 10  # card change\n"}, "card 0")
+    _commit(work, {"hermes_cli/foo.py": "a = 11  # card change\n"}, "card 1")
+    head = _git(work, "rev-parse", "HEAD")
+    # the PR (pushed from elsewhere) reverts the card's change, then squashes:
+    pr = _clone(origin, tmp_path / "pr")
+    _git(pr, "fetch", "-q", str(work), "daedalus/t_x")
+    _git(pr, "checkout", "-q", "-b", "pr", "FETCH_HEAD")
+    _commit(pr, {"hermes_cli/foo.py": "a = 1\n", "docs/pr.md": "pr\n"}, "revert card")
+    pr_head = _git(pr, "rev-parse", "HEAD")
+    _git(work, "fetch", "-q", str(pr), "pr")  # PR head known locally: ancestry is testable
+    _commit(origin, {"docs/pr.md": "pr\n"}, "card squash (#7)")
+    _advance_trunk(origin, 3, touch={"hermes_cli/foo.py": "a = 99  # later trunk edit\n"})
+    assert _git(work, "merge-base", "--is-ancestor", head, pr_head) == ""  # ancestry holds
+    monkeypatch.setattr(op, "_default_query", _states(pr_head, _squash_sha(origin), n7="MERGED"))
+    with kb.connect() as conn:
+        _complete_refused(conn, work)
+
+
+def test_e2e_pr_merged_into_another_repo_does_not_bypass_guard(
+        board, origin, tmp_path, monkeypatch):
+    """The PR head IS this checkout's HEAD, but it merged into a fork: its merge
+    commit never reached this checkout's trunk (key 9212a9f6ac95)."""
+    from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
+    monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
+    work, _ = _squash_merged_branch(origin, tmp_path, n_commits=2)
+    head = _git(work, "rev-parse", "HEAD")
+    fork = _clone(origin, tmp_path / "fork")
+    _git(fork, "fetch", "-q", str(work), "daedalus/t_x")
+    _git(fork, "merge", "-q", "--no-ff", "-X", "theirs", "-m", "fork merge (#7)", "FETCH_HEAD")
+    fork_merge = _git(fork, "rev-parse", "HEAD")
+    _git(work, "fetch", "-q", str(fork), "main")  # object present locally, not on trunk
+    monkeypatch.setattr(op, "_default_query", _states(head, fork_merge, n7="MERGED"))
+    with kb.connect() as conn:
+        _complete_refused(conn, work)

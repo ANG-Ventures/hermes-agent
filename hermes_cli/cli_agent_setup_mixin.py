@@ -56,10 +56,21 @@ class CLIAgentSetupMixin:
         # pinned to openai-codex to escape a bridge fault ran on claude-bpr
         # (t_4fe0700a). Refuse loudly instead; a cooldown exits rate-limited.
         from hermes_cli.kanban_worker_route import (
+            card_pinned_route,
             pinned_worker_provider,
             record_worker_route_pin_refused,
             record_worker_route_substitution,
         )
+        # Earliest card read in the worker: it also snapshots the run's pin
+        # before a next-dispatch set-model can land (t_1d2ba891).
+        # A provider pin already refuses every auth fallback (``_pinned``); a
+        # MODEL-only pin allows the same model on another provider only.
+        _pin_model, _pin_provider = card_pinned_route()
+        if _pin_provider or (
+            _pin_model and str(self.model or "").strip().lower() != _pin_model.lower()
+        ):
+            _pin_model = None  # provider pin, or spawned off the model pin
+        _pin_refused_logged = False
         _pinned = pinned_worker_provider(getattr(self, "_explicit_provider", None))
         if runtime is None and _primary_exc is not None and _pinned:
             from hermes_cli.auth import is_rate_limited_auth_error
@@ -85,6 +96,21 @@ class CLIAgentSetupMixin:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
                     _fb_model = (_fb.get("model") or "").strip()
                     if not _fb_provider or not _fb_model:
+                        continue
+                    if _pin_model and _fb_model.lower() != _pin_model.lower():
+                        # The card pins the MODEL: never start on another one.
+                        if not _pin_refused_logged:
+                            _pin_refused_logged = True
+                            from hermes_cli.auth import is_rate_limited_auth_error
+
+                            _rate_limited = is_rate_limited_auth_error(_primary_exc)
+                            record_worker_route_pin_refused(
+                                provider=self.requested_provider, model=self.model,
+                                reason=str(_primary_exc), rate_limited=_rate_limited,
+                                to_provider=_fb_provider, to_model=_fb_model,
+                            )
+                            if _rate_limited:
+                                self._kanban_pin_rate_limited = str(_primary_exc)
                         continue
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key

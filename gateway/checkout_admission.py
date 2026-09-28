@@ -124,6 +124,44 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             os.unlink(tmp)
 
 
+def _preserve_unreadable(src: Path) -> Path:
+    """Copy ``src`` to a NEW uniquely named audit file; never touches an existing one.
+
+    The bytes go to a private temp file first (fsynced), then are installed
+    with ``os.link``, which fails rather than overwrite -- so repeated
+    recoveries in the same second, or a crash mid-copy, cannot truncate or
+    corrupt an earlier audit snapshot.
+    """
+    directory = src.parent
+    fd, tmp = tempfile.mkstemp(prefix=f".{src.name}.audit.", dir=str(directory))
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        dest = directory / f"hold.unreadable.{time.time_ns()}.{uuid.uuid4().hex[:8]}.json"
+        try:
+            os.link(tmp, dest)
+        except FileExistsError:
+            raise
+        except OSError:
+            # Filesystem without hard links (some SMB/FUSE mounts): reserve
+            # the unique name with O_EXCL (fails rather than overwrite), then
+            # atomically swap the complete temp over our own placeholder.
+            os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            try:
+                os.replace(tmp, dest)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(dest)
+                raise
+        _fsync_dir(directory)
+        return dest
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
 def _fsync_dir(directory: Path) -> None:
     with contextlib.suppress(OSError):
         dfd = os.open(str(directory), os.O_RDONLY)
@@ -244,7 +282,7 @@ class HoldStore:
                 # _atomic_write_json swaps the replacement in, so a crash or
                 # write failure here can never leave admission open.
                 with contextlib.suppress(OSError):
-                    shutil.copyfile(self.hold_path, self.directory / f"hold.unreadable.{int(time.time())}.json")
+                    _preserve_unreadable(self.hold_path)
                 logger.warning("checkout admission: %s took over an unreadable hold", owner)
                 current = None  # re-holding over garbage keeps it CLOSED
             if current is not None and current.owner != owner:

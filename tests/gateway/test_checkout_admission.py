@@ -725,6 +725,55 @@ def test_recover_unreadable_keeps_hold_closed_if_replacement_write_fails(store, 
     assert list(store.directory.glob("hold.unreadable.*.json"))  # audit copy
 
 
+def test_repeated_unreadable_recoveries_never_overwrite_an_audit_copy(store, monkeypatch):
+    """#1364 checkout_admission.py:247: two recoveries in the same second must
+    each keep their own audit snapshot; a copy that dies mid-write must not
+    truncate or clobber an earlier one."""
+    monkeypatch.setattr(ca.time, "time", lambda: 1_000_000.0)  # same second
+    store.hold("owner-a", [GW])
+    store.hold_path.write_text("garbage-1", encoding="utf-8")
+    store.hold("op", [GW], recover_unreadable=True)
+    store.hold_path.write_text("garbage-2", encoding="utf-8")
+    store.hold("op", [GW], recover_unreadable=True)
+    audits = sorted(store.directory.glob("hold.unreadable.*.json"))
+    assert sorted(p.read_text(encoding="utf-8") for p in audits) == ["garbage-1", "garbage-2"]
+
+    # Crash during the third copy: earlier snapshots intact, no stray temp.
+    store.hold_path.write_text("garbage-3", encoding="utf-8")
+
+    def boom(inp, out, *a, **k):
+        out.write(b"partial")
+        raise OSError("crash mid-copy")
+
+    monkeypatch.setattr(ca.shutil, "copyfileobj", boom)
+    store.hold("op", [GW], recover_unreadable=True)  # audit is best-effort
+    after = sorted(store.directory.glob("hold.unreadable.*.json"))
+    assert after == audits
+    assert sorted(p.read_text(encoding="utf-8") for p in after) == ["garbage-1", "garbage-2"]
+    assert not list(store.directory.glob(".hold.json.audit.*"))
+
+
+def test_unreadable_audit_copy_survives_filesystem_without_hard_links(store, monkeypatch):
+    """#1418 checkout_admission.py:142: on a mount where os.link always fails
+    (SMB/FUSE), recovery must still keep the unreadable bytes for audit and
+    must not overwrite an earlier snapshot."""
+    import errno
+
+    def no_link(src, dst, *a, **k):
+        raise OSError(errno.ENOTSUP, "hard links not supported")
+
+    monkeypatch.setattr(ca.os, "link", no_link)
+    monkeypatch.setattr(ca.time, "time", lambda: 1_000_000.0)
+    store.hold("owner-a", [GW])
+    store.hold_path.write_text("garbage-1", encoding="utf-8")
+    store.hold("op", [GW], recover_unreadable=True)
+    store.hold_path.write_text("garbage-2", encoding="utf-8")
+    store.hold("op", [GW], recover_unreadable=True)
+    audits = sorted(store.directory.glob("hold.unreadable.*.json"))
+    assert sorted(p.read_text(encoding="utf-8") for p in audits) == ["garbage-1", "garbage-2"]
+    assert not list(store.directory.glob(".hold.json.audit.*"))
+
+
 def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
     """#1035 checkout_admission.py:419: a busy and an idle process publishing
     under ONE consumer name must not let the idle snapshot read QUIESCENT."""

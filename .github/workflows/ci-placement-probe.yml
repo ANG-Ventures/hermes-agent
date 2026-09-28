@@ -50,6 +50,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # tests.yml generate's duration-cache restore, verbatim (contract-pinned).
+      # Without it LPT slices on the 2.0 s default for every file, so the
+      # request/local_matrix differ from a real merge_group run's.
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-restore-${{ github.run_id }}
+          restore-keys: |
+            test-durations-
+
       - name: Generate test slices
         env:
           # ci.yaml's merge_group slice_count branch, verbatim (contract-pinned).
