@@ -401,13 +401,16 @@ def test_publish_absent_syncs_mode_before_linking(tmp_path, monkeypatch):
     assert events.index("chmod") < max(i for i, e in enumerate(events) if e == "fsync") < events.index("link")
 
 
-def test_malformed_page_stamp_still_fails_open_and_pages(home, monkeypatch):
-    """C5 #45 (PR #1000): a non-numeric stamp must not raise out of the verdict."""
+@pytest.mark.parametrize("stamp", ['"garbage"', "NaN", "Infinity", "-Infinity", "1e300"])
+def test_malformed_page_stamp_still_fails_open_and_pages(home, monkeypatch, stamp):
+    """C5 #45 (PR #1000): a malformed stamp must not raise out of the verdict,
+    and a non-finite or future one (json.loads accepts NaN/Infinity) must not
+    suppress the page forever (FleetReview 41486fc0cadb)."""
     import json
     pages = []
     monkeypatch.setattr(shell_hooks, "_page_missing_hook", lambda path, *args: pages.append(path) or True)
     path = home / "hooks" / "missing.py"
     (home / "state").mkdir()
-    (home / "state" / "missing-hook-pages.json").write_text(json.dumps({str(path): "garbage"}))
+    (home / "state" / "missing-hook-pages.json").write_text("{%s: %s}" % (json.dumps(str(path)), stamp))
     assert shell_hooks._make_callback(_spec(path))(tool_name="terminal") is None
     assert pages == [str(path)]

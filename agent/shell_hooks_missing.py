@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import os
 import subprocess
 import tarfile
@@ -286,6 +287,11 @@ def page_once(path: str, outcome: str) -> None:
                 except (TypeError, ValueError):
                     # A malformed stamp is "never paged", not an exception that
                     # replaces the hook verdict (C5 #45, PR #1000).
+                    last = 0.0
+                if not math.isfinite(last) or last > now:
+                    # json.loads accepts NaN/Infinity; a non-finite or future
+                    # stamp would make the interval test false forever and
+                    # silence the page for good (FleetReview 41486fc0cadb).
                     last = 0.0
                 if now - last >= PAGE_INTERVAL_SECONDS and shell_hooks._page_missing_hook(path, outcome):
                     stamps[path] = now

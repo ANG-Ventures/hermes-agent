@@ -299,6 +299,58 @@ def test_cli_refused_status_verb_leaves_no_status_comment(kanban_home, monkeypat
         assert _comments(conn, tid) == before
 
 
+def _status_cmd(verb, tid):
+    # unblock takes its reason as --reason; block/schedule take it positionally.
+    if verb == "unblock":
+        return f"unblock --reason 'why not' {tid}"
+    return f"{verb} {tid} 'why not'"
+
+
+@pytest.mark.parametrize("verb,state", [("block", "done"), ("unblock", "ready"),
+                                         ("schedule", "done")])
+def test_cli_failed_status_verb_leaves_no_status_comment(kanban_home, monkeypatch,
+                                                         verb, state):
+    """FleetReview e6af55d359f5: an ALLOWED verb whose transition fails (wrong
+    state) must not leave a BLOCKED:/UNBLOCK:/SCHEDULED: comment behind."""
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=False)
+        if state == "done":
+            assert kb.complete_task(conn, tid, result="x")
+        before = _comments(conn, tid)
+    out = kc.run_slash(_status_cmd(verb, tid))
+    assert "refused" not in out, out
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid) == before
+
+
+@pytest.mark.parametrize("verb,blocked,prefix", [("block", False, "BLOCKED:"),
+                                                 ("unblock", True, "UNBLOCK:"),
+                                                 ("schedule", False, "SCHEDULED:")])
+def test_cli_successful_status_verb_writes_status_comment(kanban_home, monkeypatch,
+                                                          verb, blocked, prefix):
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=blocked)
+    kc.run_slash(_status_cmd(verb, tid))
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid)[-1] == f"{prefix} why not"
+
+
+def test_cli_schedule_wake_reset_on_scheduled_card_writes_comment(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=False)
+        assert kb.schedule_task(conn, tid)
+    kc.run_slash(f"schedule {tid} --at 4102444800 'later'")
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid)[-1] == "SCHEDULED: later"
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+
 def test_cli_comment_on_foreign_card_is_unaffected(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
     with kb.connect_closing() as conn:

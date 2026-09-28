@@ -4795,15 +4795,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                # The guard's refusal first: a refused block must not leave a
-                # "BLOCKED:" status comment behind (C5 #20, PR #951).
-                kb.check_home_session(conn, tid, "block")
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"BLOCKED: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            # Provenance before the transition: blocking ends the run.
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
             if not kb.block_task(
                 conn,
                 tid,
@@ -4814,6 +4807,14 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    # Only after the transition landed: a refused or failed
+                    # block leaves no "BLOCKED:" comment (C5 #20, FleetReview
+                    # e6af55d359f5).
+                    kb.add_comment(
+                        conn, tid, author, f"BLOCKED: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -4865,15 +4866,19 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 current is not None and current.status == "scheduled"
                 and wake_at is not None
             )
-            if reason:
-                # The guard's refusal first: a refused schedule must not leave a
-                # "SCHEDULED:" status comment behind (C5 #20, PR #951).
-                kb.check_home_session(conn, tid, "schedule")
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"SCHEDULED: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            # Provenance before the transition: scheduling ends the run.
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
+
+            def _status_comment() -> None:
+                # Only after a mutation landed: a refused or failed schedule
+                # leaves no "SCHEDULED:" comment (C5 #20, FleetReview
+                # e6af55d359f5).
+                if reason:
+                    kb.add_comment(
+                        conn, tid, author, f"SCHEDULED: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
+
             if not already and not kb.schedule_task(
                 conn,
                 tid,
@@ -4884,12 +4889,16 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print(f"cannot schedule {tid}", file=sys.stderr)
                 continue
             if not already:
+                _status_comment()
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
             if wake_at is None:
                 continue
             ok, err = kb.set_schedule_wake(
                 conn, tid, wake_at=wake_at, actor=author, reason=reason,
             )
+            if ok and already:
+                # The wake reset is the only mutation on an already-scheduled card.
+                _status_comment()
             if not ok:
                 failed.append(tid)
                 print(f"cannot set wake for {tid}: {err}", file=sys.stderr)
@@ -4911,19 +4920,20 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                # The guard's refusal first: a refused unblock must not leave a
-                # "UNBLOCK:" status comment behind (C5 #20, PR #951).
-                kb.check_home_session(conn, tid, "unblock")
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"UNBLOCK: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
+                if reason:
+                    # Only after the transition landed: a refused or failed
+                    # unblock leaves no "UNBLOCK:" comment (C5 #20, FleetReview
+                    # e6af55d359f5). Written right after, on the same
+                    # connection; a respawned worker reads the thread later.
+                    kb.add_comment(
+                        conn, tid, author, f"UNBLOCK: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
