@@ -16,7 +16,8 @@ Contract:
     untouched and logs a warning. Process start never fails because of it.
   * The applied diff is remembered so a spawn site that must NOT carry it
     (cron script children are plain scripts, not agent processes) can undo it
-    with :func:`strip_overlay`.
+    with :func:`strip_overlay`. The pre-apply values ride to child agent
+    processes in ``HERMES_PROCESS_ENV_OVERLAY`` so a child can undo them too.
 """
 
 from __future__ import annotations
@@ -36,6 +37,23 @@ _TIMEOUT_SECONDS = 20.0
 
 # key -> (value before apply or None if unset, value after apply or None if unset)
 _OVERLAY: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+# Carries the overlay's pre-apply values ({key: old}) to child agent processes.
+# A child inherits the ALREADY-overlaid env, so its own diff is empty for every
+# key the parent set and strip_overlay could never undo them (FleetReview #1254
+# :121). Only pre-overlay values ride here; the overlaid ones are in the env.
+_INHERITED_ENV = "HERMES_PROCESS_ENV_OVERLAY"
+
+
+def _inherited_overlay(env: MutableMapping[str, str]) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    try:
+        raw = json.loads(env.get(_INHERITED_ENV) or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): (None if v is None else str(v), env.get(str(k)))
+            for k, v in raw.items() if v is None or isinstance(v, str)}
 
 
 def configured_files(cfg: Optional[dict]) -> List[str]:
@@ -114,16 +132,23 @@ def apply_process_env_files(
     (default ``os.environ``). Returns the applied diff; ``{}`` when nothing is
     configured or sourcing failed."""
     target = os.environ if env is None else env
+    inherited = _inherited_overlay(target)
     diff = compute_overlay(configured_files(cfg), target)
     for key, (_old, new) in diff.items():
         if new is None:
             target.pop(key, None)
         else:
             target[key] = new
-    if env is None and diff:
+    if env is None and (diff or inherited):
+        # An inherited key keeps the ORIGINAL pre-overlay value, even if this
+        # process's files changed it again.
+        merged = {**diff, **{k: (old, diff[k][1] if k in diff else cur)
+                             for k, (old, cur) in inherited.items()}}
         _OVERLAY.clear()
-        _OVERLAY.update(diff)
-        logger.info("agent.process_env_files applied: %s", ",".join(sorted(diff)))
+        _OVERLAY.update(merged)
+        target[_INHERITED_ENV] = json.dumps({k: old for k, (old, _new) in merged.items()})
+        if diff:
+            logger.info("agent.process_env_files applied: %s", ",".join(sorted(diff)))
     return diff
 
 
@@ -132,6 +157,7 @@ def strip_overlay(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
 
     A key is restored only while it still holds the value the overlay set, so a
     later deliberate change to that key is never reverted."""
+    env.pop(_INHERITED_ENV, None)
     for key, (old, new) in _OVERLAY.items():
         if key == "PATH" and new is not None and env.get("PATH"):
             # PATH is routinely re-edited after start (venv/tool dirs), so match

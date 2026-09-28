@@ -2552,6 +2552,26 @@ def _resolve_auto_model_sentinel(
     return resolved_model, resolved_provider, True
 
 
+def _revalidate_resolved_provider(before: Any, provider: Any, base_url: Any) -> None:
+    """Re-run the tool's base_url/provider exfil guard when store-level model
+    resolution (auto sentinel, alias, legacy heal) CHANGED the provider.
+
+    ``cronjob_tools`` validates the pair it was handed; the resolution here can
+    rewrite the provider afterwards, and the stored pair was then never checked
+    (FleetReview #1032). The scheduler's fire-time backstop still refuses such a
+    pair, so the job would only fail on every run -- refuse it at write time.
+    """
+    before = _normalize_job_optional_text(before)
+    after = _normalize_job_optional_text(provider)
+    if before == after or not _normalize_job_optional_text(base_url):
+        return
+    from tools.cronjob_tools import _validate_cron_base_url
+
+    err = _validate_cron_base_url(after, base_url)
+    if err:
+        raise ValueError(err)
+
+
 def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = False) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -2809,6 +2829,7 @@ def create_job(
         normalized_model, allow_flagship_reason=allow_flagship_reason
     )
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
+    _revalidate_resolved_provider(provider, normalized_provider, normalized_base_url)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
@@ -3142,6 +3163,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # `--model ""` clears the pin and is deliberately untouched here.
             # The "auto" sentinel is resolved (LLM job) or dropped (script job)
             # against the EFFECTIVE no_agent of this update — never stored.
+            _pre_resolution_provider = (
+                updates["provider"] if "provider" in updates else job.get("provider")
+            )
             if "model" in updates and _is_auto_model_sentinel(updates["model"]):
                 _eff_no_agent = updates["no_agent"] if "no_agent" in updates else job.get("no_agent")
                 _am, _ap, _pinned = _resolve_auto_model_sentinel(
@@ -3191,6 +3215,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if _reason:
                     updated["allow_flagship_reason"] = _reason
                 _legacy_auto_healed = True
+            _revalidate_resolved_provider(
+                _pre_resolution_provider, updated.get("provider"), updated.get("base_url")
+            )
             if "allow_flagship_reason" in updates and "model" not in updates:
                 from hermes_cli.model_policy import validate_worker_model
 

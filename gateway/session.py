@@ -4706,12 +4706,17 @@ class SessionStore:
         # durable write, so wait for the queue to drain before returning.
         self.drain_sessions_json_writes()
 
-    def clear_resume_pending(self, session_key: str) -> bool:
+    def clear_resume_pending(self, session_key: str, **kw) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
 
         Called from the gateway after ``run_conversation()`` returns a
         final response for a session that had ``resume_pending=True``,
         signalling that recovery succeeded.
+
+        ``marked_at`` (optional): the ``last_resume_marked_at`` the caller's
+        turn started from. When given, a mark written AFTER that snapshot (a
+        concurrent shutdown drain) is left in place — it is not the mark this
+        turn recovered from (FleetReview #1043).
 
         Returns True if a flag was cleared.
         """
@@ -4719,6 +4724,12 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
+                return False
+            if "marked_at" in kw and entry.last_resume_marked_at != kw["marked_at"]:
+                logger.info(
+                    "Keeping resume mark for %s: re-marked during the turn (%s -> %s)",
+                    session_key, kw["marked_at"], entry.last_resume_marked_at,
+                )
                 return False
             self._clear_resume_pending_entry(entry)
             self._save()

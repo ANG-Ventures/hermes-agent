@@ -1,5 +1,5 @@
 import { skillInvocationText } from '@hermes/shared'
-import { CONFAB_NOTICE_EVENT_TEXT, confabNoticeFromRow } from '@hermes/shared/confab-notice'
+import { confabNoticeEventText, confabNoticeFromRow } from '@hermes/shared/confab-notice'
 
 import { extractImageRefs } from '@/lib/embedded-images'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
@@ -207,12 +207,14 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     // Gated on role + re-validated metadata (confabNoticeFromRow): the
     // `display_kind` string alone is open-ended, so a malformed or imported
     // non-assistant row carrying it must not be shown as a confirmed catch.
-    if (confabNoticeFromRow(message)) {
+    const confabNotice = confabNoticeFromRow(message)
+
+    if (confabNotice) {
       flushPendingTools(index)
       result.push({
         id: `confab-notice-${message.timestamp || Date.now()}-${index}`,
         role: 'system',
-        parts: [textPart(CONFAB_NOTICE_EVENT_TEXT, message.timestamp)],
+        parts: [textPart(confabNoticeEventText(confabNotice), message.timestamp)],
         timestamp: message.timestamp
       })
       activeAssistantIndex = null
