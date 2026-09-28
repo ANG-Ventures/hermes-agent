@@ -1075,12 +1075,64 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     """
     row = fill_pin_evidence(row)
     prefix, window = _count_window(row, tz)
+    if _plain_provider(row):
+        # The banner ends after the vendor's words when there are any (Ace,
+        # 2026-09-27: no relay legs, no seats, nothing after the cause).
+        cause = _provider_cause(row)
+        return f"{prefix}{cause}" if row.get("provider_message") else f"{prefix}{cause}, {window}"
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
     if _is_pool_wide_relay_busy(row, hop, cause):
         return f"{prefix}relay busy: all subs at capacity (at the relay), {window}"
     return f"{prefix}{cause} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+
+
+_VENDOR_NAMES = {"openrouter": "OpenRouter", "openai-codex": "OpenAI", "openai": "OpenAI",
+                 "xai": "xAI", "anthropic": "Anthropic", "nous": "Nous Portal",
+                 "gemini": "Google", "google": "Google", "deepseek": "DeepSeek"}
+
+
+def _plain_provider(row: Mapping[str, Any]) -> bool:
+    """True for a failover FROM a provider with no relay/hop/sub concept
+    (openrouter, openai-codex, xai, ...). "hop" and "sub" are relay-pool
+    vocabulary for the claude-* lanes; elsewhere "(hop unknown, sub unknown)"
+    is noise (t_a8dc8b21). A row without ``from_provider``, or with any relay
+    evidence (hop/seat), keeps the relay rider."""
+    prov = str(row.get("from_provider") or "").strip().lower()
+    if prov.startswith("custom:"):  # relay lanes can be recorded as custom:claude-apr/-apx-N
+        prov = prov[len("custom:"):]
+    if not prov or prov.startswith("claude-"):
+        return False
+    return not (row.get("hop") or row.get("seat"))
+
+
+def _provider_cause(row: Mapping[str, Any]) -> str:
+    """Cause for a non-relay provider: whose limit tripped, then the vendor's
+    own words. "account rate limit" only when the vendor says "account"."""
+    prov = str(row.get("from_provider") or "").strip().lower()
+    vendor = _VENDOR_NAMES.get(prov, prov)
+    scope = row.get("provider_scope")
+    msg = row.get("provider_message")
+    status = row.get("http_status")
+    text = str(msg or row.get("err_head") or "").lower()
+    cls = row.get("trigger_class")
+    if scope == "credits":
+        cause = f"out of {vendor} credits"
+    elif scope == "byok":
+        cause = "rate limit on the upstream provider's own key (BYOK), not your account or credits"
+    elif scope == "upstream":
+        cause = f"rate limit at {vendor}'s upstream provider, not your account"
+    elif scope == "platform":
+        cause = f"{vendor} rate limit on your key"
+    elif cls == "rate_upstream":
+        cause = "account rate limit" if "account" in text else "rate limit"
+    else:
+        cause = _cause_phrase(row)
+    if msg:
+        head = f"{vendor} {status}" if status else vendor
+        cause += f'; {head} said "{msg}"'
+    return cause
 
 
 def _is_pool_wide_relay_busy(row: Mapping[str, Any], hop: Optional[str], cause: str) -> bool:
