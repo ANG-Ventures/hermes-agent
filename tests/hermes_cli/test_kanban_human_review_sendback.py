@@ -135,7 +135,9 @@ def test_sessionless_claim_is_not_bound_and_refused(board, monkeypatch):
         f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
     )
     assert "cannot request changes" in out, out
-    assert _status(board) == "running"
+    # t_0485b3ff: the unbound claim is released, never stranded in running.
+    assert "released" in out, out
+    assert _status(board) == "review"
 
 
 def test_delegate_child_caller_is_refused_even_with_the_claiming_session(board, monkeypatch):
@@ -167,7 +169,8 @@ def test_cron_session_cannot_bind_a_review_claim(board, monkeypatch):
         f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
     )
     assert "cannot request changes" in out, out
-    assert _status(board) == "running"
+    # The cron claim bound no session: released back to review, not stranded.
+    assert _status(board) == "review"
 
 
 def test_claim_event_records_session_ref_not_raw_session_id(board, monkeypatch):
@@ -177,3 +180,129 @@ def test_claim_event_records_session_ref_not_raw_session_id(board, monkeypatch):
                    if e.kind == "claimed" and e.run_id == run_id]
     assert claimed[-1].payload.get("session_ref") == kb.derive_session_ref(SESSION)
     assert SESSION not in json.dumps(claimed[-1].payload)
+
+
+# --- t_0485b3ff: claim --review + request-changes from a gateway chat turn ---
+#
+# A chat turn runs ``hermes kanban`` in a terminal SUBPROCESS of the gateway:
+# it inherits _HERMES_GATEWAY=1 but gets its own HERMES_SESSION_ID bridged per
+# command, and it never imports gateway.run. Before the fix the CLI treated it
+# as the in-process gateway, bound no session to the claim, and the following
+# request-changes was refused with the card stranded in running.
+
+
+def _gateway_subprocess_env(monkeypatch, session=SESSION):
+    import sys
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.delitem(sys.modules, "gateway.run", raising=False)
+    _as_session(monkeypatch, session)
+
+
+def test_gateway_subprocess_env_claim_then_request_changes_in_one_turn(board, monkeypatch):
+    import contextvars
+    _gateway_subprocess_env(monkeypatch)
+    out = contextvars.Context().run(cli.run_slash, f"claim {board} --review")
+    assert "Claimed" in out and "bound no session" not in out, out
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, board).current_run_id
+        claimed = [e for e in kb.list_events(conn, board)
+                   if e.kind == "claimed" and e.run_id == run_id]
+    assert claimed[-1].payload.get("session_ref") == kb.derive_session_ref(SESSION)
+    out = contextvars.Context().run(
+        cli.run_slash,
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}',
+    )
+    assert "Requested changes" in out, out
+    assert _status(board) == "ready"
+
+
+def test_in_process_gateway_still_borrows_no_env_session(monkeypatch):
+    """Control (#951): the gateway process itself still ignores os.environ."""
+    import contextvars
+    import sys
+    import types
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER_SESSION)
+    monkeypatch.setitem(sys.modules, "gateway.run", types.ModuleType("gateway.run"))
+    assert contextvars.Context().run(cli._caller_session_id) is None
+    monkeypatch.delitem(sys.modules, "gateway.run")
+    assert contextvars.Context().run(cli._caller_session_id) == OTHER_SESSION
+
+
+def test_unbound_claim_is_released_and_sent_back_by_a_bindable_session(board, monkeypatch):
+    """A claim taken with no session (the pre-fix gateway shape) no longer
+    strands: request-changes from a bindable session releases it and sends
+    back through the parked-review path in the same call."""
+    _claim(monkeypatch, board, None)
+    _as_session(monkeypatch, SESSION)
+    out = cli.run_slash(
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
+    )
+    assert "Requested changes" in out, out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, board).status == "ready"
+        released = [e for e in kb.list_events(conn, board)
+                    if e.kind == "reclaimed" and e.payload.get("unbound_review_claim")]
+    assert released and released[-1].payload["retry_status"] == "review"
+
+
+def test_unbound_claim_held_by_a_live_other_process_is_not_released(board, monkeypatch):
+    _claim(monkeypatch, board, None)
+    with kb.connect() as conn:
+        host = kb._claimer_id().rpartition(":")[0]
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", (f"{host}:1", board))
+        conn.commit()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    _as_session(monkeypatch, SESSION)
+    out = cli.run_slash(
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
+    )
+    assert "cannot request changes" in out, out
+    assert _status(board) == "running"
+
+
+def test_unbound_claim_held_on_a_remote_host_is_not_released(board, monkeypatch):
+    """FleetReview af22d38d1623: a remote lock is not proof its claimer is gone."""
+    _claim(monkeypatch, board, None)
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?",
+                     ("some-other-host:4242", board))
+        conn.commit()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    with kb.connect() as conn:
+        assert kb.release_unbound_review_claim(conn, board, reason="probe") is False
+    _as_session(monkeypatch, SESSION)
+    out = cli.run_slash(
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
+    )
+    assert "Requested changes" not in out, out
+    assert _status(board) == "running"
+
+
+def test_worker_attached_after_the_reads_blocks_the_release(board, monkeypatch):
+    """FleetReview cbacb005a819: release conditions are rechecked in the txn."""
+    _claim(monkeypatch, board, None)
+    with kb.connect() as conn:
+        host = kb._claimer_id().rpartition(":")[0]
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", (f"{host}:1", board))
+        conn.commit()
+
+    def _attach_then_report_dead(pid):
+        # Another process attaches a worker between the reads and the write.
+        with kb.connect() as other:
+            other.execute("UPDATE tasks SET worker_pid = 777 WHERE id = ?", (board,))
+            other.commit()
+        return False
+
+    monkeypatch.setattr(kb, "_pid_alive", _attach_then_report_dead)
+    with kb.connect() as conn:
+        assert kb.release_unbound_review_claim(conn, board, reason="probe") is False
+        task = kb.get_task(conn, board)
+    assert task.status == "running" and task.worker_pid == 777
+
+
+def test_bound_claim_is_never_released_by_another_session(board, monkeypatch):
+    _claim(monkeypatch, board, SESSION)
+    with kb.connect() as conn:
+        assert kb.release_unbound_review_claim(conn, board, reason="probe") is False
+    assert _status(board) == "running"

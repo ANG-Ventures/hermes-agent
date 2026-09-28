@@ -246,6 +246,12 @@ def test_gateway_sessionless_caller_does_not_inherit_env_session(monkeypatch):
 
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
     monkeypatch.setenv("HERMES_SESSION_ID", "20260927_000003_other_chat")
+    # The gateway PROCESS (gateway.run imported); a terminal subprocess that
+    # only inherited the marker resolves its own bridged env (t_0485b3ff).
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "gateway.run", types.ModuleType("gateway.run"))
     # A fresh context: no per-turn session bound, no explicit slash session.
     assert contextvars.Context().run(kc._caller_session_id) is None
 
