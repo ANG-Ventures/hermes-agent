@@ -308,6 +308,35 @@ def test_compaction_branch_in_place_no_rotation(store, key):
     assert not d.allowed and "compaction: none since last fallback call" in d.reason
 
 
+def test_compaction_outranks_warm_seat(store, key):
+    """A compaction on the fallback rewrote the prefix, so the primary seat is not
+    warm for what will be sent: the return is `compaction`, never `warm_seat`, even
+    when /eligibility reports the seat warm (t_2b064101 rig, apr arm B). Both the
+    enforce warm-rank path and the bound-seat path."""
+    st = _sticky_on_fallback(store, key)
+    bound = {"instance_id": "x", "bound_seat": "sub-vps-6", "bound_eligible": True,
+             "model_eligible": True, "bound_expires_in_s": None, "bound_expiry": "none"}
+    enforce = {"instance_id": "x", "bound_seat": "sub-vps-6", "bound_eligible": True,
+               "model_eligible": True, "warm_eligible": "sub-vps-6",
+               "warm_rank_effective": "enforce", "warm_seat": "sub-vps-6",
+               "warm_age_s": 120, "warm_window_s": 3300}
+    for elig in (bound, enforce):
+        assert fp.restore_allowed(st, T0 + 200, probe=True, primary_provider="claude-bpr",
+                                  eligibility=_elig(elig)).branch == "warm_seat"
+    fp.note_compaction(store, key, T0 + 150)
+    st = store.get(key)
+    for elig in (bound, enforce):
+        d = fp.restore_allowed(st, T0 + 200, probe=True, primary_provider="claude-bpr",
+                               live_session_id="sid-a", eligibility=_elig(elig))
+        assert d.allowed and d.branch == "compaction", (elig, d)
+    # rotating compaction (session_id changed) takes the same precedence
+    st2 = _sticky_on_fallback(store, key)
+    now2 = st2.until_epoch + 10  # re-arming doubled the cooldown; read past it
+    d = fp.restore_allowed(st2, now2, probe=True, primary_provider="claude-bpr",
+                           live_session_id="sid-b", eligibility=_elig(bound))
+    assert d.allowed and d.branch == "compaction"
+
+
 def test_note_compaction_ignores_inactive_episode(store, key):
     assert fp.note_compaction(store, key, T0) is None
     _sticky_on_fallback(store, key)
