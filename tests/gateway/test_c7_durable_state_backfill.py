@@ -183,6 +183,24 @@ def test_k95_heartbeat_of_the_dead_life_is_still_carried(tmp_path, monkeypatch):
     assert ll.detect_unclean_exit(tmp_path)["last_heartbeat_at"] == _DEATH
 
 
+def test_k93_pid_match_older_than_the_prior_life_does_not_fall_through_to_the_window(tmp_path, monkeypatch):
+    """FleetReview #1376 dbb62b713b02: a reused-pid row that fails the lifetime
+    bound must be skipped, not re-matched by the time-window fallback."""
+    from datetime import datetime, timezone
+
+    from gateway.fork_ext.unclean_restart_notice import read_planned_restart_for_sentinel
+
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    start = _epoch(_DEATH) - 50  # a short prior life
+    started_at = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+    # Aimed at the EARLIER process that owned pid 4242, 70 s before this life
+    # began (past the 60 s slack) yet 120 s before its death (inside the window).
+    _ledger(tmp_path, [_row(pid_before=4242, epoch=start - 70)])
+    sentinel = {"phase": "running", "pid": 1, "started_at": _THIS_BOOT, "prior_unclean_exit": True,
+                "prior_pid": 4242, "prior_started_at": started_at, "prior_last_heartbeat_at": _DEATH}
+    assert read_planned_restart_for_sentinel(sentinel, tmp_path) is None
+
+
 # ------------------------------------------ platforms/helpers.py (#967)
 def test_k96_superseded_writer_cannot_overwrite_its_replacement(tmp_path):
     from gateway.platforms.helpers import CoalescingJsonWriter
@@ -220,6 +238,26 @@ def test_k97_failed_background_write_is_retried(tmp_path, monkeypatch):
     assert path.exists(), "a transient failure dropped the pending snapshot"
     assert json.loads(path.read_text(encoding="utf-8")) == {"channels": ["c1"]}
     w.close(flush=False)
+
+
+def test_k96_superseded_writer_stays_superseded_after_its_replacement_is_collected(tmp_path):
+    """FleetReview #1376 48440cc59be1: ownership must outlive the replacement object."""
+    import gc
+
+    from gateway.platforms.helpers import CoalescingJsonWriter
+
+    path = tmp_path / "state.json"
+    old = CoalescingJsonWriter(path, lambda: {"v": "old"}, min_interval_s=0.3)
+    old.flush()
+    old.schedule()       # trailing write waits ~0.3 s
+    new = CoalescingJsonWriter(path, lambda: {"v": "new"}, min_interval_s=0.3)
+    new.flush()
+    new.close(flush=False)
+    del new
+    gc.collect()         # the replacement is gone before old's pending write fires
+    assert old.wait_idle(timeout=5.0)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"v": "new"}
+    old.close(flush=False)
 
 
 # --------------------------------------------------- run.py (#969, #1232)
