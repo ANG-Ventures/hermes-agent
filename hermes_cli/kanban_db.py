@@ -20092,9 +20092,11 @@ def respawn_guard_stuck_tasks(
         ).fetchone()["m"]
         rejected = conn.execute(
             "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
-            "COUNT(*) AS n, MAX(json_extract(payload, '$.prev_pid')) AS pid "
+            "COUNT(*) AS n, (SELECT json_extract(e2.payload, '$.prev_pid') FROM task_events e2 "
+            "WHERE e2.task_id=? AND e2.id>? AND e2.kind='claim_rejected' "
+            "ORDER BY e2.id DESC LIMIT 1) AS pid "  # the LATEST refusal's pid (P2 #26)
             "FROM task_events WHERE task_id=? AND id>? AND kind='claim_rejected'",
-            (task_id, last_reset),
+            (task_id, last_reset, task_id, last_reset),
         ).fetchone()
         if (rejected["n"] and now - rejected["first_at"] > 15 * 60
                 and now - rejected["last_at"] <= _RESPAWN_GUARD_STUCK_FRESH_SECONDS):
