@@ -452,3 +452,8 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_prologue_passes_the_platform_to_the_titler():
+    """derived_only_platforms is decided inside maybe_auto_title from the agent's platform."""
+    assert _title_turn("api_server").call_args.kwargs["platform"] == "api_server"

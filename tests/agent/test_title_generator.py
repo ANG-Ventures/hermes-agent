@@ -597,3 +597,41 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class TestDerivedOnlyPlatforms:
+    """``auxiliary.title_generation.derived_only_platforms``: instant title, no model call (t_5c3acc59)."""
+
+    @staticmethod
+    def _run(tmp_path, platform, listed, expect_call=False):
+        cfg = {"auxiliary": {"title_generation": {"derived_only_platforms": listed}}}
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source=platform or "cli")
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+             patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(db, "sess-1", "fix the flaky auth test in login", [], platform=platform)
+            called.wait(timeout=5 if expect_call else 0.2)  # event wait, not a fixed nap
+        return db, mock_auto
+
+    @pytest.mark.parametrize("platform", ["api_server", "kanban", "API_SERVER"])
+    def test_listed_platform_keeps_derived_title_and_skips_model(self, tmp_path, platform):
+        db, mock_auto = self._run(tmp_path, platform, ["api_server", "kanban"])
+        mock_auto.assert_not_called()
+        assert db.get_session_title("sess-1") == "fix the flaky auth test in login"
+        assert db.get_session_title_source("sess-1") == "derived"
+
+    @pytest.mark.parametrize("platform,listed", [
+        ("cli", ["api_server", "kanban"]), ("discord", "api_server"), (None, ["api_server"]),
+        ("api_server", []), ("api_server", None),
+    ])
+    def test_unlisted_platform_still_upgrades(self, tmp_path, platform, listed):
+        _, mock_auto = self._run(tmp_path, platform, listed, expect_call=True)
+        mock_auto.assert_called_once()
+
+    def test_string_value_is_one_platform(self, tmp_path):
+        _, mock_auto = self._run(tmp_path, "api_server", "api_server")
+        mock_auto.assert_not_called()
