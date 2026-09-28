@@ -4026,8 +4026,15 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-async def _probe_audio_duration(path: str) -> Optional[str]:
-    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
+_FFPROBE_TIMEOUT_S = 5.0
+
+
+async def _probe_audio_duration(path: str, *, allow_subprocess: bool = True) -> Optional[str]:
+    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure.
+
+    ``allow_subprocess=False`` keeps to the in-process header reads (wav/ogg)
+    and never spawns ffprobe.
+    """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".wav":
@@ -4053,17 +4060,28 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         except Exception:
             pass
 
+    if not allow_subprocess:
+        return None
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_FFPROBE_TIMEOUT_S)
         if proc.returncode == 0:
             return _format_duration(float(stdout.decode().strip()))
-    except Exception:
-        pass
+    except BaseException as exc:
+        # Timed out or cancelled (e.g. by a caller's wait_for): never leave
+        # ffprobe running behind us (FleetReview #115).
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not isinstance(exc, Exception):
+            raise
 
     return None
 
@@ -4109,9 +4127,12 @@ async def _inbound_log_preview(event) -> str:
         return text[:80].replace("\n", " ")
     duration = None
     if voice_paths:
+        # A log label must not cost the admitted turn an ffprobe spawn (up to
+        # the whole timeout): header reads only; anything else logs "?s"
+        # (FleetReview #115).
         try:
             duration = await asyncio.wait_for(
-                _probe_audio_duration(os.path.abspath(voice_paths[0])),
+                _probe_audio_duration(os.path.abspath(voice_paths[0]), allow_subprocess=False),
                 timeout=_VOICE_LOG_PROBE_TIMEOUT_S,
             )
         except Exception:

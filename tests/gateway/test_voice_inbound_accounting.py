@@ -178,3 +178,53 @@ async def test_pending_voice_event_passes_its_chat(caplog):
         await runner._transcribe_pending_audio_event_once(event)
     assert any(r.getMessage().startswith("stt: chat=99 transcribed 5 chars")
                for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_log_preview_never_spawns_ffprobe(tmp_path, monkeypatch):
+    """FleetReview #115: the inbound log preview awaited an ffprobe spawn (up
+    to 2 s) inside the admitted turn. A format with no header reader now logs
+    "?s" without a subprocess."""
+    import gateway.run as run_mod
+    from gateway.run import _inbound_log_preview
+
+    spawned = []
+
+    async def fake_exec(*args, **kwargs):
+        spawned.append(args)
+        raise OSError("no ffprobe in this test")
+
+    monkeypatch.setattr(run_mod.asyncio, "create_subprocess_exec", fake_exec)
+    note = tmp_path / "v.m4a"
+    note.write_bytes(b"not really m4a")
+    event = MessageEvent(text="", message_type=MessageType.VOICE, media_urls=[str(note)],
+                         media_types=["audio/mp4"])
+    assert await _inbound_log_preview(event) == "[voice ?s]"
+    assert spawned == []
+
+
+@pytest.mark.asyncio
+async def test_ffprobe_is_killed_when_the_probe_times_out(monkeypatch):
+    """FleetReview #115: a timed-out ffprobe was left running (orphaned)."""
+    import asyncio
+
+    import gateway.run as run_mod
+
+    killed = []
+
+    class HungProc:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(3600)
+
+        def kill(self):
+            killed.append(True)
+
+    async def fake_exec(*args, **kwargs):
+        return HungProc()
+
+    monkeypatch.setattr(run_mod.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(run_mod, "_FFPROBE_TIMEOUT_S", 0.05, raising=False)
+    assert await asyncio.wait_for(run_mod._probe_audio_duration("/tmp/x.m4a"), 10) is None
+    assert killed == [True]
