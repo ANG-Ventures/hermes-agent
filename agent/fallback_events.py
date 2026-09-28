@@ -222,7 +222,9 @@ def _scrub(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        # Persisted error preview: a non-navigation sink, so URL query credentials
+        # and user:pass@ userinfo are redacted too (Backfill C3).
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:  # noqa: BLE001
         return ""
 

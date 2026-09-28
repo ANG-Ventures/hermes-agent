@@ -139,6 +139,45 @@ class FileStateRegistry:
             self._reads[task_id][resolved] = (float(mtime), now, False)
             _cap_dict(self._reads[task_id], _MAX_PATHS_PER_AGENT)
 
+    @staticmethod
+    def _sibling_conflict(task_id: str, resolved: str, stamp, last_writer) -> Optional[str]:
+        """Case 1 of :meth:`check_stale`: a sibling subagent wrote *resolved* after this
+        agent's last read (or this agent never read it). None otherwise."""
+        if last_writer is None:
+            return None
+        writer_tid, writer_ts = last_writer
+        if writer_tid == task_id:
+            return None
+        if stamp is None:
+            return (
+                f"{resolved} was modified by sibling subagent "
+                f"{writer_tid!r} but this agent never read it. "
+                "Read the file before writing to avoid overwriting "
+                "the sibling's changes."
+            )
+        read_ts = stamp[1]
+        if writer_ts > read_ts:
+            return (
+                f"{resolved} was modified by sibling subagent "
+                f"{writer_tid!r} at {_fmt_ts(writer_ts)} — after "
+                f"this agent's last read at {_fmt_ts(read_ts)}. "
+                "Re-read the file before writing."
+            )
+        return None
+
+    def sibling_write_conflict(self, task_id: str, resolved: str) -> Optional[str]:
+        """The sibling-subagent staleness message, or None. Card t_f4377203: writes REFUSE on
+        this (it used to be a warning attached after the clobber). An absent file is never a
+        conflict (the write creates it)."""
+        if _disabled():
+            return None
+        with self._state_lock:
+            stamp = self._reads.get(task_id, {}).get(resolved)
+            last_writer = self._last_writer.get(resolved)
+        if last_writer is None or not os.path.exists(resolved):
+            return None
+        return self._sibling_conflict(task_id, resolved, stamp, last_writer)
+
     def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
         """Return a model-facing warning if this write would be stale.
 
@@ -170,24 +209,9 @@ class FileStateRegistry:
             return None
 
         # Case 1: sibling subagent modified after our last read.
-        if last_writer is not None:
-            writer_tid, writer_ts = last_writer
-            if writer_tid != task_id:
-                if stamp is None:
-                    return (
-                        f"{resolved} was modified by sibling subagent "
-                        f"{writer_tid!r} but this agent never read it. "
-                        "Read the file before writing to avoid overwriting "
-                        "the sibling's changes."
-                    )
-                read_ts = stamp[1]
-                if writer_ts > read_ts:
-                    return (
-                        f"{resolved} was modified by sibling subagent "
-                        f"{writer_tid!r} at {_fmt_ts(writer_ts)} — after "
-                        f"this agent's last read at {_fmt_ts(read_ts)}. "
-                        "Re-read the file before writing."
-                    )
+        sibling = self._sibling_conflict(task_id, resolved, stamp, last_writer)
+        if sibling:
+            return sibling
 
         # Case 2: external / unknown modification (mtime drifted).
         if stamp is not None:
@@ -302,6 +326,10 @@ def note_write(task_id: str, resolved_or_path: str | Path) -> None:
 
 def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
     return _registry.check_stale(task_id, str(resolved_or_path))
+
+
+def sibling_write_conflict(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
+    return _registry.sibling_write_conflict(task_id, str(resolved_or_path))
 
 
 def lock_path(resolved_or_path: str | Path):

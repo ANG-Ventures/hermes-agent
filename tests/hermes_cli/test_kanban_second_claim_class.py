@@ -255,10 +255,24 @@ def test_process_start_window_distinguishes_reused_pid(conn, monkeypatch):
 def test_expired_bounded_run_does_not_probe_live_pid(conn, monkeypatch):
     tid, _ = _live_claim(conn, "bounded old run")
     _external_release(conn, tid)
-    conn.execute("UPDATE tasks SET max_runtime_seconds=60 WHERE id=?", (tid,))
-    conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?", (time.time() - 600, tid))
+    # The RUN was bounded when it ran (its claim-time snapshot).
+    conn.execute("UPDATE task_runs SET max_runtime_seconds=60, ended_at=? WHERE task_id=?",
+                 (time.time() - 600, tid))
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
     assert kb.claim_task(conn, tid) is not None
+
+
+def test_cap_shortened_after_release_still_probes_live_owner(conn, monkeypatch):
+    """FleetReview #956: the card's CURRENT cap is not the released run's cap.
+    An operator shortening max_runtime_seconds after release must not skip the
+    live-owner probe for a worker that was claimed without that bound."""
+    tid, _ = _live_claim(conn, "cap shortened later")
+    _external_release(conn, tid)
+    conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?", (time.time() - 600, tid))
+    conn.execute("UPDATE tasks SET max_runtime_seconds=60 WHERE id=?", (tid,))
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
+    assert kb.claim_task(conn, tid) is None
+    assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
 
 
 def test_real_process_survives_operator_block_without_second_spawn(conn, monkeypatch):

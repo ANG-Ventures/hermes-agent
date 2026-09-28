@@ -361,6 +361,18 @@ class TestRendering:
         assert "write the report" in ctx
         assert "Now reading job-a" in ctx
 
+    def test_context_render_redacts_tool_arguments_and_results(self):
+        """Backfill C3 (#813): /resume-handoff returns this text to chat verbatim."""
+        key = "sk-" + "proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+        out = render_handoff_context({
+            "reason": "x",
+            "tool_calls": [{"name": "browser_type", "completed": True,
+                            "arguments": '{"text": "' + key + '"}',
+                            "result_preview": "Authorization: Bearer " + key}],
+        })
+        assert key not in out and "A1b2C3d4E5f6G7h8I9j0K1l2" not in out
+        assert "browser_type(" in out and "[completed]" in out
+
     def test_context_render_of_an_empty_handoff_is_empty(self):
         assert render_handoff_context(None) == ""
         assert render_handoff_context({}) == ""

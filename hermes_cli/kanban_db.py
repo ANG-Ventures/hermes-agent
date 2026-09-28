@@ -5347,14 +5347,22 @@ def session_owner_profile(session_id: Optional[str]) -> Optional[str]:
 
 
 def _actor_profiles(actor: MutationActor) -> frozenset[str]:
-    """Every profile identity the actor legitimately holds: the bound
-    profile plus the owner profile of each caller session."""
-    names = {actor.profile} if actor.profile else set()
-    for sid in actor.session_ids:
-        owner = session_owner_profile(sid)
-        if owner:
-            names.add(owner)
-    return frozenset(names)
+    """Every profile identity the actor legitimately holds.
+
+    The owner profile of each caller session is authoritative. The bound
+    (env-derived) profile counts only when no caller session resolves to an
+    owner: a root-home repoint makes it read ``default`` -- an operator
+    profile -- from inside another profile's session, so keeping both let
+    that caller pass ``--operator`` or mutate a ``default``-assigned card
+    (FleetReview #1074).
+    """
+    owners = {
+        owner for owner in (session_owner_profile(sid) for sid in actor.session_ids)
+        if owner
+    }
+    if owners:
+        return frozenset(owners)
+    return frozenset({actor.profile} if actor.profile else ())
 
 
 def _valid_operator_reason(reason: str) -> bool:
@@ -5605,10 +5613,9 @@ def check_home_session(
         return None
     if home in actor.session_ids:
         return None
-    # Execution lane: the assignee works its card wherever it was born, and a
-    # dispatched worker always owns the card it was spawned for.
-    if actor.profile and (row["assignee"] or "") == actor.profile:
-        return None
+    # Execution lane: a dispatched worker always owns the card it was spawned
+    # for. The assignee match lives below, on :func:`_actor_profiles` (session
+    # owner over env profile), not on the raw env profile (FleetReview #1074).
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
         return None
     # ...and the cards it fanned out: item 1 stamps a worker's children with
@@ -5719,18 +5726,34 @@ def _can_adopt_home(session_id: str) -> bool:
         return not os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")
 
 
+_HOME_UNREAD = object()
+
+
+def _read_home_session(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row["session_id"] if row is not None else None
+
+
 def record_foreign_action(
-    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor
+    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor,
+    *, home_before: Any = _HOME_UNREAD,
 ) -> None:
     """Append the audit comment for an overridden foreign-session mutation.
 
     An ``--operator`` override records an ``operator_override`` event only:
     no comment, so nothing pages the home session.
+
+    ``home_before`` is the home read BEFORE the guarded mutation ran; the
+    mutation itself may have re-stamped ``tasks.session_id`` (``update
+    --session``), and the audit must name the displaced home (C7 k103).
     """
     sess = ", ".join(actor.session_ids) or "no-session"
-    home_row = conn.execute(
-        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
+    prev_home = (
+        _read_home_session(conn, task_id)
+        if home_before is _HOME_UNREAD else home_before
+    )
     if actor.operator:
         last = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -5759,11 +5782,10 @@ def record_foreign_action(
                     "reason": actor.operator,
                     "by_sessions": list(actor.session_ids),
                     "by_profile": actor.profile,
-                    "home": (home_row["session_id"] if home_row is not None else None),
+                    "home": prev_home,
                 },
             )
         return
-    prev_home = home_row["session_id"] if home_row is not None else None
     new_home = (
         actor.session_ids[0]
         if action in REHOME_ON_TAKEOVER_ACTIONS
@@ -5839,13 +5861,19 @@ def _home_session_guarded(action: str, task_param: str = "task_id"):
                 return fn(conn, *args, **kwargs)
             task_id = sig.bind_partial(conn, *args, **kwargs).arguments.get(task_param)
             override = check_home_session(conn, str(task_id), action)
+            home_before = (
+                _read_home_session(conn, str(task_id))
+                if override is not None else _HOME_UNREAD
+            )
             token = _MUTATION_ACTOR.set(None)
             try:
                 result = fn(conn, *args, **kwargs)
             finally:
                 _MUTATION_ACTOR.reset(token)
             if override is not None and _mutation_succeeded(result):
-                record_foreign_action(conn, str(task_id), action, override)
+                record_foreign_action(
+                    conn, str(task_id), action, override, home_before=home_before
+                )
             return result
 
         wrapper.__home_session_action__ = action
@@ -7045,6 +7073,10 @@ class BatchRouteWrite:
 # Run-scoped trigger for a live route switch (``set-model --live``). The card
 # row stays the authority on the route; the event only says "re-read it now".
 ROUTE_CHANGED_EVENT = "route_changed"
+# Run-scoped marker a worker writes when its runtime cannot switch in place
+# (``codex_app_server``: the turn runs in a subprocess, no loop-boundary
+# poll). A live write to such a run is next-dispatch only, never promised.
+ROUTE_LIVE_UNSUPPORTED_EVENT = "route_live_unsupported"
 
 
 def _append_live_route_changed_locked(
@@ -7064,6 +7096,11 @@ def _append_live_route_changed_locked(
     if row is None or (row["status"] or "").lower() != "running" or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? LIMIT 1",
+        (task_id, run_id, ROUTE_LIVE_UNSUPPORTED_EVENT),
+    ).fetchone():
+        return None
     _append_event(conn, task_id, ROUTE_CHANGED_EVENT, {
         "live": True,
         "model": row["model_override"],
@@ -8378,8 +8415,11 @@ def _prior_worker_still_alive(
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT r.id, r.outcome, r.ended_at, r.started_at, t.max_runtime_seconds "
-        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        # The run's OWN runtime cap, snapshotted at claim: the card's current
+        # cap can be shortened after release while that worker still runs
+        # (FleetReview #956). A run with no snapshot is probed, never skipped.
+        "SELECT r.id, r.outcome, r.ended_at, r.started_at, r.max_runtime_seconds "
+        "FROM task_runs r "
         "WHERE r.task_id = ? ORDER BY r.id DESC",
         (task_id,),
     ).fetchall()
@@ -8461,7 +8501,7 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
             pid = int(payload["pid"])
         except (TypeError, ValueError, KeyError):
             continue
-        token = payload.get("start_token") if isinstance(payload, dict) else None
+        token = _spawn_start_token(payload)
         candidates.append((pid, spawned["run_id"] is None,
                            spawned["created_at"], token))
     for pid, late, spawned_at, token in candidates:
@@ -8528,6 +8568,36 @@ def _pid_start_token(pid: int) -> Optional[float]:
         return None
 
 
+def _boot_id() -> Optional[str]:
+    """This boot's identity, or None where the start token is not boot-relative.
+
+    A Linux start token is /proc starttime ticks SINCE BOOT, so after a reboot a
+    new process at a reused PID can carry the very token a pre-boot worker
+    recorded. The ``spawned`` event stamps this id next to the token so a token
+    from another boot is never read as identity (C7 k109).
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _spawn_start_token(payload: Any) -> Any:
+    """The ``start_token`` a ``spawned`` payload recorded, if still meaningful.
+
+    A token stamped under a different boot proves nothing about a live PID
+    now, so it is dropped and the causal-window check decides instead.
+    """
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("start_token")
+    recorded_boot = payload.get("boot_id")
+    if token is not None and recorded_boot and recorded_boot != _boot_id():
+        return None
+    return token
+
+
 def _pid_create_time(pid: int) -> Optional[float]:
     """Wall-clock epoch creation time of ``pid``, or None if unreadable."""
     try:
@@ -8564,8 +8634,9 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
     window ``[claimed_at - 1 s, spawned_at + 2 s]``.
 
     ``False``: provably not the recorded worker. ``None``: the needed reading
-    is unreadable. A missing bound is simply not applied, so missing evidence
-    never proves a PID recycled.
+    is unreadable, or the ``spawned`` upper bound is missing (identity
+    unproven). Missing evidence never proves a PID recycled, and never proves
+    it is the worker either.
     """
     if start_token is not None:
         try:
@@ -8584,6 +8655,13 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
         return False
     if spawned_at is not None and created > float(spawned_at) + _OWNER_CREATE_LAG_SECONDS:
         return False
+    if spawned_at is None:
+        # Only the claim lower bound is known (no run-scoped ``spawned``
+        # evidence: legacy/migrated runs). Any process created after the
+        # claim -- including one that reused the worker's PID -- fits, so
+        # this is UNPROVEN, not proven: termination never signals it, while
+        # every liveness caller still treats it as alive (FleetReview #1021).
+        return None
     return True
 
 
@@ -8676,7 +8754,7 @@ def _worker_owner_window(
             payload = json.loads(ev["payload"] or "{}")
             if int(payload["pid"]) == int(pid):
                 spawned_at = ev["created_at"]
-                start_token = payload.get("start_token")
+                start_token = _spawn_start_token(payload)
                 break
         except (TypeError, ValueError, KeyError, AttributeError):
             continue
@@ -9852,8 +9930,9 @@ def complete_task(
     # ``review`` is a reviewer/human approval and is left alone; so is a
     # claimed reviewer run approving with ``head_sha`` -- the PR it approved
     # is OPEN by definition and the land queue merges it from that record.
+    from hermes_cli import kanban_open_pr as _open_pr
+    _pr_query = None
     if candidate.status != 'review' and not approve_head_sha:
-        from hermes_cli import kanban_open_pr as _open_pr
         # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
         # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
         foreign = _open_pr.foreign_pr_refs(
@@ -9874,9 +9953,16 @@ def complete_task(
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
             try:
+                # Arm only the card's OWN handoff PR(s), never a PR the prose
+                # merely mentions (FleetReview #1234 finding).
                 freshness = _fresh.check(
                     still_open, task_id=task_id,
                     allow_arm=not is_milestone_card(conn, task_id),
+                    armable={
+                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                            metadata=metadata, survivor_pr=survivor_pr,
+                        )
+                    },
                 )
             except _fresh.DraftPrError as draft_err:
                 with write_txn(conn):
@@ -9916,23 +10002,26 @@ def complete_task(
                 # and the PR refs the review-card closer resolves on merged=true.
                 add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
-        # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
-        # without merge (e.g. auto-closed when its stacked base was deleted), so
-        # the work is not on default. Refuse done unless the handoff names the
-        # superseding merged PR / SHA. Raises before any mutation.
-        try:
-            _open_pr.enforce_not_closed_unmerged(
-                task_id, result, summary, metadata=metadata,
-                survivor_pr=survivor_pr, superseded_by=superseded_by,
-                query_fn=_pr_query,
+    # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
+    # without merge (e.g. auto-closed when its stacked base was deleted), so
+    # the work is not on default. Refuse done unless the handoff carries a
+    # SUPERSEDED-BY / RE-CARRIED-AS token naming merged work for that PR; an
+    # unreadable lookup refuses too. Every completion is gated, including a
+    # reviewer approving a card parked in review. Raises before any mutation.
+    try:
+        _open_pr.enforce_not_closed_unmerged(
+            task_id, result, summary, metadata=metadata,
+            survivor_pr=survivor_pr, superseded_by=superseded_by,
+            query_fn=_pr_query or _open_pr.memo_query(),
+            recorded=_card_recorded_pr_refs(conn, task_id),
+        )
+    except _open_pr.ClosedUnmergedPrError as closed_err:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_closed_unmerged_pr",
+                {"prs": closed_err.closed, "unverified": closed_err.unverified},
             )
-        except _open_pr.ClosedUnmergedPrError as closed_err:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "completion_blocked_closed_unmerged_pr",
-                    {"prs": closed_err.prs},
-                )
-            raise
+        raise
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -12724,8 +12813,8 @@ _REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 _REVIEW_NA_INABILITY = re.compile(
     r"\b(?:"
     r"skip(?:ped|ping|s)?|"
-    r"(?:could|can)\s*(?:not|n't)|cannot|unable|"
-    r"(?:did|was|were|does|do)\s*(?:not|n't)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
+    r"(?:could|can)\s*(?:not|n['\u2019]t)|can['\u2019]t|cannot|unable|"
+    r"(?:did|was|were|does|do)\s*(?:not|n['\u2019]t)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
     r"not\s+(?:run|ran|executed|attempted|tried|finished|completed|reached)|"
     r"ran\s+out|out\s+of\s+time|no\s+time\b|timed?\s*out|"
     r"fail(?:ed|s)?\s+to\b|errored|crashed|blocked\s+(?:by|on)\b|"
@@ -13154,7 +13243,10 @@ def request_changes(
     try:
         with write_txn(conn):
             ok, detail = _in_txn()
-            if not ok and opened:
+            # A refusal rolls back everything this call wrote: the opened
+            # claim AND a posted coverage comment the gate just rejected
+            # (C7 k107) -- a refused record must not persist on the run.
+            if not ok and (opened or posted):
                 raise _SendBackRefused(detail)
     except _SendBackRefused as exc:
         return False, exc.detail
@@ -14241,8 +14333,57 @@ def decompose_triage_task(
     return child_ids
 
 
+def _card_recorded_pr_refs(conn: sqlite3.Connection, task_id: str, runs=None) -> list:
+    """Every PR string any of the card's runs persisted (``kanban_open_pr.recorded_pr_refs``): pr_url /
+    pr_urls / pr, auto_routed_open_prs and survivor PR evidence. The card's own PRs for the closed-unmerged
+    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref."""
+    from hermes_cli import kanban_open_pr as _open_pr
+    out: list = []
+    for run in (list_runs(conn, task_id) if runs is None else runs):
+        out.extend(_open_pr.recorded_pr_refs(run.metadata))
+    return out
+
+
+def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:
+    """Refuse to archive a card whose own PR was closed without merge (t_a1550189).
+
+    Archiving hides a card the same way ``done`` does, so a card whose PR was auto-closed (stacked base
+    deleted) must not vanish from the board with its content never on default. The card's own refs are
+    every PR any of its runs recorded (:func:`_card_recorded_pr_refs`). Archive passes when the card's result,
+    run summaries or comments carry a SUPERSEDED-BY / RE-CARRIED-AS token naming merged work, or a card
+    comment records an explicit close decision (``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|
+    DUPLICATE-OF``, the line the close-reason contract says to copy onto the card). Unreadable refuses.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    task = get_task(conn, task_id)
+    if task is None or task.status == "archived":
+        return
+    runs = list_runs(conn, task_id)
+    urls = _card_recorded_pr_refs(conn, task_id, runs=runs)
+    if not urls:
+        return
+    texts: list = [task.result] + [run.summary for run in runs]
+    comments = [c.body for c in list_comments(conn, task_id)]
+    try:
+        _open_pr.enforce_not_closed_unmerged(
+            task_id, *texts, recorded=urls,
+            query_fn=query_fn or _open_pr.memo_query(),
+            verb="archive", decision_texts=comments,
+        )
+    except _open_pr.ClosedUnmergedPrError as closed_err:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "archive_blocked_closed_unmerged_pr",
+                {"prs": closed_err.closed, "unverified": closed_err.unverified},
+            )
+        raise
+
+
 @_home_session_guarded("archive")
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive ``task_id``. Raises :class:`kanban_open_pr.ClosedUnmergedPrError` (no state change) when
+    the card's own PR is closed-unmerged with no recorded superseder or close decision (t_a1550189)."""
+    _archive_closed_pr_gate(conn, task_id)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -15870,12 +16011,17 @@ def _notify_rate_limit_circuit(
         if same_episode and int(prior) >= until:
             return
         seen[pool] = max(int(prior), until) if same_episode else until
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps(seen), encoding="utf-8")
+
+        def _latch() -> None:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(seen), encoding="utf-8")
+
         if same_episode:
+            _latch()
             return  # hold extended; already announced
         script = _kbudget._notify_script_path()
         if script is None:
+            _latch()
             return
         import sys as _sys
         body = (
@@ -15884,10 +16030,14 @@ def _notify_rate_limit_circuit(
             f"Holding {pool} spawns until "
             f"{time.strftime('%H:%M:%S', time.localtime(until))}; other pools unaffected."
         )
-        _kbudget._run_notify([
+        delivered = _kbudget._run_notify([
             _sys.executable, script, "--channel", "discord",
             "--target", _kbudget.RECOVERY_TARGET, "--send", body,
         ])
+        # Latch the episode only once the page went out: a failed send
+        # must be retried on the next tick, not silently swallowed (C7 k105).
+        if delivered is not False:
+            _latch()
     except Exception as exc:
         _log.warning("kanban rate-limit circuit notify failed (%s: %s)", type(exc).__name__, exc)
 
@@ -17594,7 +17744,8 @@ def end_orphaned_terminal_runs(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
         "SELECT r.id, r.task_id, r.worker_pid, r.claim_lock, r.started_at, "
-        "       r.last_heartbeat_at, r.max_runtime_seconds, t.status AS task_status "
+        "       r.last_heartbeat_at, r.max_runtime_seconds, r.metadata, "
+        "       t.status AS task_status "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NULL AND t.status IN ('done', 'archived')"
     ).fetchall()
@@ -17622,6 +17773,13 @@ def end_orphaned_terminal_runs(
             "max_runtime_seconds": limit,
             "now": now,
         }
+        # Merge, never replace: the open run may already carry metadata
+        # (``pool`` from _stamp_run_pool) that the ledger reads (C7 k110).
+        try:
+            prior_meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        except (json.JSONDecodeError, TypeError):
+            prior_meta = {}
+        run_meta = {**prior_meta, **payload} if isinstance(prior_meta, dict) else payload
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE task_runs SET status = 'reclaimed', outcome = ?, "
@@ -17631,7 +17789,7 @@ def end_orphaned_terminal_runs(
                 (
                     ORPHANED_TERMINAL_TASK_OUTCOME,
                     f"run left open on a {row['task_status']} card; ended by reaper",
-                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(run_meta, ensure_ascii=False),
                     now,
                     run_id,
                 ),
@@ -18758,6 +18916,9 @@ def _set_worker_pid(
     start_token = _pid_start_token(int(pid))
     if start_token is not None:
         spawn_payload["start_token"] = start_token
+        boot_id = _boot_id()
+        if boot_id:
+            spawn_payload["boot_id"] = boot_id
     if pool is not None:
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
@@ -20455,6 +20616,36 @@ def _dispatch_once_locked(
     def pool_in_flight(pool):
         return sum(m.get(pool, 0) for m in in_flight_by_board.values())
 
+    # Review-lane POOL reservation (t_becb0042, #985 C4 follow-up): the
+    # spawn-slot reservation above is not enough when the binding limit is a
+    # pool's admission budget. The ready loop runs first and charges every
+    # admission to its pool, so a ready backlog >= eligible*N on pool P left
+    # every review card on P deferred ``pool_budget`` every tick. Mirror the
+    # spawn-slot hold per pool: for each pool that has a spawnable review
+    # card, the ready loop sees one fewer admission. Self-releasing: pools
+    # with no spawnable review work are untouched, and the map is cleared
+    # before the review loop so reviewers see the full pool budget.
+    review_pool_reserve: dict[str, int] = {}
+    if pool_spawns_per_eligible and review_rows:
+        try:
+            from hermes_cli.profiles import profile_exists as _rpp
+        except Exception:
+            _rpp = None
+        for _rrow in review_rows:
+            if not _rrow["assignee"]:
+                continue
+            if _rpp is not None and not _rpp(_rrow["assignee"]):
+                continue
+            _rtask = get_task(conn, _rrow["id"])
+            if _rtask is None:
+                continue
+            _rtask.assignee = _rrow["assignee"]
+            apply_lane_model_override(
+                _rtask, _lane_override_for(_rrow["assignee"]), now=_tick_now)
+            _rpool = pool_key(effective_provider(_rtask))
+            if _rpool is not None:
+                review_pool_reserve[_rpool] = 1
+
     def pool_budget(provider):
         pool = pool_key(provider)
         if pool is None or pool_spawns_per_eligible == 0:
@@ -20465,11 +20656,15 @@ def _dispatch_once_locked(
             return None  # Unknown probe: fail open.
         admitted = admitted_this_tick.get(pool, 0)
         in_flight = pool_in_flight(pool)
-        if in_flight + admitted < eligible * pool_spawns_per_eligible:
+        reserved = review_pool_reserve.get(pool, 0)
+        if in_flight + admitted + reserved < eligible * pool_spawns_per_eligible:
             return None
-        return {"reason": "pool_budget", "provider": provider,
-                "pool": pool, "eligible": eligible, "admitted": admitted,
-                "in_flight": in_flight}
+        payload = {"reason": "pool_budget", "provider": provider,
+                   "pool": pool, "eligible": eligible, "admitted": admitted,
+                   "in_flight": in_flight}
+        if reserved:
+            payload["reserved_for_review"] = reserved
+        return payload
 
     def charge_pool(task_id, run_id=None):
         pool = admitted_routes.pop(task_id, None)
@@ -21090,7 +21285,9 @@ def _dispatch_once_locked(
     # back) so this lane cannot be permanently starved by a sustained
     # ready backlog. The review loop itself still checks the FULL shared
     # ``spawn_budget`` — the reservation caps the ready lane, it does not
-    # grant the review lane extra capacity.
+    # grant the review lane extra capacity. Same for the per-pool hold:
+    # release it so reviewers are judged on the pool's real budget.
+    review_pool_reserve.clear()
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break

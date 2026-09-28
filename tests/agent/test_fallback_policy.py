@@ -284,6 +284,39 @@ def test_compaction_branch(store, key):
                                   live_session_id="sid-a").allowed
 
 
+def test_compaction_branch_in_place_no_rotation(store, key):
+    """compression.in_place=true (default) never rotates session_id; the
+    marker written by note_compaction drives the §4.3 compaction branch."""
+    _sticky_on_fallback(store, key)
+    assert not fp.restore_allowed(store.get(key), T0 + 300, probe=False,
+                                  live_session_id="sid-a").allowed
+    fp.note_compaction(store, key, T0 + 200)
+    d = fp.restore_allowed(store.get(key), T0 + 300, probe=False, live_session_id="sid-a")
+    assert d.allowed and d.branch == "compaction"
+    # a fallback call AFTER the compaction re-warms the fallback: no return
+    fp.note_fallback_success(store, key, T0 + 250, "sid-a")
+    d = fp.restore_allowed(store.get(key), T0 + 300, probe=False, live_session_id="sid-a")
+    assert not d.allowed and "compaction: none since last fallback call" in d.reason
+
+
+def test_note_compaction_ignores_inactive_episode(store, key):
+    assert fp.note_compaction(store, key, T0) is None
+    _sticky_on_fallback(store, key)
+    fp.record_return(store, key, T0 + 10, "fallback_cold")
+    assert fp.note_compaction(store, key, T0 + 20).last_compaction_epoch is None
+
+
+def test_compaction_marker_survives_db_only_restart(tmp_path, key):
+    """pass-10 G1: the marker is write-through, so a restarted process
+    (DB only) still evaluates the compaction branch."""
+    s1 = StickyStore(db_path=tmp_path / "t.db")
+    _sticky_on_fallback(s1, key)
+    fp.note_compaction(s1, key, T0 + 100)
+    s2 = StickyStore(db_path=tmp_path / "t.db")
+    r = fp.decide_rebuild(s2, key, T0 + 600, live_session_id="sid-a", eligibility=lambda: None)
+    assert r.action == "return" and r.decision.branch == "compaction"
+
+
 def test_nothing_but_fallback_failed_returns_before_until(store, key):
     st = _sticky_on_fallback(store, key, cls="quota_model")
     elig = _elig({"instance_id": "x", "bound_seat": "sub-vps-6", "bound_eligible": True,
@@ -923,6 +956,25 @@ def test_wiring_restore_refused_then_fallback_cold_return(wired):
     assert "fallback idle 61m" in rec["notice_text"]
     assert len(_route_lines(home)) == 2
     assert _state(a).active is False
+
+
+def test_wiring_in_place_compaction_returns_via_compaction(wired):
+    """In-place compaction keeps session_id; the wiring marker alone lets the
+    next boundary return with branch=compaction (t_2b064101)."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    _age_episode(a, fallback_idle=10 * 60)
+    st = _state(a)
+    st.last_primary_call_epoch = None  # no warm seat: only compaction can return
+    fss.default_store().put(_fw.key_for(a), st, _time.time())
+    assert _restore(a) is False
+    _fw.note_compaction(a)
+    assert a.session_id == SID
+    assert _restore(a) is True
+    assert (a.provider, a.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "compaction"
 
 
 def test_wiring_failover_fallback_failed_failover(wired):

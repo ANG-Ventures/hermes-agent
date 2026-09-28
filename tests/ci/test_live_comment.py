@@ -108,3 +108,52 @@ def test_runs_all_completed_empty_list_is_not_done():
 
 def test_runs_all_completed_missing_status_is_not_done():
     assert not _mod.runs_all_completed([{}])
+
+
+# ── comment lookup outage (#1229 C4) ─────────────────────────────────────
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        import json as _json
+
+        return _json.dumps(self._payload).encode()
+
+
+def test_comment_lookup_outage_is_retried_not_fatal(monkeypatch):
+    """A transient error listing comments must not escape run() and kill the poller."""
+    import urllib.error
+
+    lookups = []
+
+    def _find(token, repo, pr_number):
+        lookups.append(pr_number)
+        if len(lookups) == 1:
+            raise urllib.error.URLError("temporary failure in name resolution")
+        return 7
+
+    sent = []
+    monkeypatch.setattr(_mod, "_import_assembler", lambda: None)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: ([], True))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "build_comment_body", lambda *a, **k: "body")
+    monkeypatch.setattr(_mod, "find_comment_id", _find)
+    monkeypatch.setattr(_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        _mod.urllib.request, "urlopen",
+        lambda req, *a, **k: sent.append(req.get_method()) or _FakeResp({"id": 7}),
+    )
+
+    assert _mod.run("t", "o/r", "1", "5", "https://ci", interval=0) == 0
+    assert len(lookups) == 2  # the failed post is retried on the next poll
+    assert sent == ["PATCH"]

@@ -239,30 +239,52 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
 # --------------------------------------------------------------------------- closed-unmerged done gate
 # Card t_a1550189 (2026-09-27): a PR stacked on a branch that was deleted after a squash is auto-CLOSED
 # by GitHub, and the card that named it went ``done`` anyway (t_ddb3938c -> hermes-home#341,
-# t_a3b910ce -> ace-media-homelab#81): the content never reached the default branch. ``done`` is
-# refused when the card's OWN PR ref (``metadata.pr_url``/``pr``/``pr_urls`` or ``--survivor-pr``) is
-# closed-unmerged, unless the handoff names the superseding work: a PR that is MERGED, or a commit
-# SHA that is on the repo's default branch.
+# t_a3b910ce -> ace-media-homelab#81): the content never reached the default branch. ``done`` (and
+# ``archive``) is refused when the card's OWN PR ref (``metadata.pr_url``/``pr``/``pr_urls`` or
+# ``--survivor-pr``) is closed-unmerged, unless the handoff carries the canonical close-reason token for
+# THAT closed PR (Ace 2026-09-27 10:38; skills-shared/coding/coding-guardrails/references/
+# pr-close-reasons.md): ``SUPERSEDED-BY <ref>`` / ``RE-CARRIED-AS <ref>`` (or ``--superseded-by <ref>``)
+# where <ref> is a MERGED PR (``owner/repo#N``, a PR URL, or ``#N`` in the closed PR's repo) or a commit
+# SHA on the closed PR's repo's default branch. A lookup that fails refuses (fail closed).
 
 _SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 ShaCheckFn = Callable[[str, str], Optional[bool]]
+SUPERSEDE_TOKENS = ("SUPERSEDED-BY", "RE-CARRIED-AS")
+_TARGET = (r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+"
+           r"|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|#\d+|[0-9a-f]{7,40}")
+_SUPERSEDE_RE = re.compile(r"\b(?:SUPERSEDED-BY|RE-CARRIED-AS)\s+(" + _TARGET + r")\b")
+_TARGET_RE = re.compile(r"(?<![\w/#])(" + _TARGET + r")\b")
+_BARE_PR_RE = re.compile(r"^#(\d+)$")
+# Archive only (not done): an explicit close decision recorded on the card also explains the closed PR.
+_DECISION_RE = re.compile(r"\bCLOSED: (?:REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF)\b")
 
 
 class ClosedUnmergedPrError(ValueError):
-    """A completion's own PR ref is closed without merge and no superseder is named."""
+    """A completion's own PR ref is closed without merge (or unreadable) and no superseder is named."""
 
-    def __init__(self, task_id: str, prs: list):
+    def __init__(self, task_id: str, prs: list, unverified: Optional[list] = None, verb: str = "done"):
         self.task_id = task_id
-        self.prs = list(prs)
-        super().__init__(
-            f"done refused: {', '.join(self.prs)} "
-            f"{'is' if len(self.prs) == 1 else 'are'} CLOSED WITHOUT MERGE, so the work is not on "
-            f"the default branch (a stacked PR auto-closed when its base branch was deleted looks "
-            f"exactly like this). Reopen/retarget and land it, or name what superseded it in the "
-            f"result: a MERGED PR (owner/repo#N) or a commit SHA on the default branch "
-            f"(--result 'superseded by owner/repo#N' / --superseded-by <sha>). "
-            f"{task_id} is still in-flight (no state change)."
-        )
+        self.closed = list(prs)
+        self.unverified = list(unverified or [])
+        self.prs = self.closed + self.unverified
+        parts = [f"{verb} refused:"]
+        if self.closed:
+            parts.append(
+                f"{', '.join(self.closed)} {'is' if len(self.closed) == 1 else 'are'} CLOSED WITHOUT MERGE, "
+                f"so the work is not on the default branch (a stacked PR auto-closed when its base branch "
+                f"was deleted looks exactly like this). Reopen/retarget and land it, or name what superseded "
+                f"it with the close-reason token: 'SUPERSEDED-BY owner/repo#N' / 'RE-CARRIED-AS #N' (a MERGED "
+                f"PR) or 'SUPERSEDED-BY <sha>' (a commit on the default branch), in --result/--summary or "
+                f"--superseded-by <ref>."
+            )
+        if self.unverified:
+            parts.append(
+                f"GitHub could not be read for {', '.join(self.unverified)}, so it is unknown whether the "
+                f"work landed; retry when `gh api repos/<owner>/<repo>/pulls/<n>` works."
+            )
+        parts.append(f"{task_id} is still in-flight (no state change)." if verb == "done"
+                     else f"{task_id} is not archived (no state change).")
+        super().__init__(" ".join(parts))
 
 
 def sha_on_default(repo: str, sha: str) -> Optional[bool]:
@@ -304,71 +326,153 @@ def memo_query(query_fn: Optional[QueryFn] = None) -> Optional[QueryFn]:
     return _q
 
 
-def closed_unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None) -> list:
-    """The subset of ``refs`` GitHub positively reports CLOSED (not merged). Unreadable -> not listed
-    (the open-PR gate already routes an unreadable primary ref to review)."""
+def closed_unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None, unverified: Optional[list] = None) -> list:
+    """The subset of ``refs`` GitHub positively reports CLOSED (not merged). A lookup that raises or
+    returns no state is appended to ``unverified`` (the caller fails closed on it). No oracle at all
+    (pytest) checks nothing."""
     if query_fn is None:
         query_fn = _default_query()
         if query_fn is None:
             return []
     out = []
-    for ref in list(refs)[:MAX_LOOKUPS_PER_COMPLETION]:
+    # EVERY primary ref is looked up (FleetReview #1339): a cap here let the 11th own PR close unmerged
+    # and still pass. Primary refs are the card's own PRs, not prose, so they are bounded by the card.
+    for ref in refs:
         try:
             payload = query_fn(ref.repo, ref.number)
         except Exception as exc:
             _log.warning("kanban closed-pr check: lookup %s failed: %s", ref, exc)
+            payload = None
+        state = str(payload.get("state") or "").upper() if isinstance(payload, dict) else ""
+        if not state:
+            if unverified is not None:
+                unverified.append(f"{ref.repo}#{ref.number}")
             continue
-        if isinstance(payload, dict) and str(payload.get("state") or "").upper() == "CLOSED":
+        if state == "CLOSED":
             out.append(ref)
     return out
 
 
-def names_superseder(closed, *texts: Optional[str], query_fn: Optional[QueryFn] = None,
-                     sha_check: Optional[ShaCheckFn] = None) -> bool:
-    """Does the handoff text name a MERGED PR, or a SHA on the default branch of a closed PR's repo?"""
+def superseder_targets(*texts: Optional[str], superseded_by: Optional[str] = None) -> list:
+    """Targets of ``SUPERSEDED-BY <ref>`` / ``RE-CARRIED-AS <ref>`` tokens, plus every ref in --superseded-by."""
+    blob = "\n".join(t for t in texts if isinstance(t, str))
+    out = _SUPERSEDE_RE.findall(blob)
+    if isinstance(superseded_by, str):  # --superseded-by IS the token: every ref/sha in it is a target
+        out += _TARGET_RE.findall(superseded_by)
+    return list(dict.fromkeys(out))
+
+
+def _is_merged(query_fn, repo: str, number: int) -> bool:
+    try:
+        payload = query_fn(repo, number)
+    except Exception as exc:
+        _log.warning("kanban closed-pr check: superseder %s#%s lookup failed: %s", repo, number, exc)
+        return False
+    return isinstance(payload, dict) and str(payload.get("state") or "").upper() == "MERGED"
+
+
+def supersedes(closed_ref, target: str, *, query_fn: Optional[QueryFn],
+               sha_check: Optional[ShaCheckFn]) -> bool:
+    """Does ``target`` (one token target) name landed work for ``closed_ref``? Unreadable -> False."""
+    m = _BARE_PR_RE.match(target)
+    if m:
+        repo, number = closed_ref.repo, int(m.group(1))
+    elif "#" in target or "/pull/" in target:
+        refs = extract_pr_refs(target)
+        if not refs:
+            return False
+        repo, number = refs[0].repo, refs[0].number
+    else:  # a SHA: must be on the CLOSED PR's repo's default branch
+        if not re.search(r"[a-f]", target) or sha_check is None:
+            return False
+        return bool(sha_check(closed_ref.repo, target))
+    if (repo.lower(), number) == (closed_ref.repo.lower(), closed_ref.number) or query_fn is None:
+        return False  # a closed PR cannot supersede itself
+    return _is_merged(query_fn, repo, number)
+
+
+def names_superseder(closed, *texts: Optional[str], superseded_by: Optional[str] = None,
+                     query_fn: Optional[QueryFn] = None, sha_check: Optional[ShaCheckFn] = None) -> bool:
+    """Is EVERY closed PR covered by a SUPERSEDED-BY/RE-CARRIED-AS token naming merged work?"""
+    return not _unsuperseded(closed, *texts, superseded_by=superseded_by, query_fn=query_fn, sha_check=sha_check)
+
+
+def _unsuperseded(closed, *texts: Optional[str], superseded_by: Optional[str] = None,
+                  query_fn: Optional[QueryFn] = None, sha_check: Optional[ShaCheckFn] = None) -> list:
+    """The closed refs NOT covered by a SUPERSEDED-BY/RE-CARRIED-AS token naming merged work."""
     if query_fn is None:
         query_fn = _default_query()
     if sha_check is None and not os.environ.get("PYTEST_CURRENT_TEST"):
         sha_check = sha_on_default
-    closed_keys = {(r.repo.lower(), r.number) for r in closed}
-    blob = "\n".join(t for t in texts if isinstance(t, str))
-    for ref in extract_pr_refs(blob)[:MAX_LOOKUPS_PER_COMPLETION]:
-        if (ref.repo.lower(), ref.number) in closed_keys or query_fn is None:
-            continue
-        try:
-            payload = query_fn(ref.repo, ref.number)
-        except Exception:
-            continue
-        if isinstance(payload, dict) and str(payload.get("state") or "").upper() == "MERGED":
-            return True
-    if sha_check is None:
+    targets = superseder_targets(*texts, superseded_by=superseded_by)[:MAX_LOOKUPS_PER_COMPLETION]
+    return [c for c in closed
+            if not any(supersedes(c, t, query_fn=query_fn, sha_check=sha_check) for t in targets)]
+
+
+def _decision_covers(closed_ref, text: str, *, sole: bool) -> bool:
+    """Does one ``CLOSED: <reason>`` decision text explain THIS closed PR (FleetReview #1339)?
+
+    It must name the PR (``owner/repo#N``, its URL, or ``#N``), or the card must own exactly one PR and
+    the text names none. A decision naming PR A never covers PR B."""
+    if not isinstance(text, str) or not _DECISION_RE.search(text):
         return False
-    repos = sorted({r.repo for r in closed})
-    for sha in list(dict.fromkeys(_SHA_RE.findall(blob)))[:6]:
-        if not re.search(r"[a-f]", sha):  # all-digit tokens (PR numbers, timestamps) are not SHAs
-            continue
-        for repo in repos:
-            if sha_check(repo, sha):
-                return True
-    return False
+    named = extract_pr_refs(text)
+    key = (closed_ref.repo.lower(), closed_ref.number)
+    if any((r.repo.lower(), r.number) == key for r in named):
+        return True
+    bare = {int(n) for n in re.findall(r"(?<![\w/])#(\d+)\b", text)}
+    if closed_ref.number in bare and not any(r.number == closed_ref.number for r in named):
+        return True
+    return sole and not named and not bare
+
+
+def recorded_pr_refs(metadata) -> list:
+    """Every PR string a run's metadata persisted for the card: ``pr_url``/``pr_urls``/``pr``, PRs the
+    open-PR route recorded (``auto_routed_open_prs``) and survivor PR evidence (``survivor.refs[].pr`` /
+    ``survivor.claims[].pr``). The card's own PR evidence, independent of which key carried it."""
+    if not isinstance(metadata, dict):
+        return []
+    out: list = []
+    for key in ("pr_url", "pr_urls", "pr", "auto_routed_open_prs"):
+        out.extend(_iter_strings(metadata.get(key)))
+    survivor = metadata.get("survivor")
+    if isinstance(survivor, dict):
+        for group in ("refs", "claims"):
+            for item in survivor.get(group) or ():
+                if isinstance(item, dict):
+                    out.extend(_iter_strings(item.get("pr")))
+    return out
 
 
 def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: Optional[dict] = None,
                                 survivor_pr=None, superseded_by: Optional[str] = None,
                                 query_fn: Optional[QueryFn] = None,
-                                sha_check: Optional[ShaCheckFn] = None) -> list:
-    """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged and the handoff
-    (``texts`` + ``superseded_by``) names no merged superseder. Returns the closed refs it accepted."""
+                                sha_check: Optional[ShaCheckFn] = None,
+                                verb: str = "done", decision_texts=(), recorded=()) -> list:
+    """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
+    the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
+    work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
+    ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. Returns the closed refs accepted."""
     # Fleet-owned refs only: a foreign (upstream / third-party) PR is a mention the fleet cannot land.
-    primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
+    # ``recorded``: PR strings earlier runs persisted for this card (see :func:`recorded_pr_refs`), so a
+    # reviewer approving without repeating the PR is still gated on it (FleetReview #1339).
+    primary = split_fleet(extract_pr_refs(*recorded, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not primary:
         return []
-    closed = closed_unmerged_refs(primary, query_fn=query_fn)
+    unverified: list = []
+    closed = closed_unmerged_refs(primary, query_fn=query_fn, unverified=unverified)
+    if unverified:
+        raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], unverified, verb=verb)
     if not closed:
         return []
-    if names_superseder(closed, *texts, superseded_by, query_fn=query_fn, sha_check=sha_check):
+    # Each closed PR needs its OWN cover: a merged-work token, or (archive) a decision tied to that PR.
+    uncovered = _unsuperseded(closed, *texts, *decision_texts, superseded_by=superseded_by,
+                              query_fn=query_fn, sha_check=sha_check)
+    sole = len(primary) == 1
+    uncovered = [c for c in uncovered if not any(_decision_covers(c, t, sole=sole) for t in decision_texts)]
+    if not uncovered:
         return closed
-    raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed])
+    raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb)
 
 
 ROUTE_COMMENT = "survivor PR open; card closes on merged=true"

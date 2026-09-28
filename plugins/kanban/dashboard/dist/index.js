@@ -991,10 +991,15 @@
     }, [selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const createTask = useCallback(function (body) {
+      // Home the card to the viewing session, so the default "this" facet of
+      // a /kanban?session=<id> link still shows the card just created.
+      const payload = viewerSession && !(body && body.session_id)
+        ? Object.assign({}, body, { session_id: viewerSession })
+        : body;
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
       }).then(function (res) {
         // Surface dispatcher-presence warnings (e.g. "no gateway is
         // running") via the existing error banner channel. Not fatal —

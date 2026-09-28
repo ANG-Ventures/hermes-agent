@@ -184,6 +184,66 @@ class TestShouldExclude:
         # a FILE literally named "workspaces" is not a directory — keep it
         assert not _should_exclude(Path("kanban/boards/slug/workspaces"))
 
+    def test_excludes_root_scratch_trees(self):
+        """Root-anchored regenerable scratch (2026-09-27: 14.84M-file full tier vs a
+        1.1M baseline). The default board's kanban/workspaces + kanban/worktrees,
+        .worktrees/, var/ramscratch-stage-* and var/subvps-stage are excluded AND
+        pruned from the walk; same-named dirs deeper in the tree are preserved."""
+        from hermes_cli.backup import _matches_path_glob, _should_exclude
+        for p in (
+            "kanban/workspaces/t_124b00a5/repo/a.py",
+            "kanban/workspaces/default/x.txt",
+            "kanban/worktrees/apollo-1055/README.md",
+            ".worktrees/argus/t_064c65a9/head/setup.py",
+            "var/ramscratch-stage-20260925-0512/worktrees/f.txt",
+            "var/subvps-stage/sub-vps-1/etc/hosts",
+        ):
+            assert _should_exclude(Path(p)), p
+        # the walk prunes the DIR itself (prune sites pass a trailing "_" sentinel)
+        for d in ("kanban/workspaces", ".worktrees", "var/ramscratch-stage-20260925-0444",
+                  "var/subvps-stage", "kanban/worktrees"):
+            assert _matches_path_glob((*Path(d).parts, "_")), d
+        # board DBs and other var/ content survive
+        assert not _should_exclude(Path("kanban/kanban.db"))
+        assert not _should_exclude(Path("kanban.db"))
+        assert not _should_exclude(Path("var/other-stage/a.txt"))
+        assert not _should_exclude(Path("var/ramscratch-notes.md"))
+        # root-anchored: same names deeper in the tree are kept
+        assert not _should_exclude(Path("skills/x/kanban/workspaces/note.md"))
+        assert not _should_exclude(Path("skills/x/.worktrees/note.md"))
+        assert not _should_exclude(Path("profiles/p/var/subvps-stage/a.txt"))
+        assert not _should_exclude(Path("skills/git/worktrees/SKILL.md"))
+        assert not _should_exclude(Path("plans/wt/notes.md"))
+        # root wt/ + worktrees/ are operator worktrees holding unique uncommitted work
+        # (t_e95deca8) — backed up, and never pruned from the walk
+        assert not _should_exclude(Path("wt/alerts-day-media-20260911/run_agent.py"))
+        assert not _should_exclude(Path("worktrees/compression-refusal/.local-evidence/HANDOFF.md"))
+        assert not _matches_path_glob(("wt", "_"))
+        assert not _matches_path_glob(("worktrees", "_"))
+        # a FILE literally named like the dir is not an ancestor — keep it
+        assert not _should_exclude(Path(".worktrees"))
+        assert not _should_exclude(Path("kanban/workspaces"))
+
+    def test_run_backup_walk_prunes_root_scratch(self, tmp_path, monkeypatch):
+        """E2E: the real full-tier writer never archives root scratch trees."""
+        import zipfile
+        from hermes_cli.backup import _write_full_zip_backup_locked
+        home = tmp_path / "home"
+        for rel in ("config.yaml", "kanban/workspaces/t_1/repo/a.py",
+                    ".worktrees/argus/t_2/f.py", "var/ramscratch-stage-20260925-0444/g.txt",
+                    "var/subvps-stage/sub-vps-1/h.txt", "var/keep.txt", "kanban/meta.json",
+                    "wt/op-a/dirty.py", "worktrees/op-b/.local-evidence/HANDOFF.md"):
+            f = home / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("x")
+        out = tmp_path / "out.zip"
+        assert _write_full_zip_backup_locked(out, home) == out
+        names = set(zipfile.ZipFile(out).namelist())
+        assert {"config.yaml", "var/keep.txt", "kanban/meta.json",
+                "wt/op-a/dirty.py", "worktrees/op-b/.local-evidence/HANDOFF.md"} <= names
+        assert not any(n.startswith((".worktrees/", "kanban/workspaces/", "var/ramscratch-stage-",
+                                     "var/subvps-stage/")) for n in names), names
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.
@@ -2179,3 +2239,75 @@ class TestMemoryProviderExternalPaths:
         assert not (hermes_home / "_external").exists()
 
 
+class TestWorktreeUnpushedCommitBundles:
+    """Root ``wt/`` worktrees are linked worktrees whose objects live in a parent
+    repo the walk never archives; the full tier must bundle their unpushed commits
+    so they survive loss of the checkout (t_7ad1f73d)."""
+
+    @staticmethod
+    def _git(cwd, *argv):
+        import subprocess
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", str(cwd), *argv], check=True,
+                              capture_output=True, text=True, encoding="utf-8",
+                              env=env).stdout.strip()
+
+    def test_unpushed_worktree_commits_are_recoverable_from_archive(self, tmp_path, monkeypatch):
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        parent = tmp_path / "parent"   # stands in for ~/.hermes/.git: never archived
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        (parent / "a.txt").write_text("a\n", encoding="utf-8")
+        self._git(parent, "add", "a.txt")
+        self._git(parent, "commit", "-q", "-m", "base")
+        remote = tmp_path / "remote.git"  # holds only the base commit
+        self._git(tmp_path, "clone", "-q", "--bare", str(parent), str(remote))
+        self._git(parent, "remote", "add", "origin", str(remote))
+        self._git(parent, "fetch", "-q", "origin")
+        # A credential in a remote URL must never reach the archive.
+        self._git(parent, "remote", "add", "mirror", "https://user:s3cret-tok@example.invalid/r.git")
+        dirty = hermes_home / "wt" / "dirty"
+        clean = hermes_home / "wt" / "clean"
+        self._git(parent, "worktree", "add", "-q", "-b", "feat", str(dirty), "main")
+        self._git(parent, "worktree", "add", "-q", "--detach", str(clean), "main")
+        (dirty / "b.txt").write_text("unique\n", encoding="utf-8")
+        self._git(dirty, "add", "b.txt")
+        self._git(dirty, "commit", "-q", "-m", "unpushed work")
+        unique_sha = self._git(dirty, "rev-parse", "HEAD")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / "backup.zip"
+        from hermes_cli.backup import run_backup
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = zf.namelist()
+            assert "wt/dirty/b.txt" in names
+            # A credential in a remote URL must never reach the archive.
+            assert not any(b"s3cret-tok" in zf.read(n) for n in names if n.startswith("wt/"))
+            bundle = tmp_path / "restored.bundle"
+            bundle.write_bytes(zf.read("wt/dirty.git-unpushed.bundle"))
+            meta = json.loads(zf.read("wt/dirty.git-unpushed.json"))
+        # A worktree with nothing unpushed gets no bundle.
+        assert [n for n in names if n.endswith(".bundle")] == ["wt/dirty.git-unpushed.bundle"]
+        assert meta["commits"] == 1 and meta["head"] == unique_sha
+        assert meta["branch"] == "refs/heads/feat"
+        assert meta["gitdir"].startswith("gitdir: " + str(parent))
+        assert meta["remotes"] == {"origin": str(remote),
+                                   "mirror": "https://example.invalid/r.git"}
+
+        # Lose the parent repo and worktree entirely; recover from the archive alone.
+        _sh.rmtree(parent)
+        _sh.rmtree(dirty)
+        fresh = tmp_path / "fresh"
+        self._git(tmp_path, "clone", "-q", str(remote), str(fresh))
+        self._git(fresh, "fetch", "-q", str(bundle), "refs/heads/feat:recovered")
+        assert self._git(fresh, "rev-parse", "recovered") == unique_sha
+        assert self._git(fresh, "show", "recovered:b.txt") == "unique"

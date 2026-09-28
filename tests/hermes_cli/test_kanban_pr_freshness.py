@@ -195,7 +195,25 @@ def test_e2e_green_slice_armed_milestone_not(board, monkeypatch):
     _use_gh(monkeypatch, FakeGh(), armed)
     with kb.connect() as conn:
         tid, run = _claimed(conn)
-        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}", expected_run_id=run)
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                metadata={"pr_url": PR_URL}, expected_run_id=run)
         mid, mrun = _claimed(conn, title="[milestone] big thing")
-        assert kb.complete_task(conn, mid, summary=f"done {PR_URL}", expected_run_id=mrun)
+        assert kb.complete_task(conn, mid, summary=f"done {PR_URL}",
+                                metadata={"pr_url": PR_URL}, expected_run_id=mrun)
     assert armed == [(REPO, 5, HEAD, tid)]
+
+
+def test_e2e_pr_only_mentioned_in_prose_is_routed_but_never_armed(board, monkeypatch):
+    """FleetReview #1234: a green fleet PR named only in summary prose (context,
+    not this card's handoff) routes the card to review but is NOT handed to
+    fleet-merge.sh. Only metadata.pr_url / --survivor-pr authorize arming."""
+    armed = []
+    _use_gh(monkeypatch, FakeGh(), armed)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.complete_task(conn, tid, summary=f"background: see {PR_URL}",
+                                expected_run_id=run)
+        assert _status(conn, tid) == "review"
+        meta = kb.latest_run(conn, tid).metadata
+        assert "not armed" in meta["handoff_freshness"]["prs"]["o/r#5"]["automerge"]
+    assert armed == []

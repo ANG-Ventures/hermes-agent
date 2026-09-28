@@ -152,7 +152,8 @@ def provider_quota_state(
     now = time.time() if now is None else now
 
     observed_at = _coerce_epoch(account.get("observed_at"))
-    if observed_at is not None and (now - observed_at) > MAX_OBSERVATION_AGE_SECONDS:
+    # No provable observation time is not evidence: fail open like a stale one.
+    if observed_at is None or (now - observed_at) > MAX_OBSERVATION_AGE_SECONDS:
         return QuotaState(eligible=True)
 
     for window in account.get("windows") or []:

@@ -15,8 +15,10 @@ auth-time substitution instead of running a pinned card on another lane.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+from types import SimpleNamespace
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -381,6 +383,143 @@ def _refuse_live(task_id, run_id, event_id, reason, target) -> None:
     })
 
 
+def _coalesce_live_events(task, rows):
+    """Fold every pending ``route_changed`` event into one requested change.
+
+    Returns ``(touch_model, touch_effort, model, provider, effort)``. Each
+    event only asks for the fields it wrote (``touch_model`` /
+    ``touch_effort``), and the value is the one THAT live write set (its
+    payload snapshot), the latest pending event per field winning. A card
+    field written without ``--live`` therefore never goes live on the back of
+    an unrelated live event. Events without the touch flags (hand-written /
+    pre-flag rows) fall back to the card row for both fields.
+    """
+    from hermes_cli.kanban_provider_health import model_override
+
+    touch_model = touch_effort = False
+    model_pair = (task.model_override, task.provider_override)
+    effort = task.reasoning_effort
+    for row in rows:
+        try:
+            payload = json.loads(row[1] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if "touch_model" not in payload and "touch_effort" not in payload:
+            touch_model = touch_effort = True
+            model_pair = (task.model_override, task.provider_override)
+            effort = task.reasoning_effort
+            continue
+        if payload.get("touch_model"):
+            touch_model = True
+            model_pair = (payload.get("model"), payload.get("provider"))
+        if payload.get("touch_effort"):
+            touch_effort = True
+            effort = payload.get("reasoning_effort")
+    model, provider = (None, None)
+    if touch_model and model_pair[0]:
+        model, provider = model_override(SimpleNamespace(
+            model_override=model_pair[0], provider_override=model_pair[1],
+        ))
+    return touch_model, touch_effort, model, provider, (effort if touch_effort else None)
+
+
+def mark_live_route_unsupported(agent, *, reason: str) -> None:
+    """Record that this worker's runtime cannot switch routes in place.
+
+    The ``codex_app_server`` runtime hands the whole turn to a subprocess and
+    never reaches the loop-boundary poll, so a ``set-model --live`` would be
+    accepted and never applied. The run-scoped marker makes the write side
+    stop promising a live switch for this run (the write lands as
+    next-dispatch), and any live event already pending is refused on the
+    board rather than silently dropped. Never raises.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id or not _is_owning_worker() or not _bound_live_agent(agent):
+        return
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or 0) or None
+    except (TypeError, ValueError):
+        run_id = None
+    if run_id is None:
+        return
+    if not _write_live_unsupported_marker(task_id, run_id, reason):
+        _start_marker_retry(task_id, run_id, reason)
+
+
+# Backoff (seconds) for re-writing a marker whose first write failed; the
+# last delay repeats until the write lands or the process exits.
+_MARKER_RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+def _start_marker_retry(task_id: str, run_id: int, reason: str) -> None:
+    """Keep retrying a failed ``route_live_unsupported`` write in the background.
+
+    The app-server turn runs for the rest of the run with no loop boundary, so
+    this is the marker's only other chance. Until it lands the write side may
+    still accept a ``--live`` write; the marker's pending sweep refuses any
+    such event on the board once the write succeeds. One thread per process.
+    """
+    import threading
+
+    if _live_state.get("marker_retry") is not None:
+        return
+
+    def _retry() -> None:
+        attempt = 0
+        while True:
+            delay = _MARKER_RETRY_DELAYS[min(attempt, len(_MARKER_RETRY_DELAYS) - 1)]
+            attempt += 1
+            threading.Event().wait(delay)
+            if _write_live_unsupported_marker(task_id, run_id, reason):
+                logger.warning(
+                    "PHASE=kanban_live_route_unsupported_marked task=%s run=%s attempt=%s",
+                    task_id, run_id, attempt,
+                )
+                return
+
+    thread = threading.Thread(target=_retry, name="kanban-live-route-marker", daemon=True)
+    _live_state["marker_retry"] = thread
+    thread.start()
+
+
+def _write_live_unsupported_marker(task_id: str, run_id: int, reason: str) -> bool:
+    """Write the run's ``route_live_unsupported`` marker; True once it is on the board."""
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                marked = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+                    "AND kind = ? LIMIT 1",
+                    (task_id, run_id, kb.ROUTE_LIVE_UNSUPPORTED_EVENT),
+                ).fetchone()
+                if not marked:
+                    kb._append_event(conn, task_id, kb.ROUTE_LIVE_UNSUPPORTED_EVENT,
+                                     {"reason": reason}, run_id=run_id)
+                pending = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+                    "AND kind = ? AND id > ? ORDER BY id",
+                    (task_id, run_id, kb.ROUTE_CHANGED_EVENT, int(_live_state["cursor"])),
+                ).fetchall()
+                for row in pending:
+                    kb._append_event(conn, task_id, LIVE_ROUTE_SWITCH_REFUSED_EVENT, {
+                        "event_id": int(row[0]), "reason": reason,
+                    }, run_id=run_id)
+                if pending:
+                    _live_state["cursor"] = int(pending[-1][0])
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("kanban live route unsupported mark failed for %s; retrying",
+                       task_id, exc_info=True)
+        return False
+    return True
+
+
 def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None):
     """Apply a pending ``set-model --live`` to this worker; loop-boundary hook.
 
@@ -405,47 +544,56 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
 
         conn = kb.connect()
         try:
-            row = conn.execute(
-                "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
-                "AND kind = ? AND id > ? ORDER BY id DESC LIMIT 1",
+            rows = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = ? AND id > ? ORDER BY id",
                 (task_id, run_id, kb.ROUTE_CHANGED_EVENT, int(_live_state["cursor"])),
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            if not rows:
                 return active_system_prompt
-            event_id = int(row["id"] if hasattr(row, "keys") else row[0])
-            _live_state["cursor"] = event_id
+            event_id = int(rows[-1][0])
             task = kb.get_task(conn, task_id)
             if task is None or task.current_run_id != run_id:
+                _live_state["cursor"] = event_id  # handled: not this run's card
                 return active_system_prompt
-            model, provider = (None, None)
-            if task.model_override:
-                from hermes_cli.kanban_provider_health import model_override
-
-                model, provider = model_override(task)
-            effort = task.reasoning_effort
+            touch_model, touch_effort, model, provider, effort = _coalesce_live_events(task, rows)
             target = {"provider": provider or None, "model": model or None, "effort": effort or None}
-            gate_error = _live_route_gate_error(conn, task, model, provider)
+            gate_error = _live_route_gate_error(conn, task, model, provider) if touch_model else None
         finally:
             conn.close()
     except Exception:
+        # The cursor did NOT move: the pending event(s) are retried at the
+        # next iteration instead of being lost for the rest of this run.
         logger.debug("kanban live route poll failed for %s", task_id, exc_info=True)
         return active_system_prompt
-    if gate_error:
-        _refuse_live(task_id, run_id, event_id, gate_error, target)
-        return active_system_prompt
+    # Every exit below records its outcome (switched / refused / already on
+    # it), so the events are handled from here on.
+    _live_state["cursor"] = event_id
 
     before = _route_snapshot(agent)
     from hermes_constants import parse_reasoning_effort  # noqa: E402
 
     new_reasoning = parse_reasoning_effort(effort) if effort else None
-    route_changes = bool(model) and (
+    # Only the fields a pending live event asked for: a next-dispatch model
+    # write on the card must not ride along with an effort-only live event.
+    route_changes = touch_model and bool(model) and (
         model != (agent.model or "")
         or bool(provider) and provider.strip().lower() != (agent.provider or "").strip().lower()
     )
-    effort_changes = bool(effort) and new_reasoning != getattr(agent, "reasoning_config", None)
+    effort_changes = (
+        touch_effort and bool(effort)
+        and new_reasoning != getattr(agent, "reasoning_config", None)
+    )
+    # The model and effort halves are separate live writes: a refused model
+    # change is recorded on its own and a valid effort change still applies.
+    model_target = dict(target, effort=None) if effort_changes else target
+    if gate_error:
+        _refuse_live(task_id, run_id, event_id, gate_error, model_target)
+        route_changes = False
     if not route_changes and not effort_changes:
         return active_system_prompt  # already on it (e.g. written before spawn)
 
+    prompt_before = refusal = None
     if route_changes:
         try:
             from hermes_cli.model_switch import switch_model as resolve_switch
@@ -461,21 +609,26 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
                 probe_catalog=False,
             )
             if not result.success:
-                _refuse_live(task_id, run_id, event_id, result.error_message or "route did not resolve", target)
-                return active_system_prompt
-            prompt_before = getattr(agent, "_cached_system_prompt", None)
-            extra = {"session_reasoning_config": new_reasoning} if effort else {}
-            agent.switch_model(
-                new_model=result.new_model,
-                new_provider=result.target_provider,
-                api_key=result.api_key,
-                base_url=result.base_url,
-                api_mode=result.api_mode,
-                **extra,
-            )
+                refusal = result.error_message or "route did not resolve"
+            else:
+                prompt_before = getattr(agent, "_cached_system_prompt", None)
+                extra = {"session_reasoning_config": new_reasoning} if touch_effort and effort else {}
+                agent.switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                    **extra,
+                )
         except Exception as exc:  # switch_model rolls the agent back itself
-            _refuse_live(task_id, run_id, event_id, f"{exc.__class__.__name__}: {exc}", target)
-            return active_system_prompt
+            refusal = f"{exc.__class__.__name__}: {exc}"
+        if refusal is not None:
+            _refuse_live(task_id, run_id, event_id, refusal, model_target)
+            if not effort_changes:
+                return active_system_prompt
+            route_changes = False
+    if route_changes:
         # switch_model drops the cached prompt so the NEXT session turn
         # rebuilds it; mid-loop, keep it byte-stable apart from the identity
         # lines (the failover rewrite), which is what the loop is sending.

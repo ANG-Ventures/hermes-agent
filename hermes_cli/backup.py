@@ -8,12 +8,14 @@ Backup and import commands for hermes CLI.
 HERMES_HOME root.
 """
 
+import fnmatch
 import json
 import logging
 import os
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -153,6 +155,32 @@ _EXCLUDED_PARENT_CHILD = (
 # agree on what a board restore needs: the board DBs + metadata, not the scratch.
 _EXCLUDED_PATH_GLOBS = (
     ("kanban", "boards", None, "workspaces"),   # ephemeral per-task scratch checkouts
+)
+
+# ROOT-anchored scratch trees: each entry is a tuple of fnmatch patterns matched
+# against the FIRST path components only, so a same-named dir deeper in the tree
+# (e.g. a skill's own ``worktrees/`` folder) is still backed up.
+#
+# 2026-09-27: the Sunday full tier grew from 1,111,844 files (09-20) to 14,840,610
+# and was still zipping 3.7 h in (113 GB partial). Measured by ``find``: the default
+# board's ``kanban/workspaces`` 7.4M (the ``kanban/boards/*/workspaces`` glob above
+# does not cover the default board, which lives at the root), ``.worktrees/argus``
+# 4.4M, two dead 09-25 ``var/ramscratch-stage-*`` evacuation copies 5.1M and
+# ``var/subvps-stage`` 0.5M. All are regenerable scratch: git checkouts/worktrees
+# created and reaped by the kanban/review runtimes, one-off staging copies, and the
+# sub-VPS rsync stage (its contents are backed up from the boxes by restic).
+#
+# Root ``wt/`` and ``worktrees/`` are deliberately NOT listed (~0.25M files each): they
+# are hand-made operator worktrees, not runtime-reaped. A 2026-09-27 census found 30 of
+# 77 entries holding work that exists nowhere else (dirty tracked edits, untracked
+# evidence/tests, commits on no remote), and Time Machine excludes both trees, so the
+# full tier is their only copy (t_e95deca8).
+_EXCLUDED_ROOT_PATH_GLOBS = (
+    ("kanban", "workspaces"),       # default-board per-task scratch workspaces
+    ("kanban", "worktrees"),        # default-board per-task git worktrees
+    (".worktrees",),                # review/verifier worktrees (argus, per-task)
+    ("var", "ramscratch-stage-*"),  # RAM-disk evacuation staging copies
+    ("var", "subvps-stage"),        # sub-VPS rsync staging mount (restic-covered)
 )
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
@@ -495,6 +523,11 @@ def _matches_path_glob(parts: tuple[str, ...]) -> bool:
     ancestor-only discipline used for _EXCLUDED_DIR_PREFIXES.
     """
     ancestors = parts[:-1]
+    for pattern in _EXCLUDED_ROOT_PATH_GLOBS:
+        if len(ancestors) >= len(pattern) and all(
+            fnmatch.fnmatchcase(ancestors[j], pat) for j, pat in enumerate(pattern)
+        ):
+            return True
     for pattern in _EXCLUDED_PATH_GLOBS:
         n = len(pattern)
         for i in range(len(ancestors) - n + 1):
@@ -1030,6 +1063,117 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
 # Backup
 # ---------------------------------------------------------------------------
 
+
+# Root operator worktree trees whose unpushed commits the full tier must carry.
+# Their ``.git`` entry is only a ``gitdir:`` pointer into a parent repository
+# (``~/.hermes/.git`` or the root ``hermes-agent`` checkout), and both ``.git``
+# and the root ``hermes-agent`` repo are pruned from the walk, so the checked-out
+# files alone cannot recover commits that exist on no remote (t_7ad1f73d). For each
+# linked worktree with such commits the archive gets a ``git bundle`` of them plus a
+# JSON sidecar naming the source repo (the bundle's prerequisites live there).
+_WORKTREE_BUNDLE_ROOTS = ("wt", "worktrees")
+_WORKTREE_BUNDLE_SUFFIX = ".git-unpushed.bundle"
+_WORKTREE_BUNDLE_META_SUFFIX = ".git-unpushed.json"  # source repo, branch, remotes
+_WORKTREE_GIT_TIMEOUT_S = 300
+
+
+def _worktree_git(worktree: Path, *argv: str) -> "subprocess.CompletedProcess[str]":
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(
+        ["git", "-C", str(worktree), *argv],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_WORKTREE_GIT_TIMEOUT_S,
+        env=env,
+        check=False,
+    )
+
+
+def _iter_bundle_worktrees(root: Path) -> List[Path]:
+    """Linked git worktrees (``.git`` is a pointer FILE) directly under the roots."""
+    found: List[Path] = []
+    for top in _WORKTREE_BUNDLE_ROOTS:
+        base = root / top
+        if base.is_symlink() or not base.is_dir():
+            continue
+        for child in sorted(base.iterdir()):
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if (child / ".git").is_file():
+                found.append(child)
+    return found
+
+
+def _bundle_worktree_unpushed(worktree: Path, dest: Path) -> tuple[Optional[int], str]:
+    """Write a bundle of commits reachable from HEAD but from no remote-tracking ref.
+
+    Returns ``(count, "")`` where count 0 means nothing to bundle (no file written),
+    or ``(None, reason)`` when git failed, so the caller reports it instead of
+    silently shipping an archive without the commits.
+    """
+    try:
+        head = _worktree_git(worktree, "rev-parse", "--symbolic-full-name", "HEAD")
+        if head.returncode != 0:
+            return None, (head.stderr or head.stdout).strip() or "rev-parse HEAD failed"
+        count = _worktree_git(worktree, "rev-list", "--count", "HEAD", "--not", "--remotes")
+        if count.returncode != 0:
+            return None, (count.stderr or count.stdout).strip() or "rev-list failed"
+        n = int(count.stdout.strip() or "0")
+        if n == 0:
+            return 0, ""
+        refs = ["HEAD"]
+        ref = head.stdout.strip()
+        if ref.startswith("refs/heads/"):
+            refs.append(ref)  # keep the local branch name, not just a detached HEAD
+        made = _worktree_git(worktree, "bundle", "create", str(dest), *refs, "--not", "--remotes")
+        if made.returncode != 0 or not dest.is_file():
+            return None, (made.stderr or made.stdout).strip() or "git bundle create failed"
+        return n, ""
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+
+
+def _worktree_bundle_meta(worktree: Path, commits: int) -> Dict[str, Any]:
+    """Which repo a bundle belongs to: the bundle's prerequisites live there.
+
+    Operator worktrees point into many different parent repos, and the ``.git``
+    pointer file itself is not archived. Remote URLs are recorded without any
+    ``user:token@`` userinfo so no credential lands in the backup.
+    """
+    meta: Dict[str, Any] = {"commits": commits}
+    try:
+        meta["gitdir"] = (worktree / ".git").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        pass
+    for key, argv in (
+        ("head", ("rev-parse", "HEAD")),
+        ("branch", ("rev-parse", "--symbolic-full-name", "HEAD")),
+    ):
+        try:
+            res = _worktree_git(worktree, *argv)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if res.returncode == 0:
+            meta[key] = res.stdout.strip()
+    remotes: Dict[str, str] = {}
+    try:
+        res = _worktree_git(worktree, "remote", "-v")
+        for line in res.stdout.splitlines() if res.returncode == 0 else []:
+            parts = line.split()
+            if len(parts) >= 2:
+                url = parts[1]
+                scheme, sep, rest = url.partition("://")
+                if sep and "@" in rest.split("/", 1)[0]:
+                    url = scheme + sep + rest.split("@", 1)[1]
+                remotes.setdefault(parts[0], url)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    meta["remotes"] = remotes
+    return meta
+
+
 def run_backup(args) -> None:
     """Create a zip backup of the Hermes home directory."""
     hermes_root = get_default_hermes_root()
@@ -1165,6 +1309,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 
     total_bytes = 0
     errors = []
+    worktree_bundles: list[tuple[str, int]] = []  # (arcname, unpushed commit count)
     t0 = time.monotonic()
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
@@ -1217,6 +1362,33 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                 errors.append(f"  {arcname}: {exc}")
                 continue
 
+        # Unpushed commits of root operator worktrees (see _WORKTREE_BUNDLE_ROOTS).
+        # Staged next to the output zip (same filesystem), deleted once written.
+        for worktree in _iter_bundle_worktrees(hermes_root):
+            rel_wt = worktree.relative_to(hermes_root)
+            arcname = str(rel_wt) + _WORKTREE_BUNDLE_SUFFIX
+            with tempfile.NamedTemporaryFile(
+                suffix=".bundle", delete=False, dir=str(out_path.parent)
+            ) as tmp:
+                tmp_bundle = Path(tmp.name)
+            tmp_bundle.unlink(missing_ok=True)  # git refuses to overwrite
+            try:
+                commits, reason = _bundle_worktree_unpushed(worktree, tmp_bundle)
+                if commits is None:
+                    errors.append(f"  {rel_wt}: unpushed-commit bundle failed: {reason}")
+                elif commits:
+                    zf.write(tmp_bundle, arcname=arcname)
+                    total_bytes += tmp_bundle.stat().st_size
+                    zf.writestr(
+                        str(rel_wt) + _WORKTREE_BUNDLE_META_SUFFIX,
+                        json.dumps(_worktree_bundle_meta(worktree, commits), indent=2),
+                    )
+                    worktree_bundles.append((arcname, commits))
+            except (PermissionError, OSError, ValueError) as exc:
+                errors.append(f"  {arcname}: {exc}")
+            finally:
+                tmp_bundle.unlink(missing_ok=True)
+
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
     logger.info(
@@ -1242,6 +1414,14 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         print(
             f"\n  Included {len(external_to_add)} memory-provider file(s) "
             f"stored outside {display_hermes_home()}."
+        )
+
+    if worktree_bundles:
+        print(
+            f"\n  Included {len(worktree_bundles)} worktree bundle(s) of unpushed "
+            f"commits ({sum(n for _, n in worktree_bundles)} commits). Recover with "
+            "`git fetch <file>.git-unpushed.bundle HEAD:recovered` in a clone of the repo "
+            "named in the matching .git-unpushed.json."
         )
 
     if skipped_external:

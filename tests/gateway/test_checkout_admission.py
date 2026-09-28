@@ -323,7 +323,7 @@ def test_corrupt_hold_fails_closed_everywhere(store):
     assert ca.evaluate(store)["verdict"] == UNKNOWN
     with pytest.raises(HoldUnreadable):
         store.release("op")  # cannot open what it cannot read
-    store.hold("op", [GW], mode="freeze")  # operator re-holds: still closed
+    store.hold("op", [GW], mode="freeze", recover_unreadable=True)  # operator re-holds: still closed
     with pytest.raises(AdmissionRefused):
         g.admit("x")
 
@@ -689,3 +689,99 @@ def test_real_websocket_existing_connection_is_gated(store, serve_gate):
         assert call(conn, 2)["error"]["code"] == 5075
         store.release("op")
         assert call(conn, 3)["error"]["code"] != 5075
+
+
+# ------------------------------------ FleetReview #1035 (C4 backfill 2026-09-27)
+def test_unreadable_hold_cannot_be_taken_over_without_explicit_recovery(store):
+    """#1035 checkout_admission.py:229: an unreadable hold lost its owner; a
+    plain re-hold by anyone (who could then release it) must be refused."""
+    store.hold("owner-a", [GW])
+    store.hold_path.write_text("garbage", encoding="utf-8")
+    with pytest.raises(HoldConflict):
+        store.hold("intruder", [GW])
+    with pytest.raises(HoldUnreadable):
+        store.release("intruder")
+    state = store.hold("op", [GW], recover_unreadable=True)  # explicit override
+    assert store.read_hold().owner == "op" and state.owner == "op"
+    assert list(store.directory.glob("hold.unreadable.*.json"))  # kept for audit
+
+
+def test_recover_unreadable_keeps_hold_closed_if_replacement_write_fails(store, monkeypatch):
+    """#1354 checkout_admission.py:242: --recover-unreadable must not move the
+    unreadable hold away before its replacement is installed; a failed write
+    must leave hold.json in place (admission still refused), not absent."""
+    store.hold("owner-a", [GW])
+    store.hold_path.write_text("garbage", encoding="utf-8")
+
+    def boom(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ca, "_atomic_write_json", boom)
+    with pytest.raises(OSError):
+        store.hold("op", [GW], recover_unreadable=True)
+    assert store.hold_path.read_text(encoding="utf-8") == "garbage"
+    with pytest.raises(HoldUnreadable):
+        store.read_hold()  # still fail-closed, never None (open)
+    assert list(store.directory.glob("hold.unreadable.*.json"))  # audit copy
+
+
+def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
+    """#1035 checkout_admission.py:419: a busy and an idle process publishing
+    under ONE consumer name must not let the idle snapshot read QUIESCENT."""
+    store.hold("op", [GW], mode="freeze")
+    busy = _gate(store, GW)
+    busy.pid = os.getppid()  # a second live process on this host
+    busy.instance = "other-process"
+    busy._tickets["t"] = ca.Ticket("t", "turn", False, time.time(), busy)
+    busy.publish()
+    idle = _gate(store, GW)
+    idle.publish()
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
+    idle.publish()  # our own back-to-back write must not clear the flag
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN
+    assert "shared" in rep["consumers"][0]["why"]
+
+
+def test_unreadable_unexpected_consumer_record_is_unknown(store):
+    """#1035 checkout_admission.py:601: a corrupt record for a consumer the
+    operator did not list may belong to a live consumer -> UNKNOWN, not skipped."""
+    _held_and_acked(store, (GW,))
+    assert ca.evaluate(store)["verdict"] == QUIESCENT  # control
+    store.consumer_path(GW2).parent.mkdir(parents=True, exist_ok=True)
+    store.consumer_path(GW2).write_text("{not json", encoding="utf-8")
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN
+    assert any(r["consumer"] == GW2 for r in rep["consumers"])
+
+
+def test_stdio_server_installs_the_admission_gate(store, monkeypatch):
+    """#1035 tui_gateway/server.py:3156: the stdio entrypoint never runs the
+    serve lifespan; it must still refuse prompt RPCs under a hold."""
+    import io
+    import sys
+
+    import tui_gateway.entry as entry
+    import tui_gateway.server as server
+
+    gate = _gate(store, SERVE)
+    monkeypatch.setattr(ca, "process_gate", lambda kind: gate if kind == "serve" else None)
+    monkeypatch.setattr(server, "_checkout_gate_ref", None)
+    monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+    monkeypatch.setattr(server, "_start_backend_heartbeat_refresher", lambda: None)
+    monkeypatch.setattr(server, "_schedule_startup_orphan_sweep", lambda: None)
+    monkeypatch.setattr(server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(entry, "resolve_skin", lambda: None)
+    monkeypatch.setattr(entry, "handle_spurious_eof", lambda *a: False)
+    monkeypatch.setattr("hermes_cli.model_switch.prewarm_picker_cache_async", lambda: None)
+    out = []
+    monkeypatch.setattr(entry, "write_json", lambda obj: out.append(obj) or True)
+    store.hold("op", [SERVE])
+    req = {"jsonrpc": "2.0", "id": 7, "method": "prompt.submit", "params": {"session_id": "nope"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(req) + "\n"))
+
+    entry.main()
+
+    (resp,) = [o for o in out if o.get("id") == 7]
+    assert resp["error"]["code"] == 5075
