@@ -245,3 +245,44 @@ def test_dispatch_rung_off_the_card_pin_keeps_auth_fallback(board, monkeypatch):
     assert cli.provider == "claude-bpr"
     assert _events(tid, "worker_route_pin_refused") == []
     assert [r for r, _ in _events(tid, "worker_route_substituted")] == [run_id]
+
+
+# --- t_1d2ba891: a model-only card pin also constrains the auth-time fallback
+
+def _model_only_pin(tid, model="gpt-6-sol-900k"):
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET model_override=?, provider_override=NULL WHERE id=?",
+                     (model, tid))
+        conn.commit()
+
+
+def test_model_only_pin_refuses_auth_fallback_to_another_model(board, monkeypatch):
+    tid, run_id = board
+    _model_only_pin(tid)
+    calls = []
+    _resolver(monkeypatch, fail={"claude-app"}, calls=calls)
+    cli = _CLI(None)  # spawned ``-m gpt-6-sol-900k`` with no --provider
+
+    assert cli._ensure_runtime_credentials() is False
+    assert calls == ["claude-app"]  # the opus fallback was never resolved
+    assert cli.model == "gpt-6-sol-900k"
+    refused = _events(tid, "worker_route_pin_refused")
+    assert [r for r, _ in refused] == [run_id]
+    assert refused[0][1]["model"] == "gpt-6-sol-900k"
+    assert refused[0][1]["to_model"] == "claude-opus-5-5"
+    assert _events(tid, "worker_route_substituted") == []
+
+
+def test_model_only_pin_keeps_auth_fallback_to_the_same_model(board, monkeypatch):
+    tid, run_id = board
+    _model_only_pin(tid)
+    calls = []
+    _resolver(monkeypatch, fail={"claude-app"}, calls=calls)
+    cli = _CLI(None)
+    cli._fallback_model = [{"provider": "claude-bpr", "model": "claude-opus-5-5"},
+                           {"provider": "openai-codex", "model": "gpt-6-sol-900k"}]
+
+    assert cli._ensure_runtime_credentials() is True
+    assert calls == ["claude-app", "openai-codex"]
+    assert (cli.requested_provider, cli.model) == ("openai-codex", "gpt-6-sol-900k")
+    assert [r for r, _ in _events(tid, "worker_route_substituted")] == [run_id]

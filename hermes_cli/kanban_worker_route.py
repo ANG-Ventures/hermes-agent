@@ -619,6 +619,12 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
     if gate_error:
         _refuse_live(task_id, run_id, event_id, gate_error, model_target)
         route_changes = False
+    elif touch_model and model and not route_changes:
+        # A live pin onto the route already serving switches nothing but
+        # still pins this run from here on.
+        _card_pin_cache[task_id] = (
+            model.strip() or None, (provider or "").strip().lower() or None,
+        )
     if not route_changes and not effort_changes:
         return active_system_prompt  # already on it (e.g. written before spawn)
 
