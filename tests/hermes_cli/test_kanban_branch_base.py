@@ -252,8 +252,10 @@ def _card(conn, ws: Path) -> tuple[str, int]:
 
 
 def test_e2e_merged_survivor_pr_completes_without_override(board, origin, tmp_path, monkeypatch):
-    from hermes_cli import kanban_open_pr as op
+    from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
     monkeypatch.setattr(op, "_default_query", _states(n7="MERGED"))
+    # survivor capture/remote verification is a later, separate gate (network)
+    monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
     # multi-commit squash: git cherry cannot match it, only the PR state can
     work, _ = _squash_merged_branch(origin, tmp_path, n_commits=2)
     with kb.connect() as conn:
@@ -261,9 +263,7 @@ def test_e2e_merged_survivor_pr_completes_without_override(board, origin, tmp_pa
         with pytest.raises(bb.StaleBaseError):  # same checkout, no merged PR named
             kb.complete_task(conn, tid, summary="done", expected_run_id=run)
         assert kb.complete_task(conn, tid, summary="done", expected_run_id=run,
-                                survivor_pr="ANG-Ventures/hermes-agent#7",
-                                # fixture PR cannot name this card (survivor binding is out of scope)
-                                survivor_unbound=True)
+                                survivor_pr="ANG-Ventures/hermes-agent#7")
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "done"
         ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
                           (tid, "base_guard_survivor_merged")).fetchone()
