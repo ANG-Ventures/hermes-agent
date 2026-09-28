@@ -70,6 +70,18 @@ def _make_agent(session_db, response):
     return agent
 
 
+@pytest.fixture(autouse=True)
+def _no_background_title_thread(monkeypatch):
+    """Keep the instant title, skip the daemon ``auto-title`` model upgrade.
+
+    ``run_conversation()`` on a real SessionDB forks a daemon thread that
+    resolves an auxiliary provider and ``_emit_warning``s to stdout. It outlives
+    the test, and its write raced pytest's capture teardown into a SIGSEGV on
+    main CI (run 36477804956, slice 3). Titles are not under test here.
+    """
+    monkeypatch.setattr("agent.title_generator._derived_only_platform", lambda _platform: True)
+
+
 @pytest.fixture
 def real_session_db(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
