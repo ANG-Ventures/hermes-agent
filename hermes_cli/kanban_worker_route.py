@@ -173,24 +173,24 @@ def _is_sibling_pool_same_model(pinned, to_provider, from_model, to_model) -> bo
     return bool(src) and src == str(to_model or "").strip().lower()
 
 
-def card_pinned_provider() -> Optional[str]:
-    """The provider pinned on THIS worker's card row, else None.
+def card_pinned_route() -> tuple:
+    """``(model, provider)`` pinned on THIS worker's card row, else ``(None, None)``.
 
     Only a card pin (``hermes kanban set-model``, persisted in
     ``tasks.model_override`` / ``provider_override``) counts. A board-wide
     lane override and a capped-pool dispatch fallback rung ALSO reach the
     worker as ``--provider``, but the dispatcher applies them to the in-memory
     claim only and never writes them to the card, so reading the row is what
-    tells a card pin apart from a lane default. Fails open (None) when the
-    board cannot be read: an unreadable pin must not strand a worker without
-    its fallback chain.
+    tells a card pin apart from a lane default. Fails open ``(None, None)``
+    when the board cannot be read: an unreadable pin must not strand a worker
+    without its fallback chain.
     """
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if not task_id or not _is_owning_worker():
-        return None
+        return None, None
     if task_id in _card_pin_cache:
         return _card_pin_cache[task_id]
-    provider = None
+    model = provider = None
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_provider_health import model_override
@@ -201,13 +201,19 @@ def card_pinned_provider() -> Optional[str]:
         finally:
             conn.close()
         if task is not None:
-            _model, provider = model_override(task)
+            model, provider = model_override(task)
     except Exception:
         logger.debug("kanban card pin lookup failed for %s", task_id, exc_info=True)
-        return None
+        return None, None
     provider = (provider or "").strip().lower() or None
-    _card_pin_cache[task_id] = provider
-    return provider
+    model = (model or "").strip() or None
+    _card_pin_cache[task_id] = (model, provider)
+    return model, provider
+
+
+def card_pinned_provider() -> Optional[str]:
+    """The provider pinned on THIS worker's card row, else None."""
+    return card_pinned_route()[1]
 
 
 def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
@@ -215,8 +221,9 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
 
     Refuses only when (a) the card pins a provider, (b) this run is actually
     serving on that pin (a dispatch fallback rung may have moved it), and
-    (c) the fallback target is a different provider. Same-provider entries
-    (another model / key on the pinned lane) stay allowed, and so does the
+    (c) the fallback target is a different provider OR, when the pin names a
+    model, a different model (t_1d2ba891). Same-provider entries for the
+    pinned model (another key on the lane) stay allowed, and so does the
     sibling Claude pool for the identical model when the pin is a pool face
     (claude-bpr <-> claude-apr); that swap is recorded by the normal
     ``worker_route_substituted`` (stage=runtime) event. The first refusal
@@ -224,7 +231,7 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     agent so a failed result exits retry-preserving
     (:func:`apply_pin_refusal_to_result`).
     """
-    pinned = card_pinned_provider()
+    pinned_model, pinned = card_pinned_route()
     if not pinned:
         return False
     primary = getattr(agent, "_primary_runtime", None)
@@ -232,10 +239,14 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     serving = str(primary.get("provider") or getattr(agent, "provider", "") or "").strip().lower()
     if serving != pinned:
         return False
-    if str(to_provider or "").strip().lower() == pinned:
+    # A pin with a model pins the MODEL too (t_1d2ba891): claude-bpr's chain
+    # swapped a claude-fable-5-1 pin onto claude-opus-5-5 on the same lane.
+    model_ok = (not pinned_model
+                or str(to_model or "").strip().lower() == pinned_model.lower())
+    if str(to_provider or "").strip().lower() == pinned and model_ok:
         return False
     serving_model = primary.get("model") or getattr(agent, "model", None)
-    if _is_sibling_pool_same_model(pinned, to_provider, serving_model, to_model):
+    if model_ok and _is_sibling_pool_same_model(pinned, to_provider, serving_model, to_model):
         return False
     reason_value = str(getattr(reason, "value", reason) or "") or None
     if not isinstance(getattr(agent, "_kanban_pin_refused_failover", None), dict):
