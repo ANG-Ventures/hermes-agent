@@ -1544,10 +1544,8 @@ def _recorded_base(repo, recorded, published, base):
     (HEAD at dispatch) is the fork point. It is used only when it is
     ``base`` or a descendant of it, an ancestor of HEAD, and contained in the
     local remote-tracking ref of a branch the durable remote still advertises,
-    AND that remote confirms it holds the commit (protocol-v2
-    ``--negotiate-only``; a server acks objects it stores, which covers the
-    normal case of the fork point still on the live branch). Otherwise
-    nothing changes.
+    AND it is reachable from that branch's LIVE tip (see
+    `_reachable_from_live`). Otherwise nothing changes.
     """
     if not isinstance(recorded, str) or not _OBJECT_ID.fullmatch(recorded) or recorded == base:
         return base
@@ -1569,21 +1567,59 @@ def _recorded_base(repo, recorded, published, base):
                                  check=False).returncode:
         return base
     # A tracking ref is only what this checkout LAST fetched; the live branch
-    # may since have been force-pushed to unrelated history (FleetReview P1 on
-    # #1449). Ask the remote itself: protocol-v2 negotiation acknowledges the
-    # tip only if the server holds that commit, and transfers no objects.
-    # One network call per matched remote (normally one), never per head.
-    remotes = sorted({ref["remote"] for ref in published
-                      if f"refs/remotes/{ref['remote']}/{ref['branch']}" in matched})
-    for remote in remotes:
-        try:
-            acked = _git(repo, "-c", "protocol.version=2", "fetch", "--negotiate-only",
-                         f"--negotiation-tip={recorded}", remote, check=False)
-        except subprocess.TimeoutExpired:
-            continue
-        if acked.returncode == 0 and recorded in acked.stdout.decode("utf-8", "replace").split():
+    # may since have been force-pushed to unrelated history, and a server may
+    # still STORE the orphaned commit until gc (FleetReview P1s on #1449), so
+    # neither the tracking ref nor object presence proves a fresh clone of the
+    # branch can reach it. Prove reachability from the live tip instead.
+    # Network only here, after every cheap local check passed; one fetch per
+    # matched branch (normally one), never per published head.
+    for ref in sorted(matched):
+        remote, _, branch = ref.removeprefix("refs/remotes/").partition("/")
+        if _reachable_from_live(repo, remote, branch, recorded):
             return recorded
     return base
+
+
+#: Budget for proving the recorded base against a live branch. A timeout just
+#: keeps the older published base: a larger patch, never a lost one.
+_LIVE_BASE_TIMEOUT = 120
+
+
+def _reachable_from_live(repo, remote, branch, sha):
+    """True only if ``sha`` is an ancestor of ``remote``'s LIVE ``branch`` tip.
+
+    Fetches the branch into a throwaway bare repository that borrows
+    ``repo``'s objects (the `_content_advisory` pattern), so the workspace's
+    own refs and object store are never written. A ref at ``sha`` in the
+    probe makes negotiation advertise it as a ``have``, so when ``sha`` is on
+    the branch the server sends only ``sha..tip``, not the whole history.
+    """
+    objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects",
+                   check=False)
+    url = _git(repo, "remote", "get-url", remote, check=False)
+    if objects.returncode or url.returncode:
+        return False
+    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.decode().strip())
+    with tempfile.TemporaryDirectory(prefix="kanban-base-") as tmp:
+        probe = Path(tmp) / "probe.git"
+        try:
+            _git(repo, "init", "-q", "--bare", str(probe))
+            if _git(probe, "update-ref", "refs/heads/recorded", sha, env=env,
+                    check=False).returncode:
+                return False
+            fetched = _git(
+                probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
+                "fetch", "-q", "--no-tags", "candidate",
+                f"+refs/heads/{branch}:refs/heads/candidate",
+                env=dict(env, KANBAN_FETCH_URL=url.stdout.decode().strip()),
+                check=False, timeout=_LIVE_BASE_TIMEOUT,
+            )
+            if fetched.returncode:
+                return False
+            return _git(probe, "merge-base", "--is-ancestor", sha, "refs/heads/candidate",
+                        env=env, check=False).returncode == 0
+        except (subprocess.TimeoutExpired, SurvivorUnavailable, OSError):
+            return False
 
 
 def _snapshot(repo, base, prefix, *, irreversible_delete=False):

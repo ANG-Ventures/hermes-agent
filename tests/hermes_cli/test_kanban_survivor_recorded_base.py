@@ -39,7 +39,7 @@ def commit(repo, name, text):
     return git(repo, "rev-parse", "HEAD")
 
 
-def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False):
+def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False, prune=True):
     """old -> fork (recorded base) -> work; remote main has moved past `fork`."""
     tid = kb.create_task(conn, title="implement fixture")
     ws = kb.resolve_workspace(kb.get_task(conn, tid))
@@ -72,7 +72,7 @@ def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False)
         git(other, "rm", "-rq", "--cached", ".")
     commit(other, "later.txt", "later main\n")
     git(other, "push", "-f", "origin", "HEAD:refs/heads/main")
-    if rewrite_main:
+    if rewrite_main and prune:
         git(remote, "reflog", "expire", "--expire=now", "--all")
         git(remote, "gc", "-q", "--prune=now")
     work = commit(ws, "card.py", "card = True\n")
@@ -112,11 +112,16 @@ def test_unpublished_recorded_base_is_not_trusted(board, tmp_path):
     assert "diff --git a/history.txt b/history.txt" in data
 
 
-def test_recorded_base_the_remote_no_longer_holds_is_not_trusted(board, tmp_path):
+@pytest.mark.parametrize("prune", [True, False], ids=["pruned", "orphan-still-stored"])
+def test_recorded_base_off_the_live_branch_is_not_trusted(board, tmp_path, prune):
     # The local tracking ref still contains the recorded base, but the live
-    # branch was force-pushed away and the remote pruned it: a recoverer could
-    # not fetch it, so the patch must stay on a base the remote still serves.
-    tid, ws, old, fork, work = stale_base_workspace(board, tmp_path, rewrite_main=True)
+    # branch was force-pushed to unrelated history. Pruned or not (a server
+    # keeps orphaned objects until gc), a fresh clone of the branch cannot
+    # reach it, so the patch must stay on a base the live branch serves.
+    tid, ws, old, fork, work = stale_base_workspace(board, tmp_path, rewrite_main=True,
+                                                    prune=prune)
+    if not prune:
+        assert git(tmp_path / "remote.git", "cat-file", "-t", fork) == "commit"
     assert git(ws, "merge-base", "--is-ancestor", fork, "refs/remotes/origin/main") == ""
     assert kb.complete_task(board, tid, metadata={"changed_files": ["card.py"]})
     data = patch_of(board, tid)
