@@ -251,8 +251,40 @@ def test_gateway_sessionless_caller_does_not_inherit_env_session(monkeypatch):
     import sys
     import types
 
-    monkeypatch.setitem(sys.modules, "gateway.run", types.ModuleType("gateway.run"))
+    fake_run = types.ModuleType("gateway.run")
+    runner = object()
+    fake_run._gateway_runner_ref = lambda: runner  # a live GatewayRunner
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
     # A fresh context: no per-turn session bound, no explicit slash session.
+    assert contextvars.Context().run(kc._caller_session_id) is None
+
+
+def test_cli_that_merely_imported_gateway_run_is_not_the_gateway(monkeypatch):
+    """FleetReview 09c07e5eb0a9: gateway.run sets the marker at import time and
+    CLI tools import it lazily. Without a live runner (or the gateway PID being
+    ours) the process is a CLI and its env session is its own."""
+    import os
+    import sys
+    import types
+
+    from gateway import status as gw_status
+    from hermes_cli import kanban as kc
+    from hermes_cli import kanban_db as kdb
+
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260928_000001_cli_own")
+    fake_run = types.ModuleType("gateway.run")
+    fake_run._gateway_runner_ref = lambda: None  # no GatewayRunner here
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
+    monkeypatch.setattr(gw_status, "get_running_pid", lambda *a, **k: None)
+
+    assert kdb._process_is_gateway() is False
+    assert contextvars.Context().run(kc._caller_session_id) == "20260928_000001_cli_own"
+    assert contextvars.Context().run(kdb._event_actor)[1] == "20260928_000001_cli_own"
+
+    # Positive ownership via the gateway PID record counts as the gateway.
+    monkeypatch.setattr(gw_status, "get_running_pid", lambda *a, **k: os.getpid())
+    assert kdb._process_is_gateway() is True
     assert contextvars.Context().run(kc._caller_session_id) is None
 
 

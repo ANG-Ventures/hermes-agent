@@ -5283,6 +5283,35 @@ _EVENT_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
 )
 
 
+def _process_is_gateway() -> bool:
+    """True only when THIS process is the running gateway.
+
+    ``_HERMES_GATEWAY=1`` is inherited by gateway descendants and is also set
+    at import time by ``gateway.run``, which CLI-side code imports lazily
+    (send_message, platform actions, compression, tui_gateway). Neither the
+    marker nor the import proves ownership. Require positive evidence: a live
+    ``GatewayRunner`` (``gateway.run._gateway_runner_ref``), or the gateway PID
+    record naming this process (FleetReview 09c07e5eb0a9).
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return False
+    run_mod = sys.modules.get("gateway.run")
+    if run_mod is None:
+        return False
+    ref = getattr(run_mod, "_gateway_runner_ref", None)
+    try:
+        if callable(ref) and ref() is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        from gateway.status import get_running_pid
+
+        return get_running_pid(cleanup_stale=False) == os.getpid()
+    except Exception:
+        return False
+
+
 def _event_actor() -> tuple[Optional[str], Optional[str]]:
     """``(actor_profile, actor_session_id)`` for a ``task_events`` row.
 
@@ -5294,7 +5323,7 @@ def _event_actor() -> tuple[Optional[str], Optional[str]]:
     if actor is not None:
         return actor.profile, (actor.session_ids[0] if actor.session_ids else None)
     session_id: Optional[str] = None
-    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    in_gateway = _process_is_gateway()
     try:
         from gateway.session_context import resolve_current_session_id
 
