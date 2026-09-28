@@ -240,3 +240,38 @@ def test_ast_guard_notice_self_test_flags_planted_construction(tmp_path):
                        'def other():\n    verb = "Model recovery"\n    return verb\n')
     assert _violations([(planted, "agent/planted.py")]) == [
         "agent/planted.py:2 in announce", "agent/planted.py:4 in other"]
+
+
+# ── recovery rider: "sub" only on relay lanes (Ace 2026-09-28, #kimi-k3) ──────
+def _kimi_recovery_row(**over):
+    row = {"return_branch": "compaction", "seat": None, "to_provider": "cpa", "to_model": "kimi-k3",
+           "from_provider": "claude-bpr", "from_model": "claude-opus-5-5", "since_primary_call_s": None,
+           "expected_warm": False, "fallback_idle_s": 90, "dwell_s": 30 * 60, "dwell_turns": 2,
+           "trigger_class": "quota_session"}
+    row.update(over)
+    return row
+
+
+def test_recovery_rider_no_seat_clause_on_plain_provider():
+    """The real 2026-09-28 13:28 return cpa/kimi-k3 <- Opus rendered "on sub ?" — Kimi has no seats."""
+    r = fp.format_recovery_rider(_kimi_recovery_row())
+    assert "sub" not in r and "?" not in r
+    assert r == ("compaction rewrote the prefix; both caches cold, one full cache write "
+                 "(expected cold), after 30m / 2 turns on Opus")
+
+
+@pytest.mark.parametrize("prov", ["openai-codex", "openrouter", "xai-oauth", "gemini-bridge"])
+def test_recovery_rider_plain_providers_never_say_sub(prov):
+    for branch in ("warm_seat", "fallback_cold", "compaction", "cap_expiry", "fallback_failed"):
+        r = fp.format_recovery_rider(_kimi_recovery_row(return_branch=branch, to_provider=prov))
+        assert "sub" not in r, (prov, branch, r)
+
+
+def test_recovery_rider_relay_lane_lost_seat_says_unknown_in_words():
+    r = fp.format_recovery_rider(_kimi_recovery_row(to_provider="claude-bpr", to_model="claude-opus-5-5"))
+    assert "on sub unknown" in r and "sub ?" not in r
+
+
+def test_recovery_rider_relay_lane_known_seat_unchanged():
+    r = fp.format_recovery_rider(_kimi_recovery_row(to_provider="claude-bpr", seat="sub-vps-6"))
+    assert "on sub-vps-6" in r
