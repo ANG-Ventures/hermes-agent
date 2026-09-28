@@ -1881,6 +1881,19 @@ class CredentialPool:
                     pool_state=entry.to_dict() if entry.source == "device_code" else None,
                 )
                 updated = self._sync_nous_entry_from_auth_store(entry)
+            elif self.provider == "kimi-oauth":
+                # auth.json providers.kimi-oauth is the only authority for the
+                # rotating refresh token. refresh_kimi_oauth_state() re-reads it
+                # under the auth-store lock, so a token another process already
+                # rotated is adopted instead of replaying the spent one.
+                state = auth_mod.refresh_kimi_oauth_state(force=force)
+                updated = replace(
+                    entry,
+                    access_token=state["access_token"],
+                    refresh_token=state.get("refresh_token"),
+                    expires_at_ms=_kimi_state_expires_at_ms(state),
+                    last_refresh=state.get("last_refresh"),
+                )
             else:
                 return entry
         except Exception as exc:
@@ -3005,6 +3018,17 @@ class CredentialPool:
             return entry
 
 
+def _kimi_state_expires_at_ms(state: Dict[str, Any]) -> Optional[int]:
+    """``providers.kimi-oauth.expires_at`` (ISO) as epoch milliseconds, or None."""
+    raw = state.get("expires_at") if isinstance(state, dict) else None
+    if not raw:
+        return None
+    try:
+        return int(datetime.fromisoformat(str(raw)).timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
     matching_indices = []
     for idx, entry in enumerate(entries):
@@ -3431,6 +3455,36 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     )
         except Exception as exc:
             logger.debug("MiniMax OAuth token seed failed: %s", exc)
+
+    elif provider == "kimi-oauth":
+        # Kimi Code membership tokens live in auth.json providers.kimi-oauth
+        # (single authority; the refresh token rotates). Re-seed from it on
+        # every load so a rotation written by the keeper or another process
+        # is adopted, never shadowed by a stale pool copy. No network here.
+        try:
+            from hermes_cli.auth import get_provider_auth_state
+            state = get_provider_auth_state("kimi-oauth")
+            if state and state.get("access_token") and state.get("refresh_token"):
+                source_name = "oauth"
+                if not _is_suppressed(provider, source_name):
+                    active_sources.add(source_name)
+                    changed |= _upsert_entry(
+                        entries,
+                        provider,
+                        source_name,
+                        {
+                            "source": source_name,
+                            "auth_type": AUTH_TYPE_OAUTH,
+                            "access_token": state["access_token"],
+                            "refresh_token": state.get("refresh_token"),
+                            "expires_at_ms": _kimi_state_expires_at_ms(state),
+                            "last_refresh": state.get("last_refresh"),
+                            "base_url": str(state.get("inference_base_url") or "").rstrip("/"),
+                            "label": state.get("label") or "kimi-oauth",
+                        },
+                    )
+        except Exception as exc:
+            logger.debug("Kimi OAuth token seed failed: %s", exc)
 
     elif provider == "openai-codex":
         # Respect user suppression — `hermes auth remove openai-codex` marks

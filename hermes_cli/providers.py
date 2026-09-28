@@ -128,6 +128,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = GuardedDict(__name__, "HERMES_OVERLA
         auth_type="oauth_external",
         base_url_override="https://api.minimax.io/anthropic",
     ),
+    "kimi-oauth": HermesOverlay(
+        transport="anthropic_messages",
+        auth_type="oauth_external",
+        base_url_override="https://api.kimi.com/coding",
+    ),
     "minimax-cn": HermesOverlay(
         transport="anthropic_messages",
         base_url_env_var="MINIMAX_CN_BASE_URL",

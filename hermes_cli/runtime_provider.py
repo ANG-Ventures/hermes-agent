@@ -533,6 +533,13 @@ def _resolve_runtime_from_pool_entry(
         api_mode = "anthropic_messages"
         pconfig = PROVIDER_REGISTRY.get(provider)
         base_url = base_url or (pconfig.inference_base_url if pconfig else "")
+    elif provider == "kimi-oauth":
+        # Kimi Code membership: Anthropic Messages at api.kimi.com/coding.
+        # The static pool token is swapped for a per-request token provider
+        # at client construction (agent_init), like minimax-oauth.
+        api_mode = "anthropic_messages"
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        base_url = base_url or (pconfig.inference_base_url if pconfig else "")
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -2225,6 +2232,23 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "oauth"),
                 "requested_provider": requested_provider,
             }
+
+    if provider == "kimi-oauth":
+        try:
+            from hermes_cli.auth import resolve_kimi_oauth_runtime_credentials
+            creds = resolve_kimi_oauth_runtime_credentials()
+            return {
+                "provider": provider,
+                "api_mode": "anthropic_messages",
+                "base_url": creds["base_url"],
+                "api_key": creds["api_key"],
+                "source": creds.get("source", "oauth"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info("Kimi OAuth credentials failed; falling through to next provider.")
 
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
