@@ -37,6 +37,7 @@ def ledger(tmp_path, monkeypatch):
         "retention_days": 3650,
     })
     store._connect().close()
+    monkeypatch.setattr(blackbox, "_provisional_turns", {})
     HOOKS.clear()
 
     from hermes_cli import lifecycle
@@ -341,3 +342,54 @@ def test_abandoned_turn_is_written_to_the_profile_it_ran_in(ledger, tmp_path, mo
 
     assert _orphan_ids(prof_db) == []
     assert _row(ledger, tid, "1") is None
+
+
+def _raw_call(db, turn_id, seq, *, inp, out, lane_family=None, parent_call_id=None):
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO turn_api_calls (turn_id, seq, ts, provider, model, input_tokens, "
+            "output_tokens, cache_read, cache_write, reasoning, http_status, lane_family, "
+            "parent_call_id) VALUES (?, ?, ?, 'claude-bpr', 'claude-opus-5-5', ?, ?, ?, ?, 0, 200, ?, ?)",
+            (turn_id, seq, 100.0 + seq, inp, out, None if inp is None else 0,
+             None if inp is None else 0, lane_family, parent_call_id),
+        )
+
+
+def test_ledger_rollup_is_main_lane_only_and_null_is_unknown(ledger, monkeypatch):
+    tid = "20260925_184925_583448ba:20260925_184925_583448ba:5ce1d232"
+    _raw_call(ledger, tid, 0, inp=10, out=1)
+    _raw_call(ledger, tid, 1, inp=500, out=50, lane_family="aux")
+    _raw_call(ledger, tid, 2, inp=700, out=70, parent_call_id=1)
+    usage = store.ledger_turn_usage(tid)
+    assert (usage["api_calls"], usage["input_tokens"], usage["usage_unknown"]) == (1, 10, False)
+
+    _raw_call(ledger, tid, 3, inp=None, out=None)
+    usage = store.ledger_turn_usage(tid)
+    assert usage["api_calls"] == 2
+    assert usage["usage_unknown"] is True and usage["input_tokens_unknown"] is True
+
+
+def test_call_landing_after_the_provisional_row_refreshes_it(ledger, monkeypatch):
+    tid = "20260926_015422_041c59:20260926_015422_041c59:6c20bf72"
+    _in_flight_call(tid, http_status=200, seq=0, input_tokens=10)
+    _shutdown(_runner(monkeypatch), {"k": _agent(tid)})
+    assert _row(ledger, tid, "api_calls, input_tokens") == (1, 10)
+
+    _in_flight_call(tid, http_status=200, seq=1, input_tokens=32)
+
+    assert _row(ledger, tid, "api_calls, input_tokens, interrupted") == (2, 42, 1)
+
+
+def test_late_call_after_the_real_row_does_not_resurrect_the_provisional_one(ledger, monkeypatch):
+    sid = "20260926_015422_3238d7"
+    tid = sid + ":sa-2-88858c9a:bde67363"
+    _in_flight_call(tid, http_status=200)
+    _shutdown(_runner(monkeypatch), {"k": _agent(tid)})
+    blackbox._on_session_end(session_id=sid, turn_id=tid, interrupted=False,
+                             model="m", platform="discord", provider="p",
+                             user_message="u", final_response="done", turn_usage=None)
+    assert tid not in blackbox._provisional_turns
+
+    _in_flight_call(tid, http_status=200, seq=1)
+
+    assert _row(ledger, tid, "interrupted, final_text") == (0, "done")

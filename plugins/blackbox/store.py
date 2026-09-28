@@ -897,6 +897,10 @@ _INSERT_TURN_SQL = (
         if col != "turn_id"
     )
 )
+_INSERT_TURN_PROVISIONAL_SQL = (
+    _INSERT_TURN_SQL.split("ON CONFLICT(turn_id)")[0]
+    + "ON CONFLICT(turn_id) DO NOTHING"
+)
 
 
 def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
@@ -913,21 +917,20 @@ def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
             (json.dumps({sub: count for sub, count in rows}), turn_id),
         )
 
-def insert_turn(record: TurnRecord, *, provisional: bool = False) -> None:
+def insert_turn(
+    record: TurnRecord, *, provisional: bool = False, move_last_turn: bool = True
+) -> bool:
     """Persist one turn. Telemetry failures are logged but never raised.
 
-    ``provisional`` (a host abandoning an in-flight turn at shutdown): never
-    replaces an existing row for the turn and never moves the channel's
-    ``last_turn`` pointer. A real row written later upserts over it.
+    ``provisional`` (a host abandoning an in-flight turn at shutdown): the
+    insert atomically does nothing when the turn already has a row, and the
+    channel's ``last_turn`` pointer is never moved. A real row written later
+    upserts over it. Returns True when a row was written.
     """
     try:
         with _connect() as conn:
-            if provisional and conn.execute(
-                "SELECT 1 FROM turns WHERE turn_id = ?", (record.turn_id,)
-            ).fetchone():
-                return
-            conn.execute(
-                _INSERT_TURN_SQL,
+            cur = conn.execute(
+                _INSERT_TURN_PROVISIONAL_SQL if provisional else _INSERT_TURN_SQL,
                 (
                     record.turn_id,
                     record.parent_turn_id,
@@ -1008,7 +1011,9 @@ def insert_turn(record: TurnRecord, *, provisional: bool = False) -> None:
                         scrub_and_truncate(call.get("result_preview", "")),
                     ),
                 )
-            if not provisional:
+            if provisional and cur.rowcount == 0:
+                return False
+            if move_last_turn and not provisional:
                 conn.execute(
                     """
                     INSERT INTO last_turn(platform, chat_id, turn_id)
@@ -1028,8 +1033,10 @@ def insert_turn(record: TurnRecord, *, provisional: bool = False) -> None:
                     WHERE turn_id = ?
                 """, (record.turn_id,))
             _refresh_cache_monitoring(conn, record.turn_id)
+        return True
     except Exception:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
+        return False
 
 
 def ledger_turn_usage(turn_id: str) -> dict | None:
@@ -1045,7 +1052,8 @@ def ledger_turn_usage(turn_id: str) -> dict | None:
             rows = conn.execute(
                 "SELECT input_tokens, output_tokens, cache_read, cache_write, "
                 "reasoning, provider, model FROM turn_api_calls "
-                "WHERE turn_id = ? ORDER BY seq",
+                f"WHERE turn_id = ? AND {_NOT_AUX} AND {_NOT_COMPOSITE_CHILD} "
+                "ORDER BY seq",
                 (turn_id,),
             ).fetchall()
     except Exception:
@@ -1064,7 +1072,7 @@ def ledger_turn_usage(turn_id: str) -> dict | None:
             "output_tokens_unknown": out is None,
             "cache_read_tokens_unknown": cr is None,
             "cache_write_tokens_unknown": cw is None,
-            "usage_unknown": False,
+            "usage_unknown": inp is None and out is None and cr is None and cw is None,
             "provider": prov or "",
             "model": mdl or "",
             "base_url": "",

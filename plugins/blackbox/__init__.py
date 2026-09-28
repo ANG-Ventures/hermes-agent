@@ -152,6 +152,8 @@ def record_api_call(
         cache_ttl_requested=cache_ttl_requested,
         call_id=call_id,
     )
+    if turn_id in _provisional_turns:
+        _refresh_provisional_turn(turn_id)
     if api_kwargs is not None and session_key:
         observe_request_prefix(
             cfg,
@@ -695,23 +697,51 @@ def _build_record(
     )
 
 
-def _on_turn_abandoned(
-    session_id: str = "",
-    turn_id: str = "",
-    reason: str = "",
-    model: str = "",
-    platform: str = "",
-    provider: str = "",
-    user_message: str = "",
-    **kwargs: Any,
-) -> None:
+# Turns written provisionally by on_turn_abandoned in THIS process, keyed by
+# turn_id -> the hook kwargs. A call that lands after the provisional write
+# refreshes the row; the real on_session_end drops the entry. All writes for
+# such a turn happen under _provisional_lock so the real row always wins.
+_provisional_turns: dict[str, dict[str, Any]] = {}
+_provisional_lock = Lock()
+
+
+def _abandoned_record(args: dict[str, Any], cfg: dict[str, Any]) -> TurnRecord | None:
+    from plugins.blackbox import store
+
+    turn_id = str(args.get("turn_id") or "")
+    usage = store.ledger_turn_usage(turn_id) or {}
+    for key in ("parent_turn_id", "parent_platform", "parent_chat_id",
+                "parent_chat_name", "is_subagent", "depth"):
+        if key in args:
+            usage[key] = args[key]
+    return _build_record(
+        session_id=str(args.get("session_id") or ""),
+        interrupted=True,
+        model=str(args.get("model") or ""),
+        platform=str(args.get("platform") or ""),
+        provider=str(args.get("provider") or ""),
+        user_message=args.get("user_message") or "",
+        final_response="",
+        turn_usage=usage,
+        cfg=cfg,
+        kwargs={
+            "turn_id": turn_id,
+            "chat_id": args.get("chat_id"),
+            "chat_name": args.get("chat_name"),
+            "turn_exit_reason": args.get("reason"),
+            "provisional": True,
+        },
+    )
+
+
+def _on_turn_abandoned(turn_id: str = "", **kwargs: Any) -> None:
     """Provisional interrupted row for a turn the host abandons mid-flight.
 
     The gateway fires this at shutdown for turns that will never reach
-    ``on_session_end``. Usage comes from the turn's own ``turn_api_calls``
-    (authoritative for every billed call); the row never replaces an existing
-    one nor the channel's latest-turn pointer, and a real row written later
-    supersedes it.
+    ``on_session_end``. Usage comes from the turn's own main-lane
+    ``turn_api_calls`` (authoritative for every billed call); the row never
+    replaces an existing one nor the channel's latest-turn pointer, and a real
+    row written later supersedes it.
     """
     try:
         cfg = _config()
@@ -719,33 +749,32 @@ def _on_turn_abandoned(
             return
         from plugins.blackbox import store
 
-        usage = store.ledger_turn_usage(str(turn_id)) or {}
-        for key in ("parent_turn_id", "parent_platform", "parent_chat_id",
-                    "parent_chat_name", "is_subagent", "depth"):
-            if key in kwargs:
-                usage[key] = kwargs[key]
-        record = _build_record(
-            session_id=session_id,
-            interrupted=True,
-            model=model,
-            platform=platform,
-            provider=provider,
-            user_message=user_message,
-            final_response="",
-            turn_usage=usage,
-            cfg=cfg,
-            kwargs={
-                "turn_id": turn_id,
-                "chat_id": kwargs.get("chat_id"),
-                "chat_name": kwargs.get("chat_name"),
-                "turn_exit_reason": reason,
-                "provisional": True,
-            },
-        )
-        if record is not None:
-            store.insert_turn(record, provisional=True)
+        args = {**kwargs, "turn_id": str(turn_id)}
+        with _provisional_lock:
+            record = _abandoned_record(args, cfg)
+            if record is not None and store.insert_turn(record, provisional=True):
+                _provisional_turns[str(turn_id)] = args
     except Exception:
         logger.warning("blackbox on_turn_abandoned failed", exc_info=True)
+
+
+def _refresh_provisional_turn(turn_id: str) -> None:
+    """Re-roll a provisional row after a call for its turn landed late."""
+    try:
+        cfg = _config()
+        if cfg is None:
+            return
+        from plugins.blackbox import store
+
+        with _provisional_lock:
+            args = _provisional_turns.get(turn_id)
+            if args is None:
+                return
+            record = _abandoned_record(args, cfg)
+            if record is not None:
+                store.insert_turn(record, move_last_turn=False)
+    except Exception:
+        logger.warning("blackbox provisional refresh failed", exc_info=True)
 
 
 def _on_session_end(
@@ -788,7 +817,12 @@ def _on_session_end(
 
         from plugins.blackbox import store
 
-        store.insert_turn(record)
+        # Serialized with provisional writes/refreshes for the same process:
+        # dropping the entry and writing the real row under the lock means a
+        # late refresh can never land after (and over) the real row.
+        with _provisional_lock:
+            _provisional_turns.pop(record.turn_id, None)
+            store.insert_turn(record)
 
         # New-model pricing sentinel (card t_2e382a4b). Runs AFTER the turn is
         # durably stored and is wrapped end-to-end in its own try/except with a

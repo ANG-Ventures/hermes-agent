@@ -1078,6 +1078,11 @@ _live_cron_agents: dict = {}
 _live_cron_agents_lock = threading.Lock()
 
 
+def _forget_live_cron_agent(key: int) -> None:
+    with _live_cron_agents_lock:
+        _live_cron_agents.pop(key, None)
+
+
 def live_cron_agents() -> list:
     """Snapshot of the cron agents whose ``run_conversation`` is in flight."""
     with _live_cron_agents_lock:
@@ -7549,6 +7554,11 @@ def run_job(
         with _live_cron_agents_lock:
             _live_cron_agents[id(agent)] = agent
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # Deregister when the TURN ends, not when this watcher gives up on it:
+        # an inactivity-timed-out run can keep going until shutdown.
+        _cron_future.add_done_callback(
+            lambda _f, _k=id(agent): _forget_live_cron_agent(_k)
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -7596,8 +7606,6 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
-            with _live_cron_agents_lock:
-                _live_cron_agents.pop(id(agent), None)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
