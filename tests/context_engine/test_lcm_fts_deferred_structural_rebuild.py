@@ -168,3 +168,32 @@ def test_explicit_repair_stays_synchronous(tmp_path, monkeypatch):
         assert docs == N_ROWS
     finally:
         conn.close()
+
+
+def test_deferral_keeps_the_search_content_default_trigger(tmp_path, monkeypatch):
+    """C5 #49 (PR #1023): the deferral drops only the FTS-writing triggers; a
+    raw insert without search_content during the window is still filled."""
+    monkeypatch.delenv(B.BACKGROUND_INTEGRITY_ENV, raising=False)
+    db = tmp_path / "lcm.db"
+    _damaged_db(db)
+    gate = threading.Event()
+    _Recorder(monkeypatch, gate=gate)
+    st = MessageStore(db_path=str(db))
+    try:
+        names = {r[0] for r in st._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'")}
+        assert "msg_search_content_default" in names
+        assert "msg_fts_insert" not in names       # the damaged index's writers are dropped
+        cur = st._conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+            ("s", "user", "raw legacy row", 1.0),
+        )
+        st._conn.commit()
+        row = st._conn.execute(
+            "SELECT search_content FROM messages WHERE store_id = ?", (cur.lastrowid,)
+        ).fetchone()
+        assert row[0] == "raw legacy row"
+    finally:
+        gate.set()
+        join_background_integrity_scans()
+        st.close()

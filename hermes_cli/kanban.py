@@ -1996,7 +1996,19 @@ def _caller_session_id() -> Optional[str]:
     explicit = (_SLASH_SESSION_ID.get() or "").strip()
     if explicit:
         return explicit
-    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    # ``_HERMES_GATEWAY=1`` is inherited by every descendant of the gateway,
+    # including the terminal subprocess a chat turn runs ``hermes kanban``
+    # in. Only the gateway PROCESS itself (which set the marker when
+    # ``gateway.run`` was imported) has concurrent sessions sharing one
+    # os.environ. A subprocess gets its own session id bridged per command
+    # (tools/environments/local._inject_session_context_env, contextvar-
+    # authoritative), so the env value there IS the caller's. Treating the
+    # subprocess as in-gateway made every chat-turn ``claim --review`` bind
+    # no session, and the following ``request-changes`` was refused
+    # (t_0485b3ff: t_ddcd2170, t_c26be9b9, t_6500a97a stranded in running).
+    in_gateway = (
+        os.environ.get("_HERMES_GATEWAY") == "1" and "gateway.run" in sys.modules
+    )
     try:
         from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
@@ -4276,10 +4288,17 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if args.review:
+            review_session = _operator_review_session_ref()
             task = kb.claim_review_task(
                 conn, args.task_id, ttl_seconds=args.ttl,
-                session_ref=_operator_review_session_ref(),
+                session_ref=review_session,
             )
+            if task is not None and review_session is None:
+                print(
+                    f"warning: review claim on {args.task_id} bound no session; "
+                    f"request-changes cannot use it and will release it back to review",
+                    file=sys.stderr,
+                )
         else:
             task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
@@ -5087,6 +5106,15 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             return 1
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
         parked_session = None
+        released_unbound = False
+        if held_run is None and worker_run is None:
+            # A review claim that bound NO session can never be held by
+            # anyone; left alone it strands the card in running until the
+            # TTL lapses (t_0485b3ff). Return it to review, then send back
+            # through the parked path below in this same call.
+            released_unbound = kb.release_unbound_review_claim(
+                conn, tid, reason="request-changes: review claim bound no session",
+            )
         if held_run is None:
             # Card parked in ``review`` with nobody holding it: the operator
             # session opens the review run itself and sends back in ONE txn
@@ -5100,7 +5128,11 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                     f"cannot request changes for {tid}: this session does not hold its "
                     f"review run; claim it from the reviewing session first "
                     f"(hermes kanban claim {tid} --review). Delegate children and "
-                    f"cron jobs cannot hold a human-lane review claim.",
+                    f"cron jobs cannot hold a human-lane review claim."
+                    + (
+                        " The unbound review claim was released; the card is back in review."
+                        if released_unbound else ""
+                    ),
                     file=sys.stderr,
                 )
                 return 1

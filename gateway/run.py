@@ -12019,6 +12019,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return identity
 
+    async def _persist_session_model_override(
+        self,
+        session_key: str,
+        override: Optional[dict],
+        *,
+        require_persistence: bool = False,
+    ) -> None:
+        """Run :meth:`_set_session_model_override` off the loop, serialized per
+        session in issue order (C5 #36, PR #970).
+
+        Each ``to_thread`` write used to race the others, so two /model
+        commands could land in either order. The per-session asyncio.Lock is
+        acquired with no await before it, and asyncio.Lock wakes waiters FIFO,
+        so writes land in the order the commands were issued; every write
+        runs (none is skipped, so no caller reports a write that never landed).
+        """
+        locks = self.__dict__.setdefault("_model_override_locks", {})
+        lock = locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            # Hold the lock until the worker thread has FINISHED, even when
+            # this coroutine is cancelled: a cancelled to_thread keeps
+            # writing, and a newer override must not land before it.
+            fut = asyncio.ensure_future(asyncio.to_thread(
+                self._set_session_model_override,
+                session_key,
+                override,
+                require_persistence=require_persistence,
+            ))
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(fut)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if fut.done():
+                        break
+            fut.result()
+            if cancelled:
+                raise asyncio.CancelledError()
+
     def _set_session_model_override(
         self,
         session_key: str,
@@ -24956,34 +24997,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # Normal completion/exception/interrupt owns and clears this exact
-            # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
-            # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
+            # the lease its own turn acquired, never a newer turn's. It runs
+            # FIRST, before any await in this finally: after /stop the adapter
+            # cancels this task (cancel_session_processing), and a
+            # CancelledError landing on an await below used to skip this
+            # release, leaking the lease until restart (2026-09-27).
             self._release_turn_lease(_quick_key, _run_generation)
-            if _checkout_ticket is not None:
-                _checkout_ticket.release()
+            try:
+                # MoA one-shot restore must run on EVERY exit path, not just
+                # success. The restore data lives on the per-turn event object
+                # (_moa_restore_override), which is discarded once the event goes
+                # out of scope — so if _handle_message_with_agent raises, a restore
+                # in the try block would be skipped and the MoA override would leak
+                # permanently (every later message silently fans out through MoA).
+                # Putting it in finally guarantees the revert on success, exception,
+                # and interrupt alike.
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
+                # Normal completion/exception/interrupt owns and clears this exact
+                # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
+                # the next unclean startup's recovery pass.
+                await self._clear_durable_active_turn(event)
+            finally:
+                # Unconditional release covers every exit path, including a
+                # cancellation delivered on the await above. _release_running_agent_state
+                # is idempotent (pop-on-absent is harmless) and, called without a
+                # run_generation guard, always clears the slot regardless of which
+                # generation it holds. This evicts the zombie left when session_reset
+                # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
+                # inside _run_agent returns False, and the old sentinel-only check here
+                # missed the leftover real agent — locking the session out forever (#28686).
+                try:
+                    self._release_running_agent_state(_quick_key)
+                finally:
+                    if _checkout_ticket is not None:
+                        _checkout_ticket.release()
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -26346,6 +26396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 generation: int,
                 held_seconds: float,
                 wait_seconds: float,
+                tool_name: Optional[str] = None,
             ) -> None:
                 """Tell the user their message is queued behind a zombie turn.
 
@@ -26357,10 +26408,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 """
                 try:
                     await self._send_goal_status_notice(
-                        source,
-                        "⏳ Previous turn is still finishing a tool call after "
-                        "/stop — your message is queued and will run as soon "
-                        "as it lets go.",
+                        source, self._stale_lease_notice_text(tool_name)
                     )
                 except Exception:
                     logger.debug(
@@ -26389,6 +26437,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+                # The turn runs inline in this handler task, whose finally in
+                # _handle_message releases the lease. If that task ends without
+                # releasing, a waiter may reclaim the lease (2026-09-27 leak).
+                _lease_token.owner_task = asyncio.current_task()
                 # Diagnostic hint so a LATER waiter's PHASE=stale_lease_holder
                 # line can name the tool this turn is parked in.
                 try:
@@ -35413,6 +35465,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return True
 
+    @staticmethod
+    def _stale_lease_notice_text(tool_name: Optional[str]) -> str:
+        """User notice for a message queued behind a /stop'd turn.
+
+        Names the tool only when the holder is actually in one; a turn stopped
+        mid API call has no tool to finish (2026-09-27).
+        """
+        if tool_name:
+            return (
+                f"⏳ Previous turn is still finishing a tool call (`{tool_name}`) "
+                "after /stop — your message is queued and will run as soon "
+                "as it lets go."
+            )
+        return (
+            "⏳ Previous turn is still shutting down after /stop — your "
+            "message is queued and will run as soon as it lets go."
+        )
+
     def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
         """Release the turn lease acquired by (``session_key``, ``run_generation``).
 
@@ -35432,6 +35502,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         turn = state.turn
         if turn.lease_token is None or turn.lease_generation != run_generation:
+            # A stale unwind meeting a NEWER turn's token is the designed
+            # no-op. An OLDER generation's token still held while a later
+            # turn exits is a leak the registry cannot see: say so.
+            held = turn.lease_token
+            if (
+                held is not None
+                and turn.lease_generation is not None
+                and int(turn.lease_generation) < int(run_generation)
+                and registry.is_holder(held)
+            ):
+                logger.warning(
+                    "turn lease NOT released for %s gen %s: the held token "
+                    "belongs to older gen %s and is still the registry holder "
+                    "on session %s",
+                    session_key,
+                    run_generation,
+                    turn.lease_generation,
+                    held.session_id,
+                )
             return False
         token = turn.lease_token
         turn.lease_token = None
@@ -35439,7 +35528,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             return registry.release(token)
         except Exception:
-            logger.debug("Failed to release turn lease", exc_info=True)
+            logger.warning("Failed to release turn lease for %s", session_key, exc_info=True)
             return False
 
     def _rebind_turn_lease(

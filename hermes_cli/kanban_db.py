@@ -4854,10 +4854,18 @@ _PENDING_HOME_CHECK: ContextVar[Optional[dict]] = ContextVar(
 )
 
 
-def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
+_GUARDED_COLUMNS_SQL = (
+    "SELECT status, assignee, priority, session_id FROM tasks WHERE id = ?"
+)
+
+
+def _recheck_pending_home_session(conn: sqlite3.Connection) -> Optional[tuple]:
+    """Re-run the pending home check under the write lock. Returns the target's
+    guarded columns as of txn start when a foreign override is pending (the
+    baseline :func:`_record_pending_foreign_action` compares against)."""
     pending = _PENDING_HOME_CHECK.get()
     if pending is None or pending["done"]:
-        return
+        return None
     pending["done"] = True
     token = _MUTATION_ACTOR.set(pending["actor"])
     try:
@@ -4866,8 +4874,36 @@ def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
         )
     finally:
         _MUTATION_ACTOR.reset(token)
-    if pending["result"] is not None:
-        pending["home_before"] = _read_home_session(conn, pending["task_id"])
+    if pending["result"] is None:
+        return None
+    pending["home_before"] = _read_home_session(conn, pending["task_id"])
+    row = conn.execute(_GUARDED_COLUMNS_SQL, (pending["task_id"],)).fetchone()
+    return tuple(row) if row is not None else ()
+
+
+def _record_pending_foreign_action(conn: sqlite3.Connection, guarded_before: tuple) -> None:
+    """Write a guarded mutator's takeover/override audit in the SAME
+    transaction as the mutation (C5 #23, PR #951 review): a crash or a
+    concurrent reader between two commits can no longer see the foreign
+    mutation without its takeover event and comment.
+
+    Only when this transaction changed the target card's guarded columns
+    (status/assignee/priority/session_id): that is the foreign mutation
+    itself, so the audit is owed whatever the mutator later returns. A txn
+    that only wrote side rows (a ``reclaim_refused`` event, a claim-expiry
+    bump) records nothing here; the wrapper then falls back to the
+    post-commit record gated on ``_mutation_succeeded(result)``."""
+    pending = _PENDING_HOME_CHECK.get()
+    if pending is None or pending.get("recorded") or pending["result"] is None:
+        return
+    row = conn.execute(_GUARDED_COLUMNS_SQL, (pending["task_id"],)).fetchone()
+    if row is None or tuple(row) == guarded_before:
+        return
+    pending["recorded"] = True
+    pending["new_home"] = record_foreign_action(
+        conn, pending["task_id"], pending["action"], pending["result"],
+        home_before=pending["home_before"], subscribe=False,
+    )
 
 
 @contextlib.contextmanager
@@ -4919,8 +4955,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        _recheck_pending_home_session(conn)
+        guarded_before = _recheck_pending_home_session(conn)
         yield conn
+        if guarded_before is not None:
+            _record_pending_foreign_action(conn, guarded_before)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -5885,8 +5923,8 @@ def _read_home_session(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 
 def record_foreign_action(
     conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor,
-    *, home_before: Any = _HOME_UNREAD,
-) -> None:
+    *, home_before: Any = _HOME_UNREAD, subscribe: bool = True,
+) -> Optional[str]:
     """Append the audit comment for an overridden foreign-session mutation.
 
     An ``--operator`` override records an ``operator_override`` event only:
@@ -5895,6 +5933,10 @@ def record_foreign_action(
     ``home_before`` is the home read BEFORE the guarded mutation ran; the
     mutation itself may have re-stamped ``tasks.session_id`` (``update
     --session``), and the audit must name the displaced home (C7 k103).
+
+    Returns the new home session when the takeover re-homed the card.
+    ``subscribe=False`` (the in-transaction caller) leaves the post-commit
+    chat subscription to the caller.
     """
     sess = ", ".join(actor.session_ids) or "no-session"
     prev_home = (
@@ -5918,7 +5960,7 @@ def record_foreign_action(
             ):
                 # The mutator already recorded this override itself
                 # (request-changes' operator send-back); one event per call.
-                return
+                return None
         with write_txn(conn, allow_nested=True):
             _append_event(
                 conn,
@@ -5932,7 +5974,7 @@ def record_foreign_action(
                     "home": prev_home,
                 },
             )
-        return
+        return None
     new_home = (
         actor.session_ids[0]
         if action in REHOME_ON_TAKEOVER_ACTIONS
@@ -5976,15 +6018,20 @@ def record_foreign_action(
         ),
         session_ref=session_ref,
     )
-    if new_home:
-        # Pings follow the new home: subscribe the taker's chat. Best effort --
-        # notification bookkeeping must never fail the mutation.
-        try:
-            from tools.kanban_tools import subscribe_calling_session
+    if new_home and subscribe:
+        _subscribe_new_home(conn, task_id)
+    return new_home
 
-            subscribe_calling_session(conn, task_id)
-        except Exception:
-            pass
+
+def _subscribe_new_home(conn: sqlite3.Connection, task_id: str) -> None:
+    # Pings follow the new home: subscribe the taker's chat. Best effort --
+    # notification bookkeeping must never fail the mutation.
+    try:
+        from tools.kanban_tools import subscribe_calling_session
+
+        subscribe_calling_session(conn, task_id)
+    except Exception:
+        pass
 
 
 def _home_session_guarded(action: str, task_param: str = "task_id"):
@@ -6030,7 +6077,10 @@ def _home_session_guarded(action: str, task_param: str = "task_id"):
                 _PENDING_HOME_CHECK.reset(pending_token)
                 _MUTATION_ACTOR.reset(token)
             override = pending["result"]
-            if override is not None and _mutation_succeeded(result):
+            if pending.get("recorded"):
+                if pending.get("new_home"):
+                    _subscribe_new_home(conn, str(task_id))
+            elif override is not None and _mutation_succeeded(result):
                 record_foreign_action(
                     conn, str(task_id), action, override,
                     home_before=pending["home_before"],
@@ -6321,9 +6371,11 @@ def create_task(
     # no card can land without a home (never NULL) or without an origin line.
     parents = tuple(parents or ())
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
-    session_id, inherited_origin = _resolve_birth_session(
+    requested_session_id, unstamped_body = session_id, body
+    birth = _resolve_birth_session(
         conn, session_id, parents, explicit=session_explicit
     )
+    session_id, inherited_origin = birth
     body = stamp_origin_body(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
@@ -6525,6 +6577,21 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # C5 #44 (PR #987): a parent re-homed between the birth
+                # resolution above and this write lock must still be the
+                # home the child is born with. Re-resolve under the lock,
+                # BEFORE every check that reads the final home or body.
+                rebirth = _resolve_birth_session(
+                    conn, requested_session_id, parents, explicit=session_explicit
+                )
+                if rebirth != birth:
+                    birth = rebirth
+                    session_id, inherited_origin = rebirth
+                    body = stamp_origin_body(
+                        unstamped_body,
+                        inherited_origin
+                        or format_origin_line(session_id, created_by=created_by),
+                    )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -9272,6 +9339,94 @@ def review_claim_run_for_session(
     if not isinstance(payload, dict) or payload.get("source_status") != "review":
         return None
     return run_id if payload.get("session_ref") == session_ref else None
+
+
+@_home_session_guarded("request-changes")
+def release_unbound_review_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> bool:
+    """Return an ORPHANED human-lane review claim to ``review``.
+
+    A review claim that recorded no ``session_ref`` can never be used by
+    :func:`review_claim_run_for_session`, so the card sits in ``running``
+    under a claim nobody can send back until the TTL lapses (t_0485b3ff).
+    Released only when it is provably orphaned: the active run's ``claimed``
+    event is a review claim (``source_status=review``) with no session bound,
+    no worker pid is attached, and the claimer process is gone (or is this
+    very process). Returns True when the card went back to ``review``.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None or row["status"] != "running"
+        or row["current_run_id"] is None or row["worker_pid"] is not None
+    ):
+        return False
+    run_id = int(row["current_run_id"])
+    event = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("source_status") != "review"
+        or payload.get("session_ref")
+    ):
+        return False
+    lock = row["claim_lock"] or ""
+    host, _, pid_text = lock.rpartition(":")
+    try:
+        lock_pid = int(pid_text)
+    except ValueError:
+        lock_pid = None
+    # Fail closed: only a lock this host can probe proves its claimer gone.
+    # A remote (or malformed) lock is unprovable, so it is never released.
+    if not host or host != _claimer_id().rpartition(":")[0] or lock_pid is None:
+        return False  # unprovable_claimer: remote or malformed claim lock
+    if lock_pid != os.getpid() and _pid_alive(lock_pid):
+        return False  # a live sessionless claimer may still be reviewing
+    with write_txn(conn):
+        # Recheck every release condition under the write lock: a worker may
+        # have attached, or the claim rebound, since the reads above.
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock IS ? AND worker_pid IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM task_events e "
+            "  WHERE e.task_id = tasks.id AND e.run_id = ? "
+            "  AND e.kind = 'claimed' AND e.id > ?)",
+            (task_id, run_id, row["claim_lock"], run_id, event["id"]),
+        )
+        if cur.rowcount != 1:
+            return False
+        closed = _end_run(
+            conn, task_id, outcome="reclaimed", status="reclaimed",
+            error=f"unbound_review_claim_released: {reason}",
+        )
+        _append_event(
+            conn, task_id, "reclaimed",
+            {
+                "manual": True,
+                "reason": reason,
+                "prev_lock": row["claim_lock"],
+                "retry_status": "review",
+                "unbound_review_claim": True,
+            },
+            run_id=closed,
+        )
+    return True
 
 
 def _retry_status_for_run(
@@ -13073,6 +13228,7 @@ import unicodedata  # noqa: E402
 
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
 from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
+from hermes_cli.kanban_review_schema import validate_v2_fields as _validate_review_v2  # noqa: E402
 
 _REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 # An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
@@ -13239,7 +13395,8 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
                                         or _review_na_reason_ok(head))):
         return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
-    return None
+    # review_coverage v2 (additive): records with no v2 key pass untouched.
+    return _validate_review_v2(coverage, surface="board")
 
 
 def _operator_caller_profiles() -> frozenset[str]:
@@ -13361,7 +13518,8 @@ def request_changes(
 
     def _in_txn() -> tuple[bool, Optional[str]]:
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, claim_lock, claim_expires "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -13406,6 +13564,19 @@ def request_changes(
             claimed_payload = {}
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
+        if claimer and expected_run_id is None and not opened:
+            # C5 #70 (PR #1081): a send-back with no run id carries no proof
+            # of which run it owns (``claimer`` is a reusable profile name, not
+            # a run credential), so it may close only a lapsed run: claim
+            # expired and no live owner. A live run is closed with its run id.
+            if (
+                task_row["claim_lock"]
+                and int(task_row["claim_expires"] or 0) > int(time.time())
+            ) or _prior_worker_still_alive(conn, task_id) is not None:
+                return False, (
+                    "a live review run holds this task; pass its run id "
+                    "(expected_run_id) to close it"
+                )
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "

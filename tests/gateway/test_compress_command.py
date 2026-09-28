@@ -1642,3 +1642,34 @@ async def test_compress_stays_silent_for_small_session():
         await runner._handle_compress_command(_make_event())
 
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_compress_aborts_when_session_reset_during_agent_build():
+    """C5 #40 (PR #976): a /new or /reset lands while the temp agent is being
+    built off-loop; /compress must not compress the stale session."""
+    history = _make_history()
+    runner = _make_runner(history)
+    runner.session_store.peek_session_id.return_value = "sess-1"
+    agent_instance = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compression_skipped_due_to_lock = False
+
+    def _build(*_a, **_k):
+        # /reset rebinds the key while AIAgent.__init__ runs in the thread.
+        runner.session_store.peek_session_id.return_value = "sess-2"
+        return agent_instance
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", side_effect=_build),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compression cancelled" in result
+    agent_instance._compress_context.assert_not_called()
+    runner.session_store.rewrite_transcript.assert_not_called()

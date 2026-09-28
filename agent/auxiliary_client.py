@@ -622,11 +622,24 @@ def _mark_sink_unknown(sink: Dict[str, Any], reason: str) -> None:
     sink.setdefault("unknown_reason", reason)
 
 
+# A sink dict is shared by every call_llm in its block, including a detached
+# stalled compression worker that keeps running on a copied context; the
+# read-modify-writes below are serialized (C5 #41, PR #978).
+_AUX_COST_SINK_LOCK = threading.Lock()
+
+
 def _record_aux_call_cost(response: Any, route_info: Optional[Dict[str, str]],
                           *, streamed: bool) -> None:
     sink = _aux_cost_sink.get()
     if sink is None:
         return
+    with _AUX_COST_SINK_LOCK:
+        _record_aux_call_cost_locked(sink, response, route_info, streamed=streamed)
+
+
+def _record_aux_call_cost_locked(sink: Dict[str, Any], response: Any,
+                                 route_info: Optional[Dict[str, str]],
+                                 *, streamed: bool) -> None:
     try:
         sink["calls"] = int(sink.get("calls") or 0) + 1
         if streamed:

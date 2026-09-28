@@ -317,6 +317,7 @@ class LSPService:
             client = self._clients.get(key)
         if client is not None and client.is_running:
             return True
+        self._drop_dead_client(key)
         try:
             slot = host_slots.acquire(self._max_servers_per_host)
         except OSError as e:
@@ -327,6 +328,20 @@ class LSPService:
             return False
         slot.release()
         return True
+
+    def _drop_dead_client(self, key: Tuple[str, str]) -> None:
+        """Forget a registered client that is no longer running and give back
+        its host slot (C5 #48, PR #1019): a dead server kept its slot, which
+        blocked every replacement once the host cap was reached."""
+        with self._state_lock:
+            client = self._clients.get(key)
+            if client is None or client.is_running:
+                return
+            self._clients.pop(key, None)
+            self._last_used.pop(key, None)
+            slot = self._slots.pop(key, None)
+        if slot is not None:
+            slot.release()
 
     def _release_slot(self, key: Tuple[str, str]) -> None:
         """Drop the host slot held for ``key``'s server; caller has already removed the client."""
@@ -607,6 +622,7 @@ class LSPService:
                 return await spawning
             except Exception:  # noqa: BLE001
                 return None
+        self._drop_dead_client(key)
 
         # Begin spawn
         loop = asyncio.get_running_loop()
@@ -657,7 +673,10 @@ class LSPService:
             with self._state_lock:
                 self._clients[key] = client
                 self._last_used[key] = time.time()
+                stale_slot = self._slots.get(key)
                 self._slots[key], slot = slot, None
+            if stale_slot is not None:  # never leak a slot by overwriting it
+                stale_slot.release()
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client

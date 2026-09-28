@@ -138,3 +138,34 @@ async def test_reload_skills_handler_queues_note_on_diff(monkeypatch):
     assert "    - gamma: Old removed skill" in note
 
 
+
+
+@pytest.mark.asyncio
+async def test_reload_skills_does_not_block_the_loop_on_the_slug_index_lock(monkeypatch):
+    """C5 #33 (PR #969): a cold slug-index build holds _skill_slug_index_lock;
+    /reload-skills must wait for it off the event loop."""
+    import asyncio
+    import threading
+    import time as _time
+
+    import agent.skill_commands as skill_commands_mod
+    import gateway.run as run_mod
+
+    monkeypatch.setattr(skill_commands_mod, "reload_skills",
+                        lambda: {"added": [], "removed": [], "total": 0, "commands": 0})
+    runner = _make_runner()
+    run_mod._skill_slug_index_lock.acquire()      # a build is walking the trees
+    threading.Timer(1.0, run_mod._skill_slug_index_lock.release).start()
+    ticks = []
+
+    async def ticker():
+        for _ in range(10):
+            ticks.append(_time.monotonic())
+            await asyncio.sleep(0.02)
+
+    handler = asyncio.ensure_future(
+        runner._handle_reload_skills_command(_make_event("/reload-skills")))
+    await ticker()
+    assert await asyncio.wait_for(handler, 5) is not None
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    assert max(gaps) < 0.5, f"event loop stalled {max(gaps):.2f}s on the index lock"

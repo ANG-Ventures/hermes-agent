@@ -602,7 +602,7 @@ class GatewaySlashCommandsMixin:
         else:
             # Off the loop, same as the `/model reset` door: the setter does a
             # synchronous session-store write.
-            await asyncio.to_thread(self._set_session_model_override, session_key, None)
+            await self._persist_session_model_override(session_key, None)
             self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
@@ -2566,8 +2566,7 @@ class GatewaySlashCommandsMixin:
         # restart cannot resurrect the prior pin.
         if model_input.strip().lower() == "reset" and not explicit_provider:
             try:
-                await asyncio.to_thread(
-                    self._set_session_model_override,
+                await self._persist_session_model_override(
                     session_key,
                     None,
                     require_persistence=True,
@@ -2841,7 +2840,7 @@ class GatewaySlashCommandsMixin:
                         # Off the loop: the persistability check re-resolves
                         # credentials (config load + provider resolution, which
                         # can refresh an OAuth token over the network).
-                        await asyncio.to_thread(_self._set_session_model_override, _session_key, {
+                        await _self._persist_session_model_override(_session_key, {
                             "model": result.new_model,
                             "provider": result.target_provider,
                             "api_key": result.api_key,
@@ -3273,7 +3272,7 @@ class GatewaySlashCommandsMixin:
             # token over the network). On-loop, this chain held Discord for
             # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
             # open_credentialed_url) and expired /model interactions.
-            await asyncio.to_thread(self._set_session_model_override, session_key, {
+            await self._persist_session_model_override(session_key, {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
@@ -6174,6 +6173,7 @@ class GatewaySlashCommandsMixin:
                 _seed_hygiene_system_prompt(_a, session_row)
                 return _a
 
+            _compress_sid = session_entry.session_id
             tmp_agent = await asyncio.to_thread(_build_tmp_agent)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
@@ -6182,6 +6182,20 @@ class GatewaySlashCommandsMixin:
             tmp_agent.platform = _GATEWAY_HYGIENE_PLATFORM
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
+                # C5 #40 (PR #976): a /new or /reset while the agent was being
+                # built (off-loop) rebinds the key to a new session. Do not
+                # compress the stale one and rotate the key back onto it.
+                try:
+                    _bound_sid = await self.async_session_store.peek_session_id(session_key)
+                except Exception:
+                    _bound_sid = None
+                if session_entry.session_id != _compress_sid or (
+                    isinstance(_bound_sid, str) and _bound_sid != _compress_sid
+                ):
+                    return (
+                        "Compression cancelled: the session was reset while "
+                        "/compress was starting. Nothing was compressed."
+                    )
                 # Prevent close() from ending the newly rotated session —
                 # the gateway session entry now points at the new id and
                 # must remain open for the next user turn.
@@ -8805,7 +8819,10 @@ class GatewaySlashCommandsMixin:
             try:
                 from gateway.run import _invalidate_skill_slug_index
 
-                _invalidate_skill_slug_index()
+                # Off-loop: the invalidation takes _skill_slug_index_lock, which
+                # a cold index build holds for its whole rglob walk (C5 #33,
+                # PR #969). Blocking on it here would stall the event loop.
+                await loop.run_in_executor(None, _invalidate_skill_slug_index)
             except Exception:
                 logger.debug("skill slug index invalidation failed", exc_info=True)
             added = result.get("added", [])      # [{"name", "description"}, ...]

@@ -3401,7 +3401,15 @@ def _mark_structural_rebuild_pending(
     try:
         if opened_txn:
             conn.execute("BEGIN IMMEDIATE")
-        _drop_fts_triggers(conn, spec.trigger_sqls)
+        # Only the triggers that write the damaged FTS table. A trigger that
+        # maintains the content table itself (msg_search_content_default fills
+        # a NULL search_content) must keep firing through the deferral window,
+        # or rows ingested then keep a NULL search_content (C5 #49, PR #1023).
+        _drop_fts_triggers(
+            conn,
+            [sql for sql in spec.trigger_sqls
+             if spec.table_name.lower() in sql.lower()],
+        )
         _record_integrity_failed(
             conn,
             spec,
