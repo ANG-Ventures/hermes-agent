@@ -16794,13 +16794,39 @@ def _parse_github_pr_url(url: str) -> Optional[tuple[str, int]]:
     return (f"{match.group(1)}/{match.group(2)}", int(match.group(3)))
 
 
+# Head branch of every PR the guard has queried, keyed like the state caches.
+# A PR's head ref never changes, so entries never go stale; bounded FIFO.
+# Populated as a side effect of ``_query_github_pr_state`` (same ``gh`` call,
+# no extra query budget). Absent entry = owner unknown = guard fail-safe.
+_PR_HEAD_REF_CACHE: dict[tuple[str, int], str] = {}
+_PR_HEAD_REF_CACHE_LIMIT = 1024
+_CARD_ID_IN_BRANCH_RE = re.compile(r"(?<![0-9a-z])t_[0-9a-f]{8}(?![0-9a-z])")
+
+
+def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
+    """True only on POSITIVE evidence the PR is another card's work.
+
+    Fleet worker branches are named ``<assignee>/<card_id>-<topic>``. A PR
+    whose head branch names one or more card ids, none of them ``task_id``,
+    was opened for a different card: its URL on this card is a cross-card
+    mention (a coordination note), not this card's in-flight work.
+    2026-09-28, t_a8549f8b. Unknown head ref, or a branch naming no card id,
+    stays guarded (fail-safe, unchanged).
+    """
+    head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
+    if not head:
+        return False
+    ids = set(_CARD_ID_IN_BRANCH_RE.findall(head.lower()))
+    return bool(ids) and task_id.lower() not in ids
+
+
 def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
     """Resolve a PR state via ``gh``; return None on any query failure."""
     try:
         proc = subprocess.run(
             [
                 "gh", "pr", "view", str(number), "-R", repo,
-                "--json", "state,mergedAt",
+                "--json", "state,mergedAt,headRefName",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -16818,6 +16844,11 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
         return None
     if not isinstance(payload, dict):
         return None
+    head = payload.get("headRefName")
+    if isinstance(head, str) and head:
+        _PR_HEAD_REF_CACHE[(repo.lower(), int(number))] = head
+        while len(_PR_HEAD_REF_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
+            _PR_HEAD_REF_CACHE.pop(next(iter(_PR_HEAD_REF_CACHE)))
     if payload.get("mergedAt"):
         return "MERGED"
     state = str(payload.get("state") or "").upper()
@@ -19731,6 +19762,9 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        A PR whose head branch names a DIFFERENT card id is skipped (see
+        ``_pr_belongs_to_other_card``). ``detail`` gets ``pr`` and
+        ``pr_state`` for the PR that is holding the card.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -19892,10 +19926,22 @@ def check_respawn_guard(
         for url in dict.fromkeys(pr_urls):
             parsed = _parse_github_pr_url(url)
             if parsed is None:
+                if detail is not None:
+                    detail.update(pr=url, pr_state="unparseable")
                 return "active_pr"
             repo, number = parsed
-            if resolver.resolve(repo, number) not in {"MERGED", "CLOSED"}:
-                return "active_pr"
+            state = resolver.resolve(repo, number)
+            if state in {"MERGED", "CLOSED"}:
+                continue
+            # Another card's PR mentioned here is not this card's work.
+            if _pr_belongs_to_other_card(repo, number, task_id):
+                continue
+            if detail is not None:
+                detail.update(
+                    pr=f"https://github.com/{repo}/pull/{number}",
+                    pr_state=state or "unknown",
+                )
+            return "active_pr"
 
     return None
 
@@ -20020,10 +20066,17 @@ def respawn_guard_stuck_tasks(
             continue
         if now - last_at > _RESPAWN_GUARD_STUCK_FRESH_SECONDS:
             continue
+        newest = conn.execute(
+            "SELECT json_extract(payload, '$.pr') AS pr FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'respawn_guarded' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(last_other)),
+        ).fetchone()
         out.append({
             "task_id": task_id,
             "assignee": row["assignee"],
             "reason": "active_pr",
+            "pr": newest["pr"] if newest else None,
             "guarded_since": first_at,
             "guarded_seconds": now - first_at,
             "guard_events": int(streak["n"]),
