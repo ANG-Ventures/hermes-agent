@@ -5862,36 +5862,73 @@ def operator_flag_gate_scope(task_ids: Iterable[str], action: str, *, flags: Ite
         "task_ids": list(dict.fromkeys(str(t) for t in (task_ids or ()) if t)),
         "action": action,
         "flags": used,
-        "refused": None,
+        "refused": [],
     }
     token = _PENDING_OPERATOR_GATE.set(pending)
     try:
         yield
     finally:
         _PENDING_OPERATOR_GATE.reset(token)
-        refused = pending.get("refused")
-        if refused is not None:
-            tid, payload = refused
+        for tid, payload in pending["refused"]:
             try:
                 with connect_closing() as conn:
                     with write_txn(conn):
                         _append_event(conn, tid, "takeover_refused", payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                # The refusal itself stands (the mutation rolled back); only
+                # its audit row is missing. Never swallow that silently
+                # (t_920c6b4a, FleetReview 667f8318dd40).
+                _log.warning(
+                    "takeover_refused audit NOT recorded for %s (%s): %s",
+                    tid, payload.get("action"), exc,
+                )
+                try:
+                    print(
+                        f"kanban: warning: the takeover_refused event for {tid} "
+                        f"could not be recorded ({exc})",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
 
 
 def _recheck_pending_operator_gate(conn: sqlite3.Connection) -> None:
+    """Re-run the pending gate. Runs on EVERY outermost write txn in the scope,
+    including after an earlier refusal: a caller that catches the refusal and
+    goes on to another write is gated again, never waved through
+    (t_920c6b4a, FleetReview d292b198bb11)."""
     pending = _PENDING_OPERATOR_GATE.get()
-    if pending is None or pending.get("refused") is not None:
+    if pending is None:
         return
     refusal = _operator_gate_refusal(
         conn, pending["task_ids"], pending["action"], pending["flags"]
     )
     if refusal is None:
         return
-    pending["refused"] = refusal
+    pending["refused"].append(refusal)
     tid, payload = refusal
     raise _operator_gate_error(pending["action"], pending["flags"], tid, payload["token"])
+
+
+def authorize_pending_operator_gate(conn: sqlite3.Connection) -> None:
+    """Run the pending gate under the write lock NOW, for callers about to take
+    a side effect no transaction can roll back (signalling a worker). A no-op
+    outside :func:`operator_flag_gate_scope`."""
+    if _PENDING_OPERATOR_GATE.get() is None:
+        return
+    if getattr(conn, "in_transaction", False):
+        _recheck_pending_operator_gate(conn)
+        return
+    # A bare IMMEDIATE txn, not ``write_txn``: that would also consume the
+    # pending home-session recheck, which must stay with the real mutation.
+    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    try:
+        _recheck_pending_operator_gate(conn)
+    finally:
+        try:
+            conn.execute("ROLLBACK")  # nothing was written
+        except sqlite3.OperationalError:
+            pass
 
 
 def check_home_session(
@@ -9924,6 +9961,11 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    # ``reclaim --operator`` / ``reassign --reclaim --takeover``: authorize
+    # under the write lock BEFORE the termination signal. The recheck inside
+    # the later release txn cannot un-signal a worker the dispatcher claimed
+    # after the preflight (t_920c6b4a, FleetReview 946120c1ae67).
+    authorize_pending_operator_gate(conn)
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
         owner_window=_worker_owner_window(conn, task_id, row["worker_pid"]),

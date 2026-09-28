@@ -513,3 +513,61 @@ def test_gate_is_rechecked_inside_the_mutation_txn(inproc):
         "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
     assert kinds.count("takeover_refused") == 1
     assert "completed" not in kinds
+
+
+# --- t_920c6b4a round 2: FleetReview P1s on #1431 ----------------------------
+
+def test_recheck_stays_armed_after_a_caught_refusal(inproc):
+    """d292b198bb11: a caller that swallows the first refusal and writes again
+    is refused again, and both refusals are audited."""
+    kb, conn = inproc
+    tid, _ = _claimed(kb, conn)
+
+    with kb.operator_flag_gate_scope([tid], "complete", flags=["--takeover"]):
+        for _ in range(2):
+            with pytest.raises(kb.OperatorTokenRequiredError):
+                kb.complete_task(conn, tid, summary="retry after catching")
+
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running"
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+    assert kinds.count("takeover_refused") == 2
+
+
+def test_reclaim_is_authorized_before_the_worker_is_signalled(inproc):
+    """946120c1ae67: the card is claimed after the preflight; the tokenless
+    reclaim must be refused BEFORE any signal reaches the new worker."""
+    kb, conn = inproc
+    tid = kb.create_task(conn, title="idle then claimed", assignee="daedalus")
+    kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--operator"])  # idle: passes
+    kb.claim_task(conn, tid)
+    conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (os.getpid() + 7, tid))
+    conn.commit()
+    signals = []
+
+    with pytest.raises(kb.OperatorTokenRequiredError):
+        with kb.operator_flag_gate_scope([tid], "reclaim", flags=["--operator"]):
+            kb.reclaim_task(conn, tid, operator="x", signal_fn=lambda *a, **k: signals.append(a))
+
+    assert signals == []
+    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running" and row["current_run_id"] is not None
+
+
+def test_lost_refusal_audit_is_logged_not_swallowed(inproc, monkeypatch, caplog):
+    """667f8318dd40: if the audit write fails the refusal still stands and the
+    failure is logged."""
+    kb, conn = inproc
+    tid, _ = _claimed(kb, conn)
+
+    def _boom():
+        raise sqlite3.OperationalError("database is locked")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(kb.OperatorTokenRequiredError):
+            with kb.operator_flag_gate_scope([tid], "complete", flags=["--takeover"]):
+                monkeypatch.setattr(kb, "connect_closing", _boom)
+                kb.authorize_pending_operator_gate(conn)
+
+    assert "takeover_refused audit NOT recorded" in caplog.text
