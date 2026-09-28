@@ -10885,6 +10885,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    # A ``freeze`` hold refuses the turn inside _run_prompt_submit, AFTER the
+    # envelope below would be popped, and the return value is not a requeue
+    # signal -- the user's queued message was lost. Check the hold BEFORE
+    # dequeuing and leave the prompt queued (C6, #1035). True: the queued
+    # user message still wins this cycle over lower-priority follow-ups.
+    _gate = _checkout_gate_ref
+    if _gate is not None and session.get("queued_prompt") and not session.get("running"):
+        _refusal = _gate.check(internal=True)
+        if _refusal is not None:
+            logger.info("keeping queued prompt for %s: %s", sid, _refusal.reason)
+            return True
     with session["history_lock"]:
         if session.get("_closing"):
             return False

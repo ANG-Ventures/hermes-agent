@@ -149,6 +149,101 @@ def test_post_step_is_gated_on_route():
     assert post["if"] == "${{ steps.route.outputs.route != 'none' }}"
 
 
+# --- C6 (FleetReview backfill, #1196) ------------------------------------
+
+_FAKE_CURL_RUNS = r"""#!/bin/bash
+url=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac; shift
+done
+echo "$url" >> "$FAKE_CURL_LOG"
+case "$url" in
+  */actions/workflows/*/runs) printf '%s' "$FAKE_RUNS" ;;
+  *) exit 22 ;;
+esac
+"""
+
+
+def test_known_red_predecessor_is_the_latest_COMPLETED_run_not_latest_created(tmp_path):
+    """Overlapping runs: B (created later) failed, then A (created earlier)
+    succeeded last. The run before this red one, by completion, is GREEN, so
+    this red is a regression and must page #alerts, not #logs."""
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(_FAKE_CURL_RUNS)
+    (bindir / "curl").chmod(0o755)
+    out = tmp_path / "out"
+    out.write_text("")
+    runs = {"workflow_runs": [  # API order: created_at desc
+        {"id": 41, "conclusion": "failure", "updated_at": "2026-09-27T10:05:00Z"},
+        {"id": 40, "conclusion": "success", "updated_at": "2026-09-27T10:10:00Z"},
+    ]}
+    run = {"name": "Install & Update E2E", "workflow_id": 1, "id": 42, "head_branch": "main",
+           "head_sha": "abc", "conclusion": "failure", "html_url": "https://x/42",
+           "actor": {"login": "Kyzcreig"}, "event": "push"}
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(tmp_path / "log"), "FAKE_RUNS": json.dumps(runs), "GH_TOKEN": "x",
+           "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    assert got["route"] == "alerts", proc.stdout
+
+
+_FAKE_CURL_POST = r"""#!/bin/bash
+url=""; out=""; event=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    -H) case "$2" in "X-GitHub-Event: "*) event="${2#X-GitHub-Event: }" ;; esac; shift ;;
+    https://*) url="$1" ;;
+  esac; shift
+done
+echo "$url $event" >> "$FAKE_CURL_LOG"
+: > "$out"
+case "$url" in
+  *-known) printf '%s' "$FAKE_KNOWN_CODE" ;;
+  *) printf '%s' "$FAKE_ALERTS_CODE" ;;
+esac
+"""
+
+
+def _post(tmp_path, *, known_code, alerts_code):
+    steps = _workflow()["jobs"]["notify-on-failure"]["steps"]
+    post = next(s for s in steps if s.get("name", "").startswith("Sign and POST"))
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_CURL_POST)
+    (bindir / "curl").chmod(0o755)
+    log = tmp_path / "post.log"
+    log.write_text("")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "FAKE_CURL_LOG": str(log),
+           "FAKE_KNOWN_CODE": known_code, "FAKE_ALERTS_CODE": alerts_code,
+           "ROUTE": "logs", "CARD": "t_bab6df79", "CI_FAIL_WEBHOOK_SECRET": "s",
+           "WEBHOOK_URL": "https://hooks.example/webhooks/ci-fail", "WF_NAME": "Install & Update E2E",
+           "WF_BRANCH": "main", "WF_SHA": "abc", "WF_RUN_ID": "42", "WF_URL": "https://x/42",
+           "WF_ACTOR": "k", "REPO": "o/r", "WF_EVENT": "push", "EVENT_NAME": "workflow_run",
+           "GITHUB_RUN_ID": "7"}
+    proc = subprocess.run(["bash", "-c", post["run"]], env=env, capture_output=True, text=True, timeout=30)
+    return proc, log.read_text().split("\n")
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+def test_failed_known_red_delivery_falls_back_to_alerts(tmp_path):
+    proc, calls = _post(tmp_path, known_code="404", alerts_code="200")
+    assert proc.returncode == 0, proc.stderr
+    assert calls[0] == "https://hooks.example/webhooks/ci-fail-known ci_failure_known_red"
+    assert calls[1] == "https://hooks.example/webhooks/ci-fail ci_failure"
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+def test_known_red_and_fallback_both_failing_turns_the_step_red(tmp_path):
+    proc, _ = _post(tmp_path, known_code="500", alerts_code="502")
+    assert proc.returncode != 0
+
+
 # --- merge-queue dedupe (t_70f92e0b) -------------------------------------------
 # Fake GitHub API: every URL is looked up by suffix in FAKE_API (a JSON file of
 # {url-substring: response-json}); a miss exits 22 like `curl -f` on a 404.

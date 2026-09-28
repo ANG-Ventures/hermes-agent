@@ -899,3 +899,20 @@ def test_77_boards_27_concurrent_first_turns_all_within_ceiling(mod, fleet77):
     worst = max(took for _, took in res)
     assert worst < mod.BUDGET_S + SLACK_S, worst
     assert res[0][0] and "t_home" in res[0][0]["context"]
+
+
+def test_failed_exact_read_falls_back_to_the_successful_fallback_read(mod, home, monkeypatch):
+    """C6 (#1036 'Lost fallback'): a transient error on the exact-home read
+    must not drop the cards the fallback read already returned."""
+    _card(_board(home), "t_home0001", session_id=SID, title="fallback card")
+    real = mod._read_cards
+
+    def flaky(session_id, ids, parent):
+        if ids is not None:
+            raise RuntimeError("transient exact read failure")
+        return real(session_id, ids, parent)
+
+    monkeypatch.setattr(mod, "_read_cards", flaky)
+    monkeypatch.setattr(mod, "home_ids", lambda s: (s,))
+    out = mod.on_pre_llm_call(session_id=SID)
+    assert out and "fallback card" in out["context"]

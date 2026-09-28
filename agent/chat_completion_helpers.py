@@ -258,9 +258,16 @@ def _emit_api_call_record(
         # together, every fork request became the main lane's baseline and
         # the next main request was diffed against the fork. Give forks their
         # own chain, and start it fresh per fork turn.
-        is_review_fork = getattr(agent, "_memory_write_origin", None) == "background_review"
+        # /btw side-question forks are built the same way (same session_id,
+        # trimmed history): keyed with the main lane they recorded their
+        # expected replay as a mutation and spent the main lane's once-only
+        # alert slot, so a later real rewrite never paged (C6, #1176).
+        _fork_suffix = {"background_review": "review", "side_question": "side_question"}.get(
+            getattr(agent, "_memory_write_origin", None)
+        )
+        is_review_fork = _fork_suffix is not None
         if is_review_fork and session_key:
-            session_key = f"{session_key}:review"
+            session_key = f"{session_key}:{_fork_suffix}"
         prefix_reset = getattr(agent, "_blackbox_prefix_reset", None)
         if prefix_reset is not None:
             agent._blackbox_prefix_reset = None

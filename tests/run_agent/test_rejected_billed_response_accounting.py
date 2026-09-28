@@ -268,3 +268,24 @@ def test_settle_skips_rollup_for_a_foreign_turn():
     assert calls == []
     assert agent.session_api_calls == 1
     assert agent.session_output_tokens == 10606
+
+
+def test_previous_turn_failing_call_evidence_does_not_reach_the_next_turn(ledger, turn_usage):
+    """C6 (#1211): evidence stashed by a turn that ended in an error must not be
+    consumed by the NEXT turn's failover (e.g. a pre-call failover that made
+    no API call), or the fallback ledger records a stale trigger class."""
+    import time
+
+    seen = []
+
+    def _call(**_kwargs):
+        seen.append(getattr(agent, "_pending_fallback_error", "unset"))
+        return _response(usage=_ACCEPTED_USAGE, content="answer")
+
+    agent = _make_agent([])
+    agent.client.chat.completions.create.side_effect = _call
+    agent._pending_fallback_error = {"at": time.monotonic(), "status": 429,
+                                     "text": "previous turn's rate limit", "headers": {},
+                                     "body": None, "exc": "RateLimitError"}
+    agent.run_conversation("next turn")
+    assert seen and seen[0] is None

@@ -165,6 +165,23 @@ class TestBuildTurnHandoff:
         assert h["assistant_progress"] == "Half-written answer visible to the user…"
         assert "secret scratchpad" not in h["assistant_progress"]
 
+    def test_progress_cap_keeps_the_newest_work_at_the_cut(self):
+        """C6 (#813): over the cap, the live stream (tail) survives, not the
+        oldest materialized rows."""
+        from agent import turn_handoff as th
+
+        old = "OLD-PROGRESS " * (th._ASSISTANT_PROGRESS_CHARS // 4)
+        agent = _Agent(streamed_text="Half-written LIVE answer at the cut")
+        msgs = [
+            {"role": "user", "content": "hi", "row_id": 1},
+            {"role": "assistant", "content": old},
+        ]
+
+        h = build_turn_handoff(agent, msgs, turn_start_idx=0, reason="x")
+
+        assert h["assistant_progress"].endswith("Half-written LIVE answer at the cut")
+        assert "truncated" in h["assistant_progress"]
+
     def test_partial_stream_and_materialized_progress_are_preserved_once(self):
         agent = _Agent(
             streamed_text=(

@@ -78,6 +78,13 @@ def _truncate(text: Any, limit: int) -> str:
     return f"{text[:limit]}… [truncated, {len(text)} chars total]"
 
 
+def _truncate_keep_tail(text: Any, limit: int) -> str:
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text
+    return f"[truncated, {len(text)} chars total] …{text[-limit:]}"
+
+
 def _message_text(content: Any) -> str:
     """Flatten a message body (str or content-parts list) to plain text."""
     if isinstance(content, str):
@@ -220,7 +227,10 @@ def _build_turn_handoff(agent, messages, turn_start_idx, reason):
             streamed_progress = ""
         streamed_progress = streamed_progress.strip()
 
-    assistant_progress = _truncate(
+    # Keep the TAIL: the live stream and the newest progress sit at the end of
+    # the merge, and they are the state this handoff exists to carry. A head
+    # cut dropped exactly that on long tool-heavy turns (C6, #813).
+    assistant_progress = _truncate_keep_tail(
         _merge_progress(materialized_progress, streamed_progress),
         _ASSISTANT_PROGRESS_CHARS,
     )

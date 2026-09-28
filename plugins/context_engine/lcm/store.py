@@ -1370,6 +1370,20 @@ class MessageStore:
 
     # -- Search -------------------------------------------------------------
 
+    def _message_fts_flagged(self) -> bool:
+        """True while a background scan's integrity-failed flag is set for
+        ``messages_fts``. Read-only; no metadata table means no flag."""
+        from .db_bootstrap import _integrity_failed_key
+
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (_integrity_failed_key(build_message_fts_spec()),),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return bool(row and row[0])
+
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None,
@@ -1398,7 +1412,11 @@ class MessageStore:
         # query with no term left after it. A raw natural-language question is
         # NOT one of those: it sanitizes to a term form the index answers, so it
         # stays on the FTS path (F31 §3).
-        if requires_like_fallback(query, safe_query):
+        # A background scan that flagged the index (row-count parity, structure
+        # or deep integrity) means FTS MATCH can silently omit stored rows
+        # until `/lcm doctor repair`. Fail CLOSED to the exhaustive LIKE path
+        # while the flag stands (C6, #966).
+        if requires_like_fallback(query, safe_query) or self._message_fts_flagged():
             return self._search_like(
                 query,
                 session_id=session_id,

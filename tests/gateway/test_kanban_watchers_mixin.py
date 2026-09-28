@@ -462,3 +462,19 @@ def test_dispatcher_alerts_resolve_notify_from_the_active_root(tmp_path, monkeyp
     mine.write_text("", encoding="utf-8")
     assert send() is True
     assert calls[-1][1] == str(mine)
+
+
+def test_guard_stuck_notifier_pages_each_guard_reason_of_one_card():
+    """C6 (#956): a card that moves from prior_worker_still_alive to the
+    active_pr guard gets the second page and its own recovery verb."""
+    from gateway.kanban_watchers import _GuardStuckNotifier
+    notifier = _GuardStuckNotifier()
+    sent = []
+    def send(board, row):
+        sent.append(row["reason"])
+        return True
+    alive = {"task_id": "t_test", "reason": "prior_worker_still_alive", "clear_verb": "x"}
+    active_pr = {"task_id": "t_test", "reason": "active_pr", "clear_verb": "hermes kanban requeue t_test"}
+    assert notifier.observe([("default", alive)], send) == 1
+    assert notifier.observe([("default", active_pr)], send) == 1
+    assert sent == ["prior_worker_still_alive", "active_pr"]

@@ -5134,8 +5134,12 @@ def _resolve_birth_session(
        run's own per-run session id, which no human session reads.
     3. Otherwise the explicit ``session_id``, else ``unhomed``.
     """
-    if explicit and session_id and str(session_id).strip():
-        return str(session_id).strip(), None
+    if explicit:
+        # An explicit ``--session none`` arrives as None/"" and must stay
+        # unhomed; falling through would inherit the PARENT's home and stamp
+        # the child with a session the caller refused (C6, #1118).
+        sid = str(session_id).strip() if session_id else ""
+        return (sid or UNHOMED_SESSION), None
     worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     for tid in (*(parents or ()), *((worker_tid,) if worker_tid else ())):
         row = conn.execute(
@@ -12440,8 +12444,13 @@ def _kanban_review_setting(key: str, default: Any) -> tuple[Any, str]:
     if key in board:
         value, source = board[key], "board_home"
     else:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path, load_config, read_user_config_raw
 
+        # load_config() swallows a YAML/read error and serves DEFAULT_CONFIG
+        # (fresh process) -- whose review_policy is ``all``. Read the profile
+        # file raw first so an unreadable config RAISES as documented and each
+        # caller fails closed (review_policy -> none), never to ``all`` (C6, #1065).
+        read_user_config_raw(get_config_path())
         profile_cfg = (load_config() or {}).get("kanban", {}) or {}
         if key in profile_cfg:
             value = profile_cfg[key]
@@ -12570,6 +12579,18 @@ def resolve_per_profile_cap(
     if isinstance(spec, Mapping):
         key = _canonical_assignee(assignee) if assignee else None
         raw = spec.get(key) if key is not None else None
+        if raw is None and key is not None:
+            # Config keys are written by hand (``Argus: 4``); compare them in
+            # the same canonical form as the assignee, or a mixed-case key
+            # silently falls back to the default cap (C6, #1002).
+            for spec_key, spec_value in spec.items():
+                if (
+                    isinstance(spec_key, str)
+                    and spec_key != "default"
+                    and _canonical_assignee(spec_key) == key
+                ):
+                    raw = spec_value
+                    break
         if raw is None:
             raw = spec.get("default")
     else:
@@ -15410,6 +15431,20 @@ def _unstrand_evidence(conn, task_id: str) -> Optional[str]:
         (task_id,),
     ).fetchone()
     if survivor is not None and survivor[0]:
+        # A reset keeps the pointer, and the row carries no workspace
+        # generation. Once a worker has spawned into a RECREATED workspace the
+        # pointer describes the previous tree, not this one: it proves nothing
+        # about the newer, possibly unpushed work (C6, #1037). Fail closed.
+        respawned = conn.execute(
+            "SELECT 1 FROM task_events s WHERE s.task_id=? AND s.kind='spawned' "
+            "AND s.id > (SELECT COALESCE(MAX(r.id), 0) FROM task_events r "
+            "WHERE r.task_id=? AND r.kind IN ('workspace_reset', 'workspace_reallocated')) "
+            "AND EXISTS (SELECT 1 FROM task_events r WHERE r.task_id=? "
+            "AND r.kind IN ('workspace_reset', 'workspace_reallocated')) LIMIT 1",
+            (task_id, task_id, task_id),
+        ).fetchone()
+        if respawned is not None:
+            return None
         return "survivor_recorded"
     return None
 
@@ -16129,6 +16164,7 @@ def rate_limit_circuits(
         (now - 2 * window,),
     ).fetchall()
     served: dict[int, str] = {}
+    served_pool: dict[int, str] = {}
     run_ids = [int(r["id"]) for r in rows]
     for i in range(0, len(run_ids), 500):
         chunk = run_ids[i:i + 500]
@@ -16136,22 +16172,37 @@ def rate_limit_circuits(
             "SELECT run_id, kind, payload FROM task_events WHERE run_id IN ("
             + ",".join("?" * len(chunk)) + ") AND kind IN "
             "('dispatch_lane_route', 'dispatch_provider_fallback', "
-            "'worker_route_substituted') ORDER BY id",
+            "'worker_route_substituted', 'spawned') ORDER BY id",
             chunk,
         ):
             try:
                 payload = json.loads(ev["payload"] or "{}")
             except (TypeError, ValueError):
                 continue
+            if not isinstance(payload, dict):
+                continue
+            if ev["kind"] == "spawned":
+                # The pool this spawn was charged to, recorded AT spawn time
+                # (t_38be6b10): immune to a later repin of the card (C6, #953).
+                if isinstance(payload.get("pool"), str) and payload["pool"]:
+                    served_pool[int(ev["run_id"])] = payload["pool"]
+                    served.pop(int(ev["run_id"]), None)
+                continue
             field = "provider" if ev["kind"] == "dispatch_lane_route" else "to_provider"
-            if isinstance(payload, dict) and isinstance(payload.get(field), str):
+            if isinstance(payload.get(field), str):
                 served[int(ev["run_id"])] = payload[field]  # later event wins
+                served_pool.pop(int(ev["run_id"]), None)
     keys: dict[tuple, Optional[str]] = {}
     by_pool: dict[str, list[int]] = {}
     for r in rows:
+        if int(r["id"]) in served_pool:
+            by_pool.setdefault(served_pool[int(r["id"])], []).append(int(r["ended_at"]))
+            continue
         if int(r["id"]) in served:
             route = (None, "served", served[int(r["id"])])
         else:
+            # Legacy run with no recorded route: re-derived from the card's
+            # CURRENT pin, which a later repin can have changed.
             route = (r["profile"] or r["assignee"], r["model_override"], r["provider_override"])
         if route not in keys:
             keys[route] = pool_key(effective_provider(SimpleNamespace(

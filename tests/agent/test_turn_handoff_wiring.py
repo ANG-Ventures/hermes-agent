@@ -150,3 +150,24 @@ def test_no_handoff_injects_nothing(tmp_path):
 
 def test_consume_never_raises(tmp_path):
     assert consume_handoff_context(types.SimpleNamespace(), root=tmp_path) == ""
+
+
+def test_both_seams_are_called_from_the_live_turn_path():
+    """FleetReview C6 (#813 'Wiring Untested'): the tests above call the two
+    seams directly, so deleting either production call site left them green.
+    Pin that the conversation loop captures and the turn prologue consumes."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+
+    def called(rel: str, name: str) -> bool:
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        return any(
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) == name
+            for n in ast.walk(tree)
+        )
+
+    assert called("agent/conversation_loop.py", "capture_turn_handoff")
+    assert called("agent/turn_context.py", "consume_handoff_context")

@@ -483,7 +483,8 @@ def on_pre_llm_call(
             if exact is None and lin.done.is_set() and lin.error is None:
                 exact = _Bg("exact", _read_cards, sid, lin.value, parent, wake=wake)
             if dd_done:
-                if exact is not None and exact.done.is_set():
+                if exact is not None and exact.done.is_set() and (
+                        exact.error is None or fb.done.is_set()):
                     break
                 if lin.done.is_set() and lin.error is not None and fb.done.is_set():
                     break
@@ -497,8 +498,18 @@ def on_pre_llm_call(
         if _deduped(dd_done):
             return None
         stages = _stage_ms(lineage=lin, dedupe=dd, index=fb, exact=exact)
-        pick = exact if (exact is not None and exact.done.is_set()) else (
-            fb if fb.done.is_set() else None)
+        # A FAILED exact read must not hide a successful fallback read's cards
+        # (C6, #1036): the fallback home is a subset of the truth, never wrong.
+        exact_ok = exact is not None and exact.done.is_set() and exact.error is None
+        fb_ok = fb.done.is_set() and fb.error is None
+        if exact_ok:
+            pick = exact
+        elif fb_ok:
+            pick = fb
+        elif exact is not None and exact.done.is_set():
+            pick = exact
+        else:
+            pick = fb if fb.done.is_set() else None
         if pick is None:
             logger.info(  # I5 — the turn never waits longer than BUDGET_S
                 "kanban-home-cards: session=%s unavailable=timeout stage=index ms=%d %s",

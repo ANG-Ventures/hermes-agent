@@ -534,7 +534,8 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
 @pytest.mark.asyncio
 async def test_gateway_slash_session_resolution_failure_is_logged(
         kanban_home, monkeypatch, caplog):
-    """A failed lookup degrades to sessionless -- but never silently."""
+    """A failed lookup is logged, and a create then fails CLOSED (C6, #951):
+    an unstamped card would escape the home-session guard for good."""
     import logging
     from gateway.run import GatewayRunner
 
@@ -544,11 +545,35 @@ async def test_gateway_slash_session_resolution_failure_is_logged(
     with caplog.at_level(logging.WARNING):
         out = await GatewayRunner._handle_kanban_command(
             runner, _slash_event("/kanban create 'x' --json"))
-    tid = json.loads(out)["id"]
+    assert "session-unresolved" in out, out
     with kb.connect_closing() as conn:
-        assert kb.get_task(conn, tid).session_id is None
+        assert kb.list_tasks(conn) == []
     assert any("could not resolve invoking session" in r.getMessage()
                and "store offline" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_gateway_slash_unresolved_session_refuses_guarded_mutation(
+        kanban_home, monkeypatch):
+    """First-contact chat (entry_for -> no entry): a guarded mutation on a
+    homed card must not run without the guard (C6, #951 L891/L897)."""
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    out = await GatewayRunner._handle_kanban_command(
+        _slash_runner(HOME), _slash_event("/kanban create 'homed' --assignee worker-a --json"))
+    tid = json.loads(out)["id"]
+    out = await GatewayRunner._handle_kanban_command(
+        _slash_runner(None), _slash_event(f"/kanban block {tid} 'no session'"))
+    assert "session-unresolved" in out, out
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "blocked"
+    # Read-only verbs still work sessionless.
+    out = await GatewayRunner._handle_kanban_command(
+        _slash_runner(None), _slash_event(f"/kanban show {tid}"))
+    assert "session-unresolved" not in out and tid in out
 
 
 # --- claim: chat-reachable CLI verb, so guarded ---------------------------
@@ -1164,6 +1189,18 @@ def test_cli_create_writes_origin_line_when_body_omits_it(kanban_home, monkeypat
     with kb.connect_closing() as conn:
         first = kb.get_task(conn, tid).body.splitlines()[0]
     assert first.startswith("origin: ") and f"session {HOME}" in first
+
+
+def test_cli_create_child_with_session_none_stays_unhomed(kanban_home, monkeypatch):
+    """C6 (#1118 'Unstamped child'): an explicit ``--session none`` wins over
+    the parent's home instead of silently inheriting it."""
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    parent = json.loads(kc.run_slash("create 'parent' --json"))
+    assert parent["session_id"] == HOME
+    child = json.loads(kc.run_slash(f"create 'child' --parent {parent['id']} --session none --json"))
+    assert child["session_id"] is None
+    inherited = json.loads(kc.run_slash(f"create 'kid' --parent {parent['id']} --json"))
+    assert inherited["session_id"] == HOME
 
 
 # --- C5 races: ownership re-checked inside the write txn -------------------

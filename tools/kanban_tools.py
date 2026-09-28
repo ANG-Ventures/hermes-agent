@@ -1329,7 +1329,9 @@ def _read_attach_source_path(raw: str, max_bytes: int) -> bytes:
     ``max_bytes + 1`` bytes: an oversize file is then rejected by
     ``store_attachment_bytes``'s own cap without being buffered whole.
     """
-    expanded = os.path.expanduser(raw.strip())
+    # Never strip: ``/tmp/report `` and ``/tmp/report`` are different files,
+    # and stripping would attach the second while reporting success (C6).
+    expanded = os.path.expanduser(raw)
     if not os.path.isabs(expanded):
         raise ValueError(f"path must be absolute: {raw!r}")
     if not os.path.isfile(expanded):
@@ -1378,6 +1380,19 @@ def _handle_attach(args: dict, **kw) -> str:
             "supplied (omit it to attach a path unverified); nothing stored"
         )
     if has_path:
+        # ``path`` is read in THIS (host) process. With a docker/modal/ssh
+        # terminal backend the file the agent created lives in that
+        # environment, and the same absolute path on the host may be a
+        # different file. Only a digest computed where the file was written
+        # proves the host bytes are that file, so fail closed without one.
+        backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+        if backend not in ("", "local") and expected is None:
+            return tool_error(
+                f"kanban_attach: remote-path-unverified: the terminal backend is "
+                f"{backend!r}, so path is read on the agent host, not where the "
+                "file was written. Pass expected_sha256 (sha256sum of the file in "
+                "the terminal) or use content_base64."
+            )
         # The bytes never pass through the model. A model that has to
         # re-emit a file as base64 transcribes it token by token and drops
         # or invents characters on larger payloads (t_31148bf8); reading the
@@ -1389,7 +1404,7 @@ def _handle_attach(args: dict, **kw) -> str:
         except (OSError, ValueError) as e:
             return tool_error(f"kanban_attach: cannot read path: {e}")
         filename = args.get("filename") or os.path.basename(
-            os.path.expanduser(source_path.strip())
+            os.path.expanduser(source_path)
         )
     else:
         filename = args.get("filename")

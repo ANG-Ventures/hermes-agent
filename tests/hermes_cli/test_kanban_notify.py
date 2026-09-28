@@ -661,6 +661,9 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
+    # A resolved invoking session: sessionless creates fail closed (C6, #951).
+    runner._session_key_for_source = lambda _source: "agent:main:telegram:dm:chat1"
+    runner.session_store = SimpleNamespace(entry_for=lambda _key: SimpleNamespace(session_id="sess-notify"))
     source = SimpleNamespace(
         platform=Platform.TELEGRAM,
         chat_id="chat1",
@@ -737,6 +740,9 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
+    # A resolved invoking session: sessionless creates fail closed (C6, #951).
+    runner._session_key_for_source = lambda _source: "agent:main:telegram:dm:chat1"
+    runner.session_store = SimpleNamespace(entry_for=lambda _key: SimpleNamespace(session_id="sess-notify"))
     # user_id != user_id_alt is the whole point: the alt id is the canonical
     # participant, so dropping it silently corrupts the session key.
     source = SimpleNamespace(

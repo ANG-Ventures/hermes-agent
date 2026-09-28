@@ -160,3 +160,16 @@ def test_board_home_answer_stable_across_profile_switch_aba(homes, monkeypatch):
     _use(monkeypatch, root)
     r = answer()
     assert a1 == b == a2 == r == expected
+
+
+def test_unreadable_profile_config_fails_closed_to_none_not_default_all(homes, monkeypatch, caplog):
+    """C6 (#1065): load_config() hides a YAML error behind DEFAULT_CONFIG
+    (review_policy: all). A broken profile config must yield ``none`` and log
+    review_policy_invalid, never route every card to a reviewer."""
+    root, prof_w, _ = homes
+    _write_kanban(root)  # board home silent on review_policy
+    (prof_w / "config.yaml").write_text("kanban: [review_policy: none\n", encoding="utf-8")
+    _use(monkeypatch, prof_w)
+    with caplog.at_level(logging.WARNING, logger=kb.__name__):
+        assert kb.configured_review_policy() == "none"
+    assert "review_policy_invalid" in caplog.text
