@@ -4,7 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import run_agent
-from agent.session_activity import ActivityProvenance
+from agent.session_activity import (
+    ActivityProvenance,
+    SESSION_ACTIVITY_PERSIST_NEVER,
+    reset_session_activity_persist_window,
+)
 
 
 def _agent_with_db(session_id: str = "sess-1"):
@@ -14,7 +18,7 @@ def _agent_with_db(session_id: str = "sess-1"):
         _last_activity_ts=0.0,
         _last_activity_desc="",
         _last_activity_provenance=ActivityProvenance.UNKNOWN,
-        _session_activity_last_persist_mono=0.0,
+        _session_activity_last_persist_mono=SESSION_ACTIVITY_PERSIST_NEVER,
         _current_tool=None,
         _api_call_count=0,
         max_iterations=10,
@@ -94,7 +98,7 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
     )
 
     agent._session_db.touch_session_activity.reset_mock()
-    agent._session_activity_last_persist_mono = 0.0
+    reset_session_activity_persist_window(agent)
     agent._touch_activity("starting API call #1")
     assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
     agent._session_db.touch_session_activity.assert_called_once_with(
@@ -103,6 +107,27 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
         description="starting API call #1",
         provenance=ActivityProvenance.UNKNOWN,
     )
+
+
+def test_touch_activity_persists_in_first_minute_after_host_boot(monkeypatch):
+    """monotonic() counts from boot: a fresh CI VM / login-started gateway reads
+    < 60s. The first stamp and a force_persist terminal stamp must still write
+    (heavy-ci run 36328699837 flake: 0.0 sentinel read as 'persisted just now')."""
+    agent = _agent_with_db()
+    del agent._session_activity_last_persist_mono  # never-initialised path too
+    monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: 5.0)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    agent._touch_activity("first stamp after boot")
+    assert agent._session_db.touch_session_activity.call_count == 1
+
+    agent._touch_activity("inside the window")
+    assert agent._session_db.touch_session_activity.call_count == 1  # rate limit holds
+
+    reset_session_activity_persist_window(agent)
+    agent._touch_activity("context compression completed")
+    assert agent._session_db.touch_session_activity.call_count == 2
 
 
 def test_touch_activity_persist_errors_are_swallowed(monkeypatch):

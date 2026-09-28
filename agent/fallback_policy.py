@@ -1100,6 +1100,8 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).
         cause = _provider_cause(row)
         return f"{prefix}{cause}" if row.get("provider_message") else f"{prefix}{cause}, {window}"
+    if relay_conn_without_evidence(row):
+        return f"{prefix}{_relay_conn_cause(row, tz)}, {window}"
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
@@ -1125,6 +1127,53 @@ def _plain_provider(row: Mapping[str, Any]) -> bool:
     if not prov or prov.startswith("claude-"):
         return False
     return not (row.get("hop") or row.get("seat"))
+
+
+_LOOPBACK_HOSTS = ("127.", "localhost", "::1", "[::1]")
+# Failures before the relay answered. "incomplete read" / "read timeout" can
+# be a mid-stream drop after the relay picked a seat, so they keep the rider.
+_PRE_ANSWER_CONN = ("connection error", "connection reset", "connect timeout")
+
+
+def relay_conn_without_evidence(row: Mapping[str, Any]) -> bool:
+    """A pooled relay lane's connection failure with no relay evidence (no
+    hop, seat, relay header or HTTP status): the relay never answered, so there is no
+    hop or sub to name (t_21bba7dc: "connection error (hop unknown, sub
+    unknown)" while relay-autodeploy restarted the local relay)."""
+    if row.get("trigger_class") != "conn":
+        return False
+    prov = str(row.get("from_provider") or "").strip().lower()
+    if prov.startswith("custom:"):
+        prov = prov[len("custom:"):]
+    if not prov.startswith("claude-") or is_direct_pin(prov):
+        return False
+    if normalize_hop(row.get("hop")) or (row.get("seat") and row.get("seat") != "unknown"):
+        return False
+    if row.get("class_source") in ("relay_header", "relay_stream") or row.get("relay_synthetic"):
+        return False
+    if row.get("http_status") is not None:  # an HTTP status means the relay answered
+        return False
+    return _cause_phrase(row) in _PRE_ANSWER_CONN
+
+
+def _relay_conn_cause(row: Mapping[str, Any], tz: Optional[_dt.tzinfo]) -> str:
+    addr = str(row.get("relay_addr") or "").strip()
+    if not addr:
+        name = "the relay"
+    elif addr.lower().startswith(_LOOPBACK_HOSTS):
+        name = f"local relay {addr}"
+    else:
+        name = f"relay {addr}"
+    if _cause_phrase(row) == "connect timeout":
+        text = f"{name} did not accept the connection"
+    else:
+        text = f"{name} dropped the connection before answering"
+    up = row.get("relay_up")
+    if up and row.get("relay_up_ts") is not None:
+        text += f"; relay back up {_hms(row['relay_up_ts'], tz).strftime('%H:%M:%S')}"
+    elif up is False:
+        text += "; relay not reachable"
+    return text
 
 
 def _provider_cause(row: Mapping[str, Any]) -> str:

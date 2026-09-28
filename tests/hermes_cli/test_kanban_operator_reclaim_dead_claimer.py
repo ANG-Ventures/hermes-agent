@@ -183,10 +183,10 @@ def test_cli_gate_covers_reclaim_operator_only(conn, monkeypatch):
     monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
     tid, _ = _running_card(conn, _host(_dead_pid()))
     with pytest.raises(kb.OperatorTokenRequiredError):
-        kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--operator"], argv=["x"])
+        kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--operator"])
     assert _events(conn, tid, "takeover_refused")[-1]["flags"] == ["--operator"]
     # --takeover on reclaim keeps its prior, ungated behaviour.
-    kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--takeover"], argv=["x"])
+    kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--takeover"])
     assert len(_events(conn, tid, "takeover_refused")) == 1
 
 

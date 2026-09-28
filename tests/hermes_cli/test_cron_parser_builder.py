@@ -48,3 +48,26 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_pause_reason_reaches_the_store(monkeypatch):
+    """t_6b72ef98: `cron pause` had no way to record WHY, so c5ae0c293f14 was paused
+    "until the PR lands" with paused_reason=None and silently missed its first window."""
+    import importlib
+
+    cli = importlib.import_module("hermes_cli.cron")
+    seen = {}
+
+    def _fake_api(**kwargs):
+        seen.update(kwargs)
+        return {"success": True, "job": {"name": "j"}}
+
+    monkeypatch.setattr(cli, "_cron_api", _fake_api)
+    parser = _build()
+    ns = parser.parse_args(["cron", "pause", "jid", "--reason", "until PR #1 lands"])
+    assert cli.cron_command(ns) == 0
+    assert seen == {"action": "pause", "job_id": "jid", "reason": "until PR #1 lands"}
+
+    seen.clear()
+    assert cli.cron_command(parser.parse_args(["cron", "pause", "jid"])) == 0
+    assert seen == {"action": "pause", "job_id": "jid", "reason": None}

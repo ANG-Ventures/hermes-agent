@@ -82,6 +82,45 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
+_GUARD_DISPLAY_RESET_KINDS = frozenset(
+    {"claimed", "spawned", *kb._RESPAWN_GUARD_FAILURE_RESET_KINDS}
+)
+
+
+def _fmt_current_respawn_guard(status: str, events) -> str:
+    """``<reason> — <pr> (<state>)`` for the respawn guard holding a queued card.
+
+    Only the newest ``respawn_guarded`` event counts, and only when no
+    claim/spawn or guard-resetting event (operator requeue, status change,
+    reassign, ...) came after it: the guard let it go, or its answer may have
+    changed and the next dispatch tick re-records it if it still holds.
+    Empty for any other status or when nothing is holding the card.
+    """
+    if status not in ("ready", "review"):
+        return ""
+    held = None
+    for ev in events:
+        if ev.kind == "respawn_guarded":
+            held = ev
+        elif ev.kind in _GUARD_DISPLAY_RESET_KINDS:
+            held = None
+    if held is None:
+        return ""
+    payload = held.payload if isinstance(held.payload, dict) else {}
+    line = str(payload.get("reason") or "?")
+    pr = payload.get("pr")
+    if pr:
+        line += f" — {pr}"
+        if payload.get("pr_state"):
+            line += f" ({payload['pr_state']})"
+    else:
+        line += _fmt_respawn_guard_detail(
+            {k: payload.get(k) for k in ("error", "recorded_at", "eligible_at")
+             if payload.get(k)}
+        )
+    return f"{line}  [as of {_fmt_ts(held.created_at)}]"
+
+
 # Statuses on which an open workspace-refusal episode is still live news.
 _REFUSAL_VISIBLE_STATUSES = frozenset({"todo", "ready", "review"})
 
@@ -1928,7 +1967,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 with kb.connect_closing() as gate_conn:
                     kb.enforce_operator_flag_gate(
                         gate_conn, _lifecycle_target_ids(args), action,
-                        flags=gated_flags, argv=sys.argv,
+                        flags=gated_flags,
                     )
             except kb.OperatorTokenRequiredError as exc:
                 print(f"kanban: {exc}", file=sys.stderr)
@@ -1952,7 +1991,13 @@ def kanban_command(args: argparse.Namespace) -> int:
                 operator=getattr(args, "operator", None),
             )
         try:
-            with actor_scope:
+            # The preflight above ran on its own connection; the scope re-runs
+            # the same gate inside every write transaction the handler opens,
+            # so a run claimed in between is never closed by a tokenless
+            # override (t_920c6b4a).
+            with kb.operator_flag_gate_scope(
+                _lifecycle_target_ids(args), action, flags=gated_flags,
+            ), actor_scope:
                 return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             # A survivor refusal carries its operator-only hint on the
@@ -3027,6 +3072,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}"
           + (f"  [{_fmt_refusal(refusal)}]" if refusal else ""))
+    guard_line = _fmt_current_respawn_guard(task.status, events)
+    if guard_line:
+        print(f"  guard:     {guard_line}")
     print(f"  assignee:  {task.assignee or '-'}")
     print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
     print(f"  home:      {_home_label(task.session_id, unhomed=task.unhomed)}")
