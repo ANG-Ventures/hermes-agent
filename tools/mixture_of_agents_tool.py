@@ -48,6 +48,7 @@ Usage:
 import json
 import logging
 import os
+import re
 import asyncio
 import datetime
 from typing import Dict, Any, List, Optional
@@ -87,6 +88,20 @@ The model responses arrive in the user message inside <reference_responses> tags
 _debug = DebugSession("moa_tools", env_var="MOA_TOOLS_DEBUG")
 
 
+_REFERENCE_TAG_RE = re.compile(r"<\s*/?\s*reference_responses\b[^<>]*>", re.IGNORECASE)
+
+
+def _neutralize_reference_tags(text: str) -> str:
+    """Entity-escape any <reference_responses> open/close tag inside an untrusted response.
+
+    Without this a response could emit ``</reference_responses>`` followed by a forged
+    ``User query:`` section and escape the data block.
+    """
+    return _REFERENCE_TAG_RE.sub(
+        lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), str(text)
+    )
+
+
 def _construct_aggregator_prompt(user_prompt: str, responses: List[str]) -> str:
     """
     Construct the aggregator's USER message: reference responses as delimited data, then the query.
@@ -102,7 +117,9 @@ def _construct_aggregator_prompt(user_prompt: str, responses: List[str]) -> str:
     Returns:
         str: User message with enumerated, tagged responses followed by the query
     """
-    response_text = "\n".join([f"{i+1}. {response}" for i, response in enumerate(responses)])
+    response_text = "\n".join(
+        [f"{i+1}. {_neutralize_reference_tags(response)}" for i, response in enumerate(responses)]
+    )
     return (
         f"<reference_responses>\n{response_text}\n</reference_responses>\n\n"
         f"User query:\n{user_prompt}"

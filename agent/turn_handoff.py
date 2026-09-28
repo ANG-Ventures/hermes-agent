@@ -28,6 +28,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -241,6 +242,20 @@ def _build_turn_handoff(agent, messages, turn_start_idx, reason):
     }
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Persist a rename's directory entry where the platform supports it."""
+    try:
+        dfd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
 def write_turn_handoff(
     session_key: str,
     handoff: Optional[Dict[str, Any]],
@@ -257,7 +272,11 @@ def write_turn_handoff(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(handoff, fh)
+                # Durable before the saved notice goes out (C7 k86).
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
+            _fsync_dir(path.parent)
         except Exception:
             try:
                 os.unlink(tmp)
@@ -277,6 +296,42 @@ def write_turn_handoff(
     return True
 
 
+def _claim_path(path: Path) -> Path:
+    # Never matches the ``*.json`` sweep glob, so a claim is not re-read.
+    return path.with_name(f"{path.name}.claim-{uuid.uuid4().hex}")
+
+
+def _unlink_if_unchanged(path: Path, raw: str) -> None:
+    """Delete ``path`` only if it still holds ``raw``.
+
+    A concurrent :func:`write_turn_handoff` may ``os.replace`` a FRESH handoff
+    over the stale one between our read and the delete; unlinking by path
+    would destroy it. Claim the current file with an atomic rename, compare,
+    and put a fresh one back with ``os.link`` (which never overwrites a file
+    written after the claim).
+    """
+    claimed = _claim_path(path)
+    try:
+        os.rename(path, claimed)
+    except OSError:
+        return
+    try:
+        try:
+            current = claimed.read_text(encoding="utf-8")
+        except Exception:
+            current = raw
+        if current != raw:
+            try:
+                os.link(claimed, path)
+            except OSError:
+                pass  # an even newer handoff already took the path
+    finally:
+        try:
+            claimed.unlink()
+        except OSError:
+            pass
+
+
 def _load_turn_handoff(
     session_key: str,
     *,
@@ -285,19 +340,39 @@ def _load_turn_handoff(
 ) -> Optional[Dict[str, Any]]:
     """Read a valid handoff, optionally deleting it after a successful read."""
     path = handoff_path_for(session_key, root=root)
+    source = path
+    if consume:
+        # Consume = atomically take ownership of whatever handoff is current.
+        # A replacement written after this rename lands at ``path`` untouched.
+        source = _claim_path(path)
+        try:
+            os.rename(path, source)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.debug("turn handoff claim failed for %s", session_key, exc_info=True)
+            return None
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = source.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except Exception:
         logger.debug("turn handoff read failed for %s", session_key, exc_info=True)
+        if consume:
+            try:
+                source.unlink()
+            except OSError:
+                pass
         return None
 
     def _drop():
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        if consume:
+            try:
+                source.unlink()
+            except OSError:
+                pass
+        else:
+            _unlink_if_unchanged(path, raw)
 
     try:
         payload = json.loads(raw)
@@ -384,16 +459,20 @@ def prune_expired_handoffs(*, root: Optional[Path] = None) -> int:
     now = time.time()
     for path in entries:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        try:
+            payload = json.loads(raw)
             created_at = float(payload.get("created_at") or 0)
         except Exception:
             created_at = 0.0
         if (now - created_at) > HANDOFF_TTL_SECONDS:
-            try:
-                path.unlink()
+            # By content, not by path: a fresh handoff written since the read
+            # must survive the sweep.
+            _unlink_if_unchanged(path, raw)
+            if not path.exists():
                 removed += 1
-            except OSError:
-                pass
     return removed
 
 
@@ -513,7 +592,7 @@ def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
     if calls:
         lines.append("\nTool calls issued this turn:")
         for call in calls:
-            status = "completed" if call.get("completed") else "NEVER COMPLETED"
+            status = "completed" if call.get("completed") else "NO RESULT RECORDED"
             args = _redact_tool_text(call.get("arguments"))
             lines.append(f"- {call.get('name')}({args}) [{status}]")
             if call.get("result_preview"):
@@ -524,7 +603,8 @@ def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
         for todo in todos:
             lines.append(f"- [{todo.get('status')}] {todo.get('content')}")
     lines.append(
-        "\nContinue from here. Do not redo completed tool calls; re-issue the "
-        "one that never completed."
+        "\nContinue from here. Do not redo completed tool calls. A call with no "
+        "result recorded may still have run its side effect before the cut: "
+        "verify its outcome before re-issuing it."
     )
     return "\n".join(lines)

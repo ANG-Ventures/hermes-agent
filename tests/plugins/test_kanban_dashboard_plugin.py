@@ -1480,3 +1480,17 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_create_from_session_link_lands_in_viewer_home(client):
+    """C7 k121: a card created from /kanban?session=<id> must stay visible
+    under that link's default "this" facet (in_viewer_home)."""
+    sid = "20260927_120000_viewer"
+    r = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "from session link", "session_id": sid})
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["session_id"] == sid
+    board = client.get("/api/plugins/kanban/board", params={"session": sid}).json()
+    cards = [c for col in board["columns"] for c in col["tasks"] if c["id"] == task["id"]]
+    assert cards and cards[0]["in_viewer_home"] is True

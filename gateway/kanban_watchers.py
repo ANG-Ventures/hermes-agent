@@ -357,6 +357,72 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
+def _session_origin(session_id: str) -> Optional[tuple[str, str, str]]:
+    """``(platform, chat_id, thread_id)`` a session was opened from, or None.
+
+    Blocking state.db lookup; call from a worker thread only.
+    """
+    row = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            row = db.get_session(session_id)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+    except Exception:
+        return None
+    raw = (row or {}).get("origin_json")
+    if not raw:
+        return None
+    try:
+        import json as _json
+
+        origin = _json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(origin, dict):
+        return None
+    return (
+        str(origin.get("platform") or "").lower(),
+        str(origin.get("chat_id") or ""),
+        str(origin.get("thread_id") or ""),
+    )
+
+
+def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
+    """Ids of claimed events made by a session living in ``sub``'s own chat.
+
+    Waking a chat about a transition its own session just made is an echo:
+    the agent already knows, and spends a turn saying "echo of my own close,
+    nothing further" (t_a4890a77: 72 of 482 pings in Ace's chat over 48h,
+    25 visible echo replies). The passive line still posts; only the wake is
+    skipped. Events with no recorded actor, or an actor whose origin is
+    unknown or another chat, still wake. Matching is by the actor session's
+    recorded origin only: a bare ``actor == chat_id`` match proves nothing on
+    push subs, and non-push (api_server) subs never suppress (the wake is
+    their only delivery), so there is no chat_id shortcut.
+    """
+    origin_of = origin_of or _session_origin
+    chat_id = str(sub.get("chat_id") or "")
+    platform = str(sub.get("platform") or "").lower()
+    thread_id = str(sub.get("thread_id") or "")
+    out: set[int] = set()
+    cache: dict[str, Optional[tuple[str, str, str]]] = {}
+    for ev in events or []:
+        actor = (getattr(ev, "actor_session_id", None) or "").strip()
+        if not actor:
+            continue
+        if actor not in cache:
+            cache[actor] = origin_of(actor)
+        if cache[actor] == (platform, chat_id, thread_id):
+            out.add(ev.id)
+    return out
+
+
 # LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
 # `hermes kanban daemon` loop); re-exported here for existing importers.
 from hermes_cli.kanban_load_gate import LoadGate  # noqa: E402,F401
@@ -1212,6 +1278,7 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "home": home_line,
+                                        "self_event_ids": self_caused_event_ids(sub, events),
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -1619,14 +1686,35 @@ class GatewayKanbanWatchersMixin:
                             "blocked", "review_requested", "changes_requested",
                             "block_loop_detected",
                         )
-                        _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
-                        )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
+                        # A transition made from this chat's own session is
+                        # not news to it: post the line, skip the wake
+                        # (t_a4890a77). Only when the passive line on a push
+                        # adapter IS the delivery: for delivery_mode='wake'
+                        # and non-push (api_server) subs the wake is the sole
+                        # delivery, and dropping it would advance the cursor
+                        # (and maybe unsubscribe) with nothing delivered.
+                        _self_ids = (
+                            d.get("self_event_ids") or set()
+                            if (send_passive and _is_push_adapter)
+                            else set()
+                        )
+                        _wake_kinds = (
+                            {
+                                ev.kind for ev in d["events"]
+                                if ev.kind in _WAKE_KINDS and ev.id not in _self_ids
+                            }
+                            if wake_agent
+                            else set()
+                        )
+                        if wake_agent and _self_ids and not _wake_kinds:
+                            logger.info(
+                                "kanban notifier: wake skipped for %s on %s/%s: "
+                                "transition made by this chat's own session",
+                                sub["task_id"], platform_str, sub["chat_id"],
+                            )
                         _session_key = ""
                         _synth = ""
                         if _wake_kinds:

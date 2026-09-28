@@ -217,3 +217,108 @@ def test_e2e_pr_only_mentioned_in_prose_is_routed_but_never_armed(board, monkeyp
         meta = kb.latest_run(conn, tid).metadata
         assert "not armed" in meta["handoff_freshness"]["prs"]["o/r#5"]["automerge"]
     assert armed == []
+
+
+# --- audited per-card draft override (t_f38605be) ------------------------
+
+
+def _events(conn, tid, kind):
+    import json
+    return [json.loads(r["payload"]) if r["payload"] else None for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
+        (tid, kind))]
+
+
+def test_draft_ok_reports_override_and_skips_mutation():
+    gh = FakeGh(draft=True, behind=50)
+    armed = []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh,
+                   arm=lambda *a: armed.append(a), draft_ok=True)
+    assert rep["draft_override"] == ["o/r#5"]
+    assert gh.updates() == [] and armed == []
+
+
+def test_e2e_draft_refused_without_override_completes_with_it(board, monkeypatch):
+    _use_gh(monkeypatch, FakeGh(draft=True), [])
+    reason = "CI vehicle for upstream PR up/r#638; intentionally left draft"
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        with pytest.raises(fr.DraftPrError) as exc:
+            kb.complete_task(conn, tid, summary=f"done {PR_URL}", expected_run_id=run)
+        assert "draft_ok" in str(exc.value)
+        assert _status(conn, tid) == "running"
+        assert _events(conn, tid, "completion_draft_override") == []
+
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                expected_run_id=run, draft_ok=reason) is True
+        assert _status(conn, tid) == "done"
+        assert _events(conn, tid, "completion_draft_override") == [
+            {"prs": ["o/r#5"], "reason": reason}]
+        assert _events(conn, tid, "completion_routed_to_review") == []
+        meta = kb.latest_run(conn, tid).metadata
+        assert meta["draft_override"] == {"prs": ["o/r#5"], "reason": reason}
+
+
+def test_e2e_empty_draft_ok_refused_before_any_gate(board, monkeypatch):
+    _use_gh(monkeypatch, FakeGh(draft=True), [])
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        for blank in ("", "   "):
+            with pytest.raises(kb.EmptyDraftOverrideError):
+                kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                 expected_run_id=run, draft_ok=blank)
+        assert _status(conn, tid) == "running"
+        assert len(_events(conn, tid, "completion_blocked_empty_draft_override")) == 2
+        assert _events(conn, tid, "completion_blocked_draft_pr") == []
+
+
+def test_e2e_draft_ok_still_routes_other_open_prs(board, monkeypatch):
+    """The override drops ONLY the drafts; a non-draft open PR still routes to review."""
+    def gh(*args):
+        path = args[-1] if not args[0].startswith("-") else args[2]
+        if path.endswith("/pulls/5"):
+            return {"draft": True, "head": {"sha": HEAD}, "base": {"ref": "main"}}
+        if path.endswith("/pulls/6"):
+            return {"draft": False, "head": {"sha": HEAD}, "base": {"ref": "main"}}
+        if "/compare/" in path:
+            return {"behind_by": 0, "ahead_by": 1}
+        return None
+    _use_gh(monkeypatch, gh, [])
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.complete_task(
+            conn, tid, summary=f"done {PR_URL} and https://github.com/o/r/pull/6",
+            expected_run_id=run, draft_ok="vehicle") is True
+        assert _status(conn, tid) == "review"
+        assert _events(conn, tid, "completion_draft_override") == [
+            {"prs": ["o/r#5"], "reason": "vehicle"}]
+        routed = _events(conn, tid, "completion_routed_to_review")
+        assert routed and routed[0]["open_prs"] == ["o/r#6"]
+
+
+def _cli(rest):
+    import argparse, contextlib, io, shlex
+    from hermes_cli import kanban as kc
+    wrap = argparse.ArgumentParser(prog="wrap", add_help=False)
+    parser = kc.build_parser(wrap.add_subparsers(dest="_top"))
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = kc.kanban_command(parser.parse_args(shlex.split(rest)))
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_cli_draft_ok_flag_refused_then_audited(board, monkeypatch):
+    _use_gh(monkeypatch, FakeGh(draft=True), [])
+    with kb.connect() as conn:
+        tid, _ = _claimed(conn)
+    rc, _, err = _cli(f"complete {tid} --summary 'done {PR_URL}'")
+    assert rc == 1 and "DRAFT PR" in err and "--draft-ok" in err
+    rc, _, err = _cli(f"complete {tid} --summary 'done {PR_URL}' --draft-ok ' '")
+    assert rc == 1 and "empty draft_ok" in err
+    rc, out, _ = _cli(f"complete {tid} --summary 'done {PR_URL}' --draft-ok 'CI vehicle'")
+    assert rc == 0, out
+    assert f"Completed {tid}" in out and "draft override recorded for o/r#5: CI vehicle" in out
+    with kb.connect() as conn:
+        assert _status(conn, tid) == "done"
+        assert _events(conn, tid, "completion_draft_override") == [
+            {"prs": ["o/r#5"], "reason": "CI vehicle"}]

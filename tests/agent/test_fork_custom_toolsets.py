@@ -19,10 +19,16 @@ the test.
 """
 
 import importlib
+from pathlib import Path
 
 import pytest
 
 from toolsets import TOOLSETS, resolve_toolset, validate_toolset
+
+# Derived from THIS file, never from an imported module: an editable-install
+# leak makes the import AND a module-derived root point at the sibling tree,
+# so the provenance check would compare the leak with itself (C7 k129).
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
 
 
 class TestForkCustomToolsetsPresent:
@@ -58,10 +64,8 @@ class TestMixtureOfAgentsToolRegistered:
         # install. Pin the module's resolved file to THIS repo's tools/ dir, so a
         # phantom import from elsewhere is treated as "missing", not a pass.
         import os
-        import toolsets as _toolsets_mod
 
-        repo_root = os.path.dirname(os.path.abspath(_toolsets_mod.__file__))
-        expected = os.path.join(repo_root, "tools", "mixture_of_agents_tool.py")
+        expected = os.path.join(_REPO_ROOT, "tools", "mixture_of_agents_tool.py")
         assert os.path.isfile(expected), (
             "tools/mixture_of_agents_tool.py is missing from THIS repo — the moa "
             "tool module was dropped (likely an upstream parity merge)"
@@ -82,13 +86,14 @@ class TestMixtureOfAgentsToolRegistered:
 
     def test_tool_schema_shape(self):
         import os
-        import toolsets as _toolsets_mod
 
-        repo_root = os.path.dirname(os.path.abspath(_toolsets_mod.__file__))
-        expected = os.path.join(repo_root, "tools", "mixture_of_agents_tool.py")
+        expected = os.path.join(_REPO_ROOT, "tools", "mixture_of_agents_tool.py")
         assert os.path.isfile(expected), "tools/mixture_of_agents_tool.py missing from this repo"
 
-        importlib.import_module("tools.mixture_of_agents_tool")
+        mod = importlib.import_module("tools.mixture_of_agents_tool")
+        assert os.path.abspath(getattr(mod, "__file__", "") or "") == expected, (
+            f"tools.mixture_of_agents_tool imported from {mod.__file__}, not this repo"
+        )
         from tools.registry import registry
 
         entry = registry._tools["mixture_of_agents"]
