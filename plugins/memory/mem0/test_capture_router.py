@@ -157,7 +157,7 @@ def test_router_scrubs_secret_world_facts_before_any_write(tmp_path, staging_mod
     res = router.route_turn("u", "a", turn_id="t009", session="s")
     assert res["world_scrubbed"] == 1
     assert [f["content"] for f in res["world_facts"]] == ["gbrain uses PGLite by default"]
-    written = "".join(p.read_text() for p in tmp_path.rglob("*.md"))
+    written = "".join(p.read_text(encoding="utf-8") for p in tmp_path.rglob("*.md"))
     assert "PGLite" in written and secret not in written
 
 
