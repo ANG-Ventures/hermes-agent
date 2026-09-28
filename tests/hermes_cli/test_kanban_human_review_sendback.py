@@ -144,10 +144,17 @@ def _claim_refused(monkeypatch, tid, session):
 def test_sessionless_claim_is_not_bound_and_refused(board, monkeypatch):
     _claim_refused(monkeypatch, board, None)
     out = cli.run_slash(
-        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())}'
     )
     assert "cannot request changes" in out, out
     assert _status(board) == "review"
+    # An explicit --takeover is the operator's override: a card parked in
+    # review is sent back without any claim (t_c3cf232e scope add).
+    out = cli.run_slash(
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
+    )
+    assert "Requested changes" in out, out
+    assert _status(board) == "ready"
 
 
 def test_delegate_child_caller_is_refused_even_with_the_claiming_session(board, monkeypatch):

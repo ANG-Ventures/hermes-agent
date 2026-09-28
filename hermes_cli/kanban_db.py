@@ -17308,10 +17308,11 @@ def _dead_claimer_release_at(
 
     * operator claim (``claimed`` event carries ``operator_claim``, set only by
       ``hermes kanban claim --review``) with no worker evidence: release at
-      the claim itself. Nothing ever spawns for such a run, so the dead CLI
-      pid in ``claim_lock`` is the whole claimant (t_c3cf232e: without this
-      the orphan held the card for the full launch bound while every
-      operator ``reclaim`` was refused ``liveness_unprovable``).
+      the claim itself. Nothing ever spawns for such a run, so the pid in
+      ``claim_lock`` (a CLI, or the long-lived gateway) is not a worker and its
+      liveness is irrelevant; :func:`_terminate_reclaimed_worker` releases it
+      without probing that pid (t_c3cf232e: without this the orphan held the
+      card while every operator ``reclaim`` was refused ``liveness_unprovable``).
 
     Returns ``(release_at, basis, evidence_kind)``; ``release_at`` is None when
     there is no current run to anchor the bound (held).
@@ -17407,6 +17408,17 @@ def _terminate_reclaimed_worker(
             # a detached worker whose pid was never stamped, so a caller that
             # forgets conn/task_id must hold the claim, never release it.
             info["unstamped_worker_check"] = "skipped_no_run_context"
+            return info
+        release_at, basis, _ = _dead_claimer_release_at(conn, task_id)
+        if basis == "operator_claim_no_worker":
+            # An operator review claim never spawns a worker, so the claimer's
+            # liveness says nothing about one. The gateway's in-process
+            # ``/kanban claim --review`` records the long-lived gateway pid,
+            # which would otherwise hold the card for as long as the gateway
+            # runs (FleetReview fd7f0d736976, t_c3cf232e).
+            info["dead_claimer_release_basis"] = basis
+            info["liveness_unprovable"] = False
+            info["terminated"] = True
             return info
         claimer_pid = 0
         try:

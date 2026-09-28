@@ -47,7 +47,7 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _cli(home_dir: Path, rest: str, *, session=None) -> subprocess.CompletedProcess:
+def _cli(home_dir: Path, rest: str, *, session=None, extra_env=None) -> subprocess.CompletedProcess:
     """Run ``/kanban <rest>`` in a fresh interpreter that exits when done."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(_SCRUB_PREFIXES) and k not in _SCRUB_KEYS}
@@ -58,6 +58,7 @@ def _cli(home_dir: Path, rest: str, *, session=None) -> subprocess.CompletedProc
     })
     if session:
         env["HERMES_SESSION_ID"] = session
+    env.update(extra_env or {})
     code = (
         "import sys\n"
         "from hermes_cli import kanban as cli\n"
@@ -162,3 +163,99 @@ def test_dispatcher_review_claim_with_dead_claimer_still_held(home):
         assert task.status == "running"
         refused = [e for e in kb.list_events(conn, tid) if e.kind == "reclaim_refused"]
         assert refused[-1].payload["dead_claimer_release_basis"] == "launch_bound"
+
+
+def test_gateway_held_operator_claim_is_reclaimable_while_gateway_lives(home):
+    """FleetReview fd7f0d736976: the gateway's in-process ``/kanban claim
+    --review`` records the LONG-LIVED gateway pid. An operator claim never
+    spawns a worker, so a live claimer must not hold the card."""
+    tid = _parked_review()
+    gateway = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        host = kb._claimer_id().split(":", 1)[0]
+        with kb.connect() as conn:
+            assert kb.claim_review_task(
+                conn, tid, claimer=f"{host}:{gateway.pid}",
+                session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
+            )
+            assert kb.reclaim_task(conn, tid, reason="probe") is True
+            task = kb.get_task(conn, tid)
+            assert task.status == "review" and task.claim_lock is None
+            assert not [e for e in kb.list_events(conn, tid) if e.kind == "reclaim_refused"]
+
+            # TTL sweep releases an expired one too, instead of deferring.
+            assert kb.claim_review_task(
+                conn, tid, claimer=f"{host}:{gateway.pid}",
+                session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
+            )
+            conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (tid,))
+            conn.commit()
+            assert kb.release_stale_claims(conn) == 1
+            assert kb.get_task(conn, tid).status == "review"
+            assert not [e for e in kb.list_events(conn, tid) if e.kind == "reclaim_deferred"]
+
+            # Control: a dispatcher review claim with a LIVE claimer is still
+            # held (its spawn may be in flight).
+            assert kb.claim_review_task(conn, tid, claimer=f"{host}:{gateway.pid}")
+            assert kb.reclaim_task(conn, tid, reason="probe") is False
+            assert kb.get_task(conn, tid).status == "running"
+    finally:
+        gateway.kill()
+        gateway.wait()
+
+
+def test_sessionless_operator_can_request_changes_without_claim(home):
+    """Apollo 2026-09-27 22:52: an operator send-back (--operator) on a card
+    parked in review works from a sessionless shell, with no claim --review."""
+    tid = _parked_review()
+    proc = _cli(
+        home,
+        f'request-changes {tid} "rebase onto main" '
+        f'--operator "Ace via Apollo: rebase first"',
+        extra_env={"HERMES_PROFILE": "apollo"},
+    )
+    assert "Requested changes" in proc.stdout, (proc.stdout, proc.stderr)
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "operator_override"]
+
+
+def test_sessionless_takeover_with_coverage_can_request_changes(home):
+    tid = _parked_review()
+    coverage = json.dumps({
+        "lenses": {k: "done" for k in REQUIRED_REVIEW_LENSES},
+        "findings": 1, "items": ["Missing guard at handler:42"],
+        "review_minutes": 5, "batch_id": "batch-orphan-2",
+        "head_sha": "n/a: fixture card has no PR",
+    })
+    proc = _cli(
+        home,
+        f'request-changes {tid} "BEHAVIOUR: add the guard" '
+        f'--coverage {shlex.quote(coverage)} --takeover "operator review"',
+    )
+    assert "Requested changes" in proc.stdout, (proc.stdout, proc.stderr)
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_sessionless_request_changes_without_override_still_refused(home):
+    tid = _parked_review()
+    proc = _cli(home, f'request-changes {tid} "rebase onto main"')
+    assert "cannot request changes" in proc.stdout, (proc.stdout, proc.stderr)
+    assert "--operator" in proc.stdout
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_cron_operator_send_back_still_refused(home):
+    tid = _parked_review()
+    proc = _cli(
+        home,
+        f'request-changes {tid} "rebase onto main" '
+        f'--operator "Ace via Apollo: rebase first"',
+        session="cron_abc123_20260927_200000",
+        extra_env={"HERMES_PROFILE": "apollo"},
+    )
+    assert "Requested changes" not in proc.stdout, (proc.stdout, proc.stderr)
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "review"

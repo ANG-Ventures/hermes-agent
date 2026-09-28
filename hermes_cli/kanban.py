@@ -4297,8 +4297,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                     f"cannot claim {args.task_id} --review: this caller has no "
                     f"session identity (sessionless shell, cron job or delegate "
                     f"child), so no later request-changes could use the claim. "
-                    f"Run it from the reviewing session, or approve directly "
-                    f"with `hermes kanban complete {args.task_id}`.",
+                    f"Run it from the reviewing session, approve directly with "
+                    f"`hermes kanban complete {args.task_id}`, or send it back "
+                    f"with `hermes kanban request-changes {args.task_id} REASON "
+                    f"--operator \"<who: why>\"` (no claim needed).",
                     file=sys.stderr,
                 )
                 return 1
@@ -4488,6 +4490,27 @@ def _operator_review_session_ref() -> Optional[str]:
     if not session_id or session_id.startswith("cron_"):
         return None
     return kb.derive_session_ref(session_id)
+
+
+def _review_override_caller_allowed() -> bool:
+    """May this caller send back a parked review card on an explicit
+    ``--operator`` / ``--takeover`` without a bindable session?
+
+    A plain operator shell (no session identity) may. A delegate_task child or
+    a cron job may not: they can never act as the human reviewer.
+    """
+    try:
+        from agent.delegation_context import (
+            _NON_DISPATCHER_OWNED_CONTEXT,
+            is_delegated_child_process_context,
+        )
+
+        if is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get():
+            return False
+    except Exception:
+        return False
+    session_id = _caller_session_id() or ""
+    return not session_id.startswith("cron_")
 
 
 def _operator_review_run_id(conn, task_id: str) -> Optional[int]:
@@ -5104,6 +5127,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             return 1
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
         parked_session = None
+        parked_override = False
         released_unbound = False
         if held_run is None and worker_run is None:
             # A review claim that bound NO session can never be held by
@@ -5119,14 +5143,25 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             # (same audit as ``claim --review`` + request-changes). Only a
             # session that could hold that claim may do this.
             task = kb.get_task(conn, tid)
+            parked_override = False
             if task is not None and task.status == "review":
                 parked_session = _operator_review_session_ref()
-            if parked_session is None:
+                # An explicit --operator / --takeover send-back needs no prior
+                # ``claim --review`` and no bindable session (t_c3cf232e:
+                # Apollo's operator send-back from a sessionless shell was
+                # refused). Delegate children and cron jobs stay refused.
+                parked_override = parked_session is None and (
+                    operator is not None
+                    or bool((getattr(args, "foreign_ok", None) or "").strip())
+                ) and _review_override_caller_allowed()
+            if parked_session is None and not parked_override:
                 print(
                     f"cannot request changes for {tid}: this session does not hold its "
                     f"review run; claim it from the reviewing session first "
-                    f"(hermes kanban claim {tid} --review). Delegate children and "
-                    f"cron jobs cannot hold a human-lane review claim."
+                    f"(hermes kanban claim {tid} --review), or, on a card parked in "
+                    f"review, send it back with --operator \"<who: why>\" or "
+                    f"--takeover REASON. Delegate children and cron jobs cannot "
+                    f"hold a human-lane review claim."
                     + (
                         " The unbound review claim was released; the card is back in review."
                         if released_unbound else ""
@@ -5155,7 +5190,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                     "coverage": args.coverage,
                     "session_ref": parked_session,
                 }
-                if parked_session is not None
+                if parked_session is not None or parked_override
                 else {}
             ),
         )
