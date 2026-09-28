@@ -737,6 +737,10 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Home session. The dashboard sends the viewer's ``?session=`` so a card
+    # created from a session link lands in that session's home and stays
+    # visible under the default "this" facet (C7 k121).
+    session_id: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -765,6 +769,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            session_id=(payload.session_id or "").strip() or None,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
