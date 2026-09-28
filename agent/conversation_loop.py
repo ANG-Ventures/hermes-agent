@@ -1777,11 +1777,11 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 # existing path untouched.
 _PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested.", "Proceeding."})
 _TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
-# Shape of a scaffold closer we have not seen yet: a final text of at most
-# three words ending in "." right after tool results. It gets the once-only
-# nudge (auto-continue once) but is never replaced by the notice: a real short
-# reply ("Done.") must still reach the user if the model repeats it.
-_CLOSER_SHAPE_MAX_WORDS = 3
+# Only exact known closers match. A shape rule ("<= 3 words ending in '.'
+# after tool results") was tried and removed: it cannot tell a closer from a
+# real short answer ("Done."), so it spent an extra model call on every short
+# post-tool reply (t_96cf66d2). claude-bpx#254 makes new closers text-less, so
+# the only strings a model can still echo are the legacy ones listed above.
 
 
 def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
@@ -1790,21 +1790,12 @@ def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
     Returns ``"empty"`` when the placeholder should be treated as an empty
     post-tool response (the once-only nudge fires), ``"notice"`` when it must
     be replaced by :data:`_TURN_ENDED_WITHOUT_REPLY`, and ``None`` for every
-    other text — including the empty string, which keeps its own ladder.
-    An unknown closer-shaped text (<= 3 words ending in ".") after tool
-    results returns ``"empty"`` once and ``None`` after that.
+    other text — including the empty string, which keeps its own ladder, and
+    a real short reply such as "Done.".
     """
     if not isinstance(text, str):
         return None
-    stripped = text.strip()
-    if stripped not in _PLACEHOLDER_FINAL_TEXTS:
-        if (
-            prior_was_tool
-            and not already_nudged
-            and stripped.endswith(".")
-            and 0 < len(stripped.split()) <= _CLOSER_SHAPE_MAX_WORDS
-        ):
-            return "empty"
+    if text.strip() not in _PLACEHOLDER_FINAL_TEXTS:
         return None
     if prior_was_tool and not already_nudged:
         return "empty"

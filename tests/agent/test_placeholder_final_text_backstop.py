@@ -33,14 +33,16 @@ def test_bridge_closer_proceeding_is_a_known_placeholder():
     assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=False, already_nudged=False) == "notice"
 
 
-def test_unknown_closer_shape_after_tools_gets_one_nudge_never_a_notice():
-    # <= 3 words ending in "." right after tool results: auto-continue once...
-    for text in ("Continuing.", "Tool results received.", "OK."):
-        assert cl.classify_placeholder_final_text(text, prior_was_tool=True, already_nudged=False) == "empty", text
-        # ...but a repeat is delivered as-is: a real short reply must reach the user
-        assert cl.classify_placeholder_final_text(text, prior_was_tool=True, already_nudged=True) is None, text
-        # and without tool results it is an ordinary reply
-        assert cl.classify_placeholder_final_text(text, prior_was_tool=False, already_nudged=False) is None, text
+def test_short_real_reply_after_tools_is_never_nudged():
+    # t_96cf66d2: a shape rule (<= 3 words ending in ".") nudged "Done." and
+    # cost an extra model call per short post-tool answer; it ejected every
+    # merge-queue tree carrying it. Only exact known closers match.
+    for text in ("Done.", "OK.", "Continuing.", "Tool results received."):
+        for nudged in (False, True):
+            for prior in (True, False):
+                assert cl.classify_placeholder_final_text(
+                    text, prior_was_tool=prior, already_nudged=nudged
+                ) is None, (text, prior, nudged)
 
 
 def test_negative_control_longer_or_unpunctuated_short_replies_are_untouched():
