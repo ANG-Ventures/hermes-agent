@@ -203,9 +203,9 @@ NOTIONAL_OPENROUTER_PROVIDERS = frozenset({
 # cash cost is $0 (flat Kimi membership); for cost visibility their K3 turns
 # are priced at the OpenRouter ``moonshotai/kimi-k3`` snapshot below and carry
 # status "estimated". Membership model ids (k3, k3-256k) and the harness id
-# (kimi-k3) all normalize to that one vendor model. Other membership ids
-# (kimi-for-coding*, a different model family) stay unpriced rather than
-# borrowing K3 rates.
+# (kimi-k3) all normalize to that one vendor model. The K2.x ids the cpa
+# proxy serves have their own rows next to K3 (t_a9b4f1ad). kimi-for-coding*
+# (a different model family, not served by cpa) stays unpriced.
 # Vendor membership is decided by the shared _infer_vendor_from_model(), never
 # by the provider name alone. kimi-code is now an alias of the multi-vendor
 # ``cpa`` proxy lane and stays here only for rows recorded before the rename;
@@ -438,6 +438,78 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://openrouter.ai/moonshotai/kimi-k3",
         pricing_version="openrouter-kimi-k3-2026-09-27",
+    ),
+    # ── Moonshot Kimi K2.x (membership ids the cpa proxy serves) ──────────
+    # Notional list prices so these turns read "estimated", not "unknown"
+    # (t_a9b4f1ad). Membership cash cost stays $0. OpenRouter moonshotai/*
+    # snapshot 2026-09-28 where a public price exists; cache write priced at
+    # input (none published).
+    ("moonshotai", "kimi-k2"): PricingEntry(
+        # OpenRouter publishes no cache-read rate: cache reads priced at input.
+        input_cost_per_million=Decimal("0.57"),
+        output_cost_per_million=Decimal("2.30"),
+        cache_read_cost_per_million=Decimal("0.57"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k2",
+        pricing_version="openrouter-kimi-k2-2026-09-28",
+    ),
+    ("moonshotai", "kimi-k2-thinking"): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k2-thinking",
+        pricing_version="openrouter-kimi-k2-thinking-2026-09-28",
+    ),
+    ("moonshotai", "kimi-k2.5"): PricingEntry(
+        input_cost_per_million=Decimal("0.45"),
+        output_cost_per_million=Decimal("2.25"),
+        cache_read_cost_per_million=Decimal("0.07"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k2.5",
+        pricing_version="openrouter-kimi-k2.5-2026-09-28",
+    ),
+    ("moonshotai", "kimi-k2.6"): PricingEntry(
+        input_cost_per_million=Decimal("0.65"),
+        output_cost_per_million=Decimal("3.41"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k2.6",
+        pricing_version="openrouter-kimi-k2.6-2026-09-28",
+    ),
+    ("moonshotai", "kimi-k2.7-code"): PricingEntry(
+        input_cost_per_million=Decimal("0.6562"),
+        output_cost_per_million=Decimal("3.30"),
+        cache_read_cost_per_million=Decimal("0.18"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k2.7-code",
+        pricing_version="openrouter-kimi-k2.7-code-2026-09-28",
+    ),
+    # No public price for the three ids below (absent from OpenRouter
+    # 2026-09-28): priced at the kimi-k3 snapshot rate as a stand-in.
+    ("moonshotai", "kimi-k2.7-code-highspeed"): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3",
+        pricing_version="kimi-k3-rate-no-public-price-2026-09-28",
+    ),
+    ("moonshotai", "kimi-k2.8"): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3",
+        pricing_version="kimi-k3-rate-no-public-price-2026-09-28",
+    ),
+    ("moonshotai", "kimi-k2.8-code"): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3",
+        pricing_version="kimi-k3-rate-no-public-price-2026-09-28",
     ),
     # ── xAI Grok ─────────────────────────────────────────────────────────
     # Priced from OpenRouter's live catalog snapshot (per-1M in/out; cache
