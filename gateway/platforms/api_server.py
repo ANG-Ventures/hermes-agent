@@ -595,8 +595,11 @@ def _auto_truncate_response_history(
         for index, message in enumerate(conversation_history)
         if index not in event_indices and _is_compressed_summary_message(message)
     ]
+    # Notices ride along outside the content window, but never unbounded: at
+    # most the newest ``limit`` of them (FleetReview #25).
+    kept_events = set(sorted(event_indices)[-limit:])
     if not summary_indices:
-        kept_indices = set(content_indices[-limit:]) | event_indices
+        kept_indices = set(content_indices[-limit:]) | kept_events
         return [conversation_history[index] for index in sorted(kept_indices)]
 
     kept_indices = set(summary_indices[:limit])
@@ -611,7 +614,7 @@ def _auto_truncate_response_history(
             if remaining <= 0:
                 break
 
-    return [conversation_history[index] for index in sorted(kept_indices | event_indices)]
+    return [conversation_history[index] for index in sorted(kept_indices | kept_events)]
 
 
 def _normalize_chat_content(

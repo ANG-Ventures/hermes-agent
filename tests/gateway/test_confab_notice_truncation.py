@@ -36,3 +36,25 @@ def test_tool_event_does_not_displace_preserved_summary():
     latest = {"role": "user", "content": "latest"}
     history = [summary, {"role": "assistant", "content": "old"}, event, latest]
     assert _auto_truncate_response_history(history, limit=2) == [summary, event, latest]
+
+
+@pytest.mark.parametrize("with_summary", [False, True])
+def test_tool_events_are_bounded_too(with_summary):
+    """FleetReview #25: every notice was unioned into the kept set regardless
+    of the limit, so a long notice-heavy history was never truncated."""
+    def event(i):
+        return {
+            "role": "system", "content": "", "display_kind": "confab_notice",
+            "display_metadata": {CONFAB_NOTICE_KEY: {
+                "version": 1, "kind": "tool_call_as_text", "request_id": f"bound-{i}",
+                "scope": "visible", "grammar": "inbound",
+            }},
+        }
+
+    history = [{"role": "user", "content": "compacted", "_compressed_summary": True}] if with_summary else []
+    for i in range(50):
+        history += [{"role": "user", "content": f"turn {i}"}, event(i)]
+    trimmed = _auto_truncate_response_history(history, limit=4)
+    events = [m for m in trimmed if is_metadata_only_tool_notice(m)]
+    assert len(events) == 4
+    assert events == [event(i) for i in range(46, 50)]
