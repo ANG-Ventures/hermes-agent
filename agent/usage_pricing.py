@@ -341,6 +341,18 @@ _UTC_NOW = lambda: datetime.now(timezone.utc)
 # Official docs snapshot entries. Models whose published pricing and cache
 # semantics are stable enough to encode exactly.
 _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+    # Moonshot AI Kimi K3. Kimi Code membership (provider kimi-code / cpa) has $0 incremental cash;
+    # this is the equivalent metered API list-price ceiling. Published 2026-09-27:
+    # https://platform.kimi.ai/docs/pricing/chat (K3 table, per 1M tokens; 5min/1h write tiers).
+    ("moonshot", "kimi-k3"): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        cache_write_cost_per_million=Decimal("3.00"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.ai/docs/pricing/chat",
+        pricing_version="moonshot-k3-2026-09",
+    ),
     # ── xAI Grok ─────────────────────────────────────────────────────────
     # Priced from OpenRouter's live catalog snapshot (per-1M in/out; cache
     # read = input_cache_read; xAI publishes no cache-write rate → None).
@@ -2029,6 +2041,11 @@ def resolve_billing_route(
     # openai-api provider path.
     if provider_name in {"openai", "openai-api"}:
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if (provider_name in {"kimi-code", "kimi-cpa", "cpa"} and model.lower().startswith("kimi-")) or provider_name == "moonshot":
+        # The proxy-backed Kimi Code subscription and the direct platform API use the same
+        # published rates for NOTIONAL visibility, never as the subscription's cash spend.
+        return BillingRoute(provider="moonshot", model=model.split("/")[-1], base_url="",
+                            billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # Metered direct xAI API (api.x.ai, XAI_API_KEY). Bills real dollars; prices
