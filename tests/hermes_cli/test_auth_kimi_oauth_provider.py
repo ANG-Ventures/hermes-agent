@@ -525,34 +525,48 @@ def _device_jwt(exp: int, *, device_id: str, tag: str) -> str:
     return f"{enc({'alg': 'HS256'})}.{enc(claims)}.sig"
 
 
-def test_session_token_outside_history_routes_by_login_device_id(home):
+def test_device_id_claim_alone_is_not_trusted(home):
     from agent.anthropic_adapter import _kimi_oauth_token_provider_for
 
     state = _logged_in_state(access_ttl=800)
     _write_store(home, state)
-    exp = int(time.time()) - 3600  # long-expired token a live session still holds
-    mine = _device_jwt(exp, device_id=state["device_id"], tag="day-old")
-    other = _device_jwt(exp, device_id="99999999-2222-4333-8444-555555555555", tag="x")
-    assert _kimi_oauth_token_provider_for(mine) is not None
-    assert _kimi_oauth_token_provider_for(other) is None
+    forged = _device_jwt(int(time.time()) - 3600, device_id=state["device_id"], tag="forged")
+    assert _kimi_oauth_token_provider_for(forged) is None
 
 
-def test_relogin_keeps_issued_token_history(home, monkeypatch):
-    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
-
-    old = _logged_in_state(access_ttl=800, refresh="r-1", access_tag="pre-login")
-    old["issued_access_sha256"] = ["f" * 64]
-    _write_store(home, old)
+def _relogin(monkeypatch, new_access):
     monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
         (200, {"device_code": "dc", "user_code": "X", "verification_uri": "u", "interval": 1}),
-        (200, {"access_token": _jwt(int(time.time()) + 900, tag="post-login"),
-               "refresh_token": "r-2", "expires_in": 900}),
+        (200, {"access_token": new_access, "refresh_token": "r-2", "expires_in": 900}),
     ]))
     auth_mod._kimi_oauth_login(open_browser=False, sleep=lambda _s: None)
+
+
+def test_same_account_relogin_keeps_issued_token_history(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    exp = int(time.time()) + 900
+    old = _logged_in_state(access_ttl=800, refresh="r-1")
+    old["access_token"] = _account_jwt(exp, user_id="acct-a", tag="pre-login")
+    old["issued_access_sha256"] = ["f" * 64]
+    _write_store(home, old)
+    _relogin(monkeypatch, _account_jwt(exp, user_id="acct-a", tag="post-login"))
     history = get_provider_auth_state("kimi-oauth")["issued_access_sha256"]
     assert "f" * 64 in history
-    assert auth_mod.kimi_oauth_token_sha256(old["access_token"]) in history
     assert _kimi_oauth_token_provider_for(old["access_token"]) is not None
+
+
+def test_other_account_relogin_drops_issued_token_history(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    exp = int(time.time()) + 900
+    old = _logged_in_state(access_ttl=800, refresh="r-1")
+    old["access_token"] = _account_jwt(exp, user_id="acct-a", tag="pre-login")
+    old["issued_access_sha256"] = ["f" * 64]
+    _write_store(home, old)
+    _relogin(monkeypatch, _account_jwt(exp, user_id="acct-b", tag="post-login"))
+    assert get_provider_auth_state("kimi-oauth")["issued_access_sha256"] == []
+    assert _kimi_oauth_token_provider_for(old["access_token"]) is None
 
 
 def test_aux_with_options_copy_stays_bearer_only(home, monkeypatch):
