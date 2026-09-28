@@ -189,6 +189,29 @@ def call_id_of(api_kwargs):
 # the box proxy drops every x-hermes-* header before egress (I1).
 ROUTE_ID_HEADER = "x-hermes-route-id"
 LANE_SRC_HEADER = "x-hermes-lane-src"
+BRIDGE_LANE_HEADER = "x-hermes-lane"
+_BRIDGE_LANE_PROVIDER_RE = re.compile(r"^claude-bpr$|^claude-bpx-\d+$")
+
+
+def _bridge_lane_enabled() -> bool:
+    """Opt-in per profile; read at request time so absent config changes no bytes."""
+    from hermes_cli.config import load_config_readonly
+    return (load_config_readonly().get("agent") or {}).get("bridge_background_lane") is True
+
+
+def stamp_bridge_lane(agent, api_kwargs):
+    """Tag only background bridge legs; never label a human-facing gateway leg."""
+    if not isinstance(api_kwargs, dict):
+        return
+    provider = _provider_of(agent)
+    if not _BRIDGE_LANE_PROVIDER_RE.fullmatch(provider) or not _bridge_lane_enabled():
+        return
+    eh = dict(api_kwargs.get("extra_headers") or {})
+    eh.pop(BRIDGE_LANE_HEADER, None)
+    if _pool_lane(agent) == "background":
+        eh[BRIDGE_LANE_HEADER] = "background"
+    if eh or "extra_headers" in api_kwargs:
+        api_kwargs["extra_headers"] = eh
 ROUTE_ID_RE = re.compile(r"^[hc]?[0-9a-f]{32}$")
 _ROUTE_ID_ORIGINS = {"h": "harness", "c": "cli"}
 _PINNED_ROUTE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
