@@ -2300,7 +2300,13 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         return _lookup_official_docs_pricing(
             BillingRoute(
                 provider=vendor,
-                model=route.model,
+                # Kimi Code membership ids (k3, k3-256k) name the one kimi-k3 row,
+                # same as the notional kimi lanes (cpa/k3 was unpriced, t_a0cdc01a).
+                model=(
+                    _normalize_kimi_membership_model(route.model)
+                    if vendor == "moonshotai"
+                    else route.model
+                ),
                 base_url=route.base_url,
                 billing_mode=route.billing_mode,
             )

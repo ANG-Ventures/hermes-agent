@@ -1917,6 +1917,30 @@ def test_codex_auto_review_stays_unknown():
     assert result.amount_usd is None
 
 
+@pytest.mark.parametrize("provider,model", [
+    ("kimi-code", "kimi-k3"),
+    ("cpa", "kimi-k3"),
+    ("cpa", "k3"),
+    ("cpa", "k3-256k"),
+])
+def test_kimi_k3_lanes_price_from_the_one_moonshot_row(provider, model):
+    """Every lane that serves Kimi K3 prices from the single moonshotai/kimi-k3 row
+    (tokens-reprice-sweep paged kimi-code/kimi-k3 and cpa/kimi-k3 as unpriced,
+    t_d77c1865 / t_a0cdc01a). Relation, not a URL snapshot: the lane's entry IS the
+    vendor row, so a re-sourced vendor row cannot strand a lane."""
+    vendor_row = get_pricing_entry("kimi-k3", provider="moonshotai")
+    assert vendor_row is not None
+    assert get_pricing_entry(model, provider=provider) == vendor_row
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    result = estimate_usage_cost(model, usage, provider=provider)
+    assert result.amount_usd is not None and result.status == "estimated"
+
+
+def test_cpa_non_k3_kimi_id_stays_unpriced():
+    """kimi-for-coding is a different model family: no borrowed K3 rate."""
+    assert get_pricing_entry("kimi-for-coding", provider="cpa") is None
+
+
 def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
     """moonshotai/kimi-k3 on the openrouter route prices from the curated row,
     never the live catalog (t_01655aa1: subs.ace ledger NULL-priced these)."""
