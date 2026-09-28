@@ -9269,12 +9269,63 @@ def _kimi_access_token_expiry_unix(payload: Dict[str, Any], now: float) -> float
     return now + 900.0
 
 
+# Hashes of access tokens this login was issued before the current one.
+# build_anthropic_client swaps a supplied Kimi JWT for the managed token
+# provider only when it is one of these (or the current token); JWT claims
+# are unsigned from our side and can't prove ownership. 96 x 15 min = 24 h.
+KIMI_OAUTH_ISSUED_HISTORY_MAX = 96
+
+
+def kimi_oauth_token_sha256(token: Any) -> Optional[str]:
+    if not isinstance(token, str) or not token.strip():
+        return None
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def _kimi_jwt_account(token: Any) -> Optional[str]:
+    """``user_id``/``sub`` of a Kimi JWT. Only used on tokens this host
+    received from Kimi's token endpoint, never to trust a supplied token."""
+    if not isinstance(token, str) or token.count(".") != 2:
+        return None
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(part.encode()).decode())
+    except Exception:
+        return None
+    if not isinstance(claims, dict):
+        return None
+    value = claims.get("user_id") or claims.get("sub")
+    return str(value) if value else None
+
+
+def kimi_oauth_login_issued_token(token: Any) -> bool:
+    """True when *token* is (or was) an access token of the stored kimi-oauth login.
+
+    Only exact matches count: the current token or a digest in the issued
+    history. JWT claims are unverified here, so no claim (client_id,
+    user_id, device_id) is ever enough to borrow the managed login.
+    """
+    digest = kimi_oauth_token_sha256(token)
+    if digest is None:
+        return False
+    state = get_provider_auth_state("kimi-oauth") or {}
+    if kimi_oauth_token_sha256(state.get("access_token")) == digest:
+        return True
+    return digest in (state.get("issued_access_sha256") or [])
+
+
 def _kimi_state_from_token_payload(
     payload: Dict[str, Any], *, prior: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = time.time()
     expires_at_unix = _kimi_access_token_expiry_unix(payload, now)
     state = dict(prior or {})
+    history = [h for h in (state.get("issued_access_sha256") or []) if isinstance(h, str)]
+    prior_digest = kimi_oauth_token_sha256(state.get("access_token"))
+    if prior_digest and prior_digest not in history:
+        history.append(prior_digest)
+    state["issued_access_sha256"] = history[-KIMI_OAUTH_ISSUED_HISTORY_MAX:]
     state.update({
         "provider": "kimi-oauth",
         "auth_mode": "oauth_device_code",
@@ -9380,9 +9431,14 @@ def _kimi_poll_device_token(
 
 def _kimi_oauth_login(
     *, open_browser: bool = True, timeout_seconds: float = 15.0,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = time.sleep, label: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the Kimi device flow, persist tokens to auth.json, return the state."""
+    """Run the Kimi device flow, persist tokens to auth.json, return the state.
+
+    ``label`` is stored in the same single write as the tokens. A second
+    write of the returned state after this one could restore a refresh
+    token another process already rotated.
+    """
     prior = get_provider_auth_state("kimi-oauth") or {}
     # Re-login keeps the host's device id so Kimi sees one stable device.
     device_id = str(prior.get("device_id") or uuid.uuid4())
@@ -9414,7 +9470,17 @@ def _kimi_oauth_login(
         )
 
     base = {k: v for k, v in prior.items() if k in ("inference_base_url", "label")}
+    # Carry the issued-token history across a re-login only for the SAME
+    # account (both tokens came from Kimi's token endpoint). A different
+    # account starts a fresh history so its predecessor's tokens never map
+    # onto the new login.
+    prior_account = _kimi_jwt_account(prior.get("access_token"))
+    if prior_account and prior_account == _kimi_jwt_account(token.get("access_token")):
+        base["access_token"] = prior.get("access_token")
+        base["issued_access_sha256"] = prior.get("issued_access_sha256") or []
     base["device_id"] = device_id
+    if label:
+        base["label"] = label
     state = _kimi_state_from_token_payload(token, prior=base)
     _kimi_oauth_write_state(state, set_active=False)
     mark_provider_active_if_unset("kimi-oauth")
