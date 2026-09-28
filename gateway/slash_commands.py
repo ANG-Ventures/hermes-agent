@@ -947,7 +947,8 @@ class GatewaySlashCommandsMixin:
         if action == "dashboard":
             from gateway.kanban_dashboard_link import dashboard_link
 
-            link = dashboard_link(invoking_session_id)
+            # dashboard_link reads config.yaml: sync file I/O, keep it off the loop.
+            link = await asyncio.to_thread(dashboard_link, invoking_session_id)
             return link or "Dashboard link unavailable: configure dashboard.public_url."
 
         try:

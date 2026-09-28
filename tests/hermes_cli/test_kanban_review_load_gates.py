@@ -276,8 +276,9 @@ def test_review_policy_none_skips_every_card(tmp_path, monkeypatch):
     reviewer — milestone or not — and must not silently map to ``all``."""
     import hermes_cli.kanban_db as kb
     assert "none" in kb.REVIEW_POLICIES
-    monkeypatch.setattr(kb, "_kanban_cfg", lambda: {"review_policy": "none"}, raising=False)
-    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    # Drive the REAL resolver through its config seam (board home first), not a
+    # patched configured_review_policy that would only assert the patch.
+    monkeypatch.setattr(kb, "_board_home_kanban_cfg", lambda: {"review_policy": "none"})
     assert kb.configured_review_policy() == "none"
 
 
