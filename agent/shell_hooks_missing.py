@@ -123,7 +123,7 @@ def _publish_absent(dest: Path, data: bytes, mode: int) -> bool:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
-            os.fchmod(fh.fileno(), mode)  # before fsync: the mode is durable before the link publishes it
+            os.chmod(tmp, mode)  # path chmod (os.fchmod is absent on Windows <3.13), before fsync so the link publishes a durable mode
             os.fsync(fh.fileno())
         try:
             os.link(tmp, dest)
