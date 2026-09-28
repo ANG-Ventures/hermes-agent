@@ -343,13 +343,6 @@ class LSPService:
         if slot is not None:
             slot.release()
 
-    def _release_slot(self, key: Tuple[str, str]) -> None:
-        """Drop the host slot held for ``key``'s server; caller has already removed the client."""
-        with self._state_lock:
-            slot = self._slots.pop(key, None)
-        if slot is not None:
-            slot.release()
-
     def snapshot_baseline(self, file_path: str) -> None:
         """Snapshot current diagnostics for ``file_path`` as the delta baseline.
 
@@ -507,14 +500,20 @@ class LSPService:
         with self._state_lock:
             client = self._clients.pop(key, None)
             self._last_used.pop(key, None)
-        self._release_slot(key)
-        if client is not None:
-            try:
-                # Fire-and-forget shutdown — give it a second to cleanup,
-                # but don't block.  We're already on a slow path.
-                self._loop.run(client.shutdown(), timeout=1.0)
-            except Exception:  # noqa: BLE001
-                pass
+            slot = self._slots.pop(key, None)
+        try:
+            if client is not None:
+                try:
+                    # Fire-and-forget shutdown — give it a second to cleanup,
+                    # but don't block.  We're already on a slow path.
+                    self._loop.run(client.shutdown(), timeout=1.0)
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            # The slot is the host-wide cap on live servers: give it back only
+            # once this one has been told to exit (FleetReview #30).
+            if slot is not None:
+                slot.release()
 
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
@@ -727,17 +726,22 @@ class LSPService:
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)
-        for key in idle_keys:
-            self._release_slot(key)
-        if clients:
-            eventlog.log_reaped(
-                [(c.server_id, c.workspace_root) for c in clients],
-                self._idle_timeout,
-            )
-            await asyncio.gather(
-                *(client.shutdown() for client in clients),
-                return_exceptions=True,
-            )
+            # Popped with the client, released after its shutdown (#30): a
+            # replacement spawned meanwhile owns a NEW slot under the same key.
+            slots = [s for s in (self._slots.pop(key, None) for key in idle_keys) if s is not None]
+        try:
+            if clients:
+                eventlog.log_reaped(
+                    [(c.server_id, c.workspace_root) for c in clients],
+                    self._idle_timeout,
+                )
+                await asyncio.gather(
+                    *(client.shutdown() for client in clients),
+                    return_exceptions=True,
+                )
+        finally:
+            for slot in slots:
+                slot.release()
 
     async def _shutdown_async(self) -> None:
         reaper = self._idle_reaper_task
