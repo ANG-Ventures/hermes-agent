@@ -3674,6 +3674,17 @@ def switch_model(
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
     agent._fallback_index = 0
+    # An explicit user route wins over an automatic one: close the persisted
+    # sticky episode(s) too, or the next agent rebuild (every gateway /model
+    # evicts the cache) resumes the old fallback (t_b2e9bb23).
+    agent._sticky_rebuild_refusal_pending = False
+    try:
+        from agent import fallback_sticky_store as _fss
+        from agent import fallback_wiring as _fw
+
+        _fw.close_episodes_for_user_route(_fss.lineage_root_for_agent(agent))
+    except Exception:  # noqa: BLE001 — best-effort, never blocks a switch
+        logger.debug("sticky close on switch_model failed", exc_info=True)
 
     # When the user deliberately swaps primary providers (e.g. openrouter
     # → anthropic), drop any fallback entries that target the OLD primary
