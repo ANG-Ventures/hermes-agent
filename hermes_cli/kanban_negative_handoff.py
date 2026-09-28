@@ -51,10 +51,24 @@ PARTIAL_OUTCOMES = frozenset({"partial"})
 # every other result line is the worker's own prose and is scanned
 # (FleetReview #1447 @aa9e59a3: a verdict on line 2 closed the card done).
 _FENCE = re.compile(r"^\s*(?:```|~~~)")
+# "<program>[pid]: message" diagnostics (``ssh: Could not resolve hostname``,
+# ``curl: (6) ...``, git's ``fatal:``/``error:``). A closed, lowercase,
+# case-sensitive name list: a worker's own "status: blocked on ..." or
+# "Verdict: could not ..." is not a program name and is still scanned
+# (FleetReview #1464 @03d1cc77).
+_TOOL_PREFIX = (
+    r"\s*(?:[\w.~-]*/)*"
+    r"(?:ssh|scp|sftp|rsync|git|gh|curl|wget|docker|kubectl|make|npm|npx|pnpm|yarn"
+    r"|pip\d?|uv|python[\d.]*|node|bash|sh|zsh|sudo|cp|mv|rm|ln|mkdir|ls|cat|chmod"
+    r"|chown|tar|unzip|launchctl|systemctl|journalctl|brew|apt(?:-get)?|sqlite3|psql"
+    r"|ping|nc|dig|hermes|fatal|error|warning|hint|remote)"
+    r"(?:\[\d+\])?:\s"
+)
 _LOG_LINE = re.compile(
     r"^(?:\s{2,}|\t"                               # indented block / traceback frame
     r"|\s*[>$]\s"                                   # quote, shell prompt
     r"|\s*Traceback\b"
+    r"|" + _TOOL_PREFIX +                            # ssh: / curl: / fatal: ...
     r"|\s*(?:[\w.-]+:\s*)?[\w.]+(?:Error|Exception|Warning):\s"  # [tool: ]ImportError: ...
     r"|\s*E\s{2,}"                                    # pytest E-lines
     r"|\s*(?:ERROR|WARN(?:ING)?|INFO|DEBUG|CRITICAL|FATAL)\b"  # log level prefix
