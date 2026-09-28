@@ -304,3 +304,36 @@ class TestOpenRouterClientPerProfile:
         with _Scope({"UNRELATED": "x"}):
             with pytest.raises(ValueError):
                 orc.get_async_client()
+
+    def test_unscoped_multiplex_is_refused_not_served_the_process_env_key(self, monkeypatch):
+        # FleetReview #1350 key 2f266bb0b53d: MoA runs in-turn, so an unscoped
+        # call under multiplex is a missing scope, not a startup probe. It must
+        # fail closed instead of building a client on os.environ's key.
+        import agent.auxiliary_client as aux
+
+        orc = self._patch_resolver(monkeypatch)
+        # Real key source: _scoped_key_env keeps the Slack-pattern env fallback,
+        # so the refusal has to come from openrouter_client itself.
+        monkeypatch.setattr(
+            aux, "resolve_provider_client",
+            lambda provider, async_mode=False, **kw: (
+                {"built_with": aux._scoped_key_env("OPENROUTER_API_KEY")}, "m"),
+        )
+        monkeypatch.setenv("OPENROUTER_API_KEY", "process-env-key")
+        ss.set_multiplex_active(True)
+        with pytest.raises(ss.UnscopedSecretError):
+            orc.get_async_client()
+        assert orc._clients == {}
+
+    def test_single_profile_unscoped_still_reads_env(self, monkeypatch):
+        orc = self._patch_resolver(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "process-env-key")
+        client = orc.get_async_client()
+        assert client["built_with"] == "process-env-key"
+
+    def test_check_api_key_unscoped_multiplex_keeps_probe_fallback(self, monkeypatch):
+        from tools.openrouter_client import check_api_key
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "process-env-key")
+        ss.set_multiplex_active(True)
+        assert check_api_key() is True
