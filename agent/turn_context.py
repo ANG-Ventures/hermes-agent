@@ -629,6 +629,15 @@ def build_turn_context(
         )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    # Profile home this turn runs under (the multiplex gateway scopes it per
+    # turn). A host that finalizes the turn from another context (shutdown
+    # abandoning it) must write its ledger rows to the same profile.
+    try:
+        from hermes_constants import get_hermes_home
+
+        agent._turn_home = (turn_id, str(get_hermes_home()))
+    except Exception:
+        agent._turn_home = None
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()

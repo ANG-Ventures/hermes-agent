@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -922,8 +923,14 @@ def emit_session_end(
     original_user_message,
     final_response,
     turn_calls=None,
+    provisional=False,
 ):
     """Fire the per-turn ``on_session_end`` plugin hook exactly once.
+
+    ``provisional=True`` (host abandoning an in-flight turn) fires
+    ``on_turn_abandoned`` instead and does NOT set the per-turn emitted
+    marker, so if the turn later unwinds its real finalize or backstop emit
+    still fires. Returns False when a provisional emit stood down.
 
     Shared by ``finalize_turn`` (the normal loop exit) and
     ``emit_unfinalized_session_end`` (the backstop for the conversation loop's
@@ -1028,31 +1035,88 @@ def emit_session_end(
         # Mark BEFORE invoking: the run_agent forwarder's backstop
         # (emit_unfinalized_session_end) must never fire a second hook for a
         # turn whose finalizer already attempted one.
-        agent._session_end_emitted_turn_id = turn_id
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            provider=getattr(agent, "provider", None) or "",
-            chat_id=getattr(agent, "_chat_id", None) or "",
-            chat_name=getattr(agent, "_chat_name", None) or "",
-            user_message=original_user_message,
-            final_response=final_response,
-            turn_usage=_turn_usage,
-            cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
-        )
+        # The marker check and the hook write are one critical section per
+        # agent: a provisional (shutdown) emit racing the turn's own finalize
+        # must either land first (and be upserted over) or see the real
+        # marker and stand down -- never write interrupted AFTER the real row.
+        with _session_end_lock(agent):
+            if provisional:
+                # Re-read under the lock: the turn may have finished (marker
+                # set) or the agent moved on to a newer turn while we waited.
+                if getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+                    return False
+                if getattr(agent, "_current_turn_id", None) != turn_id:
+                    return False
+                # NOT on_session_end: its consumers do end-of-turn teardown
+                # (file cleanup, call hangup) that must not run on a turn that
+                # is still live. Usage is left to the consumer's own per-call
+                # ledger; only identity + attribution travel here.
+                _invoke_hook(
+                    "on_turn_abandoned",
+                    session_id=agent.session_id,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    reason=turn_exit_reason,
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                    provider=getattr(agent, "provider", None) or "",
+                    chat_id=getattr(agent, "_chat_id", None) or "",
+                    chat_name=getattr(agent, "_chat_name", None) or "",
+                    user_message=original_user_message,
+                    parent_turn_id=getattr(agent, "_blackbox_parent_turn_id", None),
+                    parent_platform=getattr(agent, "_blackbox_parent_platform", None),
+                    parent_chat_id=getattr(agent, "_blackbox_parent_chat_id", None),
+                    parent_chat_name=getattr(agent, "_blackbox_parent_chat_name", None),
+                    is_subagent=bool(getattr(agent, "_blackbox_is_subagent", False)),
+                    depth=getattr(agent, "_blackbox_depth", None),
+                )
+                return True
+            agent._session_end_emitted_turn_id = turn_id
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                provider=getattr(agent, "provider", None) or "",
+                chat_id=getattr(agent, "_chat_id", None) or "",
+                chat_name=getattr(agent, "_chat_name", None) or "",
+                user_message=original_user_message,
+                final_response=final_response,
+                turn_usage=_turn_usage,
+                cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
+            )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+    return True
 
 
-def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
+_SESSION_END_LOCKS_GUARD = threading.Lock()
+_SESSION_END_FALLBACK_LOCK = threading.RLock()
+
+
+def _session_end_lock(agent):
+    """Per-agent RLock serializing on_session_end emits for that agent.
+
+    Read from the instance ``__dict__``, never ``getattr``: agent doubles with
+    a catch-all ``__getattr__`` would hand back a non-lock.
+    """
+    slots = getattr(agent, "__dict__", None)
+    if not isinstance(slots, dict):
+        return _SESSION_END_FALLBACK_LOCK
+    lock = slots.get("_session_end_emit_lock")
+    if lock is not None:
+        return lock
+    with _SESSION_END_LOCKS_GUARD:
+        return slots.setdefault("_session_end_emit_lock", threading.RLock())
+
+
+def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, abandoned_reason=None):
     """Backstop: fire ``on_session_end`` for a turn that bypassed ``finalize_turn``.
 
     ``run_conversation`` has dozens of early ``return``s (fallback chain
@@ -1063,11 +1127,21 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
     forwarder calls this after every turn, successful or not; it is a no-op
     when the finalizer already emitted for ``turn_id`` or the turn never
     started. Returns True when it emitted. Never raises.
+
+    ``abandoned_reason`` marks a turn the HOST is abandoning while it is still
+    in flight (gateway shutdown drain timed out, the process is about to
+    exit). That emit is provisional: it fires ``on_turn_abandoned`` (not
+    ``on_session_end``), leaves the per-turn emitted marker unset so a turn
+    that does unwind later still emits its real row (which supersedes the
+    provisional one), and does not settle ``_billed_unaccounted``, which the
+    turn's own thread still owns.
     """
     try:
         if not turn_id or getattr(agent, "_current_turn_id", None) != turn_id:
             return False
         if getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+            return False
+        if abandoned_reason and getattr(agent, "_session_end_abandoned_turn_id", None) == turn_id:
             return False
         # Both are (turn_id, value) pairs so a raise before the loop published
         # them for THIS turn can never attribute the previous turn's data.
@@ -1081,15 +1155,23 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
             user_message = published_msg[1]
         try:
             # Billed responses the loop rejected before bailing out belong to
-            # THIS turn; finalize_turn settles them the same way.
-            from agent.conversation_loop import _settle_unaccepted_billed_responses
+            # THIS turn; finalize_turn settles them the same way. Not for an
+            # abandoned turn: its thread is still live and owns that list.
+            if not abandoned_reason:
+                from agent.conversation_loop import _settle_unaccepted_billed_responses
 
-            _settle_unaccepted_billed_responses(agent, turn_calls, turn_id)
+                _settle_unaccepted_billed_responses(agent, turn_calls, turn_id)
         except Exception:
             pass
+        # Copy: an abandoned turn's own thread may still be appending.
+        turn_calls = list(turn_calls)
         res = result if isinstance(result, dict) else {}
         final_response = ""
-        if exc is not None:
+        if abandoned_reason:
+            interrupted = True
+            failed = False
+            reason = str(abandoned_reason)[:200]
+        elif exc is not None:
             interrupted = isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             )
@@ -1106,7 +1188,7 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
             else:
                 reason = "early_return"
                 final_response = res.get("final_response") or ""
-        emit_session_end(
+        emitted = emit_session_end(
             agent,
             turn_id=turn_id,
             effective_task_id=getattr(agent, "_current_task_id", None),
@@ -1117,10 +1199,72 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
             original_user_message=user_message,
             final_response=final_response,
             turn_calls=turn_calls,
+            provisional=bool(abandoned_reason),
         )
-        return True
+        if abandoned_reason and emitted:
+            agent._session_end_abandoned_turn_id = turn_id
+        return bool(emitted)
     except Exception:
         logging.getLogger(__name__).warning(
             "unfinalized on_session_end backstop failed", exc_info=True
         )
         return False
+
+
+def emit_abandoned_session_ends(agents, reason):
+    """Record every still-in-flight turn of ``agents`` (and their live
+    subagents) as interrupted before the host process abandons them.
+
+    A host that exits while a turn is still running (gateway shutdown after
+    the drain + interrupt-settle window expired; the turn is blocked in a
+    provider stream or a tool) never returns from ``run_conversation``, so
+    neither ``finalize_turn`` nor the ``run_agent`` backstop fires and
+    Blackbox is left with ``turn_api_calls`` rows and no ``turns`` row. This is
+    the gateway counterpart of cli ``_emit_interrupted_session_end``. Turns
+    that already emitted (finished, early-returned) are skipped by the
+    per-turn marker, so it is safe to call on every agent. Returns the number
+    of turns it emitted for. Never raises.
+    """
+    emitted = 0
+    seen = set()
+    stack = list(agents or ())
+    while stack:
+        agent = stack.pop()
+        if agent is None or id(agent) in seen:
+            continue
+        seen.add(id(agent))
+        try:
+            lock = getattr(agent, "_active_children_lock", None)
+            children = getattr(agent, "_active_children", None) or ()
+            if lock is not None:
+                with lock:
+                    children = list(children)
+            stack.extend(list(children))
+        except Exception:
+            pass
+        turn_id = getattr(agent, "_current_turn_id", None)
+        if not turn_id:
+            continue
+        # Write under the profile the turn ran in (multiplex gateway), not the
+        # shutdown thread's: its turn_api_calls live in that profile's ledger.
+        home = getattr(agent, "_turn_home", None)
+        token = None
+        if isinstance(home, tuple) and len(home) == 2 and home[0] == turn_id and home[1]:
+            try:
+                from hermes_constants import set_hermes_home_override
+
+                token = set_hermes_home_override(home[1])
+            except Exception:
+                token = None
+        try:
+            if emit_unfinalized_session_end(agent, turn_id, abandoned_reason=reason):
+                emitted += 1
+        finally:
+            if token is not None:
+                try:
+                    from hermes_constants import reset_hermes_home_override
+
+                    reset_hermes_home_override(token)
+                except Exception:
+                    pass
+    return emitted

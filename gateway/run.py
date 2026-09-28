@@ -13823,6 +13823,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+        # Turns still in flight here (drain + interrupt-settle expired while
+        # blocked in a provider stream or a tool) never return from
+        # run_conversation before the process exits, so on_session_end never
+        # fires and Blackbox keeps their turn_api_calls with no turns row.
+        # Record them as interrupted now; finished turns are skipped by the
+        # per-turn emitted marker. Off-loop + bounded like the hooks below.
+        await self._emit_abandoned_turn_session_ends(active_agents)
         for agent in active_agents.values():
             # Persist any in-flight transcript to the SQLite session store
             # before teardown (#13121).  An agent forcibly interrupted by the
@@ -13975,6 +13982,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # enough for a normal trace-export flush, small enough that a wedged
     # plugin can never eat the systemd stop window.
     _FINALIZE_TIMEOUT_S = 10.0
+
+    async def _emit_abandoned_turn_session_ends(
+        self, active_agents: Dict[str, Any]
+    ) -> None:
+        # Drain-start snapshot PLUS whatever is running now: a pending
+        # sentinel promoted to a real agent during the drain is only in the
+        # live map. The helper de-duplicates.
+        agents = [
+            a for a in active_agents.values() if a is not _AGENT_PENDING_SENTINEL
+        ]
+        try:
+            agents.extend(self._snapshot_running_agents().values())
+        except Exception:
+            pass
+        # Cron turns run on the scheduler's own pool, outside _running_agents
+        # (the drain already waits on them via _active_cron_job_count).
+        try:
+            from cron.scheduler import live_cron_agents
+
+            agents.extend(live_cron_agents())
+        except Exception:
+            pass
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            # /v1/runs agents AND the _run_agent() turns (session chat, chat
+            # completions, responses) -- same two registries the drain
+            # interrupt walks; the helper de-duplicates by identity.
+            for _reg in ("_active_run_agents", "_shutdown_interruptible_agents"):
+                agents.extend(
+                    a for a in list(getattr(adapter, _reg, {}).values()) if a is not None
+                )
+        except Exception:
+            pass
+        if not agents:
+            return
+        reason = (
+            "gateway_restart"
+            if getattr(self, "_restart_requested", False)
+            else "gateway_shutdown"
+        )
+        # Passed by reference, never called here: the hook chain can price an
+        # unaccepted billed call (a model-metadata fetch), so it must run on
+        # the housekeeping pool, not the loop.
+        from agent.turn_finalizer import emit_abandoned_session_ends
+
+        try:
+            emitted = await asyncio.wait_for(
+                self._run_housekeeping_in_executor(
+                    "finalize", emit_abandoned_session_ends, agents, reason
+                ),
+                timeout=self._FINALIZE_TIMEOUT_S,
+            )
+            if emitted:
+                logger.info(
+                    "Shutdown: recorded %d in-flight turn(s) as interrupted (%s)",
+                    emitted,
+                    reason,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Abandoned-turn on_session_end hooks exceeded %ss; proceeding.",
+                self._FINALIZE_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.debug("Abandoned-turn on_session_end emit failed: %s", exc)
 
     async def _finalize_session_off_loop(
         self,
