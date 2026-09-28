@@ -10,7 +10,7 @@ import json
 import re
 import time
 
-from scripts.ci_overflow_plan import ARM, POOL, X64, JobPlacement, Plan, _object_pairs
+from scripts.ci_overflow_plan import ARM, BLACKSMITH, POOL, X64, JobPlacement, Plan, _object_pairs
 
 BRANCH = "ci-overflow-ledger"
 PATH = "state.json"
@@ -66,7 +66,7 @@ def _charge(job):
 def _billed_minutes(job):
     """GitHub bills each hosted job rounded UP to the whole minute. None unless the job is a
     completed hosted execution with a parseable, ordered started_at/completed_at pair."""
-    if (job.get("status") != "completed" or job.get("labels") not in (X64, ARM)
+    if (job.get("status") != "completed" or job.get("labels") not in (X64, ARM, BLACKSMITH)
             or not job.get("runner_name")):
         return None
     try:
@@ -165,7 +165,7 @@ def _validate(state, today):
             name, labels, charge = job.get("job_id"), job.get("labels"), job.get("reserved_minutes")
             if (type(name) is not str or not name or name in seen
                     or set(planned) != {"job_id", "labels", "reserved_minutes", "reason"}
-                    or type(labels) is not list or labels not in (POOL, X64, ARM)
+                    or type(labels) is not list or labels not in (POOL, X64, ARM, BLACKSMITH)
                     or type(charge) is not int or charge < 0
                     or (charge != 0 if labels == POOL else not 1 <= charge <= CEILING[_kind(name)])
                     or type(job.get("reason")) is not str
@@ -255,7 +255,7 @@ class Ledger:
         if (len({j.job_id for j in plan.jobs}) != len(plan.jobs)
                 or len(plan.jobs) > 18
                 or sum(j.reserved_minutes for j in plan.jobs) > 615
-                or any(j.labels not in (POOL, X64, ARM) or
+                or any(j.labels not in (POOL, X64, ARM, BLACKSMITH) or
                        (j.labels == POOL and j.reserved_minutes != 0) or
                        (j.labels != POOL and j.reserved_minutes != (20 if j.job_id == "e2e" else 35))
                        for j in plan.jobs)):
@@ -296,6 +296,8 @@ class Ledger:
             summary = dict(plan.summary)
             summary.update(remaining_allowance=remaining, reserved_minutes=sum(j.reserved_minutes for j in jobs),
                            budget_overrides_cloud_only=any(j.reason == "budget-overrides-cloud-only" for j in jobs))
+            if "blacksmith" in summary:   # recount after demotions: the paid share actually admitted
+                summary["blacksmith"] = sum(1 for j in jobs if j.labels == BLACKSMITH)
             if estimating:
                 summary.update(admission_estimate=dict(cost, headroom=self.headroom, samples={
                     k: len(state.get(SAMPLES, {}).get(k, [])) for k in CEILING}))

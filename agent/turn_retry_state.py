@@ -82,6 +82,13 @@ class TurnRetryState:
     # by wall-clock, not only by attempt count.
     capacity_waited_s: float = 0.0
 
+    # ── Local relay restart wait (loopback base_url connection errors) ───
+    # Seconds spent polling a restarting loopback relay this attempt block,
+    # and how many same-model retries that wait has granted. Both bound the
+    # wait so a relay that flaps cannot pin the turn.
+    local_relay_waited_s: float = 0.0
+    local_relay_recoveries: int = 0
+
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False

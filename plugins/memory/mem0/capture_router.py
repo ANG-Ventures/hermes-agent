@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -566,9 +567,27 @@ class CaptureRouter:
     # -- staged write -------------------------------------------------------
     @staticmethod
     def _default_write(path: str, content: str) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        # Publish atomically: route_turn treats an existing <turn_id>.md as a completed stage,
+        # so a crash mid-write must never leave a truncated file at the final path. The temp
+        # name does not end in .md, so neither that lookup nor an inbox sweep can pick it up.
+        # mkstemp gives every write its own temp file: two same-process writers staging the
+        # same path must not share (and truncate/rename) one PID-derived temp name.
+        dirname = os.path.dirname(path)
+        os.makedirs(dirname, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dirname, prefix=os.path.basename(path) + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                os.fchmod(fh.fileno(), 0o644)  # mkstemp is 0600; keep the mode open()+umask gave
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _stage_world_facts(self, facts: List[Dict[str, Any]], dest_dir: str, *,
                            turn_id: str, session: str, ts: Optional[str]) -> str:

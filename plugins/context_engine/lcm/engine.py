@@ -470,7 +470,7 @@ _LIFECYCLE_GC_LOCK = threading.Lock()
 def _lifecycle_gc_due(db_path: str, interval_hours: float) -> bool:
     if interval_hours <= 0:
         return True
-    now = time.time()
+    now = time.monotonic()  # in-process throttle: immune to wall-clock steps (P2 #81)
     with _LIFECYCLE_GC_LOCK:
         last = _LIFECYCLE_GC_LAST_RUN.get(db_path)
         if last is not None and (now - last) < interval_hours * 3600.0:

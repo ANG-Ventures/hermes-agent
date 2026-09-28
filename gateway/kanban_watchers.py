@@ -810,7 +810,8 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     else:
         detail = (
             "READY card stuck behind active_pr (>30 min)\n"
-            f"Operator recovery: `{item['clear_verb']}`"
+            + (f"Holding PR: {item['pr']}\n" if item.get("pr") else "")
+            + f"Operator recovery: `{item['clear_verb']}`"
         )
     message = (
         f"🛑 **Kanban dispatcher** · {detail}\n"

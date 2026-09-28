@@ -161,6 +161,13 @@ def full_rerun_verdict(prior: list[dict], jobs: list[dict], probe_lines: dict[st
         return check(name, "BLOCK", evidence, "jobs carried over from the prior attempt: selective, not full, re-run")
     if absent:
         return check(name, "BLOCK", evidence, f"prior-attempt job(s) absent from the re-run: {absent}")
+    # A job that ran in the prior attempt but never started in this one did not re-execute; only
+    # jobs skipped in BOTH attempts are exempt (FleetReview #1371 fb763f44).
+    started_before = {j["name"] for j in prior if j.get("started_at") is not None}
+    newly_skipped = sorted(j["name"] for j in jobs if j["name"] in started_before and j.get("started_at") is None)
+    if newly_skipped:
+        evidence["newly_skipped"] = newly_skipped
+        return check(name, "BLOCK", evidence, f"prior-attempt job(s) skipped in the re-run: {newly_skipped}")
     if missing or not planned:
         return check(name, "UNVERIFIABLE", evidence, f"slice job(s) without a PROBE line: {missing}")
     ok = all(p["executing"] == p["planned"] == attempt for p in planned)

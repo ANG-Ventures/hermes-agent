@@ -105,10 +105,13 @@ from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     capacity_retry_wait,
+    is_local_relay_restart_candidate,
     is_zai_coding_overload_error,
     jittered_backoff,
     resolve_retry_after,
+    wait_for_local_relay,
     zai_coding_overload_retry_ceiling,
+    LOCAL_RELAY_MAX_RECOVERIES_PER_TURN,
 )
 from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
@@ -1775,7 +1778,13 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 # re-process) the user sees a plain notice instead. Genuinely empty text and
 # "[SILENT]" are not placeholders: silent cron / no_agent turns keep their
 # existing path untouched.
-_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested.", "Proceeding."})
+_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested."})
+# "Proceeding." is an ordinary English reply, so it only counts as a
+# placeholder where the legacy closer can exist: the claude-bpx bridge lanes
+# (pool claude-bpr, pinned claude-bpx-N). Every other provider delivers it
+# verbatim (FleetReview #1332 key 9172f2d63927, t_4a1853f2).
+_BRIDGE_CLOSER_FINAL_TEXTS = frozenset({"Proceeding."})
+_BRIDGE_CLOSER_PROVIDER_RE = re.compile(r"^claude-bpx-\d+$|^claude-bpr$")
 _TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
 # Only exact known closers match. A shape rule ("<= 3 words ending in '.'
 # after tool results") was tried and removed: it cannot tell a closer from a
@@ -1784,18 +1793,24 @@ _TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
 # the only strings a model can still echo are the legacy ones listed above.
 
 
-def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
+def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged, provider=None):
     """Route a known placeholder final text.
 
     Returns ``"empty"`` when the placeholder should be treated as an empty
     post-tool response (the once-only nudge fires), ``"notice"`` when it must
     be replaced by :data:`_TURN_ENDED_WITHOUT_REPLY`, and ``None`` for every
     other text — including the empty string, which keeps its own ladder, and
-    a real short reply such as "Done.".
+    a real short reply such as "Done.". The bridge closer "Proceeding." is only
+    recognised when ``provider`` is a claude-bpx bridge lane.
     """
     if not isinstance(text, str):
         return None
-    if text.strip() not in _PLACEHOLDER_FINAL_TEXTS:
+    stripped = text.strip()
+    if stripped not in _PLACEHOLDER_FINAL_TEXTS and not (
+        stripped in _BRIDGE_CLOSER_FINAL_TEXTS
+        and isinstance(provider, str)
+        and _BRIDGE_CLOSER_PROVIDER_RE.match(provider.strip().lower())
+    ):
         return None
     if prior_was_tool and not already_nudged:
         return "empty"
@@ -6885,6 +6900,48 @@ def run_conversation(
                         )
                         # Hand off to the retries-exhausted → fallback branch.
                         retry_count = max_retries
+                # ── Loopback relay restarting: wait, retry the SAME model ──
+                # A connection error on a 127.0.0.1/localhost base_url is a
+                # local relay restart (relay-autodeploy: ~5 s listener gap).
+                # The generic backoff lands every attempt inside that gap and
+                # the fallback chain swaps models for a 5-second restart. Poll
+                # the port (bounded by ``fallback.local_relay_restart_wait_s``);
+                # if it was down and came back, retry without consuming the
+                # attempt. Still down (or never down) → existing policy below.
+                if (
+                    _is_transport_failure
+                    and _retry.local_relay_recoveries < LOCAL_RELAY_MAX_RECOVERIES_PER_TURN
+                    and is_local_relay_restart_candidate(api_error, _base)
+                ):
+                    from agent.fallback_wiring import local_relay_restart_wait_s
+
+                    _relay_budget = local_relay_restart_wait_s() - _retry.local_relay_waited_s
+                    if _relay_budget > 0:
+                        if _retry.local_relay_recoveries == 0 and _retry.local_relay_waited_s == 0:
+                            agent._vprint(
+                                f"{agent.log_prefix}⏳ local relay restarting, waiting "
+                                f"(up to {_relay_budget:.0f}s) to retry {_model}…",
+                                force=True,
+                            )
+                        agent._touch_activity("waiting for local relay restart")
+                        _relay_back, _relay_waited = wait_for_local_relay(
+                            str(_base),
+                            _relay_budget,
+                            should_abort=lambda: bool(agent._interrupt_requested),
+                        )
+                        _retry.local_relay_waited_s += _relay_waited
+                        logger.warning(
+                            "local relay %s %s after %.1fs (%s) %s",
+                            _base,
+                            "back" if _relay_back else "not recovered",
+                            _relay_waited,
+                            error_type,
+                            agent._client_log_context(),
+                        )
+                        if _relay_back:
+                            _retry.local_relay_recoveries += 1
+                            retry_count = max(retry_count - 1, 0)
+                            continue
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
@@ -9333,6 +9390,7 @@ def run_conversation(
                     final_response,
                     prior_was_tool=any(m.get("role") == "tool" for m in messages[-5:]),
                     already_nudged=getattr(agent, "_post_tool_empty_retried", False),
+                    provider=getattr(agent, "provider", None),
                 )
                 if _placeholder_route is not None:
                     logger.warning(
