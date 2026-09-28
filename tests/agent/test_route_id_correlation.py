@@ -1,0 +1,196 @@
+"""S7 D1 (t_ebbae2c8): route_id is the ONE correlation id, harness side.
+
+* Pooled lanes (claude-apr / claude-bpr): the relay mints; the harness sends
+  no route id and records the relay's ``x-pool-route-id`` (origin ``relay``).
+* Pinned lanes (claude-apx-N / claude-bpx-N): no relay in the path, so the
+  harness mints ``h`` + 32 hex per HTTP attempt, sends it as
+  ``x-hermes-route-id`` and records the SAME value (origin ``harness``).
+* Auxiliary calls to a fleet lane: one harness id per aux call, recorded on
+  the aux ledger row only when it was sent to the provider that served it.
+* lane-src now rides bpr and the pinned lanes too (apr already had it).
+* Nothing is ever sent to a third-party provider.
+"""
+from __future__ import annotations
+
+import sqlite3
+from types import SimpleNamespace
+
+import pytest
+
+from agent import auxiliary_client as ac
+from agent import chat_completion_helpers as cch
+from agent.fork_ext import relay_headers as rh
+from agent.usage_pricing import CanonicalUsage
+from plugins import blackbox
+from plugins.blackbox import store
+
+
+def _agent(provider: str, turn_id: str = "turn-1"):
+    return SimpleNamespace(
+        _current_turn_id=turn_id, provider=provider, model="claude-opus-4-8",
+        api_mode="chat_completions", platform="discord", _delegate_depth=0,
+    )
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    rows = []
+    monkeypatch.setattr("plugins.blackbox.record_api_call", lambda **row: rows.append(row))
+    return rows
+
+
+def _direct(monkeypatch, pool_headers=None):
+    sent = []
+
+    def call(_agent, kwargs):
+        sent.append(dict(kwargs.get("extra_headers") or {}))
+        return SimpleNamespace(usage=None, pool_headers=dict(pool_headers or {}))
+
+    monkeypatch.setattr(cch, "should_use_direct_api_call", lambda _agent: True)
+    monkeypatch.setattr(cch, "direct_api_call", call)
+    return sent
+
+
+@pytest.mark.parametrize("provider", ["claude-bpx-21", "claude-apx-7", "claude-bpx-0"])
+def test_pinned_lane_sends_harness_id_and_ledger_row_carries_it(recorded, monkeypatch, provider):
+    sent = _direct(monkeypatch)
+    cch.interruptible_api_call(_agent(provider), {"model": "m", "extra_headers": {"x-keep": "1"}})
+    rid = sent[0][rh.ROUTE_ID_HEADER]
+    assert rid.startswith("h") and rh.ROUTE_ID_RE.fullmatch(rid)
+    assert rh.route_id_origin(rid) == "harness"
+    assert recorded[0]["route_id"] == rid
+    assert sent[0]["x-keep"] == "1"
+    assert sent[0][rh.LANE_SRC_HEADER] == "platform=discord;delegate_depth=0;aux_task=-"
+
+
+def test_pinned_lane_mints_a_fresh_id_per_attempt(recorded, monkeypatch):
+    sent = _direct(monkeypatch)
+    agent, kwargs = _agent("claude-apx-7"), {"model": "m"}
+    cch.interruptible_api_call(agent, kwargs)
+    cch.interruptible_api_call(agent, kwargs)
+    ids = [h[rh.ROUTE_ID_HEADER] for h in sent]
+    assert len(set(ids)) == 2
+    assert [r["route_id"] for r in recorded] == ids
+
+
+@pytest.mark.parametrize("provider", ["claude-apr", "claude-bpr"])
+def test_pooled_lane_never_gets_a_harness_id_relay_id_wins(recorded, monkeypatch, provider):
+    relay_rid = "0123456789abcdef0123456789abcdef"
+    sent = _direct(monkeypatch, pool_headers={"x-pool-route-id": relay_rid})
+    # a stale harness id on reused kwargs must be dropped, not forwarded
+    kwargs = {"model": "m", "extra_headers": {rh.ROUTE_ID_HEADER: "h" + "a" * 32}}
+    cch.interruptible_api_call(_agent(provider), kwargs)
+    assert rh.ROUTE_ID_HEADER not in sent[0]
+    assert recorded[0]["route_id"] == relay_rid
+    assert rh.route_id_origin(relay_rid) == "relay"
+
+
+def test_bpr_now_carries_lane_src(recorded, monkeypatch):
+    sent = _direct(monkeypatch, pool_headers={"x-pool-route-id": "f" * 32})
+    cch.interruptible_api_call(_agent("claude-bpr"), {"model": "m"})
+    assert sent[0][rh.LANE_SRC_HEADER].startswith("platform=discord;")
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openrouter", "openai-codex", "custom"])
+def test_third_party_provider_gets_neither_header(recorded, monkeypatch, provider):
+    sent = _direct(monkeypatch)
+    stale = {rh.ROUTE_ID_HEADER: "h" + "b" * 32, rh.LANE_SRC_HEADER: "platform=cli"}
+    cch.interruptible_api_call(_agent(provider), {"model": "m", "extra_headers": stale})
+    assert rh.ROUTE_ID_HEADER not in sent[0] and rh.LANE_SRC_HEADER not in sent[0]
+    assert recorded[0]["route_id"] is None
+
+
+def test_apr_keeps_the_lane_src_its_affinity_set_stamped(recorded, monkeypatch):
+    sent = _direct(monkeypatch, pool_headers={"x-pool-route-id": "e" * 32})
+    kw = {"model": "m", "extra_headers": {rh.LANE_SRC_HEADER: "platform=cli;delegate_depth=0;aux_task=-"}}
+    cch.interruptible_api_call(_agent("claude-apr"), kw)
+    assert sent[0][rh.LANE_SRC_HEADER] == "platform=cli;delegate_depth=0;aux_task=-"
+
+
+@pytest.mark.parametrize("value,origin", [
+    ("0" * 32, "relay"), ("h" + "0" * 32, "harness"), ("c" + "0" * 32, "cli"),
+    ("x" + "0" * 32, None), ("0" * 31, None), ("H" + "0" * 32, None), (None, None), ("", None),
+])
+def test_origin_is_the_id_grammar(value, origin):
+    assert rh.route_id_origin(value) == origin
+
+
+# ---- auxiliary calls ------------------------------------------------------
+
+@pytest.mark.parametrize("provider,sent", [
+    ("gemini-bridge", True), ("claude-bpr", True), ("claude-apr", True),
+    ("claude-bpx-21", True), ("openrouter", False), ("nous", False), ("auto", False),
+])
+def test_aux_build_kwargs_carries_id_only_to_fleet_lanes(provider, sent):
+    with rh.aux_route_scope() as route:
+        kw = ac._build_call_kwargs(provider, "m", [{"role": "user", "content": "x"}], task="compression")
+    got = (kw.get("extra_headers") or {}).get(rh.ROUTE_ID_HEADER)
+    assert (got == route.route_id) is sent
+    assert (route.id_for(provider) == route.route_id) is sent
+
+
+def test_aux_build_kwargs_outside_a_scope_sends_nothing():
+    kw = ac._build_call_kwargs("gemini-bridge", "m", [{"role": "user", "content": "x"}], task="vision")
+    assert rh.ROUTE_ID_HEADER not in (kw.get("extra_headers") or {})
+
+
+def test_aux_id_is_recorded_only_for_the_provider_that_served(monkeypatch):
+    """Fallback case: the id went to gemini-bridge, a third party served."""
+    got = []
+    monkeypatch.setattr("agent.aux_accounting.record_aux_api_call",
+                        lambda response, task, route_info, route_id=None: got.append(route_id))
+
+    def impl(**kw):
+        ac._build_call_kwargs("gemini-bridge", "m", kw["messages"], task=kw["task"])
+        kw["route_info"]["provider"] = served
+        return SimpleNamespace(choices=[], usage=None)
+
+    monkeypatch.setattr(ac, "_call_llm_impl", impl)
+    for served in ("gemini-bridge", "openrouter"):
+        ac.call_llm("title_generation", messages=[{"role": "user", "content": "x"}])
+    assert got[0] and got[0].startswith("h") and got[1] is None
+
+
+def test_aux_row_carries_route_id_into_blackbox(monkeypatch):
+    rows = []
+    monkeypatch.setattr("plugins.blackbox.record_api_call", lambda **row: rows.append(row))
+    agent = SimpleNamespace(_current_turn_id="t")
+    cch._emit_aux_api_call_record(agent, "t", task="vision", provider="gemini-bridge",
+                                  model="m", usage=None, api_mode="chat_completions",
+                                  route_id="h" + "1" * 32)
+    assert rows[0]["route_id"] == "h" + "1" * 32 and rows[0]["attribution"] == "aux:vision"
+
+
+# ---- Blackbox store --------------------------------------------------------
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(blackbox, "_config", lambda: {
+        "enabled": True, "alerts_enabled": False, "record_subagents": True,
+        "retention_days": 3650, "prefix_guard": False,
+    })
+    store._connect().close()
+    return store._db_path()
+
+
+def test_store_records_route_id_origin(db):
+    for seq, rid in enumerate(["a" * 32, "h" + "b" * 32, None]):
+        store.insert_api_call("turn-x", seq, ts=1.0, provider="claude-bpx-21", model="m",
+                              usage=CanonicalUsage(input_tokens=1), sub_key=None,
+                              attribution="pinned", route_id=rid)
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT route_id, route_id_origin FROM turn_api_calls ORDER BY seq").fetchall()
+    assert rows == [("a" * 32, "relay"), ("h" + "b" * 32, "harness"), (None, None)]
+
+
+def test_store_migrates_an_existing_db_without_the_column(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store._connect().close()
+    path = store._db_path()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE turn_api_calls DROP COLUMN route_id_origin")
+    store._connect().close()
+    with sqlite3.connect(path) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turn_api_calls)")}
+    assert "route_id_origin" in cols

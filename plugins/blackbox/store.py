@@ -180,6 +180,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             http_status INT,
             relay_synthetic INT NOT NULL DEFAULT 0,
             route_id TEXT,
+            -- Who minted route_id (S7 D1): relay | harness | cli, derived from
+            -- the id's prefix by relay_headers.route_id_origin. NULL with it.
+            route_id_origin TEXT,
             -- x-hermes-call-id sent on this attempt (bridge lanes only; the
             -- bridge journal logs it, cachehop joins on it). NULL elsewhere.
             call_id TEXT,
@@ -358,7 +361,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT"),
                       ("call_id", "TEXT"), ("parent_call_id", "INT"),
-                      ("sub_harness", "TEXT")):
+                      ("sub_harness", "TEXT"), ("route_id_origin", "TEXT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -914,6 +917,15 @@ def insert_turn(record: TurnRecord) -> None:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
 
 
+def _route_id_origin(route_id: str | None) -> str | None:
+    """S7 D1: ``relay`` | ``harness`` | ``cli`` from the id grammar, else None."""
+    if not route_id:
+        return None
+    from agent.fork_ext.relay_headers import route_id_origin
+
+    return route_id_origin(route_id)
+
+
 def insert_api_call(
     turn_id: str, seq: int, *, ts: float, provider: str, model: str,
     usage: CanonicalUsage, sub_key: str | None, attribution: str,
@@ -948,15 +960,17 @@ def insert_api_call(
                 turn_id, seq, ts, provider, sub_key, model, input_tokens,
                 output_tokens, cache_read, cache_write, reasoning, attribution,
                 http_status, relay_synthetic, route_id, cache_write_5m,
-                cache_write_1h, cache_ttl_requested, lane_family, call_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cache_write_1h, cache_ttl_requested, lane_family, call_id,
+                route_id_origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
              cache_write_1h, cache_ttl_requested,
-             AUX_LANE_FAMILY if aux else lane_family(provider), call_id),
+             AUX_LANE_FAMILY if aux else lane_family(provider), call_id,
+             _route_id_origin(route_id)),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
@@ -1033,15 +1047,16 @@ def insert_composite_calls(
                     turn_id, seq, ts, provider, sub_key, model, input_tokens,
                     output_tokens, cache_read, cache_write, reasoning,
                     attribution, http_status, relay_synthetic, route_id,
-                    lane_family, parent_call_id, sub_harness
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    lane_family, parent_call_id, sub_harness, route_id_origin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                 """,
                 (turn_id, seq, call.get("ts"), provider, call.get("sub_key"),
                  str(call.get("model") or ""), values["input_tokens"],
                  values["output_tokens"], values["cache_read"],
                  values["cache_write"], values["reasoning"], attribution,
                  call.get("http_status"), call.get("route_id"),
-                 lane_family(provider), parent_seq, sub_harness),
+                 lane_family(provider), parent_seq, sub_harness,
+                 _route_id_origin(call.get("route_id"))),
             )
         conn.execute(
             "UPDATE turn_api_calls SET sub_harness = ?, "

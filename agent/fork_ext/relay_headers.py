@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 import secrets
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 
 def _pool_lane(agent, aux_task=None) -> str:
@@ -173,6 +175,133 @@ def call_id_of(api_kwargs):
     eh = api_kwargs.get("extra_headers")
     value = eh.get(CALL_ID_HEADER) if isinstance(eh, dict) else None
     return value if isinstance(value, str) and CALL_ID_RE.fullmatch(value) else None
+
+
+# S7 D1 correlation id (t_ebbae2c8; plans/subs-ace/S7-token-ledger-spec.md).
+# ``route_id`` is THE correlation id between a Blackbox ``turn_api_calls`` row
+# and the boundary record (box wirelog, bridge JSONL). The pool relay mints it
+# on pooled lanes (32 hex, returned as ``x-pool-route-id`` and forwarded to the
+# box as ``x-hermes-route-id``). Where no relay is in the path -- pinned
+# ``claude-apx-N`` / ``claude-bpx-N`` main calls and every auxiliary call to a
+# fleet lane -- the harness mints ``'h' + 32 hex`` and sends it itself. The
+# prefix IS ``route_id_origin`` (none=relay, h=harness, c=cli shim), so every
+# recorder derives the origin from the id with one grammar. Loopback hops only:
+# the box proxy drops every x-hermes-* header before egress (I1).
+ROUTE_ID_HEADER = "x-hermes-route-id"
+LANE_SRC_HEADER = "x-hermes-lane-src"
+ROUTE_ID_RE = re.compile(r"^[hc]?[0-9a-f]{32}$")
+_ROUTE_ID_ORIGINS = {"h": "harness", "c": "cli"}
+_PINNED_ROUTE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
+# lane-src is observational at the relay (pick.lane_inputs + counters, never a
+# routing input) and at the box (wirelog field). apr already gets it with the
+# affinity set; bpr and the pinned lanes get it here (S7 P2a / §10 Q2).
+_LANE_SRC_PROVIDER_RE = re.compile(r"^claude-bpr$|^claude-[ab]px-\d+$")
+# Fleet-owned loopback lanes an AUXILIARY call may carry the header to. The
+# pooled relays log it as ``client_route_id`` and forward their own id; the
+# pinned boxes and gemini-bridge record it directly. Never a third party.
+_AUX_ROUTE_PROVIDER_RE = re.compile(
+    r"^claude-apr$|^claude-bpr$|^claude-[ab]px-\d+$|^gemini-bridge$|^gemini-ultra$|^antigravity$"
+)
+
+
+def mint_harness_route_id() -> str:
+    return "h" + secrets.token_hex(16)
+
+
+def route_id_origin(route_id):
+    """``relay`` | ``harness`` | ``cli`` from the id's prefix; None if invalid."""
+    if not isinstance(route_id, str) or not ROUTE_ID_RE.fullmatch(route_id):
+        return None
+    return _ROUTE_ID_ORIGINS[route_id[0]] if len(route_id) == 33 else "relay"
+
+
+def _provider_of(agent) -> str:
+    provider = getattr(agent, "provider", "")
+    return provider.strip().lower() if isinstance(provider, str) else ""
+
+
+def stamp_correlation_headers(agent, api_kwargs):
+    """Per HTTP attempt: a FRESH harness route id on pinned claude lanes, and
+    the lane-src classifier string on bpr + pinned lanes.
+
+    A pooled call never gets a harness id (the relay mints, and its id wins).
+    Out-of-scope providers have both headers removed so a reused kwargs dict
+    never carries a stale id or lane-src to another lane (apr keeps the
+    lane-src its affinity set stamped). Returns the harness id, else None.
+    """
+    if not isinstance(api_kwargs, dict):
+        return None
+    provider = _provider_of(agent)
+    try:
+        eh = dict(api_kwargs.get("extra_headers") or {})
+    except (TypeError, ValueError):
+        return None
+    route_id = None
+    if _PINNED_ROUTE_PROVIDER_RE.fullmatch(provider):
+        route_id = mint_harness_route_id()
+        eh[ROUTE_ID_HEADER] = route_id
+    else:
+        eh.pop(ROUTE_ID_HEADER, None)
+    if _LANE_SRC_PROVIDER_RE.fullmatch(provider):
+        eh[LANE_SRC_HEADER] = _pool_lane_src(agent)
+    elif provider not in _POOL_AFFINITY_PROVIDERS:
+        eh.pop(LANE_SRC_HEADER, None)
+    if eh or "extra_headers" in api_kwargs:
+        api_kwargs["extra_headers"] = eh
+    return route_id
+
+
+def route_id_of(api_kwargs):
+    """The harness route id stamped on ``api_kwargs`` (validated), else None."""
+    if not isinstance(api_kwargs, dict):
+        return None
+    eh = api_kwargs.get("extra_headers")
+    value = eh.get(ROUTE_ID_HEADER) if isinstance(eh, dict) else None
+    return value if isinstance(value, str) and ROUTE_ID_RE.fullmatch(value) else None
+
+
+class _AuxRoute:
+    """One auxiliary call's harness route id and the providers it was sent to."""
+
+    __slots__ = ("route_id", "sent_to")
+
+    def __init__(self):
+        self.route_id = mint_harness_route_id()
+        self.sent_to = set()
+
+    def id_for(self, provider):
+        """The id iff it was actually sent to ``provider`` (the served route)."""
+        p = provider.strip().lower() if isinstance(provider, str) else ""
+        return self.route_id if p and p in self.sent_to else None
+
+
+_AUX_ROUTE: "ContextVar[_AuxRoute | None]" = ContextVar("aux_route_id", default=None)
+
+
+@contextmanager
+def aux_route_scope():
+    """Bind one harness route id to one auxiliary call (every retry/fallback
+    attempt inside it builds kwargs under the same id)."""
+    route = _AuxRoute()
+    token = _AUX_ROUTE.set(route)
+    try:
+        yield route
+    finally:
+        _AUX_ROUTE.reset(token)
+
+
+def aux_route_headers(provider) -> dict:
+    """``{x-hermes-route-id: <id>}`` for an aux request to a fleet lane inside
+    an :func:`aux_route_scope`, else ``{}``. Never raises."""
+    try:
+        route = _AUX_ROUTE.get()
+        p = provider.strip().lower() if isinstance(provider, str) else ""
+        if route is None or not _AUX_ROUTE_PROVIDER_RE.fullmatch(p):
+            return {}
+        route.sent_to.add(p)
+        return {ROUTE_ID_HEADER: route.route_id}
+    except Exception:
+        return {}
 
 
 def _pool_affinity_headers(agent, aux_task=None) -> dict:
