@@ -1917,6 +1917,19 @@ def test_codex_auto_review_stays_unknown():
     assert result.amount_usd is None
 
 
+def test_kimi_code_kimi_k3_prices_from_vendor_snapshot():
+    """kimi-code/kimi-k3 (the fleet's Kimi Code lane) resolves to the vendor row,
+    not "unknown" (t_d77c1865: tokens-reprice-sweep paged it as unpriced)."""
+    entry = get_pricing_entry("kimi-k3", provider="kimi-code")
+    assert entry is not None and entry.source == "official_docs_snapshot"
+    assert entry.source_url == "https://platform.kimi.ai/docs/pricing/chat"
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000, cache_write_tokens=1_000_000)
+    result = estimate_usage_cost("kimi-k3", usage, provider="kimi-code")
+    # 3.00 + 15.00 + 0.30 + 3.00
+    assert result.amount_usd is not None and float(result.amount_usd) == 21.30  # type: ignore[arg-type]
+
+
 def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
     """moonshotai/kimi-k3 on the openrouter route prices from the curated row,
     never the live catalog (t_01655aa1: subs.ace ledger NULL-priced these)."""

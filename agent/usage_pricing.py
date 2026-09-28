@@ -1570,6 +1570,25 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openrouter.ai/moonshotai/kimi-k3",
         pricing_version="openrouter-pricing-2026-09",
     ),
+    # ── Kimi Code (Moonshot) ─────────────────────────────────────────────
+    # The fleet's `kimi-code` provider falls through resolve_billing_route to
+    # provider="kimi-code", model="kimi-k3", so it needs its own row; without it
+    # tokens-reprice-sweep pages "unpriced model" (t_d77c1865). Vendor US-dollar
+    # rate card, read 2026-09-28 from https://platform.kimi.ai/docs/pricing/chat
+    # (K3 table): input $3.00/M, cached input $0.30/M, output $15.00/M, cache
+    # write $3.00/M at the default 5-min TTL ($6.00/M at 1 h; not modelled).
+    (
+        "kimi-code",
+        "kimi-k3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        cache_write_cost_per_million=Decimal("3.00"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.ai/docs/pricing/chat",
+        pricing_version="kimi-pricing-2026-09",
+    ),
 }
 
 # GPT-5.6 "-pro" high-effort variants bill at the same per-token rates as
