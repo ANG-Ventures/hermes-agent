@@ -54,21 +54,23 @@ SCANNED_FILES = ("gateway/run.py", "gateway/slash_commands.py")
 _WALK_ATTRS = frozenset({"rglob", "glob", "iglob"})
 _READ_ATTRS = frozenset({"read_text", "read_bytes"})
 
-# (file, coroutine, label) of pre-existing single-file reads, captured
-# 2026-09-24.  Update-/restart-notification paths reading one small state file.
-# To fix one: offload it, then DELETE its line here (a stale entry fails).
-READ_BASELINE = frozenset({
+# (file, coroutine, label) -> number of read sites, captured 2026-09-24
+# (counts added 2026-09-28, FleetReview #113: a set of keys hid a NEW read at
+# an already-baselined coroutine). Update-/restart-notification paths reading
+# one small state file. To fix one: offload it, then lower/delete its count
+# here (a stale count fails).
+READ_BASELINE = {
     # via one-hop sync helpers (breadcrumb / resume-pending / stuck-loop state files)
-    "gateway/run.py _handle_message_with_agent_admitted -> read:.read_text",
-    "gateway/run.py _stop_impl_body -> read:.read_text",
-    "gateway/run.py start -> read:.read_text",
-    "gateway/slash_commands.py _handle_reset_command -> read:.read_text",
+    "gateway/run.py _handle_message_with_agent_admitted -> read:.read_text": 1,
+    "gateway/run.py _stop_impl_body -> read:.read_text": 3,
+    "gateway/run.py start -> read:.read_text": 1,
+    "gateway/slash_commands.py _handle_reset_command -> read:.read_text": 1,
     # direct
-    "gateway/run.py _watch_update_progress -> read:.read_text",
-    "gateway/run.py _send_update_notification -> read:.read_text",
-    "gateway/run.py _send_update_notification -> read:.read_bytes",
-    "gateway/run.py _send_restart_notification -> read:.read_text",
-})
+    "gateway/run.py _watch_update_progress -> read:.read_text": 3,
+    "gateway/run.py _send_update_notification -> read:.read_text": 2,
+    "gateway/run.py _send_update_notification -> read:.read_bytes": 1,
+    "gateway/run.py _send_restart_notification -> read:.read_text": 1,
+}
 
 
 def _shape(call: ast.Call) -> str | None:
@@ -198,9 +200,13 @@ def test_no_tree_walk_reaches_the_event_loop():
 
 
 def test_single_file_reads_on_loop_do_not_grow():
-    reads = {_key(o) for o in _all_offenders() if "-> read:" in o}
-    new = sorted(reads - READ_BASELINE)
-    gone = sorted(READ_BASELINE - reads)
+    from collections import Counter
+
+    reads = Counter(_key(o) for o in _all_offenders() if "-> read:" in o)
+    new = sorted(f"{k} (x{n}, baseline x{READ_BASELINE.get(k, 0)})"
+                 for k, n in reads.items() if n > READ_BASELINE.get(k, 0))
+    gone = sorted(f"{k} (x{reads.get(k, 0)}, baseline x{n})"
+                  for k, n in READ_BASELINE.items() if reads.get(k, 0) < n)
     assert not new, "new synchronous file read on the event loop:\n  " + "\n  ".join(new)
     assert not gone, (
         "baseline entry no longer present -- delete it from READ_BASELINE:\n  "
