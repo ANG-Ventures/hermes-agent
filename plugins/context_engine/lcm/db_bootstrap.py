@@ -3596,9 +3596,18 @@ def ensure_messages_dedup_columns(conn: sqlite3.Connection) -> None:
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_msg_session_visible'"
     ).fetchone()
     if not has_visible_index:
+        # One-shot O(rows) migration on the engine-load path (C5 #64, ruled:
+        # accept it). Logged once, when it actually runs, with its cost.
+        started = time.monotonic()
+        rows = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_session_visible "
             "ON messages(session_id, store_id) WHERE superseded_by IS NULL"
+        )
+        logger.info(
+            "lcm: built idx_msg_session_visible over %d messages in %.1f ms "
+            "(one-time migration)",
+            rows, (time.monotonic() - started) * 1000.0,
         )
 
 
