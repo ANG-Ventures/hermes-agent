@@ -32,12 +32,14 @@ against the prefs pass (B's world pass leaks user-ops junk as low-value world ca
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
 import re
 import threading
 import time
+from pathlib import Path
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -488,6 +490,21 @@ class CaptureRouter:
             "destination": None, "usage": {}, "latency": 0.0,
             "providers": {}, "error": None,
         }
+        dest_dir = self._staging_dir if self._staging_mode else self._brain_inbox
+        # A prior lease may have staged this turn then died before mark_done.
+        # Preserve that durable snapshot rather than re-extracting different facts
+        # or writing a second file if the retry crosses midnight.
+        existing = sorted({
+            path for root in (self._staging_dir, self._brain_inbox)
+            for path in Path(root).glob(f"*/{glob.escape(turn_id)}.md")
+        })
+        if existing:
+            result["destination"] = (
+                "staging" if str(existing[0]).startswith(str(self._staging_dir) + os.sep)
+                else "brain-inbox"
+            )
+            result["staged_path"] = str(existing[0])
+            return result
         try:
             passes = self.two_pass_extract(user, assistant, profile)
         except Exception as e:  # ThreadPool/executor level failure — should be rare (extract is soft)

@@ -132,8 +132,13 @@ def test_async_hint_is_bounded_and_does_not_block_the_loop(monkeypatch):
 
         t = asyncio.create_task(ticker())
         start = time.monotonic()
-        got = await gateway_run._check_unavailable_skill_async("nope")
-        elapsed = time.monotonic() - start
+        try:
+            got = await gateway_run._check_unavailable_skill_async("nope")
+            elapsed = time.monotonic() - start
+        finally:
+            # Free the worker BEFORE asyncio.run's default-executor shutdown,
+            # which otherwise joins it for the full 5s wait.
+            release.set()
         t.cancel()
         return got, elapsed, ticks
 

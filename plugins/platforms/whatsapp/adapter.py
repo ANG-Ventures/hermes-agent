@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import signal
 import subprocess
 
@@ -609,7 +610,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
                         self._set_fatal_error(
                             "whatsapp_npm_install_failed",
-                            f"WhatsApp bridge npm install failed. Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                            f"WhatsApp bridge npm install failed. Run `cd {shlex.quote(str(bridge_dir))} && {shlex.quote(str(_npm_bin))} install` manually, then restart `hermes gateway`.",
                             retryable=False,
                         )
                         return False
@@ -623,7 +624,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     print(f"[{self.name}] Failed to install dependencies: {e}")
                     self._set_fatal_error(
                         "whatsapp_npm_install_failed",
-                        f"WhatsApp bridge npm install failed ({e}). Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                        f"WhatsApp bridge npm install failed ({e}). Run `cd {shlex.quote(str(bridge_dir))} && {shlex.quote(str(_npm_bin))} install` manually, then restart `hermes gateway`.",
                         retryable=False,
                     )
                     return False

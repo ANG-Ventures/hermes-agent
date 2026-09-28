@@ -81,3 +81,30 @@ def test_anthropic_lanes_keep_the_write_rule(db, usage, expected):
         turn = f"{provider}-{expected}-{usage.cache_read_input_tokens}"
         _record(turn, provider, usage, "anthropic_messages")
         assert _miss(db, turn) == expected, provider
+
+
+def test_unknown_cache_bucket_is_not_classified_as_a_miss(db):
+    """k117: an unmeasured cache_read is not a measured 0 read -> no verdict."""
+    from agent.usage_pricing import CanonicalUsage
+
+    usage = CanonicalUsage(input_tokens=100_000, output_tokens=5,
+                           cache_read_tokens=0, cache_read_tokens_unknown=True)
+    _record("unk", "openai-codex", usage, "chat_completions")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT input_tokens, cache_read FROM turn_api_calls "
+                            "WHERE turn_id='unk'").fetchone() == (100_000, None)
+    assert _miss(db, "unk") is None
+
+
+def test_aggregate_only_unknown_keeps_measured_buckets(db):
+    """usage_unknown alone (total missing) must not NULL buckets the provider reported."""
+    from agent.usage_pricing import normalize_usage
+
+    usage = normalize_usage({"prompt_tokens": 140, "total_tokens": None,
+                             "prompt_tokens_details": {"cached_tokens": 40}},
+                            api_mode="chat_completions")
+    assert usage.usage_unknown and not usage.cache_read_tokens_unknown
+    _record("agg", "openai-codex", usage, "chat_completions")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT input_tokens, cache_read FROM turn_api_calls "
+                            "WHERE turn_id='agg'").fetchone() == (100, 40)

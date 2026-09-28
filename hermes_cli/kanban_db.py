@@ -5668,6 +5668,10 @@ OPERATOR_TOKEN_FILENAME = "operator-token"
 OPERATOR_FLAG_GATED_ACTIONS: frozenset[str] = frozenset({
     "complete", "block", "unblock", "reassign", "archive", "request-review",
 })
+# Actions where ONLY ``--operator`` is gated: on ``reclaim`` it overrides the
+# dead-claimer liveness hold (t_6451e7c9), which must not be reachable with an
+# arbitrary string. ``reclaim --takeover`` keeps its existing behaviour.
+OPERATOR_ONLY_GATED_ACTIONS: frozenset[str] = frozenset({"reclaim"})
 
 
 class OperatorTokenRequiredError(ValueError):
@@ -5736,7 +5740,11 @@ def enforce_operator_flag_gate(
     ``takeover_refused`` event (caller pid, argv, which flags, token state).
     """
     used = sorted({f for f in (flags or ()) if f})
-    if action not in OPERATOR_FLAG_GATED_ACTIONS or not used:
+    if action in OPERATOR_ONLY_GATED_ACTIONS:
+        used = [f for f in used if f == "--operator"]
+    elif action not in OPERATOR_FLAG_GATED_ACTIONS:
+        return
+    if not used:
         return
     token = _operator_token_state()
     if token == "ok":
@@ -9729,6 +9737,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    operator: Optional[str] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
 
@@ -9758,6 +9767,15 @@ def reclaim_task(
     straight back to the dispatcher and defeat the block. Use
     :func:`unblock_task` or :func:`promote_task` to actually re-queue one.
 
+    ``operator`` (``--operator "<who: why>"``) overrides exactly one hold:
+    a host-local claim with NO stamped worker pid whose claimer pid is proven
+    gone (ESRCH), still inside the dead-claimer launch bound. The typical
+    shape is ``claim --review`` from a short-lived CLI process: the claimer
+    exits at once and no worker is ever spawned, yet the launch bound held the
+    card for a full claim TTL with no escape (t_6451e7c9). The override is
+    ledgered on the ``reclaimed`` event. A live claimer, a stamped worker pid,
+    or a signalled survivor is still refused.
+
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist) or if the worker's
     death cannot be proven.
@@ -9780,6 +9798,26 @@ def reclaim_task(
     # Never release a claim while our host-local worker is alive or its
     # liveness is unknown. This also covers NULL pid in the TTL and stale
     # paths that share the predicate. A request is not proof of death.
+    override_ok = False
+    if operator and _worker_survived_termination(termination):
+        # The override relaxes liveness, so it needs the same authorization
+        # as every other operator flag on a card with an active run: the
+        # operator token (or the card's own dispatcher grant). A bare
+        # ``--operator`` string is not authority (FleetReview on #1404).
+        token = _operator_token_state()
+        if token == "ok" or _caller_holds_grant_for(task_id):
+            override_ok = True
+        else:
+            termination["operator_override_refused"] = f"token_{token}"
+    if (
+        override_ok
+        and _dead_claimer_hold_only(row["worker_pid"], termination)
+        and not _host_process_mentions_task(task_id)
+    ):
+        termination["operator_override"] = str(operator)
+        termination["operator_override_basis"] = "dead_claimer_no_worker_pid"
+        termination["liveness_unprovable"] = False
+        termination["terminated"] = True
     if _worker_survived_termination(termination):
         _refuse_reclaim_unproven_death(
             conn, task_id, prev_lock, termination, reason=reason,
@@ -17472,6 +17510,69 @@ def _terminate_reclaimed_worker(
     info["terminated"] = not _pid_alive(pid)
     return info
 
+
+def _dead_claimer_hold_only(worker_pid: Optional[int], termination: dict) -> bool:
+    """True when the ONLY thing holding a claim is the dead-claimer bound.
+
+    Host-local, no worker pid ever stamped, nothing signalled, the claimer
+    pid parsed from ``claim_lock`` proven gone, and NO worker evidence
+    (``spawned``/``heartbeat``) on the current run (``launch_bound`` basis).
+    Anything else (a live claimer, a stamped pid, an identity check, a
+    heartbeat from an unstamped orphan) is real liveness evidence.
+    """
+    return bool(
+        termination.get("host_local")
+        and not worker_pid
+        and not termination.get("termination_attempted")
+        and termination.get("claimer_pid_dead")
+        and termination.get("dead_claimer_release_basis") == "launch_bound"
+    )
+
+
+def _host_process_mentions_task(task_id: str) -> bool:
+    """True if any other process on this host carries ``task_id`` in argv.
+
+    Dispatcher workers are launched with the task id on their command line,
+    so an unstamped orphan from a claimer that died between ``Popen`` and
+    ``_set_worker_pid`` is visible here. This process and its ancestors are
+    skipped. An unreadable process table counts as a match (fail closed).
+
+    A process whose command line cannot be read is INCONCLUSIVE, so it also
+    counts as a match: it could be exactly the unstamped worker we are
+    looking for. Two shapes are provably not our worker and are skipped: a
+    zombie (no code runs) and a process whose effective uid differs from
+    ours (the dispatcher launches workers as this user; setuid ``sudo`` /
+    ``login`` and other users' processes are unreadable on macOS for that
+    reason). If the uid cannot be read either, fail closed.
+    """
+    try:
+        # This CLI and the shell(s) that launched it name the task too.
+        me = psutil.Process()
+        own = {me.pid, *(p.pid for p in me.parents())}
+        # Windows has no uids: never skip on uid there.
+        _geteuid = getattr(os, "geteuid", None)
+        my_euid = _geteuid() if _geteuid is not None else None
+        for proc in psutil.process_iter(["pid", "cmdline", "status", "uids"]):
+            info = proc.info
+            if info.get("pid") in own:
+                continue
+            cmdline = info.get("cmdline")
+            if cmdline is None:
+                if info.get("status") == psutil.STATUS_ZOMBIE:
+                    continue
+                uids = info.get("uids")
+                if (
+                    my_euid is not None
+                    and uids is not None
+                    and getattr(uids, "effective", my_euid) != my_euid
+                ):
+                    continue
+                return True
+            if any(task_id in str(a) for a in cmdline):
+                return True
+    except Exception:
+        return True
+    return False
 
 def _worker_survived_termination(termination: dict) -> bool:
     """True when a host-local worker has NOT been proven gone.

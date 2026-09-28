@@ -411,7 +411,9 @@ def _explain_dead_worktree_stub(repo, key, bases=()):
     """
     target = _gitfile_target(repo)
     try:
-        if target is None or target.exists():
+        # Only a LINKED WORKTREE admin dir (``.../.git/worktrees/<name>``) is a
+        # worktree stub; a submodule gitfile points under ``.git/modules/``.
+        if target is None or target.parent.name != "worktrees" or target.exists():
             return
     except OSError:
         return

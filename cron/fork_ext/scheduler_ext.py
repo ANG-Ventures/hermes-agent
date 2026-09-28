@@ -96,7 +96,7 @@ def resolve_job_script_timeout(job, global_timeout: int, *, now=None) -> tuple[i
     if raw is not None and not isinstance(raw, bool):
         try:
             explicit = int(float(raw))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             explicit = 0
         if explicit > 0:
             return min(explicit, global_timeout), "job"

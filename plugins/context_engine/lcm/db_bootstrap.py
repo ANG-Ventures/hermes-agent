@@ -3231,6 +3231,28 @@ def repair_external_content_fts(
     now: float | None = None,
     throttle: bool = False,
 ) -> dict[str, bool]:
+    caller_txn = conn.in_transaction
+    if caller_txn:
+        conn.execute("SAVEPOINT fts_repair")
+    try:
+        result = _repair_external_content_fts_impl(
+            conn, spec, now=now, throttle=throttle, caller_txn=caller_txn)
+        if caller_txn:
+            conn.execute("RELEASE SAVEPOINT fts_repair")
+        return result
+    except BaseException:
+        if caller_txn and conn.in_transaction:
+            conn.execute("ROLLBACK TO SAVEPOINT fts_repair")
+            conn.execute("RELEASE SAVEPOINT fts_repair")
+        raise
+
+
+def _repair_external_content_fts_impl(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *,
+    now: float | None, throttle: bool, caller_txn: bool,
+) -> dict[str, bool]:
+    # Captured at wrapper entry: pre-checks may write metadata and open an
+    # implicit transaction even if the caller did not own one.
     if throttle and _fts_needs_rebuild_structural(conn, spec):
         # Engine-load path with GENUINE structural damage: never rebuild inline.
         # The rebuild is O(rows) — 1696 s on an 11.4 GB fleet snapshot — and
@@ -3241,7 +3263,7 @@ def repair_external_content_fts(
     needs_rebuild = _fts_needs_rebuild(conn, spec, now=now, throttle=throttle)
     if not (needs_rebuild or _fts_missing_triggers(conn, spec) or _fts_stale_triggers(conn, spec)):
         # No-op pass (every ordinary engine load): take no write lock.
-        return _repair_external_content_fts_body(conn, spec, now=now, needs_rebuild=False)
+        return _repair_external_content_fts_body(conn, spec, now=now, needs_rebuild=False, commit=not caller_txn)
     # Any repair is ONE write transaction. Python's legacy sqlite3 isolation
     # opens no implicit transaction for DDL, so DROP TABLE / CREATE VIRTUAL TABLE /
     # DROP TRIGGER each autocommitted on their own. For the whole O(rows) rebuild
@@ -3255,10 +3277,11 @@ def repair_external_content_fts(
         conn.execute("BEGIN IMMEDIATE")
     try:
         return _repair_external_content_fts_body(
-            conn, spec, now=now, needs_rebuild=needs_rebuild
+            conn, spec, now=now, needs_rebuild=needs_rebuild, commit=not caller_txn
         )
     except BaseException:
-        if conn.in_transaction:
+        # Roll back only our own transaction; a caller-owned one is theirs.
+        if not caller_txn and conn.in_transaction:
             conn.rollback()
         raise
 
@@ -3269,6 +3292,7 @@ def _repair_external_content_fts_body(
     *,
     now: float | None,
     needs_rebuild: bool,
+    commit: bool = True,
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
@@ -3287,7 +3311,8 @@ def _repair_external_content_fts_body(
                 # integrity-failed flag would otherwise keep `/lcm doctor`
                 # reporting issues-found for an index that no longer exists.
                 _clear_integrity_failed(conn, spec)
-                conn.commit()
+                if commit:
+                    conn.commit()
                 return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
         rebuild_started = time.monotonic()
         _drop_fts_table(conn, spec.table_name)
@@ -3333,9 +3358,22 @@ def _repair_external_content_fts_body(
     # GC scan under BEGIN IMMEDIATE) for up to busy_timeout — and it silently
     # erased the background scan's corruption flag before `/lcm doctor` could
     # ever show it.
-    if rebuilt or triggers_were_missing or triggers_were_stale:
+    # Recreating triggers alone does not repair the index: rows written while
+    # a trigger was missing/stale stay unindexed, and a deep-check or parity
+    # flag describes the index CONTENT. Without a rebuild, clear only a
+    # structural flag, and only once the structure verifiably checks out.
+    if rebuilt:
         _clear_integrity_failed(conn, spec)
-    conn.commit()
+    elif triggers_were_missing or triggers_were_stale:
+        prior = load_integrity_failed(conn, spec)
+        if (
+            prior is not None
+            and str(prior["detail"]).startswith(_SCAN_DETAIL_STRUCTURAL)
+            and not _fts_needs_rebuild_structural(conn, spec)
+        ):
+            _clear_integrity_failed(conn, spec)
+    if commit:
+        conn.commit()
     return {
         "rebuilt": rebuilt,
         "degraded": degraded,

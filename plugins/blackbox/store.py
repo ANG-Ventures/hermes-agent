@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -43,8 +44,67 @@ def scrub_and_truncate(text: Any, n: int = 2000) -> str:
     return scrubbed
 
 
+class LiveBlackboxStoreRefused(RuntimeError):
+    """A test/probe process tried to open a LIVE Blackbox ``turns.db``."""
+
+
+def _is_live_blackbox_db(resolved: Path, root: Path) -> bool:
+    """True when *resolved* is the Blackbox store of production root *root*.
+
+    Covers ``<root>/blackbox/<file>`` and ``<root>/profiles/<name>/blackbox/<file>``
+    only. Deeper paths under the root (worktrees, kanban workspaces) are
+    scratch space where hermetic tests legitimately create stores.
+    """
+    try:
+        parts = resolved.relative_to(root).parts
+    except ValueError:
+        return False
+    if len(parts) == 2:
+        return parts[0] == "blackbox"
+    return len(parts) == 4 and parts[0] == "profiles" and parts[2] == "blackbox"
+
+
+def _assert_live_store_write_allowed(path: Path) -> None:
+    """Refuse a test-context process opening a production Blackbox store.
+
+    Card t_46c8caeb (D9): on 2026-09-27 01:27 three ``turn_api_calls`` +
+    ``prefix_sessions`` rows with ``<MagicMock ...>`` provider/model/turn_id
+    landed in the LIVE ``profiles/daedalus/blackbox/turns.db`` from a test
+    harness that resolved the worker's real ``HERMES_HOME``. The conftest
+    redirect is path-scoped (it only loads for files under ``tests/``), so the
+    gate lives at the ``_connect()`` choke point, like ``state.db``
+    (``hermes_state._ensure_test_isolation``) and ``kanban.db``
+    (``kanban_db._assert_live_board_write_allowed``): same production-root
+    list, same test-context predicate, same bypass knobs. Inert in production:
+    the test-context probe is checked first and is memoised.
+    """
+    from hermes_test_context import _in_test_context
+
+    if not _in_test_context():
+        return
+    import hermes_state as _hs
+
+    if _hs._STATE_DB_GUARD_BYPASS or os.environ.get(_hs._STATE_DB_GUARD_BYPASS_ENV):
+        return
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:  # pragma: no cover - resolution failure is not a leak
+        return
+    for root in _hs._production_state_roots():
+        if _is_live_blackbox_db(resolved, root):
+            raise LiveBlackboxStoreRefused(
+                f"live-system guard: a TEST context tried to open the LIVE "
+                f"Blackbox store {resolved} (under real Hermes root {root}). "
+                "Run under a temporary HERMES_HOME (the tests/ conftest does "
+                "this); for a deliberate live read mark the test "
+                "@pytest.mark.live_system_guard_bypass or export "
+                f"{_hs._STATE_DB_GUARD_BYPASS_ENV}=1 in the child's env."
+            )
+
+
 def _connect() -> sqlite3.Connection:
     path = _db_path()
+    _assert_live_store_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
@@ -210,11 +270,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- SEARCH, identical 653 rows.
         -- (turns indexes are created AFTER the additive column migration below,
         -- guarded on the indexed columns existing -- see _ensure_turn_indexes.)
-        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
-            ON turn_api_calls(ts);
-        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
-            ON turn_api_calls(sub_key);
-
         -- Conversation prefix-stability guard (card t_c07124ab). One row per
         -- session holding the fingerprint of the LAST request sent on it
         -- (hashes + byte sizes only, never text); the next request of the
@@ -361,11 +416,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 if "duplicate column" not in str(e).lower():
                     raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
-    # The base columns too: an older partial table (key/provider/cache_write
-    # only) is accepted here, and _refresh_cache_monitoring / the call insert
-    # read input_tokens, cache_read and http_status. Missing ones made every
-    # insert_turn raise inside its fail-open catch and drop the turn (C6, #978).
-    for col, kind in (("model", "TEXT"), ("input_tokens", "INT"),
+    # Every column insert_api_call names: a pre-v1 table missing any base column
+    # would otherwise migrate "successfully" and then refuse every new call.
+    for col, kind in (("ts", "REAL"), ("provider", "TEXT"), ("sub_key", "TEXT"),
+                      ("model", "TEXT"), ("input_tokens", "INT"),
                       ("output_tokens", "INT"), ("cache_read", "INT"),
                       ("cache_write", "INT"), ("reasoning", "INT"),
                       ("attribution", "TEXT"), ("http_status", "INT"),
@@ -382,6 +436,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # Indexed columns on a legacy turn_api_calls table may have been absent;
+    # creating these in executescript above would abort before migration.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts ON turn_api_calls(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub ON turn_api_calls(sub_key)")
     for _col in ("last_cache_read", "last_cache_write", "last_uncached"):
         if _col not in _existing:
             try:
@@ -973,6 +1031,15 @@ def _route_id_origin(route_id: str | None) -> str | None:
     return route_id_origin(route_id)
 
 
+def _measured(usage: CanonicalUsage, field: str) -> int | None:
+    """A bucket the provider did not report is stored NULL, never a measured 0."""
+    # Per-bucket provenance only: an unavailable aggregate total (usage_unknown)
+    # must not discard buckets the provider did report.
+    if getattr(usage, f"{field}_unknown", False):
+        return None
+    return getattr(usage, field)
+
+
 def insert_api_call(
     turn_id: str, seq: int, *, ts: float, provider: str, model: str,
     usage: CanonicalUsage, sub_key: str | None, attribution: str,
@@ -1011,8 +1078,9 @@ def insert_api_call(
                 route_id_origin, vendor, served_provider
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
-             usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
+            (turn_id, seq, ts, provider, sub_key, model,
+             _measured(usage, "input_tokens"), _measured(usage, "output_tokens"),
+             _measured(usage, "cache_read_tokens"), _measured(usage, "cache_write_tokens"),
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
              cache_write_1h, cache_ttl_requested,

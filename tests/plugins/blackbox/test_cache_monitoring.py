@@ -8,6 +8,7 @@ import pytest
 from plugins import blackbox
 from plugins.blackbox import store
 from plugins.blackbox.record import TurnRecord
+from agent.usage_pricing import CanonicalUsage
 from agent.chat_completion_helpers import _requested_cache_ttl, _record_successful_api_call
 
 
@@ -127,6 +128,14 @@ def test_existing_call_table_migrates_without_inventing_tiers(tmp_path, monkeypa
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT lane_family,cache_write_5m,cache_write_1h FROM turn_api_calls").fetchone() == (
             "xai", None, None)
+    # k136: the migrated table must still accept a new call.
+    store.insert_api_call("new", 0, ts=2.0, provider="claude-apr", model="m",
+                          usage=CanonicalUsage(input_tokens=1, output_tokens=1),
+                          sub_key=None, attribution="wire", http_status=200,
+                          cache_write_5m=5)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT lane_family,cache_write_5m FROM turn_api_calls "
+                            "WHERE turn_id='new'").fetchone() == ("apx/apr", 5)
 
 
 def test_compaction_metadata_is_persisted_without_inventing_cost(db):
@@ -353,3 +362,20 @@ def test_partial_legacy_call_table_is_migrated_so_refresh_runs(tmp_path, monkeyp
         pass
     with sqlite3.connect(db) as conn:
         store._refresh_cache_monitoring(conn, "any")  # raised 'no such column' before
+
+
+@pytest.mark.parametrize("missing", ["ts", "sub_key"])
+def test_api_call_index_columns_migrate_before_index_creation(tmp_path, monkeypatch, missing):
+    """An older table missing an indexed column must open and take a new call."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = store._db_path()
+    db.parent.mkdir(parents=True)
+    cols = [c for c in ("ts REAL", "sub_key TEXT") if not c.startswith(missing + " ")]
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE turn_api_calls (turn_id TEXT NOT NULL, seq INT NOT NULL, "
+                     + ", ".join(cols) + ", PRIMARY KEY(turn_id,seq))")
+    store.insert_api_call("new", 0, ts=2.0, provider="claude-apr", model="m",
+                          usage=CanonicalUsage(input_tokens=1, output_tokens=1),
+                          sub_key="sub", attribution="wire", http_status=200)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT ts, sub_key FROM turn_api_calls WHERE turn_id='new'").fetchone() == (2.0, "sub")

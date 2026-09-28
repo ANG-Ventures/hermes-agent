@@ -1920,7 +1920,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             flag for flag, dest in (("--takeover", "foreign_ok"), ("--operator", "operator"))
             if getattr(args, dest, None)
         ]
-        if gated_flags and action in kb.OPERATOR_FLAG_GATED_ACTIONS:
+        if gated_flags and (
+            action in kb.OPERATOR_FLAG_GATED_ACTIONS
+            or action in kb.OPERATOR_ONLY_GATED_ACTIONS
+        ):
             try:
                 with kb.connect_closing() as gate_conn:
                     kb.enforce_operator_flag_gate(
@@ -4048,6 +4051,7 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         ok = kb.reclaim_task(
             conn, args.task_id,
             reason=getattr(args, "reason", None),
+            operator=getattr(args, "operator", None),
         )
         task = kb.get_task(conn, args.task_id) if ok else None
     if not ok:

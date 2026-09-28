@@ -194,12 +194,16 @@ def _reaches_blocking_store_member(fn: ast.AST, blocking: set[str]) -> bool:
     # ``_store = getattr(self, "session_store", None)``).
     aliases: set[str] = set()
     for n in ast.walk(fn):
-        if isinstance(n, ast.Assign) and any(
+        # ``store: SessionStore = self.session_store`` binds an alias too.
+        targets = (n.targets if isinstance(n, ast.Assign)
+                   else [n.target] if isinstance(n, ast.AnnAssign) and n.value is not None
+                   else None)
+        if targets and any(
             (isinstance(v, ast.Attribute) and v.attr == "session_store")
             or (isinstance(v, ast.Constant) and v.value == "session_store")
             for v in ast.walk(n.value)
         ):
-            aliases.update(t.id for t in n.targets if isinstance(t, ast.Name))
+            aliases.update(t.id for t in targets if isinstance(t, ast.Name))
     for n in ast.walk(fn):
         if isinstance(n, ast.Attribute) and n.attr in blocking and _is_store_expr(n.value, aliases):
             return True
@@ -310,3 +314,13 @@ def test_one_hop_walker_fires_on_the_t_ac9e21cf_shape():
     assert _one_hop_store_calls(bad, callees) == {
         ("handle", "_lookup"), ("handle", "_alias"),
     }
+
+
+def test_annotated_alias_is_tracked():
+    """``store: X = self.session_store`` is an alias like a plain assignment (#87)."""
+    fn = ast.parse(
+        "def _ann(self):\n"
+        "    store: object = self.session_store\n"
+        "    return store._ensure_loaded()\n"
+    ).body[0]
+    assert _reaches_blocking_store_member(fn, {"_ensure_loaded"})
