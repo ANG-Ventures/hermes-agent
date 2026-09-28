@@ -650,8 +650,9 @@ def evaluate(store: HoldStore, *, now: Optional[float] = None,
             continue
         if not rec:
             continue
-        fresh = isinstance(rec.get("published_at"), (int, float)) and now - rec["published_at"] <= stale_after
-        if fresh and rec.get("host") == host and pid_alive(rec.get("pid")):
+        # Freshness is NOT a filter here: a live pid whose publisher stalled
+        # may still hold work, so a stale record proves nothing (C7 k90).
+        if rec.get("host") == host and pid_alive(rec.get("pid")):
             rows.append({"consumer": name, "state": UNKNOWN, "work": None,
                          "why": "live consumer not in the hold's expected set"})
     states = {r["state"] for r in rows}
@@ -765,7 +766,12 @@ def check_pin(sha: str, *, repo: os.PathLike | str, remote_ref: str,
     def _git(*args) -> int:
         return run(["git", "-C", str(repo), *args], capture_output=True, text=True).returncode
 
-    if _git("cat-file", "-e", f"{sha}^{{commit}}") != 0:
+    # A local tracking ref can be stale (e.g. after a remote force-push):
+    # refresh it before trusting ancestry (C7 k92).
+    remote, _, branch = remote_ref.partition("/")
+    if not (remote and branch) or _git("fetch", "--quiet", remote, branch) != 0:
+        problems.append(f"could not refresh {remote_ref} from the remote")
+    elif _git("cat-file", "-e", f"{sha}^{{commit}}") != 0:
         problems.append("commit not present locally (fetch first)")
     elif _git("merge-base", "--is-ancestor", sha, remote_ref) != 0:
         problems.append(f"commit is not on {remote_ref}")
