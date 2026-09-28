@@ -10347,10 +10347,11 @@ class EmptyDraftOverrideError(ValueError):
 
 
 def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list]:
-    """``[("o/r#N @ <merge sha>", "<pr head sha>"), ...]`` when EVERY fleet PR
-    the handoff owns (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST
-    ``merged=true``; None when there is none, any is not merged, or a lookup
-    cannot tell. The head sha ("" when unknown) ties the PR to a checkout.
+    """``[("o/r#N @ <merge sha>", "<pr head sha>", "<merge sha>"), ...]`` when
+    EVERY fleet PR the handoff owns (``--survivor-pr`` + metadata
+    pr_url/pr_urls/pr) is REST ``merged=true``; None when there is none, any is
+    not merged, or a lookup cannot tell. The full head and merge shas ("" when
+    unknown) tie the PR to a checkout's trunk and content.
     """
     from hermes_cli import kanban_open_pr as _open_pr
 
@@ -10368,8 +10369,9 @@ def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list
             return None
         if not isinstance(state, dict) or str(state.get("state") or "").upper() != "MERGED":
             return None
-        sha = str(state.get("merge_commit_sha") or "")[:12] or "?"
-        merged.append((f"{ref.repo}#{ref.number} @ {sha}", str(state.get("head_sha") or "")))
+        merge_sha = str(state.get("merge_commit_sha") or "")
+        merged.append((f"{ref.repo}#{ref.number} @ {merge_sha[:12] or '?'}",
+                       str(state.get("head_sha") or ""), merge_sha))
     return merged
 
 
@@ -10388,9 +10390,11 @@ def _enforce_branch_base(
     the squash of that very PR, so the "foreign" commit and the conflict are
     the merge itself. Recorded as ``base_guard_survivor_merged``. An OPEN PR
     keeps the guard -- that is the branch that will not land. The merged PR
-    must be TIED to each failing checkout (FleetReview #1394): its head sha
-    must contain the checkout's HEAD, else naming any unrelated merged PR
-    would excuse foreign commits and conflicts.
+    must be TIED to each failing checkout (FleetReview #1394, #1434): its head
+    contains the checkout's HEAD, its merge commit is on the checkout's own
+    trunk, and the checkout's change is present in that merge commit
+    (:func:`kanban_branch_base.pr_landed_checkout`), else naming an unrelated,
+    fork-merged or reverted PR would excuse foreign commits and conflicts.
     """
     from hermes_cli import kanban_branch_base as _bb
 
@@ -10408,13 +10412,12 @@ def _enforce_branch_base(
         merged = _merged_survivor_prs(metadata, survivor_pr)
         untied: list = []
         if merged:
-            heads = [head for _, head in merged if head]
-            untied = [r.repo for r in err.reports
-                      if not _bb.head_landed_in(Path(r.repo), r.head, heads)]
+            prs = [(head, merge_sha) for _, head, merge_sha in merged]
+            untied = [r.repo for r in err.reports if not _bb.pr_landed_checkout(r, prs)]
             if not untied:
                 with write_txn(conn):
                     _append_event(conn, task.id, "base_guard_survivor_merged", {
-                        "survivor_merged": [label for label, _ in merged],
+                        "survivor_merged": [m[0] for m in merged],
                         "failures": failures,
                     })
                 return
