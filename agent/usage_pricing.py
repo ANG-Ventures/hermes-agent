@@ -441,75 +441,64 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ),
     # ── Moonshot Kimi K2.x (membership ids the cpa proxy serves) ──────────
     # Notional list prices so these turns read "estimated", not "unknown"
-    # (t_a9b4f1ad). Membership cash cost stays $0. OpenRouter moonshotai/*
-    # snapshot 2026-09-28 where a public price exists; cache write priced at
-    # input (none published).
+    # (t_a9b4f1ad). Membership cash cost stays $0. Source: models.dev
+    # 2026-09-28, first-party ``moonshotai`` row first, else the moonshot row
+    # a gateway republishes, else OpenRouter ``moonshotai/*``. USD per 1M
+    # tokens; cache write priced at input (none published). Ids with no public
+    # price alias onto a sibling row below the dict.
+    # models.dev openrouter moonshotai/kimi-k2 2026-09-28 (no cache price: cache read = input)
     ("moonshotai", "kimi-k2"): PricingEntry(
-        # OpenRouter publishes no cache-read rate: cache reads priced at input.
         input_cost_per_million=Decimal("0.57"),
         output_cost_per_million=Decimal("2.30"),
         cache_read_cost_per_million=Decimal("0.57"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k2",
-        pricing_version="openrouter-kimi-k2-2026-09-28",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
+    # models.dev openrouter moonshotai/kimi-k2-thinking 2026-09-28
     ("moonshotai", "kimi-k2-thinking"): PricingEntry(
         input_cost_per_million=Decimal("0.60"),
         output_cost_per_million=Decimal("2.50"),
         cache_read_cost_per_million=Decimal("0.15"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k2-thinking",
-        pricing_version="openrouter-kimi-k2-thinking-2026-09-28",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
+    # models.dev llmgateway-providers moonshot/kimi-k2.5 2026-09-28
     ("moonshotai", "kimi-k2.5"): PricingEntry(
-        input_cost_per_million=Decimal("0.45"),
-        output_cost_per_million=Decimal("2.25"),
-        cache_read_cost_per_million=Decimal("0.07"),
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("3.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k2.5",
-        pricing_version="openrouter-kimi-k2.5-2026-09-28",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
+    # models.dev moonshotai 2026-09-28
     ("moonshotai", "kimi-k2.6"): PricingEntry(
-        input_cost_per_million=Decimal("0.65"),
-        output_cost_per_million=Decimal("3.41"),
-        cache_read_cost_per_million=Decimal("0.15"),
+        input_cost_per_million=Decimal("0.95"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.16"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k2.6",
-        pricing_version="openrouter-kimi-k2.6-2026-09-28",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
+    # models.dev moonshotai 2026-09-28
     ("moonshotai", "kimi-k2.7-code"): PricingEntry(
-        input_cost_per_million=Decimal("0.6562"),
-        output_cost_per_million=Decimal("3.30"),
-        cache_read_cost_per_million=Decimal("0.18"),
+        input_cost_per_million=Decimal("0.95"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.19"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k2.7-code",
-        pricing_version="openrouter-kimi-k2.7-code-2026-09-28",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
-    # No public price for the three ids below (absent from OpenRouter
-    # 2026-09-28): priced at the kimi-k3 snapshot rate as a stand-in.
+    # models.dev moonshotai 2026-09-28
     ("moonshotai", "kimi-k2.7-code-highspeed"): PricingEntry(
-        input_cost_per_million=Decimal("3.00"),
-        output_cost_per_million=Decimal("15.00"),
-        cache_read_cost_per_million=Decimal("0.30"),
+        input_cost_per_million=Decimal("1.90"),
+        output_cost_per_million=Decimal("8.00"),
+        cache_read_cost_per_million=Decimal("0.38"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k3",
-        pricing_version="kimi-k3-rate-no-public-price-2026-09-28",
-    ),
-    ("moonshotai", "kimi-k2.8"): PricingEntry(
-        input_cost_per_million=Decimal("3.00"),
-        output_cost_per_million=Decimal("15.00"),
-        cache_read_cost_per_million=Decimal("0.30"),
-        source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k3",
-        pricing_version="kimi-k3-rate-no-public-price-2026-09-28",
-    ),
-    ("moonshotai", "kimi-k2.8-code"): PricingEntry(
-        input_cost_per_million=Decimal("3.00"),
-        output_cost_per_million=Decimal("15.00"),
-        cache_read_cost_per_million=Decimal("0.30"),
-        source="official_docs_snapshot",
-        source_url="https://openrouter.ai/moonshotai/kimi-k3",
-        pricing_version="kimi-k3-rate-no-public-price-2026-09-28",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
     # ── xAI Grok ─────────────────────────────────────────────────────────
     # Priced from OpenRouter's live catalog snapshot (per-1M in/out; cache
@@ -594,6 +583,15 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://openrouter.ai/x-ai/grok-4.20-multi-agent",
         pricing_version="xai-pricing-2026-07",
+    ),
+    # models.dev poe/helicone xai/grok-3-mini 2026-09-28 (no first-party xai row)
+    ("xai", "grok-3-mini"): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
     # ── OpenAI GPT-5.6 series (Sol/Terra/Luna) ───────────────────────────
     # Announced in limited preview 2026-06-26; GA 2026-07-09 at the same
@@ -1776,6 +1774,25 @@ for _alias, _canonical in {
         ("google", _canonical)
     ]
 del _alias, _canonical
+
+# Ids the cpa proxy serves (t_a9b4f1ad). Dated grok-4.20 ids: models.dev xai
+# 2026-09-28 prices each at the undated row's rate (1.25/2.5/0.2), so alias
+# rather than duplicate. The rest have NO public price as of 2026-09-28 and
+# borrow a sibling row (named per id) so the turn reads "estimated".
+for _vendor, _alias, _canonical in (
+    ("xai", "grok-4.20-0309-reasoning", "grok-4.20"),  # models.dev xai
+    ("xai", "grok-4.20-0309-non-reasoning", "grok-4.20"),  # models.dev xai
+    ("xai", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent"),  # models.dev xai
+    ("xai", "grok-3-mini-fast", "grok-3-mini"),  # sibling grok-3-mini
+    ("xai", "grok-4.7-build-fast", "grok-build-0.1"),  # sibling grok-build-0.1
+    ("xai", "grok-composer-2.5-fast", "grok-build-0.1"),  # sibling grok-build-0.1
+    ("moonshotai", "kimi-k2.8", "kimi-k2.7-code"),  # sibling kimi-k2.7-code
+    ("moonshotai", "kimi-k2.8-code", "kimi-k2.7-code"),  # sibling kimi-k2.7-code
+):
+    _OFFICIAL_DOCS_PRICING[(_vendor, _alias)] = _OFFICIAL_DOCS_PRICING[
+        (_vendor, _canonical)
+    ]
+del _vendor, _alias, _canonical
 
 
 def _to_decimal(value: Any) -> Optional[Decimal]:

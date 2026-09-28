@@ -37,5 +37,15 @@
   "kimi-k2.8-code",
   "kimi-k3",
   "kimi-k3-256k"
- ]
+ ],
+ "non_chat": [
+  "codex-auto-review",
+  "gpt-image-1.5",
+  "gpt-image-2",
+  "grok-imagine-image",
+  "grok-imagine-image-quality",
+  "grok-imagine-video",
+  "grok-imagine-video-1.5-preview"
+ ],
+ "non_chat_note": "image/video generation and the codex review endpoint: not token-priced chat turns"
 }
