@@ -225,6 +225,33 @@ def _requested_cache_ttl(api_kwargs: dict | None) -> str | None:
     return "1h" if "1h" in found else "5m" if "5m" in found else None
 
 
+def _live_route(agent: Any) -> dict[str, str]:
+    """Snapshot of the agent's CURRENT route, safe to keep across a call."""
+    return {
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "model": str(getattr(agent, "model", "") or ""),
+        "base_url": str(getattr(agent, "base_url", "") or ""),
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+    }
+
+
+def _serving_route(agent: Any) -> dict[str, str]:
+    """The route (provider/model/base_url/api_mode) the in-flight main request
+    was DISPATCHED on.
+
+    The conversation loop stamps ``agent._inflight_request_route`` at the
+    dispatch edge and clears it once the call returns. Reading the live agent
+    attributes instead is wrong whenever the route changes while the request
+    is on the wire (``/model`` or fallback from another thread): the call would
+    be recorded and priced at a model it never used (FleetReview 65e315f38776).
+    Outside a stamped dispatch the live attributes ARE the route.
+    """
+    snap = getattr(agent, "_inflight_request_route", None)
+    if isinstance(snap, dict):
+        return dict(snap)
+    return _live_route(agent)
+
+
 def _emit_api_call_record(
     agent: Any,
     *,
@@ -244,8 +271,9 @@ def _emit_api_call_record(
         turn_id = str(getattr(agent, "_current_turn_id", "") or "")
         if not turn_id:
             return None
-        provider = str(getattr(agent, "provider", "") or "")
-        model = str(getattr(agent, "model", "") or "")
+        route = _serving_route(agent)
+        provider = route["provider"]
+        model = route["model"]
         pool_headers = dict(headers or {})
         sub_key, attribution = _api_call_identity(agent, pool_headers)
         seq = _next_api_call_seq(agent, turn_id)
@@ -280,7 +308,7 @@ def _emit_api_call_record(
             provider=provider,
             model=model,
             usage=usage,
-            api_mode=str(getattr(agent, "api_mode", "") or ""),
+            api_mode=route["api_mode"],
             sub_key=sub_key,
             attribution=attribution,
             http_status=http_status,
@@ -371,10 +399,7 @@ def _note_billed_response(agent: Any, response: Any) -> None:
             agent._billed_unaccounted = pending
         pending.append({
             "response": response,
-            "provider": str(getattr(agent, "provider", "") or ""),
-            "model": str(getattr(agent, "model", "") or ""),
-            "base_url": str(getattr(agent, "base_url", "") or ""),
-            "api_mode": str(getattr(agent, "api_mode", "") or ""),
+            **_serving_route(agent),
             "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
         })
     except Exception:
@@ -3962,7 +3987,7 @@ def try_activate_fallback(
 
     if refuse_runtime_failover(agent, fb_provider, fb_model, reason):
         logger.warning(
-            "Fallback skip: %s/%s refused — kanban card pins this worker's provider",
+            "Fallback skip: %s/%s refused — kanban card pins this worker's provider/model",
             fb_provider, fb_model,
         )
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)

@@ -702,29 +702,49 @@ def _kimi_coding_attribution_headers() -> dict:
     }
 
 
-def _kimi_oauth_token_provider_for(api_key):
-    """Return a per-request token provider when *api_key* is a kimi-oauth JWT.
-
-    Kimi membership access tokens are JWTs whose ``client_id`` claim is the
-    public Kimi CLI client id. ``sk-kimi-`` API keys and anything else return
-    None and keep the static-key path.
-    """
-    if not isinstance(api_key, str) or api_key.count(".") != 2:
+def _kimi_jwt_claims(token):
+    """Decoded (unverified) JWT payload claims, or None."""
+    if not isinstance(token, str) or token.count(".") != 2:
         return None
     try:
         import base64 as _b64
         import json as _json
 
-        from hermes_cli.auth import KIMI_OAUTH_CLIENT_ID, build_kimi_oauth_token_provider
-
-        part = api_key.split(".")[1]
+        part = token.split(".")[1]
         part += "=" * (-len(part) % 4)
         claims = _json.loads(_b64.urlsafe_b64decode(part.encode()).decode())
-        if not isinstance(claims, dict) or claims.get("client_id") != KIMI_OAUTH_CLIENT_ID:
-            return None
-        return build_kimi_oauth_token_provider()
-    except Exception:  # noqa: BLE001 — not a decodable kimi-oauth JWT
+    except Exception:  # noqa: BLE001 — not a decodable JWT
         return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _kimi_oauth_token_provider_for(api_key):
+    """Return a per-request token provider when *api_key* is the local kimi-oauth login.
+
+    ``client_id`` is the public Kimi CLI app id and the JWT claims are not
+    verified here, so neither proves the token came from this host's login.
+    Swap only when *api_key* is the stored access token or one this login
+    was issued earlier (hash history in auth.json); any other token, forged
+    claims included, stays on the static path. ``sk-kimi-`` keys, foreign
+    JWTs and a missing login return None.
+    """
+    claims = _kimi_jwt_claims(api_key)
+    if claims is None:
+        return None
+    try:
+        from hermes_cli.auth import (
+            KIMI_OAUTH_CLIENT_ID,
+            build_kimi_oauth_token_provider,
+            kimi_oauth_login_issued_token,
+        )
+
+        if claims.get("client_id") != KIMI_OAUTH_CLIENT_ID:
+            return None
+        if not kimi_oauth_login_issued_token(api_key):
+            return None
+    except Exception:  # noqa: BLE001 — no readable local login
+        return None
+    return build_kimi_oauth_token_provider()
 
 
 def _build_anthropic_client_with_bearer_hook(
@@ -918,7 +938,13 @@ def build_anthropic_client(
         # traffic correctly. Send the same attribution header set we send to
         # OpenRouter, Vercel AI Gateway, and Fireworks:
         # HTTP-Referer + X-Title + HermesAgent User-Agent.
-        kwargs["api_key"] = api_key
+        if _kimi_jwt_claims(api_key) is not None:
+            # A membership JWT this host's login did not issue (the managed
+            # login was swapped for the bearer hook above) is still an OAuth
+            # bearer token: send Authorization: Bearer, not X-Api-Key.
+            kwargs["auth_token"] = api_key
+        else:
+            kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
             **_kimi_coding_attribution_headers(),
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )

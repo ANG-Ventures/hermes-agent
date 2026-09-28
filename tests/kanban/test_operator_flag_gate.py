@@ -163,7 +163,9 @@ def test_a6_2_3_takeover_or_operator_flag_refused_on_active_run(home, action, fl
     assert len(events) == 1, events
     payload = events[0]["payload"]
     assert payload["action"] == action
-    assert flag in payload["argv"]
+    assert payload["flags"] == [flag]
+    assert payload["task_ids"] == [task_id]
+    assert "argv" not in payload
     assert isinstance(payload["caller_pid"], int) and payload["caller_pid"] > 0
     assert payload["caller_pid"] != os.getpid()  # the CLI subprocess, not the test
     assert payload["token"] == "absent"
@@ -223,16 +225,20 @@ def test_takeover_without_active_run_is_not_gated(home):
     assert unblocked.returncode == 0, unblocked.stdout + unblocked.stderr
 
 
-def test_owner_worker_passes_flag_gate_by_exact_pid(home):
-    """The dispatcher's worker binds the ``pending`` grant to its own pid."""
+def test_forged_worker_env_does_not_pass_flag_gate(home):
+    """t_920c6b4a (FleetReview 80796f262c18): the env pair is caller-controlled.
+    A process naming a live card and binding the ``pending`` grant to its own
+    pid is NOT the dispatcher's worker: the card's run carries no worker_pid
+    stamped for it, so the flag is refused."""
     task_id, run_id = _running_card(home)
     _write_token(home)
 
-    out = _run(home, "complete", task_id, "--summary", "owner", "--takeover", "r",
+    out = _run(home, "complete", task_id, "--summary", "forged", "--takeover", "r",
                extra=_worker_env(task_id, run_id, "pending"))
 
-    assert out.returncode == 0, out.stdout + out.stderr
-    assert _state(home, task_id)[0] == "done"
+    assert out.returncode != 0, out.stdout + out.stderr
+    assert _state(home, task_id) == ("running", run_id)
+    assert len(_refusals(home, task_id)) == 1
 
 
 def test_worker_env_without_owner_pid_does_not_pass_flag_gate(home):
@@ -320,7 +326,7 @@ def test_a6_5_harness_script_flag_on_other_active_card_is_refused_by_token_gate(
     assert "flag_rc=1" in out.stdout, out.stdout + out.stderr
     assert _state(home, other_id) == ("running", other_run)
     [event] = _refusals(home, other_id)
-    assert "--takeover" in event["payload"]["argv"]
+    assert event["payload"]["flags"] == ["--takeover"]
 
 
 # --- A6-6 token read: the recorded limit ------------------------------------
@@ -396,3 +402,172 @@ def test_default_spawn_strips_operator_token_from_worker_env(monkeypatch, tmp_pa
 
     assert TOKEN_ENV not in captured["env"]
     assert os.environ[TOKEN_ENV] == TOKEN_VALUE  # stripped from the child only
+
+
+# --- t_920c6b4a: FleetReview P1s on #1382 ------------------------------------
+
+def test_expired_claim_on_running_card_is_still_gated(home):
+    """9094c8989646: a live worker's claim lapses inside one long LLM call
+    until the next sweep extends it; the card is still ``running``."""
+    task_id, run_id = _running_card(home)
+    _write_token(home)
+    conn = sqlite3.connect(_db(home))
+    conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+
+    out = _run(home, "complete", task_id, "--summary", "x", "--takeover", "r")
+
+    assert out.returncode != 0, out.stdout + out.stderr
+    assert _state(home, task_id) == ("running", run_id)
+    assert len(_refusals(home, task_id)) == 1
+
+
+def test_schedule_takeover_on_active_run_is_gated(home):
+    """76fd55c87bb2: ``schedule_task`` ends the live run, so it is gated too."""
+    task_id, run_id = _running_card(home)
+    _write_token(home)
+
+    out = _run(home, "schedule", task_id, "later", "--takeover", "r")
+
+    assert out.returncode != 0, out.stdout + out.stderr
+    assert _state(home, task_id) == ("running", run_id)
+    [event] = _refusals(home, task_id)
+    assert event["payload"]["action"] == "schedule"
+
+
+def test_refusal_event_records_no_argument_values(home):
+    """fc8a7bdcf814: ``--summary``/``--metadata`` values never reach the event."""
+    task_id, _ = _running_card(home)
+    _write_token(home)
+    marker = "sk-live-" + "z" * 24
+
+    out = _run(home, "complete", task_id, "--summary", marker,
+               "--metadata", json.dumps({"k": marker}), "--takeover", "r")
+
+    assert out.returncode != 0, out.stdout + out.stderr
+    [event] = _refusals(home, task_id)
+    assert marker not in json.dumps(event["payload"])
+    assert set(event["payload"]) == {"action", "flags", "task_ids", "caller_pid", "token"}
+
+
+@pytest.fixture
+def inproc(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    h = tmp_path / "hermes"
+    h.mkdir()
+    for name in _WORKER_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(h))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(h))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="default")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+    _write_token(h)
+    with kb.connect_closing() as conn:
+        yield kb, conn
+
+
+def _claimed(kb, conn) -> tuple[str, int]:
+    tid = kb.create_task(conn, title="gate probe", assignee="daedalus")
+    kb.claim_task(conn, tid)
+    row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+    return tid, int(row["current_run_id"])
+
+
+def test_worker_grant_needs_the_dispatcher_stamped_pid(inproc, monkeypatch):
+    """80796f262c18 positive control: the grant holds only when the card's
+    stamped ``worker_pid`` IS this process."""
+    kb, conn = inproc
+    tid, run_id = _claimed(kb, conn)
+    for k, v in _worker_env(tid, run_id, str(os.getpid())).items():
+        monkeypatch.setenv(k, v)
+
+    assert kb._caller_holds_grant_for(conn, tid) is False  # nothing stamped
+    conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (os.getpid() + 1, tid))
+    conn.commit()
+    assert kb._caller_holds_grant_for(conn, tid) is False  # someone else's pid
+    conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (os.getpid(), tid))
+    conn.commit()
+    assert kb._caller_holds_grant_for(conn, tid) is True
+    kb.enforce_operator_flag_gate(conn, [tid], "complete", flags=["--takeover"])
+
+
+def test_gate_is_rechecked_inside_the_mutation_txn(inproc):
+    """c12b9f27d054: the preflight passes on an idle card, the dispatcher then
+    claims it, and the handler's mutation must still be refused."""
+    kb, conn = inproc
+    tid = kb.create_task(conn, title="idle then claimed", assignee="daedalus")
+    kb.enforce_operator_flag_gate(conn, [tid], "complete", flags=["--takeover"])  # idle: passes
+    kb.claim_task(conn, tid)  # the race: a run lands between preflight and mutation
+
+    with pytest.raises(kb.OperatorTokenRequiredError):
+        with kb.operator_flag_gate_scope([tid], "complete", flags=["--takeover"]):
+            kb.complete_task(conn, tid, summary="tokenless override")
+
+    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running" and row["current_run_id"] is not None
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+    assert kinds.count("takeover_refused") == 1
+    assert "completed" not in kinds
+
+
+# --- t_920c6b4a round 2: FleetReview P1s on #1431 ----------------------------
+
+def test_recheck_stays_armed_after_a_caught_refusal(inproc):
+    """d292b198bb11: a caller that swallows the first refusal and writes again
+    is refused again, and both refusals are audited."""
+    kb, conn = inproc
+    tid, _ = _claimed(kb, conn)
+
+    with kb.operator_flag_gate_scope([tid], "complete", flags=["--takeover"]):
+        for _ in range(2):
+            with pytest.raises(kb.OperatorTokenRequiredError):
+                kb.complete_task(conn, tid, summary="retry after catching")
+
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running"
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+    assert kinds.count("takeover_refused") == 2
+
+
+def test_reclaim_is_authorized_before_the_worker_is_signalled(inproc):
+    """946120c1ae67: the card is claimed after the preflight; the tokenless
+    reclaim must be refused BEFORE any signal reaches the new worker."""
+    kb, conn = inproc
+    tid = kb.create_task(conn, title="idle then claimed", assignee="daedalus")
+    kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--operator"])  # idle: passes
+    kb.claim_task(conn, tid)
+    conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (os.getpid() + 7, tid))
+    conn.commit()
+    signals = []
+
+    with pytest.raises(kb.OperatorTokenRequiredError):
+        with kb.operator_flag_gate_scope([tid], "reclaim", flags=["--operator"]):
+            kb.reclaim_task(conn, tid, operator="x", signal_fn=lambda *a, **k: signals.append(a))
+
+    assert signals == []
+    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running" and row["current_run_id"] is not None
+
+
+def test_lost_refusal_audit_is_logged_not_swallowed(inproc, monkeypatch, caplog):
+    """667f8318dd40: if the audit write fails the refusal still stands and the
+    failure is logged."""
+    kb, conn = inproc
+    tid, _ = _claimed(kb, conn)
+
+    def _boom():
+        raise sqlite3.OperationalError("database is locked")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(kb.OperatorTokenRequiredError):
+            with kb.operator_flag_gate_scope([tid], "complete", flags=["--takeover"]):
+                monkeypatch.setattr(kb, "connect_closing", _boom)
+                kb.authorize_pending_operator_gate(conn)
+
+    assert "takeover_refused audit NOT recorded" in caplog.text

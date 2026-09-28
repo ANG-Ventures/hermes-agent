@@ -764,7 +764,7 @@ def _fallback_effort_lines(before: dict, after: dict) -> list:
     return lines
 
 
-def _job_action(action: str, job_id: str, success_verb: str) -> int:
+def _job_action(action: str, job_id: str, success_verb: str, **extra) -> int:
     _stateless_reset = None
     if action == "run":
         # One-shot CLI: this process exits as soon as the command returns, so
@@ -787,7 +787,7 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         except Exception:
             _stateless_reset = None
     try:
-        result = _cron_api(action=action, job_id=job_id)
+        result = _cron_api(action=action, job_id=job_id, **extra)
     finally:
         if _stateless_reset is not None:
             _stateless_reset()
@@ -943,7 +943,9 @@ def cron_command(args):
         return cron_edit(args)
 
     if subcmd == "pause":
-        return _job_action("pause", args.job_id, "Paused")
+        return _job_action(
+            "pause", args.job_id, "Paused", reason=getattr(args, "paused_reason", None)
+        )
 
     if subcmd == "resume":
         return cron_resume(args)

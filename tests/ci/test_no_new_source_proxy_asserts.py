@@ -58,15 +58,26 @@ def proxy_tests(source: str, rel: str) -> set[str]:
         return set()
     lines = source.splitlines()
     found = set()
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if not fn.name.startswith("test"):
-            continue
-        if NOQA in lines[fn.lineno - 1]:
-            continue
-        if _is_proxy_test(fn):
-            found.add(f"{rel}::{fn.name}")
+    # Key on the qualified name (``rel::Class::test``) so same-named methods in
+    # different classes of one file cannot shadow each other in the baseline.
+    stack: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
+    while stack:
+        node, scope = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                stack.append((child, scope + (child.name,)))
+                continue
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.append((child, scope))
+                continue
+            qual = scope + (child.name,)
+            stack.append((child, qual))
+            if not child.name.startswith("test"):
+                continue
+            if NOQA in lines[child.lineno - 1]:
+                continue
+            if _is_proxy_test(child):
+                found.add(f"{rel}::" + "::".join(qual))
     return found
 
 
@@ -104,6 +115,16 @@ def test_arm_detector_fires_on_the_cluster_a_shape():
         "    assert 'offload(' in src\n"
     )
     assert proxy_tests(bad, "t.py") == {"t.py::test_wired"}
+
+
+def test_arm_same_method_name_in_two_classes_gets_distinct_keys():
+    body = (
+        "    def test_wired(self):\n"
+        "        src = inspect.getsource(mod.run)\n"
+        "        assert 'offload(' in src\n"
+    )
+    src = "import inspect\nclass TestA:\n" + body + "class TestB:\n" + body
+    assert proxy_tests(src, "t.py") == {"t.py::TestA::test_wired", "t.py::TestB::test_wired"}
 
 
 def test_arm_behavioural_and_noqa_are_green():

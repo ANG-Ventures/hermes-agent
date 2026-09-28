@@ -90,6 +90,22 @@ def warm_refusal_arm(key: StickyKey) -> bool:
     return fp.warm_refusal_arm(key.lineage_root, pct)
 
 
+def local_relay_restart_wait_s() -> float:
+    """``fallback.local_relay_restart_wait_s`` (default 20): how long a
+    connection error on a loopback relay waits for the port to come back
+    before it counts toward the conn-fallback policy. ``0`` disables."""
+    from agent.retry_utils import LOCAL_RELAY_RESTART_WAIT_DEFAULT_S
+
+    fb = _raw_config().get("fallback")
+    val: Any = LOCAL_RELAY_RESTART_WAIT_DEFAULT_S
+    if isinstance(fb, dict) and "local_relay_restart_wait_s" in fb:
+        val = fb.get("local_relay_restart_wait_s")
+    try:
+        return max(float(val), 0.0)
+    except (TypeError, ValueError):
+        return LOCAL_RELAY_RESTART_WAIT_DEFAULT_S
+
+
 def announce_seat_names() -> bool:
     model = _raw_config().get("model")
     if isinstance(model, dict) and "announce_seat_names" in model:

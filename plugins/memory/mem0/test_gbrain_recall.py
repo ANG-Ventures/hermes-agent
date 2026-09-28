@@ -370,3 +370,33 @@ def test_non_lookup_skips_gbrain(monkeypatch):
     p = _provider(gbrain_enabled=True, mem0_rows=[{"memory": "fact one"}])
     _run_prefetch(p, "ship it")
     assert called["n"] == 0
+
+
+# ---- intent gate (D-9): "do" as question auxiliary vs imperative ---------
+@pytest.mark.parametrize("q", [
+    "Do you remember where we documented the DNS split?",
+    "do we have docs on the tunnel config",
+    "do I have a runbook for the NAS",
+    "Do they, the homelab docs, cover plex",
+    "where did we decide the local dns split",
+])
+def test_intent_true_for_lookups(q):
+    assert gbrain_recall.is_lookup_intent(q, 1) is True
+
+
+@pytest.mark.parametrize("q", [
+    "yes", "ok", "thanks", "ship it", "do it", "do that", "do it now?",
+    "fix line 12", "go ahead", "yes do that", "", "   ", "perfect, ship it",
+    "run it", "no", "stop", "commit",
+])
+def test_intent_false_for_non_lookups(q):
+    assert gbrain_recall.is_lookup_intent(q, 1) is False
+
+
+def test_do_question_reaches_gbrain(monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(gbrain_recall, "gbrain_search",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or [])
+    p = _provider(gbrain_enabled=True, mem0_rows=[{"memory": "fact one"}])
+    _run_prefetch(p, "Do you remember where we documented the DNS split?")
+    assert called["n"] == 1

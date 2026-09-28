@@ -3355,6 +3355,11 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    # Never write a silent disable: enabled=false with no reason reads as "forgotten" to every
+    # audit, and a caller who paused "until X lands" has nothing left to remind it (t_6b72ef98).
+    reason = (reason or "").strip() or (
+        f"Paused with no reason given; resume with `hermes cron resume {job['id']}`."
+    )
     return update_job(
         job["id"],
         {

@@ -82,6 +82,52 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
+# ``review_requested``: a ready card handed straight to review leaves the
+# ready-lane guard behind; its old hold is history, not the review hold.
+_GUARD_DISPLAY_RESET_KINDS = frozenset(
+    {"claimed", "spawned", "review_requested", *kb._RESPAWN_GUARD_FAILURE_RESET_KINDS}
+)
+# Guard reasons the review lane never records (it skips ``active_pr``), so a
+# review card showing one would be displaying a stale ready-lane hold.
+_READY_ONLY_GUARD_REASONS = frozenset({"active_pr"})
+
+
+def _fmt_current_respawn_guard(status: str, events) -> str:
+    """``<reason> — <pr> (<state>)`` for the respawn guard holding a queued card.
+
+    Only the newest ``respawn_guarded`` event counts, and only when no
+    claim/spawn or guard-resetting event (operator requeue, status change,
+    reassign, ...) came after it: the guard let it go, or its answer may have
+    changed and the next dispatch tick re-records it if it still holds.
+    Empty for any other status or when nothing is holding the card.
+    """
+    if status not in ("ready", "review"):
+        return ""
+    held = None
+    for ev in events:
+        if ev.kind == "respawn_guarded":
+            held = ev
+        elif ev.kind in _GUARD_DISPLAY_RESET_KINDS:
+            held = None
+    if held is None:
+        return ""
+    payload = held.payload if isinstance(held.payload, dict) else {}
+    if status == "review" and payload.get("reason") in _READY_ONLY_GUARD_REASONS:
+        return ""
+    line = str(payload.get("reason") or "?")
+    pr = payload.get("pr")
+    if pr:
+        line += f" — {pr}"
+        if payload.get("pr_state"):
+            line += f" ({payload['pr_state']})"
+    else:
+        line += _fmt_respawn_guard_detail(
+            {k: payload.get(k) for k in ("error", "recorded_at", "eligible_at")
+             if payload.get(k)}
+        )
+    return f"{line}  [as of {_fmt_ts(held.created_at)}]"
+
+
 # Statuses on which an open workspace-refusal episode is still live news.
 _REFUSAL_VISIBLE_STATUSES = frozenset({"todo", "ready", "review"})
 
@@ -1928,7 +1974,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 with kb.connect_closing() as gate_conn:
                     kb.enforce_operator_flag_gate(
                         gate_conn, _lifecycle_target_ids(args), action,
-                        flags=gated_flags, argv=sys.argv,
+                        flags=gated_flags,
                     )
             except kb.OperatorTokenRequiredError as exc:
                 print(f"kanban: {exc}", file=sys.stderr)
@@ -1952,7 +1998,13 @@ def kanban_command(args: argparse.Namespace) -> int:
                 operator=getattr(args, "operator", None),
             )
         try:
-            with actor_scope:
+            # The preflight above ran on its own connection; the scope re-runs
+            # the same gate inside every write transaction the handler opens,
+            # so a run claimed in between is never closed by a tokenless
+            # override (t_920c6b4a).
+            with kb.operator_flag_gate_scope(
+                _lifecycle_target_ids(args), action, flags=gated_flags,
+            ), actor_scope:
                 return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             # A survivor refusal carries its operator-only hint on the
@@ -2009,9 +2061,9 @@ def _caller_session_id() -> Optional[str]:
     # subprocess as in-gateway made every chat-turn ``claim --review`` bind
     # no session, and the following ``request-changes`` was refused
     # (t_0485b3ff: t_ddcd2170, t_c26be9b9, t_6500a97a stranded in running).
-    in_gateway = (
-        os.environ.get("_HERMES_GATEWAY") == "1" and "gateway.run" in sys.modules
-    )
+    # Importing ``gateway.run`` is not ownership either: it sets the marker at
+    # import time and CLI tools import it lazily (FleetReview 09c07e5eb0a9).
+    in_gateway = kb._process_is_gateway()
     try:
         from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
@@ -3074,6 +3126,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}"
           + (f"  [{_fmt_refusal(refusal)}]" if refusal else ""))
+    guard_line = _fmt_current_respawn_guard(task.status, events)
+    if guard_line:
+        print(f"  guard:     {guard_line}")
     print(f"  assignee:  {task.assignee or '-'}")
     print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
     print(f"  home:      {_home_label(task.session_id, unhomed=task.unhomed)}")
@@ -4276,7 +4331,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     try:
         from hermes_cli import kanban_load_gate as _klg
 
-        print(_klg.format_state_line(_klg.read_state()))
+        _gate_state = _klg.read_state()
+        print(_klg.format_state_line(_gate_state))
+        for _line in _klg.format_board_starvation_lines(_gate_state):
+            print(_line)
     except Exception:
         pass
 
@@ -4339,17 +4397,26 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if args.review:
-            review_session = _operator_review_session_ref()
-            task = kb.claim_review_task(
-                conn, args.task_id, ttl_seconds=args.ttl,
-                session_ref=review_session,
-            )
-            if task is not None and review_session is None:
+            session_ref = _operator_review_session_ref()
+            if session_ref is None:
+                # An unbound claim is a dead end (t_c3cf232e): no later
+                # request-changes can inherit it, and it only parks the card in
+                # ``running`` under this short-lived CLI pid. Refuse up front.
                 print(
-                    f"warning: review claim on {args.task_id} bound no session; "
-                    f"request-changes cannot use it and will release it back to review",
+                    f"cannot claim {args.task_id} --review: this caller has no "
+                    f"session identity (sessionless shell, cron job or delegate "
+                    f"child), so no later request-changes could use the claim. "
+                    f"Run it from the reviewing session, approve directly with "
+                    f"`hermes kanban complete {args.task_id}`, or send it back "
+                    f"with `hermes kanban request-changes {args.task_id} REASON "
+                    f"--operator \"<who: why>\"` (no claim needed).",
                     file=sys.stderr,
                 )
+                return 1
+            task = kb.claim_review_task(
+                conn, args.task_id, ttl_seconds=args.ttl,
+                session_ref=session_ref, operator_claim=True,
+            )
         else:
             task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
@@ -4532,6 +4599,27 @@ def _operator_review_session_ref() -> Optional[str]:
     if not session_id or session_id.startswith("cron_"):
         return None
     return kb.derive_session_ref(session_id)
+
+
+def _review_override_caller_allowed() -> bool:
+    """May this caller send back a parked review card on an explicit
+    ``--operator`` / ``--takeover`` without a bindable session?
+
+    A plain operator shell (no session identity) may. A delegate_task child or
+    a cron job may not: they can never act as the human reviewer.
+    """
+    try:
+        from agent.delegation_context import (
+            _NON_DISPATCHER_OWNED_CONTEXT,
+            is_delegated_child_process_context,
+        )
+
+        if is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get():
+            return False
+    except Exception:
+        return False
+    session_id = _caller_session_id() or ""
+    return not session_id.startswith("cron_")
 
 
 def _operator_review_run_id(conn, task_id: str) -> Optional[int]:
@@ -5148,6 +5236,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             return 1
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
         parked_session = None
+        parked_override = False
         released_unbound = False
         if held_run is None and worker_run is None:
             # A review claim that bound NO session can never be held by
@@ -5163,14 +5252,25 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             # (same audit as ``claim --review`` + request-changes). Only a
             # session that could hold that claim may do this.
             task = kb.get_task(conn, tid)
+            parked_override = False
             if task is not None and task.status == "review":
                 parked_session = _operator_review_session_ref()
-            if parked_session is None:
+                # An explicit --operator / --takeover send-back needs no prior
+                # ``claim --review`` and no bindable session (t_c3cf232e:
+                # Apollo's operator send-back from a sessionless shell was
+                # refused). Delegate children and cron jobs stay refused.
+                parked_override = parked_session is None and (
+                    operator is not None
+                    or bool((getattr(args, "foreign_ok", None) or "").strip())
+                ) and _review_override_caller_allowed()
+            if parked_session is None and not parked_override:
                 print(
                     f"cannot request changes for {tid}: this session does not hold its "
                     f"review run; claim it from the reviewing session first "
-                    f"(hermes kanban claim {tid} --review). Delegate children and "
-                    f"cron jobs cannot hold a human-lane review claim."
+                    f"(hermes kanban claim {tid} --review), or, on a card parked in "
+                    f"review, send it back with --operator \"<who: why>\" or "
+                    f"--takeover REASON. Delegate children and cron jobs cannot "
+                    f"hold a human-lane review claim."
                     + (
                         " The unbound review claim was released; the card is back in review."
                         if released_unbound else ""
@@ -5199,7 +5299,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                     "coverage": args.coverage,
                     "session_ref": parked_session,
                 }
-                if parked_session is not None
+                if parked_session is not None or parked_override
                 else {}
             ),
         )
@@ -5548,6 +5648,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ),
             "gate_auto_resolved": getattr(res, "gate_auto_resolved", []),
             "gate_closed_unmerged": getattr(res, "gate_closed_unmerged", []),
+            "spawn_paused": getattr(res, "spawn_paused", None),
+            "spawn_capped": getattr(res, "spawn_capped", None),
+            "memory_pressure": getattr(res, "memory_pressure", None),
         }, indent=2))
         return 0
     if res.skipped_locked:
@@ -5591,6 +5694,19 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"a human: {', '.join(gate_closed)}"
         )
     print(f"Spawned:      {len(res.spawned)}")
+    # Say WHY nothing (or less than asked) spawned: a bare "Spawned: 0" with
+    # dispatchable cards on the board is indistinguishable from an idle board
+    # (t_f78d1938: manual `dispatch --max 3` spawned 0 of 2 with no reason).
+    if getattr(res, "spawn_capped", None):
+        print(f"  capped: {res.spawn_capped}")
+    if getattr(res, "spawn_paused", None):
+        print(f"  paused: {res.spawn_paused}")
+    if getattr(res, "memory_pressure", None):
+        print(
+            f"  memory pressure {res.memory_pressure}: "
+            + ("no new workers this tick" if res.memory_pressure == "critical"
+               else "at most 1 new worker this tick")
+        )
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         route = res.spawn_routes.get(tid, "unknown/unknown")

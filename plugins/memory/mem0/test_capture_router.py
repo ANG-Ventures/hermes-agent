@@ -618,3 +618,27 @@ def test_429_without_reset_seconds_uses_retry_after_then_default(_fresh_cooldown
     ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
     ext.extract("p", "u", "a")
     assert cr.primary_cooldown_remaining(ext._primary_url) == pytest.approx(expected)
+
+
+def test_default_write_same_target_reentrant_writers_do_not_collide(tmp_path, monkeypatch):
+    """Two writers staging the SAME path in one process (e.g. a successor drain thread re-leasing a
+    turn whose old owner is still routing) must each get their own temp file. With a PID-based temp
+    name the inner writer truncates/renames the outer's in-progress file and the outer publish fails."""
+    target = str(tmp_path / "2026-09-28" / "turn.md")
+    real_fsync = os.fsync
+    fired = []
+
+    def fsync_then_race(fd):
+        real_fsync(fd)
+        if not fired:
+            fired.append(True)
+            # a second writer runs to completion while the first is between fsync and replace
+            CaptureRouter._default_write(target, "B-content")
+
+    monkeypatch.setattr(cr.os, "fsync", fsync_then_race)
+    CaptureRouter._default_write(target, "A-content")   # must not raise
+
+    assert fired
+    with open(target, encoding="utf-8") as fh:
+        assert fh.read() == "A-content"                 # last publish wins, whole (never truncated)
+    assert sorted(os.listdir(os.path.dirname(target))) == ["turn.md"]   # no temp left behind

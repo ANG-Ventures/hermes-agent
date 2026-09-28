@@ -353,6 +353,8 @@ model:
 # fallback:
 #   sticky_policy: true           # false = today's per-turn restore AND purges the stored episodes
 #   warm_refusal_ab_pct: 50       # % of sessions (lineage hash) in the warm-seat refusal arm (§4.4)
+#   local_relay_restart_wait_s: 20  # connection error on a 127.0.0.1/localhost base_url: wait up to N s
+#                                   # for the relay port to come back, retry the SAME model; 0 = off
 
 # =============================================================================
 # Kanban Review Dispatch

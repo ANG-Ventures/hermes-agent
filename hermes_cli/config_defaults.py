@@ -3169,6 +3169,10 @@ DEFAULT_CONFIG = {
         # review does NOT re-spawn the reviewer — the card is blocked
         # (needs_input) for the orchestrator/human to take over. 0 disables.
         "max_review_rounds": 3,
+        # True: a completion whose handoff says it did not land ("NOT
+        # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
+        # (human:apollo) instead of done. See kanban_negative_handoff.py.
+        "negative_handoff_review": False,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
         # or "qa:required" get a reviewer session (being a task_links parent

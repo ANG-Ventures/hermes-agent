@@ -61,4 +61,8 @@ def detect_code_skew() -> tuple[str, str] | None:
     current = _fingerprint()
     if current is None or current == _boot_fingerprint:
         return None
+    # Same commit reached through another ref is not skew: compare the SHA part.
+    boot_sha, cur_sha = _boot_fingerprint.rsplit(":", 1)[-1], current.rsplit(":", 1)[-1]
+    if cur_sha and cur_sha != "unresolved" and cur_sha == boot_sha:
+        return None
     return _short(_boot_fingerprint), _short(current)

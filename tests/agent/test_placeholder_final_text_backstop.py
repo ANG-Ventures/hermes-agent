@@ -26,11 +26,69 @@ def test_placeholder_after_tools_is_treated_as_empty_once():
     assert cl.classify_placeholder_final_text("  " + PLACEHOLDER + "  ", prior_was_tool=True, already_nudged=False) == "empty"
 
 
-def test_bridge_closer_proceeding_is_a_known_placeholder():
-    assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=True, already_nudged=False) == "empty"
-    assert cl.classify_placeholder_final_text(PROCEEDING + "\n", prior_was_tool=True, already_nudged=False) == "empty"
-    assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=True, already_nudged=True) == "notice"
-    assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=False, already_nudged=False) == "notice"
+def test_bridge_closer_proceeding_is_a_known_placeholder_on_bridge_lanes():
+    for prov in ("claude-bpr", "claude-bpx-8", "claude-bpx-16"):
+        kw = {"provider": prov}
+        assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=True, already_nudged=False, **kw) == "empty"
+        assert cl.classify_placeholder_final_text(PROCEEDING + "\n", prior_was_tool=True, already_nudged=False, **kw) == "empty"
+        assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=True, already_nudged=True, **kw) == "notice"
+        assert cl.classify_placeholder_final_text(PROCEEDING, prior_was_tool=False, already_nudged=False, **kw) == "notice"
+
+
+def test_proceeding_is_a_real_reply_on_every_other_provider():
+    # FleetReview #1332 key 9172f2d63927 (t_4a1853f2): "Proceeding." is a valid
+    # answer; only the claude-bpx bridge ever wrote it as a closer.
+    for prov in (None, "", "anthropic", "openrouter", "openai-codex", "claude-apr",
+                 "claude-apx-3", "claude-bpx", "claude-bpx-x", "my-claude-bpr"):
+        for nudged in (False, True):
+            for prior in (True, False):
+                assert cl.classify_placeholder_final_text(
+                    PROCEEDING, prior_was_tool=prior, already_nudged=nudged, provider=prov
+                ) is None, (prov, prior, nudged)
+
+
+def test_legacy_bridge_closer_in_history_survives_provider_switch():
+    history = [
+        {"role": "user", "content": "Run the tools"},
+        {"role": "assistant", "content": PROCEEDING},
+        {"role": "user", "content": "What happened?"},
+    ]
+    for prov in ("claude-apr", "openai-codex"):
+        assert cl.classify_placeholder_final_text(
+            PROCEEDING, prior_was_tool=True, already_nudged=False,
+            provider=prov, history=history,
+        ) == "empty"
+        assert cl.classify_placeholder_final_text(
+            PROCEEDING, prior_was_tool=False, already_nudged=False,
+            provider=prov, history=history,
+        ) == "notice"
+
+
+def test_nonbridge_proceeding_with_no_assistant_closer_remains_a_reply():
+    history = [{"role": "user", "content": PROCEEDING}]
+    assert cl.classify_placeholder_final_text(
+        PROCEEDING, prior_was_tool=True, already_nudged=False,
+        provider="claude-apr", history=history,
+    ) is None
+
+
+def test_switch_seam_passes_retained_history():
+    src = _loop_source()
+    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = assistant_message.content or ""'))
+    assert "history=messages" in src[i:i + 450]
+
+
+def test_cli_closer_stays_global_for_every_provider():
+    for prov in (None, "anthropic", "claude-bpr", "openrouter"):
+        assert cl.classify_placeholder_final_text(
+            PLACEHOLDER, prior_was_tool=True, already_nudged=False, provider=prov
+        ) == "empty"
+
+
+def test_seam_passes_the_agent_provider():
+    src = _loop_source()
+    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = assistant_message.content or ""'))
+    assert 'provider=getattr(agent, "provider", None)' in src[i:i + 400]
 
 
 def test_short_real_reply_after_tools_is_never_nudged():
@@ -74,7 +132,8 @@ def test_negative_control_real_text_mentioning_the_placeholder_is_untouched():
 def test_notice_text_is_the_documented_string():
     assert cl._TURN_ENDED_WITHOUT_REPLY == "(turn ended without a reply)"
     assert PLACEHOLDER in cl._PLACEHOLDER_FINAL_TEXTS
-    assert PROCEEDING in cl._PLACEHOLDER_FINAL_TEXTS
+    assert PROCEEDING not in cl._PLACEHOLDER_FINAL_TEXTS
+    assert PROCEEDING in cl._BRIDGE_CLOSER_FINAL_TEXTS
 
 
 def _loop_source():
@@ -103,4 +162,4 @@ def test_backstop_is_wired_at_the_final_text_seam():
 def test_classifier_signature_is_keyword_only():
     tree = ast.parse(_loop_source())
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "classify_placeholder_final_text")
-    assert [a.arg for a in fn.args.kwonlyargs] == ["prior_was_tool", "already_nudged"]
+    assert [a.arg for a in fn.args.kwonlyargs] == ["prior_was_tool", "already_nudged", "provider", "history"]

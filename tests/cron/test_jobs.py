@@ -484,6 +484,18 @@ class TestPauseResumeJob:
         assert paused["paused_reason"] == "user paused"
         assert paused.get("paused_at")
 
+    @pytest.mark.parametrize("reason", [None, "", "   "])
+    def test_pause_without_reason_never_writes_a_silent_disable(self, tmp_cron_dir, reason):
+        """t_6b72ef98: `hermes cron pause <id>` wrote enabled=false + paused_reason=None, so a
+        job paused "until the PR lands" (c5ae0c293f14) sat silently disabled and missed its
+        first window. Every pause must leave a non-empty paused_reason naming the job's state."""
+        job = create_job(prompt="Pause me", schedule="every 1h")
+        paused = pause_job(job["id"], reason=reason)
+        assert paused["enabled"] is False
+        assert paused["state"] == "paused"
+        assert (paused["paused_reason"] or "").strip(), paused["paused_reason"]
+        assert (get_job(job["id"])["paused_reason"] or "").strip()
+
     def test_pause_is_authoritative_due_jobs_do_not_fire(self, tmp_cron_dir):
         """Behavioural invariant: after pause, a past-due job must not be due.
 

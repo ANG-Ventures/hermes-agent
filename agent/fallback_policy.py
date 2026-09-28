@@ -1100,6 +1100,8 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).
         cause = _provider_cause(row)
         return f"{prefix}{cause}" if row.get("provider_message") else f"{prefix}{cause}, {window}"
+    if relay_conn_without_evidence(row):
+        return f"{prefix}{_relay_conn_cause(row, tz)}, {window}"
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
@@ -1125,6 +1127,53 @@ def _plain_provider(row: Mapping[str, Any]) -> bool:
     if not prov or prov.startswith("claude-"):
         return False
     return not (row.get("hop") or row.get("seat"))
+
+
+_LOOPBACK_HOSTS = ("127.", "localhost", "::1", "[::1]")
+# Failures before the relay answered. "incomplete read" / "read timeout" can
+# be a mid-stream drop after the relay picked a seat, so they keep the rider.
+_PRE_ANSWER_CONN = ("connection error", "connection reset", "connect timeout")
+
+
+def relay_conn_without_evidence(row: Mapping[str, Any]) -> bool:
+    """A pooled relay lane's connection failure with no relay evidence (no
+    hop, seat, relay header or HTTP status): the relay never answered, so there is no
+    hop or sub to name (t_21bba7dc: "connection error (hop unknown, sub
+    unknown)" while relay-autodeploy restarted the local relay)."""
+    if row.get("trigger_class") != "conn":
+        return False
+    prov = str(row.get("from_provider") or "").strip().lower()
+    if prov.startswith("custom:"):
+        prov = prov[len("custom:"):]
+    if not prov.startswith("claude-") or is_direct_pin(prov):
+        return False
+    if normalize_hop(row.get("hop")) or (row.get("seat") and row.get("seat") != "unknown"):
+        return False
+    if row.get("class_source") in ("relay_header", "relay_stream") or row.get("relay_synthetic"):
+        return False
+    if row.get("http_status") is not None:  # an HTTP status means the relay answered
+        return False
+    return _cause_phrase(row) in _PRE_ANSWER_CONN
+
+
+def _relay_conn_cause(row: Mapping[str, Any], tz: Optional[_dt.tzinfo]) -> str:
+    addr = str(row.get("relay_addr") or "").strip()
+    if not addr:
+        name = "the relay"
+    elif addr.lower().startswith(_LOOPBACK_HOSTS):
+        name = f"local relay {addr}"
+    else:
+        name = f"relay {addr}"
+    if _cause_phrase(row) == "connect timeout":
+        text = f"{name} did not accept the connection"
+    else:
+        text = f"{name} dropped the connection before answering"
+    up = row.get("relay_up")
+    if up and row.get("relay_up_ts") is not None:
+        text += f"; relay back up {_hms(row['relay_up_ts'], tz).strftime('%H:%M:%S')}"
+    elif up is False:
+        text += "; relay not reachable"
+    return text
 
 
 def _provider_cause(row: Mapping[str, Any]) -> str:
@@ -1194,31 +1243,41 @@ def format_recovery_rider(row: Mapping[str, Any], *, seat_names: bool = True) ->
     """Recovery rider: return_branch, seat, dwell/turns and the cache
     EXPECTATION (never a claim; the outcome is back-filled, not announced)."""
     branch = row.get("return_branch")
-    seat = row.get("seat") or "sub ?"
-    if seat != "sub ?" and not seat_names:
+    # "sub" is relay-pool vocabulary. A primary with no seat concept (cpa/Kimi,
+    # openai-codex, openrouter, xai ...) gets NO seat clause at all; a relay
+    # primary whose seat is genuinely unknown says so in words (t_246ce7d6:
+    # never a bare "?"). Ace 2026-09-28: "sub ?" on a Kimi return was confusing.
+    seat = row.get("seat")
+    if seat and not seat_names:
         seat = "a sub"
+    if seat:
+        on_seat = f" on {seat}"
+    elif _plain_provider({"from_provider": row.get("to_provider")}):
+        on_seat = ""
+    else:
+        on_seat = " on sub unknown"
     dwell = f"after {_mins(row.get('dwell_s'))} / {int(row.get('dwell_turns') or 0)} turns on {_model_short(row.get('from_model'))}"
     since = row.get("since_primary_call_s")
     warm = row.get("expected_warm")
     expect = "expected warm" if warm else "expected cold"
     if branch == "warm_seat":
-        return f"primary eligible on {seat}, last call {_mins(since)} ago ({expect}), {dwell}"
+        return f"primary eligible{on_seat}, last call {_mins(since)} ago ({expect}), {dwell}"
     if branch == "fallback_cold":
         return (f"fallback idle {_mins(row.get('fallback_idle_s'))}; both caches cold, one full "
-                f"cache write ({expect}) on {seat}, {dwell}")
+                f"cache write ({expect}){on_seat}, {dwell}")
     if branch == "compaction":
         return (f"compaction rewrote the prefix; both caches cold, one full cache write "
-                f"({expect}) on {seat}, {dwell}")
+                f"({expect}){on_seat}, {dwell}")
     if branch == "cap_expiry":
-        return (f"primary warm copy expired; one full cache write ({expect}) on {seat}, {dwell}")
+        return (f"primary warm copy expired; one full cache write ({expect}){on_seat}, {dwell}")
     if branch == "fallback_failed":
-        return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible on "
-                f"{seat} ({expect}), {dwell}")
+        return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible"
+                f"{on_seat} ({expect}), {dwell}")
     if branch == TRANSIENT_BRANCH:
         return f"cause was transient (connection); retrying primary ({expect}), {dwell}"
     if branch == USER_ROUTE_BRANCH:
         return f"cleared by /model ({expect}), {dwell}"
-    return f"branch ? on {seat} ({expect}), {dwell}"
+    return f"branch ?{on_seat} ({expect}), {dwell}"
 
 
 def recovery_row(state: StickyState, decision: Decision, now: float, *,

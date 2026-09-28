@@ -404,3 +404,109 @@ def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD
     value for Z.AI Coding overload 429s so the 30/60/90/120s waits run.
     """
     return short_attempts + len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) + 1
+
+
+# ── Local relay restart wait ──────────────────────────────────────────────
+# A connection error against a LOOPBACK base_url (claude-bpr/apr, CLIProxyAPI,
+# gemini-bridge on 127.0.0.1) is almost always the relay restarting under
+# relay-autodeploy: the listener is gone for ~5 s, then back. The generic
+# transport backoff (~2.7 s) lands both attempts inside that gap and the policy
+# walks the fallback chain for a local restart. Instead: probe the port, and if
+# it was down and comes back within ``fallback.local_relay_restart_wait_s``,
+# retry the SAME provider/model. A timeout is not a restart signal (a hung relay
+# still listens), so only connection-class errors qualify.
+LOCAL_RELAY_RESTART_WAIT_DEFAULT_S = 20.0
+LOCAL_RELAY_MAX_RECOVERIES_PER_TURN = 3
+
+_LOCAL_RELAY_CONN_ERROR_NAMES = frozenset({
+    "APIConnectionError", "ConnectError", "ConnectionError",
+    "ConnectionRefusedError", "ConnectionResetError", "ConnectionAbortedError",
+    "RemoteProtocolError", "ServerDisconnectedError", "BrokenPipeError",
+    "ReadError",
+})
+
+
+def _loopback_host_port(base_url: Any) -> Optional[tuple]:
+    """``(host, port)`` when *base_url* points at a loopback listener, else None."""
+    if not base_url or not isinstance(base_url, str):
+        return None
+    try:
+        import ipaddress
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(base_url.strip())
+        host = (parts.hostname or "").lower()
+        if not host:
+            return None
+        if host != "localhost":
+            try:
+                if not ipaddress.ip_address(host).is_loopback:
+                    return None
+            except ValueError:
+                return None
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        return host, int(port)
+    except Exception:
+        return None
+
+
+def is_loopback_base_url(base_url: Any) -> bool:
+    return _loopback_host_port(base_url) is not None
+
+
+def is_local_relay_restart_candidate(error: Any, base_url: Any) -> bool:
+    """Connection-class error (NOT a timeout) against a loopback base_url."""
+    if not is_loopback_base_url(base_url):
+        return False
+    name = type(error).__name__
+    if "Timeout" in name:
+        return False
+    if name in _LOCAL_RELAY_CONN_ERROR_NAMES:
+        return True
+    return isinstance(error, ConnectionError) and not isinstance(error, TimeoutError)
+
+
+def _tcp_listening(host: str, port: int, timeout: float = 0.5) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_local_relay(
+    base_url: str,
+    max_wait_s: float,
+    *,
+    poll_s: float = 1.0,
+    probe: Any = None,
+    sleep: Any = None,
+    should_abort: Any = None,
+) -> tuple:
+    """Poll the loopback listener behind *base_url* until it accepts a TCP
+    connection or *max_wait_s* elapses.
+
+    Returns ``(recovered, waited_s)``. ``recovered`` is True only when the port
+    was observed DOWN at least once and then came back: a listener that is up on
+    the first probe did not restart, so the error is not ours to absorb and the
+    caller keeps its existing retry/fallback behaviour.
+    """
+    hp = _loopback_host_port(base_url)
+    if hp is None or max_wait_s <= 0:
+        return False, 0.0
+    probe = probe or (lambda: _tcp_listening(*hp))
+    sleep = sleep or time.sleep
+    if probe():
+        return False, 0.0
+    waited = 0.0
+    while waited < max_wait_s:
+        if should_abort is not None and should_abort():
+            return False, waited
+        step = min(poll_s, max_wait_s - waited)
+        sleep(step)
+        waited += step
+        if probe():
+            return True, waited
+    return False, waited

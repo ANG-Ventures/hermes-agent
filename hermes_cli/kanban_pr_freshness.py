@@ -138,7 +138,6 @@ def spawn_arm(repo: str, number: int, sha: str, task_id: str) -> Optional[str]:
         return None
     from hermes_constants import get_default_hermes_root
     log_dir = get_default_hermes_root() / "logs" / "handoff-automerge"
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task_id}-{repo.replace('/', '_')}-{number}.log"
     argv = [
         "bash", str(script), repo, str(number),
@@ -147,6 +146,7 @@ def spawn_arm(repo: str, number: int, sha: str, task_id: str) -> Optional[str]:
         "--sha", sha, "--card", task_id,
     ]
     try:
+        log_dir.mkdir(parents=True, exist_ok=True)  # inside the fail-open handler (P2 #15)
         with open(log_path, "ab") as fh:
             subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, start_new_session=True)
