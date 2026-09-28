@@ -451,6 +451,7 @@ def read_planned_restart(
     *,
     prior_pid: Any = None,
     boot_at: Optional[str] = None,
+    prior_started_at: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """The safe-restart ``kickstart``/``intent`` row that explains ``ended_at``.
 
@@ -467,8 +468,8 @@ def read_planned_restart(
 
     PID identity beats the time window: a row whose ``pid_before`` equals the
     previous life's pid (``prior_pid``) was aimed at exactly that process, so it
-    explains the death however long the drain took -- provided it predates this
-    boot (``boot_at``). Among pid matches the ``kickstart`` row wins (it carries
+    explains the death however long the drain took -- provided it falls inside
+    that life (after ``prior_started_at``, before ``boot_at``). Among pid matches the ``kickstart`` row wins (it carries
     the mechanism, e.g. ``full-reload``), then ``in_band``, then ``intent``.
 
     Returns the ledger row (dict) or ``None``. Fail-OPEN on any read error:
@@ -476,6 +477,7 @@ def read_planned_restart(
     """
     ended_epoch = _iso_epoch(ended_at)
     boot_epoch = _iso_epoch(boot_at)
+    start_epoch = _iso_epoch(prior_started_at)
     pid_key = _as_pid(prior_pid)
     if ended_epoch is None and pid_key is None:
         return None
@@ -503,14 +505,25 @@ def read_planned_restart(
             epoch = float(row.get("epoch"))
         except (TypeError, ValueError):
             continue
-        if pid_key is not None and _as_pid(row.get("pid_before")) == pid_key:
-            if boot_epoch is None or epoch <= boot_epoch + _PID_MATCH_BOOT_SLACK_S:
+        row_pid = _as_pid(row.get("pid_before"))
+        if pid_key is not None and row_pid == pid_key:
+            # Bounded to the prior life: a row older than its start was aimed
+            # at an earlier process that happened to have the same pid (C7 k93).
+            if (boot_epoch is None or epoch <= boot_epoch + _PID_MATCH_BOOT_SLACK_S) and (
+                start_epoch is None or epoch >= start_epoch - _PID_MATCH_BOOT_SLACK_S
+            ):
                 if pid_best is None or _pid_rank(row, epoch) > _pid_rank(
                     pid_best, float(pid_best["epoch"])
                 ):
                     pid_best = row
                 continue
         if ended_epoch is None:
+            continue
+        # The window fallback may not match a row written after this boot, or
+        # one explicitly aimed at a different process (C7 k94).
+        if boot_epoch is not None and epoch > boot_epoch + _PID_MATCH_BOOT_SLACK_S:
+            continue
+        if pid_key is not None and row_pid is not None and row_pid != pid_key:
             continue
         delta = ended_epoch - epoch
         if -PLANNED_RESTART_WINDOW_S <= delta <= PLANNED_RESTART_WINDOW_S:
@@ -595,6 +608,7 @@ def read_planned_restart_for_sentinel(
             home,
             prior_pid=data.get("prior_pid"),
             boot_at=_as_str(data.get("started_at")),
+            prior_started_at=_as_str(data.get("prior_started_at")),
         )
     except Exception:
         logger.debug("Planned-restart lookup failed", exc_info=True)

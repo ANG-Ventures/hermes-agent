@@ -2507,6 +2507,16 @@ def switch_model(
         and not validation.get("corrected_model")
         and not any(
             isinstance(_cp, dict)
+            # Only a declaration on the CURRENT provider vouches for the id;
+            # another provider's declaration says nothing about this endpoint
+            # (C7 k112) -- same match as the override block above.
+            and (
+                target_provider.lower() in custom_provider_aliases(
+                    str(_cp.get("name", "") or ""),
+                    str(_cp.get("provider_key") or ""),
+                )
+                or _cp.get("base_url", "") == base_url
+            )
             and (
                 _cp.get("model") == new_model
                 or new_model in _declared_model_ids(_cp.get("models", {}))

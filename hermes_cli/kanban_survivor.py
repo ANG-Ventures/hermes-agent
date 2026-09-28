@@ -2515,7 +2515,21 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
              survivor_none=False, survivor_reason=None):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
-    bases, held, previous = _state(conn, task_id)
+    try:
+        bases, held, previous = _state(conn, task_id)
+        if not isinstance(bases, dict) or not (previous is None or isinstance(previous, dict)):
+            raise TypeError("survivor row is not a JSON object")
+    except (ValueError, TypeError) as exc:
+        # The row is read BEFORE the main try below, so its malformed-record
+        # backstop cannot see a partially written `bases`/`survivor` value
+        # (JSONDecodeError) or a non-object one (AttributeError on `.get`):
+        # the workspace was retained but with no `held_reason` and no
+        # `workspace_held` event (FleetReview #1034). Same HOLD, same reason.
+        _log.exception("kanban survivor: unreadable recovery state for %s", task_id)
+        reason = ("survivor_unavailable: recorded survivor state is malformed "
+                  f"({type(exc).__name__}); repair the row or recover the workspace by hand")
+        _hold(conn, task_id, reason)
+        raise _refusal(reason) from exc
     if cleanup and held:
         raise SurvivorUnavailable(held)
     if cleanup and previous and previous.get("kind") == "none":

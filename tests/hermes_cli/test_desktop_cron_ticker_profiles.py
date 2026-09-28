@@ -82,7 +82,9 @@ def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=9)
 
-    assert builtin.start_kwargs == {"interval": 9}
+    # can_dispatch is the serve admission gate (C7 k115); the legacy
+    # single-store path means no profile_homes.
+    assert {k: v for k, v in builtin.start_kwargs.items() if k != "can_dispatch"} == {"interval": 9}
 
 
 def test_enumeration_failure_fails_open(monkeypatch, _providers):
@@ -97,7 +99,9 @@ def test_enumeration_failure_fails_open(monkeypatch, _providers):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
-    assert builtin.start_kwargs == {"interval": 11}
+    # can_dispatch is the serve admission gate (C7 k115); the legacy
+    # single-store path means no profile_homes.
+    assert {k: v for k, v in builtin.start_kwargs.items() if k != "can_dispatch"} == {"interval": 11}
 
 
 def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):

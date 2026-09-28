@@ -200,14 +200,28 @@ def reset_primary_cooldowns() -> None:
 _CLAIM_RE = re.compile(r"[^A-Za-z0-9_.:/-]")
 
 
-def fallback_claim_headers() -> Dict[str, str]:
-    """Claim headers for the gemini-bridge fallback leg. Never raises."""
+def active_profile_name() -> str:
+    """The active profile name in the CALLER's context, raw. Never raises ("" on failure).
+
+    Resolve this on the turn thread (where the per-request home ContextVar is set) and carry it
+    with the turn: the drain thread and its extraction pool do not inherit that ContextVar, so a
+    lookup there reports the process-default profile for an in-process profile override."""
     try:
         from hermes_cli.profiles import get_active_profile_name
         profile = str(get_active_profile_name() or "")
     except Exception:
         profile = ""
-    profile = _CLAIM_RE.sub("-", profile.strip())[:64] or "default"
+    return profile
+
+
+def fallback_claim_headers(profile: Optional[str] = None) -> Dict[str, str]:
+    """Claim headers for the gemini-bridge fallback leg. Never raises.
+
+    `profile` is the turn's originating profile, captured at enqueue time. None (legacy queue rows
+    that predate the stamp) falls back to resolving in the current context."""
+    if profile is None:
+        profile = active_profile_name()
+    profile = _CLAIM_RE.sub("-", str(profile).strip())[:64] or "default"
     return {"x-hermes-aux-task": "mem0_capture", "x-hermes-profile": profile}
 
 
@@ -350,7 +364,8 @@ class BridgeExtractor:
                                   extra_headers)
             raise
 
-    def extract(self, system_prompt: str, user: str, assistant: str) -> Dict[str, Any]:
+    def extract(self, system_prompt: str, user: str, assistant: str,
+                profile: Optional[str] = None) -> Dict[str, Any]:
         """One pass. Returns {candidates, usage, latency, provider} or {error, ...}. codex PRIMARY,
         gemini FALLBACK on any exception/timeout. Never raises (fail-soft — a pass failure yields no
         candidates rather than breaking the turn)."""
@@ -378,7 +393,7 @@ class BridgeExtractor:
             try:
                 cands, usage, latency = self._call_with_auth_retry(
                     self._fallback_url, self._fallback_ref, self._fallback_model,
-                    system_prompt, user, assistant, fallback_claim_headers())
+                    system_prompt, user, assistant, fallback_claim_headers(profile))
                 return {"candidates": cands, "usage": usage, "latency": latency,
                         "provider": "gemini-bridge", "primary_error": str(primary_err)[:200]}
             except Exception as fallback_err:
@@ -435,12 +450,13 @@ class CaptureRouter:
                       "prefs_seen": 0, "extract_errors": 0, "fallback_passes": 0}
 
     # -- extraction ---------------------------------------------------------
-    def two_pass_extract(self, user: str, assistant: str) -> Dict[str, Any]:
+    def two_pass_extract(self, user: str, assistant: str,
+                         profile: Optional[str] = None) -> Dict[str, Any]:
         """Run the prefs pass and the world pass CONCURRENTLY (benchmark wiring note: collapse the
         2x sequential latency). Returns a dict with both pass results."""
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_prefs = ex.submit(self._extractor.extract, self._prefs_prompt, user, assistant)
-            f_world = ex.submit(self._extractor.extract, self._world_prompt, user, assistant)
+            f_prefs = ex.submit(self._extractor.extract, self._prefs_prompt, user, assistant, profile)
+            f_world = ex.submit(self._extractor.extract, self._world_prompt, user, assistant, profile)
             prefs = f_prefs.result()
             world = f_world.result()
         return {"prefs": prefs, "world": world}
@@ -462,7 +478,7 @@ class CaptureRouter:
         return out
 
     def route_turn(self, user: str, assistant: str, *, turn_id: str, session: str,
-                   ts: Optional[str] = None) -> Dict[str, Any]:
+                   ts: Optional[str] = None, profile: Optional[str] = None) -> Dict[str, Any]:
         """Full router pass for ONE turn. Runs the two concurrent extractions, applies the
         deterministic class router + dedup, and STAGES world/event facts. Returns a structured
         result for observability/replay. Never raises (fail-soft)."""
@@ -473,7 +489,7 @@ class CaptureRouter:
             "providers": {}, "error": None,
         }
         try:
-            passes = self.two_pass_extract(user, assistant)
+            passes = self.two_pass_extract(user, assistant, profile)
         except Exception as e:  # ThreadPool/executor level failure — should be rare (extract is soft)
             self.stats["extract_errors"] += 1
             result["error"] = f"two_pass_extract failed: {e}"

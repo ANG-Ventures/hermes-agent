@@ -1156,17 +1156,36 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            worker_run = _worker_run_id(tid)
+            parked_session = None
+            if worker_run is None:
+                task = kb.get_task(conn, tid)
+                if task is not None and task.status == "review":
+                    # Same provenance rule as the CLI (``_cmd_request_changes``):
+                    # only a session that could hold a human-lane review claim
+                    # may open one. Sessionless callers, cron jobs and
+                    # delegate children are refused (FleetReview #1081).
+                    from hermes_cli.kanban import _operator_review_session_ref
+
+                    parked_session = _operator_review_session_ref()
+                    if parked_session is None:
+                        return tool_error(
+                            f"could not request changes for {tid}: this caller cannot "
+                            f"hold a human-lane review claim (no bindable chat "
+                            f"session; cron jobs and delegate children are refused)"
+                        )
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=worker_run,
                 # A non-worker reviewer (human-lane orchestrator) on a parked
                 # review card opens the review run as itself, atomically.
                 # Gateway sessions carry no worker marker: fall back to the
                 # active profile, never a literal that misattributes the verdict.
                 claimer=_caller_profile() or "reviewer",
                 coverage=coverage,
+                session_ref=parked_session,
             )
             if not ok:
                 return tool_error(
@@ -1342,7 +1361,12 @@ def _handle_attach(args: dict, **kw) -> str:
     import hashlib
     expected = args.get("expected_sha256")
     if expected is not None and (not isinstance(expected, str) or not expected.strip()):
-        expected = None
+        # A supplied digest the caller meant to verify against must never be
+        # silently discarded into an unverified store (C7 k138).
+        return tool_error(
+            "expected_sha256 must be a non-empty hex SHA-256 string when "
+            "supplied (omit it to attach a path unverified); nothing stored"
+        )
     if has_path:
         # The bytes never pass through the model. A model that has to
         # re-emit a file as base64 transcribes it token by token and drops

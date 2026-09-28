@@ -1386,6 +1386,17 @@ def kanban_handoff_rejection(
         if worker_run_id is not None:
             blocked = kb.block_task(conn, task_id, reason=reason, kind="transient", expected_run_id=worker_run_id)
             return f"{reason}; task {'blocked transient after judge retry' if blocked else 'not blocked (run ownership changed)'}"
+    # A goal-mode worker handing off through the CLI runs it as a CHILD of
+    # its terminal tool: it inherits the card's task env but is never the run
+    # owner, so the resolver above returns None. That is the worker's lineage,
+    # not an operator -- a judge error must not let its handoff through
+    # (FleetReview #960). Refuse without blocking (run ownership is unproven).
+    if (
+        worker_run_id is None
+        and task_id
+        and (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id
+    ):
+        return f"{reason}; handoff refused (caller inherits this card's worker env; judge errors fail closed)"
     return None
 
 

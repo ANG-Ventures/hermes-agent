@@ -217,6 +217,16 @@ def test_401_token_redacted_in_err_head(_home, monkeypatch):
     assert len(r["err_head"]) <= 160
 
 
+def test_url_credentials_redacted_in_err_head(_home, monkeypatch):
+    """Backfill C3 (#1211): a provider error echoing a credential-bearing URL."""
+    msg = "bad redirect https://u:hunter2pw@h.test/cb?access_token=" + "opaque123" + "secret"
+    _fail_over(monkeypatch, _Err(msg, 401, body={"error": {"message": msg}}),
+               reason=FailoverReason.auth)
+    r = _rows(_home)[0]
+    assert r["err_head"] and "h.test" in r["err_head"]
+    assert "hunter2pw" not in r["err_head"] and "opaque123secret" not in r["err_head"]
+
+
 def test_err_head_only_for_error_json():
     a = types.SimpleNamespace(_current_turn_id="s:s:t", session_id="s")
     fbe.stash_api_error(a, _Err("Connection error.", None), None, None)

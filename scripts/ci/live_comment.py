@@ -312,7 +312,12 @@ def upsert_comment(
     """Create or update the review comment. Returns the comment ID."""
     owner, repo_name = repo.split("/")
     if comment_id is None:
-        comment_id = find_comment_id(token, repo, pr_number)
+        try:
+            comment_id = find_comment_id(token, repo, pr_number)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # Transient outage listing comments: best-effort, retry next poll.
+            print(f"  API error finding comment: {e}", file=sys.stderr)
+            return None
 
     if comment_id:
         url = f"{API_BASE}/repos/{owner}/{repo_name}/issues/comments/{comment_id}"
@@ -335,6 +340,9 @@ def upsert_comment(
             return result.get("id")
     except urllib.error.HTTPError as e:
         print(f"  API error {e.code}: {e.reason}", file=sys.stderr)
+        return None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"  API error updating comment: {e}", file=sys.stderr)
         return None
 
 
@@ -648,6 +656,7 @@ def run(
                     print(f"  Updated comment {cid} ({reason})")
                 else:
                     print(f"  Failed to update comment ({reason}, will retry)", file=sys.stderr)
+                    body = last_body  # not posted: keep it pending for the next poll
             last_body = body
         else:
             if pending:
