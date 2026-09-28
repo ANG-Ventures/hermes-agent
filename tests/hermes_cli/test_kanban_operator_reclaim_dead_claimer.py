@@ -278,6 +278,27 @@ def test_scan_sees_worker_ancestor_when_child_env_is_scrubbed(tmp_path):
     assert rc == 0
 
 
+def test_scan_ignores_operator_shell_ancestor_naming_task():
+    """c18fd1d3b7f7 (#1442): ``sh -c '... reclaim t_x'`` names the task but is
+    the operator's shell, not the worker."""
+    tid = "t_" + secrets.token_hex(4)
+    inner = (
+        "import os, sys\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "sys.exit(1 if kb._host_process_mentions_task(os.environ['SCAN_TID']) else 0)\n"
+    )
+    outer = (
+        "import subprocess, sys\n"
+        f"# hermes kanban reclaim {tid} --operator 'apollo: x'\n"
+        f"sys.exit(subprocess.call([sys.executable, '-c', {inner!r}]))\n"
+    )
+    repo = Path(kb.__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != _TASK_ENV}
+    env.update(SCAN_TID=tid, PYTHONPATH=str(repo))
+    rc = subprocess.call([sys.executable, "-c", outer], env=env, cwd=str(repo), timeout=120)
+    assert rc == 0
+
+
 def _stamp_between_check_and_update(monkeypatch, action):
     real = kb._host_process_mentions_task
 
@@ -324,6 +345,8 @@ def test_worker_process_title_keeps_task_id(monkeypatch):
     assert titles[-1] == kb.KANBAN_WORKER_PROCTITLE.format(task_id="t_scan")
     # The scan recognises the rewritten title (macOS pads argv with empties).
     rewritten = [titles[-1], "", "", ""]
+    assert kb._proc_is_titled_worker(rewritten, "t_scan")
+    assert not kb._proc_is_titled_worker(["sh", "-c", "hermes kanban reclaim t_scan"], "t_scan")
     monkeypatch.delenv(_TASK_ENV)
     euid = getattr(os, "geteuid", lambda: None)()
     assert _scan_with(monkeypatch, [_FakeProc(999997, rewritten, euid=euid)]) is True

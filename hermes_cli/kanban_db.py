@@ -17690,9 +17690,14 @@ def _host_process_mentions_task(task_id: str) -> bool:
 # Process title a dispatcher worker gives itself (hermes_cli/main.py
 # ``_set_process_title``). ``setproctitle`` overwrites argv AND the environ
 # block, so the title is the only place the task id survives in the process
-# table (FleetReview 1d1cb187c593 on #1404). The scan matches any argv
-# element containing the task id. Keep both sides in sync.
+# table (FleetReview 1d1cb187c593 on #1404). Keep both sides in sync.
 KANBAN_WORKER_PROCTITLE = "hermes kanban-worker {task_id}"
+
+
+def _proc_is_titled_worker(cmdline, task_id: str) -> bool:
+    """True if ``cmdline`` is exactly ``task_id``'s rewritten worker title."""
+    joined = " ".join(str(a) for a in (cmdline or ()) if a).strip()
+    return joined == KANBAN_WORKER_PROCTITLE.format(task_id=task_id)
 
 
 def _caller_inside_task_worker(task_id: str, parents, my_euid) -> bool:
@@ -17700,11 +17705,13 @@ def _caller_inside_task_worker(task_id: str, parents, my_euid) -> bool:
 
     The worker's env grant (``HERMES_KANBAN_TASK``) is inherited by every
     subprocess it launches; delegated children have it scrubbed, so each
-    ancestor's argv (task id, or the worker title) and env are read too. An
-    unreadable env alone is not inconclusive: a same-uid process hides its
-    env only when it is non-dumpable (sshd, setgid), and a Python worker is
-    not. A same-uid ancestor with NEITHER readable counts as a match (fail
-    closed).
+    ancestor's env grant and process title are read too. A bare task id in
+    an ancestor's argv is NOT a match: the operator's own shell
+    (``sh -c '... reclaim t_x'``) names the task (FleetReview c18fd1d3b7f7
+    on #1442). An unreadable env alone is not inconclusive either: a same-uid
+    process hides its env only when it is non-dumpable (sshd, setgid), and a
+    Python worker is not. A same-uid ancestor with NEITHER readable counts as
+    a match (fail closed).
     """
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
         return True
@@ -17715,7 +17722,7 @@ def _caller_inside_task_worker(task_id: str, parents, my_euid) -> bool:
             continue
         except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
             cmdline = None
-        if cmdline is not None and any(task_id in str(a) for a in cmdline):
+        if cmdline is not None and _proc_is_titled_worker(cmdline, task_id):
             return True
         try:
             env = parent.environ()
