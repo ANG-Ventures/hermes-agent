@@ -116,3 +116,96 @@ def test_approval_from_review_is_not_rerouted(conn, armed):
     # The human approving the parked card may quote the same summary.
     assert kb.complete_task(conn, tid, summary=NOT_DEPLOYED)
     assert _status(conn, tid)["status"] == "done"
+
+
+# --- FleetReview #1447 @30bc5279 (t_daa1f3bf) -------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "unblocked once bpx#288 merged; deployed and green",
+    "this was unblocked on Monday and shipped",
+    "the relay could notify Apollo, so wired it",
+    "you could note the SHA; landed as a682b93c",
+    "CANNOT_DEPLOYED_FLAG untouched",  # substring of a longer identifier
+])
+def test_phrases_need_word_boundaries(text):
+    assert neg.match([text]) is None
+
+
+def test_result_log_is_not_scanned_when_summary_is_present(conn, armed):
+    # ``result`` often carries pasted tool/test output from a failure that was
+    # later fixed; the handoff the worker writes is ``summary``.
+    tid = _claimed(conn)
+    assert kb.complete_task(
+        conn, tid, summary=GOOD,
+        result="pytest: ImportError: could not find module foo (fixed in 2nd commit)",
+        metadata={"no_pr": True},
+    )
+    assert _status(conn, tid)["status"] == "done"
+
+
+def test_result_alone_is_still_scanned(conn, armed):
+    tid = _claimed(conn)
+    assert kb.complete_task(conn, tid, result=NOT_DEPLOYED)
+    assert _status(conn, tid)["status"] == "review"
+
+
+def _scratch_task(conn):
+    tid = kb.create_task(conn, title="arm + readout", assignee="daedalus")
+    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    kb.set_workspace_path(conn, tid, ws)
+    kb.claim_task(conn, tid)
+    artifact = ws / "readout.md"
+    artifact.write_bytes(b"readout-bytes")
+    return tid, ws, artifact
+
+
+def _assert_artifact_survives_bare_approval(conn, tid, ws, artifact):
+    attachments = kb.list_attachments(conn, tid)
+    assert [a.filename for a in attachments] == ["readout.md"]
+    stored = Path(attachments[0].stored_path)
+    assert stored.parent == kb.task_attachments_dir(tid).resolve()
+    routed = kb.latest_run(conn, tid)
+    assert routed.metadata["artifacts"] == [str(stored)]
+    # Human approves from review WITHOUT repeating the implementer's metadata.
+    assert kb.complete_task(conn, tid, summary="approved")
+    assert _status(conn, tid)["status"] == "done"
+    assert not ws.exists(), "scratch workspace is still cleaned up"
+    assert stored.read_bytes() == b"readout-bytes"
+    assert [a.filename for a in kb.list_attachments(conn, tid)] == ["readout.md"]
+
+
+def test_negative_route_preserves_scratch_artifacts(conn, armed):
+    tid, ws, artifact = _scratch_task(conn)
+    assert kb.complete_task(conn, tid, summary=STOP_FINDING,
+                            metadata={"no_pr": True, "artifacts": [str(artifact)]})
+    assert _status(conn, tid)["status"] == "review"
+    _assert_artifact_survives_bare_approval(conn, tid, ws, artifact)
+
+
+def test_open_pr_route_preserves_scratch_artifacts(conn, monkeypatch):
+    # Same class, sibling early-return: the open-PR review route.
+    monkeypatch.setenv("KANBAN_HANDOFF_FRESHNESS", "0")
+    monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
+    state = {"s": "OPEN"}
+    monkeypatch.setattr(op, "_default_query",
+                        lambda: (lambda repo, number: {"state": state["s"]}))
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    tid, ws, artifact = _scratch_task(conn)
+    assert kb.complete_task(conn, tid, summary="shipped",
+                            metadata={"pr_url": "https://github.com/o/r/pull/7",
+                                      "artifacts": [str(artifact)]})
+    assert _status(conn, tid)["status"] == "review"
+    state["s"] = "MERGED"
+    _assert_artifact_survives_bare_approval(conn, tid, ws, artifact)
+
+
+def test_refused_route_leaves_no_orphan_copies(conn, armed):
+    tid, ws, artifact = _scratch_task(conn)
+    # Stale run id: request_review refuses; nothing may be attached or copied.
+    assert not kb.complete_task(conn, tid, summary=STOP_FINDING, expected_run_id=999999,
+                                metadata={"artifacts": [str(artifact)]})
+    assert kb.list_attachments(conn, tid) == []
+    att_dir = kb.task_attachments_dir(tid)
+    assert not att_dir.exists() or list(att_dir.iterdir()) == []
+    assert artifact.exists()

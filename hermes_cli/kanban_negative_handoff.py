@@ -19,15 +19,27 @@ from typing import Iterable, Optional
 REVIEWER = "human:apollo"
 SETTING = "negative_handoff_review"
 
+# Word-bounded on both sides: "unblocked once" / "could notify" are positive
+# handoffs, not "blocked on" / "could not" (FleetReview #1447, t_daa1f3bf).
 PHRASES = re.compile(
-    r"NOT\s+DEPLOYED"
+    r"\b(?:NOT\s+DEPLOYED"
     r"|STOP\s+finding"
     r"|could\s+not"
     r"|blocked\s+on"
-    r"|nothing\s+was\s+(?:armed|measured)",
+    r"|nothing\s+was\s+(?:armed|measured))\b",
     re.IGNORECASE,
 )
 PARTIAL_OUTCOMES = frozenset({"partial"})
+
+
+def handoff_texts(summary: Optional[str], result: Optional[str]) -> tuple:
+    """The prose to scan: ``summary`` when present, else the legacy ``result``.
+
+    ``result`` often carries pasted tool/test output (e.g. a "could not find
+    module" line from a failure fixed later), so it is only the handoff when
+    no summary was written.
+    """
+    return (summary,) if (summary or "").strip() else (result,)
 
 
 def match(texts: Iterable[Optional[str]], metadata: Optional[dict] = None) -> Optional[str]:

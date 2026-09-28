@@ -10621,10 +10621,12 @@ def complete_task(
             if freshness.get("prs"):
                 routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
+            routed_meta, staged = _stage_routed_scratch_artifacts(conn, task_id, routed_meta)
             ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
                 expected_run_id=expected_run_id, force=True, with_reason=True,
             )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
             if not ok:
                 # complete_task returns a bare bool, so callers can only say
                 # "unknown id or already terminal". Leave the real refusal on
@@ -10650,16 +10652,20 @@ def complete_task(
     # not done (t_d0aee724, t_b6eb2944). Default-off: kanban.negative_handoff_review.
     if candidate.status != 'review' and not approve_head_sha and not superseded_by:
         from hermes_cli import kanban_negative_handoff as _neg
-        trigger = _neg.match((summary, result), metadata)
+        trigger = _neg.match(_neg.handoff_texts(summary, result), metadata)
         if trigger and configured_negative_handoff_review():
             note = _neg.route_note(trigger)
+            routed_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, dict(metadata or {}, negative_handoff=trigger),
+            )
             ok, route_reason = request_review(
                 conn, task_id,
                 summary="\n".join(filter(None, [note, summary or result])),
-                metadata=dict(metadata or {}, negative_handoff=trigger),
+                metadata=routed_meta,
                 reviewer=_neg.REVIEWER, expected_run_id=expected_run_id,
                 force=True, with_reason=True,
             )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
             with write_txn(conn):
                 _append_event(
                     conn, task_id,
@@ -11073,6 +11079,51 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
+
+
+def _stage_routed_scratch_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+) -> tuple[dict, list[str]]:
+    """Copy declared scratch artifacts out before a completion is routed to review.
+
+    A review route returns before the ``done`` path's artifact persistence. A
+    later approval that does not repeat the implementer's metadata has no
+    artifact list, and its cleanup deletes the scratch workspace with the
+    files in it (FleetReview #1447, t_daa1f3bf). The routed run's metadata
+    carries the attachment paths; :func:`_settle_routed_scratch_artifacts`
+    registers them once the route lands.
+    """
+    staged_meta = dict(metadata)
+    _persist_scratch_completion_artifacts(conn, task_id, staged_meta)
+    return staged_meta, list(staged_meta.pop("_staged_artifacts", []))
+
+
+def _settle_routed_scratch_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    staged: list[str],
+    ok: bool,
+) -> None:
+    """Register staged copies when the review route landed; drop them if refused."""
+    if not staged:
+        return
+    if not ok:
+        for stored_path in staged:
+            try:
+                Path(stored_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
+    now = int(time.time())
+    with write_txn(conn):
+        for stored_path in staged:
+            path = Path(stored_path)
+            _insert_completion_attachment(
+                conn, task_id, filename=path.name, stored_path=str(path),
+                size=path.stat().st_size, created_at=now,
+            )
 
 
 def _insert_completion_attachment(
