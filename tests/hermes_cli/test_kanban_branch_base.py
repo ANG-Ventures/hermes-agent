@@ -237,10 +237,15 @@ def test_landed_branch_is_skipped_not_failed(origin, tmp_path):
                               scope=[], created_at=created_at) is None
 
 
-def _states(**by_number):
+def _states(head_sha: str | None = None, **by_number):
     def q(repo, number):
         st = by_number.get(f"n{number}")
-        return None if st is None else {"state": st, "merge_commit_sha": "abc123def4567"}
+        if st is None:
+            return None
+        out = {"state": st, "merge_commit_sha": "abc123def4567"}
+        if head_sha:
+            out["head_sha"] = head_sha
+        return out
     return lambda: q
 
 
@@ -253,11 +258,12 @@ def _card(conn, ws: Path) -> tuple[str, int]:
 
 def test_e2e_merged_survivor_pr_completes_without_override(board, origin, tmp_path, monkeypatch):
     from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
-    monkeypatch.setattr(op, "_default_query", _states(n7="MERGED"))
     # survivor capture/remote verification is a later, separate gate (network)
     monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
     # multi-commit squash: git cherry cannot match it, only the PR state can
     work, _ = _squash_merged_branch(origin, tmp_path, n_commits=2)
+    # the merged PR's head IS this checkout's HEAD: the PR carried these commits
+    monkeypatch.setattr(op, "_default_query", _states(_git(work, "rev-parse", "HEAD"), n7="MERGED"))
     with kb.connect() as conn:
         tid, run = _card(conn, work.parent)
         with pytest.raises(bb.StaleBaseError):  # same checkout, no merged PR named
@@ -280,3 +286,48 @@ def test_e2e_open_survivor_pr_with_foreign_commit_still_refuses(board, origin, t
             kb.complete_task(conn, tid, summary="done", expected_run_id=run,
                              survivor_pr="ANG-Ventures/hermes-agent#7")
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+
+
+# --- FleetReview #1394 P1: a merged PR must be tied to the checkout ----------
+
+
+def test_e2e_unrelated_merged_pr_does_not_bypass_guard(board, origin, tmp_path, monkeypatch):
+    """Naming ANY merged PR must not excuse a stale checkout whose commits that
+    PR never carried (key c2b6863a508d)."""
+    from hermes_cli import kanban_open_pr as op, kanban_survivor as ks
+    monkeypatch.setattr(ks, "preserve", lambda *a, **k: None)
+    with kb.connect() as conn:
+        work, _ = _stale_branch(origin, tmp_path)
+        unrelated = _git(origin, "rev-parse", "HEAD")  # a trunk sha, not this branch
+        for head in (unrelated, None):  # wrong head / no head evidence at all
+            monkeypatch.setattr(op, "_default_query", _states(head, n7="MERGED"))
+            tid, run = _card(conn, work.parent)
+            with pytest.raises(bb.StaleBaseError):
+                kb.complete_task(conn, tid, summary="done", expected_run_id=run,
+                                 survivor_pr="ANG-Ventures/hermes-agent#7")
+            assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+            ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                              (tid, "completion_blocked_stale_base")).fetchone()
+            assert ev and "survivor_merged_untied" in ev[0]
+
+
+def test_merge_commit_ahead_is_not_already_landed(origin, tmp_path):
+    """git cherry omits merge commits; a patch-equivalent commit plus a merge
+    commit carrying new changes is NOT already landed (key 16b979e96639)."""
+    work, created_at = _squash_merged_branch(origin, tmp_path)
+    # side branch: a commit patch-equivalent to one trunk already has
+    _git(work, "checkout", "-q", "-b", "side", "HEAD~1")
+    _commit(work, {"docs/n0.md": "0\n"}, "side, same patch as trunk 0")
+    _git(work, "checkout", "-q", "daedalus/t_x")
+    # evil merge: the merge commit itself introduces an unpublished change
+    _git(work, "merge", "-q", "--no-ff", "--no-commit", "side")
+    (work / "gateway" / "run.py").write_text("x = 1  # only in the merge commit\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "merge side")
+    _git(work, "fetch", "-q", "origin")
+    cherry = _git(work, "cherry", "origin/main", "HEAD").splitlines()
+    assert cherry and all(ln.startswith("- ") for ln in cherry)  # the blind spot
+    rep = bb.check_checkout(work, scope=["hermes_cli/foo.py"], since=created_at,
+                            max_behind=None)
+    assert not rep.skipped, rep.render()
+    assert not rep.ok and "gateway/run.py" in rep.out_of_scope, rep.render()
