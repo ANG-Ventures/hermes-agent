@@ -6,13 +6,13 @@ and thread participation tracking.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import re
 import os
 import threading
 import time
-import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict
 
@@ -220,7 +220,10 @@ def strip_markdown(text: str) -> str:
 _COALESCING_RETRY_DELAY_S = 1.0
 _WRITER_REGISTRY_LOCK = threading.Lock()
 _WRITER_PATH_LOCKS: "dict[str, threading.Lock]" = {}
-_WRITER_PATH_OWNERS: "weakref.WeakValueDictionary[str, CoalescingJsonWriter]" = weakref.WeakValueDictionary()
+# Newest writer generation per path. Plain ints, not weak refs: a superseded
+# writer must stay superseded after its replacement is collected.
+_WRITER_PATH_OWNERS: "dict[str, int]" = {}
+_WRITER_GENERATION = itertools.count(1)
 
 
 class CoalescingJsonWriter:
@@ -269,7 +272,8 @@ class CoalescingJsonWriter:
         self._path_key = os.path.abspath(os.fspath(self._path))
         with _WRITER_REGISTRY_LOCK:
             self._write_lock = _WRITER_PATH_LOCKS.setdefault(self._path_key, threading.Lock())
-            _WRITER_PATH_OWNERS[self._path_key] = self
+            self._generation = next(_WRITER_GENERATION)
+            _WRITER_PATH_OWNERS[self._path_key] = self._generation
         self._snapshot = snapshot
         self._interval = max(0.0, float(min_interval_s))
         self._name = name
@@ -340,7 +344,7 @@ class CoalescingJsonWriter:
     def _write_now(self, *, background: bool = False) -> None:
         with self._write_lock:
             owner = _WRITER_PATH_OWNERS.get(self._path_key)
-            if background and owner is not None and owner is not self:
+            if background and owner is not None and owner != self._generation:
                 logger.debug("[%s] superseded writer skipped a stale write", self._name)
                 return
             payload = self._snapshot()
