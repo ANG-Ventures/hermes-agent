@@ -51,7 +51,7 @@ def _canon(value) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
 
 
-def _cache_view(value):
+def _cache_view(value, *, strip_markers: bool = True):
     """What the provider's prefix cache hashes, not how it is spelled.
 
     The anthropic adapter moves a rolling ``cache_control`` breakpoint onto the
@@ -59,14 +59,22 @@ def _cache_view(value):
     as a plain string on the next. Anthropic treats a string as a single text
     block and does not hash the ``cache_control`` marker, so both spellings are
     the same cached prefix. Every other byte (text included) must match.
+
+    Only MESSAGE markers roll. ``system`` / ``tools`` breakpoints are fixed
+    and part of the prefix, so those views keep them (``strip_markers=False``;
+    FleetReview #11: stripping them hid a moved or dropped system marker).
     """
     if isinstance(value, dict):
-        out = {k: _cache_view(v) for k, v in value.items() if k != "cache_control"}
+        out = {
+            k: _cache_view(v, strip_markers=strip_markers)
+            for k, v in value.items()
+            if not (strip_markers and k == "cache_control")
+        }
         if isinstance(out.get("content"), str) and "role" in out:
             out["content"] = [{"type": "text", "text": out["content"]}]
         return out
     if isinstance(value, list):
-        return [_cache_view(v) for v in value]
+        return [_cache_view(v, strip_markers=strip_markers) for v in value]
     return value
 
 
@@ -274,9 +282,9 @@ def _prefix_parts(api_mode: str, body: dict) -> dict:
         assert body["messages"][0]["role"] == "system"
         system = body["messages"][0]
     return {
-        "system": _canon(_cache_view(system)),
+        "system": _canon(_cache_view(system, strip_markers=False)),
         "msg0": _canon(_cache_view(body["messages"][0])),
-        "tools": _canon(_cache_view(body.get("tools"))),
+        "tools": _canon(_cache_view(body.get("tools"), strip_markers=False)),
     }
 
 
