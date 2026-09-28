@@ -1967,7 +1967,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 with kb.connect_closing() as gate_conn:
                     kb.enforce_operator_flag_gate(
                         gate_conn, _lifecycle_target_ids(args), action,
-                        flags=gated_flags, argv=sys.argv,
+                        flags=gated_flags,
                     )
             except kb.OperatorTokenRequiredError as exc:
                 print(f"kanban: {exc}", file=sys.stderr)
@@ -1991,7 +1991,13 @@ def kanban_command(args: argparse.Namespace) -> int:
                 operator=getattr(args, "operator", None),
             )
         try:
-            with actor_scope:
+            # The preflight above ran on its own connection; the scope re-runs
+            # the same gate inside every write transaction the handler opens,
+            # so a run claimed in between is never closed by a tokenless
+            # override (t_920c6b4a).
+            with kb.operator_flag_gate_scope(
+                _lifecycle_target_ids(args), action, flags=gated_flags,
+            ), actor_scope:
                 return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             # A survivor refusal carries its operator-only hint on the

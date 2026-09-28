@@ -4955,6 +4955,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
+        _recheck_pending_operator_gate(conn)
         guarded_before = _recheck_pending_home_session(conn)
         yield conn
         if guarded_before is not None:
@@ -5667,6 +5668,12 @@ OPERATOR_TOKEN_ENV = "KANBAN_OPERATOR_TOKEN"
 OPERATOR_TOKEN_FILENAME = "operator-token"
 OPERATOR_FLAG_GATED_ACTIONS: frozenset[str] = frozenset({
     "complete", "block", "unblock", "reassign", "archive", "request-review",
+    # Also end a live run under ``--takeover``/``--operator`` (t_920c6b4a):
+    # ``schedule_task`` and ``triage_resolve_task`` call ``_end_run``, so an
+    # ungated flag there parks a live worker's card. ``request-changes`` is
+    # deliberately absent: it ends only a review run the calling session
+    # holds (or none, on a parked card) and refuses every other holder itself.
+    "schedule", "triage-resolve",
 })
 # Actions where ONLY ``--operator`` is gated: on ``reclaim`` it overrides the
 # dead-claimer liveness hold (t_6451e7c9), which must not be reachable with an
@@ -5701,28 +5708,105 @@ def _operator_token_state() -> str:
     return "mismatch"
 
 
-def _caller_holds_grant_for(task_id: str) -> bool:
-    """True only for the dispatcher's worker on its own card, by exact pid."""
+def _caller_holds_grant_for(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True only for the dispatcher's worker on its own card, by exact pid.
+
+    The env pair alone is caller-controlled: any process can name a live card
+    and its own pid (or the ``pending`` sentinel) before invoking the CLI. So
+    the pid must ALSO be the one the dispatcher stamped on the card's current
+    run (``tasks.worker_pid``), a value the caller cannot supply through its
+    environment (t_920c6b4a, FleetReview 80796f262c18).
+    """
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() != task_id:
         return False
     owner = (os.environ.get("HERMES_KANBAN_OWNER_PID") or "").strip()
     try:
-        return int(owner) == os.getpid()
+        if int(owner) != os.getpid():
+            return False
     except ValueError:
+        return False
+    row = conn.execute(
+        "SELECT worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["current_run_id"] is None or row["worker_pid"] is None:
+        return False
+    try:
+        return int(row["worker_pid"]) == os.getpid()
+    except (TypeError, ValueError):
         return False
 
 
 def task_run_is_active(
     conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None
 ) -> bool:
-    """A run is active: ``current_run_id`` set and the claim not yet expired."""
+    """A run is active: ``current_run_id`` set, and the card is ``running`` or
+    its claim has not yet expired.
+
+    A lapsed claim on a ``running`` card is a normal state for a live worker
+    (a slow tool-free LLM call outlives the TTL until the next dispatcher
+    sweep extends it, see ``release_stale_claims``), so expiry alone must not
+    open the gate (t_920c6b4a, FleetReview 9094c8989646). Mirrors
+    :func:`_task_has_live_run`.
+    """
     row = conn.execute(
-        "SELECT current_run_id, claim_expires FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, current_run_id, claim_expires FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None or row["current_run_id"] is None:
         return False
+    if row["status"] == "running":
+        return True
     expires = row["claim_expires"]
     return bool(expires) and int(expires) > int(now if now is not None else time.time())
+
+
+def _gated_flags_for(action: str, flags: Iterable[str]) -> list[str]:
+    used = sorted({f for f in (flags or ()) if f})
+    if action in OPERATOR_ONLY_GATED_ACTIONS:
+        return [f for f in used if f == "--operator"]
+    if action not in OPERATOR_FLAG_GATED_ACTIONS:
+        return []
+    return used
+
+
+def _operator_gate_refusal(
+    conn: sqlite3.Connection, task_ids: Sequence[str], action: str, used: Sequence[str],
+) -> Optional[tuple[str, dict]]:
+    """``(task_id, event payload)`` for the first card the flags may not
+    override, or ``None`` when every card passes.
+
+    The payload is a sanitized description of the Kanban request (action,
+    flags, target ids), never the process argv: argv carries ``--summary`` /
+    ``--metadata`` values, and in-process ``/kanban`` it is the gateway's own
+    launch line (t_920c6b4a, FleetReview fc8a7bdcf814).
+    """
+    if not used:
+        return None
+    token = _operator_token_state()
+    if token == "ok":
+        return None
+    for tid in task_ids:
+        if _caller_holds_grant_for(conn, tid) or not task_run_is_active(conn, tid):
+            continue
+        return tid, {
+            "action": action,
+            "flags": list(used),
+            "task_ids": list(task_ids),
+            "caller_pid": os.getpid(),
+            "token": token,
+        }
+    return None
+
+
+def _operator_gate_error(action: str, used: Sequence[str], tid: str, token: str):
+    return OperatorTokenRequiredError(
+        f"refused {action} {' '.join(used)} on {tid}: a run is active on it, "
+        f"and overriding a live run needs the operator token "
+        f"({OPERATOR_TOKEN_ENV}, token {token}). Recorded as a "
+        f"takeover_refused event. An operator presents it inline: "
+        f"{OPERATOR_TOKEN_ENV}=$(cat {operator_token_path()}) "
+        f"hermes kanban {action} {tid} ..."
+    )
 
 
 def enforce_operator_flag_gate(
@@ -5731,44 +5815,120 @@ def enforce_operator_flag_gate(
     action: str,
     *,
     flags: Iterable[str],
-    argv: Optional[Sequence[str]] = None,
 ) -> None:
     """Refuse ``flags`` on any of ``task_ids`` that has an active run, unless
     the caller presents the operator token or owns the card's grant by pid.
 
     Raises :class:`OperatorTokenRequiredError` after appending one
-    ``takeover_refused`` event (caller pid, argv, which flags, token state).
+    ``takeover_refused`` event (caller pid, sanitized request, which flags,
+    token state). This is the fast preflight; the authoritative recheck runs
+    inside each write transaction under :func:`operator_flag_gate_scope`.
     """
-    used = sorted({f for f in (flags or ()) if f})
-    if action in OPERATOR_ONLY_GATED_ACTIONS:
-        used = [f for f in used if f == "--operator"]
-    elif action not in OPERATOR_FLAG_GATED_ACTIONS:
+    used = _gated_flags_for(action, flags)
+    tids = list(dict.fromkeys(str(t) for t in (task_ids or ()) if t))
+    refusal = _operator_gate_refusal(conn, tids, action, used)
+    if refusal is None:
         return
+    tid, payload = refusal
+    with write_txn(conn, allow_nested=True):
+        _append_event(conn, tid, "takeover_refused", payload)
+    raise _operator_gate_error(action, used, tid, payload["token"])
+
+
+# Set by :func:`operator_flag_gate_scope` for one gated CLI mutation: every
+# OUTERMOST write transaction opened inside it re-runs the gate under its write
+# lock, before any write. The preflight above runs on its own connection and
+# commits nothing, so a dispatcher claim landing between the preflight and the
+# handler's mutation would otherwise be closed by a tokenless override
+# (t_920c6b4a, FleetReview c12b9f27d054).
+_PENDING_OPERATOR_GATE: ContextVar[Optional[dict]] = ContextVar(
+    "kanban_pending_operator_gate", default=None
+)
+
+
+@contextlib.contextmanager
+def operator_flag_gate_scope(task_ids: Iterable[str], action: str, *, flags: Iterable[str]):
+    """Hold the operator-flag gate for the duration of one lifecycle handler.
+
+    A refusal inside a write transaction rolls that transaction back; the
+    ``takeover_refused`` event is then written in its own transaction on the
+    way out, so the refusal stays audited.
+    """
+    used = _gated_flags_for(action, flags)
     if not used:
+        yield
         return
-    token = _operator_token_state()
-    if token == "ok":
+    pending = {
+        "task_ids": list(dict.fromkeys(str(t) for t in (task_ids or ()) if t)),
+        "action": action,
+        "flags": used,
+        "refused": [],
+    }
+    token = _PENDING_OPERATOR_GATE.set(pending)
+    try:
+        yield
+    finally:
+        _PENDING_OPERATOR_GATE.reset(token)
+        for tid, payload in pending["refused"]:
+            try:
+                with connect_closing() as conn:
+                    with write_txn(conn):
+                        _append_event(conn, tid, "takeover_refused", payload)
+            except Exception as exc:
+                # The refusal itself stands (the mutation rolled back); only
+                # its audit row is missing. Never swallow that silently
+                # (t_920c6b4a, FleetReview 667f8318dd40).
+                _log.warning(
+                    "takeover_refused audit NOT recorded for %s (%s): %s",
+                    tid, payload.get("action"), exc,
+                )
+                try:
+                    print(
+                        f"kanban: warning: the takeover_refused event for {tid} "
+                        f"could not be recorded ({exc})",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+
+
+def _recheck_pending_operator_gate(conn: sqlite3.Connection) -> None:
+    """Re-run the pending gate. Runs on EVERY outermost write txn in the scope,
+    including after an earlier refusal: a caller that catches the refusal and
+    goes on to another write is gated again, never waved through
+    (t_920c6b4a, FleetReview d292b198bb11)."""
+    pending = _PENDING_OPERATOR_GATE.get()
+    if pending is None:
         return
-    for tid in dict.fromkeys(str(t) for t in (task_ids or ()) if t):
-        if _caller_holds_grant_for(tid) or not task_run_is_active(conn, tid):
-            continue
-        payload = {
-            "action": action,
-            "flags": used,
-            "caller_pid": os.getpid(),
-            "argv": list(argv if argv is not None else sys.argv),
-            "token": token,
-        }
-        with write_txn(conn, allow_nested=True):
-            _append_event(conn, tid, "takeover_refused", payload)
-        raise OperatorTokenRequiredError(
-            f"refused {action} {' '.join(used)} on {tid}: a run is active on it, "
-            f"and overriding a live run needs the operator token "
-            f"({OPERATOR_TOKEN_ENV}, token {token}). Recorded as a "
-            f"takeover_refused event. An operator presents it inline: "
-            f"{OPERATOR_TOKEN_ENV}=$(cat {operator_token_path()}) "
-            f"hermes kanban {action} {tid} ..."
-        )
+    refusal = _operator_gate_refusal(
+        conn, pending["task_ids"], pending["action"], pending["flags"]
+    )
+    if refusal is None:
+        return
+    pending["refused"].append(refusal)
+    tid, payload = refusal
+    raise _operator_gate_error(pending["action"], pending["flags"], tid, payload["token"])
+
+
+def authorize_pending_operator_gate(conn: sqlite3.Connection) -> None:
+    """Run the pending gate under the write lock NOW, for callers about to take
+    a side effect no transaction can roll back (signalling a worker). A no-op
+    outside :func:`operator_flag_gate_scope`."""
+    if _PENDING_OPERATOR_GATE.get() is None:
+        return
+    if getattr(conn, "in_transaction", False):
+        _recheck_pending_operator_gate(conn)
+        return
+    # A bare IMMEDIATE txn, not ``write_txn``: that would also consume the
+    # pending home-session recheck, which must stay with the real mutation.
+    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    try:
+        _recheck_pending_operator_gate(conn)
+    finally:
+        try:
+            conn.execute("ROLLBACK")  # nothing was written
+        except sqlite3.OperationalError:
+            pass
 
 
 def check_home_session(
@@ -9801,6 +9961,11 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    # ``reclaim --operator`` / ``reassign --reclaim --takeover``: authorize
+    # under the write lock BEFORE the termination signal. The recheck inside
+    # the later release txn cannot un-signal a worker the dispatcher claimed
+    # after the preflight (t_920c6b4a, FleetReview 946120c1ae67).
+    authorize_pending_operator_gate(conn)
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
         owner_window=_worker_owner_window(conn, task_id, row["worker_pid"]),
@@ -9816,7 +9981,7 @@ def reclaim_task(
         # operator token (or the card's own dispatcher grant). A bare
         # ``--operator`` string is not authority (FleetReview on #1404).
         token = _operator_token_state()
-        if token == "ok" or _caller_holds_grant_for(task_id):
+        if token == "ok" or _caller_holds_grant_for(conn, task_id):
             override_ok = True
         else:
             termination["operator_override_refused"] = f"token_{token}"
