@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -569,10 +570,14 @@ class CaptureRouter:
         # Publish atomically: route_turn treats an existing <turn_id>.md as a completed stage,
         # so a crash mid-write must never leave a truncated file at the final path. The temp
         # name does not end in .md, so neither that lookup nor an inbox sweep can pick it up.
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.{os.getpid()}.tmp"
+        # mkstemp gives every write its own temp file: two same-process writers staging the
+        # same path must not share (and truncate/rename) one PID-derived temp name.
+        dirname = os.path.dirname(path)
+        os.makedirs(dirname, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dirname, prefix=os.path.basename(path) + ".", suffix=".tmp")
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                os.fchmod(fh.fileno(), 0o644)  # mkstemp is 0600; keep the mode open()+umask gave
                 fh.write(content)
                 fh.flush()
                 os.fsync(fh.fileno())
