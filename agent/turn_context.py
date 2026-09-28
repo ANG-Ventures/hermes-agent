@@ -617,6 +617,19 @@ def build_turn_context(
     except Exception:
         logger.debug("Could not reset quota-gate turn state", exc_info=True)
 
+    # Generate unique task_id if not provided to isolate VMs between tasks.
+    # Bound BEFORE the primary restore: its recovery / restore_refused ledger
+    # rows read ``_current_turn_id`` and belong to THIS turn (C7 k73).
+    effective_task_id = task_id or str(uuid.uuid4())
+    agent._current_task_id = effective_task_id
+    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
+    if not turn_id:
+        turn_id = (
+            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        )
+    agent._relay_pending_turn_id = None
+    agent._current_turn_id = turn_id
+
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
 
@@ -689,16 +702,6 @@ def build_turn_context(
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
     agent._persist_user_message_platform_id = persist_user_platform_id
-    # Generate unique task_id if not provided to isolate VMs between tasks.
-    effective_task_id = task_id or str(uuid.uuid4())
-    agent._current_task_id = effective_task_id
-    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
-    if not turn_id:
-        turn_id = (
-            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
-    agent._relay_pending_turn_id = None
-    agent._current_turn_id = turn_id
     agent._blackbox_compaction = {"idle_compaction_fired": False}
     agent._current_api_request_id = ""
     # Publish this agent's (provider, model) so cronjob(action="create") can

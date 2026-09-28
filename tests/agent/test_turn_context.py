@@ -299,6 +299,19 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_primary_restore_runs_under_the_new_turn_id():
+    """Recovery/restore_refused ledger rows written by the restore read
+    ``_current_turn_id``; it must already be THIS turn's id (C7 k73)."""
+    agent = _FakeAgent()
+    agent._current_turn_id = "sess-1:previous-task:deadbeef"
+    agent._relay_pending_turn_id = "sess-1:this-task:cafef00d"
+    seen = []
+    agent._restore_primary_runtime = lambda: seen.append(agent._current_turn_id)
+    _build(agent)
+    assert seen == ["sess-1:this-task:cafef00d"]
+    assert agent._current_turn_id == "sess-1:this-task:cafef00d"
+
+
 
 
 

@@ -321,7 +321,11 @@ def test_restore_never_rewrites_an_existing_file(home, monkeypatch, damage):
         (hooks / "other.py").unlink()
     else:
         edited.write_text("raise ImportError('work in progress')\n")
-    before = {f: f.read_bytes() for f in (edited, untracked)}
+        # The present entry hook carries a live edit too; it must survive (C7 k130).
+        entry = hooks / "policy.py"
+        entry.write_text(entry.read_text() + "# UNCOMMITTED ENTRY EDIT\n")
+    before = {f: f.read_bytes() for f in (edited, untracked, hooks / "policy.py") if f.exists()}
+    assert (hooks / "policy.py" in before) == (damage == "present_but_broken")
     pages = []
     monkeypatch.setattr(shell_hooks, "_page_missing_hook", lambda p, *a: pages.append((p, a)) or True)
     result = shell_hooks._make_callback(_spec(hooks / "policy.py", "restore_then_fail_closed"))(tool_name="terminal")
@@ -378,3 +382,18 @@ def test_present_hook_output_text_never_classifies_as_missing(home, monkeypatch,
     assert cb(tool_name="terminal", args={"command": "rm -rf /tmp/x"}) == {
         "action": "block", "message": "POLICY: rm -rf is forbidden",
     }
+
+
+def test_publish_absent_syncs_mode_before_linking(tmp_path, monkeypatch):
+    """The mode change must be durable before the temp file is linked into place."""
+    events = []
+    real_fsync, real_chmod, real_link = shell_hooks_missing.os.fsync, shell_hooks_missing.os.chmod, shell_hooks_missing.os.link
+    monkeypatch.setattr(shell_hooks_missing.os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(shell_hooks_missing.os, "chmod", lambda p, m, **kw: (events.append("chmod"), real_chmod(p, m, **kw))[1])
+    monkeypatch.delattr(shell_hooks_missing.os, "fchmod", raising=False)  # Windows before 3.13 has no os.fchmod
+    monkeypatch.setattr(shell_hooks_missing.os, "link", lambda a, b: (events.append("link"), real_link(a, b))[1])
+    dest = tmp_path / "hook.sh"
+    assert shell_hooks_missing._publish_absent(dest, b"#!/bin/sh\n", 0o755)
+    assert dest.read_bytes() == b"#!/bin/sh\n" and (dest.stat().st_mode & 0o777) == 0o755
+    assert "chmod" in events and "link" in events
+    assert events.index("chmod") < max(i for i, e in enumerate(events) if e == "fsync") < events.index("link")
