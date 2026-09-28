@@ -297,8 +297,11 @@ def _noqa_exempt(line: str) -> bool:
 
 def _iter_loop_calls(fn: ast.AsyncFunctionDef):
     """Yield every ast.Call lexically in ``fn``'s body, not descending into
-    nested ``def``/``lambda`` bodies, and skipping the argument subtrees of
-    offload calls (``asyncio.to_thread`` / ``run_in_executor``).
+    nested ``def``/``lambda`` bodies. Offload calls (``asyncio.to_thread`` /
+    ``run_in_executor``) are not themselves offenders, but their argument
+    subtrees ARE walked: ``to_thread(f, os.listdir(p))`` evaluates
+    ``os.listdir(p)`` eagerly on the loop (C5 #35). Only a callable passed by
+    reference (``to_thread(os.listdir, p)``) runs off-loop.
 
     Also skips the callee of an ``await`` expression: ``await x.resolve(...)``
     is an awaited coroutine, not ``pathlib.Path.resolve`` (2026-09-20 -- the
@@ -320,12 +323,7 @@ def _iter_loop_calls(fn: ast.AsyncFunctionDef):
             # attribute its body to the enclosing function.
             continue
         if isinstance(node, ast.Call):
-            if _is_offload_call(node):
-                # The callee expression may still be interesting, but every
-                # argument subtree is running off-loop by construction.
-                stack.append(node.func)
-                continue
-            if id(node) not in awaited:
+            if id(node) not in awaited and not _is_offload_call(node):
                 yield node
         stack.extend(ast.iter_child_nodes(node))
 
@@ -530,6 +528,19 @@ def test_arm_offender_wrapped_in_to_thread_is_green(tmp_path):
     assert offenders == [], offenders
     assert count == 1
 
+
+
+def test_arm_eager_offload_argument_is_red(tmp_path):
+    """RED arm (C5 #35): a sync call used as an offload ARGUMENT runs on the
+    loop before the offload starts; only a by-reference callable is exempt."""
+    src = (
+        "import asyncio\nimport subprocess\n\n"
+        "async def connect():\n"
+        "    await asyncio.to_thread(print, subprocess.run(['true']))\n"
+    )
+    root = _write(tmp_path, "m.py", src)
+    offenders, _ = find_sync_calls_in_async_defs(root)
+    assert offenders == ["m.py:5 connect -> subprocess.run"], offenders
 
 def test_arm_nested_def_and_lambda_are_not_attributed_to_the_coroutine(tmp_path):
     src = (
