@@ -281,6 +281,12 @@ def test_I1_seen_mark_happens_before_query(mod, home, monkeypatch):
         calls.append(ids); raise RuntimeError("db down")
     monkeypatch.setattr(mod, "query_cards", boom)
     assert mod.on_pre_llm_call(session_id=SID) is None
+    # The exact-home read runs on a background thread that can outlive the
+    # turn; let every stage thread finish before counting, so a late append
+    # cannot land after the capture and fake a retry.
+    for t in threading.enumerate():
+        if t.name.startswith("kanban-home-cards-"):
+            t.join(10)
     first_turn = len(calls)  # fallback-home read + exact-home read
     assert 1 <= first_turn <= 2
     assert mod.on_pre_llm_call(session_id=SID) is None

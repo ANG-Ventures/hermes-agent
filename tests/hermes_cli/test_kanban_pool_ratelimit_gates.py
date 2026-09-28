@@ -107,14 +107,37 @@ def _urls(apr_url=None, bpr_url=None) -> dict:
     return {"claude-apr": apr_url or "", "claude-bpr": bpr_url or ""}
 
 
+_DEAD_SOCKETS: list = []
+
+
 def _dead_url() -> str:
-    """A loopback URL nothing listens on (bind, read the port, close)."""
+    """A loopback URL that never answers HTTP: every connection is accepted
+    and closed at once, so a probe fails fast.
+
+    The port stays OWNED for the life of the module. Binding, reading the
+    port and closing the socket (the old shape) handed the port back to the
+    OS before the probe ran, so another process could take it and answer.
+    (A bound socket that never listen()s is no substitute: on Darwin the
+    connect hangs to the probe timeout instead of being refused.)
+    """
     import socket
+    import threading
 
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
+    s.listen(16)
+    _DEAD_SOCKETS.append(s)
+
+    def _slam() -> None:
+        while True:
+            try:
+                conn, _ = s.accept()
+            except OSError:
+                return
+            conn.close()
+
+    threading.Thread(target=_slam, daemon=True).start()
     port = s.getsockname()[1]
-    s.close()
     return f"http://127.0.0.1:{port}/health"
 
 
