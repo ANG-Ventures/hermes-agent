@@ -167,3 +167,22 @@ def test_live_probes_share_one_time_budget(tmp_path, monkeypatch):
     monkeypatch.setattr(survivor, "_reachable_from_live", hung)
     assert survivor._recorded_base(ws, recorded, published, base) == base
     assert budgets and sum(budgets) <= survivor._LIVE_BASE_TIMEOUT
+
+
+def test_live_probe_matches_sha256_object_format(tmp_path):
+    # FleetReview P1 on #1449: a SHA-1 probe cannot hold a 64-hex base.
+    import hermes_cli.kanban_survivor as survivor
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "--object-format=sha256", str(remote)],
+                   check=True)
+    ws = tmp_path / "ws"
+    subprocess.run(["git", "init", "-q", "-b", "main", "--object-format=sha256", str(ws)],
+                   check=True)
+    git(ws, "config", "user.name", "Test")
+    git(ws, "config", "user.email", "test@example.invalid")
+    recorded = commit(ws, "a.txt", "a\n")
+    commit(ws, "b.txt", "b\n")
+    assert len(recorded) == 64
+    git(ws, "remote", "add", "origin", str(remote))
+    git(ws, "push", "-q", "origin", "HEAD:refs/heads/trunk")
+    assert survivor._reachable_from_live(ws, "origin", "trunk", recorded) is True

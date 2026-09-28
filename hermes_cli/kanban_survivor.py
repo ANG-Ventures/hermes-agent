@@ -1606,13 +1606,17 @@ def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOU
     objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects",
                    check=False)
     url = _git(repo, "remote", "get-url", remote, check=False)
-    if objects.returncode or url.returncode:
+    # The probe must share the workspace's object format: a default (SHA-1)
+    # probe rejects a 64-hex SHA-256 base at `update-ref`.
+    fmt = _git(repo, "rev-parse", "--show-object-format", check=False)
+    if objects.returncode or url.returncode or fmt.returncode:
         return False
     env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.decode().strip())
     with tempfile.TemporaryDirectory(prefix="kanban-base-") as tmp:
         probe = Path(tmp) / "probe.git"
         try:
-            _git(repo, "init", "-q", "--bare", str(probe))
+            _git(repo, "init", "-q", "--bare",
+                 f"--object-format={fmt.stdout.decode().strip()}", str(probe))
             if _git(probe, "update-ref", "refs/heads/recorded", sha, env=env,
                     check=False).returncode:
                 return False
