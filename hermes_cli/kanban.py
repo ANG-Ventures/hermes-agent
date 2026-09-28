@@ -1916,6 +1916,20 @@ def kanban_command(args: argparse.Namespace) -> int:
         if not handler:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
+        gated_flags = [
+            flag for flag, dest in (("--takeover", "foreign_ok"), ("--operator", "operator"))
+            if getattr(args, dest, None)
+        ]
+        if gated_flags and action in kb.OPERATOR_FLAG_GATED_ACTIONS:
+            try:
+                with kb.connect_closing() as gate_conn:
+                    kb.enforce_operator_flag_gate(
+                        gate_conn, _lifecycle_target_ids(args), action,
+                        flags=gated_flags, argv=sys.argv,
+                    )
+            except kb.OperatorTokenRequiredError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
         actor_scope = contextlib.nullcontext()
         caller_sid = _caller_session_id() if action in _HOME_GUARDED_ACTIONS else None
         if action in _HOME_GUARDED_ACTIONS and not caller_sid:
