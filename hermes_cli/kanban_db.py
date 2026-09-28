@@ -9271,6 +9271,86 @@ def review_claim_run_for_session(
     return run_id if payload.get("session_ref") == session_ref else None
 
 
+@_home_session_guarded("request-changes")
+def release_unbound_review_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> bool:
+    """Return an ORPHANED human-lane review claim to ``review``.
+
+    A review claim that recorded no ``session_ref`` can never be used by
+    :func:`review_claim_run_for_session`, so the card sits in ``running``
+    under a claim nobody can send back until the TTL lapses (t_0485b3ff).
+    Released only when it is provably orphaned: the active run's ``claimed``
+    event is a review claim (``source_status=review``) with no session bound,
+    no worker pid is attached, and the claimer process is gone (or is this
+    very process). Returns True when the card went back to ``review``.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None or row["status"] != "running"
+        or row["current_run_id"] is None or row["worker_pid"] is not None
+    ):
+        return False
+    run_id = int(row["current_run_id"])
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("source_status") != "review"
+        or payload.get("session_ref")
+    ):
+        return False
+    lock = row["claim_lock"] or ""
+    host, _, pid_text = lock.rpartition(":")
+    try:
+        lock_pid = int(pid_text)
+    except ValueError:
+        lock_pid = None
+    if host and host == _claimer_id().rpartition(":")[0] and lock_pid is not None:
+        if lock_pid != os.getpid() and _pid_alive(lock_pid):
+            return False  # a live sessionless claimer may still be reviewing
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock IS ?",
+            (task_id, run_id, row["claim_lock"]),
+        )
+        if cur.rowcount != 1:
+            return False
+        closed = _end_run(
+            conn, task_id, outcome="reclaimed", status="reclaimed",
+            error=f"unbound_review_claim_released: {reason}",
+        )
+        _append_event(
+            conn, task_id, "reclaimed",
+            {
+                "manual": True,
+                "reason": reason,
+                "prev_lock": row["claim_lock"],
+                "retry_status": "review",
+                "unbound_review_claim": True,
+            },
+            run_id=closed,
+        )
+    return True
+
+
 def _retry_status_for_run(
     conn: sqlite3.Connection,
     task_id: str,
