@@ -238,8 +238,11 @@ def identity_absent(repo: str, ref: str, run_id: int | None) -> CheckResult:
                 scanned["log_files"] += 1
                 if CONTROLLER_IDENTITY.search(data.decode("utf-8", "replace")):
                     scan_hits.append(f"log:{member}")
-            arts = api(f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")["artifacts"]
-            for art in (a for a in arts if a["name"].startswith("ci-overflow-")):
+            listing = api(f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")
+            arts = listing["artifacts"]
+            if listing["total_count"] != len(arts):
+                raise ValueError("incomplete artifacts pagination")
+            for art in arts:  # every artifact: the identity can leak into any of them
                 for member, data in _zip_members(_api_bytes(f"repos/{repo}/actions/artifacts/{art['id']}/zip")):
                     scanned["artifact_files"] += 1
                     if CONTROLLER_IDENTITY.search(data.decode("utf-8", "replace")):
@@ -248,6 +251,8 @@ def identity_absent(repo: str, ref: str, run_id: int | None) -> CheckResult:
             if not scanned["log_files"]:
                 return check(name, "UNVERIFIABLE", evidence, "run logs empty: scan had no teeth")
         bad = hits or scan_hits or any(secret_refs.values()) or new_secrets or env_secrets or stores["org"]
+        if not bad and not run_id:
+            return check(name, "UNVERIFIABLE", evidence, "no run scanned: supply --pr-ci-run")
         return check(name, "BLOCK" if bad else "PASS", evidence, "controller identity reachable from Actions" if bad else "")
     except (RuntimeError, ValueError, KeyError) as exc:
         return check(name, "UNVERIFIABLE", {}, str(exc))

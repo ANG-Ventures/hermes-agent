@@ -754,6 +754,19 @@ def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str
     return None if elig.warm_eligible else "refuse"
 
 
+def _compacted_since_fallback(state: StickyState, live_session_id: Optional[str]) -> bool:
+    """§4.3 compaction input: an in-place compaction marker newer than the last
+    fallback call, or a session_id rotated since it (rotating compaction)."""
+    last_fb = state.last_fallback_call_epoch
+    if last_fb is None:
+        last_fb = state.entered_at
+    lc = state.last_compaction_epoch
+    if lc is not None and last_fb is not None and lc > last_fb:
+        return True
+    return bool(live_session_id and state.last_fallback_session_id
+                and live_session_id != state.last_fallback_session_id)
+
+
 def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = False,
                     live_session_id: Optional[str] = None,
                     primary_provider: str = "",
@@ -786,6 +799,13 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
     verdict: Optional[str] = None
     warm: Optional[Dict[str, Any]] = None
     box_full = False
+    # A compaction since the last fallback call rewrote the conversation, so the
+    # primary seat's cached copy no longer matches what will be sent: a return now
+    # is cold whatever /eligibility says about the seat. `compaction` therefore
+    # outranks `warm_seat` (t_2b064101 rig, 2026-09-27: branch=warm_seat with
+    # cache_read 2449/8399 on the return call). The probe still runs below so the
+    # ledger keeps the warm/box snapshot.
+    compacted = _compacted_since_fallback(state, live_session_id)
     if probe:
         provider = primary_provider or state.primary_provider
         if eligibility is not None:
@@ -805,7 +825,7 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
             if _box_full(elig, verdict):
                 box_full = True
                 warm = {**(warm or {}), **_box_fields(elig)}
-            if verdict == "return_now" and not box_full:
+            if verdict == "return_now" and not box_full and not compacted:
                 return Decision(True, "warm_seat",
                                 f"warm_seat: warm eligible seat {elig.warm_seat} "
                                 f"(warm_rank=enforce, age {elig.warm_age_s}s < {elig.warm_window_s}s)",
@@ -813,7 +833,7 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         if box_full:
             reasons.append(BOX_FULL_REASON)
             exp = elig.bound_expires_in_s
-        elif verdict != "refuse":
+        elif verdict != "refuse" and not compacted:
             ok, why, exp = _warm_seat(state, now, primary_provider=provider,
                                       eligibility=eligibility, direct_pin_benched=direct_pin_benched)
             if ok:

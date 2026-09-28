@@ -84,6 +84,16 @@ def _getenv(name: str, default: str = "") -> str:
     call site here already relies on.
     """
     val = _get_secret(name, default)
+    if val and val != default:
+        # A credential whose .env line was removed is revoked here too, not
+        # resurrected from the copy the load left in the scope (C3 #1217).
+        try:
+            from hermes_cli.config import dotenv_revoked, load_env
+
+            if not (load_env().get(name) or "").strip() and dotenv_revoked(name, val):
+                return default
+        except Exception:  # noqa: BLE001 - revocation bookkeeping never breaks a read
+            pass
     return val if val is not None else default
 
 

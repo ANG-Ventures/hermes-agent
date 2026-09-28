@@ -875,6 +875,13 @@ def redact_sensitive_json(value, **kwargs):
         out = {}
         for k, v in value.items():
             new_k = redact_sensitive_text(k, **kwargs) if isinstance(k, str) else k
+            if new_k in out:
+                # Two keys masked to the same text (PASS=a / PASS=b -> PASS=***):
+                # suffix instead of silently dropping the earlier value (C3 #1052).
+                n = 2
+                while f"{new_k}#{n}" in out or f"{new_k}#{n}" in value:
+                    n += 1
+                new_k = f"{new_k}#{n}"
             if (
                 key_rule
                 and isinstance(k, str)

@@ -36061,7 +36061,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _pin_state = self._peek_session_state(session_key)
             _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
         if internal:
-            if _eph_pin is not None:
+            # Reuse only a pin rendered under the SAME redaction mode: an
+            # unredacted pin must never serve a turn with redact_pii on (C3 #984).
+            if _eph_pin is not None and _eph_pin[2:3] == (bool(redact_pii),):
                 return _eph_pin[1]
             return build_session_context_prompt(context, redact_pii=redact_pii)
         _eph_key = self._ephemeral_change_key(context, redact_pii)
@@ -36072,6 +36074,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_state(session_key).conversation.ephemeral_pin = (
                 _eph_key,
                 text,
+                bool(redact_pii),
             )
         return text
 

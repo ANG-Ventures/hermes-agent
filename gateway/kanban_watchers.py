@@ -345,7 +345,10 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     try:
         from hermes_state import SessionDB
 
-        db = SessionDB()
+        # Read-only: a writable SessionDB runs schema init and waits up to
+        # _WRITE_PATIENCE_S on a locked state.db for a pure lookup, once per
+        # subscription per tick, after the cursor has advanced (FleetReview #987).
+        db = SessionDB(read_only=True)
         try:
             row = db.get_session(sid)
         finally:

@@ -12,17 +12,18 @@ import sys
 OUT = pathlib.Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
 AGENT = "ANG-Ventures/hermes-agent"
-HOME = "ANG-Ventures/hermes-home"
 QUEUE_QUERY = ('query{repository(owner:"ANG-Ventures",name:"hermes-agent"){mergeQueue(branch:"main")'
                '{entries(first:100){pageInfo{hasNextPage} nodes{headCommit{oid} pullRequest{number headRefOid}}}}}}')
 
 RUN_FIELDS = "{id,name,event,head_branch,head_sha,status,conclusion,created_at}"
 CAPTURES = {
     # combined-status endpoint the relay calls, on a head that carries a real
-    # fleet/attribution=success posted by fleet-merge.sh (hermes-home#455).
-    "status_attributed.json": ["gh", "api", f"repos/{HOME}/commits/c4e598efd751b623bb00f2d070338a2e48d15ad5/status?per_page=100"],
+    # fleet/attribution=success posted by fleet-merge.sh (hermes-agent#1350).
+    # Captured from THIS public repo only: a private repo's body would publish
+    # its name, description and PR URLs here.
+    "status_attributed.json": ["gh", "api", f"repos/{AGENT}/commits/6438791d6664e98a38e0456af2f49bb735fee9b3/status?per_page=100"],
     # list endpoint for the same head (shape reference: status objects carry no sha).
-    "statuses_attributed.json": ["gh", "api", f"repos/{HOME}/commits/c4e598efd751b623bb00f2d070338a2e48d15ad5/statuses?per_page=100"],
+    "statuses_attributed.json": ["gh", "api", f"repos/{AGENT}/commits/6438791d6664e98a38e0456af2f49bb735fee9b3/statuses?per_page=100"],
     # hermes-agent#955 head, queued without fleet/attribution.
     "status_unattributed.json": ["gh", "api", f"repos/{AGENT}/commits/a9809aa3709262449095dab7821f54b1628403d3/status?per_page=100"],
     "graphql_queue_955.json": ["gh", "api", "graphql", "-f", "query=" + QUEUE_QUERY],
