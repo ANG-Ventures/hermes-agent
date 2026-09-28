@@ -91,8 +91,10 @@ def test_turn_calls_carry_the_route_that_served_each_call(captured_turn_usage):
 
     def _create(*args, **kwargs):
         resp = next(responses)
-        if agent.session_api_calls >= 1:
-            # Mid-turn route change (fallback / model switch) before call 2.
+        if agent.session_api_calls == 0:
+            # Mid-turn route change (fallback / model switch) landing while
+            # call 1 is in flight: call 1 was sent on gpt-4o, call 2 is built
+            # and sent on gpt-4o-mini.
             agent.model = "gpt-4o-mini"
         return resp
 
@@ -101,6 +103,11 @@ def test_turn_calls_carry_the_route_that_served_each_call(captured_turn_usage):
 
     calls = captured_turn_usage["turn_usage"]["calls"]
     assert [c.get("model") for c in calls] == ["gpt-4o", "gpt-4o-mini"]
+    # The route recorded for each call is the route its REQUEST was sent on.
+    requested = [
+        c.kwargs.get("model") for c in agent.client.chat.completions.create.call_args_list
+    ]
+    assert [c.get("model") for c in calls] == requested
     assert [c.get("provider") for c in calls] == ["openai", "openai"]
     assert all("base_url" in c for c in calls)
 
@@ -111,3 +118,45 @@ def test_turn_calls_carry_the_route_that_served_each_call(captured_turn_usage):
     assert status != "unknown"
     assert expected != pytest.approx(wrong)
     assert total == pytest.approx(expected)
+
+
+def test_route_change_during_the_call_does_not_restamp_that_call(captured_turn_usage, monkeypatch):
+    """FleetReview 65e315f38776: a route change WHILE a request is in flight
+    (``/model`` or fallback from another thread) must not re-stamp the call that
+    was already sent. Every post-call reader -- the Blackbox ``_turn_calls``
+    entry, the session cost estimate, the state.db delta and the chokepoint
+    ``turn_api_calls`` row -- must price at the route the request went out on.
+    """
+    import plugins.blackbox as blackbox
+
+    ledger = []
+    monkeypatch.setattr(
+        blackbox, "record_api_call",
+        lambda **kw: ledger.append((kw.get("provider"), kw.get("model"))),
+    )
+    agent = _make_agent()
+    responses = iter([_response(tool_calls=[_tool_call()], content=None), _response()])
+
+    def _create(*args, **kwargs):
+        # Switch route mid-flight on EVERY call: the request carrying
+        # kwargs["model"] is already on the wire.
+        agent.model = "gpt-4o-mini" if kwargs.get("model") == "gpt-4o" else "gpt-4o"
+        agent.provider = "openrouter"
+        return next(responses)
+
+    agent.client.chat.completions.create.side_effect = _create
+    agent.run_conversation("hello")
+
+    requested = [
+        c.kwargs.get("model") for c in agent.client.chat.completions.create.call_args_list
+    ]
+    assert requested == ["gpt-4o", "gpt-4o-mini"]
+    calls = captured_turn_usage["turn_usage"]["calls"]
+    assert [c.get("model") for c in calls] == requested
+    assert [c.get("provider") for c in calls] == ["openai", "openrouter"]
+    assert [m for _p, m in ledger] == requested
+    assert [p for p, _m in ledger] == ["openai", "openrouter"]
+
+    # Session cost is the sum of each call at its OWN request route.
+    expected = _price("gpt-4o", "openai", calls[0]) + _price("gpt-4o-mini", "openrouter", calls[1])
+    assert agent.session_estimated_cost_usd == pytest.approx(expected)

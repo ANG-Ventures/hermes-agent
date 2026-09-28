@@ -247,11 +247,19 @@ def _set_process_title() -> None:
          changes lldb/top but not ``ps aux``).
       4. No-op on Windows (the .exe name is already ``hermes.exe``).
     """
+    # A dispatcher worker keeps its task id in the title: setproctitle wipes
+    # argv and environ, and ``reclaim --operator`` proves a worker gone by
+    # scanning the process table for that id. Must match
+    # ``kanban_db.KANBAN_WORKER_PROCTITLE`` (not imported: startup hot path).
+    title = "hermes"
+    kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if kanban_task:
+        title = f"hermes kanban-worker {kanban_task}"
     # Strategy 1: setproctitle (best — works on macOS, Linux, BSD)
     try:
         import setproctitle  # type: ignore[import-untyped]
 
-        setproctitle.setproctitle("hermes")
+        setproctitle.setproctitle(title)
         return
     except ImportError:
         pass
