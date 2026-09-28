@@ -297,6 +297,19 @@ def test_non_k3_membership_model_stays_unpriced():
     assert cost.status == "unknown"
 
 
+@pytest.mark.parametrize("model", ["k3", "k3-256k", "kimi-k3", "kimi-for-coding"])
+def test_kimi_ids_share_the_one_vendor_map(model):
+    from agent.usage_pricing import _infer_vendor_from_model
+
+    assert _infer_vendor_from_model(model) == "moonshotai"
+
+
+def test_non_kimi_model_on_kimi_lane_is_not_routed_to_moonshot():
+    from agent.usage_pricing import resolve_billing_route
+
+    assert resolve_billing_route("gpt-5.5", provider="kimi-code").provider != "moonshotai"
+
+
 def test_membership_402_is_billing_not_auth_and_falls_back():
     from agent.error_classifier import FailoverReason, classify_api_error
 

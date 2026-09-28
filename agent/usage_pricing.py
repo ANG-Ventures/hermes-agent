@@ -205,6 +205,10 @@ NOTIONAL_OPENROUTER_PROVIDERS = frozenset({
 # (kimi-k3) all normalize to that one vendor model. Other membership ids
 # (kimi-for-coding*, a different model family) stay unpriced rather than
 # borrowing K3 rates.
+# Vendor membership is decided by the shared _infer_vendor_from_model(), never
+# by the provider name alone. kimi-code is now an alias of the multi-vendor
+# ``cpa`` proxy lane and stays here only for rows recorded before the rename;
+# ``cpa`` itself dispatches per served model via the same function (t_d59c7936).
 NOTIONAL_MOONSHOT_PROVIDERS = frozenset({
     "kimi-oauth",
     "kimi-code",
@@ -2027,7 +2031,10 @@ def resolve_billing_route(
     # ...) but not every "-codex" variant (e.g. gpt-5.5-codex is absent while
     # gpt-5.5 is present), so _normalize_codex_model_name() strips a trailing
     # "-codex" as a fallback when the exact id is missing.
-    if provider_name in NOTIONAL_MOONSHOT_PROVIDERS:
+    if (
+        provider_name in NOTIONAL_MOONSHOT_PROVIDERS
+        and _infer_vendor_from_model(model.split("/")[-1]) == "moonshotai"
+    ):
         return BillingRoute(
             provider="moonshotai",
             model=_normalize_kimi_membership_model(model),
@@ -2181,6 +2188,11 @@ def _infer_vendor_from_model(model: str) -> Optional[str]:
         return "google"
     if name.startswith("grok-"):
         return "xai"
+    # Kimi / Moonshot: public ids (kimi-k3, kimi-for-coding) and the membership
+    # ids Kimi Code serves (k3, k3-256k). The ONE model->vendor map shared by the
+    # native kimi-oauth lane and the multi-vendor cpa proxy lane (t_d59c7936).
+    if name.startswith("kimi-") or name == "k3" or name.startswith("k3-"):
+        return "moonshotai"
     return None
 
 
