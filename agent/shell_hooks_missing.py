@@ -123,8 +123,8 @@ def _publish_absent(dest: Path, data: bytes, mode: int) -> bool:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
+            os.fchmod(fh.fileno(), mode)  # before fsync: the mode is durable before the link publishes it
             os.fsync(fh.fileno())
-            os.fchmod(fh.fileno(), mode)
         try:
             os.link(tmp, dest)
         except FileExistsError:

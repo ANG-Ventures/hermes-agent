@@ -382,3 +382,17 @@ def test_present_hook_output_text_never_classifies_as_missing(home, monkeypatch,
     assert cb(tool_name="terminal", args={"command": "rm -rf /tmp/x"}) == {
         "action": "block", "message": "POLICY: rm -rf is forbidden",
     }
+
+
+def test_publish_absent_syncs_mode_before_linking(tmp_path, monkeypatch):
+    """The mode change must be durable before the temp file is linked into place."""
+    events = []
+    real_fsync, real_fchmod, real_link = shell_hooks_missing.os.fsync, shell_hooks_missing.os.fchmod, shell_hooks_missing.os.link
+    monkeypatch.setattr(shell_hooks_missing.os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(shell_hooks_missing.os, "fchmod", lambda fd, m: (events.append("fchmod"), real_fchmod(fd, m))[1])
+    monkeypatch.setattr(shell_hooks_missing.os, "link", lambda a, b: (events.append("link"), real_link(a, b))[1])
+    dest = tmp_path / "hook.sh"
+    assert shell_hooks_missing._publish_absent(dest, b"#!/bin/sh\n", 0o755)
+    assert dest.read_bytes() == b"#!/bin/sh\n" and (dest.stat().st_mode & 0o777) == 0o755
+    assert "fchmod" in events and "link" in events
+    assert events.index("fchmod") < max(i for i, e in enumerate(events) if e == "fsync") < events.index("link")
