@@ -889,3 +889,84 @@ class TestPrivilegedIntentsRequiredFatal:
         assert "discord.com/developers/applications" in (adapter.fatal_error_message or "")
         assert adapter._bot_task is None
 
+
+
+@pytest.mark.asyncio
+async def test_cancelled_disconnect_mid_flush_still_closes_client(monkeypatch):
+    """C5 #31 (PR #967): a cancel during a shutdown flush must still cancel the
+    bot task and close the client, then propagate."""
+    import threading
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow_flush(**_kw):
+        entered.set()
+        release.wait(5)
+
+    flushed = []
+
+    def slow_flush_recorded(**_kw):
+        slow_flush()
+        flushed.append("recovery")
+
+    adapter._restart_recovery = SimpleNamespace(flush=slow_flush_recorded)
+    adapter._nonconversational_messages = SimpleNamespace(flush=lambda: flushed.append("noncon"))
+    adapter._dead_channels = SimpleNamespace(flush=lambda: flushed.append("dead"))
+    zombie = asyncio.create_task(asyncio.Event().wait())
+    adapter._bot_task = zombie
+    client = AsyncMock()
+    adapter._client = client
+    adapter._post_connect_task = None
+    adapter._voice_clients = {}
+    adapter._running = True
+    adapter._ready_event = asyncio.Event()
+
+    task = asyncio.create_task(adapter.disconnect())
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    client.close.assert_awaited_once()
+    assert zombie.cancelled() and adapter._client is None
+    # The in-flight flush finished and the remaining flushes still ran.
+    assert flushed == ["recovery", "noncon", "dead"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_release_sync_lock_under_a_live_state_write(tmp_path, monkeypatch):
+    """C5 #30 (PR #967): cancelling post-connect init while the off-loop
+    state write runs must keep _post_connect_sync_lock until that write lands."""
+    import threading
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter._client = SimpleNamespace(
+        tree=SimpleNamespace(get_commands=lambda: []), application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+    monkeypatch.setattr(adapter, "_get_discord_command_sync_policy", lambda: "safe")
+    monkeypatch.setattr(adapter, "_command_sync_skip_reason", lambda *a, **k: None)
+    release, entered, wrote = threading.Event(), threading.Event(), []
+
+    def slow_attempt(app_id, fingerprint):
+        entered.set()
+        release.wait(5)
+        wrote.append(fingerprint)
+
+    monkeypatch.setattr(adapter, "_record_command_sync_attempt", slow_attempt)
+    task = asyncio.create_task(adapter._run_post_connect_initialization())
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert adapter._post_connect_sync_lock.locked(), "lock released under a live write"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert wrote and not adapter._post_connect_sync_lock.locked()

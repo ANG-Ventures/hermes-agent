@@ -1252,3 +1252,68 @@ def test_backfill_unhomed_stamp_and_comment_are_atomic(kanban_home, monkeypatch)
         monkeypatch.setattr(kb, "add_comment", real_add_comment)
         assert tid in kb.backfill_unhomed(conn)
         assert kb.UNHOMED_BACKFILL_COMMENT in _comments(conn, tid)
+
+
+def test_takeover_audit_is_in_the_mutators_txn(kanban_home, monkeypatch):
+    """C5 #23 (PR #951): the takeover event + comment commit with the foreign
+    mutation, so a failed audit rolls the mutation back (never an unaudited
+    foreign mutation on disk)."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+
+        def boom(*a, **k):
+            raise RuntimeError("comment insert failed")
+
+        monkeypatch.setattr(kb, "add_comment", boom)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="home session is gone"):
+            with pytest.raises(RuntimeError):
+                kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "takeover" not in kinds
+
+
+def test_parent_rehomed_before_child_insert_is_the_childs_home(kanban_home, monkeypatch):
+    """C5 #44 (PR #987): the parent is re-homed after create_task's first birth
+    resolution; the child must be born on the parent's CURRENT home."""
+    with kb.connect_closing() as conn:
+        parent = _card(conn, blocked=False)
+        real = kb._resolve_birth_session
+        calls = []
+
+        def racing(c, *a, **k):
+            out = real(c, *a, **k)
+            calls.append(out)
+            if len(calls) == 1:
+                with kb.connect_closing() as other:
+                    other.execute(
+                        "UPDATE tasks SET session_id = ? WHERE id = ?", (OTHER, parent)
+                    )
+                    other.commit()
+            return out
+
+        monkeypatch.setattr(kb, "_resolve_birth_session", racing)
+        child = kb.create_task(conn, title="child", assignee="worker-a", parents=[parent])
+        assert kb.get_task(conn, child).session_id == OTHER
+
+
+def test_refused_guarded_mutation_with_side_write_records_no_takeover(kanban_home):
+    """FleetReview on #1361: a guarded mutator that writes a side event in its
+    txn and then refuses (reclaim_refused shape) must not record the takeover
+    or re-home the card."""
+    @kb._home_session_guarded("reclaim")
+    def refusing(conn, task_id):
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "reclaim_refused", {"why": "owner alive"})
+        return False
+
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopting"):
+            assert refusing(conn, tid) is False
+        assert kb.get_task(conn, tid).session_id == HOME
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "reclaim_refused" in kinds and "takeover" not in kinds
+        assert _comments(conn, tid) == []

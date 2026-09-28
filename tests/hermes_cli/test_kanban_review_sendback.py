@@ -621,3 +621,28 @@ def test_dashboard_operator_send_back(
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "ready"
         assert len(_operator_overrides(conn, tid)) == 1
+
+
+def test_claimer_without_run_id_cannot_close_another_reviewers_live_run(board: Path) -> None:
+    """C5 #70 (PR #1081): argus holds a live review claim; an apollo send-back
+    with no expected_run_id must be refused, leaving argus's run open."""
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        review = kb.claim_review_task(conn, tid, claimer="argus:1")
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", claimer="apollo", coverage=COVERAGE,
+        )
+        assert ok is False and "live review run" in detail
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.current_run_id == review.current_run_id
+        # A matching profile name is not proof of run ownership: refused too.
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", claimer="argus:1", coverage=COVERAGE,
+        )
+        assert ok is False and "live review run" in detail
+        # The run's owner closes it with its run id.
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", claimer="argus:1", coverage=COVERAGE,
+            expected_run_id=review.current_run_id,
+        )
+        assert (ok, detail) == (True, "builder")

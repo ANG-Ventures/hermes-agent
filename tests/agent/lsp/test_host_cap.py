@@ -139,3 +139,22 @@ def test_config_default_cap_reaches_the_service(repo):
         assert svc.get_status()["max_servers_per_host"] == default
     finally:
         svc.shutdown()
+
+
+def test_dead_server_gives_back_its_slot_to_a_replacement(repo):
+    """C5 #48 (PR #1019): a server that died keeps no host slot; at the cap the
+    next edit must spawn a replacement instead of running without LSP."""
+    f = str(repo.path / "x.py")
+    svc = _service(max_servers_per_host=1)
+    try:
+        svc.snapshot_baseline(f)
+        assert len(repo.spawns) == 1 and host_slots.held_count(1) == 1
+        [client] = list(svc._clients.values())
+        client._proc.kill()
+        assert _wait_until(lambda: not client.is_running), "mock server did not die"
+        assert svc.enabled_for(f)
+        svc.snapshot_baseline(f)
+        assert len(repo.spawns) == 2 and host_slots.held_count(1) == 1
+    finally:
+        svc.shutdown()
+    assert host_slots.held_count(1) == 0
