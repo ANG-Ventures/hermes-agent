@@ -261,6 +261,46 @@ def test_unbound_claim_held_by_a_live_other_process_is_not_released(board, monke
     assert _status(board) == "running"
 
 
+def test_unbound_claim_held_on_a_remote_host_is_not_released(board, monkeypatch):
+    """FleetReview af22d38d1623: a remote lock is not proof its claimer is gone."""
+    _claim(monkeypatch, board, None)
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?",
+                     ("some-other-host:4242", board))
+        conn.commit()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    with kb.connect() as conn:
+        assert kb.release_unbound_review_claim(conn, board, reason="probe") is False
+    _as_session(monkeypatch, SESSION)
+    out = cli.run_slash(
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
+    )
+    assert "Requested changes" not in out, out
+    assert _status(board) == "running"
+
+
+def test_worker_attached_after_the_reads_blocks_the_release(board, monkeypatch):
+    """FleetReview cbacb005a819: release conditions are rechecked in the txn."""
+    _claim(monkeypatch, board, None)
+    with kb.connect() as conn:
+        host = kb._claimer_id().rpartition(":")[0]
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", (f"{host}:1", board))
+        conn.commit()
+
+    def _attach_then_report_dead(pid):
+        # Another process attaches a worker between the reads and the write.
+        with kb.connect() as other:
+            other.execute("UPDATE tasks SET worker_pid = 777 WHERE id = ?", (board,))
+            other.commit()
+        return False
+
+    monkeypatch.setattr(kb, "_pid_alive", _attach_then_report_dead)
+    with kb.connect() as conn:
+        assert kb.release_unbound_review_claim(conn, board, reason="probe") is False
+        task = kb.get_task(conn, board)
+    assert task.status == "running" and task.worker_pid == 777
+
+
 def test_bound_claim_is_never_released_by_another_session(board, monkeypatch):
     _claim(monkeypatch, board, SESSION)
     with kb.connect() as conn:

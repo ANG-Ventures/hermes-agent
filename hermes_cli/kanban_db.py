@@ -9299,7 +9299,7 @@ def release_unbound_review_claim(
         return False
     run_id = int(row["current_run_id"])
     event = conn.execute(
-        "SELECT payload FROM task_events "
+        "SELECT id, payload FROM task_events "
         "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
         "ORDER BY id DESC LIMIT 1",
         (task_id, run_id),
@@ -9320,16 +9320,24 @@ def release_unbound_review_claim(
         lock_pid = int(pid_text)
     except ValueError:
         lock_pid = None
-    if host and host == _claimer_id().rpartition(":")[0] and lock_pid is not None:
-        if lock_pid != os.getpid() and _pid_alive(lock_pid):
-            return False  # a live sessionless claimer may still be reviewing
+    # Fail closed: only a lock this host can probe proves its claimer gone.
+    # A remote (or malformed) lock is unprovable, so it is never released.
+    if not host or host != _claimer_id().rpartition(":")[0] or lock_pid is None:
+        return False  # unprovable_claimer: remote or malformed claim lock
+    if lock_pid != os.getpid() and _pid_alive(lock_pid):
+        return False  # a live sessionless claimer may still be reviewing
     with write_txn(conn):
+        # Recheck every release condition under the write lock: a worker may
+        # have attached, or the claim rebound, since the reads above.
         cur = conn.execute(
             "UPDATE tasks SET status = 'review', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status = 'running' AND current_run_id = ? "
-            "AND claim_lock IS ?",
-            (task_id, run_id, row["claim_lock"]),
+            "AND claim_lock IS ? AND worker_pid IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM task_events e "
+            "  WHERE e.task_id = tasks.id AND e.run_id = ? "
+            "  AND e.kind = 'claimed' AND e.id > ?)",
+            (task_id, run_id, row["claim_lock"], run_id, event["id"]),
         )
         if cur.rowcount != 1:
             return False
