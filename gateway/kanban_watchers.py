@@ -745,7 +745,7 @@ class _GuardStuckNotifier:
         try:
             import json
 
-            data = json.loads(self._state_path.read_text())
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
             return {str(k): float(v) for k, v in data.items()} if isinstance(data, dict) else {}
         except (OSError, ValueError, TypeError, AttributeError):
             return {}
@@ -758,7 +758,7 @@ class _GuardStuckNotifier:
 
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._state_path.with_name(f"{self._state_path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(self._sent, sort_keys=True))
+            tmp.write_text(json.dumps(self._sent, sort_keys=True), encoding="utf-8")
             os.replace(tmp, self._state_path)
         except OSError:
             logger.warning("kanban dispatcher: guard-stuck page ledger not saved", exc_info=True)
