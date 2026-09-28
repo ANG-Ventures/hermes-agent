@@ -618,3 +618,4 @@ def test_429_without_reset_seconds_uses_retry_after_then_default(_fresh_cooldown
     ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
     ext.extract("p", "u", "a")
     assert cr.primary_cooldown_remaining(ext._primary_url) == pytest.approx(expected)
+

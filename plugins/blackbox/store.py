@@ -210,11 +210,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- SEARCH, identical 653 rows.
         -- (turns indexes are created AFTER the additive column migration below,
         -- guarded on the indexed columns existing -- see _ensure_turn_indexes.)
-        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
-            ON turn_api_calls(ts);
-        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
-            ON turn_api_calls(sub_key);
-
         -- Conversation prefix-stability guard (card t_c07124ab). One row per
         -- session holding the fingerprint of the LAST request sent on it
         -- (hashes + byte sizes only, never text); the next request of the
@@ -381,6 +376,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # Indexed columns on a legacy turn_api_calls table may have been absent;
+    # creating these in executescript above would abort before migration.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts ON turn_api_calls(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub ON turn_api_calls(sub_key)")
     for _col in ("last_cache_read", "last_cache_write", "last_uncached"):
         if _col not in _existing:
             try:

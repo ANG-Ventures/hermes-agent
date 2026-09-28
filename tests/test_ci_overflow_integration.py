@@ -230,6 +230,25 @@ def test_one_replanned_slice_cannot_certify_a_selective_rerun_as_full():
     assert "Python tests / Run tests a" in result["evidence"]["reused"]
 
 
+def test_full_rerun_with_one_slice_unprobed_is_not_pass():
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    logs = {"Python tests / Run tests b": "PROBE slice=b executing_attempt=2 planned_attempt=2"}
+    result = integ.full_rerun_verdict(A1, fresh, logs, attempt=2)
+    assert result["status"] == "UNVERIFIABLE"
+    assert result["evidence"]["missing_probe"] == ["Python tests / Run tests a"]
+
+
+def test_attempt_one_is_never_a_full_rerun():
+    logs = {j["name"]: "PROBE slice=x executing_attempt=1 planned_attempt=1" for j in A1}
+    assert integ.full_rerun_verdict([], A1, logs, attempt=1)["status"] == "UNVERIFIABLE"
+
+
+def test_planner_only_reexecution_is_unverifiable():
+    replanned = [{**j, "started_at": "2026-09-24T06:59:00Z"} if j["name"].endswith("Placement") else dict(j)
+                 for j in A1]
+    assert integ.selective_rerun_verdict(A1, replanned, {})["status"] == "UNVERIFIABLE"
+
+
 def test_full_rerun_with_every_job_replanned_passes():
     fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
     logs = {j["name"]: f"PROBE slice={j['name'][-1]} executing_attempt=2 planned_attempt=2"

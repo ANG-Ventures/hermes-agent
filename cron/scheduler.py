@@ -4332,7 +4332,7 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
-                    delivered_chats.add(str(chat_id))
+                    delivered_chats.add((str(platform_name).lower(), str(chat_id)))
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -4525,7 +4525,7 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
                 delivery_errors.append(msg)
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
-            delivered_chats.add(str(chat_id))
+            delivered_chats.add((str(platform_name).lower(), str(chat_id)))
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
@@ -4534,7 +4534,7 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
 
     # Ledger only a deferral that actually landed in #logs; a failed send is
     # retried and would otherwise be counted once per attempt.
-    if host_down_ledger and _HOST_DOWN_LOGS_CHAT in delivered_chats:
+    if host_down_ledger and ("discord", _HOST_DOWN_LOGS_CHAT) in delivered_chats:
         _host_down_write_ledger(host_down_ledger)
     if policy_drop_errors:
         # Filter-time drops apply to every target; report them once.

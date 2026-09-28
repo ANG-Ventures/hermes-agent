@@ -225,3 +225,33 @@ def test_failed_repair_does_not_roll_back_a_caller_owned_transaction(monkeypatch
     assert conn.in_transaction
     assert conn.execute("SELECT v FROM caller").fetchall() == [("mine",)]
     conn.close()
+
+
+def test_failed_repair_undoes_partial_trigger_writes_inside_caller_transaction(monkeypatch):
+    """A caller may catch the error and commit its own work; failed repair DDL
+    must not sneak into that commit."""
+    import pytest
+    import plugins.context_engine.lcm.db_bootstrap as B
+
+    conn = sqlite3.connect(":memory:")
+    _make_db(conn, stale=True)
+    spec = build_message_fts_spec()
+    conn.execute("CREATE TABLE caller (v TEXT)")
+    conn.commit()
+    conn.execute("INSERT INTO caller VALUES ('mine')")
+    real_drop = B._drop_fts_triggers
+
+    def boom(c, sqls):
+        real_drop(c, sqls)
+        assert B._fts_missing_triggers(c, spec) is True  # trigger DDL already ran
+        raise sqlite3.OperationalError("failed after dropping triggers")
+
+    monkeypatch.setattr(B, "_drop_fts_triggers", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        repair_external_content_fts(conn, spec, throttle=False)
+    monkeypatch.setattr(B, "_drop_fts_triggers", real_drop)
+    assert conn.in_transaction
+    conn.commit()
+    assert conn.execute("SELECT v FROM caller").fetchall() == [("mine",)]
+    assert B._fts_stale_triggers(conn, spec) is True
+    conn.close()

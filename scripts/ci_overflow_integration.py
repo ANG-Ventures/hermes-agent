@@ -141,17 +141,25 @@ def full_rerun_verdict(prior: list[dict], jobs: list[dict], probe_lines: dict[st
     """A full re-run re-executes EVERY job and every slice's PROBE plan equals ``attempt``. One matching
     slice alongside reused jobs is a selective re-run, not a full one."""
     name = "ac3_full_rerun_regenerates_plan"
+    if attempt < 2 or not prior:
+        return check(name, "UNVERIFIABLE", {"attempt": attempt},
+                     "a full re-run is attempt >= 2 with the prior attempt's listing; attempt 1 is not a re-run")
     reused = _reused_jobs(prior, jobs)
-    planned = []
+    planned, missing = [], []
     for job in jobs:
         m = PROBE_LINE.search(probe_lines.get(job["name"], ""))
         if m:
             planned.append({"job": job["name"], "executing": int(m.group(2)), "planned": int(m.group(3))})
-    ok = bool(planned) and not reused and all(p["executing"] == p["planned"] == attempt for p in planned)
-    return check(name, "PASS" if ok else "BLOCK", {"attempt": attempt, "slices": planned, "reused": reused,
-                 "note": "GitHub-side half only: controller fresh reservation is exercised under ac3_live_*"},
-                 "" if ok else ("jobs carried over from the prior attempt: selective, not full, re-run" if reused
-                                else "full re-run did not re-plan"))
+        elif not job["name"].endswith(_PLANNER_JOBS):
+            missing.append(job["name"])
+    evidence = {"attempt": attempt, "slices": planned, "reused": reused, "missing_probe": missing,
+                "note": "GitHub-side half only: controller fresh reservation is exercised under ac3_live_*"}
+    if reused:
+        return check(name, "BLOCK", evidence, "jobs carried over from the prior attempt: selective, not full, re-run")
+    if missing or not planned:
+        return check(name, "UNVERIFIABLE", evidence, f"slice job(s) without a PROBE line: {missing}")
+    ok = all(p["executing"] == p["planned"] == attempt for p in planned)
+    return check(name, "PASS" if ok else "BLOCK", evidence, "" if ok else "full re-run did not re-plan")
 
 
 # -- live gates ----------------------------------------------------------------------------------
