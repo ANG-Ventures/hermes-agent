@@ -1364,6 +1364,9 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
+            # Session platforms that keep the instant derived title and never call the title model,
+            # e.g. ["api_server", "kanban"] for machine-opened sessions nobody browses by name.
+            "derived_only_platforms": [],
         },
         "memory_query_rewrite": {
             "provider": "auto",

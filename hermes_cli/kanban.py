@@ -32,6 +32,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
+from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -102,7 +103,18 @@ def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
     flag = ""
     if refusal and t.status in _REFUSAL_VISIBLE_STATUSES:
         flag = f"  [{_fmt_refusal(refusal)}]"
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{flag}"
+    pin = _pin_badge(t)
+    pin = f"  {pin}" if pin else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{pin}{flag}"
+
+
+def _pin_badge(t) -> str:
+    """``[PIN claude-bpx-N: <reason>]`` for a card's deliberate sub pin."""
+    from hermes_cli.model_policy import format_pin_badge
+
+    return format_pin_badge(
+        getattr(t, "provider_override", None), getattr(t, "pin_sub_reason", None),
+    )
 
 
 def _fmt_links(links: list[tuple[str, str]]) -> str:
@@ -141,6 +153,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "reasoning_effort": t.reasoning_effort,
+        "pin_sub_reason": getattr(t, "pin_sub_reason", None),
+        "pin_sub_fallback": bool(getattr(t, "pin_sub_fallback", False)),
         "session_id": t.session_id,
         "unhomed": bool(getattr(t, "unhomed", False)),
         "workflow_template_id": t.workflow_template_id,
@@ -564,6 +578,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "--firepower is an alias.",
     )
     p_create.add_argument(
+        "--pin-sub", default=None, dest="pin_sub", metavar="REASON",
+        help="Deliberately pin this card to ONE Claude sub (--provider "
+             "claude-bpx-N / claude-apx-N) with a non-empty reason, recorded "
+             "as a 'sub pin:' comment and shown as [PIN ...] in show/list. "
+             "Pins provider + model + effort together (--model/--effort). "
+             "Workers ride the pool by default; pre-rename aliases "
+             "(claude-api-proxy, claude-bridge, -fN) and subs not enabled in "
+             "the usage registry are refused even with this flag. Sub 0 is a "
+             "last-resort pin (only when Ace asks or every other sub is "
+             "capped). A capped pinned sub WAITS (no profile fallback).",
+    )
+    p_create.add_argument(
+        "--pin-sub-fallback", action="store_true", dest="pin_sub_fallback",
+        help="With --pin-sub: when the pinned sub is capped/cooling, ride "
+             "its family pool (bpx-N -> claude-bpr, apx-N -> claude-apr) "
+             "instead of waiting.",
+    )
+    p_create.add_argument(
         "--reasoning",
         "--effort",
         default=None,
@@ -681,6 +713,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- assign ---
+    p_pins = sub.add_parser(
+        "pins",
+        help="List live deliberate sub pins (--pin-sub) on cards and lanes",
+    )
+    p_pins.add_argument("--json", action="store_true", dest="as_json")
+    p_pins.add_argument(
+        "--stale-hours", type=float, default=None, dest="stale_hours",
+        help="Exit 1 when any card pin is at least this old (daily lint).",
+    )
+
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
@@ -690,6 +732,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "set-model",
         help="Set or clear a task's model/provider/effort override "
              "(takes effect on the next dispatch)",
+        description="Pin a card's worker to a provider + model + effort. "
+                    "Any route is pinnable; a single Claude sub "
+                    "(claude-bpx-N/apx-N) additionally needs --pin-sub "
+                    "\"<reason>\". The pin applies on the next dispatch; no "
+                    "gateway restart. Visible in show/list as [PIN ...] and in "
+                    "the run's 'spawned' event pool. Docs: "
+                    "website/docs/user-guide/features/kanban.md, section "
+                    "'Pinning a kanban card/worker: provider, model, effort'.",
     )
     p_set_model.add_argument(
         "task_ids", nargs="*", metavar="task_id",
@@ -717,7 +767,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reclaim", action="store_true",
         help="Release the claim on selected RUNNING cards so the next "
              "dispatch respawns them on the new route. Without this a "
-             "running worker keeps its old model until it finishes.",
+             "running worker keeps its old model until it finishes. The "
+             "running worker is terminated; the next run is a FRESH session "
+             "seeded from the card body + comments + the same workspace, so "
+             "post a checkpoint comment before reclaiming mid-task.",
+    )
+    p_set_model.add_argument(
+        "--live", action="store_true",
+        help="Switch selected RUNNING workers to the new route/effort at "
+             "their next loop iteration, WITHOUT aborting them: same process, "
+             "same conversation, same workspace. Costs one prompt-cache miss "
+             "on a model/provider change (effort-only is near-free). Cards "
+             "that are not running just get the next-dispatch write. Needs an "
+             "explicit model and/or --effort (clears are refused); cannot be "
+             "combined with --reclaim.",
     )
     p_set_model.add_argument(
         "--allow-flagship",
@@ -727,6 +790,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="REASON",
         help="Allow an orchestrator-only flagship model. Requires a non-empty "
              "reason, recorded as a task comment. --firepower is an alias.",
+    )
+    p_set_model.add_argument(
+        "--pin-sub", default=None, dest="pin_sub", metavar="REASON",
+        help="Deliberately pin this card to ONE Claude sub (--provider "
+             "claude-bpx-N / claude-apx-N) with a non-empty reason, recorded "
+             "as a 'sub pin:' comment and shown as [PIN ...] in show/list. "
+             "Pins provider + model + effort together (--model/--effort). "
+             "Workers ride the pool by default; pre-rename aliases "
+             "(claude-api-proxy, claude-bridge, -fN) and subs not enabled in "
+             "the usage registry are refused even with this flag. Sub 0 is a "
+             "last-resort pin (only when Ace asks or every other sub is "
+             "capped). A capped pinned sub WAITS (no profile fallback).",
+    )
+    p_set_model.add_argument(
+        "--pin-sub-fallback", action="store_true", dest="pin_sub_fallback",
+        help="With --pin-sub: when the pinned sub is capped/cooling, ride "
+             "its family pool (bpx-N -> claude-bpr, apx-N -> claude-apr) "
+             "instead of waiting.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -780,6 +861,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="REASON",
         help="Required justification when the model is flagship/firepower-only "
              "(same flagship ban as create/set-model --allow-flagship).",
+    )
+    _lane_set.add_argument(
+        "--pin-sub", default=None, dest="pin_sub", metavar="REASON",
+        help="Authorize a single-sub lane (claude-bpx-N / claude-apx-N) with a "
+             "reason. Same refusals as set-model --pin-sub (pre-rename "
+             "aliases, subs not enabled in the usage registry); a capped "
+             "pinned lane holds its cards.",
     )
     _lane_show = _lane_sub.add_parser(
         "show", help="Show active lane overrides and their remaining TTL",
@@ -1161,10 +1249,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--coverage", default=None,
         help="Review coverage JSON; records a run-attributed comment before transition (human CLI)",
     )
+    # ``--operator "<who: why>"`` is added by the home-guard loop below; on
+    # request-changes it is also the operator send-back (coverage waived).
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
-        help="Retired: claim review and request-changes with a full coverage comment instead",
+        help="Retired: claim review and request-changes with a full coverage comment "
+             "instead (operators: request-changes --operator \"<who: why>\")",
     )
     p_reopen_review.add_argument("task_ids", nargs="+")
     p_reopen_review.add_argument(
@@ -1687,6 +1778,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    refusal = _non_owner_lifecycle_refusal(args)
+    if refusal:
+        print(f"kanban: {refusal}", file=sys.stderr)
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1763,6 +1859,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "lane-model": _cmd_lane_model,
+            "pins":     _cmd_pins,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1879,16 +1976,24 @@ def _caller_session_id() -> Optional[str]:
     explicit = (_SLASH_SESSION_ID.get() or "").strip()
     if explicit:
         return explicit
+    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
     try:
-        from gateway.session_context import resolve_current_session_id
+        from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
+        if in_gateway:
+            # In-process gateway: ONLY a per-turn contextvar bound in this
+            # context is ours. A plain slash command runs before that bind,
+            # and the resolver's os.environ fallback is process-global --
+            # another chat's session. Sessionless means None, never a
+            # borrowed identity (FleetReview #951).
+            bound = _SESSION_ID.get()
+            return (bound.strip() or None) if isinstance(bound, str) else None
         resolved = (resolve_current_session_id() or "").strip()
         if resolved:
             return resolved
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            return None  # in-process: env is another session's, never ours
     except Exception:
-        pass
+        if in_gateway:
+            return None
     return (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
 
 
@@ -1988,6 +2093,59 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         return is_delegated_child_process_context()
     except Exception:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+#: Terminal/lifecycle writes a worker makes on its OWN card. Each one passes
+#: ``expected_run_id=_worker_run_id_for(tid)``, which is ``None`` for a process
+#: that does not own the grant, and ``None`` means "operator, no run guard".
+_WORKER_LIFECYCLE_ACTIONS: frozenset[str] = frozenset({
+    "complete",
+    "block",
+    "schedule",
+    "request-review",
+})
+
+
+def _lifecycle_target_ids(args: argparse.Namespace) -> list[str]:
+    ids = list(getattr(args, "task_ids", None) or [])
+    if getattr(args, "task_id", None):
+        ids.append(args.task_id)
+    ids.extend(getattr(args, "ids", None) or [])
+    return ids
+
+
+def _non_owner_lifecycle_refusal(args: argparse.Namespace) -> Optional[str]:
+    """Refuse a lifecycle write on the ambient worker card by a non-owner.
+
+    A process that inherited a worker's ``HERMES_KANBAN_TASK`` but does not hold
+    the owner grant (``HERMES_KANBAN_OWNER_PID`` names another pid) gets
+    ``expected_run_id=None`` from :func:`_worker_run_id_for`, which
+    ``complete_task``/``block_task`` read as an operator override with no run
+    guard. Without this gate such a process closes the live worker's card
+    (2026-08-12, t_09b90233: a nested process closed its parent's card).
+
+    Scope is the card the inherited env names. A shell with no worker env is an
+    operator and is unaffected; so is the owning worker, and a hand-driven
+    worker with no owner marker (``owns_kanban_worker_authority`` fails open).
+    """
+    if getattr(args, "kanban_action", None) not in _WORKER_LIFECYCLE_ACTIONS:
+        return None
+    ambient = os.environ.get("HERMES_KANBAN_TASK")
+    if not ambient or ambient not in _lifecycle_target_ids(args):
+        return None
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if is_dispatcher_owned_worker_context():
+            return None
+    except Exception:
+        return None
+    return (
+        f"this process inherited worker env for {ambient} but does not hold "
+        f"its owner grant; only the dispatcher's worker may "
+        f"{args.kanban_action} that card (run it from a shell without the "
+        f"worker env to act as an operator)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2457,6 +2615,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_retries=max_retries,
                 model_override=getattr(args, "model_override", None),
                 provider_override=getattr(args, "provider_override", None),
+                pin_sub_reason=getattr(args, "pin_sub", None),
+                pin_sub_fallback=bool(getattr(args, "pin_sub_fallback", False)),
                 flagship_override_reason=getattr(args, "allow_flagship", None),
                 flagship_override_author=args.created_by or _profile_author(),
                 reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -2846,6 +3006,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+        if _pin_badge(task):
+            _fb = "family pool" if task.pin_sub_fallback else "wait"
+            print(f"  pin:       {_pin_badge(task)} (capped sub => {_fb})")
     print(f"  reasoning: {task.reasoning_effort or 'inherit'}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
@@ -3328,6 +3491,18 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     all_active = bool(getattr(args, "all_active", False))
     task_ids = list(getattr(args, "task_ids", None) or [])
     reclaim = bool(getattr(args, "reclaim", False))
+    live = bool(getattr(args, "live", False))
+    if live and reclaim:
+        print("kanban: --live and --reclaim are exclusive (--live keeps the "
+              "running worker; --reclaim aborts it)", file=sys.stderr)
+        return 2
+    if live and (clear_effort or (touch_model and not model and not provider)):
+        # A clear resolves through lane overrides / the capped-pool ladder at
+        # dispatch time, which a running worker cannot reproduce. Name the
+        # route to switch to, or clear without --live (next dispatch).
+        print("kanban: --live needs an explicit route or --effort level; "
+              "clears apply on the next dispatch (drop --live)", file=sys.stderr)
+        return 2
     if task_ids and (where or all_active):
         print(
             "kanban: pass task ids OR a selector (--where/--all-active), not both",
@@ -3344,6 +3519,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     cleared_routes: dict[str, str] = {}
     reclaim_errors: dict[str, str] = {}
     skipped: dict[str, str] = {}
+    live_runs: dict[str, int] = {}
     batch_error: Optional[str] = None
     committed = False
     try:
@@ -3403,6 +3579,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     require_statuses=require_statuses,
                     require_assignees=require_assignees,
                     skip_if_unmatched=not task_ids,
+                    live=live,
                 )
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
@@ -3410,6 +3587,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.touch_model = True
                     write.model = effective_model
                     write.provider = provider
+                    write.pin_sub_reason = getattr(args, "pin_sub", None)
+                    write.pin_sub_fallback = bool(getattr(args, "pin_sub_fallback", False))
+                    if write.pin_sub_reason:
+                        write.pin_sub_author = _profile_author()
                     if firepower:
                         write.audit_comment_author = _profile_author()
                         # Same comment main's create/set-model writes, so
@@ -3422,7 +3603,9 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.effort = None if clear_effort else effort
                 writes.append(write)
 
-            written = set(kb.apply_batch_route_writes(conn, writes, skipped=skipped))
+            written = set(kb.apply_batch_route_writes(
+                conn, writes, skipped=skipped, live_runs=live_runs,
+            ))
             # PAST THIS LINE THE ROUTES ARE DURABLE. Nothing below may let an
             # exception escape without the operator learning which cards
             # moved — that is the whole honest-partial contract, and it is
@@ -3485,12 +3668,19 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         # `applies=next-dispatch` alone is technically true but reads as
         # normal — the refusal line below is what names it, and this keeps
         # the two consistent.
-        applies = "redispatch" if redispatched else "next-dispatch"
+        live_run = live_runs.get(task_id)
+        applies = (
+            "redispatch" if redispatched
+            else f"live(run {live_run})" if live_run is not None
+            else "next-dispatch"
+        )
         if single:
             if touch_model and (model or provider):
                 label = f"{provider}:{model or inherited_models[task_id]}" if provider else model
                 suffix = (
                     " (reclaimed; redispatches now)" if redispatched
+                    else f" (live: run {live_run} switches at its next turn, "
+                         "context kept)" if live_run is not None
                     else " (applies on next dispatch)"
                 )
                 print(f"Set model override on {task_id}: {label}{suffix}")
@@ -3501,8 +3691,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 print(f"Cleared reasoning effort on {task_id} "
                       "(worker uses its profile's agent.reasoning_effort)")
             elif effort is not None:
-                print(f"Set reasoning effort on {task_id}: {effort} "
-                      "(applies on next dispatch)")
+                when = (
+                    f"live: run {live_run} switches at its next turn"
+                    if live_run is not None else "applies on next dispatch"
+                )
+                print(f"Set reasoning effort on {task_id}: {effort} ({when})")
             continue
         if touch_model and (model or provider):
             route = f"{provider}/{model or inherited_models[task_id]}" if provider else model
@@ -3623,7 +3816,8 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         return 2
     from hermes_cli.model_policy import pinned_sub_provider_error
 
-    pin_error = pinned_sub_provider_error(model, provider)
+    pin_sub_reason = getattr(args, "pin_sub", None)
+    pin_error = pinned_sub_provider_error(model, provider, pin_sub_reason=pin_sub_reason)
     if pin_error:
         print(f"kanban: {pin_error}", file=sys.stderr)
         return 2
@@ -3652,12 +3846,18 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
             firepower=firepower_reason,
             created_by=_profile_author(),
             now=now,
+            pin_sub_reason=pin_sub_reason,
         )
     scope = f"assignee={assignee}" if assignee else "assignee=(board-wide)"
     print(
         f"lane-model set: route={override.route} {scope} "
         f"ttl={_format_ttl(ttl_seconds)} applies=next-dispatch"
     )
+    if override.pin_sub_reason:
+        from hermes_cli.model_policy import format_pin_badge
+
+        print(f"  {format_pin_badge(override.provider, override.pin_sub_reason)} "
+              "(capped sub => cards wait)")
     if reason:
         print(f"  reason: {reason}")
     if is_firepower_model(model) and firepower_reason:
@@ -3683,6 +3883,7 @@ def _cmd_lane_model_show(args: argparse.Namespace) -> int:
                 "route": row.route,
                 "reason": row.reason,
                 "firepower": row.firepower,
+                "pin_sub_reason": row.pin_sub_reason,
                 "created_by": row.created_by,
                 "created_at": row.created_at,
                 "expires_at": row.expires_at,
@@ -3703,9 +3904,77 @@ def _cmd_lane_model_show(args: argparse.Namespace) -> int:
             print(f"  reason: {row.reason}")
         if row.firepower:
             print(f"  firepower: {row.firepower}")
+        if row.pin_sub_reason:
+            from hermes_cli.model_policy import format_pin_badge
+
+            print(f"  {format_pin_badge(row.provider, row.pin_sub_reason)}")
         if row.created_by:
             print(f"  set by: {row.created_by}")
     return 0
+
+
+def _cmd_pins(args: argparse.Namespace) -> int:
+    """List every LIVE deliberate sub pin (cards + lanes) -- the daily lint.
+
+    #1116's failure mode was a forgotten pin silently hogging one sub, so every
+    live pin is listed with its age. ``--stale-hours N`` exits 1 when any card
+    pin is older than N hours (for a cron lint); otherwise exit 0.
+    """
+    from hermes_cli.model_policy import format_pin_badge
+
+    now = int(time.time())
+    stale_hours = getattr(args, "stale_hours", None)
+    rows = []
+    with kb.connect_closing() as conn:
+        placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
+        for r in conn.execute(
+            "SELECT t.id, t.status, t.assignee, t.title, t.model_override, "
+            "t.provider_override, t.pin_sub_reason, t.pin_sub_fallback, t.created_at, "
+            "(SELECT max(e.created_at) FROM task_events e WHERE e.task_id = t.id "
+            " AND e.kind IN ('model_override_set', 'created')) AS pinned_at "
+            f"FROM tasks t WHERE t.pin_sub_reason IS NOT NULL AND t.status IN ({placeholders}) "
+            "ORDER BY pinned_at ASC",
+            _ACTIVE_STATUSES,
+        ).fetchall():
+            pinned_at = int(r["pinned_at"] or r["created_at"] or now)
+            rows.append({
+                "kind": "card", "id": r["id"], "status": r["status"],
+                "assignee": r["assignee"], "title": r["title"],
+                "provider": r["provider_override"], "model": r["model_override"],
+                "reason": r["pin_sub_reason"],
+                "fallback": "pool" if r["pin_sub_fallback"] else "wait",
+                "age_hours": round((now - pinned_at) / 3600, 1),
+            })
+        for lane in kb.list_lane_model_overrides(conn, now=now):
+            if lane.pin_sub_reason:
+                rows.append({
+                    "kind": "lane", "id": lane.assignee or "(board-wide)",
+                    "status": "active", "assignee": lane.assignee, "title": "",
+                    "provider": lane.provider, "model": lane.model,
+                    "reason": lane.pin_sub_reason, "fallback": "wait",
+                    "age_hours": round((now - int(lane.created_at)) / 3600, 1),
+                    "ttl_seconds": lane.ttl_remaining(now),
+                })
+    stale = [
+        r for r in rows
+        if stale_hours is not None and r["kind"] == "card" and r["age_hours"] >= stale_hours
+    ]
+    if getattr(args, "as_json", False):
+        print(json.dumps({"pins": rows, "stale": [r["id"] for r in stale]}, indent=2))
+    elif not rows:
+        print("(no live sub pins -- every worker rides the pool)")
+    else:
+        for r in rows:
+            badge = format_pin_badge(r["provider"], r["reason"])
+            extra = (f"ttl={_format_ttl(r['ttl_seconds'])}" if r["kind"] == "lane"
+                     else f"status={r['status']} assignee={r['assignee'] or '-'}")
+            print(f"{r['kind']} {r['id']} {badge} model={r['model']} "
+                  f"age={r['age_hours']}h fallback={r['fallback']} {extra}"
+                  + (f"  {r['title']}" if r["title"] else ""))
+        if stale:
+            print(f"STALE (>= {stale_hours}h): {', '.join(r['id'] for r in stale)} -- "
+                  "clear with `hermes kanban set-model <id> none` if no longer wanted")
+    return 1 if stale else 0
 
 
 def _cmd_lane_model_clear(args: argparse.Namespace) -> int:
@@ -4352,7 +4621,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -4708,7 +4977,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
                 with_reason=True,
             )
-        except (DraftPrError, StaleBaseError) as draft_err:
+        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
             print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
             return 1
         if not ok:
@@ -4736,10 +5005,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
+    operator = (getattr(args, "operator", None) or "").strip() or None
     with kb.connect_closing() as conn:
         # The caller must hold the review run: as its dispatcher-owned worker,
         # or as the operator session that made ``claim --review`` (human lane).
         worker_run = _worker_run_id_for(tid)
+        if operator is not None and worker_run is not None:
+            # A dispatched reviewer run always carries full coverage.
+            print(
+                f"cannot request changes for {tid}: --operator is not for a "
+                f"dispatched review run; post the review_coverage record",
+                file=sys.stderr,
+            )
+            return 1
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
         parked_session = None
         if held_run is None:
@@ -4770,6 +5048,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             tid,
             reason=reason,
             expected_run_id=held_run,
+            operator=operator,
             **(
                 {
                     # Open the review run as this session, and record the
@@ -4796,7 +5075,10 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             _unused_run, session_ref = safe_comment_provenance(tid)
             kb.add_comment(
                 conn, tid, _profile_author(),
-                "changes requested (human review lane): "
+                (
+                    f"changes requested (operator send-back, {operator}): "
+                    if operator else "changes requested (human review lane): "
+                )
                 + str(kb.redact_review_value(reason)),
                 run_id=(
                     held_run if held_run is not None
@@ -4820,7 +5102,12 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             kb.reopen_review_task(conn, tid)
-            print(f"cannot reopen {tid}: legacy bypass retired; claim review and use request-changes with full coverage", file=sys.stderr)
+            print(
+                f"cannot reopen {tid}: legacy bypass retired; claim review and use "
+                f"request-changes with full coverage (operator send-back: "
+                f"hermes kanban request-changes {tid} \"<reason>\" --operator \"<who: why>\")",
+                file=sys.stderr,
+            )
     return 1
 
 
@@ -4932,7 +5219,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                archived = kb.archive_task(conn, tid)
+            except ClosedUnmergedPrError as closed_err:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {closed_err}", file=sys.stderr)
+                continue
+            if not archived:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

@@ -795,6 +795,47 @@ def _registered_nested(workspace):
     return nested
 
 
+def _pinned_submodule(path, parent):
+    """True when ``path`` is a checked-out submodule holding no bytes of its own.
+
+    The parent's index pins a ``160000`` gitlink at ``path``; the submodule's
+    HEAD is exactly that sha; a remote-tracking ref in the submodule holds it;
+    and ``status --ignored`` shows nothing. Such a checkout is reproducible from
+    the parent commit plus the submodule's remote, so the parent's survivor
+    already covers it (t_adf672fb: t_327d1c1b's ``sat/`` clone with an
+    initialised ``esp-libopus`` was refused ahead of every survivor branch).
+    Any failed or ambiguous probe answers False -- the nested refusal stands.
+    """
+    try:
+        rel = path.relative_to(parent).as_posix()
+        entry = _git(parent, "ls-files", "--stage", "--", rel, check=False)
+        lines = entry.stdout.decode("utf-8", "replace").splitlines()
+        if entry.returncode or len(lines) != 1:
+            return False
+        meta, _, listed = lines[0].partition("\t")
+        fields = meta.split()
+        if listed != rel or len(fields) < 2 or fields[0] != "160000":
+            return False
+        head = _git(path, "rev-parse", "--verify", "HEAD", check=False)
+        if head.returncode or head.stdout.decode().strip() != fields[1]:
+            return False
+        status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=all",
+                      check=False)
+        if status.returncode or status.stdout:
+            return False
+        held = _git(path, "for-each-ref", "--contains", fields[1], "--format=%(refname)",
+                    "refs/remotes", check=False)
+        return held.returncode == 0 and bool(held.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _drop_pinned_submodules(repos, parent_of):
+    """``repos`` minus clean pinned submodules of their nearest enclosing repo."""
+    return [repo for repo in repos
+            if not ((parent := parent_of(repo)) is not None and _pinned_submodule(repo, parent))]
+
+
 def _state(conn, task_id):
     row = conn.execute(
         "SELECT bases, held_reason, survivor FROM task_workspace_survivors WHERE task_id = ?",
@@ -2474,7 +2515,21 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
              survivor_none=False, survivor_reason=None):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
-    bases, held, previous = _state(conn, task_id)
+    try:
+        bases, held, previous = _state(conn, task_id)
+        if not isinstance(bases, dict) or not (previous is None or isinstance(previous, dict)):
+            raise TypeError("survivor row is not a JSON object")
+    except (ValueError, TypeError) as exc:
+        # The row is read BEFORE the main try below, so its malformed-record
+        # backstop cannot see a partially written `bases`/`survivor` value
+        # (JSONDecodeError) or a non-object one (AttributeError on `.get`):
+        # the workspace was retained but with no `held_reason` and no
+        # `workspace_held` event (FleetReview #1034). Same HOLD, same reason.
+        _log.exception("kanban survivor: unreadable recovery state for %s", task_id)
+        reason = ("survivor_unavailable: recorded survivor state is malformed "
+                  f"({type(exc).__name__}); repair the row or recover the workspace by hand")
+        _hold(conn, task_id, reason)
+        raise _refusal(reason) from exc
     if cleanup and held:
         raise SurvivorUnavailable(held)
     if cleanup and previous and previous.get("kind") == "none":
@@ -2609,6 +2664,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         registered = _registered_nested(workspace)
         if foreign:
             registered = [path for path in registered if not foreign.foreign(path)]
+        registered = _drop_pinned_submodules(registered, lambda _path: workspace)
         if registered:
             raise SurvivorUnavailable(
                 "survivor_unavailable: nested repository requires separate recovery "
@@ -2625,6 +2681,11 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                     ", ".join(f"{p.relative_to(workspace)} ({o})"
                               for p, o in list(foreign.skipped.items())[:5]),
                 )
+        # A clean submodule pinned by its nearest enclosing repository adds no
+        # bytes that repository's survivor does not already name (t_adf672fb).
+        repos = _drop_pinned_submodules(repos, lambda repo: max(
+            (other for other in repos if other != repo and repo.is_relative_to(other)),
+            key=lambda other: len(other.parts), default=None))
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")

@@ -15,6 +15,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_open_pr as op
 
 PR_URL = "https://github.com/ANG-Ventures/example-home/pull/670"
+FOREIGN_URL = "https://github.com/stephenschoettler/hermes-lcm/pull/638"
+
+
+@pytest.fixture(autouse=True)
+def _fixture_owners_are_fleet(monkeypatch):
+    """The ``o/r`` / ``a/b`` fixture repos stand in for fleet repos (t_06dccfe3)."""
+    monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o", "a"})
 
 
 @pytest.fixture
@@ -360,3 +367,65 @@ def test_lint_lists_recent_done_cards_naming_open_pr(kanban_home):
     assert hits[0]["open_prs"] == ["ANG-Ventures/example-home#670"]
     # one lookup per distinct PR, old card outside the window never queried
     assert sorted(q.calls) == [("ANG-Ventures/example-home", 670), ("o/r", 2)]
+
+
+# --- foreign-owner PRs are mentions, not a gate (t_06dccfe3) ----------------
+
+
+def test_fleet_owner_match_is_case_insensitive():
+    refs = op.extract_pr_refs(
+        "ang-ventures/x#1 KYZCREIG/y#2 NousResearch/hermes-agent#3", FOREIGN_URL)
+    fleet, foreign = op.split_fleet(refs)
+    assert [(r.repo, r.number) for r in fleet] == [("ang-ventures/x", 1), ("KYZCREIG/y", 2)]
+    assert [(r.repo, r.number) for r in foreign] == [
+        ("NousResearch/hermes-agent", 3), ("stephenschoettler/hermes-lcm", 638)]
+
+
+def test_open_pr_refs_never_looks_up_a_foreign_ref():
+    q = _stub({("stephenschoettler/hermes-lcm", 638): "OPEN"})
+    assert op.open_pr_refs(FOREIGN_URL, survivor_pr="NousResearch/x#1", query_fn=q) == []
+    assert q.calls == []
+
+
+def test_complete_naming_only_foreign_open_pr_goes_done_with_mention(kanban_home, monkeypatch):
+    q = _use_oracle(monkeypatch, {("stephenschoettler/hermes-lcm", 638): "OPEN"})
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent,
+                                summary=f"upstreamed as {FOREIGN_URL}") is True
+        assert _status(conn, parent) == "done"
+        assert _status(conn, child) == "ready"
+        assert "completion_routed_to_review" not in _kinds(conn, parent)
+        meta = kb.latest_run(conn, parent).metadata
+        assert meta["mentioned_foreign_prs"] == ["stephenschoettler/hermes-lcm#638"]
+        assert "auto_routed_open_prs" not in meta
+        assert _comments(conn, parent) == []
+    assert q.calls == []
+
+
+def test_mixed_fleet_and_foreign_routes_to_review_with_fleet_ref_only(kanban_home, monkeypatch):
+    q = _use_oracle(monkeypatch, {
+        ("ang-ventures/example-home", 670): "OPEN",
+        ("stephenschoettler/hermes-lcm", 638): "OPEN",
+    })
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent, summary=f"{PR_URL} upstream {FOREIGN_URL}",
+                                metadata={"pr_url": [PR_URL, FOREIGN_URL]}) is True
+        assert _status(conn, parent) == "review"
+        assert _status(conn, child) == "todo"
+        meta = kb.latest_run(conn, parent).metadata
+        assert meta["auto_routed_open_prs"] == ["ANG-Ventures/example-home#670"]
+        assert meta["mentioned_foreign_prs"] == ["stephenschoettler/hermes-lcm#638"]
+        assert _comments(conn, parent) == [
+            "survivor PR open; card closes on merged=true (ANG-Ventures/example-home#670)"]
+    assert q.calls == [("ANG-Ventures/example-home", 670)]
+
+
+def test_lint_ignores_foreign_open_pr(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="upstreamed", assignee="w")
+        kb.complete_task(conn, tid, result=FOREIGN_URL)  # pytest: routing oracle disabled
+        q = _stub({("stephenschoettler/hermes-lcm", 638): "OPEN"})
+        assert op.find_done_with_open_pr(conn, query_fn=q) == []
+    assert q.calls == []

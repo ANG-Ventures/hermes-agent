@@ -184,6 +184,29 @@ def _auto_title_enabled() -> bool:
         return True
 
 
+def _derived_only_platform(platform: Optional[str]) -> bool:
+    """True when ``auxiliary.title_generation.derived_only_platforms`` lists this session's platform.
+
+    Machine-driven surfaces (``api_server`` relays, ``kanban`` workers) open hundreds of sessions a
+    day that nobody browses by name. The instant derived title is enough there, and every model
+    upgrade is one more auxiliary call against a shared, capped provider window (t_5c3acc59).
+    """
+    name = str(platform or "").strip().lower()
+    if not name:
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        title_config = ((load_config_readonly() or {}).get("auxiliary") or {}).get("title_generation") or {}
+        listed = title_config.get("derived_only_platforms") or []
+        if isinstance(listed, str):
+            listed = [listed]
+        return name in {str(p).strip().lower() for p in listed if str(p).strip()}
+    except Exception:
+        logger.debug("Failed to read title_generation.derived_only_platforms", exc_info=True)
+        return False
+
+
 def strip_control_wrappers(text: str) -> str:
     """Remove leading machine-authored control wrappers, including nested ones.
 
@@ -709,6 +732,7 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    platform: Optional[str] = None,
 ) -> None:
     """Title a session from its opening message: instant, then upgraded.
 
@@ -746,6 +770,10 @@ def maybe_auto_title(
         return
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
+
+    if _derived_only_platform(platform):
+        logger.debug("Auto-title: instant title only; %s is in derived_only_platforms", platform)
+        return
 
     # A bare thread starts with an empty Context: carry the turn's Blackbox
     # ledger binding over so the title call is ledgered as aux:title_generation.

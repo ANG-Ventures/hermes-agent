@@ -1,0 +1,133 @@
+name: CI placement probe
+
+# Synthetic P4 bench (t_eb230c34): ONLY the merge_group Placement exchange of
+# tests.yml, dispatchable on demand, so a CB5 wave of 20 exchanges is graded in
+# minutes instead of waiting for 20 organic merge_group runs.
+#
+#   generate  -> the same ci-overflow request + local-matrix artifacts tests.yml
+#                uploads for a managed merge_group (slice count = ci.yaml's
+#                merge_group expression, full scope).
+#   placement -> the Placement job of tests.yml, STEP FOR STEP (pinned by
+#                tests/test_ci_placement_probe_contract.py): same steps, plan
+#                read, timeout, permissions and outputs. Only `if:` differs.
+#
+# The external ci-overflow-controller admits these runs only while a bench
+# window is open (fleet-ops-scripts ci-overflow-controller/tools/p4_bench.py)
+# and admits them as synthetic: every job planned on the local pool with 0
+# reserved minutes, so a probe never charges the hosted allowance or claims a
+# runner slot. No test job runs here.
+#
+# Deliberately NOT triggered on merge_group: a probe on every real merge would
+# double the controller's admissions and add a check run to the queue. The
+# step-for-step contract keeps the probed path identical instead.
+on:
+  workflow_dispatch:
+    inputs:
+      wave:
+        description: Bench wave id (p4_bench.py)
+        type: string
+        required: true
+      exchange:
+        description: Exchange index within the wave
+        type: string
+        required: true
+
+run-name: "placement probe ${{ inputs.wave }} #${{ inputs.exchange }}"
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate slices
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      request_digest: ${{ steps.request.outputs.artifact-digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Generate test slices
+        env:
+          # ci.yaml's merge_group slice_count branch, verbatim (contract-pinned).
+          SLICES: ${{ vars.CI_MERGE_GROUP_SLICES == '' && 16 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) < 4 && 4 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) > 16 && 16 || fromJSON(vars.CI_MERGE_GROUP_SLICES))) }}
+          CI_SELF_HOSTED_SLOTS: ${{ vars.CI_SELF_HOSTED_SLOTS }}
+          CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
+          CI_X64_HOSTED_MIN: ${{ vars.CI_X64_HOSTED_MIN || '2' }}
+        run: |
+          mkdir -p ci-overflow
+          python3 scripts/run_tests_parallel.py \
+            --generate-slices "$SLICES" \
+            --test-scope full \
+            --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
+            --self-hosted-labels "$CI_RUNNER_LABELS" \
+            --x64-hosted-min="$CI_X64_HOSTED_MIN" \
+            --event=merge_group \
+            --same-repo=true > ci-overflow/matrix.json
+
+      - name: Build CI overflow request and local matrix
+        env:
+          MANAGED_PLACEMENT: ${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event merge_group --managed "$MANAGED_PLACEMENT"
+
+      - name: Upload CI overflow request
+        id: request
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow/request.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload local matrix for placement
+        if: vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow/local_matrix.json
+          if-no-files-found: error
+          retention-days: 1
+
+  placement:
+    name: Placement
+    needs: generate
+    if: vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      e2e_runs_on: ${{ steps.plan.outputs.e2e_runs_on }}
+      plan_valid: ${{ steps.plan.outputs.plan_valid }}
+      plan_attempt: ${{ steps.plan.outputs.plan_attempt }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Download local matrix
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow
+
+      - name: Read validated plan from ci-overflow-ledger
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REPOSITORY_ID: ${{ github.repository_id }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_HEAD_SHA: ${{ github.sha }}
+          CI_REQUEST_DIGEST: ${{ needs.generate.outputs.request_digest }}
+          CI_MATRIX_FILE: ci-overflow/local_matrix.json
+        run: python3 scripts/ci_overflow_placement.py place

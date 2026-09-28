@@ -308,7 +308,16 @@ def test_cli_parked_send_back_refused_without_bindable_session(
         assert len(_kinds(conn, tid)) == before
 
 
-def test_tool_request_changes_sends_back_parked_review(board: Path) -> None:
+@pytest.fixture
+def chat_session(monkeypatch: pytest.MonkeyPatch) -> str:
+    """A bindable chat session: the only caller that may open a human-lane
+    review run from the tool (FleetReview #1081, same rule as the CLI)."""
+    sid = "20260926_070000_chat"
+    monkeypatch.setenv("HERMES_SESSION_ID", sid)
+    return sid
+
+
+def test_tool_request_changes_sends_back_parked_review(board: Path, chat_session) -> None:
     from tools import kanban_tools as tools
 
     with kb.connect() as conn:
@@ -325,7 +334,7 @@ def test_tool_request_changes_sends_back_parked_review(board: Path) -> None:
 
 
 def test_tool_send_back_from_gateway_session_attributes_active_profile(
-    board: Path, monkeypatch: pytest.MonkeyPatch,
+    board: Path, monkeypatch: pytest.MonkeyPatch, chat_session,
 ) -> None:
     """An orchestrator in a gateway session has no HERMES_PROFILE (only dispatched
     workers do): the review claim and coverage comment name the active profile."""
@@ -345,7 +354,7 @@ def test_tool_send_back_from_gateway_session_attributes_active_profile(
         _assert_sent_back(conn, tid, "default")
 
 
-def test_tool_send_back_without_coverage_is_refused(board: Path) -> None:
+def test_tool_send_back_without_coverage_is_refused(board: Path, chat_session) -> None:
     from tools import kanban_tools as tools
 
     with kb.connect() as conn:
@@ -355,6 +364,31 @@ def test_tool_send_back_without_coverage_is_refused(board: Path) -> None:
         "task_id": tid, "reason": "add the boundary test",
     }))
     assert "missing review_coverage" in out["error"]
+    with kb.connect() as conn:
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+@pytest.mark.parametrize("session", [None, "cron_abc123_20260926_070000"])
+def test_tool_parked_send_back_refused_without_bindable_session(
+    board: Path, monkeypatch: pytest.MonkeyPatch, session,
+) -> None:
+    """FleetReview #1081: the tool path had no session check, so a sessionless
+    or cron caller could open and close a human-lane review run the CLI
+    refuses. Now refused identically, before any write."""
+    from tools import kanban_tools as tools
+
+    if session is None:
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_SESSION_ID", session)
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+    out = json.loads(tools._handle_request_changes({
+        "task_id": tid, "reason": "add the boundary test",
+        "coverage": json.loads(COVERAGE),
+    }))
+    assert "human-lane review claim" in out["error"]
     with kb.connect() as conn:
         _assert_untouched(conn, tid, before, runs_before)
 
@@ -386,3 +420,204 @@ def test_dashboard_request_changes_route_sends_back_parked_review(board: Path) -
     assert ok.json()["implementer"] == "builder"
     with kb.connect() as conn:
         _assert_sent_back(conn, tid, "apollo")
+
+
+# --- operator send-back (t_7481005e) ---------------------------------------
+# #999 made a review card leave review only with a full coverage record. An
+# operator profile bouncing a card for a non-review reason ("wrong repo",
+# "rebase first") uses ``operator="<who: why>"`` instead: coverage waived for
+# that call, an ``operator_override`` event on the closed run. Reviewer runs
+# keep the gate; non-operator profiles are refused.
+
+OPERATOR = "Ace via Apollo: wrong repo, re-port onto hermes-home"
+
+
+def _operator_overrides(conn, tid):
+    return [
+        (payload, run_id) for kind, payload, run_id in _kinds(conn, tid)
+        if kind == "operator_override"
+    ]
+
+
+def test_operator_send_back_without_coverage_succeeds_and_is_recorded(
+    board: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        ok, detail = kb.request_changes(
+            conn, tid, reason="rebase first", claimer="apollo",
+            operator=OPERATOR,
+        )
+        assert (ok, detail) == (True, "builder")
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready" and task.assignee == "builder"
+        events = _kinds(conn, tid)
+        after = events[[k for k, _, _ in events].index("review_requested") + 1:]
+        assert [k for k, _, _ in after] == [
+            "claimed", "changes_requested", "operator_override",
+        ]
+        run_id = after[0][2]
+        assert after[1][1]["operator"] == OPERATOR
+        overrides = _operator_overrides(conn, tid)
+        assert len(overrides) == 1
+        payload, ev_run = overrides[0]
+        assert ev_run == run_id
+        assert payload["action"] == "request-changes"
+        assert payload["reason"] == OPERATOR
+        assert payload["coverage_waived"] is True
+        assert payload["by_profile"] == "apollo"
+        assert not [
+            c for c in kb.list_comments(conn, tid)
+            if c.body.startswith("review_coverage:")
+        ]
+
+
+@pytest.mark.parametrize("profile", ["argus", "daedalus"])
+def test_operator_send_back_refused_for_non_operator_profile(
+    board: Path, monkeypatch: pytest.MonkeyPatch, profile: str,
+) -> None:
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+        ok, detail = kb.request_changes(
+            conn, tid, reason="rebase first", claimer=profile,
+            operator=OPERATOR,
+        )
+        assert ok is False
+        assert "--operator is for operator profiles" in detail
+        assert profile in detail
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+@pytest.mark.parametrize("reason", ["just bounce it", ": no who", "Ace:  "])
+def test_operator_send_back_needs_who_colon_why(board: Path, reason: str) -> None:
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+        ok, detail = kb.request_changes(
+            conn, tid, reason="rebase first", claimer="apollo", operator=reason,
+        )
+        assert ok is False and "<who: why>" in detail
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+def test_reviewer_run_without_coverage_is_still_refused(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate is unchanged for a dispatched reviewer: no coverage, no
+    send-back -- and it cannot borrow --operator either."""
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        review = kb.claim_review_task(conn, tid, claimer="argus:1")
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", expected_run_id=review.current_run_id,
+        )
+        assert ok is False and detail == kb._REVIEW_COVERAGE_MISSING
+        monkeypatch.setenv("HERMES_PROFILE", "argus")
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", expected_run_id=review.current_run_id,
+            operator=OPERATOR,
+        )
+        assert ok is False and "--operator is for operator profiles" in detail
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id == review.current_run_id
+        assert not _operator_overrides(conn, tid)
+
+
+def test_cli_operator_send_back_parked_review(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260927_090000_operator")
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+    rc = kc._cmd_request_changes(argparse.Namespace(
+        task_id=tid, reason=["rebase", "first"], coverage=None,
+        operator=OPERATOR,
+    ))
+    assert rc == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert len(_operator_overrides(conn, tid)) == 1
+        rework = [
+            c.body for c in kb.list_comments(conn, tid)
+            if c.body.startswith("changes requested (operator send-back,")
+        ]
+        assert rework == [
+            f"changes requested (operator send-back, {OPERATOR}): rebase first"
+        ]
+
+
+def test_cli_without_operator_still_needs_coverage(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260927_090000_operator")
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+    rc = kc._cmd_request_changes(argparse.Namespace(
+        task_id=tid, reason=["rebase", "first"], coverage=None,
+    ))
+    assert rc == 1
+    with kb.connect() as conn:
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+def test_foreign_card_operator_send_back_records_one_event(board: Path) -> None:
+    """On a foreign card the home guard also honours --operator; the send-back
+    and the guard must not both write an operator_override for one call."""
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET session_id = ? WHERE id = ?",
+                ("20260927_080000_homesess", tid),
+            )
+        with kb.mutation_actor(
+            session_ids=("20260927_090000_callersess",), profile="apollo",
+            operator=OPERATOR,
+        ):
+            ok, detail = kb.request_changes(
+                conn, tid, reason="rebase first", claimer="apollo",
+                operator=OPERATOR,
+            )
+        assert (ok, detail) == (True, "builder")
+        overrides = _operator_overrides(conn, tid)
+        assert len(overrides) == 1
+        assert overrides[0][0]["coverage_waived"] is True
+
+
+def test_dashboard_operator_send_back(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from plugins.kanban.dashboard import plugin_api
+
+    app = FastAPI()
+    app.include_router(plugin_api.router, prefix="/api/plugins/kanban")
+    client = TestClient(app)
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+    url = f"/api/plugins/kanban/tasks/{tid}/request-changes"
+    monkeypatch.setenv("HERMES_PROFILE", "argus")
+    refused = client.post(url, json={
+        "reason": "rebase first", "author": "argus", "operator": OPERATOR,
+    })
+    assert refused.status_code == 409
+    assert "--operator is for operator profiles" in refused.json()["detail"]
+    with kb.connect() as conn:
+        _assert_untouched(conn, tid, before, runs_before)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    ok = client.post(url, json={
+        "reason": "rebase first", "author": "apollo", "operator": OPERATOR,
+    })
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["implementer"] == "builder"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert len(_operator_overrides(conn, tid)) == 1

@@ -4468,7 +4468,9 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
     """Track visible root child names and immediate directory mtimes.
 
     Category mtimes detect skill additions/removals within categories; child
-    names detect flat skill additions/removals. Hidden telemetry/curator files
+    names detect flat skill additions/removals; second-level directory mtimes
+    detect SKILL.md added to/removed from an existing category/skill directory.
+    Hidden telemetry/curator files
     and directories never invalidate the index. /reload-skills picks up deeper
     edits such as a frontmatter rename.
     """
@@ -4481,8 +4483,21 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
                     if entry.name.startswith("."):
                         continue
                     try:
-                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        is_dir = entry.is_dir()
+                        mtime = entry.stat().st_mtime_ns if is_dir else -1
                         out.append((entry.path, mtime))
+                    except OSError:
+                        continue
+                    if not is_dir:
+                        continue
+                    # category/skill dirs: adding or removing SKILL.md inside
+                    # one changes only that dir's mtime (C7 k99).
+                    try:
+                        with os.scandir(entry.path) as children:
+                            for child in children:
+                                if child.name.startswith(".") or not child.is_dir():
+                                    continue
+                                out.append((child.path, child.stat().st_mtime_ns))
                     except OSError:
                         continue
         except OSError:
@@ -32893,10 +32908,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    # INFO carries size + latency only: the words are the user's
+                    # speech (passwords, PII) and INFO logs are long-lived (Backfill C3).
                     logger.info(
-                        "stt: chat=%s transcribed %d chars in %.1fs: %r",
+                        "stt: chat=%s transcribed %d chars in %.1fs",
                         _stt_chat, len(transcript), time.monotonic() - _stt_started,
-                        transcript[:60].replace("\n", " "),
                     )
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
@@ -33729,9 +33745,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"\n- … and {omitted} more completion(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
-        lines.append(
-            "If a result does not change the current conclusion, absorb it silently.]"
-        )
+        from tools.process_registry import COMPLETION_SILENCE_HINT
+        lines.append(f"{COMPLETION_SILENCE_HINT}]")
         return "\n".join(lines)
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
@@ -34108,12 +34123,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _format_coalesced_async_delegations(blocks: list[str]) -> str:
         """Join per-delegation formatted blocks into one consolidated turn."""
+        from tools.process_registry import COMPLETION_SILENCE_HINT
         header = (
             f"[IMPORTANT: {len(blocks)} background subagent delegations "
             "completed for this session. Treat these results as one "
             "completion batch and send at most one consolidated user-facing "
-            "response. If a result does not change the current conclusion, "
-            "absorb it silently.]"
+            "response. "
+            + COMPLETION_SILENCE_HINT + "]"
         )
         return "\n\n".join([header, *blocks])
 
@@ -34633,7 +34649,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
             }
-            cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
+            # from_global_config re-reads the file: memoize only if it still
+            # holds the bytes the key was hashed from (C7 k102).
+            try:
+                import hashlib as _hashlib
+                recheck = _hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                recheck = None
+            if recheck == digest:
+                cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)
         except Exception:
             return cls._empty_honcho_cache_busting_config()

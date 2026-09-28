@@ -364,3 +364,50 @@ def test_reinstall_after_manual_directory_removal_retains_pin(monkeypatch, tmp_p
 
     assert _git(target, "rev-parse", "HEAD") == old_sha
     assert _metadata(home)["demo"]["pinned"] is True
+
+
+def _pin_with_hostile_source(monkeypatch, tmp_path):
+    from hermes_cli.plugins_cmd import _install_plugin_core
+
+    repo, old_sha, _new_sha = _plugin_repo(tmp_path)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _install_plugin_core(repo.as_uri(), force=False, ref=old_sha)
+    source = f"{repo} $(touch {tmp_path}/pwned); echo"
+    meta_path = home / "plugins" / ".install-metadata.json"
+    meta = json.loads(meta_path.read_text())
+    meta["demo"]["source"] = source
+    meta_path.write_text(json.dumps(meta))
+    return source
+
+
+def _remedy_argv(text: str) -> list[str]:
+    import re
+    import shlex
+
+    match = re.search(r"`(hermes plugins install .*?)`", text, re.S)
+    assert match, text
+    return shlex.split(match.group(1))
+
+
+def test_pinned_update_remedy_shell_quotes_the_source(monkeypatch, tmp_path, capsys):
+    """The copy-paste remedy must pass the recorded source as ONE inert argv item (#1230 C4)."""
+    from hermes_cli.plugins_cmd import cmd_update
+
+    source = _pin_with_hostile_source(monkeypatch, tmp_path)
+    monkeypatch.setenv("COLUMNS", "1000")
+    with pytest.raises(SystemExit):
+        cmd_update("demo")
+    argv = _remedy_argv(capsys.readouterr().out)
+    assert argv[3] == source
+    assert argv[4:] == ["--force", "--ref", "<40-character", "commit", "SHA>"]
+
+
+def test_dashboard_pinned_remedy_shell_quotes_the_source(monkeypatch, tmp_path):
+    from hermes_cli.plugins_cmd import dashboard_update_user_plugin
+
+    source = _pin_with_hostile_source(monkeypatch, tmp_path)
+    result = dashboard_update_user_plugin("demo")
+    assert result["ok"] is False
+    argv = _remedy_argv(result["error"])
+    assert argv[3] == source

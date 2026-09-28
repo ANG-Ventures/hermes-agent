@@ -435,6 +435,19 @@ def note_fallback_success(store: StickyStore, key: StickyKey, now: float,
     return state
 
 
+def note_compaction(store: StickyStore, key: StickyKey, now: float) -> Optional[StickyState]:
+    """§4.3 ``compaction`` input: stamp ``last_compaction_epoch`` on the
+    active episode. Called after every completed compaction, in place or
+    rotating (in-place mode never rotates ``session_id``). No-op without an
+    active episode."""
+    state = _load(store, key)
+    if state is None or not state.active:
+        return state
+    state.last_compaction_epoch = now
+    store.put(key, state, now)
+    return state
+
+
 def seat_from_response(provider: Optional[str],
                        headers: Optional[Mapping[str, str]]) -> Optional[str]:
     """D6 seat: ``x-pool-served-by`` on a pooled response; the provider name
@@ -501,6 +514,11 @@ class Eligibility:
     # t_90d3bd12). None = unknown, stale or an older relay: today's behaviour.
     bound_box_free: Optional[int] = None
     warm_box_free: Optional[int] = None
+    # t_bbe0023c: warm holders the relay dropped for an active model cap
+    # (``warm_skip: "model_capped"``). The relay only lists copies still inside
+    # their window, so a non-empty list = "warm copy exists, not eligible".
+    warm_skip: Optional[str] = None
+    warm_skipped: Tuple[str, ...] = ()
 
 
 def _opt_int(v: Any) -> Optional[int]:
@@ -544,6 +562,9 @@ def parse_eligibility(obj: Any) -> Optional[Eligibility]:
         warm_refusal=obj.get("warm_refusal"),
         bound_box_free=_opt_int(obj.get("bound_box_free")),
         warm_box_free=_opt_int(obj.get("warm_box_free")),
+        warm_skip=str(obj.get("warm_skip")) if obj.get("warm_skip") else None,
+        warm_skipped=tuple(str(x) for x in (obj.get("warm_skipped") or ())
+                           if x) if isinstance(obj.get("warm_skipped"), (list, tuple)) else (),
     )
 
 
@@ -685,9 +706,13 @@ def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str
 
     * ``"return_now"`` - enforce, ``warm_eligible`` and age < window;
     * ``"refuse"``     - refusal half (shadow|enforce, ``warm_refusal`` on,
-      session in the A/B arm): a warm copy exists but no warm seat is eligible;
+      session in the A/B arm): a warm copy exists but no warm seat is eligible.
+      A copy the relay dropped for a model cap (``warm_skipped``) counts as
+      "warm copy exists, not eligible" (t_e001a935, fallback spec D6);
     * ``"cap"``        - refusal half, but the primary's warm copy has expired
-      or has no entry: waiting saves nothing (hard cap, pass-1 B1);
+      or has no entry. Telemetry only: :func:`restore_allowed` no longer
+      returns early on it (Ace 2026-09-25 19:35 "do not bother returning
+      early"; D6 rejects the warm-seat spec P3 hard cap, Apollo t_e001a935);
     * ``None``         - the fallback spec rule unchanged (relay unreachable, no
       warm fields, ``off``, ``warm_refusal=off``, control arm, or shadow with a
       warm eligible seat).
@@ -698,7 +723,8 @@ def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str
     if mode not in ("shadow", "enforce"):
         return None
     age, win = elig.warm_age_s, elig.warm_window_s
-    has_copy = age is not None and win is not None and age < win
+    has_copy = ((age is not None and win is not None and age < win)
+                or (elig.warm_skip is not None and bool(elig.warm_skipped)))
     if mode == "enforce" and elig.warm_eligible and has_copy:
         return "return_now"
     if elig.warm_refusal == "off" or not refusal_arm:
@@ -765,19 +791,22 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
             if ok:
                 return Decision(True, "warm_seat", why, exp, warm)
             reasons.append(why)
-        if verdict == "cap":
-            return Decision(True, "cap_expiry",
-                            "cap_expiry: primary warm copy expired or absent", exp, warm)
+        # verdict == "cap" (primary warm copy expired/absent) does NOT return
+        # here: the fallback copy may still be warm, and D6 waits for
+        # fallback_cold/compaction below (t_e001a935; no cap_expiry branch).
     last_fb = state.last_fallback_call_epoch
     if last_fb is None:
         last_fb = state.entered_at
     if last_fb is not None and now - last_fb > FALLBACK_COLD_S:
         return Decision(True, "fallback_cold", f"fallback idle {now - last_fb:.0f}s", exp, warm)
     reasons.append("fallback_cold: last fallback call <= 60 min ago")
+    lc = state.last_compaction_epoch
+    if lc is not None and last_fb is not None and lc > last_fb:
+        return Decision(True, "compaction", "compaction ran since last fallback call", exp, warm)
     if (live_session_id and state.last_fallback_session_id
             and live_session_id != state.last_fallback_session_id):
         return Decision(True, "compaction", "session_id rotated since last fallback call", exp, warm)
-    reasons.append("compaction: no session_id rotation")
+    reasons.append("compaction: none since last fallback call")
     if verdict == "refuse":
         return Decision(False, None, "no_warm_primary_seat", exp, warm)
     if box_full:

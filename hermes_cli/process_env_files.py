@@ -137,10 +137,14 @@ def strip_overlay(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
             # PATH is routinely re-edited after start (venv/tool dirs), so match
             # components rather than the whole value: drop only what we added.
             before = set((old or "").split(os.pathsep))
+            after = set(new.split(os.pathsep))
             added = {p for p in new.split(os.pathsep) if p and p not in before}
-            env["PATH"] = os.pathsep.join(
-                p for p in env["PATH"].split(os.pathsep) if p not in added
-            )
+            kept = [p for p in env["PATH"].split(os.pathsep) if p not in added]
+            # ...and put back what the overlay REMOVED (a file that replaced
+            # PATH rather than prepending to it), in original order (C7 k114).
+            kept += [p for p in (old or "").split(os.pathsep)
+                     if p and p not in after and p not in kept]
+            env["PATH"] = os.pathsep.join(kept)
             continue
         if env.get(key) != new:
             continue

@@ -241,6 +241,20 @@ def _build_turn_handoff(agent, messages, turn_start_idx, reason):
     }
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Persist a rename's directory entry where the platform supports it."""
+    try:
+        dfd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
 def write_turn_handoff(
     session_key: str,
     handoff: Optional[Dict[str, Any]],
@@ -257,7 +271,11 @@ def write_turn_handoff(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(handoff, fh)
+                # Durable before the saved notice goes out (C7 k86).
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
+            _fsync_dir(path.parent)
         except Exception:
             try:
                 os.unlink(tmp)
@@ -345,6 +363,32 @@ def consume_turn_handoff(
     bad payload cannot be retried on every subsequent turn.
     """
     return _load_turn_handoff(session_key, root=root, consume=True)
+
+
+def discard_turn_handoff(
+    session_key: str,
+    *,
+    root: Optional[Path] = None,
+) -> bool:
+    """Delete any handoff saved for ``session_key``. Never raises.
+
+    Handoffs are keyed by the stable chat key, which OUTLIVES a conversation:
+    ``/new``, ``/reset``, idle/daily auto-reset and ``/resume`` all mint or
+    switch the session id under the same key. The session store calls this at
+    each of those boundaries so the first turn of the next conversation cannot
+    inject the discarded conversation's request, results and tool re-issue
+    instruction. Returns True when a file was removed.
+    """
+    if not session_key:
+        return False
+    try:
+        handoff_path_for(session_key, root=root).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logger.debug("turn handoff discard failed for %s", session_key, exc_info=True)
+        return False
 
 
 def prune_expired_handoffs(*, root: Optional[Path] = None) -> int:
@@ -455,6 +499,19 @@ def format_handoff_notice(handoff: Optional[Dict[str, Any]]) -> str:
     )
 
 
+def _redact_tool_text(value: Any) -> str:
+    """Tool arguments/results in the handoff reach chat via /resume-handoff and
+    the next turn's context: redact credentials first (Backfill C3). Fails
+    closed to a placeholder, never to the raw text."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            "" if value is None else str(value), force=True, redact_url_credentials=True)
+    except Exception:
+        return "<redaction unavailable>"
+
+
 def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
     """Render the handoff as context text injected into the next turn."""
     if not handoff or not isinstance(handoff, dict):
@@ -474,17 +531,19 @@ def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
     if calls:
         lines.append("\nTool calls issued this turn:")
         for call in calls:
-            status = "completed" if call.get("completed") else "NEVER COMPLETED"
-            lines.append(f"- {call.get('name')}({call.get('arguments')}) [{status}]")
+            status = "completed" if call.get("completed") else "NO RESULT RECORDED"
+            args = _redact_tool_text(call.get("arguments"))
+            lines.append(f"- {call.get('name')}({args}) [{status}]")
             if call.get("result_preview"):
-                lines.append(f"  result: {call['result_preview']}")
+                lines.append(f"  result: {_redact_tool_text(call['result_preview'])}")
     todos = handoff.get("open_todos") or []
     if todos:
         lines.append("\nStill open:")
         for todo in todos:
             lines.append(f"- [{todo.get('status')}] {todo.get('content')}")
     lines.append(
-        "\nContinue from here. Do not redo completed tool calls; re-issue the "
-        "one that never completed."
+        "\nContinue from here. Do not redo completed tool calls. A call with no "
+        "result recorded may still have run its side effect before the cut: "
+        "verify its outcome before re-issuing it."
     )
     return "\n".join(lines)

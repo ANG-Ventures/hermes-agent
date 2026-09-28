@@ -102,7 +102,9 @@ _in_flight_worker.conns = []
 def _running(board, now, pid, *, progress_at, started_ago=1800):
     tid = kb.create_task(board, title="waiting on capped pool", assignee="argus")
     task = kb.claim_task(board, tid)
-    board.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+    # Record the pid the way the dispatcher does (with its ``spawned`` event):
+    # termination signals only a worker bounded by that record (#1021).
+    assert kb._set_worker_pid(board, tid, pid, run_id=task.current_run_id)
     board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now - started_ago, task.current_run_id))
     board.commit()
     if progress_at is not None:
@@ -150,7 +152,7 @@ def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, m
         again = _in_flight_worker(silent_server, fake_cpu)
         claimed = kb.claim_task(board, tid)
         board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now - 1500, claimed.current_run_id))
-        board.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (again.pid, tid))
+        assert kb._set_worker_pid(board, tid, again.pid, run_id=claimed.current_run_id)
         # The faked clock has advanced 600 s past the REAL one, so claim_task
         # stamped its ``claimed`` event in the future of this worker's real
         # creation. The owner-identity window (t_0ae83825) would then read the

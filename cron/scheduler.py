@@ -3601,10 +3601,17 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
         if not armed:
             return content, targets
         producers = _host_down_producers(job)
-        # The owner deadman's own DOWN/recovery notes are exempt.
-        if set(producers) & {a["owner"] for a in armed.values()}:
-            return content, targets
-        hosts = _host_down_decision(content or "", cfg, armed, producers)
+        # The owner deadman's own DOWN/recovery notes are exempt -- for the
+        # host it owns only. A note that names only OTHER down hosts is gated.
+        owned = {h for h, a in armed.items() if a["owner"] in producers}
+        if owned:
+            others = set(armed) - owned
+            named = _host_down_named(content or "", cfg)
+            if not others or not named or named - others:
+                return content, targets
+            hosts = sorted(named)
+        else:
+            hosts = _host_down_decision(content or "", cfg, armed, producers)
         if not hosts:
             return content, targets
         first = armed[hosts[0]]
@@ -8649,6 +8656,9 @@ def _run_one_job_body(
                         delivery_error = _deliver_result(
                             job,
                             deliver_content,
+                            # Without this a FAILED run wore the success header
+                            # ("✅ Cronjob Response") over its own failure body.
+                            success=success,
                             adapters=adapters,
                             loop=loop,
                         )
@@ -8821,6 +8831,7 @@ def _run_one_job_body(
                             _summarize_cron_failure_for_delivery(job, _err_text)
                             + _failure_streak_nudge(job)
                         ),
+                        success=False,
                         adapters=adapters,
                         loop=loop,
                     )

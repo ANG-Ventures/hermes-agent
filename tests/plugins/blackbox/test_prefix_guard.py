@@ -436,3 +436,20 @@ def test_render_alert_shape():
     assert "• Cache read tokens: 199,607 → 14,947" in lines
     assert "• 2 more session(s) hit this since the last page" in lines
     assert ("T" * 32) in body and ("T" * 33) not in body
+
+
+def test_send_alert_targets_logs_not_alerts(monkeypatch, tmp_path):
+    """The prefix-mutation notice is an observation, not a fault: it goes to
+    #logs; #alerts is failure-only (noise r4, t_6bedca00)."""
+    from plugins.blackbox import sentinel
+
+    script = tmp_path / "notify.py"
+    script.write_text("")
+    monkeypatch.setattr(sentinel, "_notify_script", lambda: script)
+    calls = []
+    monkeypatch.setattr(pg.subprocess, "run",
+                        lambda argv, **kw: calls.append(argv) or SimpleNamespace(returncode=0))
+    assert pg.send_alert("body") is True
+    argv = calls[0]
+    assert argv[argv.index("--target") + 1] == pg.LOGS_CHANNEL_ID == "1480525090331561984"
+    assert sentinel.ALERTS_CHANNEL_ID not in argv

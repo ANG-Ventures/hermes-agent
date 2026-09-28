@@ -57,7 +57,9 @@ from agent.fork_ext.relay_headers import (
     _pool_affinity_headers,
     _pool_lane,
     _pool_lane_src,
+    call_id_of,
     merge_pool_capability_headers,
+    stamp_call_id,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -158,17 +160,31 @@ def _codex_sub_key(agent: Any) -> Optional[str]:
 
 def _api_call_identity(agent: Any, headers: dict[str, str]) -> tuple[Optional[str], str]:
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    return _route_identity(provider, headers, agent)
+
+
+def _route_identity(
+    provider: str, headers: dict[str, str], agent: Any = None,
+    *, codex_from_agent: bool = True,
+) -> tuple[Optional[str], str]:
+    """``(sub_key, attribution)`` for one call on ``provider``.
+
+    One rule set for the main-lane call and composite (MoA) physical calls.
+    ``codex_from_agent=False`` for a physical call that did not run on the
+    agent's own credential pool (an advisor), whose codex account is unknown.
+    """
     served_by = headers.get("x-pool-served-by")
     if served_by:
         if _POOL_SUB_KEY_RE.fullmatch(served_by):
             return served_by, "wire"
-        _note_api_call_recording_failure(agent)
+        if agent is not None:
+            _note_api_call_recording_failure(agent)
         logger.warning("invalid x-pool-served-by value; recording NULL identity")
     if _PINNED_CLAUDE_PROVIDER_RE.fullmatch(provider):
         return provider, "pinned"
     if provider in _PINNED_PROVIDER_KEYS:
         return _PINNED_PROVIDER_KEYS[provider], "pinned"
-    if provider == "openai-codex":
+    if provider == "openai-codex" and codex_from_agent and agent is not None:
         return _codex_sub_key(agent), "wire"
     return None, "wire"
 
@@ -214,17 +230,18 @@ def _emit_api_call_record(
     headers: Optional[dict[str, str]] = None,
     http_status: Optional[int] = None,
     api_kwargs: Optional[dict] = None,
-) -> None:
+) -> Optional[int]:
     """Fail-open bridge from the inference chokepoint to Blackbox.
 
     An empty turn id means no conversation turn is in progress (startup probes
     and provider health checks); those calls intentionally have no parent
-    ``turns`` row and are outside the per-turn ledger contract.
+    ``turns`` row and are outside the per-turn ledger contract. Returns the
+    row's seq once it was handed to Blackbox, else None.
     """
     try:
         turn_id = str(getattr(agent, "_current_turn_id", "") or "")
         if not turn_id:
-            return
+            return None
         provider = str(getattr(agent, "provider", "") or "")
         model = str(getattr(agent, "model", "") or "")
         pool_headers = dict(headers or {})
@@ -261,14 +278,17 @@ def _emit_api_call_record(
             relay_synthetic="x-pool-unreachable" in pool_headers,
             route_id=pool_headers.get("x-pool-route-id"),
             cache_ttl_requested=_requested_cache_ttl(api_kwargs),
+            call_id=call_id_of(api_kwargs),
             api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
             session_key=session_key or None,
             prefix_reset=str(prefix_reset) if prefix_reset else None,
             prefix_compare_across_turns=not is_review_fork,
         )
+        return seq
     except Exception:
         _note_api_call_recording_failure(agent)
         logger.warning("blackbox API-call attribution insert failed", exc_info=True)
+        return None
 
 
 
@@ -373,13 +393,78 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     from agent import fallback_wiring as _fw
 
     _fw.note_success(agent, headers if isinstance(headers, dict) else None)
-    _emit_api_call_record(
+    seq = _emit_api_call_record(
         agent,
         usage=getattr(response, "usage", None),
         headers=headers if isinstance(headers, dict) else {},
         http_status=200,
         api_kwargs=api_kwargs,
     )
+    # The latest successful row is the one the loop's accept site commits; a
+    # composite (MoA) call hangs its physical children off it.
+    agent._blackbox_last_ok_call = (
+        (str(getattr(agent, "_current_turn_id", "") or ""), seq)
+        if seq is not None else None
+    )
+
+
+def _emit_composite_api_call_records(
+    agent: Any,
+    pricing_calls: Any,
+    *,
+    sub_harness: str,
+) -> int:
+    """Ledger a composite call's physical calls as children of its virtual row.
+
+    ``pricing_calls`` are the physical advisor + aggregator records built by
+    ``conversation_loop._build_moa_pricing_calls`` (real provider/model/usage
+    per call). The parent is the row ``_record_successful_api_call`` wrote for
+    the accepted composite response in THIS turn. Each child takes a seq from
+    the turn's shared allocator. Returns the number of children handed to
+    Blackbox. Fail-open: telemetry never breaks the turn.
+    """
+    try:
+        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+        last = getattr(agent, "_blackbox_last_ok_call", None)
+        agent._blackbox_last_ok_call = None  # one composite per accepted row
+        if not turn_id or not isinstance(last, tuple) or last[0] != turn_id:
+            return 0
+        calls = [c for c in (pricing_calls or []) if isinstance(c, dict)]
+        if not calls:
+            return 0
+        rows = []
+        now = time.time()
+        for call in calls:
+            provider = str(call.get("provider") or "")
+            headers = call.get("pool_headers")
+            headers = dict(headers) if isinstance(headers, dict) else {}
+            sub_key, attribution = _route_identity(
+                provider.strip().lower(), headers, agent, codex_from_agent=False,
+            )
+            rows.append({
+                **{k: call.get(k) for k in (
+                    "input_tokens", "output_tokens", "cache_read_tokens",
+                    "cache_write_tokens", "reasoning_tokens")},
+                "seq": _next_api_call_seq(agent, turn_id),
+                "ts": now,
+                "provider": provider,
+                "model": str(call.get("model") or ""),
+                "sub_key": sub_key,
+                "attribution": attribution,
+                "http_status": call.get("http_status", 200),
+                "route_id": headers.get("x-pool-route-id"),
+            })
+        from plugins.blackbox import record_composite_calls
+
+        record_composite_calls(
+            turn_id=turn_id, parent_seq=last[1], sub_harness=sub_harness,
+            calls=rows,
+        )
+        return len(rows)
+    except Exception:
+        _note_api_call_recording_failure(agent)
+        logger.warning("blackbox composite API-call insert failed", exc_info=True)
+        return 0
 
 
 
@@ -1767,6 +1852,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
+    # One fresh correlation id per HTTP attempt (bridge lanes only); the ledger
+    # row for this attempt reads the same value back off api_kwargs.
+    stamp_call_id(agent, api_kwargs)
     if should_use_direct_api_call(agent):
         try:
             response = direct_api_call(agent, api_kwargs)
@@ -6560,6 +6648,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
                 result["failure_recorded"] = False
+                # Fresh correlation id per stream attempt (bridge lanes only).
+                stamp_call_id(agent, api_kwargs)
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),

@@ -112,6 +112,21 @@ def test_cap_refuses_the_seventh_server_until_a_slot_frees(repo, caplog):
     assert host_slots.held_count(6) == 0
 
 
+def test_unwritable_slot_dir_skips_lsp_instead_of_raising(repo, monkeypatch, tmp_path):
+    """Slot-file I/O errors must not escape enabled_for() into write_file (#1019 C4)."""
+    not_a_dir = tmp_path / "lock-dir-is-a-file"
+    not_a_dir.write_text("")
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(not_a_dir))  # mkdir(<file>/lsp-slots) -> OSError
+    f = str(repo.path / "x.py")
+    svc = _service(max_servers_per_host=3)
+    try:
+        assert svc.enabled_for(f) is False
+        svc.snapshot_baseline(f)  # the pre-write hook must not raise either
+        assert repo.spawns == []
+    finally:
+        svc.shutdown()
+
+
 def test_config_default_cap_reaches_the_service(repo):
     """The shipped default is the value a worker with no ``lsp.max_servers_per_host`` key runs under."""
     from hermes_cli.config_defaults import DEFAULT_CONFIG

@@ -161,6 +161,15 @@ class TestProviderQuotaState:
         }}
         assert provider_quota_state("claude-apx-1", snap).eligible is True
 
+    @pytest.mark.parametrize("observed_at", [None, "", "not-a-date"])
+    def test_missing_or_unparseable_observed_at_fails_open(self, observed_at):
+        """No provable observation time is not evidence of exhaustion (#813 C4)."""
+        account = {"windows": [_win("seven_day", 100.0, "rejected", 3 * 86400)]}
+        if observed_at is not None:
+            account["observed_at"] = observed_at
+        state = provider_quota_state("claude-apx-1", {"claude-apx-1": account})
+        assert state.eligible is True
+
 
 # ── one-pass chain pruning ──────────────────────────────────────────────
 

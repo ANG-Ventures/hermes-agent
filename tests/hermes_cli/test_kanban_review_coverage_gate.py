@@ -271,6 +271,9 @@ def test_na_applicability_reason_accepted(review, reason):
     'n/a: no mutation tool available here', 'n/a: mutmut missing on host',
     'n/a: budget exhausted', 'n/a: c\u200bould n\u200bot run',
     'n/a: \uff43ould not run',  # fullwidth 'c' folds under NFKC
+    # FleetReview #999: the "can't" contraction (ASCII and curly apostrophe).
+    "n/a: can't run mutation tests", 'n/a: can’t run mutation tests',
+    'n/a: we couldn’t run it', 'n/a: didn’t run the suite',
     # Deliberately conservative: an inability WORD anywhere is refused, so an
     # applicability claim must be phrased without it ("do not differ").
     'n/a: no provider code touched, so vendors cannot differ',

@@ -284,6 +284,39 @@ def test_compaction_branch(store, key):
                                   live_session_id="sid-a").allowed
 
 
+def test_compaction_branch_in_place_no_rotation(store, key):
+    """compression.in_place=true (default) never rotates session_id; the
+    marker written by note_compaction drives the §4.3 compaction branch."""
+    _sticky_on_fallback(store, key)
+    assert not fp.restore_allowed(store.get(key), T0 + 300, probe=False,
+                                  live_session_id="sid-a").allowed
+    fp.note_compaction(store, key, T0 + 200)
+    d = fp.restore_allowed(store.get(key), T0 + 300, probe=False, live_session_id="sid-a")
+    assert d.allowed and d.branch == "compaction"
+    # a fallback call AFTER the compaction re-warms the fallback: no return
+    fp.note_fallback_success(store, key, T0 + 250, "sid-a")
+    d = fp.restore_allowed(store.get(key), T0 + 300, probe=False, live_session_id="sid-a")
+    assert not d.allowed and "compaction: none since last fallback call" in d.reason
+
+
+def test_note_compaction_ignores_inactive_episode(store, key):
+    assert fp.note_compaction(store, key, T0) is None
+    _sticky_on_fallback(store, key)
+    fp.record_return(store, key, T0 + 10, "fallback_cold")
+    assert fp.note_compaction(store, key, T0 + 20).last_compaction_epoch is None
+
+
+def test_compaction_marker_survives_db_only_restart(tmp_path, key):
+    """pass-10 G1: the marker is write-through, so a restarted process
+    (DB only) still evaluates the compaction branch."""
+    s1 = StickyStore(db_path=tmp_path / "t.db")
+    _sticky_on_fallback(s1, key)
+    fp.note_compaction(s1, key, T0 + 100)
+    s2 = StickyStore(db_path=tmp_path / "t.db")
+    r = fp.decide_rebuild(s2, key, T0 + 600, live_session_id="sid-a", eligibility=lambda: None)
+    assert r.action == "return" and r.decision.branch == "compaction"
+
+
 def test_nothing_but_fallback_failed_returns_before_until(store, key):
     st = _sticky_on_fallback(store, key, cls="quota_model")
     elig = _elig({"instance_id": "x", "bound_seat": "sub-vps-6", "bound_eligible": True,
@@ -925,6 +958,25 @@ def test_wiring_restore_refused_then_fallback_cold_return(wired):
     assert _state(a).active is False
 
 
+def test_wiring_in_place_compaction_returns_via_compaction(wired):
+    """In-place compaction keeps session_id; the wiring marker alone lets the
+    next boundary return with branch=compaction (t_2b064101)."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    _age_episode(a, fallback_idle=10 * 60)
+    st = _state(a)
+    st.last_primary_call_epoch = None  # no warm seat: only compaction can return
+    fss.default_store().put(_fw.key_for(a), st, _time.time())
+    assert _restore(a) is False
+    _fw.note_compaction(a)
+    assert a.session_id == SID
+    assert _restore(a) is True
+    assert (a.provider, a.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "compaction"
+
+
 def test_wiring_failover_fallback_failed_failover(wired):
     """failover -> fallback_failed -> failover within one turn: 2 failover
     rows + 1 recovery row, 3 route-change lines, both failovers announced;
@@ -1487,22 +1539,51 @@ def test_warm_refusal_returns_on_compaction(store, key):
     assert d.allowed and d.branch == "compaction"
 
 
-@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
-def test_warm_hard_cap_primary_copy_expired_or_absent(store, key, age):
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_warm_capped_copy_refuses_while_fallback_warm(store, key, mode):
+    """t_e001a935 / rig arm C: the relay dropped the primary's warm copy for a
+    model cap (warm_skip). That is "warm copy exists, not eligible" -> refuse,
+    never cap_expiry while the fallback copy is still warm (D6)."""
     st = _sticky_on_fallback(store, key)
-    d = _gate(st, T0 + 200, _warm("shadow", eligible=None, age=age, bound_eligible=False))
-    assert d.allowed and d.branch == "cap_expiry"
-    assert fp.recovery_row(st, d, T0 + 200)["expected_warm"] is False
-    assert "expired" in fp.format_recovery_rider(fp.recovery_row(st, d, T0 + 200))
+    obj = {**_warm(mode, eligible=None, age=None, bound_seat="sub-vps-6",
+                   bound_eligible=False),
+           "warm_skip": "model_capped", "warm_skipped": ["sub-vps-6"]}
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.reason == "no_warm_primary_seat"
+    assert d.warm["warm_gate"] == "refuse"
+    # then return normally: fallback cold (> 1h idle) or compaction
+    assert _gate(st, T0 + 1 + 61 * 60, obj).branch == "fallback_cold"
+    assert _gate(st, T0 + 200, obj, sid="sid-b").branch == "compaction"
 
 
-def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
+def test_parse_eligibility_warm_skip_fields():
+    e = fp.parse_eligibility({**_warm(), "warm_skip": "model_capped",
+                              "warm_skipped": ["sub-vps-6", ""]})
+    assert (e.warm_skip, e.warm_skipped) == ("model_capped", ("sub-vps-6",))
+    e = fp.parse_eligibility({**_warm(), "warm_skip": None, "warm_skipped": "junk"})
+    assert (e.warm_skip, e.warm_skipped) == (None, ())
+    assert fp.parse_eligibility(_warm()).warm_skipped == ()
+
+
+@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
+def test_warm_expired_copy_no_cap_expiry_while_fallback_warm(store, key, age):
+    """Ace 2026-09-25 19:35 "do not bother returning early": the warm-seat spec
+    P3 hard cap is rejected (fallback spec D6, Apollo ruling t_e001a935)."""
+    st = _sticky_on_fallback(store, key)
+    obj = _warm("shadow", eligible=None, age=age, bound_eligible=False)
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.branch is None
+    assert d.warm["warm_gate"] == "cap"
+    d = _gate(st, T0 + 1 + 61 * 60, obj)
+    assert d.allowed and d.branch == "fallback_cold"
+
+
+def test_warm_active_session_never_returns_early_on_cap(store, key):
     """Fallback called every 2 min for 3h (never cold); the relay's warm copy
-    of the primary ages from the last primary call with a 1h-tier window
-    (3300 s). The return lands no later than 55 min after that call."""
+    of the primary expires at 55 min. No cap_expiry return while the fallback
+    copy stays warm; the session stays sticky (D6, no time cap)."""
     last_primary = T0 - 60
     st = _sticky_on_fallback(store, key, last_primary=last_primary)
-    returned_at = None
     t = T0 + 120
     while t <= T0 + 3 * 3600:
         fp.note_fallback_success(store, key, t, "sid-a")
@@ -1511,14 +1592,8 @@ def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
         obj = _warm("enforce", eligible=None, age=age if age < 3300 else None,
                     bound_eligible=False)
         d = _gate(st, t + 1, obj)
-        if d.allowed:
-            returned_at = t + 1
-            assert d.branch == "cap_expiry"
-            break
-        assert d.reason == "no_warm_primary_seat"
+        assert not d.allowed and d.branch != "cap_expiry"
         t += 120
-    assert returned_at is not None
-    assert returned_at - last_primary <= 55 * 60 + 120  # first boundary after expiry
 
 
 @pytest.mark.parametrize("obj", [

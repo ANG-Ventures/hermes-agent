@@ -473,6 +473,19 @@ def attribute_unclean_exit(
         return {"killer": "unattributed", "reason": "probe_failed:%s" % exc}
 
 
+def _iso_not_before(value: Any, floor: Any) -> bool:
+    """``value >= floor`` for ISO timestamps; True when either is unparseable."""
+    try:
+        v, f = datetime.fromisoformat(value), datetime.fromisoformat(floor)
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        if f.tzinfo is None:
+            f = f.replace(tzinfo=timezone.utc)
+        return v >= f
+    except (TypeError, ValueError):
+        return True
+
+
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Inspect the previous life's sentinel; return an evidence dict when it
     died uncleanly, else ``None``.  Read-only — does not rewrite the sentinel.
@@ -496,6 +509,14 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
 
         hb = _read_json(get_loop_heartbeat_path(home))
     except Exception:
+        hb = None
+    # The heartbeat file outlives its writer: a life that died before its first
+    # heartbeat leaves an OLDER life's file behind. Only use it when it names
+    # the dead process and postdates its start (pid reuse) (C7 k95).
+    if hb and not (
+        hb.get("pid") == sentinel.get("pid")
+        and _iso_not_before(hb.get("updated_at"), sentinel.get("started_at"))
+    ):
         hb = None
     if hb:
         evidence["last_heartbeat_at"] = hb.get("updated_at")

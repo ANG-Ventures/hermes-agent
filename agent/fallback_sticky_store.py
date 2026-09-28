@@ -75,6 +75,10 @@ class StickyState:
     entered_at: Optional[float] = None
     last_fallback_call_epoch: Optional[float] = None
     last_fallback_session_id: Optional[str] = None
+    # §4.3 ``compaction`` marker: epoch of the last compaction on this lineage
+    # while the episode was active. Written in BOTH compaction modes; the only
+    # signal under the default ``compression.in_place: true`` (no id rotation).
+    last_compaction_epoch: Optional[float] = None
     turns_on_fallback: int = 0
     ff_disabled_until: float = 0.0
     last_primary_call_epoch: Optional[float] = None

@@ -1819,3 +1819,28 @@ def test_complete_schema_exposes_superseded_by():
     props = KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
     assert "superseded_by" in props
     assert props["superseded_by"]["type"] == "string"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 123, ["abc"]])
+def test_attach_path_rejects_invalid_supplied_digest(worker_env, tmp_path, monkeypatch, bad):
+    """C7 k138: an invalid expected_sha256 is refused, never ignored."""
+    from agent.delegation_context import KANBAN_OWNER_PID_ENV
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Run under a dispatched worker, the inherited owner stamp would refuse
+    # every mutation before the digest check is reached.
+    monkeypatch.delenv(KANBAN_OWNER_PID_ENV, raising=False)
+
+    src = tmp_path / "artifact.txt"
+    src.write_bytes(b"payload\n")
+    result = json.loads(kt._handle_attach({
+        "task_id": worker_env, "path": str(src), "expected_sha256": bad,
+    }))
+    assert result.get("ok") is not True, result
+    assert "expected_sha256" in result.get("error", ""), result
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
