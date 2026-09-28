@@ -1528,6 +1528,11 @@ def _base(repo, published):
     return min(candidates)[1]
 
 
+#: A full object id (SHA-1 or SHA-256); anything else in `bases` is not a
+#: base and must never reach git's argv, where it could parse as an option.
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
 def _recorded_base(repo, recorded, published, base):
     """``recorded`` when it is a safe, NEWER base than ``base``; else ``base``.
 
@@ -1541,26 +1546,22 @@ def _recorded_base(repo, recorded, published, base):
     local remote-tracking ref of a branch the durable remote still advertises
     -- a recoverer can then fetch it from that branch. Otherwise nothing changes.
     """
-    if not recorded or recorded == base:
+    if not isinstance(recorded, str) or not _OBJECT_ID.fullmatch(recorded) or recorded == base:
         return base
-    if not _present_commits(repo, [recorded]):
+    # ONE spawn answers presence and containment for every tracking ref at
+    # once (a missing object exits non-zero). A per-published-head loop here
+    # starves the terminal transition on a many-headed fork
+    # (test_kanban_terminal_transition_ref_cost), so it is checked first.
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}" for ref in published}
+    listed = _git(repo, "for-each-ref", "--contains", recorded, "--format=%(refname)",
+                  "refs/remotes", check=False)
+    if listed.returncode or not advertised.intersection(
+            listed.stdout.decode("utf-8", "replace").splitlines()):
         return base
     if _git(repo, "merge-base", "--is-ancestor", recorded, "HEAD", check=False).returncode:
         return base
     if base is not None and _git(repo, "merge-base", "--is-ancestor", base, recorded,
                                  check=False).returncode:
-        return base
-    tracked = []
-    for ref in published:
-        name = f"refs/remotes/{ref['remote']}/{ref['branch']}"
-        sha = _git(repo, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}", check=False)
-        if sha.returncode == 0:
-            tracked.append(sha.stdout.decode().strip())
-    tracked = _present_commits(repo, sorted(set(tracked)))
-    if not tracked:
-        return base
-    walked = _rev_list(repo, recorded, tracked)
-    if walked.returncode or walked.stdout.strip():
         return base
     return recorded
 
