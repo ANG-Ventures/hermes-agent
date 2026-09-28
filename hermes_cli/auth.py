@@ -9380,9 +9380,14 @@ def _kimi_poll_device_token(
 
 def _kimi_oauth_login(
     *, open_browser: bool = True, timeout_seconds: float = 15.0,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = time.sleep, label: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the Kimi device flow, persist tokens to auth.json, return the state."""
+    """Run the Kimi device flow, persist tokens to auth.json, return the state.
+
+    ``label`` is stored in the same single write as the tokens. A second
+    write of the returned state after this one could restore a refresh
+    token another process already rotated.
+    """
     prior = get_provider_auth_state("kimi-oauth") or {}
     # Re-login keeps the host's device id so Kimi sees one stable device.
     device_id = str(prior.get("device_id") or uuid.uuid4())
@@ -9415,6 +9420,8 @@ def _kimi_oauth_login(
 
     base = {k: v for k, v in prior.items() if k in ("inference_base_url", "label")}
     base["device_id"] = device_id
+    if label:
+        base["label"] = label
     state = _kimi_state_from_token_payload(token, prior=base)
     _kimi_oauth_write_state(state, set_active=False)
     mark_provider_active_if_unset("kimi-oauth")

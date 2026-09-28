@@ -702,29 +702,58 @@ def _kimi_coding_attribution_headers() -> dict:
     }
 
 
-def _kimi_oauth_token_provider_for(api_key):
-    """Return a per-request token provider when *api_key* is a kimi-oauth JWT.
-
-    Kimi membership access tokens are JWTs whose ``client_id`` claim is the
-    public Kimi CLI client id. ``sk-kimi-`` API keys and anything else return
-    None and keep the static-key path.
-    """
-    if not isinstance(api_key, str) or api_key.count(".") != 2:
+def _kimi_jwt_claims(token):
+    """Decoded (unverified) JWT payload claims, or None."""
+    if not isinstance(token, str) or token.count(".") != 2:
         return None
     try:
         import base64 as _b64
         import json as _json
 
-        from hermes_cli.auth import KIMI_OAUTH_CLIENT_ID, build_kimi_oauth_token_provider
-
-        part = api_key.split(".")[1]
+        part = token.split(".")[1]
         part += "=" * (-len(part) % 4)
         claims = _json.loads(_b64.urlsafe_b64decode(part.encode()).decode())
-        if not isinstance(claims, dict) or claims.get("client_id") != KIMI_OAUTH_CLIENT_ID:
-            return None
-        return build_kimi_oauth_token_provider()
-    except Exception:  # noqa: BLE001 — not a decodable kimi-oauth JWT
+    except Exception:  # noqa: BLE001 — not a decodable JWT
         return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _kimi_oauth_token_provider_for(api_key):
+    """Return a per-request token provider when *api_key* is the local kimi-oauth login.
+
+    ``client_id`` is the public Kimi CLI app id, so it only says the JWT is
+    a Kimi membership token, not that it came from this host's login. Swap
+    only when the stored ``providers.kimi-oauth`` login is the same token or
+    the same account (``user_id``/``sub``); otherwise the caller's token
+    stays on the static path and is never replaced by another account's.
+    ``sk-kimi-`` API keys, foreign JWTs and a missing login return None.
+    """
+    claims = _kimi_jwt_claims(api_key)
+    if claims is None:
+        return None
+    try:
+        from hermes_cli.auth import (
+            KIMI_OAUTH_CLIENT_ID,
+            build_kimi_oauth_token_provider,
+            get_provider_auth_state,
+        )
+
+        if claims.get("client_id") != KIMI_OAUTH_CLIENT_ID:
+            return None
+        stored_token = (get_provider_auth_state("kimi-oauth") or {}).get("access_token")
+    except Exception:  # noqa: BLE001 — no readable local login
+        return None
+    if not stored_token:
+        return None
+    if stored_token != api_key:
+        stored_claims = _kimi_jwt_claims(stored_token) or {}
+        same_account = any(
+            claims.get(key) and claims.get(key) == stored_claims.get(key)
+            for key in ("user_id", "sub")
+        )
+        if not same_account:
+            return None
+    return build_kimi_oauth_token_provider()
 
 
 def _build_anthropic_client_with_bearer_hook(

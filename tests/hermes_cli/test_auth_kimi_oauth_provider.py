@@ -331,3 +331,108 @@ def test_membership_model_context_lengths():
 
     assert _endpoint_scoped_context_length("k3", KIMI_OAUTH_INFERENCE_BASE_URL) == 1_048_576
     assert _endpoint_scoped_context_length("k3-256k", KIMI_OAUTH_INFERENCE_BASE_URL) == 262_144
+
+
+# ---------------------------------------------------------------------------
+# FleetReview #1392 follow-ups (t_ca39d148)
+# ---------------------------------------------------------------------------
+
+
+def _account_jwt(exp: int, *, user_id: str, tag: str, client_id: str = KIMI_OAUTH_CLIENT_ID) -> str:
+    def enc(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    claims = {"exp": exp, "client_id": client_id, "jti": tag, "user_id": user_id, "sub": user_id}
+    return f"{enc({'alg': 'HS256'})}.{enc(claims)}.sig"
+
+
+def test_login_label_rides_in_the_single_login_write(home, monkeypatch):
+    (home / "auth.json").write_text(json.dumps({"version": 1, "active_provider": "anthropic", "providers": {}}))
+    monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
+        (200, {"device_code": "dc", "user_code": "X", "verification_uri": "u", "interval": 1}),
+        (200, {"access_token": _jwt(int(time.time()) + 900), "refresh_token": "r-1", "expires_in": 900}),
+    ]))
+    writes = []
+    real_write = auth_mod._kimi_oauth_write_state
+
+    def _spy(state, **kw):
+        writes.append(dict(state))
+        return real_write(state, **kw)
+
+    monkeypatch.setattr(auth_mod, "_kimi_oauth_write_state", _spy)
+    auth_mod._kimi_oauth_login(open_browser=False, sleep=lambda _s: None, label="work")
+    assert len(writes) == 1 and writes[0]["label"] == "work"
+    assert get_provider_auth_state("kimi-oauth")["label"] == "work"
+
+
+def test_auth_add_label_does_not_restore_a_rotated_refresh_token(home, monkeypatch):
+    import hermes_cli.auth_commands as auth_commands
+
+    rotated = _logged_in_state(access_ttl=900, refresh="r-rotated", access_tag="gen2")
+
+    def _fake_login(*, open_browser, timeout_seconds, label=None):
+        written = _logged_in_state(access_ttl=900, refresh="r-spent", access_tag="gen1")
+        if label:
+            written["label"] = label
+        # The login persisted `written`; another process then rotated the pair.
+        _write_store(home, dict(rotated, label=written.get("label")))
+        return written
+
+    monkeypatch.setattr(auth_mod, "_kimi_oauth_login", _fake_login)
+    monkeypatch.setattr(auth_commands, "load_pool", lambda provider: None, raising=False)
+
+    class _Args:
+        provider = "kimi-oauth"
+        auth_type = "oauth"
+        label = "work"
+        no_browser = True
+        timeout = None
+
+    auth_commands.auth_add_command(_Args())
+    stored = get_provider_auth_state("kimi-oauth")
+    assert stored["refresh_token"] == "r-rotated"
+    assert stored["label"] == "work"
+
+
+def test_foreign_account_kimi_jwt_is_not_swapped_for_the_stored_login(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for, build_anthropic_client
+
+    exp = int(time.time()) + 900
+    state = _logged_in_state(access_ttl=800)
+    state["access_token"] = _account_jwt(exp, user_id="acct-local", tag="mine")
+    _write_store(home, state)
+    foreign = _account_jwt(exp, user_id="acct-other", tag="theirs")
+
+    assert _kimi_oauth_token_provider_for(foreign) is None
+    client = build_anthropic_client(foreign, KIMI_OAUTH_INFERENCE_BASE_URL)
+    assert client.auth_token != "entra-id-bearer-via-http-hook"
+    # Same account, older rotation: still the managed login → swapped.
+    assert _kimi_oauth_token_provider_for(_account_jwt(exp - 60, user_id="acct-local", tag="old")) is not None
+    assert _kimi_oauth_token_provider_for(state["access_token"]) is not None
+
+
+def test_kimi_jwt_without_a_stored_login_keeps_the_static_path(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for, build_anthropic_client
+
+    token = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    assert _kimi_oauth_token_provider_for(token) is None
+    client = build_anthropic_client(token, KIMI_OAUTH_INFERENCE_BASE_URL)
+    assert client.auth_token != "entra-id-bearer-via-http-hook"
+
+
+def test_auxiliary_resolver_builds_a_kimi_oauth_client(home):
+    from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
+
+    _write_store(home, _logged_in_state(access_ttl=800))
+    client, model = resolve_provider_client("kimi-oauth", "k3")
+    assert isinstance(client, AnthropicAuxiliaryClient)
+    assert model == "k3"
+    assert client._real_client.auth_token == "entra-id-bearer-via-http-hook"
+    assert client.base_url.rstrip("/") == KIMI_OAUTH_INFERENCE_BASE_URL
+
+
+def test_auxiliary_resolver_without_kimi_login_returns_none(home):
+    from agent.auxiliary_client import resolve_provider_client
+
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    assert resolve_provider_client("kimi-oauth", "k3") == (None, None)

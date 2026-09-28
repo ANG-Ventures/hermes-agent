@@ -7653,6 +7653,41 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    elif pconfig.auth_type == "oauth_kimi":
+        # kimi-oauth (Kimi Code membership): the managed login's rotating
+        # JWT is served per request by the auth.json token provider, on the
+        # Anthropic Messages wire at api.kimi.com/coding.
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+            from hermes_cli.auth import resolve_kimi_oauth_runtime_credentials
+
+            creds = resolve_kimi_oauth_runtime_credentials(as_token_provider=True)
+        except Exception as exc:
+            logger.debug("resolve_provider_client: kimi-oauth unavailable: %s", exc)
+            return None, None
+        base_url = (explicit_base_url or creds["base_url"]).strip().rstrip("/")
+        # An explicit key goes through build_anthropic_client too: it is
+        # swapped for the token provider only when it is this login's JWT.
+        api_key = explicit_api_key or creds["api_key"]
+        default_model = _get_aux_model_for_provider(provider)
+        final_model = _normalize_resolved_model(model or default_model, provider)
+        if not final_model:
+            logger.debug("resolve_provider_client: kimi-oauth has no model to use")
+            return None, None
+        try:
+            real_client = build_anthropic_client(api_key, base_url)
+        except Exception as exc:
+            logger.warning("resolve_provider_client: cannot create kimi-oauth client: %s", exc)
+            return None, None
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model,
+            api_key=explicit_api_key or "kimi-oauth-bearer-via-http-hook",
+            base_url=base_url,
+        )
+        logger.debug("resolve_provider_client: kimi-oauth (%s)", final_model)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
     elif pconfig.auth_type in {"oauth_device_code", "oauth_external"}:
         # OAuth providers — route through their specific try functions
         if provider == "nous":
