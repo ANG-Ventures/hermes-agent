@@ -345,7 +345,10 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     try:
         from hermes_state import SessionDB
 
-        db = SessionDB()
+        # Read-only: a writable SessionDB runs schema init and waits up to
+        # _WRITE_PATIENCE_S on a locked state.db for a pure lookup, once per
+        # subscription per tick, after the cursor has advanced (FleetReview #987).
+        db = SessionDB(read_only=True)
         try:
             row = db.get_session(sid)
         finally:
@@ -357,8 +360,8 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
-def _session_origin(session_id: str) -> Optional[tuple[str, str, str]]:
-    """``(platform, chat_id, thread_id)`` a session was opened from, or None.
+def _session_origin(session_id: str) -> Optional[dict]:
+    """The ``origin_json`` dict a session was opened from, or None.
 
     Blocking state.db lookup; call from a worker thread only.
     """
@@ -386,11 +389,38 @@ def _session_origin(session_id: str) -> Optional[tuple[str, str, str]]:
         return None
     if not isinstance(origin, dict):
         return None
-    return (
-        str(origin.get("platform") or "").lower(),
-        str(origin.get("chat_id") or ""),
-        str(origin.get("thread_id") or ""),
-    )
+    return origin
+
+
+def _origin_is_subscriber(origin: Optional[dict], sub: dict) -> bool:
+    """True only when ``origin`` is provably the subscriber's own session.
+
+    The wake targets ONE session: the subscriber participant's (group
+    sessions are per user by default) under the notifier profile. So chat
+    alone is not enough: platform, chat, thread, participant and profile
+    must all match. Anything missing fails open (not self), so a wake is
+    never dropped on a guess.
+    """
+    if not isinstance(origin, dict):
+        return False
+
+    def _s(v) -> str:
+        return str(v or "").strip()
+
+    if (
+        _s(origin.get("platform")).lower() != _s(sub.get("platform")).lower()
+        or _s(origin.get("chat_id")) != _s(sub.get("chat_id"))
+        or _s(origin.get("thread_id")) != _s(sub.get("thread_id"))
+        or not _s(sub.get("chat_id"))
+    ):
+        return False
+    sub_users = {_s(sub.get("user_id")), _s(sub.get("user_id_alt"))} - {""}
+    actor_users = {_s(origin.get("user_id")), _s(origin.get("user_id_alt"))} - {""}
+    if not sub_users or not (sub_users & actor_users):
+        return False
+    actor_profile = _s(origin.get("profile"))
+    sub_profile = _s(sub.get("notifier_profile")) or "default"
+    return bool(actor_profile) and actor_profile == sub_profile
 
 
 def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
@@ -401,24 +431,21 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
     nothing further" (t_a4890a77: 72 of 482 pings in Ace's chat over 48h,
     25 visible echo replies). The passive line still posts; only the wake is
     skipped. Events with no recorded actor, or an actor whose origin is
-    unknown or another chat, still wake. Matching is by the actor session's
-    recorded origin only: a bare ``actor == chat_id`` match proves nothing on
-    push subs, and non-push (api_server) subs never suppress (the wake is
-    their only delivery), so there is no chat_id shortcut.
+    unknown or another chat/participant/profile, still wake. Matching is by
+    the actor session's recorded origin only (no ``actor == chat_id``
+    shortcut). The caller drops the wake only for events whose passive line
+    was actually delivered.
     """
     origin_of = origin_of or _session_origin
-    chat_id = str(sub.get("chat_id") or "")
-    platform = str(sub.get("platform") or "").lower()
-    thread_id = str(sub.get("thread_id") or "")
     out: set[int] = set()
-    cache: dict[str, Optional[tuple[str, str, str]]] = {}
+    cache: dict[str, bool] = {}
     for ev in events or []:
         actor = (getattr(ev, "actor_session_id", None) or "").strip()
         if not actor:
             continue
         if actor not in cache:
-            cache[actor] = origin_of(actor)
-        if cache[actor] == (platform, chat_id, thread_id):
+            cache[actor] = _origin_is_subscriber(origin_of(actor), sub)
+        if cache[actor]:
             out.add(ev.id)
     return out
 
@@ -1358,6 +1385,9 @@ class GatewayKanbanWatchersMixin:
                     # exists on the board.
                     wake_handoff = ""
                     wake_review_detail = ""
+                    # Events whose passive line was confirmed delivered; only
+                    # these may have their wake skipped as a self-echo.
+                    _sent_event_ids: set[int] = set()
                     for ev in d["events"]:
                         kind = ev.kind
                         lane_key = None
@@ -1604,6 +1634,7 @@ class GatewayKanbanWatchersMixin:
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
+                            _sent_event_ids.add(ev.id)
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
@@ -1692,21 +1723,14 @@ class GatewayKanbanWatchersMixin:
                             "blocked", "review_requested", "changes_requested",
                             "block_loop_detected",
                         )
-                        from gateway.wake import adapter_supports_push as _adapter_push_ok
-
-                        _is_push_adapter = _adapter_push_ok(adapter)
                         # A transition made from this chat's own session is
                         # not news to it: post the line, skip the wake
-                        # (t_a4890a77). Only when the passive line on a push
-                        # adapter IS the delivery: for delivery_mode='wake'
-                        # and non-push (api_server) subs the wake is the sole
-                        # delivery, and dropping it would advance the cursor
-                        # (and maybe unsubscribe) with nothing delivered.
-                        _self_ids = (
-                            d.get("self_event_ids") or set()
-                            if (send_passive and _is_push_adapter)
-                            else set()
-                        )
+                        # (t_a4890a77). Only for events whose passive line was
+                        # CONFIRMED sent: delivery_mode='wake', non-push
+                        # (api_server) subs and events skipped without a send
+                        # never land in _sent_event_ids, so their wake (the
+                        # sole delivery) stays.
+                        _self_ids = set(d.get("self_event_ids") or ()) & _sent_event_ids
                         _wake_kinds = (
                             {
                                 ev.kind for ev in d["events"]
@@ -1721,6 +1745,9 @@ class GatewayKanbanWatchersMixin:
                                 "transition made by this chat's own session",
                                 sub["task_id"], platform_str, sub["chat_id"],
                             )
+                        from gateway.wake import adapter_supports_push as _adapter_push_ok
+
+                        _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
                         if _wake_kinds:

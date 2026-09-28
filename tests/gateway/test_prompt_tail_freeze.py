@@ -244,6 +244,16 @@ class TestSessionContextPin:
         assert human == _render(_make_context())
         assert again is human
 
+    def test_internal_event_never_reuses_unredacted_pin_once_redaction_on(self):
+        # C3 #984: pin rendered with redact_pii off, then redaction enabled;
+        # the next internal event must not return the unredacted pin.
+        runner = _make_runner()
+        ctx = _make_context(platform=Platform.TELEGRAM, thread_id=None, parent_chat_id=None)
+        assert _render(ctx, False) != _render(ctx, True)
+        runner._pinned_session_context_prompt(ctx, False, "sk")  # noqa: SLF001
+        internal = runner._pinned_session_context_prompt(ctx, True, "sk", internal=True)  # noqa: SLF001
+        assert internal == _render(ctx, True)
+
     def test_human_metadata_change_still_repins(self):
         runner = _make_runner()
         first = runner._pinned_session_context_prompt(_make_context(), False, "sk")  # noqa: SLF001

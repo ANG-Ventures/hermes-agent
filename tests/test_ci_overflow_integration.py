@@ -123,3 +123,60 @@ def test_rerun_whose_executed_jobs_logged_no_probe_is_unverifiable_not_pass():
     result = integ.selective_rerun_verdict(A1, fresh, {j["name"]: "no probe here" for j in fresh})
     assert result["status"] == "UNVERIFIABLE"
     assert "no-probe-evidence" in result["reason"]
+
+
+# -- C3 #954: identity scan must not PASS without scanning, and must scan every artifact ---------
+def _identity_fakes(monkeypatch, artifacts, blobs, total=None):
+    import base64
+    import io
+    import zipfile
+
+    def zipped(text):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("f.txt", text)
+        return buf.getvalue()
+
+    def api(path):
+        if path.startswith("repos/o/r/contents/.github/workflows?"):
+            return [{"path": ".github/workflows/x.yml", "name": "x.yml"}]
+        if path.startswith("repos/o/r/contents/"):
+            return {"content": base64.b64encode(b"on: push").decode()}
+        if path == "repos/o/r/actions/secrets":
+            return {"secrets": [{"name": n} for n in sorted(integ.PRE_EXISTING_SECRETS)]}
+        if path == "orgs/ANG-Ventures/actions/secrets":
+            return {"total_count": 0}
+        if path == "repos/o/r/environments":
+            return {"environments": []}
+        if "/artifacts?" in path:
+            return {"total_count": len(artifacts) if total is None else total, "artifacts": artifacts}
+        raise AssertionError(path)
+
+    def api_bytes(path):
+        if path.endswith("/logs"):
+            return zipped("clean log")
+        return zipped(blobs[path.split("/")[-2]])
+
+    monkeypatch.setattr(integ, "api", api)
+    monkeypatch.setattr(integ, "_api_bytes", api_bytes)
+
+
+def test_identity_scan_without_a_run_is_unverifiable_not_pass(monkeypatch):
+    _identity_fakes(monkeypatch, [], {})
+    assert integ.identity_absent("o/r", "main", None)["status"] == "UNVERIFIABLE"
+
+
+def test_identity_in_a_non_overflow_artifact_blocks(monkeypatch):
+    _identity_fakes(monkeypatch, [{"id": 7, "name": "coverage"}], {"7": "BEGIN PRIVATE KEY"})
+    res = integ.identity_absent("o/r", "main", 1)
+    assert res["status"] == "BLOCK" and res["evidence"]["run_hits"] == ["artifact:coverage/f.txt"]
+
+
+def test_incomplete_artifact_listing_fails_closed(monkeypatch):
+    _identity_fakes(monkeypatch, [{"id": 7, "name": "coverage"}], {"7": "clean"}, total=101)
+    assert integ.identity_absent("o/r", "main", 1)["status"] == "UNVERIFIABLE"
+
+
+def test_clean_scanned_run_passes(monkeypatch):
+    _identity_fakes(monkeypatch, [{"id": 7, "name": "coverage"}], {"7": "clean"})
+    assert integ.identity_absent("o/r", "main", 1)["status"] == "PASS"

@@ -130,3 +130,22 @@ def test_main_entry_applies_profile_config(tmp_path, monkeypatch):
         assert os.environ.get("PEF_MAIN_PROBE") == "from-file"
     finally:
         os.environ.pop("PEF_MAIN_PROBE", None)
+
+
+def test_a_file_that_exports_then_fails_leaves_env_untouched(tmp_path):
+    """FleetReview #1254 :68: the per-file status was ignored, so partial exports applied."""
+    f = _write(tmp_path / "bad.sh", "export PEF_PARTIAL=1\nfalse\n")
+    env = {"PATH": os.environ["PATH"]}
+    assert pef.apply_process_env_files(_cfg(f), env) == {}
+    assert "PEF_PARTIAL" not in env
+
+
+def test_relative_configured_path_is_sourced_from_cwd(tmp_path, monkeypatch):
+    """FleetReview #1254 :52: POSIX `.` searches PATH for a slash-less name."""
+    _write(tmp_path / "lane.sh", "export PEF_REL=ok\n")
+    monkeypatch.chdir(tmp_path)
+    files = pef.configured_files(_cfg("lane.sh"))
+    assert files == [str(tmp_path / "lane.sh")] or files == [os.path.realpath(tmp_path / "lane.sh")] \
+        or os.path.isabs(files[0])
+    env = {"PATH": "/usr/bin:/bin"}
+    assert pef.apply_process_env_files(_cfg("lane.sh"), env).get("PEF_REL") == (None, "ok")

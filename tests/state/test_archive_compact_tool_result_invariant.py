@@ -102,3 +102,21 @@ def test_preexisting_duplicate_key_does_not_wedge_compaction(db):
     db.archive_and_compact("S", [{"role": "user", "content": "[summary]"}, _call("terminal:0"),
                                  _result("terminal:0", "a"), _call("terminal:0"), _result("terminal:0", "b")])
     assert _active_results(db, "terminal:0") == 2
+
+
+def test_extra_copy_of_an_already_duplicated_id_still_rolls_back(db):
+    """FleetReview #1054: a set difference let a THIRD copy of an id that was already
+    duplicated in the live set through (the id is in both sets)."""
+    _append(db, [{"role": "user", "content": "go"}, _call("t1"), _result("t1"), _result("t1")])
+    assert _active_results(db, "t1") == 2
+    with pytest.raises(TranscriptInvariantError, match="t1"):
+        db.archive_and_compact("S", [{"role": "user", "content": "[summary]"}, _call("t1"),
+                                     _result("t1"), _result("t1"), _result("t1")])
+    assert _active_results(db, "t1") == 2
+
+
+def test_preexisting_duplicate_carried_unchanged_is_allowed(db):
+    _append(db, [{"role": "user", "content": "go"}, _call("t1"), _result("t1"), _result("t1")])
+    db.archive_and_compact("S", [{"role": "user", "content": "[summary]"}, _call("t1"),
+                                 _result("t1"), _result("t1")])
+    assert _active_results(db, "t1") == 2

@@ -107,3 +107,35 @@ def test_removed_op_reference_revokes_its_resolution(home, monkeypatch):
     assert cp.get_env_prefer_dotenv(KEY) == "sk-resolved-by-1password"
     _write(home, "")
     assert cp.get_env_prefer_dotenv(KEY) == ""
+
+
+# -- C3 #1217: revoke exactly what the file supplied, nothing else ------------------------
+def test_removed_op_reference_does_not_revoke_a_different_later_value(home, monkeypatch):
+    """Migrating op:// out of .env into secrets.onepassword: the new resolution
+    differs from nothing the file carried, so it must not be revoked."""
+    _write(home, f"{KEY}=op://Vault/Item/field\n")
+    monkeypatch.setenv(KEY, "sk-from-op-line")
+    assert cp.get_env_prefer_dotenv(KEY) == "sk-from-op-line"
+    _write(home, "")
+    monkeypatch.setenv(KEY, "sk-from-config-block")
+    assert cp.get_env_prefer_dotenv(KEY) == "sk-from-config-block"
+
+
+def test_same_value_shell_export_survives_removal(home, monkeypatch):
+    """A value the process was started with came from the shell, not the file."""
+    monkeypatch.setattr(env_loader, "_PROCESS_START_ENV", {KEY: "sk-shared"})
+    _write(home, f"{KEY}=sk-shared\n")
+    _boot_load(home, monkeypatch)
+    _write(home, "")
+    assert cp.get_env_prefer_dotenv(KEY) == "sk-shared"
+
+
+def test_runtime_provider_fallback_honours_revocation(home, monkeypatch):
+    from hermes_cli import runtime_provider as rp
+
+    _write(home, f"{KEY}=sk-revoke-me\n")
+    _boot_load(home, monkeypatch)
+    assert rp._getenv(KEY) == "sk-revoke-me"
+    _write(home, "")
+    assert os.environ.get(KEY) == "sk-revoke-me"
+    assert rp._getenv(KEY) == ""

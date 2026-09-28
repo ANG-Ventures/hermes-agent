@@ -63,6 +63,16 @@ def test_recorded_fixtures_are_what_the_relay_assumes():
             node["headCommit"]["oid"]) == MEMBERS[2]
 
 
+def test_fixtures_hold_no_private_repo_capture():
+    # This repo is public: a recorded body from a private repo publishes its
+    # name, description and PR URLs (C3 #957). Every capture targets this repo.
+    for path in sorted(FIXTURES.glob("*.json")):
+        body = json.loads(path.read_text())
+        assert f"repos/{REPO}/" in body["capture"]["command"] or " graphql " in body["capture"]["command"], path.name
+        response = json.dumps(body["response"])
+        assert '"private": true' not in response, path.name
+
+
 def test_has_success_on_recorded_combined_status():
     assert relay.has_success(STATUS_OK)
     failed = copy.deepcopy(STATUS_OK)

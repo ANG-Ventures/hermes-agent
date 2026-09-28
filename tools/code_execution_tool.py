@@ -240,6 +240,10 @@ _HERMES_CHILD_ALLOWED = frozenset({
 _GIT_IDENTITY_VARS = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
                       "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
 _GIT_HELPER_KEY_RE = re.compile(r"^credential\.(?:\S+\.)?helper$")
+# A helper VALUE passes only as empty (list reset) or an absolute helper path
+# with plain word arguments (``!/path/gh auth git-credential``). Anything else
+# (shell snippets, ``password=...``, inline tokens) drops the group (C3 #1254).
+_GIT_HELPER_VALUE_RE = re.compile(r"^(?:!?/[\w./+-]+(?: [A-Za-z][A-Za-z-]*)*)?$")
 
 
 def _carry_git_lane_env(source_env, scrubbed):
@@ -255,10 +259,11 @@ def _carry_git_lane_env(source_env, scrubbed):
     group = {"GIT_CONFIG_COUNT": str(count)}
     for i in range(count):
         key = source_env.get(f"GIT_CONFIG_KEY_{i}")
-        if key is None or not _GIT_HELPER_KEY_RE.match(key):
+        value = source_env.get(f"GIT_CONFIG_VALUE_{i}", "")
+        if key is None or not _GIT_HELPER_KEY_RE.match(key) or not _GIT_HELPER_VALUE_RE.match(value):
             return scrubbed
         group[f"GIT_CONFIG_KEY_{i}"] = key
-        group[f"GIT_CONFIG_VALUE_{i}"] = source_env.get(f"GIT_CONFIG_VALUE_{i}", "")
+        group[f"GIT_CONFIG_VALUE_{i}"] = value
     scrubbed.update(group)
     return scrubbed
 
@@ -426,7 +431,20 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             ", ".join(sorted(_dropped_hermes)),
         )
 
-    _carry_git_lane_env(source_env, scrubbed)
+    # The git lane in os.environ belongs to the gateway's LAUNCH profile. A
+    # multiplexed secondary profile (context-local home) must not inherit its
+    # identity/credential helper or its home: point the child at the active
+    # profile's home and carry no lane (C3 #1254).
+    try:
+        from hermes_constants import get_hermes_home_override
+        _active_home = get_hermes_home_override()
+    except Exception:
+        _active_home = None
+    if _active_home and os.path.realpath(_active_home) != os.path.realpath(
+            source_env.get("HERMES_HOME") or os.devnull):
+        scrubbed["HERMES_HOME"] = _active_home
+    else:
+        _carry_git_lane_env(source_env, scrubbed)
 
     # delegate_task children are marked with a ContextVar, not os.environ, while
     # the execute_code sandbox crosses a process boundary. Bridge that context

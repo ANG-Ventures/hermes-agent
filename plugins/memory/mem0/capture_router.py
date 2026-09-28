@@ -516,6 +516,17 @@ class CaptureRouter:
         # DEDUP world against prefs (the leak fix).
         world_kept, world_dropped = dedup_world_against_prefs(world_raw, prefs_cands)
 
+        # Deterministic secret scrub BEFORE either destination is written: the mem0 post-write
+        # scrub never sees these candidates, and the prompt's "no secrets" rule is not a boundary
+        # (C3 #1213). A dropped fact is counted, never logged.
+        try:
+            from . import capture_scrub
+        except ImportError:  # loaded as a top-level module (tests / live_e2e harness)
+            import capture_scrub  # type: ignore
+        scrubbed = [f for f in world_kept if capture_scrub.is_secret(str(f.get("content", "")))]
+        world_kept = [f for f in world_kept if f not in scrubbed]
+        result["world_scrubbed"] = len(scrubbed)
+
         self.stats["prefs_seen"] += len(prefs_cands)
         self.stats["world_deduped"] += len(world_dropped)
 
