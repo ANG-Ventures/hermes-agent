@@ -395,6 +395,15 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     _prov = (rec.get("provider") or "").strip()
     _model_disp = f"{_prov}/{_model}" if _prov and _model != "—" else _model
     lines.append(f"• Model: {_model_disp}")
+    # Proxy lanes (cpa) front several vendors behind one provider name; name the
+    # vendor and upstream provider the served model came from (t_d59c7936).
+    from agent.usage_pricing import VENDOR_ATTRIBUTION, attribute_route, proxy_lane
+    if proxy_lane(_prov):
+        _route = attribute_route(_prov, rec.get("model"))
+        _vendor = rec.get("vendor") or _route["vendor"]
+        _label = VENDOR_ATTRIBUTION.get(_vendor, (_vendor, ""))[0]
+        _served = rec.get("served_provider") or _route["served_provider"]
+        lines.append(f"• Route: vendor {_label} · provider {_served} · lane cpa")
     lines.append(f"• Session: {_session_label(rec.get('platform',''), rec.get('chat_id',''), rec.get('chat_name',''))}")
 
     ts_start = rec.get("ts_start")

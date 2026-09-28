@@ -178,6 +178,7 @@ def _resolve_notional_custom_lane(provider_name: str) -> Optional[str]:
         or is_notional_xai_provider(lane)
         or lane in NOTIONAL_OPENROUTER_PROVIDERS
         or lane in NOTIONAL_MOONSHOT_PROVIDERS
+        or lane in NOTIONAL_PROXY_PROVIDERS
     ):
         return lane
     return None
@@ -220,6 +221,62 @@ _KIMI_K3_MODEL_IDS = frozenset({"k3", "k3-256k", "kimi-k3", "kimi-k3-256k"})
 def _normalize_kimi_membership_model(model: str) -> str:
     bare = (model or "").split("/")[-1].strip().lower()
     return "kimi-k3" if bare in _KIMI_K3_MODEL_IDS else bare
+
+
+# Multi-vendor subscription proxy lanes (t_d59c7936). The ``cpa`` provider plugin
+# fronts the local CLIProxyAPI, which serves Kimi, Codex and Grok subscriptions
+# behind one key; ``kimi-code``, ``kimi-cpa`` and ``cliproxyapi`` are its aliases.
+# The provider name says nothing about the vendor, so pricing and the blackbox
+# vendor label both dispatch on the SERVED model id via _infer_vendor_from_model.
+NOTIONAL_PROXY_PROVIDERS = frozenset({
+    "cpa",
+    "kimi-code",
+    "kimi-cpa",
+    "cliproxyapi",
+})
+
+# Served-model vendor -> the single-vendor notional lane that prices it. A proxy
+# turn is priced exactly as that lane would price it (status "estimated").
+_PROXY_VENDOR_PRICING_LANE = {
+    "moonshotai": "kimi-oauth",
+    "openai": "openai-codex",
+    "xai": "xai-oauth",
+}
+
+# Vendor key (_infer_vendor_from_model) -> (display vendor, upstream provider a
+# proxy lane reached for it). Only the display half is used for direct lanes.
+VENDOR_ATTRIBUTION: Dict[str, tuple[str, str]] = {
+    "moonshotai": ("Kimi (Moonshot)", "kimi"),
+    "openai": ("OpenAI", "openai-codex"),
+    "xai": ("xAI", "xai"),
+    "anthropic": ("Anthropic", "anthropic"),
+    "google": ("Google", "google"),
+}
+UNKNOWN_VENDOR = "vendor-unknown"
+
+
+def proxy_lane(provider: Optional[str]) -> Optional[str]:
+    """``"cpa"`` when ``provider`` (bare or ``custom:<name>``) is a proxy lane."""
+    p = (provider or "").strip().lower()
+    if p.startswith("custom:"):
+        p = p.split(":", 1)[1].strip()
+    return "cpa" if p in NOTIONAL_PROXY_PROVIDERS else None
+
+
+def attribute_route(provider: Optional[str], model: Optional[str]) -> Dict[str, str]:
+    """``{vendor, vendor_label, served_provider}`` for one recorded route.
+
+    ``vendor`` is the vendor API key from the served model id (``moonshotai``,
+    ``openai``, ...) or ``vendor-unknown``; never ``other``. ``served_provider``
+    is the upstream a proxy lane reached (``kimi`` for a cpa/kimi-k3 turn) and
+    the recorded provider for every other lane.
+    """
+    bare_model = (model or "").strip().split("/")[-1]
+    vendor = _infer_vendor_from_model(bare_model) or UNKNOWN_VENDOR
+    label, upstream = VENDOR_ATTRIBUTION.get(vendor, (UNKNOWN_VENDOR, UNKNOWN_VENDOR))
+    recorded = (provider or "").strip().lower()
+    served = upstream if proxy_lane(recorded) else (recorded or "unknown")
+    return {"vendor": vendor, "vendor_label": label, "served_provider": served}
 
 
 @dataclass(frozen=True)
@@ -2029,6 +2086,17 @@ def resolve_billing_route(
     if _notional_lane:
         provider_name = _notional_lane
 
+    # Multi-vendor proxy lane (cpa + aliases): re-route to the single-vendor
+    # notional lane of the SERVED model's vendor, so a cpa turn prices exactly
+    # like kimi-oauth / openai-codex / xai-oauth would. An unrecognised vendor
+    # stays unknown rather than borrowing another vendor's rates.
+    if provider_name in NOTIONAL_PROXY_PROVIDERS:
+        _proxy_vendor = _infer_vendor_from_model(model.split("/")[-1])
+        _pricing_lane = _PROXY_VENDOR_PRICING_LANE.get(_proxy_vendor or "")
+        if _pricing_lane is None:
+            return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="unknown")
+        provider_name = _pricing_lane
+
     # Notional pricing for local subscription proxies/bridges that front the
     # Anthropic API (Claude Code OAuth billing, tailnet failovers, etc.). The
     # marginal cash cost is $0 (covered by a flat subscription), but for fleet
@@ -2226,7 +2294,7 @@ def _infer_vendor_from_model(model: str) -> Optional[str]:
     name = (model or "").lower().strip()
     if name.startswith("claude-"):
         return "anthropic"
-    if name.startswith("gpt-") or re.fullmatch(r"o[1-9][a-z0-9.\-]*", name):
+    if name.startswith(("gpt-", "codex-")) or re.fullmatch(r"o[1-9][a-z0-9.\-]*", name):
         return "openai"
     if name.startswith("gemini-"):
         return "google"
