@@ -207,3 +207,76 @@ def test_e2e_complete_task_refuses_stale_base_card_stays_running(board, origin, 
         kinds = [r[0] for r in conn.execute(
             "SELECT kind FROM task_events WHERE task_id=?", (tid,))]
         assert "completion_blocked_stale_base" in kinds
+
+
+# --- t_22c91696: already-merged PRs are not a stale base -------------------
+
+
+def _squash_merged_branch(origin: Path, tmp_path: Path, n_commits: int = 1) -> tuple[Path, float]:
+    """The 2026-09-27 shape: the card's branch was squash-merged, then trunk
+    moved on (140 behind) and edited the same lines, so the stale workspace
+    branch reads as 'foreign patch-equivalent commit' + 'does not merge cleanly'."""
+    work = _clone(origin, tmp_path / "ws" / "repo")
+    created_at = time.time() - 5
+    _git(work, "checkout", "-q", "-b", "daedalus/t_x")
+    for i in range(n_commits):
+        _commit(work, {"hermes_cli/foo.py": f"a = {10 + i}  # card change\n"}, f"card {i}")
+    # the merge queue squashes the PR onto trunk
+    _commit(origin, {"hermes_cli/foo.py": f"a = {10 + n_commits - 1}  # card change\n"},
+            "card squash (#1)")
+    _advance_trunk(origin, 12, touch={"hermes_cli/foo.py": "a = 99  # later trunk edit\n"})
+    return work, created_at
+
+
+def test_landed_branch_is_skipped_not_failed(origin, tmp_path):
+    work, created_at = _squash_merged_branch(origin, tmp_path)
+    rep = bb.check_checkout(work, scope=["hermes_cli/foo.py"], since=created_at,
+                            max_behind=None)
+    assert rep.ok and rep.skipped and "already landed" in rep.skipped, rep.render()
+    assert bb.enforce_handoff("t_x", workspace_path=str(work.parent), workspace_kind="scratch",
+                              scope=[], created_at=created_at) is None
+
+
+def _states(**by_number):
+    def q(repo, number):
+        st = by_number.get(f"n{number}")
+        return None if st is None else {"state": st, "merge_commit_sha": "abc123def4567"}
+    return lambda: q
+
+
+def _card(conn, ws: Path) -> tuple[str, int]:
+    tid = kb.create_task(conn, title="slice", assignee="worker", body="edit `hermes_cli/foo.py`",
+                         workspace_kind="scratch", workspace_path=str(ws))
+    kb.claim_task(conn, tid)
+    return tid, conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+
+
+def test_e2e_merged_survivor_pr_completes_without_override(board, origin, tmp_path, monkeypatch):
+    from hermes_cli import kanban_open_pr as op
+    monkeypatch.setattr(op, "_default_query", _states(n7="MERGED"))
+    # multi-commit squash: git cherry cannot match it, only the PR state can
+    work, _ = _squash_merged_branch(origin, tmp_path, n_commits=2)
+    with kb.connect() as conn:
+        tid, run = _card(conn, work.parent)
+        with pytest.raises(bb.StaleBaseError):  # same checkout, no merged PR named
+            kb.complete_task(conn, tid, summary="done", expected_run_id=run)
+        assert kb.complete_task(conn, tid, summary="done", expected_run_id=run,
+                                survivor_pr="ANG-Ventures/hermes-agent#7",
+                                # fixture PR cannot name this card (survivor binding is out of scope)
+                                survivor_unbound=True)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "done"
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                          (tid, "base_guard_survivor_merged")).fetchone()
+        assert ev and "ANG-Ventures/hermes-agent#7 @ abc123def456" in ev[0]
+
+
+def test_e2e_open_survivor_pr_with_foreign_commit_still_refuses(board, origin, tmp_path, monkeypatch):
+    from hermes_cli import kanban_open_pr as op
+    monkeypatch.setattr(op, "_default_query", _states(n7="OPEN"))
+    with kb.connect() as conn:
+        work, _ = _stale_branch(origin, tmp_path)
+        tid, run = _card(conn, work.parent)
+        with pytest.raises(bb.StaleBaseError):
+            kb.complete_task(conn, tid, summary="done", expected_run_id=run,
+                             survivor_pr="ANG-Ventures/hermes-agent#7")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"

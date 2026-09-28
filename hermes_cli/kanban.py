@@ -4599,7 +4599,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if not isinstance(metadata, dict):
                 raise ValueError("must be a JSON object")
         except (ValueError, json.JSONDecodeError) as exc:
-            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            print(
+                f"kanban: --metadata wants a JSON object, e.g. "
+                f"--metadata '{{\"base_guard_override\": \"<reason>\"}}' ({exc})",
+                file=sys.stderr,
+            )
             return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
@@ -4693,7 +4697,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             if not isinstance(metadata, dict):
                 raise ValueError("must be a JSON object")
         except (ValueError, json.JSONDecodeError) as exc:
-            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            print(
+                f"kanban: --metadata wants a JSON object, e.g. "
+                f"--metadata '{{\"base_guard_override\": \"<reason>\"}}' ({exc})",
+                file=sys.stderr,
+            )
             return 2
 
     model_override = getattr(args, "model_override", None)
@@ -4990,7 +4998,11 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             if not isinstance(metadata, dict):
                 raise ValueError("must be a JSON object")
         except (ValueError, json.JSONDecodeError) as exc:
-            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            print(
+                f"kanban: --metadata wants a JSON object, e.g. "
+                f"--metadata '{{\"base_guard_override\": \"<reason>\"}}' ({exc})",
+                file=sys.stderr,
+            )
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
