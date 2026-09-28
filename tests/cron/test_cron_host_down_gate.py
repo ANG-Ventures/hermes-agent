@@ -261,3 +261,25 @@ def test_ledger_row_is_flushed_as_soon_as_logs_delivery_succeeds(fleet):
          patch("tools.send_message_tool._send_to_platform", new=send):
         _deliver_result(job, _failure_content(job, "cannot read torrents/info"))
     assert seen_at_later_target == [True]
+
+
+def test_prefix_rides_only_the_demoted_target(fleet):
+    """FleetReview #31: the host-down prefix was applied to the SHARED content,
+    so every target (not only the demoted #alerts one) got it."""
+    from gateway.config import Platform
+
+    _arm(fleet)
+    job = _qbt_job(deliver=f"discord:{ALERTS},discord:999")
+    content = _failure_content(job, "cannot read torrents/info: RuntimeError")
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    cfg = MagicMock()
+    cfg.platforms = {Platform.DISCORD: pconfig}
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch("tools.send_message_tool._send_to_platform",
+               new=AsyncMock(return_value={"success": True})) as send:
+        assert _deliver_result(job, content) is None
+    sent = {str(c[0][2]): c[0][3] for c in send.call_args_list}
+    assert set(sent) == {LOGS, "999"}
+    assert "[host-down: ace-ai since" in sent[LOGS]
+    assert "[host-down" not in sent["999"]
