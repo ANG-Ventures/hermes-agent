@@ -5578,6 +5578,117 @@ def _worker_owns_card(
     return row is not None
 
 
+# ---------------------------------------------------------------------------
+# Operator-token flag gate (harness-parity spec 4.7 layer i, AC-A6)
+# ---------------------------------------------------------------------------
+# ``--takeover`` / ``--operator`` let a CLI caller act on a card it does not
+# own. While a run is active on the card, those flags are refused unless the
+# process presents ``KANBAN_OPERATOR_TOKEN`` equal to the ``operator-token``
+# file beside the board (written 0600 by a launchd job, never by the gateway).
+# The dispatcher's own worker is exempt only when ``HERMES_KANBAN_OWNER_PID`` is
+# THIS pid: an exact pid match, never an env value alone and never ancestry.
+# This is a tripwire, not a wall: a same-uid process can read the file (AC-A6
+# arm 6, Q15). Every refusal leaves a ``takeover_refused`` event.
+OPERATOR_TOKEN_ENV = "KANBAN_OPERATOR_TOKEN"
+OPERATOR_TOKEN_FILENAME = "operator-token"
+OPERATOR_FLAG_GATED_ACTIONS: frozenset[str] = frozenset({
+    "complete", "block", "unblock", "reassign", "archive", "request-review",
+})
+
+
+class OperatorTokenRequiredError(ValueError):
+    """A flag override on a card with an active run lacked the operator token."""
+
+
+def operator_token_path() -> Path:
+    """``<root>/kanban/operator-token``: beside the boards, outside any profile."""
+    return kanban_home() / "kanban" / OPERATOR_TOKEN_FILENAME
+
+
+def _operator_token_state() -> str:
+    """``ok`` | ``absent`` | ``no_token_file`` | ``mismatch``. Never the value."""
+    import hmac
+
+    presented = (os.environ.get(OPERATOR_TOKEN_ENV) or "").strip()
+    if not presented:
+        return "absent"
+    try:
+        expected = operator_token_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return "no_token_file"
+    if not expected:
+        return "no_token_file"
+    if hmac.compare_digest(presented.encode(), expected.encode()):
+        return "ok"
+    return "mismatch"
+
+
+def _caller_holds_grant_for(task_id: str) -> bool:
+    """True only for the dispatcher's worker on its own card, by exact pid."""
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() != task_id:
+        return False
+    owner = (os.environ.get("HERMES_KANBAN_OWNER_PID") or "").strip()
+    try:
+        return int(owner) == os.getpid()
+    except ValueError:
+        return False
+
+
+def task_run_is_active(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None
+) -> bool:
+    """A run is active: ``current_run_id`` set and the claim not yet expired."""
+    row = conn.execute(
+        "SELECT current_run_id, claim_expires FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["current_run_id"] is None:
+        return False
+    expires = row["claim_expires"]
+    return bool(expires) and int(expires) > int(now if now is not None else time.time())
+
+
+def enforce_operator_flag_gate(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    action: str,
+    *,
+    flags: Iterable[str],
+    argv: Optional[Sequence[str]] = None,
+) -> None:
+    """Refuse ``flags`` on any of ``task_ids`` that has an active run, unless
+    the caller presents the operator token or owns the card's grant by pid.
+
+    Raises :class:`OperatorTokenRequiredError` after appending one
+    ``takeover_refused`` event (caller pid, argv, which flags, token state).
+    """
+    used = sorted({f for f in (flags or ()) if f})
+    if action not in OPERATOR_FLAG_GATED_ACTIONS or not used:
+        return
+    token = _operator_token_state()
+    if token == "ok":
+        return
+    for tid in dict.fromkeys(str(t) for t in (task_ids or ()) if t):
+        if _caller_holds_grant_for(tid) or not task_run_is_active(conn, tid):
+            continue
+        payload = {
+            "action": action,
+            "flags": used,
+            "caller_pid": os.getpid(),
+            "argv": list(argv if argv is not None else sys.argv),
+            "token": token,
+        }
+        with write_txn(conn, allow_nested=True):
+            _append_event(conn, tid, "takeover_refused", payload)
+        raise OperatorTokenRequiredError(
+            f"refused {action} {' '.join(used)} on {tid}: a run is active on it, "
+            f"and overriding a live run needs the operator token "
+            f"({OPERATOR_TOKEN_ENV}, token {token}). Recorded as a "
+            f"takeover_refused event. An operator presents it inline: "
+            f"{OPERATOR_TOKEN_ENV}=$(cat {operator_token_path()}) "
+            f"hermes kanban {action} {tid} ..."
+        )
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -22274,6 +22385,9 @@ def _default_spawn(
     # own session-id stamping relies on them). Pop it here — mirrors the restart
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
+    # INV-A7: the operator token is presented inline by a human operator and
+    # must never ride into a worker by inheritance from the dispatcher's env.
+    env.pop(OPERATOR_TOKEN_ENV, None)
 
     # A worker imports the runtime tree its argv's venv points at — never a
     # dispatcher's PYTHONPATH/PYTHONHOME. sys.path beats the venv's editable
