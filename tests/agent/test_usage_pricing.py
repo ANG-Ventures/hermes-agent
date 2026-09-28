@@ -1635,6 +1635,36 @@ def test_gemini_31_pro_preview_alias_shares_tiered_pricing():
     assert result.amount_usd == Decimal("1.18")
 
 
+def test_gemini_38_flash_prices_at_google_list_rate():
+    """gemini-3.8-flash has a snapshot row (t_6ea3da6f): $0.75 in / $3.75 out /
+    $0.075 cache read per 1M, Google pricing page 2026-09-28."""
+    result = estimate_usage_cost(
+        "gemini-3.8-flash",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                       cache_read_tokens=1_000_000),
+        provider="google",
+    )
+    assert result.amount_usd == Decimal("4.575")
+
+
+def test_gemini_bridge_effort_suffix_prices_as_base_model():
+    """The gemini-bridge appends agy's effort tier (-low/-medium/-high). Effort is
+    not a SKU, so each suffixed id prices exactly like its base id, and via the
+    vendor fallback too (provider=gemini-bridge)."""
+    usage = CanonicalUsage(input_tokens=12_345, output_tokens=6_789, cache_read_tokens=1_000)
+    base = estimate_usage_cost("gemini-3.8-flash", usage, provider="google")
+    assert base.amount_usd is not None and base.amount_usd > 0
+    for suffix in ("low", "medium", "high"):
+        for provider in ("google", "gemini-bridge"):
+            got = estimate_usage_cost(f"gemini-3.8-flash-{suffix}", usage, provider=provider)
+            assert got.amount_usd == base.amount_usd, (suffix, provider)
+    # A suffix that is not an effort tier stays unpriced (no guessing).
+    assert estimate_usage_cost("gemini-3.8-flash-ultra", usage, provider="google").amount_usd is None
+    # A real SKU whose name ends in a non-effort word keeps its own row.
+    lite = estimate_usage_cost("gemini-3.5-flash-lite", usage, provider="google")
+    assert lite.amount_usd != estimate_usage_cost("gemini-3.5-flash", usage, provider="google").amount_usd
+
+
 def test_gemini_25_pro_tiered_rates_with_cache_read_fallback():
     """gemini-2.5-pro tiers at the same 200k threshold ($2.50 input / $15
     output above). Its snapshot has no tiered cache-read rate, so cache reads

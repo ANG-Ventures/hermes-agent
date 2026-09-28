@@ -441,6 +441,12 @@ def _register_all_sources() -> None:
         description="auth.json providers.minimax-oauth",
     ))
     register(RemovalStep(
+        provider="kimi-oauth", source_id="oauth",
+        # Same single-source auth.json shape as MiniMax OAuth.
+        remove_fn=_remove_minimax_oauth,
+        description="auth.json providers.kimi-oauth",
+    ))
+    register(RemovalStep(
         provider="*", source_id="config:",
         match_fn=lambda src: src.startswith("config:") or src == "model_config",
         remove_fn=_remove_custom_config,

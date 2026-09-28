@@ -100,9 +100,25 @@ def register_provider(profile: ProviderProfile) -> None:
     plugins under ``$HERMES_HOME/plugins/model-providers/`` can override
     bundled profiles without editing repo code.
     """
+    _register(profile)
+    # Remember which module registered it, so discovery can replay the
+    # registration for a module that was imported before discovery ran.
+    try:
+        mod = sys._getframe(1).f_globals.get("__name__")
+    except ValueError:  # pragma: no cover - no caller frame
+        mod = None
+    if mod:
+        _PROFILES_BY_MODULE.setdefault(mod, []).append(profile)
+
+
+def _register(profile: ProviderProfile) -> None:
     _REGISTRY[profile.name] = profile
     for alias in profile.aliases:
         _ALIASES[alias] = profile.name
+
+
+#: module name -> profiles it registered at import (see _import_plugin_dir).
+_PROFILES_BY_MODULE: dict[str, list[ProviderProfile]] = {}
 
 
 def get_provider_profile(name: str) -> ProviderProfile | None:
@@ -170,7 +186,14 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
         module_name = f"_hermes_user_provider_{safe_name}"
 
     if module_name in sys.modules:
-        return  # already imported
+        # Already imported (e.g. a direct import of a bundled profile class
+        # before discovery). Its import-time registration ran BEFORE the
+        # entry-point scan, so a pip plugin of the same name may have replaced
+        # it since. Replay it here to keep filesystem-over-pip precedence
+        # (FleetReview #1095).
+        for profile in _PROFILES_BY_MODULE.get(module_name, ()):
+            _register(profile)
+        return
 
     try:
         spec = importlib.util.spec_from_file_location(

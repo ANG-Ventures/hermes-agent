@@ -16,6 +16,7 @@ def _clean_overlay():
     yield
     pef._OVERLAY.clear()
     pef._OVERLAY.update(saved)
+    os.environ.pop(pef._INHERITED_ENV, None)  # written by an env=None apply
 
 
 def _write(path, text):

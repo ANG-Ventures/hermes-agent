@@ -131,3 +131,30 @@ describe('desktop hydration gating', () => {
     expect(markers([noticeRow({ display_metadata: '{not json' })])).toHaveLength(0)
   })
 })
+
+describe('tool-call notice on a metadata-only system row (FleetReview #942)', () => {
+  // conversation_loop persists a tool-call notice as role=system, content ''.
+  // The Python reader (notice_from_display_row) accepts that row; an
+  // assistant-only gate here dropped it on every reload.
+  const TOOL_NOTICE = { grammar: null, kind: 'tool_call_as_text', request_id: 'r1', scope: 'visible', version: 1 }
+  const toolRow = (over: Record<string, unknown> = {}) =>
+    noticeRow({ content: '', display_metadata: { confab_notice: TOOL_NOTICE }, role: 'system', ...over })
+
+  it('surfaces the tool-call label from an empty system row', () => {
+    const out = texts([toolRow()]).filter(m => m.text.includes('Tool call not executed'))
+
+    expect(out).toHaveLength(1)
+    expect(out[0]?.role).toBe('system')
+    expect(out[0]?.text).toContain('text was sent instead of a native tool call')
+  })
+
+  it('still refuses a scaffold catch on a system row', () => {
+    expect(markers([toolRow({ display_metadata: { confab_notice: NOTICE } })])).toHaveLength(0)
+  })
+
+  it('refuses a tool-call notice with a non-visible scope', () => {
+    const row = toolRow({ display_metadata: { confab_notice: { ...TOOL_NOTICE, scope: 'both' } } })
+
+    expect(texts([row]).filter(m => m.text.includes('Tool call not executed'))).toHaveLength(0)
+  })
+})

@@ -792,9 +792,10 @@ def test_single_gate_call_site():
 
     src = inspect.getsource(gr)
     # Direct call or offloaded via asyncio.to_thread(self._apply_..., key).
+    # (t_7da6cadf: the offloaded call now also passes marked_at=..., FleetReview #1043.)
     n = src.count("self._apply_post_turn_resume_gate(session_key)") + src.count(
         "self._apply_post_turn_resume_gate, session_key)"
-    )
+    ) + src.count("self._apply_post_turn_resume_gate, session_key,")
     assert n == 1, f"expected 1 gate call site, found {n}"
 
 

@@ -177,6 +177,7 @@ def _resolve_notional_custom_lane(provider_name: str) -> Optional[str]:
         is_notional_anthropic_provider(lane)
         or is_notional_xai_provider(lane)
         or lane in NOTIONAL_OPENROUTER_PROVIDERS
+        or lane in NOTIONAL_MOONSHOT_PROVIDERS
     ):
         return lane
     return None
@@ -194,6 +195,31 @@ def _resolve_notional_custom_lane(provider_name: str) -> Optional[str]:
 NOTIONAL_OPENROUTER_PROVIDERS = frozenset({
     "openai-codex",
 })
+
+
+# Notional pricing for the Kimi Code membership lanes: the native device-flow
+# provider (kimi-oauth) and the CLIProxyAPI plugin lane (kimi-code). Marginal
+# cash cost is $0 (flat Kimi membership); for cost visibility their K3 turns
+# are priced at the OpenRouter ``moonshotai/kimi-k3`` snapshot below and carry
+# status "estimated". Membership model ids (k3, k3-256k) and the harness id
+# (kimi-k3) all normalize to that one vendor model. Other membership ids
+# (kimi-for-coding*, a different model family) stay unpriced rather than
+# borrowing K3 rates.
+# Vendor membership is decided by the shared _infer_vendor_from_model(), never
+# by the provider name alone. kimi-code is now an alias of the multi-vendor
+# ``cpa`` proxy lane and stays here only for rows recorded before the rename;
+# ``cpa`` itself dispatches per served model via the same function (t_d59c7936).
+NOTIONAL_MOONSHOT_PROVIDERS = frozenset({
+    "kimi-oauth",
+    "kimi-code",
+})
+
+_KIMI_K3_MODEL_IDS = frozenset({"k3", "k3-256k", "kimi-k3", "kimi-k3-256k"})
+
+
+def _normalize_kimi_membership_model(model: str) -> str:
+    bare = (model or "").split("/")[-1].strip().lower()
+    return "kimi-k3" if bare in _KIMI_K3_MODEL_IDS else bare
 
 
 @dataclass(frozen=True)
@@ -341,6 +367,21 @@ _UTC_NOW = lambda: datetime.now(timezone.utc)
 # Official docs snapshot entries. Models whose published pricing and cache
 # semantics are stable enough to encode exactly.
 _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+    # ── Moonshot Kimi K3 ─────────────────────────────────────────────────
+    # OpenRouter catalog snapshot for moonshotai/kimi-k3 (2026-09-27: $3/M in,
+    # $15/M out, $0.30/M cache read; no cache-write rate → priced at input).
+    # Reached by the notional Kimi membership lanes (kimi-oauth, kimi-code).
+    (
+        "moonshotai",
+        "kimi-k3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3",
+        pricing_version="openrouter-kimi-k3-2026-09-27",
+    ),
     # ── xAI Grok ─────────────────────────────────────────────────────────
     # Priced from OpenRouter's live catalog snapshot (per-1M in/out; cache
     # read = input_cache_read; xAI publishes no cache-write rate → None).
@@ -1094,6 +1135,21 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="deepseek-pricing-2026-07",
     ),
     # Google Gemini
+    # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
+    # These are the launch rates Google lists "through December 31, 2026"; the
+    # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027", so this row
+    # must be re-read then.
+    (
+        "google",
+        "gemini-3.8-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("3.75"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-09-28",
+    ),
     (
         "google",
         "gemini-3.6-flash",
@@ -2008,6 +2064,16 @@ def resolve_billing_route(
     # ...) but not every "-codex" variant (e.g. gpt-5.5-codex is absent while
     # gpt-5.5 is present), so _normalize_codex_model_name() strips a trailing
     # "-codex" as a fallback when the exact id is missing.
+    if (
+        provider_name in NOTIONAL_MOONSHOT_PROVIDERS
+        and _infer_vendor_from_model(model.split("/")[-1]) == "moonshotai"
+    ):
+        return BillingRoute(
+            provider="moonshotai",
+            model=_normalize_kimi_membership_model(model),
+            base_url=base_url or "",
+            billing_mode="official_docs_snapshot",
+        )
     if provider_name in NOTIONAL_OPENROUTER_PROVIDERS:
         return BillingRoute(
             provider="openrouter",
@@ -2136,6 +2202,17 @@ def _strip_anthropic_release_date(name: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+# Trailing reasoning-effort tier the gemini-bridge appends to a Gemini id
+# (agy's "(Low|Medium|High)" display suffix, slugged: gemini-3.8-flash-low).
+_GEMINI_EFFORT_SUFFIX_RE = re.compile(r"^(gemini-.+)-(?:low|medium|high)$")
+
+
+def _strip_gemini_effort_suffix(name: str) -> Optional[str]:
+    """gemini-3.8-flash-medium → gemini-3.8-flash; None when there is no suffix."""
+    m = _GEMINI_EFFORT_SUFFIX_RE.match(name)
+    return m.group(1) if m else None
+
+
 def _infer_vendor_from_model(model: str) -> Optional[str]:
     """Infer the pricing vendor from an unambiguous model-id prefix (M1, SPEC §5B).
 
@@ -2155,6 +2232,11 @@ def _infer_vendor_from_model(model: str) -> Optional[str]:
         return "google"
     if name.startswith("grok-"):
         return "xai"
+    # Kimi / Moonshot: public ids (kimi-k3, kimi-for-coding) and the membership
+    # ids Kimi Code serves (k3, k3-256k). The ONE model->vendor map shared by the
+    # native kimi-oauth lane and the multi-vendor cpa proxy lane (t_d59c7936).
+    if name.startswith("kimi-") or name == "k3" or name.startswith("k3-"):
+        return "moonshotai"
     return None
 
 
@@ -2186,6 +2268,16 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         # own key. Fixes the dated-Haiku unpriced gap (audit 2026-06-17).
         base = _strip_anthropic_release_date(normalized)
         if base and base != normalized:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
+            if entry:
+                return entry
+    # Google ids from the gemini-bridge carry the agy reasoning-effort tier as a
+    # suffix (gemini-3.8-flash-low, gemini-3.1-pro-high). Effort is not a SKU:
+    # Google bills thinking tokens at the model's output rate, so retry on the
+    # base id. Runs after the direct lookup, so a real "-high" SKU would win.
+    if route.provider == "google":
+        base = _strip_gemini_effort_suffix(model)
+        if base:
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
             if entry:
                 return entry

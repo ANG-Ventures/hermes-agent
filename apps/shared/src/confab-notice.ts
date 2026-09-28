@@ -13,7 +13,8 @@
  * row. Presenting the confirmed-confabulation claim off that string would put
  * a false accusation on a user or system turn. So a row must clear two gates:
  *
- * 1. `role === 'assistant'` — only a model reply can carry a catch;
+ * 1. `role === 'assistant'` — only a model reply can carry a scaffold catch;
+ *    a metadata-only `system` event row may carry a TOOL-CALL notice only;
  * 2. `display_metadata.confab_notice` re-validates against the same
  *    fail-closed v1 schema the wire payload had to pass.
  *
@@ -31,6 +32,17 @@ export const CONFAB_NOTICE_VERSION = 1
 
 /** The only catch kind defined by v1 of the contract. */
 export const CONFAB_NOTICE_KIND = 'scaffold_confab_removed'
+
+/**
+ * Tool-call notice kinds (Python `TOOL_CALL_NOTICE_TEXT`) and their fixed
+ * labels (`confab_notice_status`). These persist as an EMPTY `system` row, so
+ * a reader that only accepted assistant rows dropped them on reload
+ * (FleetReview #942).
+ */
+export const TOOL_CALL_NOTICE_EVENT_TEXT: Readonly<Record<string, string>> = {
+  tool_call_as_text: 'Tool call not executed: text was sent instead of a native tool call.',
+  tool_call_unparseable: 'Tool call not executed: tool-call JSON could not be parsed.'
+}
 
 /** Allowed `scope` values. */
 export const CONFAB_NOTICE_SCOPES = ['visible', 'intermediate', 'both'] as const
@@ -76,7 +88,9 @@ export function validateConfabNotice(raw: unknown): ConfabNotice | null {
     return null
   }
 
-  if (candidate.kind !== CONFAB_NOTICE_KIND) {
+  const isToolCallKind = typeof candidate.kind === 'string' && Object.hasOwn(TOOL_CALL_NOTICE_EVENT_TEXT, candidate.kind)
+
+  if (candidate.kind !== CONFAB_NOTICE_KIND && !isToolCallKind) {
     return null
   }
 
@@ -85,6 +99,10 @@ export function validateConfabNotice(raw: unknown): ConfabNotice | null {
   }
 
   if (typeof candidate.scope !== 'string' || !CONFAB_NOTICE_SCOPES.includes(candidate.scope as never)) {
+    return null
+  }
+
+  if (isToolCallKind && candidate.scope !== 'visible') {
     return null
   }
 
@@ -98,7 +116,7 @@ export function validateConfabNotice(raw: unknown): ConfabNotice | null {
 
   return {
     grammar: grammar === undefined || grammar === null ? null : grammar,
-    kind: CONFAB_NOTICE_KIND,
+    kind: candidate.kind as string,
     request_id: candidate.request_id,
     scope: candidate.scope,
     version: CONFAB_NOTICE_VERSION
@@ -112,7 +130,7 @@ export function validateConfabNotice(raw: unknown): ConfabNotice | null {
  * JSON text, so parse a string form before reading into it.
  */
 export function confabNoticeFromRow(row: ConfabNoticeRow | null | undefined): ConfabNotice | null {
-  if (!row || row.role !== 'assistant' || row.display_kind !== CONFAB_NOTICE_DISPLAY_KIND) {
+  if (!row || (row.role !== 'assistant' && row.role !== 'system') || row.display_kind !== CONFAB_NOTICE_DISPLAY_KIND) {
     return null
   }
 
@@ -130,5 +148,17 @@ export function confabNoticeFromRow(row: ConfabNoticeRow | null | undefined): Co
     return null
   }
 
-  return validateConfabNotice((metadata as Record<string, unknown>)[CONFAB_NOTICE_KEY])
+  const notice = validateConfabNotice((metadata as Record<string, unknown>)[CONFAB_NOTICE_KEY])
+
+  // Mirrors Python: a system row may only carry a tool-call notice.
+  if (row.role === 'system' && (!notice || !Object.hasOwn(TOOL_CALL_NOTICE_EVENT_TEXT, notice.kind))) {
+    return null
+  }
+
+  return notice
+}
+
+/** The fixed event label for a validated notice. */
+export function confabNoticeEventText(notice: ConfabNotice): string {
+  return TOOL_CALL_NOTICE_EVENT_TEXT[notice.kind] ?? CONFAB_NOTICE_EVENT_TEXT
 }

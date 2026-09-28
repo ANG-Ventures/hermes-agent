@@ -479,6 +479,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = GuardedDict(__name__, "_PROVIDER_MODELS
         "MiniMax-M2.7",
         "MiniMax-M2.7-highspeed",
     ],
+    "kimi-oauth": [
+        "k3",
+        "k3-256k",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+    ],
     "minimax-cn": [
         "MiniMax-M3",
         "MiniMax-M2.7",
@@ -1369,6 +1375,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("zai",            "Z.AI / GLM",               "Z.AI / GLM (Zhipu direct API)"),
     ProviderEntry("kimi-coding",    "Kimi / Kimi Coding Plan",  "Kimi Coding Plan (api.kimi.com & Moonshot API)"),
     ProviderEntry("kimi-coding-cn", "Kimi / Moonshot (China)",  "Kimi / Moonshot China (Domestic direct API)"),
+    ProviderEntry("kimi-oauth",     "Kimi Code (OAuth)",        "Kimi Code membership via device-code login (K3, no API key)"),
     ProviderEntry("stepfun",        "StepFun Step Plan",       "StepFun Step Plan (Agent / coding models via Step Plan API)"),
     ProviderEntry("minimax",        "MiniMax",                  "MiniMax (Global direct API)"),
     ProviderEntry("minimax-oauth",  "MiniMax (OAuth)",          "MiniMax via OAuth browser login (Coding Plan, minimax.io)"),
@@ -1566,7 +1573,7 @@ _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named prov
 # Member order is the order shown inside the group submenu.
 # ---------------------------------------------------------------------------
 PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
-    "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
+    "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-oauth", "kimi-coding-cn"]),
     "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
     "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
@@ -1670,6 +1677,8 @@ _PROVIDER_ALIASES = GuardedDict(__name__, "_PROVIDER_ALIASES", {
     "moonshot": "kimi-coding",
     "kimi-cn": "kimi-coding-cn",
     "moonshot-cn": "kimi-coding-cn",
+    "kimi_oauth": "kimi-oauth",
+    "kimi-membership": "kimi-oauth",
     "step": "stepfun",
     "stepfun-coding-plan": "stepfun",
     "arcee-ai": "arcee",

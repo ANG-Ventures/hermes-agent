@@ -1088,6 +1088,19 @@ def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
         return 1_048_576
     if (
         parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "api.kimi.com"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.rstrip("/") in {"/coding", "/coding/v1"}
+        and not parsed.query
+        and not parsed.fragment
+        and model.strip().lower() == "k3-256k"
+    ):
+        # Membership id (kimi-oauth); /coding/v1/models reports 262,144.
+        return 262_144
+    if (
+        parsed.scheme.lower() == "https"
         and (parsed.hostname or "").lower() == "integrate.api.nvidia.com"
         and port in (None, 443)
         and parsed.username is None
