@@ -13488,12 +13488,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return int(row[0]) if row else 0
 
     @staticmethod
-    def _active_duplicate_tool_result_ids(conn, session_id: str) -> set:
-        """tool_call_ids with more than one ACTIVE ``role='tool'`` row in *session_id*."""
+    def _active_duplicate_tool_result_ids(conn, session_id: str) -> dict:
+        """``{tool_call_id: count}`` for ids with more than one ACTIVE ``role='tool'``
+        row in *session_id*. A count, not a set: a THIRD copy of an id that was
+        already duplicated is still an introduced duplicate (FleetReview #1054)."""
         return {
-            row[0]
+            row[0]: int(row[1])
             for row in conn.execute(
-                "SELECT tool_call_id FROM messages "
+                "SELECT tool_call_id, COUNT(*) FROM messages "
                 "WHERE session_id = ? AND active = 1 AND role = 'tool' "
                 "AND tool_call_id IS NOT NULL AND tool_call_id != '' "
                 "GROUP BY tool_call_id HAVING COUNT(*) > 1",
@@ -13631,10 +13633,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
 
-            introduced = (
-                self._active_duplicate_tool_result_ids(conn, session_id)
-                - preexisting_dup_tool_results
-            )
+            introduced = {
+                tc_id
+                for tc_id, n in self._active_duplicate_tool_result_ids(conn, session_id).items()
+                if n > preexisting_dup_tool_results.get(tc_id, 1)
+            }
             if introduced:
                 raise TranscriptInvariantError(
                     f"archive_and_compact({session_id!r}) would publish "

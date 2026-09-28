@@ -53,7 +53,9 @@ def configured_files(cfg: Optional[dict]) -> List[str]:
         except Exception:
             continue
         if os.path.isfile(path):
-            out.append(path)
+            # POSIX `.` searches PATH for a name without a slash, so a relative
+            # path accepted here would not be the file sourced (FleetReview #1254 :52).
+            out.append(os.path.abspath(path))
     return out
 
 
@@ -65,7 +67,11 @@ def compute_overlay(
     if not files:
         return {}
     dump = "import json,os,sys;sys.stdout.write(json.dumps(dict(os.environ)))"
-    script = 'for __pef in "$@"; do . "$__pef" >/dev/null 2>&1; done; unset __pef; exec "$PEF_PY" -c "$PEF_DUMP"'
+    # Each file's own status counts: a file that exports and then fails must not
+    # have its partial exports applied (contract: non-zero exit = env untouched;
+    # FleetReview #1254 :68).
+    script = ('for __pef in "$@"; do . "$__pef" >/dev/null 2>&1 || exit 97; done; '
+              'unset __pef; exec "$PEF_PY" -c "$PEF_DUMP"')
     child_env = dict(base)
     child_env["PEF_PY"] = sys.executable
     child_env["PEF_DUMP"] = dump
