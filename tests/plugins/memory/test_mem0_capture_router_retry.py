@@ -39,3 +39,28 @@ def test_retried_route_preserves_staged_facts_across_dates(tmp_path):
     assert router.calls == 0
     assert "original" in open(original, encoding="utf-8").read()
     assert list((tmp_path / "staged").rglob("turn-1.md")) == [Path(original)]
+
+
+def test_retry_does_not_restage_when_destination_mode_changes(tmp_path):
+    class _Router:
+        _stage_world_facts = CaptureRouter._stage_world_facts
+        route_turn = CaptureRouter.route_turn
+        _write = staticmethod(CaptureRouter._default_write)
+        def __init__(self):
+            self._staging_dir = str(tmp_path / "staged")
+            self._brain_inbox = str(tmp_path / "inbox")
+            self._staging_mode = True
+            self._now = lambda: __import__("datetime").datetime.now()
+            self.calls = 0
+        def two_pass_extract(self, *args):
+            self.calls += 1
+            raise AssertionError("already staged: must not re-extract")
+
+    router = _Router()
+    original = router._stage_world_facts([{"class": "world_entity", "content": "original"}],
+                                          router._staging_dir, turn_id="turn-2", session="s", ts=None)
+    router._staging_mode = False
+    result = router.route_turn("user", "assistant", turn_id="turn-2", session="s")
+    assert result["staged_path"] == original
+    assert result["destination"] == "staging"
+    assert list((tmp_path / "inbox").rglob("turn-2.md")) == []
