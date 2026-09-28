@@ -137,6 +137,7 @@ describe('tool-call notice on a metadata-only system row (FleetReview #942)', ()
   // The Python reader (notice_from_display_row) accepts that row; an
   // assistant-only gate here dropped it on every reload.
   const TOOL_NOTICE = { grammar: null, kind: 'tool_call_as_text', request_id: 'r1', scope: 'visible', version: 1 }
+
   const toolRow = (over: Record<string, unknown> = {}) =>
     noticeRow({ content: '', display_metadata: { confab_notice: TOOL_NOTICE }, role: 'system', ...over })
 

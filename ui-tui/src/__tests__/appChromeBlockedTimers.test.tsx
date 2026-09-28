@@ -303,6 +303,7 @@ describe('status-chrome timers under an occluding overlay', () => {
     // clock, because nowSpy has replaced Date.now in this file. A genuine
     // regression still fails below, just on the real frame text.
     let resumed = ''
+
     for (let i = 0; i < 250 && resumed === ''; i++) {
       await flush()
       resumed = rule.output()
