@@ -4288,17 +4288,24 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if args.review:
-            review_session = _operator_review_session_ref()
-            task = kb.claim_review_task(
-                conn, args.task_id, ttl_seconds=args.ttl,
-                session_ref=review_session,
-            )
-            if task is not None and review_session is None:
+            session_ref = _operator_review_session_ref()
+            if session_ref is None:
+                # An unbound claim is a dead end (t_c3cf232e): no later
+                # request-changes can inherit it, and it only parks the card in
+                # ``running`` under this short-lived CLI pid. Refuse up front.
                 print(
-                    f"warning: review claim on {args.task_id} bound no session; "
-                    f"request-changes cannot use it and will release it back to review",
+                    f"cannot claim {args.task_id} --review: this caller has no "
+                    f"session identity (sessionless shell, cron job or delegate "
+                    f"child), so no later request-changes could use the claim. "
+                    f"Run it from the reviewing session, or approve directly "
+                    f"with `hermes kanban complete {args.task_id}`.",
                     file=sys.stderr,
                 )
+                return 1
+            task = kb.claim_review_task(
+                conn, args.task_id, ttl_seconds=args.ttl,
+                session_ref=session_ref, operator_claim=True,
+            )
         else:
             task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
