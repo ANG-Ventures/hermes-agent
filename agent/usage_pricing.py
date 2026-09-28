@@ -1094,6 +1094,21 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="deepseek-pricing-2026-07",
     ),
     # Google Gemini
+    # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
+    # These are the launch rates Google lists "through December 31, 2026"; the
+    # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027", so this row
+    # must be re-read then.
+    (
+        "google",
+        "gemini-3.8-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("3.75"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-09-28",
+    ),
     (
         "google",
         "gemini-3.6-flash",
@@ -2136,6 +2151,17 @@ def _strip_anthropic_release_date(name: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+# Trailing reasoning-effort tier the gemini-bridge appends to a Gemini id
+# (agy's "(Low|Medium|High)" display suffix, slugged: gemini-3.8-flash-low).
+_GEMINI_EFFORT_SUFFIX_RE = re.compile(r"^(gemini-.+)-(?:low|medium|high)$")
+
+
+def _strip_gemini_effort_suffix(name: str) -> Optional[str]:
+    """gemini-3.8-flash-medium → gemini-3.8-flash; None when there is no suffix."""
+    m = _GEMINI_EFFORT_SUFFIX_RE.match(name)
+    return m.group(1) if m else None
+
+
 def _infer_vendor_from_model(model: str) -> Optional[str]:
     """Infer the pricing vendor from an unambiguous model-id prefix (M1, SPEC §5B).
 
@@ -2186,6 +2212,16 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         # own key. Fixes the dated-Haiku unpriced gap (audit 2026-06-17).
         base = _strip_anthropic_release_date(normalized)
         if base and base != normalized:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
+            if entry:
+                return entry
+    # Google ids from the gemini-bridge carry the agy reasoning-effort tier as a
+    # suffix (gemini-3.8-flash-low, gemini-3.1-pro-high). Effort is not a SKU:
+    # Google bills thinking tokens at the model's output rate, so retry on the
+    # base id. Runs after the direct lookup, so a real "-high" SKU would win.
+    if route.provider == "google":
+        base = _strip_gemini_effort_suffix(model)
+        if base:
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
             if entry:
                 return entry
