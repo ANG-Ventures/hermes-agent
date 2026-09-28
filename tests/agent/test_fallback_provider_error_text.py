@@ -147,3 +147,95 @@ def test_custom_prefixed_relay_keeps_relay_rider():
     assert _plain_provider({"from_provider": "custom:claude-apr"}) is False
     assert _plain_provider({"from_provider": "custom:claude-apx-7"}) is False
     assert _plain_provider({"from_provider": "openrouter"}) is True
+
+
+# ── t_21bba7dc: conn drop to the local relay before it answered ──────────
+
+# The real 2026-09-28 08:15:40 ledger row (turns.db fallback_events id 781):
+# APIConnectionError to 127.0.0.1:18811 while relay-autodeploy restarted it.
+REAL_0815_ROW = {"from_provider": "claude-bpr", "from_model": "claude-fable-5-1",
+                 "to_provider": "claude-bpr", "to_model": "claude-opus-5-5",
+                 "kind": "failover", "reason": "timeout", "trigger_class": "conn",
+                 "class_source": "text", "http_status": None, "relay_synthetic": 0,
+                 "hop": None, "seat": None, "attempts": 1,
+                 "ts": 1790608540.24259, "first_err_ts": 1790608540.24259}
+
+
+def _conn_error(url="http://127.0.0.1:18811/v1/messages"):
+    return openai.APIConnectionError(message="Connection error.",
+                                     request=httpx.Request("POST", url))
+
+
+def test_relay_conn_drop_names_local_relay_not_hop_sub(monkeypatch):
+    monkeypatch.setattr(fbe, "probe_listener", lambda addr, timeout=0.3: False)
+    agent, emitted = _agent("claude-bpr")
+    fbe.stash_api_error(agent, _conn_error(), None)
+    row = fbe.build_row(agent, "failover", from_provider="claude-bpr",
+                        from_model="claude-fable-5-1", to_provider="claude-bpr",
+                        to_model="claude-opus-5-5", reason="timeout")
+    assert row["trigger_class"] == "conn" and row["relay_addr"] == "127.0.0.1:18811"
+    _emit_fallback_announce(agent, "claude-fable-5-1", "claude-opus-5-5", "claude-bpr",
+                            old_provider="claude-bpr", reason=FailoverReason.timeout,
+                            ledger_row=row)
+    banner = emitted[0]
+    assert "hop unknown" not in banner and "sub unknown" not in banner, banner
+    assert ("local relay 127.0.0.1:18811 dropped the connection before answering; "
+            "relay not reachable") in banner, banner
+
+
+def test_relay_conn_drop_says_relay_back_up_when_listener_answers(monkeypatch):
+    monkeypatch.setattr(fbe, "probe_listener", lambda addr, timeout=0.3: True)
+    agent, _ = _agent("claude-bpr")
+    fbe.stash_api_error(agent, _conn_error(), None)
+    row = fbe.build_row(agent, "failover", from_provider="claude-bpr",
+                        from_model="claude-fable-5-1", to_provider="claude-bpr",
+                        to_model="claude-opus-5-5", reason="timeout")
+    row["relay_up_ts"] = 1790608541.0  # 08:15:41 PDT
+    rider = fp.format_cause_rider(dict(row, first_err_ts=REAL_0815_ROW["ts"]),
+                                  tz=dt.timezone(dt.timedelta(hours=-7)))
+    assert rider == ("local relay 127.0.0.1:18811 dropped the connection before answering; "
+                     "relay back up 08:15:41, 08:15:40"), rider
+
+
+def test_real_0815_row_without_address_drops_rider():
+    rider = fp.format_cause_rider(REAL_0815_ROW, tz=UTC)
+    assert "hop unknown" not in rider and "sub unknown" not in rider, rider
+    assert rider.startswith("the relay dropped the connection before answering"), rider
+
+
+def test_relay_conn_with_seat_keeps_rider():
+    row = dict(REAL_0815_ROW, seat="sub-vps-7", hop="relay→bridge", relay_addr="127.0.0.1:18811")
+    rider = fp.format_cause_rider(row, tz=UTC)
+    assert rider.startswith("connection error to sub-vps-7 bridge"), rider
+    assert "local relay" not in rider
+    # A mid-stream drop (incomplete read) with no evidence keeps the relay rider too.
+    mid = dict(REAL_0815_ROW, err_head="peer closed connection: incomplete read")
+    assert "(hop unknown, sub unknown)" in fp.format_cause_rider(mid, tz=UTC)
+
+
+def test_openrouter_conn_row_unchanged(monkeypatch):
+    called = []
+    monkeypatch.setattr(fbe, "probe_listener", lambda *a, **k: called.append(a))
+    agent, _ = _agent("openrouter")
+    fbe.stash_api_error(agent, _conn_error("https://openrouter.ai/api/v1/chat/completions"), None)
+    row = fbe.build_row(agent, "failover", from_provider="openrouter",
+                        from_model="moonshotai/kimi-k3", to_provider="claude-bpr",
+                        to_model="claude-opus-5-5", reason="timeout")
+    assert not called and "relay_addr" not in row
+    rider = fp.format_cause_rider(dict(row, ts=3600, first_err_ts=3600), tz=UTC)
+    assert rider == "connection error, 01:00:00", rider
+
+
+def test_probe_listener_real_socket():
+    import socket
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert fbe.probe_listener(f"127.0.0.1:{port}") is True
+    finally:
+        srv.close()
+    assert fbe.probe_listener(f"127.0.0.1:{port}") is False
+    assert fbe.probe_listener(None) is None
