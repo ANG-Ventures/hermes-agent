@@ -32,7 +32,7 @@ def _init(monkeypatch, tmp_path, cfg):
     monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
     monkeypatch.setenv("MEM0_USER_ID", "ace")
     monkeypatch.delenv("MEM0_API_KEY", raising=False)
-    (tmp_path / "mem0.json").write_text(json.dumps(cfg))
+    (tmp_path / "mem0.json").write_text(json.dumps(cfg), encoding="utf-8")
     p = Mem0MemoryProvider()
     p.initialize("test-session")
     return p
