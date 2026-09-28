@@ -157,3 +157,21 @@ def test_comment_lookup_outage_is_retried_not_fatal(monkeypatch):
     assert _mod.run("t", "o/r", "1", "5", "https://ci", interval=0) == 0
     assert len(lookups) == 2  # the failed post is retried on the next poll
     assert sent == ["PATCH"]
+
+
+# ── stale re-run artifacts (k125, C7) ────────────────────────────────────
+
+
+def test_rerun_dedupe_keeps_the_newest_artifact(monkeypatch, tmp_path):
+    """Two same-name artifacts from a re-run: the NEWEST attempt's results win,
+    whatever order the listing returns them in."""
+    old = {"id": 10, "name": "review-status-lint", "created_at": "2026-09-27T10:00:00Z"}
+    new = {"id": 20, "name": "review-status-lint", "created_at": "2026-09-27T11:00:00Z"}
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [old, new])
+    monkeypatch.setattr(_mod, "_download_artifact",
+                        lambda token, repo, art, d: Path(str(art["id"])))
+    monkeypatch.setattr(_mod, "_parse_status_file", lambda p: [
+        {"source": "lint", "results": [{"attempt": int(p.name)}]}])
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    out = _mod.fetch_all_review_statuses("t", "o/r", "1")
+    assert out == [{"source": "lint", "results": [{"attempt": 20}]}]

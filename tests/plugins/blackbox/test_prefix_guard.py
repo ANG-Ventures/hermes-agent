@@ -468,3 +468,43 @@ def test_side_question_fork_gets_its_own_prefix_chain(monkeypatch):
     cch._record_successful_api_call(fork, response, _request(2))
     assert [(r["session_key"], r["prefix_compare_across_turns"]) for r in rows] == [
         ("S:side_question", False)]
+
+
+def test_unmeasured_prompt_buckets_reach_the_guard_as_none(db, enabled, monkeypatch):
+    """k116: an unknown input/cache bucket must not be persisted as a measured 0."""
+    from agent.usage_pricing import CanonicalUsage
+
+    seen = []
+    real = store.record_prefix_check
+    monkeypatch.setattr(store, "record_prefix_check",
+                        lambda **kw: seen.append(kw) or real(**kw))
+    usage = CanonicalUsage(input_tokens=100, output_tokens=1,
+                           cache_read_tokens=0, cache_read_tokens_unknown=True)
+    blackbox.record_api_call(
+        turn_id="t", seq=0, ts=1.0, provider="p", model="m", usage=usage,
+        api_mode="anthropic_messages", sub_key=None, attribution="wire", http_status=200,
+        relay_synthetic=False, route_id=None, api_kwargs=_request(2), session_key="s",
+    )
+    assert seen and seen[0]["cache_read"] is None
+    assert seen[0]["prompt_tokens"] is None
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT prompt_tokens FROM prefix_sessions").fetchone()[0] is None
+
+
+def test_aggregate_only_unknown_keeps_measured_prompt_side(db, enabled, monkeypatch):
+    """usage_unknown alone must not erase measured cache_read / prompt size from the guard."""
+    from agent.usage_pricing import CanonicalUsage
+
+    seen = []
+    real = store.record_prefix_check
+    monkeypatch.setattr(store, "record_prefix_check",
+                        lambda **kw: seen.append(kw) or real(**kw))
+    usage = CanonicalUsage(input_tokens=100, output_tokens=0, cache_read_tokens=40,
+                           usage_unknown=True)
+    blackbox.record_api_call(
+        turn_id="t", seq=0, ts=1.0, provider="p", model="m", usage=usage,
+        api_mode="chat_completions", sub_key=None, attribution="wire", http_status=200,
+        relay_synthetic=False, route_id=None, api_kwargs=_request(2), session_key="s",
+    )
+    assert seen and seen[0]["cache_read"] == 40
+    assert seen[0]["prompt_tokens"] == 140

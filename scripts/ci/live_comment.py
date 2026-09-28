@@ -480,6 +480,11 @@ def fetch_all_review_statuses(
         shutil.rmtree(run_dl_dir)
     run_dl_dir.mkdir(parents=True, exist_ok=True)
 
+    # Newest first: the first-wins dedupe below must keep the latest re-run's
+    # results, not whichever copy the listing happened to return first.
+    rs_artifacts.sort(
+        key=lambda a: (a.get("created_at") or "", a.get("id") or 0), reverse=True,
+    )
     for artifact in rs_artifacts:
         status_file = _download_artifact(token, repo, artifact, run_dl_dir)
         if status_file is None:

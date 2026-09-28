@@ -193,3 +193,71 @@ def test_no_table_is_inert(tmp_path, monkeypatch):
     job = _qbt_job()
     chat, _ = _deliver(job, "cannot read torrents/info")
     assert chat == ALERTS
+
+
+def test_ledger_not_written_when_demoted_delivery_fails(fleet):
+    """k88: the ledger row counts a DELIVERED deferral; a failed send must not
+    leave a row behind (the retry path would otherwise double-count it)."""
+    from gateway.config import Platform
+
+    latch = _arm(fleet)
+    job = _qbt_job()
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    cfg = MagicMock()
+    cfg.platforms = {Platform.DISCORD: pconfig}
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch("tools.send_message_tool._send_to_platform",
+               new=AsyncMock(return_value={"error": "Discord send failed"})):
+        err = _deliver_result(job, _failure_content(job, "cannot read torrents/info"))
+    assert err and "Discord send failed" in err
+    assert not (latch.parent / "suppressed.jsonl").exists()
+
+
+def test_ledger_not_written_when_only_a_same_id_other_platform_target_delivers(fleet):
+    """#logs failed; a telegram target with the SAME chat id succeeded. The deferral
+    never reached #logs, so no ledger row."""
+    from gateway.config import Platform
+
+    latch = _arm(fleet)
+    job = _qbt_job(deliver=f"discord:{ALERTS},telegram:{LOGS}")
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    cfg = MagicMock()
+    cfg.platforms = {Platform.DISCORD: pconfig, Platform.TELEGRAM: pconfig}
+
+    async def send(platform, pcfg, chat_id, *a, **k):
+        if platform == Platform.DISCORD:
+            return {"error": "Discord send failed"}
+        return {"success": True}
+
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch("tools.send_message_tool._send_to_platform", new=send):
+        err = _deliver_result(job, _failure_content(job, "cannot read torrents/info"))
+    assert err and "Discord send failed" in err
+    assert not (latch.parent / "suppressed.jsonl").exists()
+
+
+def test_ledger_row_is_flushed_as_soon_as_logs_delivery_succeeds(fleet):
+    """The #logs send landed; the row must be on disk before later targets run,
+    so an abort or worker exit during them cannot lose a delivered deferral."""
+    from gateway.config import Platform
+
+    latch = _arm(fleet)
+    ledger = latch.parent / "suppressed.jsonl"
+    job = _qbt_job(deliver=f"discord:{ALERTS},telegram:12345")
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    cfg = MagicMock()
+    cfg.platforms = {Platform.DISCORD: pconfig, Platform.TELEGRAM: pconfig}
+    seen_at_later_target = []
+
+    async def send(platform, pcfg, chat_id, *a, **k):
+        if platform == Platform.TELEGRAM:
+            seen_at_later_target.append(ledger.exists())
+        return {"success": True}
+
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch("tools.send_message_tool._send_to_platform", new=send):
+        _deliver_result(job, _failure_content(job, "cannot read torrents/info"))
+    assert seen_at_later_target == [True]

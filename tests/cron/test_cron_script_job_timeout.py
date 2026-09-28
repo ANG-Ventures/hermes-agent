@@ -66,7 +66,9 @@ def test_explicit_timeout_overrides_interval_both_ways():
     assert scheduler_ext.resolve_job_script_timeout(tight, 7200) == (120, "job")
 
 
-@pytest.mark.parametrize("bad", [0, -5, "nope", None, True])
+@pytest.mark.parametrize(
+    "bad", [0, -5, "nope", None, True, "inf", "-Infinity", float("inf"), "nan"]
+)
 def test_invalid_explicit_timeout_falls_back_to_interval(bad):
     job = {"timeout_s": bad, "schedule": {"kind": "interval", "minutes": 10}}
     assert scheduler_ext.resolve_job_script_timeout(job, 7200) == (600, "interval")
