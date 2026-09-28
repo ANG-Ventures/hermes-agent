@@ -20,31 +20,33 @@ REVIEWER = "human:apollo"
 SETTING = "negative_handoff_review"
 
 # Word-bounded on both sides: "unblocked once" / "could notify" are positive
-# handoffs, not "blocked on" / "could not". A negated phrase ("no STOP
-# finding", "no longer blocked on") is positive too, and "could not
-# reproduce" is the usual wording of a clean flake verdict
-# (FleetReview #1447, t_daa1f3bf).
-_NEGATED = r"(?<!\bno\s)(?<!\bnot\s)(?<!\bnever\s)(?<!\blonger\s)(?<!\bwithout\s)"
+# handoffs, not "blocked on" / "could not". "could not reproduce" is the usual
+# wording of a clean flake verdict (FleetReview #1447, t_daa1f3bf).
 PHRASES = re.compile(
-    _NEGATED
-    + r"\b(?:NOT\s+DEPLOYED"
+    r"\b(?:NOT\s+DEPLOYED"
     r"|STOP\s+finding"
     r"|could\s+not(?!\s+reproduce)"
     r"|blocked\s+on"
     r"|nothing\s+was\s+(?:armed|measured))\b",
     re.IGNORECASE,
 )
+# A negated phrase is positive: "no STOP finding", "no new STOP finding",
+# "no longer blocked on". The negator may sit up to two words before it.
+_NEGATED_TAIL = re.compile(
+    r"\b(?:no|not|never|without|longer)(?:\s+[\w-]+){0,2}\s+$", re.IGNORECASE,
+)
 PARTIAL_OUTCOMES = frozenset({"partial"})
 
 
 def handoff_texts(summary: Optional[str], result: Optional[str]) -> tuple:
-    """The prose to scan: ``summary`` when present, else the legacy ``result``.
+    """The prose to scan: ``summary`` plus the headline (first line) of ``result``.
 
-    ``result`` often carries pasted tool/test output (e.g. a "could not find
-    module" line from a failure fixed later), so it is only the handoff when
-    no summary was written.
+    ``result`` is a short result line, but workers also paste tool/test output
+    into it (e.g. a "could not find module" traceback fixed later). Its first
+    line is the verdict; later lines are treated as quoted logs.
     """
-    return (summary,) if (summary or "").strip() else (result,)
+    headline = next((ln for ln in (result or "").splitlines() if ln.strip()), "")
+    return (summary, headline)
 
 
 def match(texts: Iterable[Optional[str]], metadata: Optional[dict] = None) -> Optional[str]:
@@ -52,9 +54,10 @@ def match(texts: Iterable[Optional[str]], metadata: Optional[dict] = None) -> Op
     for text in texts:
         if not text:
             continue
-        hit = PHRASES.search(str(text))
-        if hit:
-            return hit.group(0)
+        text = str(text)
+        for hit in PHRASES.finditer(text):
+            if not _NEGATED_TAIL.search(text[max(0, hit.start() - 48):hit.start()]):
+                return hit.group(0)
     if isinstance(metadata, dict):
         outcome = metadata.get("outcome")
         if isinstance(outcome, str) and outcome.strip().casefold() in PARTIAL_OUTCOMES:

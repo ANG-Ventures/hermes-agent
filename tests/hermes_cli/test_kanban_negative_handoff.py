@@ -132,18 +132,20 @@ def test_approval_from_review_is_not_rerouted(conn, armed):
     "no STOP finding; admission measured 39 legs",
     "no longer blocked on bpx#288; landed",
     "could not reproduce the flake in 50 runs; closing as green",
+    "no new STOP finding; admission measured 39 legs",
 ])
 def test_phrases_need_word_boundaries(text):
     assert neg.match([text]) is None
 
 
-def test_result_log_is_not_scanned_when_summary_is_present(conn, armed):
+def test_quoted_log_lines_in_result_are_not_scanned(conn, armed):
     # ``result`` often carries pasted tool/test output from a failure that was
     # later fixed; the handoff the worker writes is ``summary``.
     tid = _claimed(conn)
     assert kb.complete_task(
         conn, tid, summary=GOOD,
-        result="pytest: ImportError: could not find module foo (fixed in 2nd commit)",
+        result="tests green after 2nd commit\n"
+               "pytest: ImportError: could not find module foo (fixed in 2nd commit)",
         metadata={"no_pr": True},
     )
     assert _status(conn, tid)["status"] == "done"
@@ -244,3 +246,71 @@ def test_negative_route_promotes_prose_named_artifact(conn, armed):
                             metadata={"no_pr": True})
     assert _status(conn, tid)["status"] == "review"
     _assert_artifact_survives_bare_approval(conn, tid, ws, artifact)
+
+
+# --- FleetReview #1447 @3021cfdb (t_daa1f3bf) -------------------------------
+
+
+def test_result_headline_is_scanned_even_with_a_summary(conn, armed):
+    tid = _claimed(conn)
+    assert kb.complete_task(conn, tid, summary="Attempted rollout; details in result",
+                            result="NOT DEPLOYED; nothing was armed")
+    assert _status(conn, tid)["status"] == "review"
+
+
+@pytest.mark.parametrize("status", ["blocked", "ready"])
+def test_non_running_card_completes_with_negative_wording(conn, armed, status):
+    tid = kb.create_task(conn, title="vendor", assignee="daedalus")
+    if status == "blocked":
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="vendor")
+    assert _status(conn, tid)["status"] == status
+    # Operator close of a card no worker is running: not an implementer handoff.
+    assert kb.complete_task(conn, tid, summary="blocked on vendor, closing as won't-fix")
+    assert _status(conn, tid)["status"] == "done"
+
+
+def test_open_pr_route_escalates_negative_handoff_to_apollo(conn, armed, monkeypatch):
+    monkeypatch.setenv("KANBAN_HANDOFF_FRESHNESS", "0")
+    monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
+    monkeypatch.setattr(op, "_default_query", lambda: (lambda repo, number: {"state": "OPEN"}))
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: "argus")
+    tid = _claimed(conn)
+    assert kb.complete_task(conn, tid, summary=NOT_DEPLOYED,
+                            metadata={"pr_url": "https://github.com/o/r/pull/7"})
+    row = _status(conn, tid)
+    assert (row["status"], row["assignee"]) == ("review", neg.REVIEWER)
+    kinds = _kinds(conn, tid)
+    assert "completion_routed_to_review" in kinds
+    assert "completion_routed_negative_handoff" in kinds
+    assert kb.latest_run(conn, tid).metadata["negative_handoff"] == "NOT DEPLOYED"
+
+
+def test_bare_approval_event_carries_routed_artifacts(conn, armed):
+    tid, ws, artifact = _scratch_task(conn)
+    assert kb.complete_task(conn, tid, summary=STOP_FINDING,
+                            metadata={"artifacts": [str(artifact)]})
+    stored = kb.list_attachments(conn, tid)[0].stored_path
+    assert kb.complete_task(conn, tid, summary="approved")
+    completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][-1]
+    assert completed.payload["artifacts"] == [stored]
+    # No duplicate attachment row for the carried copy.
+    assert len(kb.list_attachments(conn, tid)) == 1
+
+
+def test_vanished_copy_after_route_does_not_fail_the_route(conn, armed, monkeypatch):
+    tid, ws, artifact = _scratch_task(conn)
+    real = kb.request_review
+
+    def racing_request_review(*a, **k):
+        out = real(*a, **k)
+        for p in k["metadata"]["artifacts"]:
+            Path(p).unlink()
+        return out
+
+    monkeypatch.setattr(kb, "request_review", racing_request_review)
+    assert kb.complete_task(conn, tid, summary=STOP_FINDING,
+                            metadata={"artifacts": [str(artifact)]})
+    assert _status(conn, tid)["status"] == "review"
+    assert kb.list_attachments(conn, tid) == []
+    assert "routed_artifact_missing" in _kinds(conn, tid)
