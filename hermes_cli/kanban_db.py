@@ -9592,7 +9592,7 @@ def release_stale_claims(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -9673,8 +9673,12 @@ def release_stale_claims(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                # The release verdict was made for THIS run; a new run that
+                # reuses the same lock (gateway pid) is not covered by it.
+                "AND current_run_id IS ?",
+                (retry_status, row["id"], row["claim_lock"], now,
+                 row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -9769,7 +9773,8 @@ def reclaim_task(
     death cannot be proven.
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -9810,8 +9815,13 @@ def reclaim_task(
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked', "
             "'triage', 'scheduled') "
-            "AND claim_lock IS ?",
-            (held_status if preserve_status else retry_status, task_id, prev_lock),
+            "AND claim_lock IS ? "
+            # Fence to the run the termination verdict inspected: a gateway
+            # dispatcher run reusing the same lock (spawn in flight, pid not
+            # stamped yet) must not be released by it (FleetReview ffdcb1bab162).
+            "AND current_run_id IS ?",
+            (held_status if preserve_status else retry_status, task_id, prev_lock,
+             row["current_run_id"]),
         )
         if cur.rowcount != 1:
             return False
@@ -17307,7 +17317,8 @@ def _dead_claimer_release_at(
       forever (the stuck-running shape this path exists to end).
 
     * operator claim (``claimed`` event carries ``operator_claim``, set only by
-      ``hermes kanban claim --review``) with no worker evidence: release at
+      ``hermes kanban claim --review``) with no ``spawned`` event (heartbeats
+      alone do not count; the CLI can send them): release at
       the claim itself. Nothing ever spawns for such a run, so the pid in
       ``claim_lock`` (a CLI, or the long-lived gateway) is not a worker and its
       liveness is irrelevant; :func:`_terminate_reclaimed_worker` releases it
@@ -17324,13 +17335,17 @@ def _dead_claimer_release_at(
     ).fetchone()
     if run is None or run["started_at"] is None:
         return None, "no_current_run", None
-    evidence = conn.execute(
-        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
-        "AND run_id = ? AND kind IN ('heartbeat', 'spawned') "
-        "ORDER BY created_at DESC, id DESC LIMIT 1",
+    spawned = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'spawned' LIMIT 1",
         (task_id, int(run["id"])),
     ).fetchone()
-    if evidence is None:
+    if spawned is None:
+        # Checked before heartbeat evidence: a credential-less
+        # ``kanban heartbeat`` on an operator claim is not a worker, and must
+        # not put it back behind the live-claimer hold (FleetReview
+        # 19939cc85ba7). A ``spawned`` event is real worker evidence and keeps
+        # the worker-safety path below.
         claimed = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
             "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
@@ -17345,6 +17360,13 @@ def _dead_claimer_release_at(
             payload = {}
         if isinstance(payload, dict) and payload.get("operator_claim") is True:
             return int(run["started_at"]), "operator_claim_no_worker", None
+    evidence = conn.execute(
+        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+        "AND run_id = ? AND kind IN ('heartbeat', 'spawned') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, int(run["id"])),
+    ).fetchone()
+    if evidence is None:
         return (
             int(run["started_at"]) + DEAD_CLAIMER_LAUNCH_BOUND_SECONDS,
             "launch_bound",
@@ -18021,6 +18043,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -18067,8 +18090,8 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ? AND current_run_id IS ?",
+                (retry_status, tid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue

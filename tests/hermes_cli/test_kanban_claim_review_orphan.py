@@ -204,6 +204,118 @@ def test_gateway_held_operator_claim_is_reclaimable_while_gateway_lives(home):
         gateway.wait()
 
 
+def _race_new_run_after_verdict(monkeypatch, conn, tid, lock):
+    """After the reclaim verdict on operator run A, end A and let the
+    dispatcher claim run B with the SAME lock before the release txn."""
+    orig = kb._terminate_reclaimed_worker
+    state = {}
+
+    def racing(*args, **kwargs):
+        info = orig(*args, **kwargs)
+        if not state:
+            state["verdict"] = dict(info)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL WHERE id = ?", (tid,),
+                )
+                kb._end_run(conn, tid, outcome="reviewed", status="reviewed")
+            task_b = kb.claim_review_task(conn, tid, claimer=lock)
+            assert task_b
+            state["run_b"] = task_b.current_run_id
+        return info
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", racing)
+    return state
+
+
+@pytest.mark.parametrize("path", ["reclaim", "stale_running"])
+def test_operator_release_verdict_is_fenced_to_the_inspected_run(home, monkeypatch, path):
+    """FleetReview ffdcb1bab162: the operator_claim_no_worker verdict is about
+    run A. A dispatcher run B that takes the same gateway lock (pid-less, spawn
+    in flight) before the release txn must NOT be released by it."""
+    tid = _parked_review()
+    gateway = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        host = kb._claimer_id().split(":", 1)[0]
+        lock = f"{host}:{gateway.pid}"
+        with kb.connect() as conn:
+            run_a = kb.claim_review_task(
+                conn, tid, claimer=lock,
+                session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
+            ).current_run_id
+            conn.execute("UPDATE task_runs SET started_at = 1 WHERE id = ?", (run_a,))
+            conn.commit()
+            state = _race_new_run_after_verdict(monkeypatch, conn, tid, lock)
+            if path == "reclaim":
+                assert kb.reclaim_task(conn, tid, reason="probe") is False
+            else:
+                assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == []
+            assert state["verdict"]["dead_claimer_release_basis"] == "operator_claim_no_worker"
+            task = kb.get_task(conn, tid)
+            assert task.status == "running"
+            assert task.current_run_id == state["run_b"] != run_a
+            assert task.claim_lock == lock
+    finally:
+        gateway.kill()
+        gateway.wait()
+
+
+def test_heartbeat_does_not_make_operator_claim_unreclaimable(home):
+    """FleetReview 19939cc85ba7: a credential-less ``kanban heartbeat`` on an
+    operator review claim must not flip it back to the live-claimer hold."""
+    tid = _parked_review()
+    gateway = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        host = kb._claimer_id().split(":", 1)[0]
+        with kb.connect() as conn:
+            assert kb.claim_review_task(
+                conn, tid, claimer=f"{host}:{gateway.pid}",
+                session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
+            )
+            assert kb.heartbeat_worker(conn, tid, note="operator still here")
+            assert kb.reclaim_task(conn, tid, reason="probe") is True
+            assert kb.get_task(conn, tid).status == "review"
+            assert not [e for e in kb.list_events(conn, tid) if e.kind == "reclaim_refused"]
+
+            # TTL sweep, same shape.
+            assert kb.claim_review_task(
+                conn, tid, claimer=f"{host}:{gateway.pid}",
+                session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
+            )
+            assert kb.heartbeat_worker(conn, tid)
+            conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (tid,))
+            conn.commit()
+            assert kb.release_stale_claims(conn) == 1
+            assert kb.get_task(conn, tid).status == "review"
+            assert not [e for e in kb.list_events(conn, tid) if e.kind == "reclaim_deferred"]
+    finally:
+        gateway.kill()
+        gateway.wait()
+
+
+def test_operator_claim_with_spawned_worker_keeps_the_worker_safety_hold(home):
+    """Control: a ``spawned`` event is real worker evidence; the operator
+    marker must not bypass the live-claimer hold for it."""
+    tid = _parked_review()
+    gateway = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        host = kb._claimer_id().split(":", 1)[0]
+        with kb.connect() as conn:
+            task = kb.claim_review_task(
+                conn, tid, claimer=f"{host}:{gateway.pid}",
+                session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
+            )
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "spawned", {"pid": 0},
+                                 run_id=task.current_run_id)
+            assert kb.reclaim_task(conn, tid, reason="probe") is False
+            assert kb.get_task(conn, tid).status == "running"
+    finally:
+        gateway.kill()
+        gateway.wait()
+
+
 def test_sessionless_operator_can_request_changes_without_claim(home):
     """Apollo 2026-09-27 22:52: an operator send-back (--operator) on a card
     parked in review works from a sessionless shell, with no claim --review."""
