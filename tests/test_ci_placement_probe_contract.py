@@ -66,6 +66,16 @@ def test_probe_producer_uploads_what_tests_yml_generate_uploads():
         "MANAGED_PLACEMENT"]
 
 
+def test_probe_restores_the_duration_cache_before_slicing_like_tests_yml():
+    """Without tests.yml's restore, LPT slices on 2.0 s defaults and the request differs from merge_group's."""
+    real = _load("tests.yml")["jobs"]["generate"]
+    probe = _load("ci-placement-probe.yml")["jobs"]["generate"]
+    name = "Restore duration cache"
+    assert _step(probe, name) == _step(real, name)
+    names = [s.get("name") for s in probe["steps"]]
+    assert names.index(name) < names.index("Generate test slices")
+
+
 def test_probe_slice_count_is_ci_yaml_merge_group_branch():
     """The controller derives N from ci.yaml for merge_group; the probe must emit that same N."""
     ci = _load("ci.yaml")["jobs"]["tests"]["with"]["slice_count"]
