@@ -15,6 +15,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_open_pr as op
 
 PR_URL = "https://github.com/ANG-Ventures/example-home/pull/670"
+FOREIGN_URL = "https://github.com/stephenschoettler/hermes-lcm/pull/638"
+
+
+@pytest.fixture(autouse=True)
+def _fixture_owners_are_fleet(monkeypatch):
+    """The ``o/r`` / ``a/b`` fixture repos stand in for fleet repos (t_06dccfe3)."""
+    monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o", "a"})
 
 
 @pytest.fixture
@@ -139,12 +146,102 @@ def test_complete_with_merged_pr_goes_done_and_releases_child(kanban_home, monke
         assert "completion_routed_to_review" not in _kinds(conn, parent)
 
 
-def test_complete_fails_open_when_lookup_errors(kanban_home, monkeypatch):
-    _use_oracle(monkeypatch, {("ang-ventures/example-home", 670): RuntimeError("boom")})
+@pytest.mark.parametrize("failure", [RuntimeError("boom"), None])
+def test_complete_fails_closed_when_lookup_cannot_read_state(kanban_home, monkeypatch, failure):
+    """t_36d0114e: the worker lane's gh READ cap made every lookup time out;
+    fail-open wrote ``done`` over 14 open PRs. Unreadable state -> review."""
+    _use_oracle(monkeypatch, {("ang-ventures/example-home", 670): failure})
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent, summary=PR_URL) is True
+        assert _status(conn, parent) == "review"
+        assert _status(conn, child) == "todo"
+
+
+def test_complete_with_not_found_ref_goes_done(kanban_home, monkeypatch):
+    """A definite 404 (the ref names no PR) is not a reason to hold the card."""
+    _use_oracle(monkeypatch, {("ang-ventures/example-home", 670): op.NOT_FOUND})
     with kb.connect() as conn:
         parent, _child = _parent_child(conn)
         assert kb.complete_task(conn, parent, summary=PR_URL) is True
         assert _status(conn, parent) == "done"
+
+
+def _comments(conn, tid):
+    return [r["body"] for r in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (tid,))]
+
+
+def test_survivor_pr_open_routes_to_review_with_one_comment(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: "human:apollo")
+    _use_oracle(monkeypatch, {("o/r", 7): "OPEN"})
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent, summary="shipped", survivor_pr="o/r#7") is True
+        row = conn.execute("SELECT status, assignee FROM tasks WHERE id=?", (parent,)).fetchone()
+        assert (row["status"], row["assignee"]) == ("review", "human:apollo")
+        assert _status(conn, child) == "todo"
+        assert _comments(conn, parent) == [
+            "survivor PR open; card closes on merged=true (o/r#7)"]
+
+
+def test_survivor_pr_merged_goes_done(kanban_home, monkeypatch):
+    q = _use_oracle(monkeypatch, {("o/r", 7): "MERGED"})
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent, summary="landed", survivor_pr="o/r#7") is True
+        assert _status(conn, parent) == "done"
+        assert _status(conn, child) == "ready"
+        assert _comments(conn, parent) == []
+    assert q.calls == [("o/r", 7)]
+
+
+def test_primary_refs_are_checked_past_the_prose_cap():
+    prose = " ".join(f"a/b#{n}" for n in range(1, 16))
+    q = _stub({("o/r", 7): "OPEN", **{("a/b", n): "MERGED" for n in range(1, 16)}})
+    got = op.open_pr_refs(prose, survivor_pr="o/r#7", query_fn=q)
+    assert [(r.repo, r.number) for r in got] == [("o/r", 7)]
+    assert len([c for c in q.calls if c[0] == "a/b"]) == op.MAX_LOOKUPS_PER_COMPLETION
+
+
+class _Proc:
+    def __init__(self, rc, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+@pytest.mark.parametrize("proc, want", [
+    (_Proc(0, json.dumps({"state": "open", "merged_at": None})), {"state": "OPEN"}),
+    (_Proc(0, json.dumps({"state": "closed", "merged_at": "2026-09-27T00:00:00Z"})), {"state": "MERGED"}),
+    (_Proc(1, '{"message":"Not Found","status":"404"}', "gh: Not Found (HTTP 404)"), {"state": op.NOT_FOUND}),
+    (_Proc(75, "", "cap exceeded"), None),
+    (_Proc(0, "not json"), None),
+])
+def test_query_pr_state_separates_not_found_from_unknown(monkeypatch, proc, want):
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: proc)
+    assert op.query_pr_state("o/r", 1) == want
+
+
+def test_query_pr_state_timeout_is_unknown(monkeypatch):
+    def boom(*a, **k):
+        raise op.subprocess.TimeoutExpired("gh", 10)
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    assert op.query_pr_state("o/r", 1) is None
+
+
+def test_reopen_done_card_to_review_assigns_review_assignee(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: "human:apollo")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stranded", assignee="worker")
+        assert kb.complete_task(conn, tid, result=PR_URL) is True  # oracle off under pytest
+        assert _status(conn, tid) == "done"
+        ok, err = kb.reopen_task(conn, tid, actor="closer", reason="PR still open",
+                                 to_status="review")
+        assert ok, err
+        row = conn.execute("SELECT status, assignee, completed_at FROM tasks WHERE id=?",
+                           (tid,)).fetchone()
+        assert (row["status"], row["assignee"], row["completed_at"]) == ("review", "human:apollo", None)
+        assert kb.reopen_task(conn, tid, actor="c", reason="x", to_status="blocked")[0] is False
 
 
 def test_open_pr_in_metadata_pr_url_is_caught(kanban_home, monkeypatch):
@@ -270,3 +367,65 @@ def test_lint_lists_recent_done_cards_naming_open_pr(kanban_home):
     assert hits[0]["open_prs"] == ["ANG-Ventures/example-home#670"]
     # one lookup per distinct PR, old card outside the window never queried
     assert sorted(q.calls) == [("ANG-Ventures/example-home", 670), ("o/r", 2)]
+
+
+# --- foreign-owner PRs are mentions, not a gate (t_06dccfe3) ----------------
+
+
+def test_fleet_owner_match_is_case_insensitive():
+    refs = op.extract_pr_refs(
+        "ang-ventures/x#1 KYZCREIG/y#2 NousResearch/hermes-agent#3", FOREIGN_URL)
+    fleet, foreign = op.split_fleet(refs)
+    assert [(r.repo, r.number) for r in fleet] == [("ang-ventures/x", 1), ("KYZCREIG/y", 2)]
+    assert [(r.repo, r.number) for r in foreign] == [
+        ("NousResearch/hermes-agent", 3), ("stephenschoettler/hermes-lcm", 638)]
+
+
+def test_open_pr_refs_never_looks_up_a_foreign_ref():
+    q = _stub({("stephenschoettler/hermes-lcm", 638): "OPEN"})
+    assert op.open_pr_refs(FOREIGN_URL, survivor_pr="NousResearch/x#1", query_fn=q) == []
+    assert q.calls == []
+
+
+def test_complete_naming_only_foreign_open_pr_goes_done_with_mention(kanban_home, monkeypatch):
+    q = _use_oracle(monkeypatch, {("stephenschoettler/hermes-lcm", 638): "OPEN"})
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent,
+                                summary=f"upstreamed as {FOREIGN_URL}") is True
+        assert _status(conn, parent) == "done"
+        assert _status(conn, child) == "ready"
+        assert "completion_routed_to_review" not in _kinds(conn, parent)
+        meta = kb.latest_run(conn, parent).metadata
+        assert meta["mentioned_foreign_prs"] == ["stephenschoettler/hermes-lcm#638"]
+        assert "auto_routed_open_prs" not in meta
+        assert _comments(conn, parent) == []
+    assert q.calls == []
+
+
+def test_mixed_fleet_and_foreign_routes_to_review_with_fleet_ref_only(kanban_home, monkeypatch):
+    q = _use_oracle(monkeypatch, {
+        ("ang-ventures/example-home", 670): "OPEN",
+        ("stephenschoettler/hermes-lcm", 638): "OPEN",
+    })
+    with kb.connect() as conn:
+        parent, child = _parent_child(conn)
+        assert kb.complete_task(conn, parent, summary=f"{PR_URL} upstream {FOREIGN_URL}",
+                                metadata={"pr_url": [PR_URL, FOREIGN_URL]}) is True
+        assert _status(conn, parent) == "review"
+        assert _status(conn, child) == "todo"
+        meta = kb.latest_run(conn, parent).metadata
+        assert meta["auto_routed_open_prs"] == ["ANG-Ventures/example-home#670"]
+        assert meta["mentioned_foreign_prs"] == ["stephenschoettler/hermes-lcm#638"]
+        assert _comments(conn, parent) == [
+            "survivor PR open; card closes on merged=true (ANG-Ventures/example-home#670)"]
+    assert q.calls == [("ANG-Ventures/example-home", 670)]
+
+
+def test_lint_ignores_foreign_open_pr(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="upstreamed", assignee="w")
+        kb.complete_task(conn, tid, result=FOREIGN_URL)  # pytest: routing oracle disabled
+        q = _stub({("stephenschoettler/hermes-lcm", 638): "OPEN"})
+        assert op.find_done_with_open_pr(conn, query_fn=q) == []
+    assert q.calls == []

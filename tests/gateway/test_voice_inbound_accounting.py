@@ -100,7 +100,7 @@ async def test_text_and_audio_file_events_are_not_voice(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stt_success_logs_chat_chars_and_head(caplog):
+async def test_stt_success_logs_chat_chars_not_content(caplog):
     runner = _runner()
     with caplog.at_level(logging.INFO, logger="gateway.run"), patch(
         "tools.transcription_tools.transcribe_audio",
@@ -113,7 +113,8 @@ async def test_stt_success_logs_chat_chars_and_head(caplog):
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("stt")]
     assert len(lines) == 1
     assert lines[0].startswith("stt: chat=42 transcribed 28 chars in ")
-    assert "'we need to account for voice'" in lines[0]
+    # Backfill C3 (#1064): the user's words never reach an INFO log line.
+    assert all("account for voice" not in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -284,6 +284,39 @@ def test_compaction_branch(store, key):
                                   live_session_id="sid-a").allowed
 
 
+def test_compaction_branch_in_place_no_rotation(store, key):
+    """compression.in_place=true (default) never rotates session_id; the
+    marker written by note_compaction drives the §4.3 compaction branch."""
+    _sticky_on_fallback(store, key)
+    assert not fp.restore_allowed(store.get(key), T0 + 300, probe=False,
+                                  live_session_id="sid-a").allowed
+    fp.note_compaction(store, key, T0 + 200)
+    d = fp.restore_allowed(store.get(key), T0 + 300, probe=False, live_session_id="sid-a")
+    assert d.allowed and d.branch == "compaction"
+    # a fallback call AFTER the compaction re-warms the fallback: no return
+    fp.note_fallback_success(store, key, T0 + 250, "sid-a")
+    d = fp.restore_allowed(store.get(key), T0 + 300, probe=False, live_session_id="sid-a")
+    assert not d.allowed and "compaction: none since last fallback call" in d.reason
+
+
+def test_note_compaction_ignores_inactive_episode(store, key):
+    assert fp.note_compaction(store, key, T0) is None
+    _sticky_on_fallback(store, key)
+    fp.record_return(store, key, T0 + 10, "fallback_cold")
+    assert fp.note_compaction(store, key, T0 + 20).last_compaction_epoch is None
+
+
+def test_compaction_marker_survives_db_only_restart(tmp_path, key):
+    """pass-10 G1: the marker is write-through, so a restarted process
+    (DB only) still evaluates the compaction branch."""
+    s1 = StickyStore(db_path=tmp_path / "t.db")
+    _sticky_on_fallback(s1, key)
+    fp.note_compaction(s1, key, T0 + 100)
+    s2 = StickyStore(db_path=tmp_path / "t.db")
+    r = fp.decide_rebuild(s2, key, T0 + 600, live_session_id="sid-a", eligibility=lambda: None)
+    assert r.action == "return" and r.decision.branch == "compaction"
+
+
 def test_nothing_but_fallback_failed_returns_before_until(store, key):
     st = _sticky_on_fallback(store, key, cls="quota_model")
     elig = _elig({"instance_id": "x", "bound_seat": "sub-vps-6", "bound_eligible": True,
@@ -925,6 +958,25 @@ def test_wiring_restore_refused_then_fallback_cold_return(wired):
     assert _state(a).active is False
 
 
+def test_wiring_in_place_compaction_returns_via_compaction(wired):
+    """In-place compaction keeps session_id; the wiring marker alone lets the
+    next boundary return with branch=compaction (t_2b064101)."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    _age_episode(a, fallback_idle=10 * 60)
+    st = _state(a)
+    st.last_primary_call_epoch = None  # no warm seat: only compaction can return
+    fss.default_store().put(_fw.key_for(a), st, _time.time())
+    assert _restore(a) is False
+    _fw.note_compaction(a)
+    assert a.session_id == SID
+    assert _restore(a) is True
+    assert (a.provider, a.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "compaction"
+
+
 def test_wiring_failover_fallback_failed_failover(wired):
     """failover -> fallback_failed -> failover within one turn: 2 failover
     rows + 1 recovery row, 3 route-change lines, both failovers announced;
@@ -1000,8 +1052,9 @@ def test_wiring_resume_after_three_evictions_and_restart(wired):
     fss.default_store().evict_memory()                      # gateway restart
     b = _fresh_rebuild(home, calls, st0)
     assert len(_rows(home, "sticky_resume")) == 4
+    assert _restore(b) is False  # first turn consumes the rebuild decision
     _age_episode(b, fallback_idle=61 * 60)
-    assert _restore(b) is True
+    assert _restore(b) is True  # later turn can return once eligible
     assert (b.provider, b.model) == FABLE and b.client.tag == "primary"
 
 
@@ -1096,6 +1149,36 @@ def test_wiring_g2_one_decision_one_notice_per_rebuild(wired):
     notices = [m for _k, m in d._announced if m.startswith("🔄 Model recovery")]
     assert len(notices) == 1 and "primary eligible on sub-vps-6" in notices[0]
     assert rec["notice_text"] == notices[0]
+
+
+@pytest.mark.parametrize("warm_refusal", [False, True])
+def test_wiring_rebuild_refusal_is_once_per_turn(wired, monkeypatch, warm_refusal):
+    """A fresh resume and its turn-start restore are one refused decision;
+    a cached agent makes a new decision on the next turn."""
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    if warm_refusal:
+        monkeypatch.setattr(_fw, "warm_refusal_arm", lambda key: True)
+        _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=60 * 60)
+    runner, key = _runner_env(home, OPUS)
+    b = _wired_agent()
+    _prerun(runner, key, b)
+    assert (b.provider, b.model) == OPUS
+    assert len(_rows(home, "restore_refused")) == 1
+    assert len(_rows(home, "sticky_resume")) == 1
+    eligibility_polls = calls["elig"]
+    assert eligibility_polls == (1 if warm_refusal else 0)
+
+    from agent.agent_runtime_helpers import restore_primary_runtime
+    assert restore_primary_runtime(b) is False
+    assert (b.provider, b.model) == OPUS
+    assert len(_rows(home, "restore_refused")) == 1
+    assert calls["elig"] == eligibility_polls  # no second warm-path poll
+
+    assert restore_primary_runtime(b) is False  # next turn, cached agent
+    assert len(_rows(home, "restore_refused")) == 2
+    assert len(_rows(home, "sticky_resume")) == 1
 
 
 def test_wiring_db_only_restart_fallback_cold_and_compaction(wired):
@@ -1356,6 +1439,71 @@ def test_warm_return_now_on_enforce(store, key, arm):
     assert row["warm_gate"] == "return_now" and row["warm_eligible"] is True
 
 
+# t_90d3bd12: a warm return is refused while the bound box is full (free==0).
+
+@pytest.mark.parametrize("arm", [True, False])
+def test_warm_return_now_refused_when_bound_box_full(store, key, arm):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0, "warm_box_free": 2}
+    d = _gate(st, T0 + 200, obj, arm=arm)
+    assert not d.allowed and d.reason == fp.BOX_FULL_REASON == "warm_seat: bound box full"
+    assert d.warm["bound_box_free"] == 0 and d.warm["warm_box_free"] == 2
+
+
+def test_warm_return_now_refused_when_warm_box_full(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 3, "warm_box_free": 0}
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.reason == fp.BOX_FULL_REASON
+
+
+@pytest.mark.parametrize("free", [None, 2])
+def test_warm_return_now_unchanged_when_box_has_room_or_unknown(store, key, free):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": free,
+           "warm_box_free": free}
+    d = _gate(st, T0 + 200, obj)
+    assert d.allowed and d.branch == "warm_seat"
+    assert d.warm["bound_box_free"] == free
+
+
+def test_d6_bound_seat_return_refused_when_bound_box_full(store, key):
+    """warm_rank off: the D6 bound-seat branch (_warm_seat) alone would return."""
+    st = _sticky_on_fallback(store, key)
+    base = {**_warm("off", bound_seat="sub-vps-6"), "warm_seat": None}
+    assert _gate(st, T0 + 200, base).branch == "warm_seat"
+    d = _gate(st, T0 + 200, {**base, "bound_box_free": 0})
+    assert not d.allowed and d.reason == fp.BOX_FULL_REASON
+    ok, why, _ = fp._warm_seat(st, T0 + 200, primary_provider="claude-bpr",
+                               eligibility=_elig({**base, "bound_box_free": 0}),
+                               direct_pin_benched=None)
+    assert not ok and why == fp.BOX_FULL_REASON
+
+
+def test_box_full_still_returns_when_fallback_cold(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0}
+    d = _gate(st, T0 + 1 + 61 * 60, obj)
+    assert d.allowed and d.branch == "fallback_cold"
+
+
+def test_box_full_never_blocks_fallback_failed(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0}
+    d = fp.fallback_failed_allowed(st, "quota_model", T0 + 200, primary_provider="claude-bpr",
+                                   eligibility=_elig(obj))
+    assert d.allowed and d.branch == "fallback_failed"
+
+
+def test_parse_eligibility_box_free_fields():
+    e = fp.parse_eligibility({**_warm(), "bound_box_free": 0, "warm_box_free": "3"})
+    assert (e.bound_box_free, e.warm_box_free) == (0, 3)
+    e = fp.parse_eligibility({**_warm(), "bound_box_free": True, "warm_box_free": "x"})
+    assert (e.bound_box_free, e.warm_box_free) == (None, None)
+    e = fp.parse_eligibility(_warm())
+    assert (e.bound_box_free, e.warm_box_free) == (None, None)
+
+
 def test_warm_return_now_needs_age_under_window(store, key):
     st = _sticky_on_fallback(store, key)
     d = _gate(st, T0 + 200, _warm("enforce", eligible="sub-vps-3", age=3300.0))
@@ -1391,22 +1539,51 @@ def test_warm_refusal_returns_on_compaction(store, key):
     assert d.allowed and d.branch == "compaction"
 
 
-@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
-def test_warm_hard_cap_primary_copy_expired_or_absent(store, key, age):
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_warm_capped_copy_refuses_while_fallback_warm(store, key, mode):
+    """t_e001a935 / rig arm C: the relay dropped the primary's warm copy for a
+    model cap (warm_skip). That is "warm copy exists, not eligible" -> refuse,
+    never cap_expiry while the fallback copy is still warm (D6)."""
     st = _sticky_on_fallback(store, key)
-    d = _gate(st, T0 + 200, _warm("shadow", eligible=None, age=age, bound_eligible=False))
-    assert d.allowed and d.branch == "cap_expiry"
-    assert fp.recovery_row(st, d, T0 + 200)["expected_warm"] is False
-    assert "expired" in fp.format_recovery_rider(fp.recovery_row(st, d, T0 + 200))
+    obj = {**_warm(mode, eligible=None, age=None, bound_seat="sub-vps-6",
+                   bound_eligible=False),
+           "warm_skip": "model_capped", "warm_skipped": ["sub-vps-6"]}
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.reason == "no_warm_primary_seat"
+    assert d.warm["warm_gate"] == "refuse"
+    # then return normally: fallback cold (> 1h idle) or compaction
+    assert _gate(st, T0 + 1 + 61 * 60, obj).branch == "fallback_cold"
+    assert _gate(st, T0 + 200, obj, sid="sid-b").branch == "compaction"
 
 
-def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
+def test_parse_eligibility_warm_skip_fields():
+    e = fp.parse_eligibility({**_warm(), "warm_skip": "model_capped",
+                              "warm_skipped": ["sub-vps-6", ""]})
+    assert (e.warm_skip, e.warm_skipped) == ("model_capped", ("sub-vps-6",))
+    e = fp.parse_eligibility({**_warm(), "warm_skip": None, "warm_skipped": "junk"})
+    assert (e.warm_skip, e.warm_skipped) == (None, ())
+    assert fp.parse_eligibility(_warm()).warm_skipped == ()
+
+
+@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
+def test_warm_expired_copy_no_cap_expiry_while_fallback_warm(store, key, age):
+    """Ace 2026-09-25 19:35 "do not bother returning early": the warm-seat spec
+    P3 hard cap is rejected (fallback spec D6, Apollo ruling t_e001a935)."""
+    st = _sticky_on_fallback(store, key)
+    obj = _warm("shadow", eligible=None, age=age, bound_eligible=False)
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.branch is None
+    assert d.warm["warm_gate"] == "cap"
+    d = _gate(st, T0 + 1 + 61 * 60, obj)
+    assert d.allowed and d.branch == "fallback_cold"
+
+
+def test_warm_active_session_never_returns_early_on_cap(store, key):
     """Fallback called every 2 min for 3h (never cold); the relay's warm copy
-    of the primary ages from the last primary call with a 1h-tier window
-    (3300 s). The return lands no later than 55 min after that call."""
+    of the primary expires at 55 min. No cap_expiry return while the fallback
+    copy stays warm; the session stays sticky (D6, no time cap)."""
     last_primary = T0 - 60
     st = _sticky_on_fallback(store, key, last_primary=last_primary)
-    returned_at = None
     t = T0 + 120
     while t <= T0 + 3 * 3600:
         fp.note_fallback_success(store, key, t, "sid-a")
@@ -1415,14 +1592,8 @@ def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
         obj = _warm("enforce", eligible=None, age=age if age < 3300 else None,
                     bound_eligible=False)
         d = _gate(st, t + 1, obj)
-        if d.allowed:
-            returned_at = t + 1
-            assert d.branch == "cap_expiry"
-            break
-        assert d.reason == "no_warm_primary_seat"
+        assert not d.allowed and d.branch != "cap_expiry"
         t += 120
-    assert returned_at is not None
-    assert returned_at - last_primary <= 55 * 60 + 120  # first boundary after expiry
 
 
 @pytest.mark.parametrize("obj", [
@@ -1528,6 +1699,27 @@ def test_wiring_warm_refusal_arm_config_and_ledger_columns(wired, monkeypatch):
     assert _restore(a) is True
     [rec] = _rows(home, "recovery")
     assert rec["return_branch"] == "warm_seat" and rec["warm_refusal_arm"] == 0
+
+
+def test_wiring_bound_box_full_refusal_persists_box_free(wired, monkeypatch):
+    """t_90d3bd12 E2E through restore_primary_runtime: the bound box reads
+    free==0 -> refused with "warm_seat: bound box full", the restore_refused
+    row carries bound_box_free; once the box has room the return goes through."""
+    home, _ = wired
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0, "warm_box_free": 1}
+    cur = {"e": fp.parse_eligibility(obj)}
+    monkeypatch.setattr(_fw, "_eligibility_fn", lambda agent: (lambda: cur["e"]))
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=10 * 60)
+    assert _restore(a) is False
+    [row] = _rows(home, "restore_refused")
+    assert row["reason"] == "warm_seat: bound box full"
+    assert row["bound_box_free"] == 0 and row["warm_box_free"] == 1
+    cur["e"] = fp.parse_eligibility({**obj, "bound_box_free": 2})
+    assert _restore(a) is True
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "warm_seat" and rec["bound_box_free"] == 2
 
 
 # ── t_00fda99a: cached TurnEligibility must follow a rotated session_id ────

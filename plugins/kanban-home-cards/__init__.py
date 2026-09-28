@@ -137,7 +137,9 @@ def _redact(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        # redact_url_credentials: card text is injected into the model context, a
+        # non-navigation egress, so ?access_token= / user:pass@ must not survive.
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:
         # Fail closed on the content, not the turn: without the redactor we
         # cannot vouch for comment text, so drop it.
@@ -158,7 +160,7 @@ def _card_line(card: Mapping[str, Any]) -> str:
     # Board before the comment: the line cap may only ever eat comment text.
     board = card.get("board") or "default"
     if board != "default":
-        parts.append(f"board {_one_line(board, 40)}")
+        parts.append(f"board {_one_line(_redact(_one_line(board, 200)), 40)}")
     comment = _one_line(_redact(_one_line(card.get("last_comment"), 400)), COMMENT_MAX)
     if comment:
         parts.append(f"last: {comment}")
@@ -426,6 +428,7 @@ def on_pre_llm_call(
     platform: str = "",
     conversation_history: Any = None,
     parent_session_id: str = "",
+    user_message: Any = None,
     **_: Any,
 ) -> Optional[dict]:
     """The first turn waits at most ``BUDGET_S`` (t_15d21849 AC3), once.
@@ -442,6 +445,11 @@ def on_pre_llm_call(
     try:
         sid = str(session_id or "")
         if not sid or _excluded(platform):
+            return None
+        # Core can only append plugin context to a str user message
+        # (compose_user_api_content returns None for multimodal lists), so a
+        # multimodal first turn must not consume the one-shot gate.
+        if user_message is not None and not isinstance(user_message, str):
             return None
         if not _first_sighting(sid):  # I1 — marked before any DB work
             return None

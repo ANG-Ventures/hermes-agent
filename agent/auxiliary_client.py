@@ -2586,7 +2586,14 @@ class _AnthropicCompletionsAdapter:
 
         usage = None
         if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            # OpenAI chat shape: prompt_tokens INCLUDES cached tokens and the
+            # details object breaks them out. Anthropic's input_tokens excludes
+            # both cache buckets, so fold them in or every aux ledger row and
+            # compaction price reads cache as 0 (C7 k74/k75).
+            input_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            prompt_tokens = input_tokens + cache_read + cache_write
             completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
             total_tokens = getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
             usage = SimpleNamespace(
@@ -2594,6 +2601,10 @@ class _AnthropicCompletionsAdapter:
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
             )
+            if cache_read or cache_write:
+                usage.prompt_tokens_details = SimpleNamespace(
+                    cached_tokens=cache_read, cache_write_tokens=cache_write,
+                )
 
         choice = SimpleNamespace(
             index=0,
@@ -5253,7 +5264,9 @@ def _retry_same_provider_sync(
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        from agent.fork_ext.gemini_bridge_claims import merge_extra_headers
+
+        merge_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -5327,7 +5340,9 @@ async def _retry_same_provider_async(
     # Preserve per-request attribution headers across the rebuilt-client
     # retry — see the sync variant above (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        from agent.fork_ext.gemini_bridge_claims import merge_extra_headers
+
+        merge_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -9464,6 +9479,15 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
+    # gemini-bridge attribution claims (profile / aux task / session). Built
+    # per call from the provider actually requested, so a fallback to another
+    # provider never carries them.
+    from agent.fork_ext.gemini_bridge_claims import claim_headers
+
+    _claims = claim_headers(provider, task)
+    if _claims:
+        kwargs["extra_headers"] = _claims
+
     return kwargs
 
 
@@ -10437,7 +10461,9 @@ def _call_llm_impl(
         # provider-quirk handling (same guard as the fallback path).
         kwargs.update(auxiliary_max_tokens_param(fast_compression_cap, model=final_model))
     if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+        from agent.fork_ext.gemini_bridge_claims import merge_extra_headers
+
+        merge_extra_headers(kwargs, extra_headers)
 
     # Route-scoped resilience for the COMPACTION summarizer (PRD 2026-06-25).
     # The Anthropic transport adapter reads ``_aux_task`` to thread the timeout

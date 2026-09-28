@@ -532,6 +532,79 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         output_cost_per_million_above=Decimal("0.75"),
         cache_read_cost_per_million_above=Decimal("0.02"),
     ),
+    # ── OpenAI GPT-5.5 / GPT-5.4 / GPT-5.4 mini / GPT-5-Codex ───────────
+    # Older models the fleet's Codex CLI still runs (codex-cli rollouts).
+    # Standard-tier list rates, read 2026-09-27 from the pricing page
+    # (https://developers.openai.com/api/docs/pricing) and each model page.
+    # OpenAI publishes no cache-write rate for these ("-"), so cache_write
+    # stays None and the engine bills written tokens at the input rate.
+    # gpt-5.5 and gpt-5.4: "prompts with >272K input tokens are priced at 2x
+    # input and 1.5x output for the full session" (long-context columns on the
+    # pricing page: cached input also 2x). gpt-5.4-mini and gpt-5-codex cap
+    # input at 272K, so they have no long-context tier.
+    # Source: https://developers.openai.com/api/docs/models/gpt-5.5
+    (
+        "openai",
+        "gpt-5.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("30.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.5",
+        pricing_version="openai-gpt-5.5-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("10.00"),
+        output_cost_per_million_above=Decimal("45.00"),
+        cache_read_cost_per_million_above=Decimal("1.00"),
+    ),
+    # Source: https://developers.openai.com/api/docs/models/gpt-5.4
+    (
+        "openai",
+        "gpt-5.4",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.50"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.25"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.4",
+        pricing_version="openai-gpt-5.4-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("5.00"),
+        output_cost_per_million_above=Decimal("22.50"),
+        cache_read_cost_per_million_above=Decimal("0.50"),
+    ),
+    # Source: https://developers.openai.com/api/docs/models/gpt-5.4-mini
+    (
+        "openai",
+        "gpt-5.4-mini",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.4-mini",
+        pricing_version="openai-gpt-5.4-mini-2026-09",
+    ),
+    # Same rates as gpt-5 (the model page's own comparison table).
+    # Source: https://developers.openai.com/api/docs/models/gpt-5-codex
+    (
+        "openai",
+        "gpt-5-codex",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.25"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5-codex",
+        pricing_version="openai-gpt-5-codex-2026-09",
+    ),
+    # NOT priced: codex-auto-review. It is a hidden Codex-internal slug
+    # (~/.codex/models_cache.json: visibility "hide", "Automatic approval
+    # review model for Codex"). It appears on no OpenAI pricing or model page
+    # and its catalog entry names no underlying model id (only "based on
+    # GPT-5", which is a family, not a price row). Aliasing it to any gpt-5.x
+    # would be a guess, so it stays unknown and its rows stay NULL-priced.
     # ── Anthropic Claude Opus 5 ──────────────────────────────────────────
     # Released 2026-07-24, same $5/$25 base pricing as Opus 4.8 (announcement:
     # "priced at $5 per million input tokens and $25 per million output tokens

@@ -195,6 +195,36 @@ def reset_primary_cooldowns() -> None:
         _primary_cooldown_until.clear()
 
 
+# gemini-bridge records these as CLAIMED fields only (attribution SPEC I5): they never decide auth
+# or consumer. Charset/length match the bridge's claim sanitizer. Sent on the fallback leg only.
+_CLAIM_RE = re.compile(r"[^A-Za-z0-9_.:/-]")
+
+
+def active_profile_name() -> str:
+    """The active profile name in the CALLER's context, raw. Never raises ("" on failure).
+
+    Resolve this on the turn thread (where the per-request home ContextVar is set) and carry it
+    with the turn: the drain thread and its extraction pool do not inherit that ContextVar, so a
+    lookup there reports the process-default profile for an in-process profile override."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = str(get_active_profile_name() or "")
+    except Exception:
+        profile = ""
+    return profile
+
+
+def fallback_claim_headers(profile: Optional[str] = None) -> Dict[str, str]:
+    """Claim headers for the gemini-bridge fallback leg. Never raises.
+
+    `profile` is the turn's originating profile, captured at enqueue time. None (legacy queue rows
+    that predate the stamp) falls back to resolving in the current context."""
+    if profile is None:
+        profile = active_profile_name()
+    profile = _CLAIM_RE.sub("-", str(profile).strip())[:64] or "default"
+    return {"x-hermes-aux-task": "mem0_capture", "x-hermes-profile": profile}
+
+
 class BridgeExtractor:
     """Runs one extraction pass against codex-bridge (PRIMARY); on ANY error/timeout falls back to
     gemini-bridge. Both are OpenAI-compatible /v1/chat/completions endpoints behind a bearer secret.
@@ -291,7 +321,9 @@ class BridgeExtractor:
             return r.read().decode("utf-8")
 
     def _call(self, url: str, secret_ref: str, model: str, system_prompt: str,
-              user: str, assistant: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
+              user: str, assistant: str,
+              extra_headers: Optional[Dict[str, str]] = None,
+              ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
         user_content = f"USER MESSAGE:\n{user}\n\nASSISTANT REPLY:\n{assistant}"
         body = json.dumps({
             "model": model,
@@ -302,6 +334,8 @@ class BridgeExtractor:
         }).encode("utf-8")
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._secret(secret_ref)}"}
+        if extra_headers:
+            headers.update(extra_headers)
         t0 = time.time()
         raw = self._http(url, body, headers, self._timeout_s)
         latency = time.time() - t0
@@ -314,20 +348,24 @@ class BridgeExtractor:
         return cands, usage, latency
 
     def _call_with_auth_retry(self, url: str, secret_ref: str, model: str, system_prompt: str,
-                              user: str, assistant: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
+                              user: str, assistant: str,
+                              extra_headers: Optional[Dict[str, str]] = None,
+                              ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
         """_call, but on an auth-shaped failure (401/403) drop the cached secret and retry once —
         so a rotated 1Password token heals mid-process instead of failing until restart."""
         try:
-            return self._call(url, secret_ref, model, system_prompt, user, assistant)
+            return self._call(url, secret_ref, model, system_prompt, user, assistant, extra_headers)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 logger.warning("capture-router: auth-shaped %s from %s — refreshing secret and retrying",
                                e.code, url)
                 self.invalidate_secret(secret_ref)
-                return self._call(url, secret_ref, model, system_prompt, user, assistant)
+                return self._call(url, secret_ref, model, system_prompt, user, assistant,
+                                  extra_headers)
             raise
 
-    def extract(self, system_prompt: str, user: str, assistant: str) -> Dict[str, Any]:
+    def extract(self, system_prompt: str, user: str, assistant: str,
+                profile: Optional[str] = None) -> Dict[str, Any]:
         """One pass. Returns {candidates, usage, latency, provider} or {error, ...}. codex PRIMARY,
         gemini FALLBACK on any exception/timeout. Never raises (fail-soft — a pass failure yields no
         candidates rather than breaking the turn)."""
@@ -355,7 +393,7 @@ class BridgeExtractor:
             try:
                 cands, usage, latency = self._call_with_auth_retry(
                     self._fallback_url, self._fallback_ref, self._fallback_model,
-                    system_prompt, user, assistant)
+                    system_prompt, user, assistant, fallback_claim_headers(profile))
                 return {"candidates": cands, "usage": usage, "latency": latency,
                         "provider": "gemini-bridge", "primary_error": str(primary_err)[:200]}
             except Exception as fallback_err:
@@ -412,12 +450,13 @@ class CaptureRouter:
                       "prefs_seen": 0, "extract_errors": 0, "fallback_passes": 0}
 
     # -- extraction ---------------------------------------------------------
-    def two_pass_extract(self, user: str, assistant: str) -> Dict[str, Any]:
+    def two_pass_extract(self, user: str, assistant: str,
+                         profile: Optional[str] = None) -> Dict[str, Any]:
         """Run the prefs pass and the world pass CONCURRENTLY (benchmark wiring note: collapse the
         2x sequential latency). Returns a dict with both pass results."""
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_prefs = ex.submit(self._extractor.extract, self._prefs_prompt, user, assistant)
-            f_world = ex.submit(self._extractor.extract, self._world_prompt, user, assistant)
+            f_prefs = ex.submit(self._extractor.extract, self._prefs_prompt, user, assistant, profile)
+            f_world = ex.submit(self._extractor.extract, self._world_prompt, user, assistant, profile)
             prefs = f_prefs.result()
             world = f_world.result()
         return {"prefs": prefs, "world": world}
@@ -439,7 +478,7 @@ class CaptureRouter:
         return out
 
     def route_turn(self, user: str, assistant: str, *, turn_id: str, session: str,
-                   ts: Optional[str] = None) -> Dict[str, Any]:
+                   ts: Optional[str] = None, profile: Optional[str] = None) -> Dict[str, Any]:
         """Full router pass for ONE turn. Runs the two concurrent extractions, applies the
         deterministic class router + dedup, and STAGES world/event facts. Returns a structured
         result for observability/replay. Never raises (fail-soft)."""
@@ -450,7 +489,7 @@ class CaptureRouter:
             "providers": {}, "error": None,
         }
         try:
-            passes = self.two_pass_extract(user, assistant)
+            passes = self.two_pass_extract(user, assistant, profile)
         except Exception as e:  # ThreadPool/executor level failure — should be rare (extract is soft)
             self.stats["extract_errors"] += 1
             result["error"] = f"two_pass_extract failed: {e}"

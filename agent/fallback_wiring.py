@@ -370,6 +370,20 @@ def note_success(agent: Any, headers: Optional[Dict[str, str]]) -> None:
         logger.debug("sticky success note failed (best-effort)", exc_info=True)
 
 
+def note_compaction(agent: Any) -> None:
+    """§4.3: record a completed compaction (in place or rotating) on the
+    active sticky episode. Best-effort, never raises."""
+    try:
+        if not sticky_policy_enabled():
+            return
+        key = key_for(agent)
+        if not key.lineage_root or not key.primary_provider:
+            return
+        fp.note_compaction(store(), key, time.time())
+    except Exception:  # noqa: BLE001
+        logger.debug("sticky compaction note failed (best-effort)", exc_info=True)
+
+
 # ── §4.2 construction-time decision ──────────────────────────────────────
 
 _RESUME_UNTOUCHED = (
@@ -455,8 +469,11 @@ def decide_rebuild_for_agent(agent: Any) -> str:
                     "sticky_until_epoch": rd.state.until_epoch,
                     "from_provider": rd.state.fallback_provider,
                     "from_model": rd.state.fallback_model})
-                agent._fallback_restore_refused_logged = False
-            return "resume" if resume_sticky_fallback(agent, rd.state) else "primary"
+            resumed = resume_sticky_fallback(agent, rd.state)
+            if resumed and rd.decision is not None:
+                # Turn-start restore would repeat this construction-time decision.
+                agent._sticky_rebuild_refusal_pending = True
+            return "resume" if resumed else "primary"
         if rd.action == "return" and rd.state is not None and rd.decision is not None:
             # rd.state is post-record_return (active=false); the row wants
             # the episode fields, which record_return keeps.

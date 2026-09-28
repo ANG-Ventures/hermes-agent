@@ -519,6 +519,9 @@ class GitHubAuth:
 
     def _try_gh_cli(self) -> Optional[str]:
         """Try to get a token from the gh CLI."""
+        from hermes_cli.copilot_auth import gh_is_shim_fronted
+        if gh_is_shim_fronted(shutil.which("gh")):
+            return None  # the gh-shim refuses `gh auth token`; don't spam its log
         try:
             result = subprocess.run(
                 ["gh", "auth", "token"],

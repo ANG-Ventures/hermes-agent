@@ -188,6 +188,19 @@ class GatewayAuthorizationMixin:
                     return profile
         return getattr(source, "profile", None)
 
+    def _live_allowed_roles(self, source: SessionSource, profile: Optional[str]) -> bool:
+        """Whether a role allowlist is configured NOW for *source*'s platform."""
+        adapter = self._authorization_adapter(source.platform, profile)
+        getter = getattr(adapter, "_get_allowed_roles", None)
+        if callable(getter):
+            try:
+                return bool(getter())
+            except Exception:
+                return False
+        if source.platform == Platform.DISCORD:
+            return bool(_platform_gate_env("DISCORD_ALLOWED_ROLES").strip())
+        return False
+
     def _adapter_authorization_is_upstream(
         self,
         platform: Optional[Platform],
@@ -581,9 +594,16 @@ class GatewayAuthorizationMixin:
         # Compare with ``is True`` so the real bool field authorizes while a
         # MagicMock source (test fixtures using ``object.__new__`` runners with
         # mock sources) does not auto-truthy through this gate (see pitfall #13).
+        # A restart-spool replay restores the adapter's verdict from park
+        # time; it still needs a live role gate, so removing the allowed roles
+        # during the restart refuses the replay (#961).
         if (
             allow_adapter_delegation
             and getattr(source, "role_authorized", False) is True
+            and (
+                not getattr(source, "_restart_followup_session", None)
+                or self._live_allowed_roles(source, adapter_profile)
+            )
         ):
             return True
 

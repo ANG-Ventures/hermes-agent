@@ -9625,8 +9625,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): reverting #780 alone would leave #764's consumer with 5 known P1 defects (dropped/duplicated/false notices). Its fate is #764's: if #764 is later dropped, drop both. Measured: follows #764 (lead: KEEP, 2 bridge-side 'confab notice emitted out-of-band' across 20 bridges). Consumer-side count: messages.display_kind='confab_notice' = 2 rows in root state.db (2026-09-21 07:58 and 08:09 UTC, source cli), 0 in the other 13 profile DBs; 0 after #780 merged (09-21 18:02 UTC) over 58,652 later assistant rows. Low fire, but the rows exist and #780 is the P1 correctness fix to a KEPT consumer. Upstream: n/a (fleet-only)",
   "x": {
    "branch": null,
    "evidence": {
@@ -17114,8 +17114,8 @@
   "auditor": "DROP",
   "adv": "needs-lead",
   "adv_new": "lead: test before revert",
-  "final": "UNRESOLVED",
-  "why": "LEAD: removed from the #49 revert unit. The empty-resume guard is not undo-only: upstream synthesizes an empty-text internal resume event (up gateway/run_startup.py:611) with no empty-row guard. Needs a repro on upstream before either DROP or UPSTREAM; unmeasured either way.",
+  "final": "SUPERSEDED-BY-UPSTREAM",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): upstream solved the same empty-row bug (persists the note instead of dropping the row); fork flag+drop machinery is redundant. Measured: live call on upstream c15ebb1435: gateway.run._prepare_resume_pending_message('restart','') returns a non-empty persist text (the recovery note), so the synthesized empty-text resume event (up gateway/run_startup.py:611) no longer yields an empty user row; real text still persisted clean. Upstream: GREEN: fixed by upstream 0cc26777bb 'fix(gateway): persist resume recovery notes' + c69b6471e6 (#86580), consumed at up gateway/run_turn_runner.py:1647 (slice card t_da2a5730) | prior lead note: LEAD: removed from the #49 revert unit. The empty-resume guard is not undo-only: upstream synthesizes an empty-text internal resume event (up gateway/run_startup.py:611) with no empty-row guard. Needs a repro on upstream before either DROP or UPSTREAM; unmeasured either way.",
   "x": {
    "verdict": "DROP",
    "problem": "empty user row persisted on auto-resume (the /undo '(no text)' bug)",
@@ -22270,8 +22270,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): guard on a destructive path with two live-board incidents in the last 5 days; silent by design (a refusal raises to the caller). Measured: trigger measured in the live board: incident card t_e1c2dae5 (2026-09-21 14:51, 'a probe that redirected HOME still wrote to the live board'), and kanban.db task_events shows 21 review_stale_alerted events on 17 cards dated 2026-09-22 UTC, the burst the PR describes. Repro on fork 858ee59722: test_diverged_pin_cannot_create_a_task_or_append_an_event and test_pin_contradicting_explicit_board_arg_REFUSES pass (part of a 175-test narrow run via test-gate on ACE-MEDIA). Upstream: RED by read: upstream reads the same board-path pin env but has no KanbanPinDivergenceError / refusal",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(kanban): refuse destructive writes when pin contradicts requested board (t_e1c2dae5) (#907) \u2014 <!-- codesmith:footer --> --- <a href=\"https://app.blacksmith.sh/ANG-Ventures/codesmith/hermes-agent/pr/907?autoLogin=true&ref=codesmith_pr_footer\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://pr-comments-assets.blacksmith.sh/codesmith/view-with-codesmith",
@@ -22689,8 +22689,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): rare but real; 225 loc, 0 conflicting files; operator-facing remedy that otherwise cannot be pasted. Measured: trigger shape is live: 3 of 1,715 repository keys in live kanban.db task_workspace_survivors.bases contain whitespace (card t_f5ebd9db, keys ending '/fresh clone'); a bare `--survivor-pr <key>=...` hint for those splits in the shell. Fork 858ee59722: tests/hermes_cli/test_cli_hint.py passes in the 175-test narrow run (test-gate, ACE-MEDIA). Upstream: n/a: survivor/hint path is fork-only (hint_arg, kanban_survivor absent upstream)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(cli): a printed --flag hint must parse as pasted, for any repo key or path (#879) \u2014 `--survivor-pr <key>=owner/repo#N`. For a key beginning with `-` argparse binds the token as an option and refuses (`expected one argument`); measured against the real `hermes kanban complete` parser, 3 of 7 key shapes failed to round-trip. The equals form works but the hint neve",
@@ -22896,8 +22896,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): 112 loc closing a measured second rw door to the live board. Measured: trigger measured: live card t_880f5d17 (2026-09-22 05:05, argus) records repair_db() PROCEEDING from a pytest context and leaving .init.lock + .bak beside a production board. Fork repro: tests/hermes_cli/test_kanban_live_board_write_guard.py (test_test_context_refused_on_live_board etc.) pass in the same 175-test narrow run. Upstream: n/a: fork-only kanban path (fork kanban_db.py diverged from upstream split modules)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(kanban): gate repair_db(), the second rw door to the live board (t_880f5d17) (#858) \u2014 #853 put `_assert_live_board_write_allowed()` at `connect()`. `connect()` is not the only read-write door to a `kanban_db_path()`-derived board. `repair_db()` (`hermes kanban repair`) resolves the same way and opens the file rw via `_sqlite_connect()` **without calling `connect()",
@@ -23883,8 +23883,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): fires ~19x/day on the live board; fork review lane depends on it. Measured: DB signal exists after all: task_events 'blocked' payload carries source_status. Since merge (2026-09-21 18:51 UTC): 76 blocks with source_status='review' on 68 cards, and 84 'unblocked' events restoring status='review' (85 with resume_status='review', 70 cards). Upstream: RED by read: up block_task UPDATE@hermes_cli/kanban_db.py:3287 still limits to status IN ('running','ready'), so a review card cannot be parked",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(kanban): park a review card \u2014 block accepts review, unblock restores it, triage-resolve names the verb (#798) \u2014 Three one-line-class fixes so a **finished-but-unclosable** card can be parked without a hand DB edit. Measured 2026-09-20 on live cards `t_3fd73eba` / `t_86d437a7`: a card whose implementation was landed and **approved**, but whose `kanban_complete` was structurally refused by t",
@@ -25160,8 +25160,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): warning-text fix for a model-string form nobody uses; never fires. Measured: 0/34,120 sessions across 12 profile state.db (2026-05-08..2026-09-26) have model LIKE 'name:%'; 0 config.yaml/cron jobs use a name:<sub>/<model> string; 0 'could not verify name:' lines in ~/.hermes/logs + profiles/*/logs. Upstream: RED by read: up validate_requested_model@hermes_cli/models_validate.py:780 has no name: strip (relocated from models.py) (slice card t_111298c6)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(models): strip relay routing prefix before model-listing lookup (#620) \u2014 A relay/pool provider takes a model string shaped `name:<sub>/<model-id>` \u2014 the `name:<sub>/` prefix pins **which upstream subscription** serves the request; only the final segment is the model id the endpoint's `/v1/models` listing contains. `validate_requested_model()` compared",
@@ -25513,8 +25513,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): decoys are being created weekly; the reader half is what stops a script reading them as an empty board. Follow-up: something other than connect() still creates the stubs (a literal '*.db' = an unexpanded shell glob), so the source half does not cover all creators. Measured: trigger still occurs: 4 zero-byte .db decoys on the LIVE board tree right now (~/.hermes/kanban/kanban.db 09-22 01:01, boards/'*.db' 09-22 09:41, board.db 09-24 07:35, default.db 09-24 17:21; all created after #579 merged 08-11). Repro on a zero-byte kanban.db in a temp home: fork connect_readonly -> KanbanDbNotABoardError; upstream c15ebb1435 has no read-only reader and its connect() silently turns the decoy into a real empty board (0 tasks, 0 -> 4096 bytes); fork connect() does the same. Upstream: RED (live call): up connect@hermes_cli/kanban_db_connect.py:668 initialises schema in a zero-byte file",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(kanban): zero-byte board .db files must not exist, and must not read as empty boards (#579) \u2014 A zero-byte `.db` is worse than a missing one. `sqlite3.connect()` on an **existing** zero-byte file succeeds even with `mode=ro`, and reports an empty `sqlite_master` \u2014 so a reader concludes *\"this board is empty\"* instead of *\"I opened the wrong file\"*. Measured on a live fleet",
@@ -26499,8 +26499,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): never contends under fleet load; 473/474 loc across 5 files that conflict in all 3 syncs. #441 is a re-land of #215: revert as one unit incl. the tui_gateway/ws.py import. Measured: the gate logs INFO 'session_db_heavy_read queue_wait=... outcome=acquired' whenever a read waits >=1 ms and WARNING '... outcome=shed' on busy; the dashboard process's hermes_cli.* loggers demonstrably reach ~/.hermes/logs/agent.log (8 web_server + 153 dashboard_auth.registry lines, same process). Count: 0 'session_db_heavy_read' lines in root agent.log* (2026-09-25 04:05..18:11) and errors.log* (02:58..18:20), and 0 across every file under ~/.hermes/logs + profiles/*/logs. Not one heavy read queued even 1 ms in the window. (Live counter /api/status.session_db_heavy_reads is auth-gated; not read.). Upstream: RED by read (no admission gate; up offloads per router + bounds read connections in hermes_state_readpool.py) (slice card t_7c17872a)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "feat(tui_gateway): bound heavy session reads (#441) \u2014 A single Discord voice message posted its \ud83c\udf99\ufe0f transcript echo **twice** \u2014 two identical messages 4.3s apart. The gateway log confirms the same `.ogg` was transcribed twice: ``` 09:27:37,033 INFO tools.transcription_tools: Transcribed audio_b8e37bff145d.ogg via local whisper (base,",
@@ -26898,8 +26898,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "UPSTREAM",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): generic 1-line fix, reproduced on upstream, provider in live use; effect is a stale error record that misleads triage (07-14 incident). Measured: live repro in temp HOME: seed auth.json xai-oauth.last_auth_error, call _save_xai_oauth_tokens(new tokens): upstream c15ebb1435 -> last_auth_error present=True (RED); fork 858ee59722 -> False. xai-oauth is live on root auth.json (last_refresh 2026-09-25T21:25Z), so the path runs in production. Upstream: RED (live): up _save_xai_oauth_tokens@hermes_cli/auth_xai.py:127 does state.update(...) and never pops last_auth_error (slice card t_4bf92fd0)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(auth): clear stale xai-oauth last_auth_error on successful token save (#326) \u2014 **Observed 2026-07-14:** a stale 07-13 `invalid_grant` (\"Refresh token has been revoked\") record was still sitting in `auth.json` while grok-4.5 was serving `HTTP 200` and a force-refresh succeeded cleanly. The actual cron fallback that fired was an unrelated transient xAI `429 \"",
@@ -27039,8 +27039,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "SUPERSEDED-BY-UPSTREAM",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): upstream solved the same 10s sidebar cost the same way. Measured: live call on upstream c15ebb1435 with a 4-profile temp home and list_profiles() wrapped with a call counter: web_routers.profiles._profile_targets (serves GET /api/profiles/sessions + /sidebar) and web_server_cron._cron_profile_dicts both return all 4 profiles with 0 list_profiles() calls. Upstream: GREEN: upstream uses profiles_to_serve() (directory read) for both hot paths \u2014 de626c5a36 (_profile_targets) + 4590ef8b58 '#114041 polled profile lists never walk skill trees'; the auditor read of 'keeps full list_profiles()' was wrong (slice card t_ee9353f2)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "perf(dashboard): lightweight profile listing for session-list + cron aggregators (10s -> ~1s) (#291) \u2014 `/api/profiles/sessions?profile=all` (fired on every desktop sidebar refresh) takes **10\u201312s** with 7 profiles; `/api/cron/jobs` (also a boot-path RPC) stacks on top. py-spy on the live dashboard: **~70% of the wall time is inside `list_profiles()`** \u2014 per profile it yaml-parses ",
@@ -27250,8 +27250,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): never contends under fleet load; 473/474 loc across 5 files that conflict in all 3 syncs. #441 is a re-land of #215: revert as one unit incl. the tui_gateway/ws.py import. Measured: the gate logs INFO 'session_db_heavy_read queue_wait=... outcome=acquired' whenever a read waits >=1 ms and WARNING '... outcome=shed' on busy; the dashboard process's hermes_cli.* loggers demonstrably reach ~/.hermes/logs/agent.log (8 web_server + 153 dashboard_auth.registry lines, same process). Count: 0 'session_db_heavy_read' lines in root agent.log* (2026-09-25 04:05..18:11) and errors.log* (02:58..18:20), and 0 across every file under ~/.hermes/logs + profiles/*/logs. Not one heavy read queued even 1 ms in the window. (Live counter /api/status.session_db_heavy_reads is auth-gated; not read.). Upstream: RED by read (no admission gate; up offloads per router + bounds read connections in hermes_state_readpool.py) (slice card t_7c17872a)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "feat(tui_gateway): bound heavy session reads (#215) \u2014 Phase 2 of docs/desktop/2026-07-05-session-list-loop-starvation-PRD.md (D-4/D-5/INV-4/INV-6). Shared per-loop async SessionDB heavy-read gate (default 2, config dashboard.heavy_read_max_concurrency, lazy/loop-bound NOT import-frozen). REST + WS list_sessions_rich (and siblings) a",
@@ -27401,8 +27401,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "UPSTREAM",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): duplicate picker rows reproduce on upstream with the fleet's live claude-apr catalog shape; fix is generic (own-slug prefix only). Measured: live trigger shape confirmed: ~/.hermes/plugins/model-providers/claude-apr fallback_models = 'claude-apr/<id>' x5 (namespaced with own slug) while GET 127.0.0.1:18810/anthropic/v1/models returns bare ids. Real provider_model_ids() with that exact profile shape (stubbed fetch): upstream c15ebb1435 -> 10 rows (every model twice); fork -> 5. Upstream: RED (live call): up provider_model_ids@hermes_cli/models.py:1683 merges curated-namespaced + live-bare without canonicalizing (slice card t_db92203d)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(models): dedup namespaced curated vs bare live ids in provider_model_ids merge (#166) \u2014 Every model for `claude-api-proxy`, `claude-api-proxy-f1..f5`, `claude-bridge`, `claude-bridge-f1..f5` (and any plugin provider whose curated catalog is namespaced) shows up **twice** in the desktop Models dialog / model picker \u2014 e.g. Fable 5, Opus 4-8, Sonnet 5, Haiku 4-5 each l",
@@ -27443,8 +27443,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "UPSTREAM",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): Apollo's own root config hits it every /model picker open; generic namespace-aware presence check. Measured: live trigger: root ~/.hermes/config.yaml model.default=claude-fable-5-1 (bare), provider claude-bpr whose plugin fallback_models are 'claude-bpr/<id>'. Upstream _finalize_picker_rows(row models=['claude-bpr/claude-fable-5-1','claude-bpr/claude-opus-5-5'], current='claude-fable-5-1') -> ['claude-fable-5-1','claude-bpr/claude-fable-5-1',...] (current model listed twice). Upstream: RED (live call): up _finalize_picker_rows@hermes_cli/model_switch_providers.py:1280 uses plain `current_model not in models` (slice card t_bc006a95)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(model-picker): don't duplicate the current model when its catalog entry is namespaced (#135) \u2014 The `/model` picker (Discord dropdown, screenshot from Ace) listed **`claude-opus-4-8` twice** when it was the current model \u2014 once injected at the top, once from the provider's curated catalog. ## Root cause `list_authenticated_providers` (`hermes_cli/model_switch.py`) injects t",
@@ -27628,8 +27628,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): launcher never used in window; upstream client unaffected; --remote-allow-origins=* also widens the debug port to any web origin. Measured: live CDP repro, Chrome 154.0.8037.57 headless on temp profiles: with upstream launch args (no --remote-allow-origins) the handshake WITHOUT an Origin header (websockets default = upstream tools/browser_cdp_tool.py:176) -> OK; only a handshake WITH an Origin header -> HTTP 403. The launcher that this PR edits logged 0 'browser debug launch: spawned' lines across ~/.hermes/logs + profiles/*/logs; 0 CDP 403/'Rejected an incoming WebSocket' lines. Upstream: GREEN for upstream's own CDP client (no Origin sent); 403 only reproduces for Origin-sending clients (slice card t_d3825c87)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(browser): add --remote-allow-origins to CDP debug launch for Chrome 111+ (#33) \u2014 Chrome/Chromium **111+** rejects CDP WebSocket handshakes with **HTTP 403** unless the connecting origin is explicitly allowed (the DevTools remote-origin lockdown, [crrev/c/4106462](https://chromium-review.googlesource.com/c/chromium/src/+/4106462)). Playwright's `connect_over_c",
@@ -27795,8 +27795,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): guard on a dead module; fires 0 by construction. Measured: caller count: build_recap (the only public entry of hermes_cli/session_recap.py) has 0 non-test callers on fork 858ee59722 and 0 on upstream c15ebb1435 (grep over *.py/*.ts/*.tsx/*.yaml); the module is not imported by gateway/ or hermes_cli anywhere. The guard's code path cannot run. Upstream: n/a: upstream session_recap.py:169 is equally unreached; upstream's extract_local_files@gateway/platforms/base.py:3283 is only called from gateway/kanban_watchers.py:162 (slice card t_08d470c3)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(recap): backtick-wrap Files touched paths to stop gateway auto-attach \u2014 The /status session recap lists touched file paths via _shortened_path, which emits a bare absolute or ~-relative path for any file outside the gateway cwd. The gateway scans outbound message text for bare local file paths and auto-uploads matches as native attachments (gateway/p",
@@ -30123,8 +30123,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): the operator reads it ~3x/day; #18 layers on #17, keep as one unit. 508 loc over 15 locale files is the cost; candidate for upstreaming as one PR later. Measured: /compress usage counted from gateway logs: 19 \"[Discord] slash '/compress' invoked\" lines by Ace's user id in ~/.hermes/logs/gateway.log* (window 2026-09-20..09-25, ~6 days: 10 on 09-20, 4 on 09-21, 5 on 09-23) \u2014 each renders this readout. Upstream: read-only: upstream /compress reply has no measured-context / full-request lines (readout keys fork-only)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(compress): two-line readout \u2014 Chat size + Full request size (#18) \u2014 Reworks the `/compress` token readout per request into **two clearly labelled lines** instead of one ambiguous estimate: ``` \ud83d\udddc\ufe0f Compressed: 181 \u2192 181 messages Chat size: ~29,521 \u2192 ~27,300 tokens (excludes system, tools, tool results) Full request size: 290,310 \u2192 ~265,000 tokens (",
@@ -30183,8 +30183,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "KEEP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): the operator reads it ~3x/day; #18 layers on #17, keep as one unit. 508 loc over 15 locale files is the cost; candidate for upstreaming as one PR later. Measured: /compress usage counted from gateway logs: 19 \"[Discord] slash '/compress' invoked\" lines by Ace's user id in ~/.hermes/logs/gateway.log* (window 2026-09-20..09-25, ~6 days: 10 on 09-20, 4 on 09-21, 5 on 09-23) \u2014 each renders this readout. Upstream: read-only: upstream /compress reply has no measured-context / full-request lines (readout keys fork-only)",
   "x": {
    "verdict": "UNRESOLVED",
    "problem": "fix(compress): show real measured context alongside estimate; estimate over full transcript (#17) \u2014 `/compress` reported two token numbers that disagreed by ~10x with no explanation (flagged by diagnosing the difference between `/usage` Context % and `/compress` Approx request size). ### Root cause - **`/usage` Context %** = real provider-returned `prompt_tokens` \u2014 counts syste",
@@ -30292,8 +30292,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): never fired, verified clean at landing and now; 121 loc in providers/__init__.py which diverges +184/-346 from upstream. Measured: the in-repo diff is only C-2 (lint_provider_collisions + a doctor line; C-1 normalisation is not in this commit). Ran the fork lint against the LIVE plugin registry (real HOME, read-only): 0 collisions. 'Provider collision lint' warning lines: 0 across ~/.hermes/logs + profiles/*/logs. Callers: doctor.py:1928 only; no cron job or script runs it (the 'cli-parity sweep' caller named in the docstring does not exist in cron/jobs.json or ~/.hermes/scripts). Upstream: n/a (fleet copy-paste fN plugin hazard) (slice card t_c4b3a02c)",
   "x": {
    "branch": null,
    "evidence": {
@@ -30600,8 +30600,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): never fires on this fleet; 629 loc incl. gateway/run.py (conflicts in all 3 syncs). If wanted for Windows users, upstream #889+#894 together as one PR. Measured: trigger = a whitespace in the home / interpreter / skill-category / plugin path pasted into a hint. Measured on both fleet hosts: Mac Studio HOME=/Users/alexgierczyk, ACE-AI HOME=/home/ace; 0 of 18 profile dirs, 0 skill category dirs (skills, skills-shared, fork skills/ + optional-skills/), 0 venv interpreter paths contain whitespace. The printed hints round-trip unquoted here. Upstream: not applicable as-is: routes through hint_value from fork-only #889 (slice card t_ceb111f9)",
   "x": {
    "branch": null,
    "evidence": {
@@ -30994,8 +30994,8 @@
   "auditor": "SUPERSEDED-BY-UPSTREAM",
   "adv": "needs-lead",
   "adv_new": "lead: upstream claim falsified",
-  "final": "UNRESOLVED",
-  "why": "LEAD: auditor premise falsified (upstream prompt.submit has no empty-text check); fork guard fires unmeasured. Needs a count of 4020 rejections before KEEP/UPSTREAM.",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): guard's path carries ~no traffic here and the client that looped is gone; not worth 237 loc on 2 files that conflict every sync. Reopen if a desktop empty-submit loop recurs. Measured: 4020 rejections are not logged anywhere (0 hits for 4020 in dashboard.{out,err}.log, dashboard-auth.log); a count needs live instrumentation and ~/.hermes is read-only for this card. Substitute measurement of the path's traffic: root state.db has 8 source='tui' sessions out of 15,265 (all 2026-08-20; 2026-05-08..2026-09-26); 0 empty user rows ever from source tui. The triggering client (fork desktop reconnect loop) is retired by D9 (desktop upstream-owned since 2026-08-08). Upstream: RED by read: up prompt.submit@tui_gateway/methods_prompt.py:564 has no empty-text rejection (auditor's 'absorbed' premise falsified) (slice card t_28b13602) | prior lead note: LEAD: auditor premise falsified (upstream prompt.submit has no empty-text check); fork guard fires unmeasured. Needs a count of 4020 rejections before KEEP/UPSTREAM.",
   "x": {
    "verdict": "SUPERSEDED-BY-UPSTREAM",
    "problem": "tui_gateway accepted an empty prompt.submit and ran model-switch side effects on a no-op switch",
@@ -31316,8 +31316,8 @@
   "auditor": "UPSTREAM",
   "adv": "keep-unproven",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "LEAD: merge-queue red NOT reproduced on either tree (17 passed x3 + 6/6 concurrent both); evidence = PR body only.",
+  "final": "UPSTREAM",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): the flake was real (5% of merge-queue runs over a week) and the fix removed it; test-only, generic. Branch already built: audit/scripts_misc/upstream-695 @ 830f68a5dc (hand port off upstream/main). Measured: merge-queue counts via REST job logs (ANSI-stripped, grep 'FAIL ... virtualHistoryOffsetCache.test.ts'): BEFORE the fix (merge_group runs 2026-09-07..09-14 13:52, 201 runs) 10 'JS & TS checks' jobs failed on this exact file (09-07, 09-08, 09-09 x4, 09-10 x2, 09-14 x2). AFTER (2026-09-14 14:00..09-26, 2,297 runs, 120 failed runs) 0 failures of this file (1 JS&TS failure total, a different test). Upstream: RED by read: up ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts lacks the act()/IS_REACT_ACT_ENVIRONMENT settle (slice card t_c1c5035d) | prior lead note: LEAD: merge-queue red NOT reproduced on either tree (17 passed x3 + 6/6 concurrent both); evidence = PR body only.",
   "x": {
    "branch": "audit/scripts_misc/upstream-695",
    "evidence": {
@@ -38904,8 +38904,8 @@
   "auditor": "UNRESOLVED",
   "adv": "none",
   "adv_new": null,
-  "final": "UNRESOLVED",
-  "why": "unchallenged by adversary (KEEP/UPSTREAM rows are only challenged when flagged)",
+  "final": "DROP",
+  "why": "RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): 0 fires in ~80 days / 3,130 writes; the repo script is dead. 554 loc in tools/skill_manager_tool.py + agent/skill_utils.py (2 files, conflict in 2 syncs). Measured: G1/G2 refusals return to the model as skill_manage tool results. Across all 14 profile state.db since the commit (2026-07-08..2026-09-26): 3,130 skill_manage tool results, 0 containing 'Refusing to author', 'reserved work-queue-note prefix' or 'Post-write placement check failed' (the 5 LIKE hits are all read_file/terminal/execute_code rows showing the SOURCE template '{name}', incl. this audit). scripts/local-skill-leak-check.py has 0 callers (launchd ai.hermes.skill-collision-check runs the skills-shared copy). Upstream: n/a (fleet-only skills-shared layout) (slice card t_cad124fd)",
   "x": {
    "branch": null,
    "evidence": {
@@ -42202,9 +42202,9 @@
   "auditor": "(auto)",
   "adv": "n/a",
   "adv_new": null,
-  "final": "UNRESOLVED",
+  "final": "DROP",
   "follows": "nopr:8dcc69611c",
-  "why": "auto: follows nopr:8dcc69611c (scripts_misc) by path; same fate.",
+  "why": "auto: follows nopr:8dcc69611c (scripts_misc) by path; joins that card.",
   "x": {
    "branch": null
   },

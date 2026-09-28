@@ -340,6 +340,12 @@ def _record_codex_app_server_compaction(
 
     agent._last_compaction_in_place = False
     try:
+        from agent.fallback_wiring import note_compaction as _fb_note_compaction
+
+        _fb_note_compaction(agent)
+    except Exception:
+        pass
+    try:
         if getattr(agent, "event_callback", None):
             agent.event_callback(
                 "session:compress",

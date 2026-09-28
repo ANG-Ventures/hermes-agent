@@ -4273,13 +4273,27 @@ def delegate_task(
         # Credentials are deliberately absent and resolve again below.
         _execution = recovery_execution
         _credential_ref = _execution.get("credential_ref") or {}
+        _recovered_provider = (
+            _credential_ref.get("provider") or _execution.get("provider") or ""
+        )
+        # Only a direct-endpoint delegation (credential_ref.source ==
+        # "delegation_config") pins its persisted base_url/api_mode. A NAMED
+        # provider re-resolves its endpoint by name, like the original spawn
+        # did: replaying the resolved base_url next to the name collapsed the
+        # child to provider="custom" (no provider profile -> no relay routing
+        # key) and would also pin a stale endpoint after a registry move.
+        _direct_endpoint = (
+            _credential_ref.get("source") == "delegation_config"
+            or not _recovered_provider
+            or _recovered_provider == _RUNTIME_PROVIDER_CUSTOM
+        )
         cfg = dict(cfg)
         cfg.update({
             "model": _execution.get("model") or "",
-            "provider": _credential_ref.get("provider") or _execution.get("provider") or "",
-            "base_url": _execution.get("base_url") or "",
+            "provider": _recovered_provider,
+            "base_url": (_execution.get("base_url") or "") if _direct_endpoint else "",
             "api_key": "",
-            "api_mode": _execution.get("api_mode") or "",
+            "api_mode": (_execution.get("api_mode") or "") if _direct_endpoint else "",
             "max_iterations": int(
                 _execution.get("max_iterations") or DEFAULT_MAX_ITERATIONS
             ),
@@ -5340,6 +5354,26 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
                 )
                 request_overrides = dict(runtime.get("request_overrides") or {}) or None
                 max_output_tokens = runtime.get("max_output_tokens")
+                # The configured base_url IS the named provider's own endpoint
+                # (e.g. claude-bpr + http://127.0.0.1:18811/v1, which is what
+                # restart recovery replays): keep the provider's identity. The
+                # bare "custom" collapse drops the provider profile, and with it
+                # the stateful-relay routing key (claude-bpr `user`=hermes-sess),
+                # so every child call reached the pool/bridge keyless -> sub hops
+                # + a fresh CLI session per call (t_9fdac10c, $68-eq plateau).
+                _rt_provider = str(runtime.get("provider") or "").strip()
+                _rt_base = str(runtime.get("base_url") or "").strip().rstrip("/")
+                if (
+                    _rt_provider
+                    and _rt_provider != _RUNTIME_PROVIDER_CUSTOM
+                    and _rt_base
+                    and _rt_base == configured_base_url.strip().rstrip("/")
+                ):
+                    provider = _rt_provider
+                    if configured_api_mode not in {
+                        "chat_completions", "codex_responses", "anthropic_messages"
+                    } and runtime.get("api_mode"):
+                        api_mode = runtime.get("api_mode")
             except Exception as exc:
                 logger.debug(
                     "delegation.base_url: runtime resolution for provider '%s' "

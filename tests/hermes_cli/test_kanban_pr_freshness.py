@@ -15,6 +15,12 @@ PR_URL = "https://github.com/o/r/pull/5"
 HEAD = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def _fixture_owner_is_fleet(monkeypatch):
+    """The ``o/r`` fixture repo stands in for a fleet repo (t_06dccfe3)."""
+    monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
+
+
 class FakeGh:
     def __init__(self, *, draft=False, behind=0, checks=("success",), status="success"):
         self.draft, self.behind, self.checks, self.status = draft, behind, checks, status
@@ -101,6 +107,14 @@ def test_milestone_and_kill_switches_do_not_arm(monkeypatch):
     fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(draft=True), arm=None)  # no raise
 
 
+def test_foreign_pr_is_never_updated_or_armed():
+    """t_06dccfe3: the gate never touches a PR the fleet does not own."""
+    gh, armed = FakeGh(draft=True, behind=50), []
+    refs = op.extract_pr_refs("https://github.com/stephenschoettler/hermes-lcm/pull/5")
+    rep = fr.check(refs, task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a))
+    assert rep["prs"] == {} and gh.calls == [] and armed == []
+
+
 def test_lookup_failure_fails_open():
     rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=lambda *a: None, arm=None)
     assert "fail-open" in rep["prs"]["o/r#5"]["lookup"]
@@ -181,7 +195,25 @@ def test_e2e_green_slice_armed_milestone_not(board, monkeypatch):
     _use_gh(monkeypatch, FakeGh(), armed)
     with kb.connect() as conn:
         tid, run = _claimed(conn)
-        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}", expected_run_id=run)
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                metadata={"pr_url": PR_URL}, expected_run_id=run)
         mid, mrun = _claimed(conn, title="[milestone] big thing")
-        assert kb.complete_task(conn, mid, summary=f"done {PR_URL}", expected_run_id=mrun)
+        assert kb.complete_task(conn, mid, summary=f"done {PR_URL}",
+                                metadata={"pr_url": PR_URL}, expected_run_id=mrun)
     assert armed == [(REPO, 5, HEAD, tid)]
+
+
+def test_e2e_pr_only_mentioned_in_prose_is_routed_but_never_armed(board, monkeypatch):
+    """FleetReview #1234: a green fleet PR named only in summary prose (context,
+    not this card's handoff) routes the card to review but is NOT handed to
+    fleet-merge.sh. Only metadata.pr_url / --survivor-pr authorize arming."""
+    armed = []
+    _use_gh(monkeypatch, FakeGh(), armed)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.complete_task(conn, tid, summary=f"background: see {PR_URL}",
+                                expected_run_id=run)
+        assert _status(conn, tid) == "review"
+        meta = kb.latest_run(conn, tid).metadata
+        assert "not armed" in meta["handoff_freshness"]["prs"]["o/r#5"]["automerge"]
+    assert armed == []

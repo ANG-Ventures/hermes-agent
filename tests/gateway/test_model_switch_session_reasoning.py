@@ -159,12 +159,23 @@ def _handler_nodes():
 
 
 def _switch_model_calls(node):
-    return [
-        n for n in ast.walk(node)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "switch_model"
-    ]
+    """Direct ``x.switch_model(...)`` calls AND off-loop dispatches
+    ``asyncio.to_thread(x.switch_model, ...)`` (t_515b7fce) — keywords ride the
+    ``to_thread`` call in the latter, so the splat check below applies to both."""
+    out = []
+    for n in ast.walk(node):
+        if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+            continue
+        if n.func.attr == "switch_model":
+            out.append(n)
+        elif (
+            n.func.attr == "to_thread"
+            and n.args
+            and isinstance(n.args[0], ast.Attribute)
+            and n.args[0].attr == "switch_model"
+        ):
+            out.append(n)
+    return out
 
 
 @pytest.mark.parametrize("handler", ["_on_model_selected", "_finish_switch"])

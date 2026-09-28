@@ -394,3 +394,96 @@ def test_repair_db_still_repairs_for_a_real_operator(
     assert index_name in report.reindexed
     with kb.connect_readonly(db_path=live) as conn:
         assert conn.execute("select count(*) from tasks").fetchone()[0] == 1
+
+
+# --- Board-set state (board.json, current pointer, archive) — t_216b74e0 ----
+# connect()'s gate only sees kanban.db. On 2026-09-22 ten fixture slugs
+# (alpha, curr, my-proj, persist, recycle, slug-immutable, spawntest, hascards,
+# proja, real) landed in the live kanban/boards/: create_board() writes
+# board.json and mkdirs the board dir BEFORE connect() runs, so even a refused
+# create left a board list_boards() surfaces. set_current_board() and
+# remove_board() never reach connect() at all.
+
+
+def _files_under(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+@pytest.fixture
+def kanban_on_live_root(live_root, monkeypatch):
+    """kanban_home() resolves to the (fake) live root, as it does when a test's
+    HERMES_HOME sits under the real ~/.hermes (the 09-22 TMPDIR shape)."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(live_root))
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    return live_root
+
+
+def test_create_board_on_live_root_leaves_no_board_behind(kanban_on_live_root):
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.create_board("spawntest")
+    assert _files_under(kanban_on_live_root) == []
+    assert [b["slug"] for b in kb.list_boards()] == ["default"]
+
+
+def test_board_metadata_write_on_live_root_is_refused(kanban_on_live_root):
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.write_board_metadata("slug-immutable", name="New Display Name")
+    assert _files_under(kanban_on_live_root) == []
+
+
+def test_live_current_board_pointer_cannot_be_moved(kanban_on_live_root):
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.set_current_board("curr")
+    assert not (kanban_on_live_root / "kanban" / "current").exists()
+
+
+def test_live_current_board_pointer_cannot_be_cleared(kanban_on_live_root):
+    current = kanban_on_live_root / "kanban" / "current"
+    current.parent.mkdir(parents=True)
+    current.write_text("real-board\n", encoding="utf-8")
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.clear_current_board()
+    assert current.read_text(encoding="utf-8") == "real-board\n"
+
+
+def test_live_board_cannot_be_archived_or_deleted(kanban_on_live_root):
+    board = kanban_on_live_root / "kanban" / "boards" / "real-board"
+    board.mkdir(parents=True)
+    (board / "board.json").write_text("{}", encoding="utf-8")
+    for archive in (True, False):
+        with pytest.raises(kb.LiveBoardWriteRefused):
+            kb.remove_board("real-board", archive=archive)
+    assert (board / "board.json").exists()
+    assert not (kanban_on_live_root / "kanban" / "boards" / "_archived").exists()
+
+
+def test_init_db_refusal_creates_no_board_dir(kanban_on_live_root):
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.init_db(board="recycle")
+    assert _files_under(kanban_on_live_root) == []
+
+
+def test_board_lifecycle_still_works_for_a_production_process(
+    kanban_on_live_root, as_production_process
+):
+    kb.create_board("ops")
+    kb.set_current_board("ops")
+    assert kb.get_current_board() == "ops"
+    kb.clear_current_board()
+    res = kb.remove_board("ops")
+    assert res["action"] == "archived"
+    assert [b["slug"] for b in kb.list_boards()] == ["default"]
+
+
+def test_board_lifecycle_under_a_hermetic_home_is_untouched(
+    tmp_path, live_root, monkeypatch
+):
+    home = tmp_path / "sandbox"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    kb.create_board("alpha")
+    kb.set_current_board("alpha")
+    kb.remove_board("alpha")
+    assert _files_under(live_root) == []

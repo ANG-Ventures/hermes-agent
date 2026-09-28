@@ -435,6 +435,19 @@ def note_fallback_success(store: StickyStore, key: StickyKey, now: float,
     return state
 
 
+def note_compaction(store: StickyStore, key: StickyKey, now: float) -> Optional[StickyState]:
+    """§4.3 ``compaction`` input: stamp ``last_compaction_epoch`` on the
+    active episode. Called after every completed compaction, in place or
+    rotating (in-place mode never rotates ``session_id``). No-op without an
+    active episode."""
+    state = _load(store, key)
+    if state is None or not state.active:
+        return state
+    state.last_compaction_epoch = now
+    store.put(key, state, now)
+    return state
+
+
 def seat_from_response(provider: Optional[str],
                        headers: Optional[Mapping[str, str]]) -> Optional[str]:
     """D6 seat: ``x-pool-served-by`` on a pooled response; the provider name
@@ -497,6 +510,24 @@ class Eligibility:
     warm_age_s: Optional[float] = None
     warm_window_s: Optional[float] = None
     warm_refusal: Optional[str] = None
+    # Free child slots on the bound / warm seat's box (claude-pool BoxCapacity,
+    # t_90d3bd12). None = unknown, stale or an older relay: today's behaviour.
+    bound_box_free: Optional[int] = None
+    warm_box_free: Optional[int] = None
+    # t_bbe0023c: warm holders the relay dropped for an active model cap
+    # (``warm_skip: "model_capped"``). The relay only lists copies still inside
+    # their window, so a non-empty list = "warm copy exists, not eligible".
+    warm_skip: Optional[str] = None
+    warm_skipped: Tuple[str, ...] = ()
+
+
+def _opt_int(v: Any) -> Optional[int]:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _opt_float(v: Any) -> Optional[float]:
@@ -529,6 +560,11 @@ def parse_eligibility(obj: Any) -> Optional[Eligibility]:
         warm_age_s=_opt_float(obj.get("warm_age_s")),
         warm_window_s=_opt_float(obj.get("warm_window_s")),
         warm_refusal=obj.get("warm_refusal"),
+        bound_box_free=_opt_int(obj.get("bound_box_free")),
+        warm_box_free=_opt_int(obj.get("warm_box_free")),
+        warm_skip=str(obj.get("warm_skip")) if obj.get("warm_skip") else None,
+        warm_skipped=tuple(str(x) for x in (obj.get("warm_skipped") or ())
+                           if x) if isinstance(obj.get("warm_skipped"), (list, tuple)) else (),
     )
 
 
@@ -613,6 +649,10 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
     # expiry (bound_expiry="none", claude-pool since t_4bbac8a8): a binding
     # that still reports bound_seat == last_primary_seat is live.
     ttl_ok = exp is None or exp >= BOUND_EXPIRES_MIN_S
+    if elig.bound_box_free == 0:
+        # Ace 09-27 04:38: return to the warm seat "unless that box is too
+        # full and contended". Stay sticky; the next boundary re-checks.
+        return False, BOX_FULL_REASON, exp
     if seat_ok and elig.bound_eligible and ttl_ok:
         return True, f"warm_seat: bound seat {seat} eligible", exp
     why = []
@@ -623,6 +663,22 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
     if not ttl_ok:
         why.append(f"bound_expires_in_s {exp} < 60")
     return False, "warm_seat: " + "; ".join(why), exp
+
+
+BOX_FULL_REASON = "warm_seat: bound box full"
+
+
+def _box_full(elig: Optional[Eligibility], verdict: Optional[str]) -> bool:
+    """A warm return would land on a box with no free child slot: the bound
+    box, or (``return_now``: the relay's warm pick routes there) the warm
+    seat's box. Unknown (None) never refuses."""
+    if elig is None:
+        return False
+    return elig.bound_box_free == 0 or (verdict == "return_now" and elig.warm_box_free == 0)
+
+
+def _box_fields(elig: Eligibility) -> Dict[str, Any]:
+    return {"bound_box_free": elig.bound_box_free, "warm_box_free": elig.warm_box_free}
 
 
 def warm_refusal_arm(session_key: Optional[str], pct: Any = WARM_REFUSAL_AB_PCT_DEFAULT) -> bool:
@@ -641,7 +697,7 @@ def _warm_snapshot(elig: Eligibility, arm: bool, verdict: Optional[str]) -> Dict
     return {"warm_rank_effective": elig.warm_rank_effective, "warm_refusal": elig.warm_refusal,
             "warm_seat": elig.warm_seat, "warm_age_s": elig.warm_age_s,
             "warm_window_s": elig.warm_window_s, "warm_eligible": elig.warm_eligible,
-            "warm_refusal_arm": arm, "warm_gate": verdict}
+            "warm_refusal_arm": arm, "warm_gate": verdict, **_box_fields(elig)}
 
 
 def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str]:
@@ -650,9 +706,13 @@ def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str
 
     * ``"return_now"`` - enforce, ``warm_eligible`` and age < window;
     * ``"refuse"``     - refusal half (shadow|enforce, ``warm_refusal`` on,
-      session in the A/B arm): a warm copy exists but no warm seat is eligible;
+      session in the A/B arm): a warm copy exists but no warm seat is eligible.
+      A copy the relay dropped for a model cap (``warm_skipped``) counts as
+      "warm copy exists, not eligible" (t_e001a935, fallback spec D6);
     * ``"cap"``        - refusal half, but the primary's warm copy has expired
-      or has no entry: waiting saves nothing (hard cap, pass-1 B1);
+      or has no entry. Telemetry only: :func:`restore_allowed` no longer
+      returns early on it (Ace 2026-09-25 19:35 "do not bother returning
+      early"; D6 rejects the warm-seat spec P3 hard cap, Apollo t_e001a935);
     * ``None``         - the fallback spec rule unchanged (relay unreachable, no
       warm fields, ``off``, ``warm_refusal=off``, control arm, or shadow with a
       warm eligible seat).
@@ -663,7 +723,8 @@ def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str
     if mode not in ("shadow", "enforce"):
         return None
     age, win = elig.warm_age_s, elig.warm_window_s
-    has_copy = age is not None and win is not None and age < win
+    has_copy = ((age is not None and win is not None and age < win)
+                or (elig.warm_skip is not None and bool(elig.warm_skipped)))
     if mode == "enforce" and elig.warm_eligible and has_copy:
         return "return_now"
     if elig.warm_refusal == "off" or not refusal_arm:
@@ -696,6 +757,7 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
     exp: Optional[float] = None
     verdict: Optional[str] = None
     warm: Optional[Dict[str, Any]] = None
+    box_full = False
     if probe:
         provider = primary_provider or state.primary_provider
         if eligibility is not None:
@@ -712,32 +774,43 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
             verdict = warm_gate(elig, refusal_arm=refusal_arm)
             if elig is not None and elig.warm_rank_effective in ("shadow", "enforce"):
                 warm = _warm_snapshot(elig, refusal_arm, verdict)
-            if verdict == "return_now":
+            if _box_full(elig, verdict):
+                box_full = True
+                warm = {**(warm or {}), **_box_fields(elig)}
+            if verdict == "return_now" and not box_full:
                 return Decision(True, "warm_seat",
                                 f"warm_seat: warm eligible seat {elig.warm_seat} "
                                 f"(warm_rank=enforce, age {elig.warm_age_s}s < {elig.warm_window_s}s)",
                                 elig.bound_expires_in_s, warm)
-        if verdict != "refuse":
+        if box_full:
+            reasons.append(BOX_FULL_REASON)
+            exp = elig.bound_expires_in_s
+        elif verdict != "refuse":
             ok, why, exp = _warm_seat(state, now, primary_provider=provider,
                                       eligibility=eligibility, direct_pin_benched=direct_pin_benched)
             if ok:
                 return Decision(True, "warm_seat", why, exp, warm)
             reasons.append(why)
-        if verdict == "cap":
-            return Decision(True, "cap_expiry",
-                            "cap_expiry: primary warm copy expired or absent", exp, warm)
+        # verdict == "cap" (primary warm copy expired/absent) does NOT return
+        # here: the fallback copy may still be warm, and D6 waits for
+        # fallback_cold/compaction below (t_e001a935; no cap_expiry branch).
     last_fb = state.last_fallback_call_epoch
     if last_fb is None:
         last_fb = state.entered_at
     if last_fb is not None and now - last_fb > FALLBACK_COLD_S:
         return Decision(True, "fallback_cold", f"fallback idle {now - last_fb:.0f}s", exp, warm)
     reasons.append("fallback_cold: last fallback call <= 60 min ago")
+    lc = state.last_compaction_epoch
+    if lc is not None and last_fb is not None and lc > last_fb:
+        return Decision(True, "compaction", "compaction ran since last fallback call", exp, warm)
     if (live_session_id and state.last_fallback_session_id
             and live_session_id != state.last_fallback_session_id):
         return Decision(True, "compaction", "session_id rotated since last fallback call", exp, warm)
-    reasons.append("compaction: no session_id rotation")
+    reasons.append("compaction: none since last fallback call")
     if verdict == "refuse":
         return Decision(False, None, "no_warm_primary_seat", exp, warm)
+    if box_full:
+        return Decision(False, None, BOX_FULL_REASON, exp, warm)
     return Decision(False, None, " | ".join(reasons), exp, warm)
 
 
@@ -969,7 +1042,21 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     prefix, window = _count_window(row, tz)
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
-    return f"{prefix}{_cause_phrase(row)} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+    cause = _cause_phrase(row)
+    if _is_pool_wide_relay_busy(row, hop, cause):
+        return f"{prefix}relay busy: all subs at capacity (at the relay), {window}"
+    return f"{prefix}{cause} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+
+
+def _is_pool_wide_relay_busy(row: Mapping[str, Any], hop: Optional[str], cause: str) -> bool:
+    """A pooled lane's pool_pressure refusal that names no seat was decided AT the
+    relay before any seat was chosen ("pool at capacity"): there is no seat to name
+    and the hop is known. t_e17de574: rendered "relay busy (hop unknown, sub
+    unknown)" through a 9-minute tailnet outage, which read as missing data."""
+    return (row.get("trigger_class") == "pool_pressure"
+            and not row.get("seat") and hop in (None, "relay")
+            and cause in ("relay busy", "pool at capacity")
+            and not is_direct_pin(row.get("from_provider")))
 
 
 def head_label_override(row: Mapping[str, Any]) -> Optional[str]:

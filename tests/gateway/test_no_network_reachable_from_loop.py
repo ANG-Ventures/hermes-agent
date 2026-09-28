@@ -111,15 +111,15 @@ REACHABLE_BASELINE = frozenset({
     "gateway/relay/media.py download -> urlopen",
     "gateway/relay/media.py upload -> urlopen",
     "gateway/run.py _handle_message_with_agent_admitted -> urlopen",
-    "gateway/run.py _post_turn_goal_continuation -> requests.get",
     "gateway/run.py _prepare_inbound_message_text -> urlopen",
     "gateway/run.py _run_agent_admitted -> open_credentialed_url",
     "gateway/run.py _run_background_task_inner -> urlopen",
     "gateway/run.py _stop_impl -> requests.get",
     "gateway/run.py start -> urlopen",
     "gateway/run.py stop -> requests.get",
-    "gateway/slash_commands.py _handle_btw_command -> urlopen",
-    "gateway/slash_commands.py _handle_compress_command_inner -> urlopen",
+    # _handle_btw_command: gone -- its runtime resolve is offloaded (t_515b7fce).
+    # _handle_compress_command_inner: gone -- _compress_context runs under
+    # _run_in_executor_with_context, which the walker now counts (t_7189c691).
     "gateway/slash_commands.py _handle_context_command -> requests.get",
     "gateway/slash_commands.py _handle_debug_command -> urlopen",
     "gateway/slash_commands.py _handle_merge_command -> httpx.get",
@@ -205,6 +205,55 @@ def test_the_model_switch_doors_never_reach_the_network(live_sites):
     )
     leaked = [k for k in REACHABLE_BASELINE if k.startswith(FIXED_COROUTINES)]
     assert not leaked, f"a fixed door was absorbed into the baseline: {leaked}"
+
+
+def test_compression_never_runs_on_the_loop():
+    """No gateway coroutine may call ``AIAgent._compress_context`` on the loop.
+
+    ``_compress_context`` reaches ``requests.get`` through
+    ``resolve_compression_fallback_route > _select_main_fallback_entry >
+    _candidate_context_window > get_model_context_length >
+    fetch_model_metadata`` (plus the summary LLM call itself). Both gateway
+    call sites -- /compress and session hygiene -- hop to a worker thread;
+    /compress does it through ``_run_in_executor_with_context``, which the
+    walker must recognize as an offload or it reports the hop as on-loop.
+    """
+    repo = _repo_root()
+    modules = derive_scanned_modules(repo, SCAN_ROOTS)
+    sites = find_onloop_sink_sites(
+        repo,
+        modules,
+        sink_names={"_compress_context"},
+        sink_dotted=(),
+        noqa_token=NOQA_TOKEN,
+        start_roots=START_ROOTS,
+    )
+    assert not sites, (
+        "a gateway coroutine calls _compress_context on the event loop; it "
+        "reaches fetch_model_metadata -> requests.get. Offload it "
+        "(asyncio.to_thread / self._run_in_executor_with_context):\n"
+        + "\n".join(f"  {s}" for s in sites)
+    )
+
+
+def test_compress_context_still_reaches_the_metadata_fetch():
+    """Non-vacuity for the test above: the sink chain it guards is real."""
+    from collections import defaultdict
+
+    from tests.gateway._loop_atomic_write_reachability import _search
+
+    repo = _repo_root()
+    index = build_index(repo, derive_scanned_modules(repo, SCAN_ROOTS), noqa_token=NOQA_TOKEN)
+    by_name = defaultdict(list)
+    for key in index:
+        by_name[key[1]].append(key)
+    found = _search(
+        ("run_agent.py", "_compress_context"),
+        index,
+        by_name,
+        (NETWORK_SINK_NAMES, NETWORK_SINK_DOTTED),
+    )
+    assert found is not None, "_compress_context no longer reaches a network sink"
 
 
 def _reresolve_switch_model_calls(src: str) -> list:
@@ -395,6 +444,49 @@ def test_arm_to_thread_offload_is_green(tmp_path):
     )
     root = _write_tree(tmp_path, files)
     assert _sites(root, [k for k in files if k.endswith(".py")]) == []
+
+
+def test_arm_context_executor_offload_is_green(tmp_path):
+    """The gateway's contextvar-preserving executor hop is an offload."""
+    files = dict(_INCIDENT_SHAPE)
+    files["gateway/run.py"] = files["gateway/run.py"].replace(
+        "        self._set_override('k', {})",
+        "        await self._run_in_executor_with_context(\n"
+        "            lambda: self._set_override('k', {})\n"
+        "        )",
+    )
+    root = _write_tree(tmp_path, files)
+    assert _sites(root, [k for k in files if k.endswith(".py")]) == []
+
+
+def test_offload_helpers_really_hop_to_an_executor():
+    """Each gateway helper the walker treats as an offload must end in
+    ``run_in_executor`` (directly or via another listed helper), so the
+    offload list cannot silently exempt an on-loop call."""
+    import ast
+
+    from tests.gateway._loop_atomic_write_reachability import _OFFLOAD_ATTRS
+
+    helpers = sorted(_OFFLOAD_ATTRS - {"to_thread", "run_in_executor"})
+    assert helpers, "no gateway offload helpers registered"
+    tree = ast.parse((_repo_root() / "gateway" / "run.py").read_text(encoding="utf-8"))
+    defs = {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name in helpers
+    }
+    for name in helpers:
+        assert name in defs, f"offload helper {name} is not an async def in gateway/run.py"
+        awaited = {
+            c.value.func.attr
+            for c in ast.walk(defs[name])
+            if isinstance(c, ast.Await)
+            and isinstance(c.value, ast.Call)
+            and isinstance(c.value.func, ast.Attribute)
+        }
+        assert awaited & (_OFFLOAD_ATTRS - {name}), (
+            f"{name} no longer awaits an executor hop; remove it from _OFFLOAD_ATTRS"
+        )
 
 
 def test_arm_bare_noqa_is_not_an_exemption(tmp_path):

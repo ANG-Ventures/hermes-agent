@@ -121,7 +121,9 @@ def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
             return cls
     if exc_name in _CONN_EXC_NAMES:
         return "conn"
-    if http_status == 401:
+    # Last resort, same as the runtime classifier (error_classifier routes an
+    # otherwise-unrecognized 403 to FailoverReason.auth) (C7 k80).
+    if http_status in (401, 403):
         return "auth"
     return "unclassified"
 
@@ -222,7 +224,9 @@ def _scrub(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        # Persisted error preview: a non-navigation sink, so URL query credentials
+        # and user:pass@ userinfo are redacted too (Backfill C3).
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:  # noqa: BLE001
         return ""
 
@@ -250,13 +254,47 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "status": status_code if isinstance(status_code, int) else None,
             "text": msg[:2000],
             "headers": {k: v for k, v in headers.items()
-                        if k in ("x-relay-error-class", "x-pool-unreachable",
+                        if k in ("x-relay-error-class", "x-relay-error-hop",
+                                 "x-relay-seat", "x-pool-unreachable",
                                  "x-pool-route-id", "retry-after")},
             "body": body if isinstance(body, dict) else None,
             "exc": type(api_error).__name__,
         }
     except Exception:  # noqa: BLE001
         logger.debug("fallback ledger: stash failed", exc_info=True)
+
+
+_SEAT_UNSTATED = frozenset(("", "unknown", "none"))
+
+
+def relay_hop_seat(headers: Any, body: Any) -> Tuple[Optional[str], Optional[str]]:
+    """``(hop, seat)`` the relay stated for a failed call (error-class-v2).
+
+    ``x-relay-error-hop`` / ``x-relay-seat`` first, then ``relay_error_hop`` /
+    ``relay_seat`` in the SSE error body (top level or inside ``error``, same
+    shapes as :func:`relay_error_class`). The hop comes back in the notice
+    enum (``fallback_policy.normalize_hop``); an unstated seat (the relay
+    sends ``none`` when it has none) is None. Never raises.
+    """
+    hop = seat = None
+    try:
+        h = _lower_headers(headers)
+        raw_hop, raw_seat = h.get("x-relay-error-hop"), h.get("x-relay-seat")
+        if isinstance(body, dict):
+            inner = body.get("error") if isinstance(body.get("error"), dict) else {}
+            if not raw_hop:
+                raw_hop = body.get("relay_error_hop") or inner.get("relay_error_hop")
+            if not raw_seat:
+                raw_seat = body.get("relay_seat") or inner.get("relay_seat")
+        if isinstance(raw_hop, str) and raw_hop.strip():
+            from agent.fallback_policy import normalize_hop
+
+            hop = normalize_hop(raw_hop)
+        if isinstance(raw_seat, str) and raw_seat.strip().lower() not in _SEAT_UNSTATED:
+            seat = raw_seat.strip()
+    except Exception:  # noqa: BLE001
+        return None, None
+    return hop, seat
 
 
 def clear_pending(agent: Any) -> None:
@@ -372,6 +410,13 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         **{k: v for k, v in (extra or {}).items() if k not in ("kind",)},
     }
     if kind == "failover":
+        # §4.8: a pooled relay states hop/seat in its error-class-v2 headers
+        # (or SSE error fields). Recorded values (``extra``) win.
+        r_hop, r_seat = relay_hop_seat(headers, body)
+        if r_hop and not row.get("hop"):
+            row["hop"] = r_hop
+        if r_seat and (not row.get("seat") or row.get("seat") == "unknown"):
+            row["seat"] = r_seat
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:

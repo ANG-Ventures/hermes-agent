@@ -175,3 +175,61 @@ def test_oneshot_jobs_are_not_requeued(env):
                         no_agent=True, deliver="local")
     assert job["schedule"]["kind"] == "once"
     assert cj.request_restart_requeue(job["id"], "test") is False
+
+
+def test_dying_process_tick_leaves_requeue_marker_for_next_boot(env):
+    """Reviewer race on #1301: the dying gateway's ticker keeps running from
+    drain timeout until runner.stop() returns. A tick in that window must not
+    consume the marker (the dispatch would be refused as 'Skipped: shutting
+    down', record an error and use up the one re-fire)."""
+    from cron.jobs import get_job, get_due_jobs, RESTART_REQUEUE_KEY
+    import cron.scheduler as sched
+
+    job = _make_job()
+    t = threading.Thread(target=sched.run_one_job, args=(job,), daemon=True)
+    t.start()
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        with sched._script_procs_lock:
+            if sched._active_script_procs:
+                break
+        time.sleep(0.05)
+    else:
+        pytest.fail("script never started")
+    sched.signal_shutdown("gateway shutdown drain")
+    assert sched.terminate_running_scripts("gateway drain timeout") == 1
+    t.join(20)
+    assert not t.is_alive()
+    before = get_job(job["id"])
+    assert before.get(RESTART_REQUEUE_KEY)
+
+    # Still the dying process: its ticker fires once more.
+    assert sched.tick(verbose=False) == 0
+    after = get_job(job["id"])
+    assert after.get(RESTART_REQUEUE_KEY) == before.get(RESTART_REQUEUE_KEY)
+    assert after.get("next_run_at") == before.get("next_run_at")
+    assert "shutting down" not in (after.get("last_error") or "")
+
+    # Next process: the re-fire is still there and ends ok.
+    sched.clear_shutdown()
+    due = [j for j in get_due_jobs() if j["id"] == job["id"]]
+    assert due, "re-fire lost when the dying process's ticker scans after the marker"
+    assert sched.run_one_job(due[0]) is True
+    assert get_job(job["id"])["last_status"] == "ok"
+
+
+def test_dying_process_tick_does_not_skip_normally_due_job(env):
+    """A job that simply comes due during the drain is left for the next
+    process, not recorded as a 'Skipped: shutting down' error."""
+    from cron.jobs import get_job, update_job
+    import cron.jobs as cj
+    import cron.scheduler as sched
+
+    job = _make_job()
+    past = (cj._hermes_now() - timedelta(seconds=30)).isoformat()
+    update_job(job["id"], {"next_run_at": past})
+    sched.signal_shutdown("gateway shutdown drain")
+    assert sched.tick(verbose=False) == 0
+    row = get_job(job["id"])
+    assert row.get("next_run_at") == past
+    assert row.get("last_status") in (None, "")
