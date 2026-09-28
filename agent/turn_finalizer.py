@@ -922,8 +922,13 @@ def emit_session_end(
     original_user_message,
     final_response,
     turn_calls=None,
+    provisional=False,
 ):
     """Fire the per-turn ``on_session_end`` plugin hook exactly once.
+
+    ``provisional=True`` (host abandoning an in-flight turn) does NOT set the
+    per-turn emitted marker, so if the turn later unwinds, its real finalize
+    or backstop emit still fires and its row supersedes the provisional one.
 
     Shared by ``finalize_turn`` (the normal loop exit) and
     ``emit_unfinalized_session_end`` (the backstop for the conversation loop's
@@ -1028,7 +1033,8 @@ def emit_session_end(
         # Mark BEFORE invoking: the run_agent forwarder's backstop
         # (emit_unfinalized_session_end) must never fire a second hook for a
         # turn whose finalizer already attempted one.
-        agent._session_end_emitted_turn_id = turn_id
+        if not provisional:
+            agent._session_end_emitted_turn_id = turn_id
         _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
@@ -1066,14 +1072,18 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
 
     ``abandoned_reason`` marks a turn the HOST is abandoning while it is still
     in flight (gateway shutdown drain timed out, the process is about to
-    exit): it is recorded as ``interrupted`` with that exit reason. The turn's
-    own thread may still unwind later and emit again; the Blackbox ``turns``
-    insert is an upsert, so the later, more complete row wins.
+    exit): it is recorded as ``interrupted`` with that exit reason. That emit
+    is provisional: it leaves the per-turn emitted marker unset (so a turn
+    that does unwind later still emits its real row, which the Blackbox
+    ``turns`` upsert lets supersede this one) and it does not settle
+    ``_billed_unaccounted``, which the turn's own thread still owns.
     """
     try:
         if not turn_id or getattr(agent, "_current_turn_id", None) != turn_id:
             return False
         if getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+            return False
+        if abandoned_reason and getattr(agent, "_session_end_abandoned_turn_id", None) == turn_id:
             return False
         # Both are (turn_id, value) pairs so a raise before the loop published
         # them for THIS turn can never attribute the previous turn's data.
@@ -1087,10 +1097,12 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
             user_message = published_msg[1]
         try:
             # Billed responses the loop rejected before bailing out belong to
-            # THIS turn; finalize_turn settles them the same way.
-            from agent.conversation_loop import _settle_unaccepted_billed_responses
+            # THIS turn; finalize_turn settles them the same way. Not for an
+            # abandoned turn: its thread is still live and owns that list.
+            if not abandoned_reason:
+                from agent.conversation_loop import _settle_unaccepted_billed_responses
 
-            _settle_unaccepted_billed_responses(agent, turn_calls, turn_id)
+                _settle_unaccepted_billed_responses(agent, turn_calls, turn_id)
         except Exception:
             pass
         # Copy: an abandoned turn's own thread may still be appending.
@@ -1129,7 +1141,10 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
             original_user_message=user_message,
             final_response=final_response,
             turn_calls=turn_calls,
+            provisional=bool(abandoned_reason),
         )
+        if abandoned_reason:
+            agent._session_end_abandoned_turn_id = turn_id
         return True
     except Exception:
         logging.getLogger(__name__).warning(

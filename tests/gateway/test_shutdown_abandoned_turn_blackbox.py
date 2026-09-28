@@ -98,7 +98,60 @@ def test_abandoned_turns_and_subagents_get_interrupted_turn_rows(ledger, monkeyp
             (parent_tid, child_tid),
         ).fetchall())
     assert rows == {parent_tid: 1, child_tid: 1}
-    assert parent._session_end_emitted_turn_id == parent_tid
+    # Provisional: the real per-turn marker stays unset so a late unwind wins.
+    assert getattr(parent, "_session_end_emitted_turn_id", None) is None
+
+
+def test_turn_that_unwinds_after_shutdown_emit_supersedes_it(ledger, monkeypatch):
+    from agent.turn_finalizer import emit_unfinalized_session_end
+
+    tid = "20260927_181411_30304c67:3f8c4d10:55b7f62b"
+    _in_flight_call(tid, http_status=200)
+    agent = _agent(tid)
+    asyncio.run(_runner(monkeypatch)._finalize_shutdown_agents({"k": agent}))
+    # A second shutdown pass does not re-emit the same provisional row.
+    fired = []
+    from hermes_cli import lifecycle
+
+    real = lifecycle.invoke_hook
+    monkeypatch.setattr(lifecycle, "invoke_hook",
+                        lambda name, **kw: (fired.append(name), real(name, **kw))[1])
+    asyncio.run(_runner(monkeypatch)._finalize_shutdown_agents({"k": agent}))
+    assert fired == []
+
+    # The turn then unwinds through an early return: the run_agent backstop
+    # must still fire and replace the provisional interrupted row.
+    assert emit_unfinalized_session_end(
+        agent, tid, result={"completed": True, "final_response": "done"}
+    ) is True
+    with sqlite3.connect(ledger) as conn:
+        assert conn.execute("SELECT interrupted FROM turns WHERE turn_id = ?",
+                            (tid,)).fetchone() == (0,)
+
+
+def test_abandoned_emit_does_not_settle_billed_responses_of_a_live_turn(ledger, monkeypatch):
+    import agent.conversation_loop as loop
+
+    settled = []
+    monkeypatch.setattr(loop, "_settle_unaccepted_billed_responses",
+                        lambda *a, **k: settled.append(a))
+    tid = "20260924_121319_7e96dd9c:7ca4180a:45a30131"
+    _in_flight_call(tid)
+    asyncio.run(_runner(monkeypatch)._finalize_shutdown_agents({"k": _agent(tid)}))
+    assert settled == []
+    assert _orphan_ids(ledger) == []
+
+
+def test_agent_started_after_drain_snapshot_is_covered(ledger, monkeypatch):
+    tid = "20260927_135358_92971ac4:2ba7799a:dc65d5fb"
+    _in_flight_call(tid, http_status=200)
+    runner = _runner(monkeypatch)
+    late = _agent(tid)
+    runner._snapshot_running_agents = lambda: {"late": late}
+
+    asyncio.run(runner._finalize_shutdown_agents({}))
+
+    assert _orphan_ids(ledger) == []
 
 
 def test_turn_that_already_emitted_is_not_re_emitted(ledger, monkeypatch):

@@ -13986,9 +13986,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _emit_abandoned_turn_session_ends(
         self, active_agents: Dict[str, Any]
     ) -> None:
+        # Drain-start snapshot PLUS whatever is running now: a pending
+        # sentinel promoted to a real agent during the drain is only in the
+        # live map. The helper de-duplicates.
         agents = [
             a for a in active_agents.values() if a is not _AGENT_PENDING_SENTINEL
         ]
+        try:
+            agents.extend(self._snapshot_running_agents().values())
+        except Exception:
+            pass
         try:
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
             agents.extend(list(getattr(adapter, "_active_run_agents", {}).values()))
