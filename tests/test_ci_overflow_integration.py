@@ -180,3 +180,19 @@ def test_incomplete_artifact_listing_fails_closed(monkeypatch):
 def test_clean_scanned_run_passes(monkeypatch):
     _identity_fakes(monkeypatch, [{"id": 7, "name": "coverage"}], {"7": "clean"})
     assert integ.identity_absent("o/r", "main", 1)["status"] == "PASS"
+
+
+def test_one_probed_job_does_not_certify_an_unprobed_sibling():
+    # FleetReview #1362 (ce3217f9): two slice jobs executed, only one logged a PROBE line.
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    logs = {"Python tests / Run tests a": "PROBE slice=a executing_attempt=3 planned_attempt=3"}
+    result = integ.selective_rerun_verdict(A1, fresh, logs)
+    assert result["status"] == "UNVERIFIABLE"
+    assert result["evidence"]["unprobed"] == ["Python tests / Run tests b"]
+
+
+def test_unprobed_planner_jobs_do_not_block_a_fully_probed_rerun():
+    # Generate/placement run no slice, so they log no PROBE line; every slice job did.
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    logs = {j["name"]: "PROBE slice=x executing_attempt=3 planned_attempt=3" for j in fresh if "Run tests" in j["name"]}
+    assert integ.selective_rerun_verdict(A1, fresh, logs)["status"] == "PASS"

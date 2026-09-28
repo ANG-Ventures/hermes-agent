@@ -52,3 +52,27 @@ def test_unflagged_index_stays_on_fts(tmp_path):
         assert st.search("zebra") == []
     finally:
         st.close()
+
+
+def test_flagged_index_or_query_matches_either_term(tmp_path):
+    """FleetReview #1362 (da1d6f7c): an FTS-style ``a OR b`` query sent to the
+    LIKE path while the index is flagged still finds rows with either term."""
+    st = _lagging_store(tmp_path / "lcm.db")
+    try:
+        conn = st._conn
+        text = "a lion roars"
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, search_content, timestamp) "
+            "VALUES (?,?,?,?,?)",
+            ("s", "user", st._cipher.encrypt_text(text, field="content"), text, 2.0),
+        )
+        B._record_integrity_failed(
+            conn, build_message_fts_spec(),
+            detail="content/index row-count mismatch (parity check)", now=time.time(),
+        )
+        conn.commit()
+        for q in ("zebra OR lion", "zebra lion"):
+            got = sorted(h["content"] for h in st.search(q))
+            assert got == ["a lion roars", "zebra lagging needle"], (q, got)
+    finally:
+        st.close()
