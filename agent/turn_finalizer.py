@@ -1052,7 +1052,7 @@ def emit_session_end(
         logger.warning("on_session_end hook failed: %s", exc)
 
 
-def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
+def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, abandoned_reason=None):
     """Backstop: fire ``on_session_end`` for a turn that bypassed ``finalize_turn``.
 
     ``run_conversation`` has dozens of early ``return``s (fallback chain
@@ -1063,6 +1063,12 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
     forwarder calls this after every turn, successful or not; it is a no-op
     when the finalizer already emitted for ``turn_id`` or the turn never
     started. Returns True when it emitted. Never raises.
+
+    ``abandoned_reason`` marks a turn the HOST is abandoning while it is still
+    in flight (gateway shutdown drain timed out, the process is about to
+    exit): it is recorded as ``interrupted`` with that exit reason. The turn's
+    own thread may still unwind later and emit again; the Blackbox ``turns``
+    insert is an upsert, so the later, more complete row wins.
     """
     try:
         if not turn_id or getattr(agent, "_current_turn_id", None) != turn_id:
@@ -1087,9 +1093,15 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
             _settle_unaccepted_billed_responses(agent, turn_calls, turn_id)
         except Exception:
             pass
+        # Copy: an abandoned turn's own thread may still be appending.
+        turn_calls = list(turn_calls)
         res = result if isinstance(result, dict) else {}
         final_response = ""
-        if exc is not None:
+        if abandoned_reason:
+            interrupted = True
+            failed = False
+            reason = str(abandoned_reason)[:200]
+        elif exc is not None:
             interrupted = isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             )
@@ -1124,3 +1136,42 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
             "unfinalized on_session_end backstop failed", exc_info=True
         )
         return False
+
+
+def emit_abandoned_session_ends(agents, *, reason):
+    """Record every still-in-flight turn of ``agents`` (and their live
+    subagents) as interrupted before the host process abandons them.
+
+    A host that exits while a turn is still running (gateway shutdown after
+    the drain + interrupt-settle window expired; the turn is blocked in a
+    provider stream or a tool) never returns from ``run_conversation``, so
+    neither ``finalize_turn`` nor the ``run_agent`` backstop fires and
+    Blackbox is left with ``turn_api_calls`` rows and no ``turns`` row. This is
+    the gateway counterpart of cli ``_emit_interrupted_session_end``. Turns
+    that already emitted (finished, early-returned) are skipped by the
+    per-turn marker, so it is safe to call on every agent. Returns the number
+    of turns it emitted for. Never raises.
+    """
+    emitted = 0
+    seen = set()
+    stack = list(agents or ())
+    while stack:
+        agent = stack.pop()
+        if agent is None or id(agent) in seen:
+            continue
+        seen.add(id(agent))
+        try:
+            lock = getattr(agent, "_active_children_lock", None)
+            children = getattr(agent, "_active_children", None) or ()
+            if lock is not None:
+                with lock:
+                    children = list(children)
+            stack.extend(list(children))
+        except Exception:
+            pass
+        turn_id = getattr(agent, "_current_turn_id", None)
+        if turn_id and emit_unfinalized_session_end(
+            agent, turn_id, abandoned_reason=reason
+        ):
+            emitted += 1
+    return emitted
