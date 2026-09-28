@@ -13070,6 +13070,7 @@ import unicodedata  # noqa: E402
 
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
 from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
+from hermes_cli.kanban_review_schema import validate_v2_fields as _validate_review_v2  # noqa: E402
 
 _REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 # An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
@@ -13236,7 +13237,8 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
                                         or _review_na_reason_ok(head))):
         return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
-    return None
+    # review_coverage v2 (additive): records with no v2 key pass untouched.
+    return _validate_review_v2(coverage, surface="board")
 
 
 def _operator_caller_profiles() -> frozenset[str]:
