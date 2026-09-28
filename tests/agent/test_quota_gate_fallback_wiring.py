@@ -276,13 +276,27 @@ def test_turn_prologue_resets_snapshot_derived_gate_state():
     )
 
 
-def test_terminal_failure_consumes_the_soonest_reset_message():
-    """Lock the producer to its user-facing consumer in the live loop."""
-    from agent.conversation_loop import run_conversation
+def test_terminal_failure_consumes_the_soonest_reset_message(monkeypatch):
+    """Lock the producer to its user-facing consumer in the live loop: a turn
+    that dies with the chain exhausted carries the soonest-reset line in its
+    final response (FleetReview #123: was a getsource string check)."""
+    from tests.run_agent.test_pool_capacity_503_retry import (
+        PoolCapacity503, _make_agent, _response, _run,
+    )
 
-    source = inspect.getsource(run_conversation)
-    assert "append_quota_exhaustion_message" in source
-    assert "agent, _final_response" in source
+    monkeypatch.setattr(
+        "agent.quota_registry_gate.quota_exhausted_chain_message",
+        lambda agent: "SOONEST-RESET-MARKER in 2h",
+    )
+    agent = _make_agent([])
+    agent._fallback_chain = []
+    agent._capacity_retry_attempts = 0
+    err = PoolCapacity503()
+    result, _, call = _run(agent, [err, err, err, err, _response("never")], [])
+
+    assert call.call_count == 3  # api_max_retries, no fallback left
+    assert result.get("completed") is not True
+    assert "SOONEST-RESET-MARKER in 2h" in (result.get("final_response") or "")
 
 
 def test_non_quota_failures_do_not_prune(monkeypatch):
