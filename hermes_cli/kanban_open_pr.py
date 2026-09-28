@@ -401,12 +401,12 @@ _BARE_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
 _NO_PR = ("", -1)  # subject key that matches no PR: an ambiguous clause that names some other PR
 
 
-def _subject_keys(text: str, exclude=()) -> set:
+def _subject_keys(text: str) -> set:
     """PR keys a subject region names: ``(repo_lower, n)`` for qualified refs, ``(None, n)`` for bare ``#N``."""
     keys = {(r.repo.lower(), r.number) for r in extract_pr_refs(text)}
     qualified_numbers = {n for _, n in keys}
     keys |= {(None, int(n)) for n in _BARE_REF_RE.findall(text) if int(n) not in qualified_numbers}
-    return keys - set(exclude)
+    return keys
 
 
 def _bound_matches(text: Optional[str], pattern) -> list:
@@ -418,9 +418,9 @@ def _bound_matches(text: Optional[str], pattern) -> list:
         matches = list(pattern.finditer(clause))
         if len(matches) == 1:  # one token/decision: its subject precedes it, else follows it
             m = matches[0]
-            exclude = _subject_keys(m.group(1)) if m.groups() else ()  # a token's target is not its subject
-            subject = (_subject_keys(clause[:m.start()], exclude)
-                       or _subject_keys(clause[m.end():], exclude))
+            # The target sits inside the match, outside both regions. A ref naming the target elsewhere
+            # in the clause is still a named subject, never erased into "unattributed" (#1363 review).
+            subject = _subject_keys(clause[:m.start()]) or _subject_keys(clause[m.end():])
             out.append((m, subject))
             continue
         # Several in one clause: each owns ONLY the text between the previous match's end (past its

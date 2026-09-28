@@ -400,6 +400,19 @@ def test_decision_covers_only_the_pr_in_its_own_clause():
         decision_texts=["ANG-Ventures/r#5, ANG-Ventures/r#6 CLOSED: STALE"]) != []
 
 
+def test_token_naming_its_own_target_as_subject_does_not_cover_the_sole_closed_pr():
+    # FleetReview #1363 P1: "r#9 SUPERSEDED-BY r#9" names #9, not #5. Erasing the named #9 (it equals
+    # the target) made the token unattributed, so it bound the sole closed PR #5.
+    q = states(n5="CLOSED", n9="MERGED")
+    for text in ("ANG-Ventures/r#9 SUPERSEDED-BY ANG-Ventures/r#9", "#9 SUPERSEDED-BY #9",
+                 "SUPERSEDED-BY ANG-Ventures/r#9 (see ANG-Ventures/r#9)"):
+        with pytest.raises(op.ClosedUnmergedPrError):
+            op.enforce_not_closed_unmerged("t_x", text, recorded=[PR_URL], query_fn=q, sha_check=lambda r, s: False)
+    # The sole-PR fallback still holds for a genuinely unattributed token.
+    assert op.enforce_not_closed_unmerged("t_x", "SUPERSEDED-BY ANG-Ventures/r#9", recorded=[PR_URL],
+                                          query_fn=q, sha_check=lambda r, s: False) != []
+
+
 def test_one_superseder_token_does_not_cover_a_second_closed_pr():
     two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
     q = states(n5="CLOSED", n6="CLOSED", n9="MERGED", n10="MERGED")
