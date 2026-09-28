@@ -255,6 +255,24 @@ def test_notional_xai_predicate_matches_only_oauth():
     assert not is_notional_xai_provider(None)
 
 
+def test_kimi_code_proxy_prices_list_ceiling_without_confusing_other_cpa_models():
+    """Kimi Code is a flat-rate membership via CLIProxyAPI; the API list rate is only notional.
+    Moonshot's K3 table: $3/M input + $0.30/M cached + $15/M output, 5min write $3/M.
+    https://platform.kimi.ai/docs/pricing/chat (2026-09-27)."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000, cache_write_tokens=1_000_000)
+    for provider in ('kimi-code', 'kimi-cpa', 'cpa', 'moonshot'):
+        route = resolve_billing_route('kimi-k3', provider=provider)
+        assert (route.provider, route.model, route.billing_mode) == (
+            'moonshot', 'kimi-k3', 'official_docs_snapshot')
+        result = estimate_usage_cost('kimi-k3', usage, provider=provider)
+        assert result.status == 'estimated' and float(result.amount_usd) == 21.30
+        assert float(result.cost_cache_read_usd) == 0.30
+        assert float(result.cost_cache_write_usd) == 3.00
+    assert resolve_billing_route('gpt-6-sol', provider='cpa').provider != 'moonshot'
+    assert estimate_usage_cost('kimi-unknown', usage, provider='cpa').amount_usd is None
+
+
 def test_xai_oauth_route_resolves_to_xai_billing():
     """resolve_billing_route rewrites xai-oauth AND the metered xai/x-ai/xai-api
     provider keys to provider 'xai' with the docs-snapshot billing mode."""
