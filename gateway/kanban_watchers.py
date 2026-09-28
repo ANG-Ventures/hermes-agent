@@ -2833,7 +2833,10 @@ class GatewayKanbanWatchersMixin:
                 _n = len(getattr(res, "spawned", None) or []) if res is not None else 0
                 _tick_spawned += _n
                 if _spare is not None:
-                    _spare = max(0, _spare - max(0, _n - _quota))
+                    # Quota this board did not use (concurrency cap, demand
+                    # over-count) goes back to the pool for the boards after
+                    # it; spawns past its quota came out of the pool.
+                    _spare = max(0, _spare + _quota - _n)
                 _ready = _demand_by.get(slug, 0)
                 if not _demand:
                     # Gate paused/disabled: no split happened, so no board

@@ -102,3 +102,38 @@ async def test_second_board_gets_a_spawn_every_tick(boards, caplog):
              if "ready=" in r.getMessage() and "starved=" in r.getMessage()]
     assert any(l.startswith("kanban dispatcher [subs-ace]: ready=3 quota=2 spawned=2 starved=0")
                for l in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_quota_a_board_cannot_use_passes_to_the_next_board(boards, monkeypatch):
+    """Allowance 1; default gets the quota but its concurrency cap lets it
+    spawn nothing. The unused quota must reach subs-ace this same tick."""
+    monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self: (1, None))
+    inner = kb.dispatch_once
+
+    def capped(conn, *, board=None, spawn_paused=None, spawn_limit=None, **kw):
+        if board == "default":
+            boards.calls.append((board, spawn_limit, spawn_paused, 0))
+            return kb.DispatchResult()
+        return inner(conn, board=board, spawn_paused=spawn_paused,
+                     spawn_limit=spawn_limit, **kw)
+
+    monkeypatch.setattr(kb, "dispatch_once", capped)
+    b = runner()
+    task = asyncio.create_task(b._kanban_dispatcher_watcher())
+    try:
+        for _ in range(40):
+            _delay, resume = await boards.clock.paused(task)
+            resume.set_result(None)
+            if len(boards.calls) >= 2:
+                break
+    finally:
+        await cancel(task, b)
+    first_tick = dict((c[0], c) for c in boards.calls[:2])
+    # default was offered the quota first (tick 0 rotation) and spawned 0.
+    assert first_tick["default"][1] == 1, boards.calls
+    assert first_tick["default"][3] == 0, boards.calls
+    # subs-ace is not paused and spawns the unused quota.
+    assert first_tick["subs-ace"][2] is None, boards.calls
+    assert first_tick["subs-ace"][1] == 1, boards.calls
+    assert first_tick["subs-ace"][3] == 1, boards.calls
