@@ -14001,15 +14001,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if getattr(self, "_restart_requested", False)
             else "gateway_shutdown"
         )
-
-        def _call() -> int:
-            from agent.turn_finalizer import emit_abandoned_session_ends
-
-            return emit_abandoned_session_ends(agents, reason=reason)
+        # Passed by reference, never called here: the hook chain can price an
+        # unaccepted billed call (a model-metadata fetch), so it must run on
+        # the housekeeping pool, not the loop.
+        from agent.turn_finalizer import emit_abandoned_session_ends
 
         try:
             emitted = await asyncio.wait_for(
-                self._run_housekeeping_in_executor("finalize", _call),
+                self._run_housekeeping_in_executor(
+                    "finalize", emit_abandoned_session_ends, agents, reason
+                ),
                 timeout=self._FINALIZE_TIMEOUT_S,
             )
             if emitted:

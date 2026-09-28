@@ -1138,7 +1138,7 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
         return False
 
 
-def emit_abandoned_session_ends(agents, *, reason):
+def emit_abandoned_session_ends(agents, reason):
     """Record every still-in-flight turn of ``agents`` (and their live
     subagents) as interrupted before the host process abandons them.
 
