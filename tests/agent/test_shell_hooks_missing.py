@@ -21,6 +21,9 @@ def home(tmp_path, monkeypatch):
     root.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(root))
     shell_hooks.reset_for_tests()
+    # Pages run on a background thread in production (C5 #46); these tests
+    # assert delivery right after the verdict, so run the page inline.
+    monkeypatch.setattr(shell_hooks_missing, "_dispatch_page", lambda fn, name: fn())
     yield root
     shell_hooks.reset_for_tests()
 
@@ -30,6 +33,32 @@ def _spec(path, policy="fail_open_and_page"):
         event="pre_tool_call", command=f"{sys.executable} {path}",
         fail_closed=True, missing_hook_policy=policy,
     )
+
+
+def test_page_runs_off_the_verdict_path_on_a_non_daemon_thread(home, monkeypatch):
+    """C5 #46: a slow page must not delay the hook verdict, and must not be a daemon thread."""
+    import threading
+
+    monkeypatch.undo()  # drop the fixture's inline dispatch: exercise the real one
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    release = threading.Event()
+    seen = []
+
+    def slow_page(path, *args):
+        seen.append((path, threading.current_thread().daemon))
+        release.wait(10)
+        return True
+
+    monkeypatch.setattr(shell_hooks, "_page_missing_hook", slow_page)
+    path = home / "hooks" / "missing.py"
+    cb = shell_hooks._make_callback(_spec(path))
+    try:
+        assert cb(tool_name="terminal") is None  # verdict returned while the page blocks
+        assert not shell_hooks_missing.flush_pages(timeout=0.2)  # still in flight, logged
+    finally:
+        release.set()
+    assert shell_hooks_missing.flush_pages(timeout=5)
+    assert seen == [(str(path), False)]
 
 
 def test_missing_script_allows_logs_and_pages_once(home, monkeypatch, caplog):

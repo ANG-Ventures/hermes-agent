@@ -1104,6 +1104,10 @@ class TestFailSemanticsEndToEnd:
         assert result["action"] == "block"
         assert "infrastructure failure" in result["message"]
         assert "not a policy verdict" in result["message"]
+        # The page runs on a background thread (C5 #46): drain it while the
+        # _page_missing_hook stub is still installed, never the real notify.
+        from agent import shell_hooks_missing
+        assert shell_hooks_missing.flush_pages(timeout=10)
 
     def test_run_once_reflects_exit_2_block(self, tmp_path):
         """hermes hooks test must mirror production semantics."""
