@@ -9847,6 +9847,14 @@ def reclaim_task(
     held_status = row["status"]
     preserve_status = held_status in ("blocked", "triage", "scheduled")
     with write_txn(conn):
+        if termination.get("operator_override") and (
+            _dead_claimer_release_at(conn, task_id)[1] != "launch_bound"
+        ):
+            # The override was granted on "no worker evidence". Worker evidence
+            # (a ``spawned``/``heartbeat`` event) that landed after that check
+            # voids it: re-read it under the write lock (FleetReview
+            # 8a8140b0725a on #1404).
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -9857,9 +9865,13 @@ def reclaim_task(
             # Fence to the run the termination verdict inspected: a gateway
             # dispatcher run reusing the same lock (spawn in flight, pid not
             # stamped yet) must not be released by it (FleetReview ffdcb1bab162).
-            "AND current_run_id IS ?",
+            "AND current_run_id IS ? "
+            # ... and to the worker pid it inspected: a pid stamped after the
+            # verdict is a live worker the verdict never saw (FleetReview
+            # 8a8140b0725a on #1404).
+            "AND worker_pid IS ?",
             (held_status if preserve_status else retry_status, task_id, prev_lock,
-             row["current_run_id"]),
+             row["current_run_id"], row["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
@@ -17640,10 +17652,18 @@ def _host_process_mentions_task(task_id: str) -> bool:
     try:
         # This CLI and the shell(s) that launched it name the task too.
         me = psutil.Process()
-        own = {me.pid, *(p.pid for p in me.parents())}
+        parents = me.parents()
         # Windows has no uids: never skip on uid there.
         _geteuid = getattr(os, "geteuid", None)
         my_euid = _geteuid() if _geteuid is not None else None
+        # Skipping ancestors must not skip the worker itself: an unstamped
+        # orphan that runs ``reclaim --operator`` on its own card is our
+        # ancestor (or this very process). Its env grant is inherited by every
+        # descendant, so check it before excluding anyone (FleetReview
+        # 2362caff15e1 on #1404).
+        if _caller_inside_task_worker(task_id, parents, my_euid):
+            return True
+        own = {me.pid, *(p.pid for p in parents)}
         for proc in psutil.process_iter(["pid", "cmdline", "status", "uids"]):
             info = proc.info
             if info.get("pid") in own:
@@ -17664,6 +17684,55 @@ def _host_process_mentions_task(task_id: str) -> bool:
                 return True
     except Exception:
         return True
+    return False
+
+
+# Process title a dispatcher worker gives itself (hermes_cli/main.py
+# ``_set_process_title``). ``setproctitle`` overwrites argv AND the environ
+# block, so the title is the only place the task id survives in the process
+# table (FleetReview 1d1cb187c593 on #1404). The scan matches any argv
+# element containing the task id. Keep both sides in sync.
+KANBAN_WORKER_PROCTITLE = "hermes kanban-worker {task_id}"
+
+
+def _caller_inside_task_worker(task_id: str, parents, my_euid) -> bool:
+    """True if this process runs inside ``task_id``'s own worker tree.
+
+    The worker's env grant (``HERMES_KANBAN_TASK``) is inherited by every
+    subprocess it launches; delegated children have it scrubbed, so each
+    ancestor's argv (task id, or the worker title) and env are read too. An
+    unreadable env alone is not inconclusive: a same-uid process hides its
+    env only when it is non-dumpable (sshd, setgid), and a Python worker is
+    not. A same-uid ancestor with NEITHER readable counts as a match (fail
+    closed).
+    """
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return True
+    for parent in parents:
+        try:
+            cmdline = parent.cmdline()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            cmdline = None
+        if cmdline is not None and any(task_id in str(a) for a in cmdline):
+            return True
+        try:
+            env = parent.environ()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            if cmdline is not None:
+                continue
+            try:
+                euid = parent.uids().effective
+            except Exception:
+                return True
+            if my_euid is not None and euid != my_euid:
+                continue
+            return True
+        if (env.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+            return True
     return False
 
 def _worker_survived_termination(termination: dict) -> bool:
