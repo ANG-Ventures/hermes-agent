@@ -380,6 +380,7 @@ def build_keepalive_http_client(
     *,
     async_mode: bool = False,
     verify: Any = True,
+    event_hooks: Optional[dict] = None,
 ) -> Optional[Any]:
     """Build an httpx client for OpenAI SDK calls with env-only proxy policy.
 
@@ -431,6 +432,7 @@ def build_keepalive_http_client(
             proxy=proxy,
             mounts=mounts or None,
             verify=verify,
+            **({"event_hooks": event_hooks} if event_hooks else {}),
         )
     except Exception:
         return None

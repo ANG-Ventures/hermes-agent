@@ -5,16 +5,22 @@
 * Pinned lanes (claude-apx-N / claude-bpx-N): no relay in the path, so the
   harness mints ``h`` + 32 hex per HTTP attempt, sends it as
   ``x-hermes-route-id`` and records the SAME value (origin ``harness``).
-* Auxiliary calls to a fleet lane: one harness id per aux call, recorded on
-  the aux ledger row only when it was sent to the provider that served it.
+* Auxiliary calls to a fleet lane: one harness id per aux call. The ledger
+  row records what the WIRE saw on the served attempt (t_d5f71d8e): a pooled
+  relay's own ``x-pool-route-id`` wins; otherwise the harness id, only if the
+  served request actually carried it.
 * lane-src now rides bpr and the pinned lanes too (apr already had it).
 * Nothing is ever sent to a third-party provider.
 """
 from __future__ import annotations
 
 import sqlite3
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from agent import auxiliary_client as ac
@@ -117,6 +123,12 @@ def test_origin_is_the_id_grammar(value, origin):
 
 # ---- auxiliary calls ------------------------------------------------------
 
+def _wire(kwargs, relay_id=None):
+    """The httpx response the served attempt would produce for ``kwargs``."""
+    req = httpx.Request("POST", "http://127.0.0.1/v1/x", headers=dict(kwargs.get("extra_headers") or {}))
+    return httpx.Response(200, request=req, headers={"x-pool-route-id": relay_id} if relay_id else {})
+
+
 @pytest.mark.parametrize("provider,sent", [
     ("gemini-bridge", True), ("claude-bpr", True), ("claude-apr", True),
     ("claude-bpx-21", True), ("openrouter", False), ("nous", False), ("auto", False),
@@ -124,6 +136,8 @@ def test_origin_is_the_id_grammar(value, origin):
 def test_aux_build_kwargs_carries_id_only_to_fleet_lanes(provider, sent):
     with rh.aux_route_scope() as route:
         kw = ac._build_call_kwargs(provider, "m", [{"role": "user", "content": "x"}], task="compression")
+        assert route.id_for(provider) is None, "kwargs intent alone is not evidence the id was sent"
+        rh.note_aux_http_response(_wire(kw))
     got = (kw.get("extra_headers") or {}).get(rh.ROUTE_ID_HEADER)
     assert (got == route.route_id) is sent
     assert (route.id_for(provider) == route.route_id) is sent
@@ -141,7 +155,10 @@ def test_aux_id_is_recorded_only_for_the_provider_that_served(monkeypatch):
                         lambda response, task, route_info, route_id=None: got.append(route_id))
 
     def impl(**kw):
-        ac._build_call_kwargs("gemini-bridge", "m", kw["messages"], task=kw["task"])
+        first = ac._build_call_kwargs("gemini-bridge", "m", kw["messages"], task=kw["task"])
+        rh.note_aux_http_response(_wire(first))
+        if served != "gemini-bridge":  # fallback attempt: a fresh build, a third party serves
+            rh.note_aux_http_response(_wire(ac._build_call_kwargs(served, "m", kw["messages"], task=kw["task"])))
         kw["route_info"]["provider"] = served
         return SimpleNamespace(choices=[], usage=None)
 
@@ -149,6 +166,126 @@ def test_aux_id_is_recorded_only_for_the_provider_that_served(monkeypatch):
     for served in ("gemini-bridge", "openrouter"):
         ac.call_llm("title_generation", messages=[{"role": "user", "content": "x"}])
     assert got[0] and got[0].startswith("h") and got[1] is None
+
+
+# ---- t_d5f71d8e: the aux id is what the wire carried -----------------------
+
+RELAY_RID = "0123456789abcdef0123456789abcdef"
+
+
+class _FakeStream:
+    def __init__(self, response):
+        self.response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(())
+
+    def get_final_message(self):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")], stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1,
+                                  cache_read_input_tokens=0, cache_creation_input_tokens=0),
+            model="claude-haiku-4-5", id="msg_1", role="assistant", type="message",
+        )
+
+
+def _anthropic_adapter(relay_id=None):
+    """A real _AnthropicCompletionsAdapter over a fake SDK client that builds the
+    request from exactly the kwargs the adapter hands it (what reaches the wire)."""
+    calls = []
+
+    def stream(**kw):
+        calls.append(kw)
+        req = httpx.Request("POST", "http://127.0.0.1/v1/messages", headers=dict(kw.get("extra_headers") or {}))
+        return _FakeStream(httpx.Response(200, request=req,
+                                          headers={"x-pool-route-id": relay_id} if relay_id else {}))
+
+    client = SimpleNamespace(messages=SimpleNamespace(stream=stream, create=None))
+    return ac._AnthropicCompletionsAdapter(client, "claude-haiku-4-5", base_url="http://127.0.0.1:18801/anthropic"), calls
+
+
+@pytest.mark.parametrize("provider", ["claude-apr", "claude-apx-7"])
+def test_anthropic_aux_adapter_forwards_the_route_header(provider):
+    """P1 f9f24feb: the Messages adapter's kwargs allow-list dropped extra_headers."""
+    adapter, calls = _anthropic_adapter()
+    with rh.aux_route_scope() as route:
+        kw = ac._build_call_kwargs(provider, "claude-haiku-4-5", [{"role": "user", "content": "x"}], task="title_generation")
+        adapter.create(**kw)
+    assert (calls[0].get("extra_headers") or {}).get(rh.ROUTE_ID_HEADER) == route.route_id
+    assert route.id_for(provider) == route.route_id
+
+
+def test_aux_id_is_none_when_the_served_request_never_carried_it():
+    """An adapter that drops the header must not leave a ledger claim behind."""
+    with rh.aux_route_scope() as route:
+        kw = ac._build_call_kwargs("claude-apx-7", "m", [{"role": "user", "content": "x"}], task="vision")
+        rh.note_aux_http_response(_wire({}))  # the wire saw no route header
+    assert kw["extra_headers"][rh.ROUTE_ID_HEADER] == route.route_id
+    assert route.id_for("claude-apx-7") is None
+
+
+@pytest.mark.parametrize("provider", ["claude-apr", "claude-bpr"])
+def test_pooled_aux_call_records_the_relay_minted_id(provider):
+    """P1 a3c3697f: the pooled relay forwards ITS id to the box; the ledger must too."""
+    with rh.aux_route_scope() as route:
+        kw = ac._build_call_kwargs(provider, "m", [{"role": "user", "content": "x"}], task="title_generation")
+        rh.note_aux_http_response(_wire(kw, relay_id=RELAY_RID))
+    assert route.id_for(provider) == RELAY_RID
+    assert rh.route_id_origin(route.id_for(provider)) == "relay"
+
+
+def test_pooled_anthropic_aux_call_records_the_relay_id_end_to_end():
+    adapter, _ = _anthropic_adapter(relay_id=RELAY_RID)
+    with rh.aux_route_scope() as route:
+        kw = ac._build_call_kwargs("claude-apr", "claude-haiku-4-5", [{"role": "user", "content": "x"}], task="title_generation")
+        adapter.create(**kw)
+    assert route.id_for("claude-apr") == RELAY_RID
+
+
+class _PoolRelay(BaseHTTPRequestHandler):
+    seen = []
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        _PoolRelay.seen.append(self.headers.get(rh.ROUTE_ID_HEADER))
+        body = json.dumps({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("x-pool-route-id", RELAY_RID)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def test_openai_aux_client_records_the_relay_id_from_a_real_http_response(monkeypatch):
+    """claude-bpr is chat_completions: the aux OpenAI client (real httpx, real
+    loopback socket) reads the relay's x-pool-route-id off the served response."""
+    for var in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    server = HTTPServer(("127.0.0.1", 0), _PoolRelay)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = ac._create_openai_client(api_key="k", base_url=f"http://127.0.0.1:{server.server_port}/v1")
+        with rh.aux_route_scope() as route:
+            kw = ac._build_call_kwargs("claude-bpr", "m", [{"role": "user", "content": "x"}], task="title_generation")
+            client.chat.completions.create(**kw)
+    finally:
+        server.shutdown()
+    assert _PoolRelay.seen[-1] == route.route_id
+    assert route.id_for("claude-bpr") == RELAY_RID
 
 
 def test_aux_row_carries_route_id_into_blackbox(monkeypatch):
