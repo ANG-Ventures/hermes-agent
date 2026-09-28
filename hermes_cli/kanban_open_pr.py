@@ -277,6 +277,9 @@ class ClosedUnmergedPrError(ValueError):
                 f"PR) or 'SUPERSEDED-BY <sha>' (a commit on the default branch), in --result/--summary or "
                 f"--superseded-by <ref>."
             )
+            if len(self.closed) > 1:
+                parts.append("Each closed PR needs its own token: name it before the token, e.g. "
+                             "'owner/repo#5 SUPERSEDED-BY #9; owner/repo#6 RE-CARRIED-AS #10'.")
         if self.unverified:
             parts.append(
                 f"GitHub could not be read for {', '.join(self.unverified)}, so it is unknown whether the "
@@ -353,15 +356,6 @@ def closed_unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None, unverified
     return out
 
 
-def superseder_targets(*texts: Optional[str], superseded_by: Optional[str] = None) -> list:
-    """Targets of ``SUPERSEDED-BY <ref>`` / ``RE-CARRIED-AS <ref>`` tokens, plus every ref in --superseded-by."""
-    blob = "\n".join(t for t in texts if isinstance(t, str))
-    out = _SUPERSEDE_RE.findall(blob)
-    if isinstance(superseded_by, str):  # --superseded-by IS the token: every ref/sha in it is a target
-        out += _TARGET_RE.findall(superseded_by)
-    return list(dict.fromkeys(out))
-
-
 def _is_merged(query_fn, repo: str, number: int) -> bool:
     try:
         payload = query_fn(repo, number)
@@ -397,43 +391,109 @@ def names_superseder(closed, *texts: Optional[str], superseded_by: Optional[str]
     return not _unsuperseded(closed, *texts, superseded_by=superseded_by, query_fn=query_fn, sha_check=sha_check)
 
 
+# A token/decision is bound to the PR(s) named in its own clause (FleetReview #1352): clauses split on
+# ``;`` and newlines. A lone token owns its clause (the PR before it, else the PR after it); several
+# tokens in one clause each own only the text since the previous token's target, and if any of them
+# names no PR there the clause is ambiguous and binds nothing but a sole PR (#1363 review).
+# ``PR #5 CLOSED: REJECTED; PR #6 still needs work`` covers #5 only; ``r#5 SUPERSEDED-BY #9`` covers #5 only.
+_CLAUSE_SPLIT_RE = re.compile(r"[;\n]")
+_BARE_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+_NO_PR = ("", -1)  # subject key that matches no PR: an ambiguous clause that names some other PR
+
+
+def _subject_keys(text: str) -> set:
+    """PR keys a subject region names: ``(repo_lower, n)`` for qualified refs, ``(None, n)`` for bare ``#N``."""
+    keys = {(r.repo.lower(), r.number) for r in extract_pr_refs(text)}
+    qualified_numbers = {n for _, n in keys}
+    keys |= {(None, int(n)) for n in _BARE_REF_RE.findall(text) if int(n) not in qualified_numbers}
+    return keys
+
+
+def _bound_matches(text: Optional[str], pattern) -> list:
+    """``(match, subject_keys)`` for every ``pattern`` match in ``text``, bound to its own clause."""
+    if not isinstance(text, str):
+        return []
+    out = []
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        matches = list(pattern.finditer(clause))
+        if len(matches) == 1:  # one token/decision: its subject precedes it, else follows it
+            m = matches[0]
+            # The target sits inside the match, outside both regions. A ref naming the target elsewhere
+            # in the clause is still a named subject, never erased into "unattributed" (#1363 review).
+            subject = _subject_keys(clause[:m.start()]) or _subject_keys(clause[m.end():])
+            out.append((m, subject))
+            continue
+        # Several in one clause: each owns ONLY the text between the previous match's end (past its
+        # target) and its own start. If any of them names no PR there, the text between two matches
+        # could belong to either, so the whole clause is unattributed (covers a sole PR only).
+        regions = [clause[(matches[i - 1].end() if i else 0):m.start()] for i, m in enumerate(matches)]
+        subjects = [_subject_keys(r) for r in regions]
+        if not all(subjects):
+            # Ambiguous. If the clause names any PR besides the token targets, it is about THAT PR and
+            # binds nothing (never falls back to a sole PR); otherwise it is unattributed.
+            named = _subject_keys(" ".join(regions + [clause[matches[-1].end():]]))
+            subjects = [{_NO_PR} if named else set() for _ in matches]
+        out.extend(zip(matches, subjects))
+    return out
+
+
+def _binds(closed_ref, subject: set, *, sole: bool) -> bool:
+    """Is a token/decision whose clause names ``subject`` about ``closed_ref``? An unattributed one
+    (its clause names no PR) is only about the card's sole candidate."""
+    if not subject:
+        return sole
+    return (closed_ref.repo.lower(), closed_ref.number) in subject or (None, closed_ref.number) in subject
+
+
 def _unsuperseded(closed, *texts: Optional[str], superseded_by: Optional[str] = None,
                   query_fn: Optional[QueryFn] = None, sha_check: Optional[ShaCheckFn] = None) -> list:
-    """The closed refs NOT covered by a SUPERSEDED-BY/RE-CARRIED-AS token naming merged work."""
+    """The closed refs NOT covered by a SUPERSEDED-BY/RE-CARRIED-AS token naming merged work FOR THEM.
+
+    A token covers the closed PR named in its clause; an unattributed token (or ``--superseded-by``
+    without a token word) covers only a sole closed PR. One token never covers several closed PRs
+    unless its clause names each of them."""
     if query_fn is None:
         query_fn = _default_query()
     if sha_check is None and not os.environ.get("PYTEST_CURRENT_TEST"):
         sha_check = sha_on_default
-    targets = superseder_targets(*texts, superseded_by=superseded_by)[:MAX_LOOKUPS_PER_COMPLETION]
+    sole = len(closed) == 1
+    bound: list = []  # (target, subject)
+    for text in texts:
+        bound += [(m.group(1), subj) for m, subj in _bound_matches(text, _SUPERSEDE_RE)]
+    if isinstance(superseded_by, str):
+        tokens = _bound_matches(superseded_by, _SUPERSEDE_RE)
+        if tokens:
+            bound += [(m.group(1), subj) for m, subj in tokens]
+        else:  # --superseded-by IS the token: every ref/sha in it is an unattributed target
+            bound += [(t, set()) for t in _TARGET_RE.findall(superseded_by)]
+    bound = list(dict.fromkeys((t, frozenset(s)) for t, s in bound))[:MAX_LOOKUPS_PER_COMPLETION]
     return [c for c in closed
-            if not any(supersedes(c, t, query_fn=query_fn, sha_check=sha_check) for t in targets)]
+            if not any(_binds(c, subj, sole=sole)
+                       and supersedes(c, t, query_fn=query_fn, sha_check=sha_check) for t, subj in bound)]
 
 
 def _decision_covers(closed_ref, text: str, *, sole: bool) -> bool:
-    """Does one ``CLOSED: <reason>`` decision text explain THIS closed PR (FleetReview #1339)?
+    """Does one ``CLOSED: <reason>`` decision text explain THIS closed PR (FleetReview #1339/#1352)?
 
-    It must name the PR (``owner/repo#N``, its URL, or ``#N``), or the card must own exactly one PR and
-    the text names none. A decision naming PR A never covers PR B."""
-    if not isinstance(text, str) or not _DECISION_RE.search(text):
-        return False
-    named = extract_pr_refs(text)
-    key = (closed_ref.repo.lower(), closed_ref.number)
-    if any((r.repo.lower(), r.number) == key for r in named):
-        return True
-    bare = {int(n) for n in re.findall(r"(?<![\w/])#(\d+)\b", text)}
-    if closed_ref.number in bare and not any(r.number == closed_ref.number for r in named):
-        return True
-    return sole and not named and not bare
+    The decision's own clause must name the PR (``owner/repo#N``, its URL, or ``#N``), or the card must
+    own exactly one PR and that clause names none. A decision naming PR A never covers PR B, even when
+    B is mentioned elsewhere in the same comment."""
+    return any(_binds(closed_ref, subj, sole=sole) for _m, subj in _bound_matches(text, _DECISION_RE))
 
 
 def recorded_pr_refs(metadata) -> list:
-    """Every PR string a run's metadata persisted for the card: ``pr_url``/``pr_urls``/``pr``, PRs the
-    open-PR route recorded (``auto_routed_open_prs``) and survivor PR evidence (``survivor.refs[].pr`` /
-    ``survivor.claims[].pr``). The card's own PR evidence, independent of which key carried it."""
+    """Every PR string a run's metadata persisted for the card: ``pr_url``/``pr_urls``/``pr``, the card's
+    own PRs the open-PR route recorded (``own_prs``) and survivor PR evidence (``survivor.refs[].pr`` /
+    ``survivor.claims[].pr``). The card's own PR evidence, independent of which key carried it.
+
+    ``auto_routed_open_prs`` also lists PRs the handoff prose merely mentions, so a mention must never
+    gate this card (FleetReview #1352). It is read only for a LEGACY routed run (no ``own_prs`` key:
+    routed before the route wrote it), where it is the only persisted copy of a ``--survivor-pr``."""
     if not isinstance(metadata, dict):
         return []
     out: list = []
-    for key in ("pr_url", "pr_urls", "pr", "auto_routed_open_prs"):
+    legacy = "own_prs" not in metadata and "auto_routed_open_prs" in metadata
+    for key in ("pr_url", "pr_urls", "pr", "auto_routed_open_prs" if legacy else "own_prs"):
         out.extend(_iter_strings(metadata.get(key)))
     survivor = metadata.get("survivor")
     if isinstance(survivor, dict):

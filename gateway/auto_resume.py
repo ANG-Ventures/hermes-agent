@@ -446,7 +446,7 @@ def describe_inflight_tool_calls(messages: Iterable[dict[str, Any]]) -> str | No
         ):
             answered.add(call_id)
 
-    pending: list[str] = []
+    pending: list[tuple[str, bool]] = []
     for row in rows:
         calls = row.get("tool_calls")
         if isinstance(calls, str):
@@ -470,18 +470,26 @@ def describe_inflight_tool_calls(messages: Iterable[dict[str, Any]]) -> str | No
             args = " ".join(args.split())
             if len(args) > _INFLIGHT_ARGS_PREVIEW_CHARS:
                 args = args[:_INFLIGHT_ARGS_PREVIEW_CHARS] + "…"
+            read_only = name in _READ_ONLY_TOOLS
             kind = (
                 "read-only: re-issue it"
-                if name in _READ_ONLY_TOOLS
+                if read_only
                 else "may have taken effect: check its effect before re-running it"
             )
-            pending.append(f"{name}({args}) [{kind}]")
+            pending.append((f"{name}({args}) [{kind}]", read_only))
     if not pending:
         return None
-    extra = len(pending) - _INFLIGHT_MAX_CALLS
-    shown = "; ".join(pending[:_INFLIGHT_MAX_CALLS])
+    # The cap only drops READ-ONLY calls: the interrupted tail is stripped
+    # from the resumed history, so a mutating call left out of this note can
+    # never be checked or finished (C7 k89).
+    kept = [
+        text for i, (text, read_only) in enumerate(pending)
+        if i < _INFLIGHT_MAX_CALLS or not read_only
+    ]
+    extra = len(pending) - len(kept)
+    shown = "; ".join(kept)
     if extra > 0:
-        shown += f"; …and {extra} more"
+        shown += f"; …and {extra} more read-only"
     return (
         "Tool calls in flight when the gateway stopped (no result recorded): "
         f"{shown}."

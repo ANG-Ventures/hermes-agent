@@ -5390,6 +5390,14 @@ def run_conversation(
                             "output_tokens_unknown": output_unknown,
                             "latency_s": api_duration,
                             "composition": _call_composition,
+                            # Price at the route that SERVED this call. Without
+                            # these, Blackbox cost.py prices every call at the
+                            # turn's FINAL route, so a mid-turn model switch
+                            # misprices the turn vs its turn_api_calls rows
+                            # (t_0c5c3822).
+                            "provider": agent.provider or "",
+                            "model": agent.model,
+                            "base_url": agent.base_url or "",
                         })
                         _turn_call = _turn_calls[-1]
                     except Exception:

@@ -6,9 +6,11 @@ and thread participation tracking.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import re
+import os
 import threading
 import time
 from pathlib import Path
@@ -215,6 +217,15 @@ def strip_markdown(text: str) -> str:
 # ─── Coalescing off-loop JSON persistence ────────────────────────────────────
 
 
+_COALESCING_RETRY_DELAY_S = 1.0
+_WRITER_REGISTRY_LOCK = threading.Lock()
+_WRITER_PATH_LOCKS: "dict[str, threading.Lock]" = {}
+# Newest writer generation per path. Plain ints, not weak refs: a superseded
+# writer must stay superseded after its replacement is collected.
+_WRITER_PATH_OWNERS: "dict[str, int]" = {}
+_WRITER_GENERATION = itertools.count(1)
+
+
 class CoalescingJsonWriter:
     """Persist a JSON snapshot at most once per ``min_interval_s``, off the loop.
 
@@ -255,6 +266,14 @@ class CoalescingJsonWriter:
         # a late write from one owner could land in another owner's home and
         # resurrect foreign state on its next load (t_73d1988f).
         self._path = path_fn() if callable(path_fn) else path_fn
+        # Writers of one file share a lock, and only the newest writer may
+        # write in the background: a superseded owner's pending snapshot is
+        # older than its replacement's and must not land after it (C7 k96).
+        self._path_key = os.path.abspath(os.fspath(self._path))
+        with _WRITER_REGISTRY_LOCK:
+            self._write_lock = _WRITER_PATH_LOCKS.setdefault(self._path_key, threading.Lock())
+            self._generation = next(_WRITER_GENERATION)
+            _WRITER_PATH_OWNERS[self._path_key] = self._generation
         self._snapshot = snapshot
         self._interval = max(0.0, float(min_interval_s))
         self._name = name
@@ -263,7 +282,6 @@ class CoalescingJsonWriter:
         self._dirty = False
         self._stop = False
         self._thread: threading.Thread | None = None
-        self._write_lock = threading.Lock()
         self._busy = False  # writer thread has claimed a snapshot, not yet written
         self._last_write_mono: float | None = None
         self.writes = 0  # observable for tests / diagnostics
@@ -306,16 +324,29 @@ class CoalescingJsonWriter:
                 self._dirty = False
                 self._busy = True
             try:
-                self._write_now()
+                self._write_now(background=True)
             except Exception:
                 logger.debug("[%s] background persist failed", self._name, exc_info=True)
+                # Keep the snapshot pending and retry after a bounded delay;
+                # otherwise a transient failure loses it until the next
+                # schedule() (C7 k97).
+                with self._cv:
+                    if not self._stop:
+                        self._dirty = True
+                        self._last_write_mono = time.monotonic() + max(
+                            0.0, _COALESCING_RETRY_DELAY_S - self._interval
+                        )
             finally:
                 with self._cv:
                     self._busy = False
                     self._cv.notify_all()
 
-    def _write_now(self) -> None:
+    def _write_now(self, *, background: bool = False) -> None:
         with self._write_lock:
+            owner = _WRITER_PATH_OWNERS.get(self._path_key)
+            if background and owner is not None and owner != self._generation:
+                logger.debug("[%s] superseded writer skipped a stale write", self._name)
+                return
             payload = self._snapshot()
             atomic_json_write(self._path, payload, **self._dump_kwargs)
             self._last_write_mono = time.monotonic()

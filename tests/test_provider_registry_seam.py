@@ -653,3 +653,35 @@ def test_lazy_auto_extend_fires_through_facade_and_snapshot():
               "seamlazy" in models._KNOWN_PROVIDER_NAMES)
     """)
     assert "SNAP True Seam Lazy True FACADE True True" in out, out
+
+
+def test_one_shot_iterables_are_materialized_before_build():
+    """C5: ``build`` reads ``committed`` twice and may re-run after a swap, so a
+    generator must be materialized once or its names are silently dropped."""
+    name = "seam-oneshot"
+    delta = _delta(name)
+    delta["_KNOWN_PROVIDER_NAMES"] = (n for n in (name, f"{name}-alias"))
+    delta["committed"] = {"test-lane": (n for n in (name,))}
+    g = provider_seam.publish(delta)
+    assert all(_surfaces(g, name).values()), _surfaces(g, name)
+
+
+def test_seam_collision_does_not_latch_canonical_discovery(monkeypatch):
+    """C5: a concurrent-registration collision must leave discovery retryable."""
+    import types as _types
+    import providers as _providers
+
+    fake = _types.SimpleNamespace(
+        name="seam-latch-probe", auth_type="api_key",
+        display_name="Seam Latch Probe", description="probe",
+    )
+    monkeypatch.setattr(_providers, "list_providers", lambda: [fake])
+    monkeypatch.setattr(_providers, "discovery_in_progress", lambda: False, raising=False)
+
+    def _collide(delta):
+        raise provider_seam.SeamCollision("concurrent label")
+
+    monkeypatch.setattr(provider_seam, "publish", _collide)
+    monkeypatch.setattr(models, "_canonical_extended", False)
+    models._extend_canonical_from_plugins()
+    assert models._canonical_extended is False

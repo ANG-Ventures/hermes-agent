@@ -782,3 +782,159 @@ def test_notifier_drops_subscription_at_once_when_target_is_gone(tmp_path, monke
         assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# t_a4890a77: a transition made by the subscriber chat's OWN session posts the
+# passive line but must not wake that chat ("echo of my own close").
+# ---------------------------------------------------------------------------
+
+
+def _self_caused_completion(actor_session_id, delivery_mode="notify+wake"):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="closed from chat",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            chat_type="dm", delivery_mode=delivery_mode,
+        )
+        kb.complete_task(conn, tid, summary="merged and closed")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET actor_session_id=? "
+                "WHERE task_id=? AND kind='completed'",
+                (actor_session_id, tid),
+            )
+        return tid
+    finally:
+        conn.close()
+
+
+def _origins(monkeypatch, mapping):
+    import gateway.kanban_watchers as kw
+
+    monkeypatch.setattr(kw, "_session_origin", lambda sid: mapping.get(sid))
+
+
+def test_self_caused_completion_posts_line_but_does_not_wake(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "self-echo.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"sess-chat-1": ("telegram", "chat-1", "")})
+    tid = _self_caused_completion("sess-chat-1")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1 and tid in adapter.sent[0]["text"]
+    assert adapter.handled == [], "own-session close must not wake the same chat"
+    assert _unseen_terminal_events(tid) == [], "cursor still advances"
+
+
+def test_completion_from_another_chat_still_wakes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "other-chat.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"sess-other": ("telegram", "chat-2", "")})
+    tid = _self_caused_completion("sess-other")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in _wake_text(adapter)
+
+
+def test_self_caused_event_ids_matching_rules():
+    from gateway.kanban_watchers import self_caused_event_ids
+
+    def ev(i, actor):
+        return kb.Event(id=i, task_id="t", kind="completed", payload=None,
+                        created_at=0, actor_session_id=actor)
+
+    sub = {"platform": "Discord", "chat_id": "c1", "thread_id": ""}
+    origins = {
+        "same": ("discord", "c1", ""),
+        "thread": ("discord", "c1", "th9"),
+        "other": ("discord", "c2", ""),
+    }
+    events = [ev(1, "same"), ev(2, "thread"), ev(3, "other"), ev(4, None),
+              ev(5, "unknown"), ev(6, "c1")]
+    got = self_caused_event_ids(sub, events, origin_of=origins.get)
+    # 6: an actor id that merely equals chat_id is NOT proof of the same
+    # chat (FleetReview e014c9b89f4e); only a recorded origin match counts.
+    assert got == {1}
+
+
+def test_self_caused_event_on_wake_only_sub_still_wakes(tmp_path, monkeypatch):
+    """delivery_mode='wake' posts no passive line: the wake is the only
+    delivery, so a self-caused event must still wake (FleetReview d9c37a52d911)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-only.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"sess-chat-1": ("telegram", "chat-1", "")})
+    tid = _self_caused_completion("sess-chat-1", delivery_mode="wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert tid in _wake_text(adapter)
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_self_caused_event_on_apiserver_sub_still_wakes(tmp_path, monkeypatch):
+    """Non-push (api_server) subs: the self-post wake IS the delivery, so an
+    event whose actor is the subscriber session still wakes it
+    (FleetReview d9c37a52d911, delegated child completion case)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-self.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"origin-session": ("api_server", "origin-session", "")})
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="child work", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="api_server", chat_id="origin-session",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="child done")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET actor_session_id=? "
+                "WHERE task_id=? AND kind='completed'",
+                ("origin-session", tid),
+            )
+    finally:
+        conn.close()
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    class ApiServerLike:
+        supports_async_delivery = False
+
+        async def send(self, chat_id, text, metadata=None):
+            from gateway.platforms.base import SendResult
+
+            return SendResult(success=False, error="no send()")
+
+        async def handle_message(self, event):
+            raise AssertionError("api_server wake must not use handle_message")
+
+    runner = _make_runner(ApiServerLike())
+    runner.adapters = {Platform.API_SERVER: runner.adapters[Platform.TELEGRAM]}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(posts) == 1 and tid in posts[0]["text"]
+    assert posts[0]["session_id"] == "origin-session"
