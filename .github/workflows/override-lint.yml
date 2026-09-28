@@ -6,8 +6,7 @@
 #
 # Placeholders:
 #   88e090ebb883a1147d4086ea80ddf32637e8edd9   40-char commit SHA of the central repo
-#   ubuntu-latest      private ANG-Ventures repo: blacksmith-2vcpu-ubuntu-2404 (x64 only).
-#                   Public or Kyzcreig repo: ubuntu-latest.
+#   ubuntu-latest      public repo: GitHub-hosted. Private ANG-Ventures repos use the org's metered runner label.
 name: override-lint
 
 # path-filter-exempt: the check reads the PR BODY; `edited` must re-run it on a body-only change, and a path-filtered check would skip those.
