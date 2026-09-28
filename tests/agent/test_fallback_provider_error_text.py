@@ -140,3 +140,10 @@ def test_non_relay_banner_has_no_hop_or_sub(provider, message):
     assert "hop" not in rider and "sub" not in rider, rider
     if message:
         assert rider.endswith(f'said "{message}"'), rider
+
+
+def test_custom_prefixed_relay_keeps_relay_rider():
+    from agent.fallback_policy import _plain_provider
+    assert _plain_provider({"from_provider": "custom:claude-apr"}) is False
+    assert _plain_provider({"from_provider": "custom:claude-apx-7"}) is False
+    assert _plain_provider({"from_provider": "openrouter"}) is True

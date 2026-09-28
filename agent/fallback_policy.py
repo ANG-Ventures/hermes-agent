@@ -1065,6 +1065,8 @@ def _plain_provider(row: Mapping[str, Any]) -> bool:
     is noise (t_a8dc8b21). A row without ``from_provider``, or with any relay
     evidence (hop/seat), keeps the relay rider."""
     prov = str(row.get("from_provider") or "").strip().lower()
+    if prov.startswith("custom:"):  # relay lanes can be recorded as custom:claude-apr/-apx-N
+        prov = prov[len("custom:"):]
     if not prov or prov.startswith("claude-"):
         return False
     return not (row.get("hop") or row.get("seat"))
