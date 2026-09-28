@@ -1351,6 +1351,27 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
         pass
 
 
+def _finalize_signaled_kanban_worker(cli, signum) -> None:
+    """Make a SIGTERM'd kanban worker's in-flight turn durable before ``os._exit``.
+
+    ``os._exit`` skips every unwind path, including the ``on_session_end`` hook the
+    KeyboardInterrupt path emits. Blackbox writes a turn's ``turns`` row only from
+    ``on_session_end``, so each externally-killed worker left ``turn_api_calls``
+    rows with no parent turn (blackbox-orphan-guard, 2026-09-28: 45 of 50 orphans
+    were kanban workers, e.g. run 13600 "killed by signal 15"). Flush the session
+    store first (the transcript matters most under the SIGALRM deadman), then emit
+    the interrupted session end. Each step is best-effort and never raises.
+    """
+    try:
+        _flush_one_shot_session_store(cli)
+    except Exception:
+        pass
+    try:
+        _emit_interrupted_session_end(cli, reason=f"signal_{int(signum)}")
+    except Exception:
+        pass
+
+
 def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> None:
     agent = getattr(cli, "agent", None)
     session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
@@ -22266,10 +22287,7 @@ def main(
             # flush + finalize the session store here or the worker's turn
             # (and its usage deltas) never become durable (#88583 / #50881
             # class). Best-effort under the SIGALRM deadman above.
-            try:
-                _flush_one_shot_session_store(cli)
-            except Exception:
-                pass
+            _finalize_signaled_kanban_worker(cli, signum)
             try:
                 import logging as _lg
                 _lg.shutdown()
