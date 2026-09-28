@@ -10012,6 +10012,14 @@ def reclaim_task(
     held_status = row["status"]
     preserve_status = held_status in ("blocked", "triage", "scheduled")
     with write_txn(conn):
+        if termination.get("operator_override") and (
+            _dead_claimer_release_at(conn, task_id)[1] != "launch_bound"
+        ):
+            # The override was granted on "no worker evidence". Worker evidence
+            # (a ``spawned``/``heartbeat`` event) that landed after that check
+            # voids it: re-read it under the write lock (FleetReview
+            # 8a8140b0725a on #1404).
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -10022,9 +10030,13 @@ def reclaim_task(
             # Fence to the run the termination verdict inspected: a gateway
             # dispatcher run reusing the same lock (spawn in flight, pid not
             # stamped yet) must not be released by it (FleetReview ffdcb1bab162).
-            "AND current_run_id IS ?",
+            "AND current_run_id IS ? "
+            # ... and to the worker pid it inspected: a pid stamped after the
+            # verdict is a live worker the verdict never saw (FleetReview
+            # 8a8140b0725a on #1404).
+            "AND worker_pid IS ?",
             (held_status if preserve_status else retry_status, task_id, prev_lock,
-             row["current_run_id"]),
+             row["current_run_id"], row["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
@@ -10306,9 +10318,10 @@ class EmptyDraftOverrideError(ValueError):
 
 
 def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list]:
-    """``["o/r#N @ <merge sha>", ...]`` when EVERY fleet PR the handoff owns
-    (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST ``merged=true``;
-    None when there is none, any is not merged, or a lookup cannot tell.
+    """``[("o/r#N @ <merge sha>", "<pr head sha>"), ...]`` when EVERY fleet PR
+    the handoff owns (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST
+    ``merged=true``; None when there is none, any is not merged, or a lookup
+    cannot tell. The head sha ("" when unknown) ties the PR to a checkout.
     """
     from hermes_cli import kanban_open_pr as _open_pr
 
@@ -10327,7 +10340,7 @@ def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list
         if not isinstance(state, dict) or str(state.get("state") or "").upper() != "MERGED":
             return None
         sha = str(state.get("merge_commit_sha") or "")[:12] or "?"
-        merged.append(f"{ref.repo}#{ref.number} @ {sha}")
+        merged.append((f"{ref.repo}#{ref.number} @ {sha}", str(state.get("head_sha") or "")))
     return merged
 
 
@@ -10345,7 +10358,10 @@ def _enforce_branch_base(
     stale post-merge workspace branch is measured against a trunk that holds
     the squash of that very PR, so the "foreign" commit and the conflict are
     the merge itself. Recorded as ``base_guard_survivor_merged``. An OPEN PR
-    keeps the guard -- that is the branch that will not land.
+    keeps the guard -- that is the branch that will not land. The merged PR
+    must be TIED to each failing checkout (FleetReview #1394): its head sha
+    must contain the checkout's HEAD, else naming any unrelated merged PR
+    would excuse foreign commits and conflicts.
     """
     from hermes_cli import kanban_branch_base as _bb
 
@@ -10361,16 +10377,23 @@ def _enforce_branch_base(
     except _bb.StaleBaseError as err:
         failures = {r.repo: r.failures for r in err.reports}
         merged = _merged_survivor_prs(metadata, survivor_pr)
+        untied: list = []
         if merged:
-            with write_txn(conn):
-                _append_event(conn, task.id, "base_guard_survivor_merged", {
-                    "survivor_merged": merged, "failures": failures,
-                })
-            return
+            heads = [head for _, head in merged if head]
+            untied = [r.repo for r in err.reports
+                      if not _bb.head_landed_in(Path(r.repo), r.head, heads)]
+            if not untied:
+                with write_txn(conn):
+                    _append_event(conn, task.id, "base_guard_survivor_merged", {
+                        "survivor_merged": [label for label, _ in merged],
+                        "failures": failures,
+                    })
+                return
+        payload = {"failures": failures}
+        if untied:
+            payload["survivor_merged_untied"] = untied
         with write_txn(conn):
-            _append_event(conn, task.id, "completion_blocked_stale_base", {
-                "failures": failures,
-            })
+            _append_event(conn, task.id, "completion_blocked_stale_base", payload)
         raise
     except Exception as exc:  # the guard must never break a handoff by crashing
         _log.warning("branch-base guard skipped for %s: %s", task.id, exc)
@@ -17304,6 +17327,13 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    spawn_capped: Optional[str] = None
+    """Non-None when a concurrency cap or the per-tick spawn limit left this
+    tick with a spawn budget of ZERO (``kanban.max_spawn`` / ``--max``,
+    ``kanban.max_in_progress`` host cap, or the load-gate ``spawn_limit``).
+    The string names the cap and the numbers that tripped it, so a manual
+    ``hermes kanban dispatch`` that spawns nothing says WHY instead of
+    printing a bare ``Spawned: 0`` (t_f78d1938)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -17809,10 +17839,18 @@ def _host_process_mentions_task(task_id: str) -> bool:
     try:
         # This CLI and the shell(s) that launched it name the task too.
         me = psutil.Process()
-        own = {me.pid, *(p.pid for p in me.parents())}
+        parents = me.parents()
         # Windows has no uids: never skip on uid there.
         _geteuid = getattr(os, "geteuid", None)
         my_euid = _geteuid() if _geteuid is not None else None
+        # Skipping ancestors must not skip the worker itself: an unstamped
+        # orphan that runs ``reclaim --operator`` on its own card is our
+        # ancestor (or this very process). Its env grant is inherited by every
+        # descendant, so check it before excluding anyone (FleetReview
+        # 2362caff15e1 on #1404).
+        if _caller_inside_task_worker(task_id, parents):
+            return True
+        own = {me.pid, *(p.pid for p in parents)}
         for proc in psutil.process_iter(["pid", "cmdline", "status", "uids"]):
             info = proc.info
             if info.get("pid") in own:
@@ -17833,6 +17871,50 @@ def _host_process_mentions_task(task_id: str) -> bool:
                 return True
     except Exception:
         return True
+    return False
+
+
+# Process title a dispatcher worker gives itself (hermes_cli/main.py
+# ``_set_process_title``). ``setproctitle`` overwrites argv AND the environ
+# block, so the title is the only place the task id survives in the process
+# table (FleetReview 1d1cb187c593 on #1404). Keep both sides in sync.
+KANBAN_WORKER_PROCTITLE = "hermes kanban-worker {task_id}"
+
+
+def _proc_is_titled_worker(cmdline, task_id: str) -> bool:
+    """True if ``cmdline`` is exactly ``task_id``'s rewritten worker title."""
+    joined = " ".join(str(a) for a in (cmdline or ()) if a).strip()
+    return joined == KANBAN_WORKER_PROCTITLE.format(task_id=task_id)
+
+
+def _caller_inside_task_worker(task_id: str, parents) -> bool:
+    """True if this process runs inside ``task_id``'s own worker tree.
+
+    The worker's env grant (``HERMES_KANBAN_TASK``) is inherited by every
+    subprocess it launches; delegated children have it scrubbed, so each
+    ancestor's env grant and process title are read too. A bare task id in
+    an ancestor's argv is NOT a match: the operator's own shell
+    (``sh -c '... reclaim t_x'``) names the task (FleetReview c18fd1d3b7f7
+    on #1442). An ancestor whose title or env cannot be read is skipped, as
+    every ancestor was before: a dispatcher worker is a same-uid Python
+    process whose argv and env are readable, while CI runners and containers
+    do have unreadable ancestors, and failing closed on them refused every
+    override there.
+    """
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return True
+    for parent in parents:
+        try:
+            if _proc_is_titled_worker(parent.cmdline(), task_id):
+                return True
+        except (psutil.Error, OSError):
+            pass
+        try:
+            env = parent.environ()
+        except (psutil.Error, OSError):
+            continue
+        if (env.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+            return True
     return False
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -20353,6 +20435,44 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def count_spawnable_demand(
+    conn: sqlite3.Connection,
+    *,
+    default_assignee: Optional[str] = None,
+    include_review: bool = False,
+) -> int:
+    """Upper bound on the spawns this board could use this tick.
+
+    Ready (and, with ``include_review``, review) unclaimed tasks whose
+    assignee is a real Hermes profile, plus unassigned ready tasks when
+    ``default_assignee`` is set. Used by the gateway dispatcher to split one
+    per-tick load-gate allowance across boards (t_f78d1938). Deliberately a
+    superset of what :func:`dispatch_once` will actually spawn: an
+    under-count here would give a board a zero quota.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None
+    statuses = ["ready"] + (["review"] if include_review else [])
+    rows = conn.execute(
+        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+        f"WHERE status IN ({','.join('?' * len(statuses))}) "
+        "    AND claim_lock IS NULL GROUP BY assignee, status",
+        tuple(statuses),
+    ).fetchall()
+    total = 0
+    for row in rows:
+        who = row["assignee"]
+        if not who:
+            if row["status"] == "ready" and default_assignee:
+                total += int(row["n"])
+            continue
+        if profile_exists is None or profile_exists(who):
+            total += int(row["n"])
+    return total
+
+
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -21339,6 +21459,9 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.spawn_capped = (
+                f"max_spawn={max_spawn} reached: {running_count} running on this board"
+            )
             return result
         spawn_budget = max_spawn - running_count
 
@@ -21355,6 +21478,10 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_capped = (
+                f"max_in_progress={max_in_progress} reached: {total_running} "
+                f"running host-wide ({running_count} on this board)"
+            )
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -21368,6 +21495,10 @@ def _dispatch_once_locked(
         _limit = max(0, int(spawn_limit))
         if spawn_budget is None or spawn_budget > _limit:
             spawn_budget = _limit
+        if _limit == 0:
+            result.spawn_capped = (
+                "load gate: this tick's spawn allowance for this board is 0"
+            )
 
     # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
     # can't see the host's actual memory state (other tenants, bloated

@@ -112,17 +112,22 @@ def test_crash_mid_staging_write_leaves_no_file_at_the_final_path(tmp_path, monk
             return self
         def __exit__(self, *exc):
             self._fh.close()
+        def fileno(self):
+            return self._fh.fileno()
         def write(self, content):
             self._fh.write(content[: len(content) // 2])
             self._fh.flush()
             raise OSError("process died mid-write")
 
+    real_fdopen = os.fdopen
+    # the write may go through open() or os.fdopen() (mkstemp temp file); make both die mid-write
     monkeypatch.setattr(builtins, "open", lambda path, *a, **k: _Dies(real_open(path, *a, **k)))
+    monkeypatch.setattr(os, "fdopen", lambda fd, *a, **k: _Dies(real_fdopen(fd, *a, **k)))
     try:
         CaptureRouter._default_write(str(target), "---\nclass: world_entity\n---\n- fact\n")
     except OSError:
         pass
-    monkeypatch.setattr(builtins, "open", real_open)
+    monkeypatch.undo()
     assert not target.exists()
     assert os.listdir(target.parent) == []
 

@@ -3964,7 +3964,7 @@ def try_activate_fallback(
 
     if refuse_runtime_failover(agent, fb_provider, fb_model, reason):
         logger.warning(
-            "Fallback skip: %s/%s refused — kanban card pins this worker's provider",
+            "Fallback skip: %s/%s refused — kanban card pins this worker's provider/model",
             fb_provider, fb_model,
         )
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)

@@ -239,3 +239,51 @@ def test_dying_process_tick_does_not_skip_normally_due_job(env):
     row = get_job(job["id"])
     assert row.get("next_run_at") == past
     assert row.get("last_status") in (None, "")
+
+
+def _capture_deliveries(monkeypatch):
+    import cron.scheduler as sched
+    sent = []
+
+    def fake_deliver(job, content, **kw):
+        sent.append((content, kw.get("success")))
+        return None
+
+    monkeypatch.setattr(sched, "_deliver_result", fake_deliver)
+    return sent
+
+
+def test_drain_killed_script_is_not_paged(env, monkeypatch):
+    """t_e0aa9875: a restart kill is not a failure -> no 'Cronjob Failed' page.
+    The run is still recorded and the one re-fire is still requested."""
+    from cron.jobs import get_job, RESTART_REQUEUE_KEY
+
+    sent = _capture_deliveries(monkeypatch)
+    job = _make_job()
+    _run_and_kill_by_drain(job, env / "scripts" / "first-ran")
+    row = get_job(job["id"])
+    assert sent == [], f"restart kill was paged: {sent!r}"
+    assert row["last_status"] == "error"
+    assert row.get(RESTART_REQUEUE_KEY), "re-fire must still be requested"
+
+
+def test_sigterm_outside_shutdown_still_pages(env, monkeypatch):
+    """Other direction: a kill while NOT draining is a real failure and pages."""
+    import cron.scheduler as sched
+
+    sent = _capture_deliveries(monkeypatch)
+    job = _make_job()
+    t = threading.Thread(target=sched.run_one_job, args=(job,), daemon=True)
+    t.start()
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        with sched._script_procs_lock:
+            if sched._active_script_procs:
+                break
+        time.sleep(0.05)
+    sched.terminate_running_scripts("external kill")
+    t.join(20)
+    assert len(sent) == 1, sent
+    content, success = sent[0]
+    assert success is False
+    assert "-15" in content or "exited with code" in content
