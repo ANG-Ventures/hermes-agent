@@ -721,12 +721,12 @@ def _kimi_jwt_claims(token):
 def _kimi_oauth_token_provider_for(api_key):
     """Return a per-request token provider when *api_key* is the local kimi-oauth login.
 
-    ``client_id`` is the public Kimi CLI app id, so it only says the JWT is
-    a Kimi membership token, not that it came from this host's login. Swap
-    only when the stored ``providers.kimi-oauth`` login is the same token or
-    the same account (``user_id``/``sub``); otherwise the caller's token
-    stays on the static path and is never replaced by another account's.
-    ``sk-kimi-`` API keys, foreign JWTs and a missing login return None.
+    ``client_id`` is the public Kimi CLI app id and the JWT claims are not
+    verified here, so neither proves the token came from this host's login.
+    Swap only when *api_key* is the stored access token or one this login
+    was issued earlier (hash history in auth.json); any other token, forged
+    claims included, stays on the static path. ``sk-kimi-`` keys, foreign
+    JWTs and a missing login return None.
     """
     claims = _kimi_jwt_claims(api_key)
     if claims is None:
@@ -735,24 +735,15 @@ def _kimi_oauth_token_provider_for(api_key):
         from hermes_cli.auth import (
             KIMI_OAUTH_CLIENT_ID,
             build_kimi_oauth_token_provider,
-            get_provider_auth_state,
+            kimi_oauth_login_issued_token,
         )
 
         if claims.get("client_id") != KIMI_OAUTH_CLIENT_ID:
             return None
-        stored_token = (get_provider_auth_state("kimi-oauth") or {}).get("access_token")
+        if not kimi_oauth_login_issued_token(api_key):
+            return None
     except Exception:  # noqa: BLE001 — no readable local login
         return None
-    if not stored_token:
-        return None
-    if stored_token != api_key:
-        stored_claims = _kimi_jwt_claims(stored_token) or {}
-        same_account = any(
-            claims.get(key) and claims.get(key) == stored_claims.get(key)
-            for key in ("user_id", "sub")
-        )
-        if not same_account:
-            return None
     return build_kimi_oauth_token_provider()
 
 

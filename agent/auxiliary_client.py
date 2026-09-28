@@ -7657,18 +7657,26 @@ def resolve_provider_client(
         # kimi-oauth (Kimi Code membership): the managed login's rotating
         # JWT is served per request by the auth.json token provider, on the
         # Anthropic Messages wire at api.kimi.com/coding.
-        try:
-            from agent.anthropic_adapter import build_anthropic_client
-            from hermes_cli.auth import resolve_kimi_oauth_runtime_credentials
+        from agent.anthropic_adapter import build_anthropic_client
+        from hermes_cli.auth import (
+            KIMI_OAUTH_INFERENCE_BASE_URL,
+            resolve_kimi_oauth_runtime_credentials,
+        )
 
-            creds = resolve_kimi_oauth_runtime_credentials(as_token_provider=True)
-        except Exception as exc:
-            logger.debug("resolve_provider_client: kimi-oauth unavailable: %s", exc)
-            return None, None
-        base_url = (explicit_base_url or creds["base_url"]).strip().rstrip("/")
-        # An explicit key goes through build_anthropic_client too: it is
-        # swapped for the token provider only when it is this login's JWT.
-        api_key = explicit_api_key or creds["api_key"]
+        if explicit_api_key:
+            # No stored login needed. build_anthropic_client swaps the key
+            # for the token provider only when this login issued it.
+            api_key = explicit_api_key
+            base_url = explicit_base_url or KIMI_OAUTH_INFERENCE_BASE_URL
+        else:
+            try:
+                creds = resolve_kimi_oauth_runtime_credentials(as_token_provider=True)
+            except Exception as exc:
+                logger.debug("resolve_provider_client: kimi-oauth unavailable: %s", exc)
+                return None, None
+            api_key = creds["api_key"]
+            base_url = explicit_base_url or creds["base_url"]
+        base_url = base_url.strip().rstrip("/")
         default_model = _get_aux_model_for_provider(provider)
         final_model = _normalize_resolved_model(model or default_model, provider)
         if not final_model:

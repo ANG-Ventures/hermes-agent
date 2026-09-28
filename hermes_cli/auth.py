@@ -9269,12 +9269,41 @@ def _kimi_access_token_expiry_unix(payload: Dict[str, Any], now: float) -> float
     return now + 900.0
 
 
+# Hashes of access tokens this login was issued before the current one.
+# build_anthropic_client swaps a supplied Kimi JWT for the managed token
+# provider only when it is one of these (or the current token); JWT claims
+# are unsigned from our side and can't prove ownership. 96 x 15 min = 24 h.
+KIMI_OAUTH_ISSUED_HISTORY_MAX = 96
+
+
+def kimi_oauth_token_sha256(token: Any) -> Optional[str]:
+    if not isinstance(token, str) or not token.strip():
+        return None
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def kimi_oauth_login_issued_token(token: Any) -> bool:
+    """True when *token* is (or was) an access token of the stored kimi-oauth login."""
+    digest = kimi_oauth_token_sha256(token)
+    if digest is None:
+        return False
+    state = get_provider_auth_state("kimi-oauth") or {}
+    if kimi_oauth_token_sha256(state.get("access_token")) == digest:
+        return True
+    return digest in (state.get("issued_access_sha256") or [])
+
+
 def _kimi_state_from_token_payload(
     payload: Dict[str, Any], *, prior: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = time.time()
     expires_at_unix = _kimi_access_token_expiry_unix(payload, now)
     state = dict(prior or {})
+    history = [h for h in (state.get("issued_access_sha256") or []) if isinstance(h, str)]
+    prior_digest = kimi_oauth_token_sha256(state.get("access_token"))
+    if prior_digest and prior_digest not in history:
+        history.append(prior_digest)
+    state["issued_access_sha256"] = history[-KIMI_OAUTH_ISSUED_HISTORY_MAX:]
     state.update({
         "provider": "kimi-oauth",
         "auth_mode": "oauth_device_code",

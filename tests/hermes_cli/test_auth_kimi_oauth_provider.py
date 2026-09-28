@@ -406,9 +406,35 @@ def test_foreign_account_kimi_jwt_is_not_swapped_for_the_stored_login(home):
     assert _kimi_oauth_token_provider_for(foreign) is None
     client = build_anthropic_client(foreign, KIMI_OAUTH_INFERENCE_BASE_URL)
     assert client.auth_token != "entra-id-bearer-via-http-hook"
-    # Same account, older rotation: still the managed login → swapped.
-    assert _kimi_oauth_token_provider_for(_account_jwt(exp - 60, user_id="acct-local", tag="old")) is not None
     assert _kimi_oauth_token_provider_for(state["access_token"]) is not None
+
+
+def test_forged_jwt_with_matching_account_claims_is_not_swapped(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    exp = int(time.time()) + 900
+    state = _logged_in_state(access_ttl=800)
+    state["access_token"] = _account_jwt(exp, user_id="acct-local", tag="mine")
+    _write_store(home, state)
+    # Unsigned payload copying the public client_id and the local user_id/sub.
+    forged = _account_jwt(exp, user_id="acct-local", tag="forged")
+    assert _kimi_oauth_token_provider_for(forged) is None
+
+
+def test_earlier_rotation_of_the_stored_login_is_still_swapped(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    old = _logged_in_state(access_ttl=30, refresh="r-1", access_tag="gen1")
+    _write_store(home, old)
+    monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
+        (200, {"access_token": _jwt(int(time.time()) + 900, tag="gen2"),
+               "refresh_token": "r-2", "expires_in": 900}),
+    ]))
+    auth_mod.refresh_kimi_oauth_state()
+    stored = get_provider_auth_state("kimi-oauth")
+    assert stored["access_token"] != old["access_token"]
+    assert _kimi_oauth_token_provider_for(old["access_token"]) is not None
+    assert old["access_token"] not in json.dumps(stored["issued_access_sha256"])
 
 
 def test_kimi_jwt_without_a_stored_login_keeps_the_static_path(home):
@@ -436,3 +462,15 @@ def test_auxiliary_resolver_without_kimi_login_returns_none(home):
 
     (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
     assert resolve_provider_client("kimi-oauth", "k3") == (None, None)
+
+
+def test_auxiliary_resolver_uses_explicit_key_without_a_stored_login(home):
+    from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
+
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    key = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    client, model = resolve_provider_client("kimi-oauth", "k3", explicit_api_key=key)
+    assert isinstance(client, AnthropicAuxiliaryClient)
+    assert model == "k3"
+    assert client._real_client.auth_token != "entra-id-bearer-via-http-hook"
+    assert client.base_url.rstrip("/") == KIMI_OAUTH_INFERENCE_BASE_URL
