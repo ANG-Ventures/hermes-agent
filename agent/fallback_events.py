@@ -121,7 +121,9 @@ def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
             return cls
     if exc_name in _CONN_EXC_NAMES:
         return "conn"
-    if http_status == 401:
+    # Last resort, same as the runtime classifier (error_classifier routes an
+    # otherwise-unrecognized 403 to FailoverReason.auth) (C7 k80).
+    if http_status in (401, 403):
         return "auth"
     return "unclassified"
 
@@ -222,7 +224,9 @@ def _scrub(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        # Persisted error preview: a non-navigation sink, so URL query credentials
+        # and user:pass@ userinfo are redacted too (Backfill C3).
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:  # noqa: BLE001
         return ""
 
@@ -252,7 +256,9 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "headers": {k: v for k, v in headers.items()
                         if k in ("x-relay-error-class", "x-relay-error-hop",
                                  "x-relay-seat", "x-pool-unreachable",
-                                 "x-pool-route-id", "retry-after")},
+                                 "x-pool-route-id", "retry-after",
+                                 "x-ratelimit-limit", "x-ratelimit-remaining",
+                                 "x-ratelimit-reset")},
             "body": body if isinstance(body, dict) else None,
             "exc": type(api_error).__name__,
         }
@@ -291,6 +297,60 @@ def relay_hop_seat(headers: Any, body: Any) -> Tuple[Optional[str], Optional[str
     except Exception:  # noqa: BLE001
         return None, None
     return hop, seat
+
+
+PROVIDER_MESSAGE_MAX = 120
+
+
+def _error_obj(body: Any) -> Dict[str, Any]:
+    """The vendor error object: OpenAI SDK passes the inner ``error`` dict as
+    ``body``; other SDKs pass the whole ``{"error": {...}}`` envelope."""
+    if not isinstance(body, dict):
+        return {}
+    inner = body.get("error")
+    return inner if isinstance(inner, dict) else body
+
+
+def provider_error_detail(provider: Any, body: Any, headers: Any = None,
+                          http_status: Optional[int] = None) -> Tuple[Optional[str], Optional[str]]:
+    """``(message, scope)`` a non-relay provider stated for a failed call.
+
+    ``message`` is the vendor's own ``error.message``, scrubbed and cut to
+    :data:`PROVIDER_MESSAGE_MAX` chars. ``scope`` says WHOSE limit tripped on
+    an OpenRouter 429 (t_a8dc8b21): ``byok`` (the upstream provider's own
+    key, "custom key used"), ``upstream`` (``metadata.provider_name`` /
+    ``provider_code`` set), ``platform`` (OpenRouter's own limiter:
+    ``metadata.error_type=rate_limit_exceeded`` or X-RateLimit headers), or
+    ``credits`` for an OpenRouter 402. None when the body says nothing.
+    Never raises.
+    """
+    try:
+        err = _error_obj(body)
+        raw = err.get("message")
+        msg = None
+        if isinstance(raw, str) and raw.strip():
+            msg = _scrub(" ".join(raw.split()))
+            if len(msg) > PROVIDER_MESSAGE_MAX:
+                msg = msg[:PROVIDER_MESSAGE_MAX - 1].rstrip() + "…"
+            msg = msg or None
+        scope = None
+        if str(provider or "").strip().lower() == "openrouter":
+            meta = err.get("metadata") if isinstance(err.get("metadata"), dict) else {}
+            h = _lower_headers(headers)
+            low = raw.lower() if isinstance(raw, str) else ""
+            if http_status == 402:
+                scope = "credits"
+            elif http_status == 429 or "rate limit" in low:
+                if "custom key" in low or meta.get("is_byok") is True:
+                    scope = "byok"
+                elif meta.get("provider_name") or meta.get("provider_code"):
+                    scope = "upstream"
+                elif (meta.get("error_type") == "rate_limit_exceeded"
+                      or any(k.startswith("x-ratelimit-") for k in h)):
+                    scope = "platform"
+        return msg, scope
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
 def clear_pending(agent: Any) -> None:
@@ -408,6 +468,14 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
     if kind == "failover":
         # §4.8: a pooled relay states hop/seat in its error-class-v2 headers
         # (or SSE error fields). Recorded values (``extra``) win.
+        # t_a8dc8b21: a non-relay provider's own error text and, for
+        # OpenRouter, whose limit tripped. In memory for the notice only
+        # (not ledger columns); the rendered notice_text carries it.
+        p_msg, p_scope = provider_error_detail(from_provider, body, headers, status)
+        if p_msg and not row.get("provider_message"):
+            row["provider_message"] = p_msg
+        if p_scope and not row.get("provider_scope"):
+            row["provider_scope"] = p_scope
         r_hop, r_seat = relay_hop_seat(headers, body)
         if r_hop and not row.get("hop"):
             row["hop"] = r_hop

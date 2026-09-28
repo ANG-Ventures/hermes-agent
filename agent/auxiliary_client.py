@@ -1502,6 +1502,10 @@ _AI_GATEWAY_HEADERS = {
 # (main loop, aux, compression, web_extract). Do not inline a literal here;
 # see agent/portal_tags.py for the rationale.
 from agent.portal_tags import nous_portal_tags as _nous_portal_tags
+from agent.fork_ext.relay_headers import (  # S7 D1 aux route id
+    aux_route_headers as _aux_route_headers,
+    aux_route_scope as _aux_route_scope,
+)
 
 
 def _nous_extra_body() -> dict:
@@ -2586,7 +2590,14 @@ class _AnthropicCompletionsAdapter:
 
         usage = None
         if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            # OpenAI chat shape: prompt_tokens INCLUDES cached tokens and the
+            # details object breaks them out. Anthropic's input_tokens excludes
+            # both cache buckets, so fold them in or every aux ledger row and
+            # compaction price reads cache as 0 (C7 k74/k75).
+            input_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            prompt_tokens = input_tokens + cache_read + cache_write
             completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
             total_tokens = getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
             usage = SimpleNamespace(
@@ -2594,6 +2605,10 @@ class _AnthropicCompletionsAdapter:
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
             )
+            if cache_read or cache_write:
+                usage.prompt_tokens_details = SimpleNamespace(
+                    cached_tokens=cache_read, cache_write_tokens=cache_write,
+                )
 
         choice = SimpleNamespace(
             index=0,
@@ -9474,6 +9489,8 @@ def _build_call_kwargs(
     from agent.fork_ext.gemini_bridge_claims import claim_headers
 
     _claims = claim_headers(provider, task)
+    # S7 D1: the aux call's harness route id, fleet lanes only.
+    _claims.update(_aux_route_headers(provider))
     if _claims:
         kwargs["extra_headers"] = _claims
 
@@ -10100,6 +10117,7 @@ def call_llm(
             ),
             _aux_timing_hook(_aux_dispatch, _timed_dispatch),
             _aux_timing_hook(_aux_provider_response, _timed_response),
+            _aux_route_scope() as aux_route,
         ):
             response = _call_llm_impl(
                 task=task,
@@ -10131,7 +10149,8 @@ def call_llm(
         _record_aux_call_cost(response, route_info, streamed=bool(stream))
         if not stream:
             from agent.aux_accounting import record_aux_api_call
-            record_aux_api_call(response, task, route_info)
+            record_aux_api_call(response, task, route_info,
+                                route_id=aux_route.id_for(route_info.get("provider")))
         return response
     finally:
         if latency_info is not None:
@@ -11132,25 +11151,27 @@ async def async_call_llm(
     request_started_at = time.monotonic()
     outcome = "failed"
     try:
-        response = await _async_call_llm_impl(
-            task=task,
-            provider=provider,
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            main_runtime=main_runtime,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            timeout=timeout,
-            extra_body=extra_body,
-            reasoning_config=reasoning_config,
-            route_info=route_info,
-        )
+        with _aux_route_scope() as aux_route:
+            response = await _async_call_llm_impl(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+                route_info=route_info,
+            )
         outcome = "ok"
         from agent.aux_accounting import record_aux_api_call
-        record_aux_api_call(response, task, route_info)
+        record_aux_api_call(response, task, route_info,
+                            route_id=aux_route.id_for(route_info.get("provider")))
         return response
     finally:
         # Same duration contract as the sync path: an engine that summarises on the async

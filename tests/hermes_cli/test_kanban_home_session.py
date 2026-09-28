@@ -1201,3 +1201,54 @@ def test_cli_create_child_with_session_none_stays_unhomed(kanban_home, monkeypat
     assert child["session_id"] is None
     inherited = json.loads(kc.run_slash(f"create 'kid' --parent {parent['id']} --json"))
     assert inherited["session_id"] == HOME
+
+
+# --- C5 races: ownership re-checked inside the write txn -------------------
+
+
+def test_restamp_between_precheck_and_write_is_refused_inside_txn(kanban_home, monkeypatch):
+    """C5 TOCTOU (PR #951): the card is re-homed after the fast pre-check; the
+    re-check under the mutator's write lock must refuse and roll back."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        real = kb.check_home_session
+        calls = []
+
+        def racing(c, task_id, action):
+            calls.append(action)
+            out = real(c, task_id, action)
+            if len(calls) == 1:
+                with kb.connect_closing() as other:
+                    other.execute(
+                        "UPDATE tasks SET session_id = ? WHERE id = ?", (OTHER, task_id)
+                    )
+                    other.commit()
+            return out
+
+        monkeypatch.setattr(kb, "check_home_session", racing)
+        with kb.mutation_actor(session_ids=(HOME,), profile="apollo"):
+            with pytest.raises(kb.ForeignSessionMutationError):
+                kb.unblock_task(conn, tid)
+        assert len(calls) == 2
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_backfill_unhomed_stamp_and_comment_are_atomic(kanban_home, monkeypatch):
+    """C5 (PR #987): a failed audit comment must roll back the home stamp."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", assignee="worker-a")
+        conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (tid,))
+        conn.commit()
+
+        def boom(*a, **k):
+            raise RuntimeError("comment insert failed")
+
+        real_add_comment = kb.add_comment
+        monkeypatch.setattr(kb, "add_comment", boom)
+        with pytest.raises(RuntimeError):
+            kb.backfill_unhomed(conn)
+        row = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["session_id"] is None
+        monkeypatch.setattr(kb, "add_comment", real_add_comment)
+        assert tid in kb.backfill_unhomed(conn)
+        assert kb.UNHOMED_BACKFILL_COMMENT in _comments(conn, tid)

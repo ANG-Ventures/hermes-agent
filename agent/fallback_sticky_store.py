@@ -203,6 +203,28 @@ class StickyStore:
             self._remember(key, dataclasses.replace(state))
         self._write_through(key, state, now)
 
+    def keys_for_lineage(self, lineage_root: str) -> List[StickyKey]:
+        """Every stored key (map and table) for one lineage root, any primary.
+        Raises :class:`StoreUnreadable` when the table cannot be read."""
+        root = str(lineage_root or "")
+        with self._lock:
+            keys = [k for k in self._map if k.lineage_root == root]
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT primary_provider, primary_model FROM fallback_sticky"
+                    " WHERE lineage_root=?", (root,)).fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001
+            raise StoreUnreadable(str(exc)) from exc
+        for p, m in rows:
+            k = StickyKey(root, str(p), str(m))
+            if k not in keys:
+                keys.append(k)
+        return keys
+
     def evict_memory(self) -> None:
         """Drop the in-process map (simulates a gateway restart in tests)."""
         with self._lock:

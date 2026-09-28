@@ -437,14 +437,52 @@ def test_single_tick_pool_budget_across_ready_and_review(home, apr, reviews):
                                max_in_progress=100)
         assert len(seen) == 2
         assert len([tid for tid, reason in res.respawn_guarded if reason == "pool_budget"]) == 28
+        review_ids = set(ids[-reviews:]) if reviews else set()
+        if 0 < reviews < 30:
+            # One pool admission is held back from the ready loop for review.
+            assert len(set(seen) & review_ids) == 1
         for tid in ids:
             if tid not in seen:
-                assert _events(conn, tid, "deferred")[-1] == {
+                expected = {
                     "reason": "pool_budget", "provider": "claude-apr",
                     "pool": "claude-apr", "eligible": 1, "admitted": 2,
                     "in_flight": 0,
                 }
+                if review_ids and tid not in review_ids:
+                    expected.update(admitted=1, reserved_for_review=1)
+                assert _events(conn, tid, "deferred")[-1] == expected
         assert apr.hits == 1
+
+
+def test_review_pool_reservation_survives_ready_backlog(home, apr, monkeypatch):
+    """#985 C4 follow-up (t_becb0042): a ready backlog >= eligible*N on pool P
+    must not spend P's whole admission budget before the review loop runs.
+    One P admission is held for the spawnable review card; with no review
+    work the ready loop keeps the full pool budget (self-releasing)."""
+    monkeypatch.setattr(ph, "pool_budget_eligible", lambda *a, **k: 1)
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    _profile(home, "impl", "claude-apr")
+    with kb.connect_closing() as conn:
+        ready = [kb.create_task(conn, title=f"r-{i}", assignee="impl") for i in range(6)]
+        rev = kb.create_task(conn, title="rev", assignee="argus")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (rev,))
+        conn.commit()
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+                               max_in_progress=100, dry_run=True)
+        spawned = [tid for tid, _a, _w in res.spawned]
+        assert rev in spawned, spawned
+        assert len(spawned) == 2
+        assert len(set(spawned) & set(ready)) == 1
+
+        # No review work: the hold releases and ready gets both admissions.
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (rev,))
+        conn.commit()
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+                               max_in_progress=100, dry_run=True)
+        assert len([t for t, _a, _w in res.spawned if t in ready]) == 2
 
 
 def test_pool_budget_is_per_tick_across_boards_with_shared_tick_cache(home, apr):

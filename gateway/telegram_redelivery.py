@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -47,9 +48,11 @@ def _hwm_path(hermes_home: Path, profile: str) -> Path:
 class TelegramHwmTracker:
     """Per-profile in-memory HWM with a coalesced, atomic disk flush.
 
-    One instance per gateway process (the process serves one profile). Thread-
-    unsafe by design: mutated only from the single asyncio event loop that
-    dispatches Telegram updates.
+    One instance per gateway process (the process serves one profile). The
+    duplicate check runs off-loop (``asyncio.to_thread``) and shutdown flushes
+    on the loop, so every read-modify-write and flush is serialized on
+    ``_lock``: otherwise a checkpoint can clear ``_dirty`` after another
+    thread advanced the HWM, and two writers share the per-pid temp file.
     """
 
     def __init__(
@@ -66,6 +69,7 @@ class TelegramHwmTracker:
         self._hwm: int = 0
         self._dirty = False
         self._last_flush_at: float = clock()
+        self._lock = threading.Lock()
 
     # ── in-memory advance (hot path — no I/O) ─────────────────────────────
 
@@ -78,9 +82,10 @@ class TelegramHwmTracker:
             uid = int(update_id)
         except (TypeError, ValueError):
             return
-        if uid > self._hwm:
-            self._hwm = uid
-            self._dirty = True
+        with self._lock:
+            if uid > self._hwm:
+                self._hwm = uid
+                self._dirty = True
 
     @property
     def value(self) -> int:
@@ -92,20 +97,23 @@ class TelegramHwmTracker:
         """Flush to disk iff dirty AND (forced OR the throttle window elapsed).
         Returns True if a write happened. Best-effort: a write failure logs and
         returns False, never raises (SPEC D-4)."""
-        if not self._dirty:
-            return False
-        now = self._clock()
-        if not force and (now - self._last_flush_at) < self._interval:
-            return False
-        return self._write(now)
+        with self._lock:
+            if not self._dirty:
+                return False
+            now = self._clock()
+            if not force and (now - self._last_flush_at) < self._interval:
+                return False
+            return self._write(now)
 
     def flush(self) -> bool:
         """Unconditional flush (graceful shutdown). SPEC D-2."""
-        if not self._dirty:
-            return False
-        return self._write(self._clock())
+        with self._lock:
+            if not self._dirty:
+                return False
+            return self._write(self._clock())
 
     def _write(self, now: float) -> bool:
+        # Caller holds ``_lock``.
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(self._path.suffix + f".tmp-{os.getpid()}")
@@ -121,6 +129,11 @@ class TelegramHwmTracker:
         except Exception:
             logger.debug("telegram HWM flush failed (non-fatal)", exc_info=True)
             return False
+
+
+# Serializes the gateway's lazy tracker construction: the duplicate check runs
+# on worker threads, and two first-turns must not build two trackers.
+TRACKER_INIT_LOCK = threading.Lock()
 
 
 def read_hwm(hermes_home: Path, profile: str) -> Optional[int]:

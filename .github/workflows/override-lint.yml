@@ -1,0 +1,30 @@
+# Override lint — thin caller (t_8f526b34). A PR that ADDS a refusal string (scoped paths, or a new
+# raise/emit_block/sys.exit/HTTPException(409) with refusal wording) must carry an `Override:` line in
+# its body naming the flag/env/reason field, or `Override: none by design — <why>`.
+# Copy to .github/workflows/override-lint.yml. Pin `uses:` to an IMMUTABLE 40-hex commit SHA of
+# ANG-Ventures/fleet-floor-workflows (never a moving tag).
+#
+# Placeholders:
+#   88e090ebb883a1147d4086ea80ddf32637e8edd9   40-char commit SHA of the central repo
+#   ubuntu-latest      public repo: GitHub-hosted. Private ANG-Ventures repos use the org's metered runner label.
+name: override-lint
+
+# path-filter-exempt: the check reads the PR BODY; `edited` must re-run it on a body-only change, and a path-filtered check would skip those.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  override_lint:
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@88e090ebb883a1147d4086ea80ddf32637e8edd9
+    with:
+      runner: ubuntu-latest
+      # Repos whose skills live elsewhere: pass the dirs grepped for the named override (warning only).
+      # docs-paths: "skills-shared skills"
+      # Reviewed no-override-by-design additions, one per line (`path:<regex> <why>` / `line:<regex> <why>`):
+      # allowlist: |
+      #   line:my refusal text reviewed in PR #N

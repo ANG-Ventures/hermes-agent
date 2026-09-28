@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import contextlib
 import ipaddress
 import concurrent.futures
 import dataclasses
@@ -4468,7 +4469,9 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
     """Track visible root child names and immediate directory mtimes.
 
     Category mtimes detect skill additions/removals within categories; child
-    names detect flat skill additions/removals. Hidden telemetry/curator files
+    names detect flat skill additions/removals; second-level directory mtimes
+    detect SKILL.md added to/removed from an existing category/skill directory.
+    Hidden telemetry/curator files
     and directories never invalidate the index. /reload-skills picks up deeper
     edits such as a frontmatter rename.
     """
@@ -4481,8 +4484,21 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
                     if entry.name.startswith("."):
                         continue
                     try:
-                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        is_dir = entry.is_dir()
+                        mtime = entry.stat().st_mtime_ns if is_dir else -1
                         out.append((entry.path, mtime))
+                    except OSError:
+                        continue
+                    if not is_dir:
+                        continue
+                    # category/skill dirs: adding or removing SKILL.md inside
+                    # one changes only that dir's mtime (C7 k99).
+                    try:
+                        with os.scandir(entry.path) as children:
+                            for child in children:
+                                if child.name.startswith(".") or not child.is_dir():
+                                    continue
+                                out.append((child.path, child.stat().st_mtime_ns))
                     except OSError:
                         continue
         except OSError:
@@ -6497,13 +6513,21 @@ class TurnRunner:
                 res = fut.result()
             except Exception as exc:
                 _warn_route_drop("adapter_send_exception", type(exc).__name__)
+                if is_route_change:
+                    self._queue_undelivered_route_notice(event_type, prepared_message)
                 return
             if is_route_change and not getattr(res, "success", False):
                 error = _redact_gateway_user_facing_secrets(
                     str(getattr(res, "error", "") or type(res).__name__)
                 )[:160]
                 _warn_route_drop("adapter_send_failed", error)
+                # A hop the user never saw is the worst outcome: queue the
+                # line and redeliver it on the next turn in this chat.
+                self._queue_undelivered_route_notice(event_type, prepared_message)
                 return
+            if is_route_change:
+                # The platform is reachable again: flush anything queued.
+                self._flush_route_notice_outbox()
             # Route announcements are durable messages, not temporary progress.
             if ctx._cleanup_progress and not is_route_change:
                 mid = getattr(res, "message_id", None)
@@ -6513,6 +6537,78 @@ class TurnRunner:
         if is_route_change or ctx._cleanup_progress:
             _fut.add_done_callback(_track_status_result)
         return True if is_route_change else None
+
+    def _route_notice_chat_key(self) -> str:
+        from gateway.route_notice_outbox import chat_key
+
+        ctx = self._ctx
+        return chat_key(ctx.source.platform, ctx._status_chat_id,
+                        ctx._status_thread_metadata)
+
+    def _queue_undelivered_route_notice(self, event_type: str, message: str) -> None:
+        """Queue a route-change line the adapter failed to send (t_b2e9bb23).
+        Best-effort: never raises."""
+        try:
+            from gateway.route_notice_outbox import default_outbox
+
+            default_outbox().enqueue(
+                self._route_notice_chat_key(), message,
+                self._ctx._status_thread_metadata, event_type=event_type,
+            )
+        except Exception:
+            logger.debug("route notice enqueue failed", exc_info=True)
+
+    def _flush_route_notice_outbox(self) -> int:
+        """Redeliver queued route-change lines for this chat, oldest first,
+        each marked delayed. A failed redelivery goes back on the queue.
+        Returns the number scheduled. Best-effort: never raises."""
+        ctx = self._ctx
+        try:
+            from gateway.route_notice_outbox import default_outbox, delayed_text
+
+            outbox = default_outbox()
+            key = self._route_notice_chat_key()
+            if not outbox.pending(key):
+                return 0
+            resolver = ctx._current_status_adapter
+            adapter = resolver() if callable(resolver) else None
+            if not adapter:
+                return 0
+            entries = outbox.take(key)
+            scheduled = 0
+            for entry in entries:
+                text = delayed_text(str(entry.get("message") or ""),
+                                    float(entry.get("dropped_at") or time.time()))
+                fut = safe_schedule_threadsafe(
+                    _send_or_update_status_coro(
+                        adapter, ctx._status_chat_id,
+                        entry.get("event_type") or "info", text,
+                        ctx._status_thread_metadata, durable=True,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="route notice redelivery scheduling error",
+                )
+                if fut is None:
+                    outbox.restore(key, entry)
+                    continue
+                scheduled += 1
+
+                def _done(f, _entry=entry):
+                    try:
+                        ok = bool(getattr(f.result(), "success", False))
+                    except Exception:
+                        ok = False
+                    if ok:
+                        logger.info("route notice redelivered: chat=%s", key)
+                    else:
+                        outbox.restore(key, _entry)
+
+                fut.add_done_callback(_done)
+            return scheduled
+        except Exception:
+            logger.debug("route notice flush failed", exc_info=True)
+            return 0
 
     def run_sync(self):
         ctx = self._ctx
@@ -7001,6 +7097,9 @@ class TurnRunner:
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
+        # An inbound message just arrived, so the platform is reachable:
+        # redeliver any route-change line a previous send dropped (t_b2e9bb23).
+        self._flush_route_notice_outbox()
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
         # standalone push: render to a single plaintext line and deliver via
@@ -7069,7 +7168,16 @@ class TurnRunner:
             # announces the return with the stashed recovery row (G2).
             from agent import fallback_wiring as _fw
 
-            _fw.decide_rebuild_for_agent(agent)
+            # A /model this turn (stamp set by _set_session_model_override,
+            # consumed below by the re-init announce) is an explicit route: it
+            # closes any sticky episode instead of resuming it (t_b2e9bb23).
+            try:
+                _user_route = bool(getattr(
+                    self._runner, "_override_target_just_changed", {}
+                ).get(ctx.session_key))
+            except Exception:
+                _user_route = False
+            _fw.decide_rebuild_for_agent(agent, user_route=_user_route)
             self._runner._announce_reinit_recovery(
                 agent=agent,
                 session_key=ctx.session_key,
@@ -14352,25 +14460,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if int(value.get("count", 0) or 0) >= self._STUCK_LOOP_THRESHOLD
             ]
 
-            for session_key in stuck_keys:
-                try:
-                    entry = self.session_store._entries.get(session_key)
-                    if entry and not entry.suspended:
-                        entry.suspended = True
-                        suspended += 1
-                        logger.warning(
-                            "Auto-suspended stuck session %s (active across %d "
-                            "consecutive restarts — likely a stuck loop)",
-                            session_key, counts[session_key]["count"],
-                        )
-                except Exception:
-                    pass
+            # Runs via asyncio.to_thread: the entry RMW and the snapshot must
+            # hold the store lock like every other session-store writer
+            # (``_save`` defers its durable I/O past the lock's release).
+            store_lock = getattr(self.session_store, "_lock", None)
+            with store_lock if store_lock is not None else contextlib.nullcontext():
+                for session_key in stuck_keys:
+                    try:
+                        entry = self.session_store._entries.get(session_key)
+                        if entry and not entry.suspended:
+                            entry.suspended = True
+                            suspended += 1
+                            logger.warning(
+                                "Auto-suspended stuck session %s (active across %d "
+                                "consecutive restarts — likely a stuck loop)",
+                                session_key, counts[session_key]["count"],
+                            )
+                    except Exception:
+                        pass
 
-            if suspended:
-                try:
-                    self.session_store._save()
-                except Exception:
-                    pass
+                if suspended:
+                    try:
+                        self.session_store._save()
+                    except Exception:
+                        pass
 
             for session_key in stuck_keys:
                 counts.pop(session_key, None)
@@ -25667,17 +25780,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if update_id is None:
             return False  # nothing to scope on — process
 
-        # Lazy-init the per-process HWM tracker + suppression counter.
-        if getattr(self, "_tg_redelivery_hwm", None) is None:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                _profile = get_active_profile_name() or "default"
-            except Exception:
-                _profile = "default"
-            self._tg_redelivery_profile = _profile
-            self._tg_redelivery_boot_hwm = _tgr.read_hwm(_hermes_home, _profile)
-            self._tg_redelivery_hwm = _tgr.TelegramHwmTracker(_hermes_home, _profile)
-            self._tg_redelivery_counter = _tgr.RedeliverySuppressionCounter()
+        # Lazy-init the per-process HWM tracker + suppression counter. This
+        # runs on worker threads (to_thread), so init is serialized; the tracker
+        # itself locks every mutation and flush.
+        with _tgr.TRACKER_INIT_LOCK:
+            if getattr(self, "_tg_redelivery_hwm", None) is None:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _profile = get_active_profile_name() or "default"
+                except Exception:
+                    _profile = "default"
+                self._tg_redelivery_profile = _profile
+                self._tg_redelivery_boot_hwm = _tgr.read_hwm(_hermes_home, _profile)
+                self._tg_redelivery_hwm = _tgr.TelegramHwmTracker(_hermes_home, _profile)
+                self._tg_redelivery_counter = _tgr.RedeliverySuppressionCounter()
 
         # Track this dispatch's update_id in the in-memory HWM (coalesced flush
         # happens elsewhere). This advances the HWM as the gateway processes.
@@ -32412,22 +32528,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # Profile attribution: a per-source profile wins (multiplexed serving
-        # binds each inbound to the profile that owns it), but when the source
-        # carries none, fall back to the profile THIS gateway was launched with
-        # rather than binding "". An empty profile made every subprocess/tool
-        # that reads HERMES_SESSION_PROFILE (papercut attribution, delegate_tool,
-        # kanban_tools) silently resolve to the default profile's identity even
-        # on a sibling gateway launched with --profile <name>. getattr keeps
-        # bare runners built via object.__new__ (tests) working.
-        _profile = getattr(source, "profile", "") or ""
-        if not _profile:
-            _resolve = getattr(self, "_active_profile_name", None)
-            if callable(_resolve):
-                try:
-                    _profile = _resolve() or ""
-                except Exception:
-                    _profile = ""
         return set_session_vars(
             platform=source.platform.value,
             chat_id=source.chat_id,
@@ -32451,7 +32551,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key or "",
             session_id=session_id or "",
             message_id=str(message_id) if message_id else "",
-            profile=_profile,
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -32905,10 +33005,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    # INFO carries size + latency only: the words are the user's
+                    # speech (passwords, PII) and INFO logs are long-lived (Backfill C3).
                     logger.info(
-                        "stt: chat=%s transcribed %d chars in %.1fs: %r",
+                        "stt: chat=%s transcribed %d chars in %.1fs",
                         _stt_chat, len(transcript), time.monotonic() - _stt_started,
-                        transcript[:60].replace("\n", " "),
                     )
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
@@ -34645,7 +34746,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
             }
-            cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
+            # from_global_config re-reads the file: memoize only if it still
+            # holds the bytes the key was hashed from (C7 k102).
+            try:
+                import hashlib as _hashlib
+                recheck = _hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                recheck = None
+            if recheck == digest:
+                cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)
         except Exception:
             return cls._empty_honcho_cache_busting_config()

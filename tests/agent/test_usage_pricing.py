@@ -360,6 +360,8 @@ _CODEX_STUB_METADATA = {
     "gpt-5.5": {"pricing": {"prompt": "0.000005", "completion": "0.00003"}},
     "gpt-5.4": {"pricing": {"prompt": "0.0000025", "completion": "0.000015"}},
     "gpt-5.3-codex": {"pricing": {"prompt": "0.00000175", "completion": "0.000014"}},
+    # Not in the curated snapshot, so it exercises the external-catalog path.
+    "gpt-5.2": {"pricing": {"prompt": "0.00000175", "completion": "0.000014"}},
 }
 
 
@@ -429,10 +431,11 @@ def test_openai_codex_priced_from_openrouter_catalog(monkeypatch):
         "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
     )
     usage = CanonicalUsage(input_tokens=120_000, output_tokens=8_000)
-    # 120000*5/1e6 + 8000*30/1e6 = 0.6 + 0.24 = 0.84
-    result = estimate_usage_cost("gpt-5.5", usage, provider="openai-codex")
+    # gpt-5.2 has no curated snapshot row (gpt-5.5 does since t_4a976965).
+    # 120000*1.75/1e6 + 8000*14/1e6 = 0.21 + 0.112 = 0.322
+    result = estimate_usage_cost("gpt-5.2", usage, provider="openai-codex")
     assert result.status == "estimated"
-    assert result.amount_usd is not None and float(result.amount_usd) == 0.84  # type: ignore[arg-type]
+    assert result.amount_usd is not None and float(result.amount_usd) == 0.322  # type: ignore[arg-type]
     assert result.source == "provider_models_api"
 
 
@@ -518,11 +521,17 @@ def test_estimate_usage_cost_prices_cache_write_at_input_rate_when_no_cache_writ
     separate cache-write rate — cache-write tokens are billed at the input
     rate. The estimator must price the turn (status 'estimated'), NOT drop it
     as unpriced and silently lose real spend. Regression for the lone
-    remaining 'unpriced' turn on the tokens.ace by-profile chart (2026-06)."""
+    remaining 'unpriced' turn on the tokens.ace by-profile chart (2026-06).
+
+    Uses gpt-5.2 (no curated snapshot row) so the catalog path is the one under
+    test; gpt-5.5 has a snapshot row since t_4a976965."""
+    monkeypatch.setattr(
+        "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
+    )
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",
         lambda: {
-            "gpt-5.5": {
+            "gpt-5.2": {
                 "pricing": {
                     "prompt": "0.000005",       # $5/M input
                     "completion": "0.00003",    # $30/M output
@@ -534,7 +543,7 @@ def test_estimate_usage_cost_prices_cache_write_at_input_rate_when_no_cache_writ
     )
 
     result = estimate_usage_cost(
-        "gpt-5.5",
+        "gpt-5.2",
         CanonicalUsage(
             input_tokens=6,
             output_tokens=3104,
@@ -1818,3 +1827,77 @@ def test_opus_5_5_dot_notation_resolves_to_the_same_entry():
     assert dotted is not None and hyphen is not None
     assert dotted.input_cost_per_million == hyphen.input_cost_per_million
     assert dotted.output_cost_per_million == hyphen.output_cost_per_million
+
+
+# ── OpenAI GPT-5.5 / GPT-5.4 / GPT-5.4 mini / GPT-5-Codex (codex-cli lane) ──
+# Standard list rates from https://developers.openai.com/api/docs/pricing
+# (read 2026-09-27). 13,338 codex-cli rows priced NULL before these rows
+# existed (t_4a976965). Contract: each id the Codex CLI records prices on the
+# bare "openai" route AND the notional "openai-codex" route, from the curated
+# snapshot, with cached input at 0.1x input.
+
+
+@pytest.mark.parametrize(
+    "model,inp,out,cached",
+    [
+        ("gpt-5.5", "5.00", "30.00", "0.50"),
+        ("gpt-5.4", "2.50", "15.00", "0.25"),
+        ("gpt-5.4-mini", "0.75", "4.50", "0.075"),
+        ("gpt-5-codex", "1.25", "10.00", "0.125"),
+    ],
+)
+@pytest.mark.parametrize("provider", ["openai", "openai-codex"])
+def test_codex_cli_openai_models_price_from_snapshot(model, inp, out, cached, provider):
+    result = estimate_usage_cost(
+        model,
+        CanonicalUsage(
+            input_tokens=100_000, output_tokens=100_000, cache_read_tokens=100_000
+        ),
+        provider=provider,
+    )
+    assert result.status != "unknown"
+    assert result.cost_input_usd == Decimal(inp) / 10
+    assert result.cost_output_usd == Decimal(out) / 10
+    assert result.cost_cache_read_usd == Decimal(cached) / 10
+    assert Decimal(cached) * 10 == Decimal(inp)
+
+
+@pytest.mark.parametrize(
+    "model,inp_above,out_above",
+    [("gpt-5.5", "10.00", "45.00"), ("gpt-5.4", "5.00", "22.50")],
+)
+def test_gpt55_gpt54_above_272k_uses_whole_request_tier(model, inp_above, out_above):
+    above = estimate_usage_cost(
+        model,
+        CanonicalUsage(input_tokens=300_000, output_tokens=10_000),
+        provider="openai",
+    )
+    assert above.cost_input_usd == Decimal("0.3") * Decimal(inp_above)
+    assert above.cost_output_usd == Decimal("0.01") * Decimal(out_above)
+
+
+def test_codex_auto_review_stays_unknown():
+    """Hidden Codex-internal slug with no published price and no named
+    underlying model: never guess a rate for it."""
+    result = estimate_usage_cost(
+        "codex-auto-review",
+        CanonicalUsage(input_tokens=1_000, output_tokens=100),
+        provider="openai",
+    )
+    assert result.amount_usd is None
+
+
+def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
+    """moonshotai/kimi-k3 on the openrouter route prices from the curated row,
+    never the live catalog (t_01655aa1: subs.ace ledger NULL-priced these)."""
+    def _no_catalog(route):
+        raise AssertionError(f"external catalog consulted for {route.model}")
+
+    monkeypatch.setattr("agent.usage_pricing._external_pricing_entry", _no_catalog)
+    entry = get_pricing_entry("moonshotai/kimi-k3", provider="openrouter")
+    assert entry is not None and entry.source == "official_docs_snapshot"
+    assert entry.source_url == "https://openrouter.ai/moonshotai/kimi-k3"
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    result = estimate_usage_cost("moonshotai/kimi-k3", usage, provider="openrouter")
+    # 3.00 + 15.00 + 0.30
+    assert result.amount_usd is not None and float(result.amount_usd) == 18.30  # type: ignore[arg-type]

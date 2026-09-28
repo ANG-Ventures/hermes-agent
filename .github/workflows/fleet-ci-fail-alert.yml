@@ -184,6 +184,67 @@ jobs:
               ROUTE=logs
             fi
           fi
+          # MERGE-QUEUE DEDUPE (t_70f92e0b). The queue rebuilds a group each time a
+          # PR ahead of it is ejected, so ONE broken test re-fails the same PR 3-6
+          # times (pr-1332 paged 6x 19:34-20:36Z on 2026-09-27). Page once per
+          # (PR, failing-test signature): a red whose signature already failed an
+          # earlier merge_group run of the SAME PR in the last 24h stays silent. A
+          # new signature, or another PR, still pages. The page names the PR and
+          # the failing tests in its first line. Signature = the pytest node ids the
+          # test jobs annotate "FAILED (not quarantined)", else the failed job names
+          # with the slice number stripped (a test moves between slices as the tree
+          # changes). Any API error keeps the page (fail loud).
+          PR_NUM=""; SIG=""
+          if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = merge_group ]; then
+            PR_NUM="$(sed -nE 's#^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p' <<< "$WF_BRANCH")"
+          fi
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
+            local jobs ids id ann got
+            jobs="$(api "actions/runs/$1/jobs?filter=latest&per_page=100")" || return 1
+            ids="$(jq -r '.jobs[] | select(.conclusion == "failure") | .id' <<< "$jobs")" || return 1
+            ann=""
+            for id in $ids; do
+              got="$(api "check-runs/$id/annotations?per_page=100")" || return 1
+              ann+="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
+              ann+=$'\n'
+            done
+            ann="$(grep -v '^$' <<< "$ann" | sort -u | paste -sd ' ' -)"
+            if [ -z "$ann" ]; then
+              ann="$(jq -r '[.jobs[] | select(.conclusion == "failure") | .name
+                | select(test("Tests complete|All required checks") | not)
+                | sub(" slice [0-9]+/[0-9]+$"; "")] | unique | join("; ")' <<< "$jobs")" || return 1
+            fi
+            printf '%s' "$ann"
+          }
+          if [ -n "$PR_NUM" ]; then
+            if SIG="$(sig_of "$WF_RUN_ID")" && [ -n "$SIG" ]; then
+              SINCE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)"
+              PRIOR="$(api "actions/workflows/$WF_ID/runs?event=merge_group&status=failure&per_page=50" \
+                | jq -r --argjson id "$WF_RUN_ID" --arg pr "$PR_NUM" --arg since "$SINCE" \
+                  '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
+                    | select((.head_branch // "") | test("^gh-readonly-queue/.+/pr-" + $pr + "-[0-9a-f]+$"))
+                    | .id][:5][]')" || PRIOR=error
+              if [ "$PRIOR" = error ]; then
+                echo "::warning::prior merge_group run lookup failed; paging"
+              else
+                for prev in $PRIOR; do
+                  if [ "$(sig_of "$prev" || echo __error__)" = "$SIG" ]; then
+                    ROUTE=none; echo "no page: PR #$PR_NUM already failed the queue on '$SIG' (run $prev)"; break
+                  fi
+                done
+              fi
+            else
+              SIG=""; echo "::warning::cannot read the failing tests of run $WF_RUN_ID; paging"
+            fi
+          fi
+          SUMMARY=""
+          if [ -n "$PR_NUM" ]; then
+            SUMMARY="PR #$PR_NUM ejected from the merge queue: ${SIG:-failing job unknown}"
+            [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
+          fi
+          echo "pr=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "summary=$SUMMARY" | tee -a "$GITHUB_OUTPUT"
           echo "route=$ROUTE" | tee -a "$GITHUB_OUTPUT"
           echo "card=$CARD" >> "$GITHUB_OUTPUT"
 
@@ -192,6 +253,8 @@ jobs:
         env:
           ROUTE: ${{ steps.route.outputs.route }}
           CARD: ${{ steps.route.outputs.card }}
+          PR_NUM: ${{ steps.route.outputs.pr }}
+          SUMMARY: ${{ steps.route.outputs.summary }}
           CI_FAIL_WEBHOOK_SECRET: ${{ secrets.CI_FAIL_WEBHOOK_SECRET }}
           WEBHOOK_URL: https://hooks.angventures.io/webhooks/ci-fail
           WF_NAME: ${{ steps.route.outputs.wf_name }}
@@ -216,6 +279,10 @@ jobs:
           # A replay is labelled and gets its own delivery id, so the receiver's
           # idempotency does not drop it when the original run already paged.
           DELIVERY="ci-fail-${WF_RUN_ID}"
+          # Merge-queue ejection: PR + failing tests on the page's first line (t_70f92e0b).
+          if [ -n "${SUMMARY:-}" ]; then
+            WF_NAME="${WF_NAME} — ${SUMMARY}"
+          fi
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             WF_NAME="[replay] ${WF_NAME}"
             DELIVERY="${DELIVERY}-replay-${GITHUB_RUN_ID}"
@@ -238,7 +305,8 @@ jobs:
             --arg run_url "$WF_URL" \
             --arg actor "$WF_ACTOR" \
             --arg trigger "$WF_EVENT" \
-            '{event_type:$event_type, card:$card, repo:$repo, workflow:$workflow, branch:$branch, sha:$sha, run_url:$run_url, actor:$actor, trigger:$trigger}')"
+            --arg pr "${PR_NUM:-}" \
+            '{event_type:$event_type, card:$card, repo:$repo, workflow:$workflow, branch:$branch, sha:$sha, run_url:$run_url, actor:$actor, trigger:$trigger, pr:$pr}')"
           # Generic HMAC-SHA256 hex over the raw body → X-Webhook-Signature.
           SIG="$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
           CODE="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \

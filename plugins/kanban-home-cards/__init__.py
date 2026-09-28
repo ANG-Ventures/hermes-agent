@@ -137,7 +137,9 @@ def _redact(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        # redact_url_credentials: card text is injected into the model context, a
+        # non-navigation egress, so ?access_token= / user:pass@ must not survive.
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:
         # Fail closed on the content, not the turn: without the redactor we
         # cannot vouch for comment text, so drop it.
@@ -158,7 +160,7 @@ def _card_line(card: Mapping[str, Any]) -> str:
     # Board before the comment: the line cap may only ever eat comment text.
     board = card.get("board") or "default"
     if board != "default":
-        parts.append(f"board {_one_line(board, 40)}")
+        parts.append(f"board {_one_line(_redact(_one_line(board, 200)), 40)}")
     comment = _one_line(_redact(_one_line(card.get("last_comment"), 400)), COMMENT_MAX)
     if comment:
         parts.append(f"last: {comment}")

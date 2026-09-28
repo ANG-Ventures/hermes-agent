@@ -120,7 +120,12 @@ def test_next_turn_sees_the_cut_turns_work(tmp_path):
     assert "Listing jobs now." in ctx                # in-progress text
     assert "job-a" in ctx                            # the completed result
     assert "read_file" in ctx                        # the in-flight call
-    assert "NEVER COMPLETED" in ctx                  # …and that it never ran
+    # No result row proves only that no result was RECORDED; the call may have
+    # run its side effect before the cut (C7 k131/k85).
+    assert "NO RESULT RECORDED" in ctx
+    assert "NEVER COMPLETED" not in ctx
+    assert "re-issue the one that never completed" not in ctx
+    assert "verify" in ctx.lower()
     assert "finish the audit" in ctx                 # the open todo
 
 

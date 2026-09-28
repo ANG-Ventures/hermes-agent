@@ -209,8 +209,9 @@ def test_accepted_only_turn_is_not_double_counted(ledger, turn_usage):
 
 
 def test_rejected_call_on_an_early_return_turn_reaches_session_totals(ledger, turn_usage):
-    """No fallback: the refusal returns early (no finalizer). The spend is
-    settled into the SESSION at the next turn, never into that turn's rollup."""
+    """No fallback: the refusal returns early (no finalizer). The backstop
+    (emit_unfinalized_session_end) settles the spend into THAT turn's rollup
+    and the session totals; the next turn carries only its own call (C7 k137)."""
     agent = _make_agent([
         _response(usage=_REJECTED_USAGE, content="", finish_reason="content_filter"),
         _response(usage=_ACCEPTED_USAGE, content="answer"),
@@ -219,11 +220,17 @@ def test_rejected_call_on_an_early_return_turn_reaches_session_totals(ledger, tu
     agent._has_pending_fallback = lambda: False
 
     agent.run_conversation("turn one")
+    # The refused call is attributed to the turn that spent it.
+    assert len(turn_usage) == 1
+    assert turn_usage[0]["api_calls"] == 1
+    assert turn_usage[0]["output_tokens"] == _REJECTED_USAGE["completion_tokens"]
+    assert not getattr(agent, "_billed_unaccounted", [])
     agent.run_conversation("turn two")
 
     sums = _ledger_sums(ledger)
     assert sums["api_calls"] == 2
     _assert_counters_match_ledger(agent, sums)
+    assert len(turn_usage) == 2
     # Turn two's rollup holds only turn two's own call.
     assert turn_usage[-1]["api_calls"] == 1
     assert turn_usage[-1]["output_tokens"] == 200

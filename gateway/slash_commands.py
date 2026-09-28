@@ -2401,6 +2401,34 @@ class GatewaySlashCommandsMixin:
         except Exception:
             return None
 
+    def _clear_fallback_for_user_route(self, session_key: str, agent=None) -> bool:
+        """``/model`` is an explicit route and beats an automatic fallback
+        (t_b2e9bb23): close every active sticky episode on the session's
+        lineage so the rebuilt agent cannot resume it. Sync (sqlite); call via
+        ``asyncio.to_thread``. Returns whether a fallback was in effect, so the
+        reply can say so. The pre-run rebuild site closes again from the
+        ``_override_target_just_changed`` stamp (covers a non-resident agent
+        whose lineage root differs from its session id)."""
+        try:
+            from agent import fallback_sticky_store as _fss
+            from agent import fallback_wiring as _fw
+
+            was_live = _fw.live_fallback_active(agent)
+            root = _fss.lineage_root_for_agent(agent) if agent is not None else ""
+            if not root:
+                store = getattr(self, "session_store", None)
+                entry = store.entry_for(session_key) if store is not None else None
+                root = str(getattr(entry, "session_id", "") or "")
+            closed = _fw.close_episodes_for_user_route(root)
+            return bool(was_live or closed)
+        except Exception:
+            logger.debug("user-route fallback clear failed (non-fatal)", exc_info=True)
+            return False
+
+    @staticmethod
+    def _fallback_cleared_line(provider, model) -> str:
+        return f"Fallback cleared; next turn runs on `{provider}/{model}`."
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -2518,6 +2546,7 @@ class GatewaySlashCommandsMixin:
         # "current", the announce fallback and the bare-model resolution
         # provider in one place. Best-effort: a cache hiccup must not break
         # the switch.
+        _live_agent = None
         try:
             _live_lock = getattr(self, "_agent_cache_lock", None)
             _live_cache = getattr(self, "_agent_cache", None)
@@ -2551,6 +2580,11 @@ class GatewaySlashCommandsMixin:
                 )
             getattr(self, "_pending_model_notes", {}).pop(session_key, None)
             getattr(self, "_last_resolved_model", {}).pop(session_key, None)
+            _fb_cleared = await asyncio.to_thread(
+                self._clear_fallback_for_user_route,
+                session_key,
+                _live_agent,
+            )
             try:
                 self._evict_cached_agent(session_key)
             except Exception:
@@ -2561,10 +2595,14 @@ class GatewaySlashCommandsMixin:
                 f"{current_provider}/{current_model}",
                 f"{configured_provider}/{configured_model}",
             )
-            return (
+            _reset_reply = (
                 "Model session override cleared; using configured route "
                 f"`{configured_provider}/{configured_model}`."
             )
+            if _fb_cleared:
+                _reset_reply += "\n" + self._fallback_cleared_line(
+                    configured_provider, configured_model)
+            return _reset_reply
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -2659,6 +2697,12 @@ class GatewaySlashCommandsMixin:
                         if _cache_lock and _cache is not None:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
+                        # Explicit route beats an automatic one (t_b2e9bb23).
+                        _fb_cleared = await asyncio.to_thread(
+                            _self._clear_fallback_for_user_route,
+                            _session_key,
+                            cached_entry[0] if cached_entry else None,
+                        )
                         if cached_entry and cached_entry[0] is not None:
                             _sw_old_model = getattr(cached_entry[0], "model", _cur_model)
                             _sw_old_provider = getattr(cached_entry[0], "provider", _cur_provider)
@@ -2966,6 +3010,9 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
+                        if _fb_cleared:
+                            lines.append(_self._fallback_cleared_line(
+                                result.target_provider, result.new_model))
                         return "\n".join(lines)
 
                     async def _on_model_selected_dispatch(
@@ -3086,6 +3133,13 @@ class GatewaySlashCommandsMixin:
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
+            # Explicit route beats an automatic one: read + close the fallback
+            # episode BEFORE the in-place swap resets the live flags.
+            _fb_cleared = await asyncio.to_thread(
+                self._clear_fallback_for_user_route,
+                session_key,
+                cached_entry[0] if cached_entry else None,
+            )
 
             if cached_entry and cached_entry[0] is not None:
                 _sw_old_model = getattr(cached_entry[0], "model", current_model)
@@ -3419,6 +3473,9 @@ class GatewaySlashCommandsMixin:
                 lines.append("    (next turn only — restores after one response)")
             else:
                 lines.append(t("gateway.model.session_only_hint"))
+            if _fb_cleared:
+                lines.append(self._fallback_cleared_line(
+                    result.target_provider, result.new_model))
 
             return "\n".join(lines)
 

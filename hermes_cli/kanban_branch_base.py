@@ -293,6 +293,14 @@ def check_checkout(
     if rep.ahead == 0:
         rep.skipped = f"no commits ahead of {trunk}"
         return rep
+    # Already landed (t_22c91696): every commit ahead is patch-equivalent to
+    # one on trunk -- the squash/queue merge of this branch's own PR. The
+    # branch adds nothing, so "foreign commit" and "does not merge cleanly"
+    # (trunk moved on over the same lines) are measurements of the merge itself.
+    cherry = _lines(repo, "cherry", trunk, "HEAD")
+    if cherry and all(ln.startswith("- ") for ln in cherry):
+        rep.skipped = f"already landed on {trunk} ({len(cherry)} commit(s) patch-equivalent)"
+        return rep
     rep.own_files = _lines(repo, "diff", "--name-only", rep.merge_base, "HEAD")
     rep.tree_delta_files = _lines(repo, "diff", "--name-only", trunk, "HEAD")
 
