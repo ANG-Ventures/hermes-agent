@@ -1885,3 +1885,19 @@ def test_codex_auto_review_stays_unknown():
         provider="openai",
     )
     assert result.amount_usd is None
+
+
+def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
+    """moonshotai/kimi-k3 on the openrouter route prices from the curated row,
+    never the live catalog (t_01655aa1: subs.ace ledger NULL-priced these)."""
+    def _no_catalog(route):
+        raise AssertionError(f"external catalog consulted for {route.model}")
+
+    monkeypatch.setattr("agent.usage_pricing._external_pricing_entry", _no_catalog)
+    entry = get_pricing_entry("moonshotai/kimi-k3", provider="openrouter")
+    assert entry is not None and entry.source == "official_docs_snapshot"
+    assert entry.source_url == "https://openrouter.ai/moonshotai/kimi-k3"
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    result = estimate_usage_cost("moonshotai/kimi-k3", usage, provider="openrouter")
+    # 3.00 + 15.00 + 0.30
+    assert result.amount_usd is not None and float(result.amount_usd) == 18.30  # type: ignore[arg-type]

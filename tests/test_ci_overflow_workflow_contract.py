@@ -377,23 +377,71 @@ def test_placement_job_shape_and_permissions_exact():
     assert job["outputs"]["plan_attempt"] == "${{ steps.plan.outputs.plan_attempt }}"
 
 
-def test_placement_sparse_checkout_carries_everything_the_plan_read_imports(tmp_path):
-    """The placement checkout is sparse (the full tree was the CB5 latency tail). Invariant: every
-    path the job runs from must be inside the sparse set, and the script must load from a tree that
-    holds ONLY that set -- a new top-level import outside scripts/ would fail here, not in CI."""
+def _placement_bundle() -> list[str]:
+    """Paths generate ships in the local-matrix artifact; Placement downloads it to the workspace root."""
+    doc = _tests_yml()
+    upload = next(s for s in doc["jobs"]["generate"]["steps"] if s.get("name") == "Upload local matrix for placement")
+    download = next(s for s in doc["jobs"]["placement"]["steps"]
+                    if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+    assert download["with"]["name"] == upload["with"]["name"]
+    assert download["with"]["path"] == "."  # artifact root = common ancestor of the paths = workspace
+    return upload["with"]["path"].split()
+
+
+def _scripts_import_closure(entry: str) -> set[str]:
+    """Every scripts/*.py reachable from `entry` through static `scripts.*` imports (any nesting)."""
+    import ast
+
+    seen, todo = set(), [entry]
+    while todo:
+        rel = todo.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        for node in ast.walk(ast.parse((ROOT / rel).read_text(encoding="utf-8"))):
+            mods = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mods = [node.module] + [f"{node.module}.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            for mod in mods:
+                if mod.startswith("scripts.") and (ROOT / (mod.replace(".", "/") + ".py")).is_file():
+                    todo.append(mod.replace(".", "/") + ".py")
+    return seen
+
+
+def test_placement_runs_no_checkout_and_its_artifact_carries_everything_it_runs(tmp_path):
+    """t_eb230c34: actions/checkout (even sparse, #1311) was the whole CB5 tail, so Placement has none.
+    Invariants: no checkout step; every .py the job runs, plus its static scripts.* import closure, is in
+    the artifact generate uploads; and the plan read RUNS from a tree holding ONLY those files (a new
+    import outside the bundle fails here, not in the merge queue)."""
     job = _tests_yml()["jobs"]["placement"]
-    checkout = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
-    sparse = checkout["with"]["sparse-checkout"].split()
-    assert checkout["with"].get("sparse-checkout-cone-mode", True) is True
-    for step in job["steps"]:
-        for word in str(step.get("run", "")).split():
-            if word.endswith(".py"):
-                assert any(word.startswith(d.rstrip("/") + "/") for d in sparse), (word, sparse)
-    for d in sparse:
-        shutil.copytree(ROOT / d, tmp_path / d)
-    proc = subprocess.run([sys.executable, "-I", str(tmp_path / "scripts/ci_overflow_placement.py"), "--help"],
-                          cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert not [s for s in job["steps"] if "checkout" in str(s.get("uses", ""))], "Placement must not check out"
+    bundle = _placement_bundle()
+    assert "ci-overflow/local_matrix.json" in bundle
+    ran = [w for s in job["steps"] for w in str(s.get("run", "")).split() if w.endswith(".py")]
+    assert ran == ["scripts/ci_overflow_placement.py"]
+    missing = sorted(_scripts_import_closure(ran[0]) - set(bundle))
+    assert not missing, f"imported by the plan read but not shipped to Placement: {missing}"
+    for rel in bundle:
+        if rel.endswith(".py"):
+            (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / rel, tmp_path / rel)
+    (tmp_path / "ci-overflow").mkdir()
+    (tmp_path / "ci-overflow" / "local_matrix.json").write_text(json.dumps(local_matrix(GEN_MATRIX)),
+                                                                encoding="utf-8")
+    out = tmp_path / "gh_output"
+    step = next(s for s in job["steps"] if s.get("id") == "plan")
+    env = {"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(out), "CI_REPOSITORY": "o/r", "CI_REPOSITORY_ID": "1",
+           "CI_RUN_ID": "2", "CI_RUN_ATTEMPT": "1", "CI_HEAD_SHA": "a" * 40, "CI_REQUEST_DIGEST": "",
+           "CI_MATRIX_FILE": step["env"]["CI_MATRIX_FILE"]}
+    # No digest -> decided offline (no ledger read) AFTER the matrix is parsed and every row's core flag
+    # computed through scripts.run_tests_parallel: the whole import closure executes.
+    proc = subprocess.run([sys.executable, "-I", *step["run"].split()[1:]], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
+    assert "request artifact digest missing" in proc.stdout, proc.stdout
+    assert out.read_text(encoding="utf-8") == "plan_valid=false\n"
 
 
 def test_generate_emits_local_matrix_and_request_artifact():

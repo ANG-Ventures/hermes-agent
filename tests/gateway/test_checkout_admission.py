@@ -785,3 +785,12 @@ def test_stdio_server_installs_the_admission_gate(store, monkeypatch):
 
     (resp,) = [o for o in out if o.get("id") == 7]
     assert resp["error"]["code"] == 5075
+
+
+def test_cancelling_work_counts_are_unknown_not_quiescent(store):
+    """C5: +N/-N entries sum to zero; each entry must be non-negative."""
+    store.hold("op", [GW], mode="freeze")
+    AdmissionGate(store, GW, active_work=lambda: {"agents": 2, "bogus": -2}).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN
+    assert "negative" in rep["consumers"][0]["why"]

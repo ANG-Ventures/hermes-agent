@@ -1,5 +1,5 @@
 """Unit tests for the gbrain document leg (Phase 2b) — mapping, fail-open,
-flag-off-is-inert, token caching, and the QMD-replacement gate derivation.
+flag-off-is-inert, token caching, and the prefetch/search document lanes.
 
 All HTTP is mocked; no live serve or mem0 needed. Run from the repo root:
   venv/bin/python -m pytest plugins/memory/mem0/test_gbrain_recall.py -v -o addopts=""
@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from plugins.memory.mem0 import gbrain_recall, qmd_recall
+from plugins.memory.mem0 import gbrain_recall
 from plugins.memory.mem0 import Mem0MemoryProvider
 
 
@@ -46,7 +46,7 @@ def _clear_token_cache():
 
 
 # ---------------------------------------------------------------------------
-# parse_gbrain_results: mapping to the exact QMD pointer shape
+# parse_gbrain_results: mapping to the exact pointer shape
 # ---------------------------------------------------------------------------
 
 def test_mapping_exact_pointer_shape():
@@ -58,7 +58,7 @@ def test_mapping_exact_pointer_shape():
         "line": 0,
         "docid": "gbrain:4214",
     }]
-    # pointer-only contract: exactly the five QMD keys, no chunk_text leak
+    # pointer-only contract: exactly the five pointer keys, no chunk_text leak
     assert set(out[0].keys()) == {"file", "title", "score", "line", "docid"}
 
 
@@ -275,7 +275,7 @@ def test_config_defaults_flag_off():
     assert cfg2 == gbrain_recall.GBRAIN_DEFAULTS  # unknown keys ignored, None ignored
 
 
-def _provider(qmd_enabled=False, gbrain_enabled=False, mem0_rows=None):
+def _provider(gbrain_enabled=False, mem0_rows=None):
     """Minimal provider with initialize()'s gate derivation replicated via the
     REAL initialize() config path (config dict only; network calls stubbed)."""
     p = Mem0MemoryProvider()
@@ -285,18 +285,10 @@ def _provider(qmd_enabled=False, gbrain_enabled=False, mem0_rows=None):
     p._temporal_search = False
     p._consecutive_failures = 0
     p._breaker_open_until = 0
-    p._qmd_cfg = qmd_recall.load_qmd_config({"enabled": qmd_enabled})
-    p._qmd_enabled = qmd_enabled
-    p._qmd_prefetch_enabled = qmd_enabled
-    p._qmd_search_enabled = qmd_enabled
     p._gbrain_cfg = gbrain_recall.load_gbrain_config({"enabled": gbrain_enabled})
     p._gbrain_enabled = gbrain_enabled
     p._gbrain_prefetch_enabled = gbrain_enabled
     p._gbrain_search_enabled = gbrain_enabled
-    if p._gbrain_prefetch_enabled:
-        p._qmd_prefetch_enabled = False
-    if p._gbrain_search_enabled:
-        p._qmd_search_enabled = False
 
     class _Stub:
         def search(self, **kw):
@@ -323,7 +315,7 @@ def test_flag_off_is_inert_no_gbrain_call(monkeypatch):
         return [{"file": "x", "title": "x", "score": 1.0, "line": 0, "docid": "gbrain:1"}]
     monkeypatch.setattr(gbrain_recall, "gbrain_search", spy)
 
-    p = _provider(qmd_enabled=False, gbrain_enabled=False,
+    p = _provider(gbrain_enabled=False,
                   mem0_rows=[{"memory": "fact one"}])
     out = _run_prefetch(p, "where did we decide the local dns split")
     assert called["n"] == 0
@@ -334,23 +326,17 @@ def test_flag_off_is_inert_no_gbrain_call(monkeypatch):
     assert "docs" not in reply
 
 
-def test_gbrain_replaces_qmd_prefetch(monkeypatch):
-    """gbrain on + qmd on: only the gbrain leg fires (one retrieval leg per turn)."""
-    qmd_calls = {"n": 0}
-    monkeypatch.setattr(qmd_recall, "qmd_query",
-                        lambda *a, **k: qmd_calls.__setitem__("n", qmd_calls["n"] + 1) or [])
+def test_gbrain_prefetch_injects_docs_block(monkeypatch):
+    """gbrain on: the document block follows the mem0 block."""
     monkeypatch.setattr(
         gbrain_recall, "gbrain_search",
         lambda *a, **k: [{"file": "ai/dora-doorbell/dora-ai-doorbell",
                           "title": "Dora Ai Doorbell", "score": 0.859,
                           "line": 0, "docid": "gbrain:4214"}],
     )
-    p = _provider(qmd_enabled=True, gbrain_enabled=True,
+    p = _provider(gbrain_enabled=True,
                   mem0_rows=[{"memory": "fact one"}])
-    assert p._qmd_prefetch_enabled is False   # gate derivation: QMD lane superseded
-    assert p._qmd_search_enabled is False
     out = _run_prefetch(p, "where did we decide the local dns split")
-    assert qmd_calls["n"] == 0                 # QMD never called
     assert "## Local Docs (gbrain)" in out
     assert "ai/dora-doorbell/dora-ai-doorbell" in out
     assert "## Mem0 Memory\n- fact one" in out

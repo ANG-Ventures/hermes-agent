@@ -1011,6 +1011,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "'superseded'; no --result/--summary required, but the "
                                  "pointer must be non-empty (an unnamed supersede is a "
                                  "silent delete of the work).")
+    p_complete.add_argument("--draft-ok", default=None, metavar="REASON",
+                            help="Audited per-card override for the DRAFT-PR refusal: the "
+                                 "handoff names a draft PR that is intentionally left open "
+                                 "(e.g. a CI vehicle for an upstream PR). The draft is not "
+                                 "routed to review; a completion_draft_override event records "
+                                 "the PRs and REASON. An empty REASON is refused.")
     p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
                                  "remote, not in the workspace. Verified with git ls-remote "
@@ -1910,6 +1916,20 @@ def kanban_command(args: argparse.Namespace) -> int:
         if not handler:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
+        gated_flags = [
+            flag for flag, dest in (("--takeover", "foreign_ok"), ("--operator", "operator"))
+            if getattr(args, dest, None)
+        ]
+        if gated_flags and action in kb.OPERATOR_FLAG_GATED_ACTIONS:
+            try:
+                with kb.connect_closing() as gate_conn:
+                    kb.enforce_operator_flag_gate(
+                        gate_conn, _lifecycle_target_ids(args), action,
+                        flags=gated_flags, argv=sys.argv,
+                    )
+            except kb.OperatorTokenRequiredError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
         actor_scope = contextlib.nullcontext()
         caller_sid = _caller_session_id() if action in _HOME_GUARDED_ACTIONS else None
         if action in _HOME_GUARDED_ACTIONS and not caller_sid:
@@ -4540,6 +4560,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     superseded_by = getattr(args, "superseded_by", None)
+    draft_ok = getattr(args, "draft_ok", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -4550,9 +4571,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_none = getattr(args, "survivor_none", False)
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
-                         or survivor_unbound or survivor_none or survivor_reason or superseded_by):
+                         or survivor_unbound or survivor_none or survivor_reason or superseded_by
+                         or draft_ok is not None):
         print(
-            "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
+            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --survivor-ref / "
             "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
@@ -4616,8 +4638,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_none=survivor_none,
                     survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
+                    draft_ok=draft_ok,
                 )
-            except kb.EmptySupersedeError as supersede_err:
+            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
@@ -4640,7 +4663,25 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                           f"{outcome or 'handoff names a still-OPEN PR'}")
                 else:
                     print(f"Completed {tid}")
+                override = _draft_override_of(conn, tid, last_event)
+                if override:
+                    print(f"  draft override recorded for {', '.join(override['prs'])}: "
+                          f"{override['reason']}")
     return 0 if not failed else 1
+
+
+def _draft_override_of(conn, tid: str, after_event_id):
+    """This completion's ``completion_draft_override`` payload on ``tid``, or None."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND id > ? AND kind = "
+        "'completion_draft_override' ORDER BY id DESC LIMIT 1", (tid, after_event_id or 0),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:

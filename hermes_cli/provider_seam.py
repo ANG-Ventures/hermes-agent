@@ -282,6 +282,18 @@ def publish(delta: Mapping[str, Any]) -> Generation:
     unknown = [n for n in delta if n != _COMMITTED and n not in _KINDS]
     if unknown:
         raise KeyError(f"unknown seam container(s): {sorted(unknown)}")
+    # Materialize once: ``build`` may run twice (optimistic, then under the
+    # lock after a concurrent swap) and reads ``committed`` names twice, so a
+    # one-shot iterable would be exhausted and silently publish nothing.
+    delta = {
+        name: (
+            {lane: tuple(names) for lane, names in dict(entries).items()}
+            if name == _COMMITTED
+            else dict(entries) if _KINDS[name] == "dict"
+            else tuple(entries)
+        )
+        for name, entries in delta.items()
+    }
 
     def build(base: Generation) -> Optional[_Plan]:
         committed_delta = delta.get(_COMMITTED) or {}

@@ -45,30 +45,35 @@ _wake = threading.Event()
 
 def describe_call(name: str, args: Any) -> str:
     """One-line, bounded description of what the call is doing."""
-    text = ""
-    if isinstance(args, dict):
-        for key in _DESCRIBE_KEYS:
-            value = args.get(key)
-            if isinstance(value, str) and value.strip():
-                text = value
-                break
-        else:
-            try:
-                text = json.dumps(args, default=str, ensure_ascii=False)
-            except Exception:
-                text = str(args)
-    elif args is not None:
-        text = str(args)
-    text = " ".join(text.split())
     # Redact BEFORE truncating: a cut can leave a key fragment too short for the log
     # formatter's pattern to recognise, and URL credentials are not redacted there
-    # by default. force=True: this is a safety boundary (Backfill C3).
+    # by default. force=True: this is a safety boundary (Backfill C3). A dict with no
+    # descriptive key is redacted per leaf before serializing (t_d59ca5db guard).
+    kw = {"force": True, "redact_url_credentials": True}
+    text = ""
     try:
-        from agent.redact import redact_sensitive_text
+        from agent.redact import redact_sensitive_json, redact_sensitive_text
 
-        text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+        if isinstance(args, dict):
+            for key in _DESCRIBE_KEYS:
+                value = args.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = redact_sensitive_text(value, **kw)
+                    break
+            else:
+                try:
+                    text = json.dumps(
+                        redact_sensitive_json(args, **kw),
+                        default=lambda o: redact_sensitive_text(str(o), **kw),
+                        ensure_ascii=False,
+                    )
+                except Exception:
+                    text = redact_sensitive_text(str(args), **kw)
+        elif args is not None:
+            text = redact_sensitive_text(str(args), **kw)
     except Exception:
         return f"<{name} args unavailable>"
+    text = " ".join(text.split())
     if len(text) > MAX_CMD_CHARS:
         text = text[:MAX_CMD_CHARS] + "\u2026"
     return text

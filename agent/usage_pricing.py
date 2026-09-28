@@ -1537,6 +1537,24 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://docs.fireworks.ai/serverless/pricing",
         pricing_version="fireworks-pricing-2026-07",
     ),
+    # ── OpenRouter-hosted third-party models ─────────────────────────────
+    # Keyed on the OpenRouter namespaced id, consulted first on the
+    # ``openrouter`` route (see get_pricing_entry). Without a row these price
+    # from the live models.dev/OpenRouter catalog, which the subs.ace ledger
+    # must not depend on per row. OpenRouter publishes no cache-write rate.
+    # Source: https://openrouter.ai/moonshotai/kimi-k3 (models API 2026-09-28:
+    # prompt $3/M, completion $15/M, input_cache_read $0.30/M)
+    (
+        "openrouter",
+        "moonshotai/kimi-k3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3",
+        pricing_version="openrouter-pricing-2026-09",
+    ),
 }
 
 # GPT-5.6 "-pro" high-effort variants bill at the same per-token rates as
@@ -2423,6 +2441,9 @@ def get_pricing_entry(
         # source="none"/$0 while a correct entry sat unused. The docstring
         # above (external is consulted only AFTER the snapshot misses) is the
         # contract; this makes the notional route honor it.
+        snapshot = _OFFICIAL_DOCS_PRICING.get(("openrouter", route.model.lower()))
+        if snapshot is not None:
+            return snapshot
         snapshot = _lookup_official_docs_pricing(
             BillingRoute(
                 provider="openai",

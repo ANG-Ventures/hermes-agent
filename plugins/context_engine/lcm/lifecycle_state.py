@@ -794,11 +794,16 @@ class LifecycleStateStore:
                 # this session between the read-only pass and now.
                 if _session_has_data(cur) or _session_has_data(fin):
                     continue
-                conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (conversation_id,),
+                # ...and only while the row still references the sessions the
+                # read-only pass judged empty: a rebind in between points it at
+                # a new session with no messages yet, which must survive.
+                cursor = conn.execute(
+                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ? "
+                    "AND COALESCE(current_session_id, '') = ? "
+                    "AND COALESCE(last_finalized_session_id, '') = ?",
+                    (conversation_id, cur, fin),
                 )
-                deleted += 1
+                deleted += cursor.rowcount or 0
 
             if deleted:
                 conn.commit()

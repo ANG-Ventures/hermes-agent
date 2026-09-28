@@ -34,7 +34,10 @@ LEDGER_BRANCH = "ci-overflow-ledger"
 LEDGER_PATH = "state.json"
 E2E_JOB_ID = "e2e"
 POLL_DEADLINE_S = 180
-POLL_INTERVAL_S = 5
+# 2 s, not 5 (t_eb230c34): the controller commits the plan ~4 s after the artifact lands, so a 5 s read
+# cadence alone could add up to 5 s to CB5. A read is one GITHUB_TOKEN contents GET; a full 180 s miss is
+# 90 of them, well inside the job token's hourly allowance, and a refused request now fails at once.
+POLL_INTERVAL_S = 2
 
 
 class PlanInvalid(ValueError):

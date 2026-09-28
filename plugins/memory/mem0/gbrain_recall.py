@@ -1,16 +1,15 @@
 """gbrain document-recall leg for the mem0 plugin (Phase 2b, 2026-07-08).
 
-A flag-gated ALTERNATIVE to the QMD leg (qmd_recall): when the `mem0_gbrain` config
-block sets `enabled: true`, the prefetch + mem0_search document lanes call the warm
-gbrain serve (loopback MCP-over-HTTP, OAuth 2.1 client_credentials) instead of the
-QMD daemon. One retrieval leg per turn — never both.
+The only document leg (the qmd leg was retired 2026-08-28): when the `mem0_gbrain`
+config block sets `enabled: true`, the prefetch + mem0_search document lanes call the
+warm gbrain serve (loopback MCP-over-HTTP, OAuth 2.1 client_credentials).
 
-Design mirrors qmd_recall on purpose:
+Design:
 - stdlib-only (http.client / urllib), no `mcp` SDK, no new pip dependency;
 - a hard wall-clock deadline enforced by a watchdog that shuts the live socket
   (interrupts an SSE keepalive trickle hang);
 - degraded-safe: ANY failure -> [] — a down gbrain must never break a turn;
-- returns the exact QMD pointer shape [{file, title, score, line, docid}] so the
+- returns the pointer shape [{file, title, score, line, docid}] so the
   hits ride the existing rendering / budget / intent-gate machinery unchanged.
   `file` carries the gbrain page slug (the brain's stable identifier — resolvable
   via `rail.sh graph <slug>` / the `get_page` op); `docid` is "gbrain:<page_id>".
@@ -36,28 +35,35 @@ from urllib.parse import urlencode, urlparse
 logger = logging.getLogger(__name__)
 
 # ---- config defaults --------------------------------------------------------
-# Mirrors qmd_recall.QMD_DEFAULTS' shape/gating semantics. Loaded from the
-# `mem0_gbrain` (fallback `gbrain`) block of mem0.json — the SAME config surface
-# _qmd_cfg comes from. `enabled` defaults False: deploy is inert until flipped.
+# Loaded from the `mem0_gbrain` (fallback `gbrain`) block of mem0.json.
+# `enabled` defaults False: deploy is inert until flipped.
 GBRAIN_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
     # Sub-lane gates (meaningful only when `enabled`). Both default true so flipping
-    # only `enabled` swaps BOTH lanes from QMD to gbrain in one move.
+    # only `enabled` turns BOTH lanes on in one move.
     "prefetch_enabled": True,
     "search_enabled": True,
     "url": "http://127.0.0.1:8199",           # warm serve base (launchd ai.gbrain.serve)
     "creds_path": "~/gbrain/.gbrain/rail-client.env",
     # Whole-operation wall-clock deadline (token mint, when needed, included).
     # gbrain `search` measured warm p50 1.14s / p95 1.58s (2026-07-08) — 4.0s
-    # matches the QMD budget precedent and leaves headroom for a cold token mint.
+    # leaves headroom for a cold token mint.
     "total_deadline_s": 4.0,
-    "mem0_budget_s": 6.0,      # same INV-4a semantics as the QMD leg
+    "mem0_budget_s": 6.0,      # INV-4a: skip the leg when mem0 overran this
     # gbrain scores are calibrated-ish vector/RRF blends (top hits ~0.8+); 0.5
     # trims junk-tail rows without clipping legitimate rank-2/3 results.
     "min_score": 0.5,
     "prefetch_limit": 3,
     "search_limit": 5,
-    "intent_min_tokens": 1,    # reuses qmd_recall.is_lookup_intent (same gate)
+    "intent_min_tokens": 1,    # floor for is_lookup_intent; the leader-word set is the real gate
+}
+
+# leading tokens that mark a NON-lookup turn (affirmation / imperative-action) — D-9/INV-7
+_NON_LOOKUP_LEADERS = {
+    "yes", "yep", "yeah", "ok", "okay", "sure", "thanks", "thank", "thx", "ty",
+    "ship", "do", "go", "fix", "run", "add", "delete", "remove", "make", "build",
+    "create", "commit", "push", "merge", "send", "post", "stop", "cancel", "no",
+    "nope", "yup", "sounds", "great", "perfect", "good", "nice", "cool",
 }
 
 _TOKEN_REFRESH_MARGIN_S = 120.0
@@ -205,12 +211,12 @@ def _extract_json(raw: str) -> Optional[Any]:
 
 
 def parse_gbrain_results(payload: Any, min_score: float) -> List[Dict[str, Any]]:
-    """Pure: map a `search` tools/call response to the QMD pointer shape.
+    """Pure: map a `search` tools/call response to the pointer shape.
 
     GROUND-TRUTHED response shape (v0.42.x, 2026-07-08): the MCP result carries
     result.content[0].text = a JSON ARRAY of rows, each with slug / page_id /
     title / score (float) / chunk_text / ... . Pointers only — chunk_text is
-    DROPPED (same INV-5 posture as the QMD leg: never inject document bodies).
+    DROPPED (INV-5: never inject document bodies).
     """
     try:
         result = (payload or {}).get("result", {})
@@ -248,7 +254,7 @@ def parse_gbrain_results(payload: Any, min_score: float) -> List[Dict[str, Any]]
 
 
 def render_gbrain_block(hits: List[Dict[str, Any]]) -> str:
-    """Pure renderer, same contract as qmd_recall.render_qmd_block: empty -> ""
+    """Pure renderer: empty -> ""
     (no header). The header names the backend so a transcript reader can tell
     which leg served the turn."""
     if not hits:
@@ -259,6 +265,28 @@ def render_gbrain_block(hits: List[Dict[str, Any]]) -> str:
         title = h.get("title") or h.get("file", "")
         lines.append(f"- {h.get('file','')} — {title} ({pct})")
     return "\n".join(lines)
+
+
+def is_lookup_intent(query: str, min_tokens: int) -> bool:
+    """Pure intent gate (D-9). False for short or imperative/affirmation turns."""
+    if not query or not query.strip():
+        return False
+    toks = query.strip().lower().split()
+    if len(toks) < max(1, int(min_tokens)):
+        return False
+    first = "".join(ch for ch in toks[0] if ch.isalpha())
+    if first in _NON_LOOKUP_LEADERS:
+        return False
+    return True
+
+
+def join_blocks(mem0_block: str, docs_block: str) -> str:
+    """Join the two recall blocks. Skip the separator when a side is empty (INV-6/m2 byte-guard)."""
+    a = mem0_block or ""
+    b = docs_block or ""
+    if a and b:
+        return a + "\n\n" + b
+    return a or b
 
 
 def gbrain_search(query: str, *, limit: int, min_score: float, deadline_s: float,
