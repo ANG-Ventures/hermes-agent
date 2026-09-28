@@ -352,3 +352,31 @@ def test_worker_process_title_keeps_task_id(monkeypatch):
     assert _scan_with(monkeypatch, [_FakeProc(999997, rewritten, euid=euid)]) is True
     hmain._set_process_title()
     assert titles[-1] == "hermes"
+
+
+class _FakeParent:
+    def __init__(self, cmdline=None, env=None):
+        self._cmdline, self._env = cmdline, env
+
+    def cmdline(self):
+        if self._cmdline is None:
+            raise psutil.AccessDenied(1)
+        return self._cmdline
+
+    def environ(self):
+        if self._env is None:
+            raise psutil.AccessDenied(1)
+        return self._env
+
+
+def test_ancestor_check_skips_unreadable_and_matches_grant_or_title(monkeypatch):
+    """CI runners/containers have unreadable ancestors; they are not the worker.
+    Failing closed on them refused every override there (#1442 CI)."""
+    monkeypatch.delenv(_TASK_ENV, raising=False)
+    unreadable = _FakeParent()
+    shell = _FakeParent(["sh", "-c", "hermes kanban reclaim t_scan"], env={})
+    assert kb._caller_inside_task_worker("t_scan", [unreadable, shell]) is False
+    granted = _FakeParent(["hermes"], env={_TASK_ENV: "t_scan"})
+    assert kb._caller_inside_task_worker("t_scan", [unreadable, granted]) is True
+    titled = _FakeParent([kb.KANBAN_WORKER_PROCTITLE.format(task_id="t_scan")])
+    assert kb._caller_inside_task_worker("t_scan", [titled]) is True

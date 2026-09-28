@@ -17661,7 +17661,7 @@ def _host_process_mentions_task(task_id: str) -> bool:
         # ancestor (or this very process). Its env grant is inherited by every
         # descendant, so check it before excluding anyone (FleetReview
         # 2362caff15e1 on #1404).
-        if _caller_inside_task_worker(task_id, parents, my_euid):
+        if _caller_inside_task_worker(task_id, parents):
             return True
         own = {me.pid, *(p.pid for p in parents)}
         for proc in psutil.process_iter(["pid", "cmdline", "status", "uids"]):
@@ -17700,7 +17700,7 @@ def _proc_is_titled_worker(cmdline, task_id: str) -> bool:
     return joined == KANBAN_WORKER_PROCTITLE.format(task_id=task_id)
 
 
-def _caller_inside_task_worker(task_id: str, parents, my_euid) -> bool:
+def _caller_inside_task_worker(task_id: str, parents) -> bool:
     """True if this process runs inside ``task_id``'s own worker tree.
 
     The worker's env grant (``HERMES_KANBAN_TASK``) is inherited by every
@@ -17708,36 +17708,24 @@ def _caller_inside_task_worker(task_id: str, parents, my_euid) -> bool:
     ancestor's env grant and process title are read too. A bare task id in
     an ancestor's argv is NOT a match: the operator's own shell
     (``sh -c '... reclaim t_x'``) names the task (FleetReview c18fd1d3b7f7
-    on #1442). An unreadable env alone is not inconclusive either: a same-uid
-    process hides its env only when it is non-dumpable (sshd, setgid), and a
-    Python worker is not. A same-uid ancestor with NEITHER readable counts as
-    a match (fail closed).
+    on #1442). An ancestor whose title or env cannot be read is skipped, as
+    every ancestor was before: a dispatcher worker is a same-uid Python
+    process whose argv and env are readable, while CI runners and containers
+    do have unreadable ancestors, and failing closed on them refused every
+    override there.
     """
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
         return True
     for parent in parents:
         try:
-            cmdline = parent.cmdline()
-        except psutil.NoSuchProcess:
-            continue
-        except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            cmdline = None
-        if cmdline is not None and _proc_is_titled_worker(cmdline, task_id):
-            return True
+            if _proc_is_titled_worker(parent.cmdline(), task_id):
+                return True
+        except (psutil.Error, OSError):
+            pass
         try:
             env = parent.environ()
-        except psutil.NoSuchProcess:
+        except (psutil.Error, OSError):
             continue
-        except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            if cmdline is not None:
-                continue
-            try:
-                euid = parent.uids().effective
-            except Exception:
-                return True
-            if my_euid is not None and euid != my_euid:
-                continue
-            return True
         if (env.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
             return True
     return False
