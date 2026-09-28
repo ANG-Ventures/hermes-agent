@@ -1503,3 +1503,29 @@ def test_pool_budget_pinned_route_honours_an_explicit_probe(pool, bpr):
     assert got == 0
     # No explicit probe: the pinned lane still spends one subscription.
     assert ph.pool_budget_eligible("claude-bpx-22", {}, {}, _urls(None, bpr.url)) == 1
+
+
+def test_steady_state_deferral_is_recorded_once(home, apr):
+    """FleetReview #83: an unchanged pool_budget deferral appended one event
+    per backlogged card per tick. Identical back-to-back deferrals collapse;
+    a changed one still records."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        for i in range(5):
+            _running_run(conn, kb.create_task(conn, title=f"r-{i}", assignee="argus"),
+                         {"pool": "claude-apr"})
+        tid = kb.create_task(conn, title="backlog", assignee="argus")
+        for _ in range(3):
+            kb.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100,
+                             max_in_progress=100)
+        assert len(_events(conn, tid, "deferred")) == 1
+        apr.eligible = 2  # the budget changed: a new deferral row
+        getattr(ph, "_PROBE_STATE", {}).clear()
+        _running_run(conn, kb.create_task(conn, title="r-5", assignee="argus"),
+                     {"pool": "claude-apr"})
+        kb.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100, max_in_progress=100)
+        deferred = _events(conn, tid, "deferred")
+        assert len(deferred) == 2 and deferred[-1]["eligible"] == 2
