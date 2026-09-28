@@ -17135,6 +17135,13 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    spawn_capped: Optional[str] = None
+    """Non-None when a concurrency cap or the per-tick spawn limit left this
+    tick with a spawn budget of ZERO (``kanban.max_spawn`` / ``--max``,
+    ``kanban.max_in_progress`` host cap, or the load-gate ``spawn_limit``).
+    The string names the cap and the numbers that tripped it, so a manual
+    ``hermes kanban dispatch`` that spawns nothing says WHY instead of
+    printing a bare ``Spawned: 0`` (t_f78d1938)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -20184,6 +20191,44 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def count_spawnable_demand(
+    conn: sqlite3.Connection,
+    *,
+    default_assignee: Optional[str] = None,
+    include_review: bool = False,
+) -> int:
+    """Upper bound on the spawns this board could use this tick.
+
+    Ready (and, with ``include_review``, review) unclaimed tasks whose
+    assignee is a real Hermes profile, plus unassigned ready tasks when
+    ``default_assignee`` is set. Used by the gateway dispatcher to split one
+    per-tick load-gate allowance across boards (t_f78d1938). Deliberately a
+    superset of what :func:`dispatch_once` will actually spawn: an
+    under-count here would give a board a zero quota.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None
+    statuses = ["ready"] + (["review"] if include_review else [])
+    rows = conn.execute(
+        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+        f"WHERE status IN ({','.join('?' * len(statuses))}) "
+        "    AND claim_lock IS NULL GROUP BY assignee, status",
+        tuple(statuses),
+    ).fetchall()
+    total = 0
+    for row in rows:
+        who = row["assignee"]
+        if not who:
+            if row["status"] == "ready" and default_assignee:
+                total += int(row["n"])
+            continue
+        if profile_exists is None or profile_exists(who):
+            total += int(row["n"])
+    return total
+
+
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -21170,6 +21215,9 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.spawn_capped = (
+                f"max_spawn={max_spawn} reached: {running_count} running on this board"
+            )
             return result
         spawn_budget = max_spawn - running_count
 
@@ -21186,6 +21234,10 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_capped = (
+                f"max_in_progress={max_in_progress} reached: {total_running} "
+                f"running host-wide ({running_count} on this board)"
+            )
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -21199,6 +21251,10 @@ def _dispatch_once_locked(
         _limit = max(0, int(spawn_limit))
         if spawn_budget is None or spawn_budget > _limit:
             spawn_budget = _limit
+        if _limit == 0:
+            result.spawn_capped = (
+                "load gate: this tick's spawn allowance for this board is 0"
+            )
 
     # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
     # can't see the host's actual memory state (other tenants, bloated
