@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 import threading
 import time
@@ -60,10 +61,13 @@ def main() -> int:
     result: dict = {}
 
     if phase == "interrupt":
-        prompt = f"RUN_TOOL:touch {marker} && sleep 60"
+        prompt = f"RUN_TOOL:touch {shlex.quote(marker)} && sleep 60"
 
         def run():
-            result["r"] = agent.run_conversation(prompt)
+            try:
+                result["r"] = agent.run_conversation(prompt)
+            except BaseException as exc:  # surfaced below, never read as "not interrupted"
+                result["exc"] = exc
 
         t = threading.Thread(target=run, daemon=True)
         t.start()
@@ -79,6 +83,9 @@ def main() -> int:
         if t.is_alive():
             print(json.dumps({"error": "turn did not unwind after interrupt"}))
             return 3
+        if "exc" in result:
+            print(json.dumps({"error": f"turn raised {result['exc']!r}"}))
+            return 4
         r = result.get("r") or {}
         print(json.dumps({"interrupted": bool(r.get("interrupted"))}))
         return 0

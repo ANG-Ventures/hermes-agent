@@ -2071,7 +2071,7 @@ def test_runtime_tree_is_checked_against_a_real_git_checkout(
             stdout=subprocess.PIPE, text=True,
         ).stdout.strip()
 
-    git("init", "-q")
+    git("init", "-q", "-b", "main")  # never init.defaultBranch=upstream
     git("commit", "-q", "--allow-empty", "-m", "base")
     base = git("rev-parse", "HEAD")
     git("checkout", "-q", "-b", "upstream")

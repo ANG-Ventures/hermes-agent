@@ -61,7 +61,9 @@ contract + cold artifact, execution + base/head differential, cross-vendor +
 aliases/entry points, mutation + test-of-test. Inspect raw traces and reconcile
 ALL findings before one verdict; never serialize lenses across review rounds.
 Record the actual delegate batch id in a card comment. If delegation itself is
-unavailable, do all four personally in the same round and name the limitation.
+unavailable, do all four personally in the same round and name the limitation;
+`batch_id` is then `"n/a: <reason>"` (e.g. `"n/a: delegate_task not in this
+toolset, four lenses run personally"`), never an invented id.
 
 Before EVERY `kanban_request_changes`, post a current-run comment containing
 a single JSON line:

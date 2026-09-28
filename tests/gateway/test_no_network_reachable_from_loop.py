@@ -80,10 +80,15 @@ NETWORK_SINK_DOTTED = frozenset({
     "requests.get",
     "requests.post",
     "requests.put",
+    "requests.patch",
+    "requests.delete",
     "requests.head",
     "requests.request",
     "httpx.get",
     "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
     "httpx.request",
     "socket.create_connection",
     "request.urlopen",
@@ -114,9 +119,7 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run.py _prepare_inbound_message_text -> urlopen",
     "gateway/run.py _run_agent_admitted -> open_credentialed_url",
     "gateway/run.py _run_background_task_inner -> urlopen",
-    "gateway/run.py _stop_impl -> requests.get",
     "gateway/run.py start -> urlopen",
-    "gateway/run.py stop -> requests.get",
     # _handle_btw_command: gone -- its runtime resolve is offloaded (t_515b7fce).
     # _handle_compress_command_inner: gone -- _compress_context runs under
     # _run_in_executor_with_context, which the walker now counts (t_7189c691).
@@ -126,6 +129,13 @@ REACHABLE_BASELINE = frozenset({
     "gateway/slash_commands.py _handle_refine_command -> httpx.get",
     "gateway/slash_commands.py _handle_review_command -> urlopen",
     "plugins/platforms/matrix/adapter.py send_model_picker -> requests.get",
+    # Surfaced 2026-09-28 (t_cd88e043 #82) when requests.delete/patch and
+    # httpx.put/patch/delete joined the sink set: shutdown reaches the camofox
+    # browser close (_delete) synchronously. Pre-existing; burn-down item.
+    # The walker names ONE sink per coroutine, so these replace the old
+    # ``stop``/``_stop_impl -> requests.get`` entries (same coroutines).
+    "gateway/run.py _stop_impl -> requests.delete",
+    "gateway/run.py stop -> requests.delete",
 })
 
 # Coroutines this change took off the network path. They must stay off it.
