@@ -112,7 +112,10 @@ def query_pr_state(repo: str, number: int) -> Optional[dict]:
         return None
     if not isinstance(payload, dict) or not payload.get("state"):
         return None
-    return {"state": "MERGED" if payload.get("merged_at") else str(payload["state"]).upper()}
+    out = {"state": "MERGED" if payload.get("merged_at") else str(payload["state"]).upper()}
+    if out["state"] == "MERGED" and payload.get("merge_commit_sha"):
+        out["merge_commit_sha"] = str(payload["merge_commit_sha"])
+    return out
 
 
 def _default_query() -> Optional[QueryFn]:

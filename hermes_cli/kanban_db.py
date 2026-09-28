@@ -9924,14 +9924,47 @@ class EmptyDraftOverrideError(ValueError):
         )
 
 
+def _merged_survivor_prs(metadata: Optional[dict], survivor_pr) -> Optional[list]:
+    """``["o/r#N @ <merge sha>", ...]`` when EVERY fleet PR the handoff owns
+    (``--survivor-pr`` + metadata pr_url/pr_urls/pr) is REST ``merged=true``;
+    None when there is none, any is not merged, or a lookup cannot tell.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+
+    own = _open_pr.split_fleet(
+        _open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
+    query = _open_pr.memo_query() if own else None
+    if query is None:
+        return None
+    merged = []
+    for ref in own:
+        try:
+            state = query(ref.repo, ref.number)
+        except Exception as exc:
+            _log.warning("branch-base: %s#%s lookup failed: %s", ref.repo, ref.number, exc)
+            return None
+        if not isinstance(state, dict) or str(state.get("state") or "").upper() != "MERGED":
+            return None
+        sha = str(state.get("merge_commit_sha") or "")[:12] or "?"
+        merged.append(f"{ref.repo}#{ref.number} @ {sha}")
+    return merged
+
+
 def _enforce_branch_base(
-    conn: sqlite3.Connection, task: "Task", metadata: Optional[dict]
+    conn: sqlite3.Connection, task: "Task", metadata: Optional[dict],
+    survivor_pr=None,
 ) -> None:
     """Branch-base guard on a worker handoff (t_18e781d0).
 
     Raises :class:`kanban_branch_base.StaleBaseError` -- before any mutation
     other than one audit event -- when a checkout in the worker's workspace
     is cut from a stale/foreign base. Fail-open on anything it cannot measure.
+
+    A handoff whose own PRs are all already merged (t_22c91696) passes: the
+    stale post-merge workspace branch is measured against a trunk that holds
+    the squash of that very PR, so the "foreign" commit and the conflict are
+    the merge itself. Recorded as ``base_guard_survivor_merged``. An OPEN PR
+    keeps the guard -- that is the branch that will not land.
     """
     from hermes_cli import kanban_branch_base as _bb
 
@@ -9945,9 +9978,17 @@ def _enforce_branch_base(
             metadata=metadata,
         )
     except _bb.StaleBaseError as err:
+        failures = {r.repo: r.failures for r in err.reports}
+        merged = _merged_survivor_prs(metadata, survivor_pr)
+        if merged:
+            with write_txn(conn):
+                _append_event(conn, task.id, "base_guard_survivor_merged", {
+                    "survivor_merged": merged, "failures": failures,
+                })
+            return
         with write_txn(conn):
             _append_event(conn, task.id, "completion_blocked_stale_base", {
-                "failures": {r.repo: r.failures for r in err.reports},
+                "failures": failures,
             })
         raise
     except Exception as exc:  # the guard must never break a handoff by crashing
@@ -10113,7 +10154,7 @@ def complete_task(
     # stale/foreign base is refused here, in the worker's run, not at the
     # merge pass (t_18e781d0). Reviewer approvals are not implementer work.
     if candidate.status == 'running' and not approve_head_sha:
-        _enforce_branch_base(conn, candidate, metadata)
+        _enforce_branch_base(conn, candidate, metadata, survivor_pr=survivor_pr)
     # A completion whose evidence names a still-OPEN PR is a review handoff,
     # not ``done``: done releases dependants, and an unmerged PR has no owner
     # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
