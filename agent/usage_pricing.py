@@ -593,6 +593,17 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://models.dev/api.json",
         pricing_version="modelsdev-2026-09-28",
     ),
+    # grok-3-mini-fast: absent from models.dev/OpenRouter 2026-09-28; xAI's
+    # published launch rate (grok-3-mini-fast-beta) is $0.60/$4.00, NOT the
+    # grok-3-mini rate. No cache-read rate published: cache read = input.
+    ("xai", "grok-3-mini-fast"): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.60"),
+        source="official_docs_snapshot",
+        source_url="https://docs.x.ai/docs/models",
+        pricing_version="xai-grok-3-mini-fast-launch-2025",
+    ),
     # ── OpenAI GPT-5.6 series (Sol/Terra/Luna) ───────────────────────────
     # Announced in limited preview 2026-06-26; GA 2026-07-09 at the same
     # rates (Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M in/out). Cache
@@ -1783,7 +1794,6 @@ for _vendor, _alias, _canonical in (
     ("xai", "grok-4.20-0309-reasoning", "grok-4.20"),  # models.dev xai
     ("xai", "grok-4.20-0309-non-reasoning", "grok-4.20"),  # models.dev xai
     ("xai", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent"),  # models.dev xai
-    ("xai", "grok-3-mini-fast", "grok-3-mini"),  # sibling grok-3-mini
     ("xai", "grok-4.7-build-fast", "grok-build-0.1"),  # sibling grok-build-0.1
     ("xai", "grok-composer-2.5-fast", "grok-build-0.1"),  # sibling grok-build-0.1
     ("moonshotai", "kimi-k2.8", "kimi-k2.7-code"),  # sibling kimi-k2.7-code

@@ -42,6 +42,15 @@ def test_non_proxy_vendor_on_cpa_stays_unpriced():
     assert result.status == "unknown", result
 
 
+def test_grok_3_mini_fast_has_its_own_rate():
+    # FleetReview 58d4eee8312e: the fast variant is priced above grok-3-mini.
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+    fast = estimate_usage_cost("grok-3-mini-fast", usage, provider="cpa")
+    base = estimate_usage_cost("grok-3-mini", usage, provider="cpa")
+    assert fast.amount_usd == Decimal("4.60")
+    assert fast.amount_usd > base.amount_usd
+
+
 def test_k3_numbers_unchanged():
     usage = CanonicalUsage(input_tokens=1_000, output_tokens=100, cache_read_tokens=500)
     for model in ("kimi-k3", "kimi-k3-256k", "k3"):
