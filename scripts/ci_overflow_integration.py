@@ -38,6 +38,7 @@ CONTROLLER_IDENTITY = re.compile(
     r"|BEGIN (?:RSA )?PRIVATE KEY")
 PRE_EXISTING_SECRETS = {"AUTOFIX_BOT_PAT", "CI_FAIL_WEBHOOK_SECRET"}
 PROBE_LINE = re.compile(r"PROBE slice=(\S+) executing_attempt=(\d+) planned_attempt=(\d+)")
+_PLANNER_JOBS = ("Generate slices", "Placement")
 
 
 # -- pure gates (unit-tested; take data, not the network) ---------------------------------------
@@ -128,6 +129,31 @@ def selective_rerun_verdict(original: list[dict], rerun: list[dict], probe_lines
     return check(name, "PASS", evidence)
 
 
+def _reused_jobs(prior: list[dict], jobs: list[dict]) -> list[str]:
+    """Jobs of the later attempt that are the prior attempt's execution carried over (same start + runner)."""
+    by_name = {j["name"]: j for j in prior}
+    return [j["name"] for j in jobs
+            if (p := by_name.get(j["name"])) is not None
+            and p["started_at"] == j["started_at"] and p["runner_name"] == j["runner_name"]]
+
+
+def full_rerun_verdict(prior: list[dict], jobs: list[dict], probe_lines: dict[str, str], attempt: int) -> CheckResult:
+    """A full re-run re-executes EVERY job and every slice's PROBE plan equals ``attempt``. One matching
+    slice alongside reused jobs is a selective re-run, not a full one."""
+    name = "ac3_full_rerun_regenerates_plan"
+    reused = _reused_jobs(prior, jobs)
+    planned = []
+    for job in jobs:
+        m = PROBE_LINE.search(probe_lines.get(job["name"], ""))
+        if m:
+            planned.append({"job": job["name"], "executing": int(m.group(2)), "planned": int(m.group(3))})
+    ok = bool(planned) and not reused and all(p["executing"] == p["planned"] == attempt for p in planned)
+    return check(name, "PASS" if ok else "BLOCK", {"attempt": attempt, "slices": planned, "reused": reused,
+                 "note": "GitHub-side half only: controller fresh reservation is exercised under ac3_live_*"},
+                 "" if ok else ("jobs carried over from the prior attempt: selective, not full, re-run" if reused
+                                else "full re-run did not re-plan"))
+
+
 # -- live gates ----------------------------------------------------------------------------------
 def _run_jobs(repo: str, run_id: int, attempt: int) -> list[dict]:
     data = api(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
@@ -191,15 +217,9 @@ def full_rerun(repo: str, run_id: int | None, attempt: int | None) -> CheckResul
         return check(name, "UNVERIFIABLE", {}, "supply --rerun-probe-run and --full-rerun-attempt")
     try:
         jobs = _run_jobs(repo, run_id, attempt)
-        planned = []
-        for job in jobs:
-            m = PROBE_LINE.search(_job_log(repo, job["id"]))
-            if m:
-                planned.append({"job": job["name"], "executing": int(m.group(2)), "planned": int(m.group(3))})
-        ok = planned and all(p["executing"] == p["planned"] == attempt for p in planned)
-        return check(name, "PASS" if ok else "BLOCK", {"attempt": attempt, "slices": planned,
-                     "note": "GitHub-side half only: controller fresh reservation is exercised under ac3_live_*"},
-                     "" if ok else "full re-run did not re-plan")
+        prior = _run_jobs(repo, run_id, attempt - 1) if attempt > 1 else []
+        logs = {job["name"]: _job_log(repo, job["id"]) for job in jobs}
+        return full_rerun_verdict(prior, jobs, logs, attempt)
     except (RuntimeError, ValueError, KeyError) as exc:
         return check(name, "UNVERIFIABLE", {}, str(exc))
 

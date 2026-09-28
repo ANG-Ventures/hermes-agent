@@ -172,3 +172,56 @@ def test_missing_trigger_still_repaired():
     assert result["triggers_recreated"] is True
     assert external_content_fts_needs_repair(conn, spec) is False
     conn.close()
+
+
+def test_trigger_only_repair_keeps_a_deep_corruption_flag():
+    """k119: recreating triggers does not repair the index; a deep-check
+    corruption flag must survive a pass that rebuilt nothing."""
+    import time
+
+    from plugins.context_engine.lcm.db_bootstrap import (
+        _record_integrity_checked,
+        _record_integrity_failed,
+        _record_parity_checked,
+        load_integrity_failed,
+    )
+
+    conn = sqlite3.connect(":memory:")
+    _make_db(conn, stale=True)
+    spec = build_message_fts_spec()
+    now = time.time()
+    _record_parity_checked(conn, spec, now=now)
+    _record_integrity_checked(conn, spec, now=now)
+    _record_integrity_failed(conn, spec, detail="fts5: malformed inverted index", now=now)
+    conn.commit()
+
+    result = repair_external_content_fts(conn, spec, now=now, throttle=True)
+    assert result["rebuilt"] is False and result["triggers_recreated"] is True
+    flag = load_integrity_failed(conn, spec)
+    assert flag is not None and "malformed" in flag["detail"]
+    conn.close()
+
+
+def test_failed_repair_does_not_roll_back_a_caller_owned_transaction(monkeypatch):
+    """k120: repair only rolls back a transaction it opened itself."""
+    import pytest
+
+    import plugins.context_engine.lcm.db_bootstrap as B
+
+    conn = sqlite3.connect(":memory:")
+    _make_db(conn, stale=True)
+    spec = build_message_fts_spec()
+    conn.execute("CREATE TABLE caller (v TEXT)")
+    conn.commit()
+    conn.execute("INSERT INTO caller VALUES ('mine')")  # opens the caller's txn
+    assert conn.in_transaction
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(B, "_repair_external_content_fts_body", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        repair_external_content_fts(conn, spec, throttle=False)
+    assert conn.in_transaction
+    assert conn.execute("SELECT v FROM caller").fetchall() == [("mine",)]
+    conn.close()

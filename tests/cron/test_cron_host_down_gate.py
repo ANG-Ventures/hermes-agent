@@ -193,3 +193,22 @@ def test_no_table_is_inert(tmp_path, monkeypatch):
     job = _qbt_job()
     chat, _ = _deliver(job, "cannot read torrents/info")
     assert chat == ALERTS
+
+
+def test_ledger_not_written_when_demoted_delivery_fails(fleet):
+    """k88: the ledger row counts a DELIVERED deferral; a failed send must not
+    leave a row behind (the retry path would otherwise double-count it)."""
+    from gateway.config import Platform
+
+    latch = _arm(fleet)
+    job = _qbt_job()
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    cfg = MagicMock()
+    cfg.platforms = {Platform.DISCORD: pconfig}
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch("tools.send_message_tool._send_to_platform",
+               new=AsyncMock(return_value={"error": "Discord send failed"})):
+        err = _deliver_result(job, _failure_content(job, "cannot read torrents/info"))
+    assert err and "Discord send failed" in err
+    assert not (latch.parent / "suppressed.jsonl").exists()

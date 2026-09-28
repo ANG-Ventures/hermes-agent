@@ -3231,6 +3231,9 @@ def repair_external_content_fts(
     now: float | None = None,
     throttle: bool = False,
 ) -> dict[str, bool]:
+    # Captured before the checks below: they may write metadata and so open an
+    # implicit transaction that is ours, not the caller's.
+    caller_txn = conn.in_transaction
     if throttle and _fts_needs_rebuild_structural(conn, spec):
         # Engine-load path with GENUINE structural damage: never rebuild inline.
         # The rebuild is O(rows) — 1696 s on an 11.4 GB fleet snapshot — and
@@ -3258,7 +3261,8 @@ def repair_external_content_fts(
             conn, spec, now=now, needs_rebuild=needs_rebuild
         )
     except BaseException:
-        if conn.in_transaction:
+        # Roll back only our own transaction; a caller-owned one is theirs.
+        if not caller_txn and conn.in_transaction:
             conn.rollback()
         raise
 
@@ -3333,8 +3337,20 @@ def _repair_external_content_fts_body(
     # GC scan under BEGIN IMMEDIATE) for up to busy_timeout — and it silently
     # erased the background scan's corruption flag before `/lcm doctor` could
     # ever show it.
-    if rebuilt or triggers_were_missing or triggers_were_stale:
+    # Recreating triggers alone does not repair the index: rows written while
+    # a trigger was missing/stale stay unindexed, and a deep-check or parity
+    # flag describes the index CONTENT. Without a rebuild, clear only a
+    # structural flag, and only once the structure verifiably checks out.
+    if rebuilt:
         _clear_integrity_failed(conn, spec)
+    elif triggers_were_missing or triggers_were_stale:
+        prior = load_integrity_failed(conn, spec)
+        if (
+            prior is not None
+            and str(prior["detail"]).startswith(_SCAN_DETAIL_STRUCTURAL)
+            and not _fts_needs_rebuild_structural(conn, spec)
+        ):
+            _clear_integrity_failed(conn, spec)
     conn.commit()
     return {
         "rebuilt": rebuilt,

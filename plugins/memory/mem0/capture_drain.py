@@ -298,6 +298,10 @@ class CaptureDrainWorker:
                 # added but crashed/failed BEFORE the scrub ran, so the shortcut must not skip it.
                 if self._scrub_written_or_requeue(key, row):
                     return True
+                # A crash after the add but before routing lands here on the next lease;
+                # route now or the turn's world/event facts are never staged. Staging is
+                # keyed by turn id, so re-routing an already-routed turn overwrites in place.
+                self._maybe_route(key, payload, messages)
                 self._q.mark_done(key)
                 self.stats["drained"] += 1
                 return True

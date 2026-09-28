@@ -361,11 +361,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 if "duplicate column" not in str(e).lower():
                     raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
-    # The base columns too: an older partial table (key/provider/cache_write
-    # only) is accepted here, and _refresh_cache_monitoring / the call insert
-    # read input_tokens, cache_read and http_status. Missing ones made every
-    # insert_turn raise inside its fail-open catch and drop the turn (C6, #978).
-    for col, kind in (("model", "TEXT"), ("input_tokens", "INT"),
+    # Every column insert_api_call names: a pre-v1 table missing any base column
+    # would otherwise migrate "successfully" and then refuse every new call.
+    for col, kind in (("ts", "REAL"), ("provider", "TEXT"), ("sub_key", "TEXT"),
+                      ("model", "TEXT"), ("input_tokens", "INT"),
                       ("output_tokens", "INT"), ("cache_read", "INT"),
                       ("cache_write", "INT"), ("reasoning", "INT"),
                       ("attribution", "TEXT"), ("http_status", "INT"),
@@ -973,6 +972,13 @@ def _route_id_origin(route_id: str | None) -> str | None:
     return route_id_origin(route_id)
 
 
+def _measured(usage: CanonicalUsage, field: str) -> int | None:
+    """A bucket the provider did not report is stored NULL, never a measured 0."""
+    if getattr(usage, "usage_unknown", False) or getattr(usage, f"{field}_unknown", False):
+        return None
+    return getattr(usage, field)
+
+
 def insert_api_call(
     turn_id: str, seq: int, *, ts: float, provider: str, model: str,
     usage: CanonicalUsage, sub_key: str | None, attribution: str,
@@ -1011,8 +1017,9 @@ def insert_api_call(
                 route_id_origin, vendor, served_provider
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
-             usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
+            (turn_id, seq, ts, provider, sub_key, model,
+             _measured(usage, "input_tokens"), _measured(usage, "output_tokens"),
+             _measured(usage, "cache_read_tokens"), _measured(usage, "cache_write_tokens"),
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
              cache_write_1h, cache_ttl_requested,

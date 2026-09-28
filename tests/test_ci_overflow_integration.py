@@ -219,3 +219,19 @@ def test_variable_write_probe_never_writes_an_existing_variable():
 def test_variable_write_probe_fails_closed_unless_403(code):
     denied, _ = integ.variable_write_denied(lambda m, p, b=None: (code, None))
     assert denied is False
+
+
+def test_one_replanned_slice_cannot_certify_a_selective_rerun_as_full():
+    """k128: attempt 2 re-executed only slice b (a selective re-run); slice a was reused
+    from attempt 1. One matching PROBE line must not certify a full re-run."""
+    logs = {"Python tests / Run tests b": "PROBE slice=b executing_attempt=2 planned_attempt=2"}
+    result = integ.full_rerun_verdict(A1, A2, logs, attempt=2)
+    assert result["status"] == "BLOCK"
+    assert "Python tests / Run tests a" in result["evidence"]["reused"]
+
+
+def test_full_rerun_with_every_job_replanned_passes():
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    logs = {j["name"]: f"PROBE slice={j['name'][-1]} executing_attempt=2 planned_attempt=2"
+            for j in fresh if "Run tests" in j["name"]}
+    assert integ.full_rerun_verdict(A1, fresh, logs, attempt=2)["status"] == "PASS"

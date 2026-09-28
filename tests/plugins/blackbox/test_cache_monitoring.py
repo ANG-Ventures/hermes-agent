@@ -8,6 +8,7 @@ import pytest
 from plugins import blackbox
 from plugins.blackbox import store
 from plugins.blackbox.record import TurnRecord
+from agent.usage_pricing import CanonicalUsage
 from agent.chat_completion_helpers import _requested_cache_ttl, _record_successful_api_call
 
 
@@ -127,6 +128,14 @@ def test_existing_call_table_migrates_without_inventing_tiers(tmp_path, monkeypa
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT lane_family,cache_write_5m,cache_write_1h FROM turn_api_calls").fetchone() == (
             "xai", None, None)
+    # k136: the migrated table must still accept a new call.
+    store.insert_api_call("new", 0, ts=2.0, provider="claude-apr", model="m",
+                          usage=CanonicalUsage(input_tokens=1, output_tokens=1),
+                          sub_key=None, attribution="wire", http_status=200,
+                          cache_write_5m=5)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT lane_family,cache_write_5m FROM turn_api_calls "
+                            "WHERE turn_id='new'").fetchone() == ("apx/apr", 5)
 
 
 def test_compaction_metadata_is_persisted_without_inventing_cost(db):

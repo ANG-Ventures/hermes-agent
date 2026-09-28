@@ -3565,14 +3565,26 @@ def _host_down_producers(job: dict) -> List[str]:
     return out
 
 
-def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
+def _host_down_write_ledger(rows) -> None:
+    for path, rec in rows:
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception as e:
+            logger.warning("host-down ledger write failed: %r", e)
+
+
+def _apply_host_down_gate(job: dict, content: str, targets: List[dict],
+                          pending_ledger: Optional[list] = None):
     """Return (content, targets) with #alerts targets demoted to #logs when the
     message is about a host whose owner deadman latch is armed.
 
     Never drops: the demoted message still delivers, prefixed
     ``[host-down: H since TS — deferred to OWNER]``, and one ledger row per
     deferred host is appended to <latch dir>/suppressed.jsonl so the owner's
-    recovery note (notify.py --host-down-summary) counts it.
+    recovery note (notify.py --host-down-summary) counts it. With
+    ``pending_ledger`` the rows are queued there instead, so the caller writes
+    them only once the demoted delivery actually succeeded.
     """
     try:
         alerts_idx = [
@@ -3626,12 +3638,11 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
             "producer": producers[0] if producers else "unknown",
             "head": (content or "").strip().splitlines()[0][:160] if (content or "").strip() else "",
         }
-        for h in hosts:
-            try:
-                with (armed[h]["latch_path"].parent / _HOST_DOWN_LEDGER).open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec) + "\n")
-            except Exception as e:
-                logger.warning("host-down ledger write failed: %r", e)
+        rows = [(armed[h]["latch_path"].parent / _HOST_DOWN_LEDGER, rec) for h in hosts]
+        if pending_ledger is None:
+            _host_down_write_ledger(rows)
+        else:
+            pending_ledger.extend(rows)
         logger.info("Job '%s': host-down gate deferred #alerts delivery to #logs (%s)",
                     job.get("id"), ", ".join(hosts))
         return f"{prefix} {content}", new_targets
@@ -3676,7 +3687,9 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
-    content, targets = _apply_host_down_gate(job, content, targets)
+    host_down_ledger: list = []
+    content, targets = _apply_host_down_gate(
+        job, content, targets, pending_ledger=host_down_ledger)
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -3781,6 +3794,7 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         return msg
 
     delivery_errors = []
+    delivered_chats = set()
 
     for target in targets:
         platform_name = target["platform"]
@@ -4318,6 +4332,7 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    delivered_chats.add(str(chat_id))
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -4510,12 +4525,17 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
                 delivery_errors.append(msg)
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            delivered_chats.add(str(chat_id))
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
 
+    # Ledger only a deferral that actually landed in #logs; a failed send is
+    # retried and would otherwise be counted once per attempt.
+    if host_down_ledger and _HOST_DOWN_LOGS_CHAT in delivered_chats:
+        _host_down_write_ledger(host_down_ledger)
     if policy_drop_errors:
         # Filter-time drops apply to every target; report them once.
         delivery_errors.extend(policy_drop_errors)
