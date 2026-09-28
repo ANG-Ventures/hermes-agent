@@ -329,6 +329,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ("gap_prev_turn_s", "REAL"), ("first_call_cache_miss", "INT"),
         ("idle_compaction_fired", "INT"), ("compaction_tokens_before", "INT"),
         ("compaction_tokens_after", "INT"), ("compaction_cost_usd", "REAL"),
+        # Route attribution (t_d59c7936): derived from provider+model at insert
+        # by agent.usage_pricing.attribute_route; NULL on rows predating it.
+        ("lane_family", "TEXT"), ("vendor", "TEXT"), ("served_provider", "TEXT"),
     ):
         if col not in _existing:
             try:
@@ -371,7 +374,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                       ("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT"),
                       ("call_id", "TEXT"), ("parent_call_id", "INT"),
-                      ("sub_harness", "TEXT"), ("route_id_origin", "TEXT")):
+                      ("sub_harness", "TEXT"), ("route_id_origin", "TEXT"),
+                      ("vendor", "TEXT"), ("served_provider", "TEXT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -632,7 +636,21 @@ def _cost_float(value: Any) -> float | None:
 
 
 def lane_family(provider: str) -> str:
+    """Named lane family for a recorded provider; never ``"other"`` (t_d59c7936).
+
+    A ``custom:<name>`` lane is its registered backend. The multi-vendor proxy
+    (``cpa`` and its aliases) is ``"cpa"``. Any provider with no shared family
+    is its own name, and an empty provider is ``"unknown"``.
+    """
+    from agent.usage_pricing import proxy_lane
+
     p = str(provider or "").strip().lower()
+    if p.startswith("custom:"):
+        p = p.split(":", 1)[1].strip()
+    if not p:
+        return "unknown"
+    if proxy_lane(p):
+        return "cpa"
     for prefixes, family in (
         (("claude-apx", "claude-apr", "claude-api-proxy"), "apx/apr"),
         (("claude-bpx", "claude-bpr", "claude-bridge"), "bpx/bpr"),
@@ -641,7 +659,19 @@ def lane_family(provider: str) -> str:
     ):
         if p.startswith(prefixes):
             return family
-    return "codex" if p == "openai-codex" else "other"
+    return "codex" if p == "openai-codex" else p
+
+
+def _route_columns(provider: Any, model: Any) -> tuple[str, str, str]:
+    """``(lane_family, vendor, served_provider)`` for one recorded route.
+
+    A cpa/kimi-k3 row is lane ``cpa``, vendor ``moonshotai``, served provider
+    ``kimi``. Vendor comes from the ONE model->vendor map in usage_pricing.
+    """
+    from agent.usage_pricing import attribute_route
+
+    route = attribute_route(str(provider or ""), str(model or ""))
+    return lane_family(str(provider or "")), route["vendor"], route["served_provider"]
 
 
 # Auxiliary-model calls (compression, title_generation, vision, web_extract, ...)
@@ -717,18 +747,14 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
 def backfill_cache_monitoring() -> None:
     """Explicit historical fill; never infer cache tiers or compaction cost."""
     with _connect() as conn:
-        for family, prefixes in (
-            ("apx/apr", ("claude-apx", "claude-apr", "claude-api-proxy")),
-            ("bpx/bpr", ("claude-bpx", "claude-bpr", "claude-bridge")),
-            ("cpx/cpr", ("claude-cpx", "claude-cpr")),
-            ("codex", ("openai-codex",)), ("xai", ("xai",)),
-            ("openrouter", ("openrouter",)),
-        ):
-            for prefix in prefixes:
-                conn.execute("UPDATE turn_api_calls SET lane_family=? "
-                             "WHERE lane_family IS NULL AND lower(provider) LIKE ?",
-                             (family, prefix + "%"))
-        conn.execute("UPDATE turn_api_calls SET lane_family='other' WHERE lane_family IS NULL")
+        # One mapping: lane_family() per distinct provider, never a SQL copy.
+        for (prov,) in conn.execute(
+                "SELECT DISTINCT provider FROM turn_api_calls "
+                "WHERE lane_family IS NULL OR lane_family = 'other'").fetchall():
+            conn.execute("UPDATE turn_api_calls SET lane_family=? "
+                         "WHERE (lane_family IS NULL OR lane_family = 'other') "
+                         "AND provider IS ?",
+                         (lane_family(prov), prov))
         conn.execute("""
             UPDATE turns SET gap_prev_turn_s = ts_start - (
                 SELECT prev.ts_end FROM turns AS prev
@@ -800,6 +826,7 @@ _INSERT_TURN_COLUMNS = (
     "input_tokens_unknown", "cache_read_tokens_unknown",
     "cache_write_tokens_unknown", "usage_unknown",
     "terminal_error",
+    "lane_family", "vendor", "served_provider",
 )
 
 _INSERT_TURN_SQL = (
@@ -894,6 +921,7 @@ def insert_turn(record: TurnRecord) -> None:
                     scrub_and_truncate(record.terminal_error, 300)
                     if record.terminal_error
                     else None,
+                    *_route_columns(record.provider, record.model),
                 ),
             )
             _refresh_served_subs(conn, record.turn_id)
@@ -980,8 +1008,8 @@ def insert_api_call(
                 output_tokens, cache_read, cache_write, reasoning, attribution,
                 http_status, relay_synthetic, route_id, cache_write_5m,
                 cache_write_1h, cache_ttl_requested, lane_family, call_id,
-                route_id_origin
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                route_id_origin, vendor, served_provider
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
@@ -989,7 +1017,7 @@ def insert_api_call(
              _bool_int(relay_synthetic), route_id, cache_write_5m,
              cache_write_1h, cache_ttl_requested,
              AUX_LANE_FAMILY if aux else lane_family(provider), call_id,
-             _route_id_origin(route_id)),
+             _route_id_origin(route_id), *_route_columns(provider, model)[1:]),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
@@ -1066,8 +1094,9 @@ def insert_composite_calls(
                     turn_id, seq, ts, provider, sub_key, model, input_tokens,
                     output_tokens, cache_read, cache_write, reasoning,
                     attribution, http_status, relay_synthetic, route_id,
-                    lane_family, parent_call_id, sub_harness, route_id_origin
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                    lane_family, parent_call_id, sub_harness, route_id_origin,
+                    vendor, served_provider
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (turn_id, seq, call.get("ts"), provider, call.get("sub_key"),
                  str(call.get("model") or ""), values["input_tokens"],
@@ -1075,7 +1104,8 @@ def insert_composite_calls(
                  values["cache_write"], values["reasoning"], attribution,
                  call.get("http_status"), call.get("route_id"),
                  lane_family(provider), parent_seq, sub_harness,
-                 _route_id_origin(call.get("route_id"))),
+                 _route_id_origin(call.get("route_id")),
+                 *_route_columns(provider, call.get("model"))[1:]),
             )
         conn.execute(
             "UPDATE turn_api_calls SET sub_harness = ?, "
