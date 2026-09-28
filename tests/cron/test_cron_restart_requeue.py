@@ -73,16 +73,20 @@ def _make_job():
     return get_job(job["id"])
 
 
-def _run_and_kill_by_drain(job):
+def _run_and_kill_by_drain(job, first_ran):
     """Run the job in a thread; once its script is live, do what the gateway
-    drain timeout does, then boot state is 'next process'."""
+    drain timeout does, then boot state is 'next process'.
+
+    "Live" means the script reached its long phase (``first_ran`` exists), not
+    merely that the Popen is registered: killing bash before its ``touch``
+    leaves no marker and the re-fire takes the long branch again."""
     import cron.scheduler as sched
     t = threading.Thread(target=sched.run_one_job, args=(job,), daemon=True)
     t.start()
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         with sched._script_procs_lock:
-            if sched._active_script_procs:
+            if sched._active_script_procs and first_ran.exists():
                 break
         time.sleep(0.05)
     else:
@@ -100,7 +104,7 @@ def test_drain_killed_script_refires_once_and_ends_ok(env):
     import cron.scheduler as sched
 
     job = _make_job()
-    _run_and_kill_by_drain(job)
+    _run_and_kill_by_drain(job, env / "scripts" / "first-ran")
 
     killed = get_job(job["id"])
     assert killed["last_status"] == "error"
@@ -124,11 +128,12 @@ def test_refire_killed_again_is_not_requeued_twice(env):
     from cron.jobs import get_job, get_due_jobs, RESTART_REQUEUE_KEY
 
     job = _make_job()
-    _run_and_kill_by_drain(job)
+    first_ran = env / "scripts" / "first-ran"
+    _run_and_kill_by_drain(job, first_ran)
     due = [j for j in get_due_jobs() if j["id"] == job["id"]]
     assert due
-    (env / "scripts" / "first-ran").unlink()  # re-fire is long again
-    _run_and_kill_by_drain(due[0])
+    first_ran.unlink()  # re-fire is long again
+    _run_and_kill_by_drain(due[0], first_ran)
     again = get_job(job["id"])
     assert again["last_status"] == "error"
     assert not again.get(RESTART_REQUEUE_KEY), "re-queue must be bounded to one fire"
@@ -189,9 +194,10 @@ def test_dying_process_tick_leaves_requeue_marker_for_next_boot(env):
     t = threading.Thread(target=sched.run_one_job, args=(job,), daemon=True)
     t.start()
     deadline = time.monotonic() + 15
+    first_ran = env / "scripts" / "first-ran"
     while time.monotonic() < deadline:
         with sched._script_procs_lock:
-            if sched._active_script_procs:
+            if sched._active_script_procs and first_ran.exists():
                 break
         time.sleep(0.05)
     else:
