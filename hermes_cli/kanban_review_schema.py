@@ -183,10 +183,15 @@ def is_v2_record(record: _Any) -> bool:
 
 def is_themis_record(record: _Any) -> bool:
     """A stage/Themis record: every THEMIS_REQUIRED_* field is mandatory."""
-    reviewer = record.get("reviewer") if isinstance(record, dict) else None
-    return isinstance(reviewer, dict) and (
-        reviewer.get("profile") == THEMIS_PROFILE or reviewer.get("kind") == THEMIS_STAGE_KIND
-    )
+    if not isinstance(record, dict):
+        return False
+    reviewer = record.get("reviewer")
+    if isinstance(reviewer, dict) and (
+            reviewer.get("profile") == THEMIS_PROFILE or reviewer.get("kind") == THEMIS_STAGE_KIND):
+        return True
+    # ``by: themis`` alone is a v1 de-facto key; it marks a Themis record only
+    # once the record is in v2 mode, so dropping ``reviewer`` cannot opt out.
+    return record.get("by") == THEMIS_AUTHOR and is_v2_record(record)
 
 
 def _validate_reviewer(reviewer: _Any, themis: bool) -> _Optional[str]:

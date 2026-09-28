@@ -291,3 +291,11 @@ def test_gate_accepts_valid_and_refuses_invalid_themis_record():
     assert "trigger" in _gate(_gate_ready(themis_board(trigger="cron")))
     assert "unknown key" in _gate(_gate_ready(themis_board(summary="looks fine to me")))
     assert "eligible_at" in _gate(_gate_ready(themis_board(eligible_at="2026-09-27T00:00:00Z")))
+
+
+def test_by_themis_without_reviewer_is_still_themis():
+    rec = themis_board()
+    del rec["reviewer"]
+    assert "reviewer" in s.validate_v2_fields(rec)
+    # v1 record carrying by: themis and no v2 key stays v1.
+    assert s.validate_v2_fields({"verdict": "approve", "by": "themis"}) is None
