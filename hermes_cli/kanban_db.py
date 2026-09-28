@@ -16819,24 +16819,28 @@ def _parse_github_pr_url(url: str) -> Optional[tuple[str, int]]:
 # no extra query budget). Absent entry = owner unknown = guard fail-safe.
 _PR_HEAD_REF_CACHE: dict[tuple[str, int], str] = {}
 _PR_HEAD_REF_CACHE_LIMIT = 1024
-_CARD_ID_IN_BRANCH_RE = re.compile(r"(?<![0-9a-z])t_[0-9a-f]{8}(?![0-9a-z])")
+# Owner position only: the card id that OPENS the branch's last path segment
+# (``<assignee>/<card_id>-<topic>``, ``wt/<card_id>``, ``<slug>/<card_id>``).
+# An id elsewhere (``alice/fix-t_11111111``) is a topic mention, not an owner.
+_CARD_ID_OWNER_RE = re.compile(r"t_[0-9a-f]{8}(?![0-9a-z])")
 
 
 def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
     """True only on POSITIVE evidence the PR is another card's work.
 
     Fleet worker branches are named ``<assignee>/<card_id>-<topic>``. A PR
-    whose head branch names one or more card ids, none of them ``task_id``,
-    was opened for a different card: its URL on this card is a cross-card
+    whose head branch has a card id other than ``task_id`` in that OWNER
+    position (start of the last path segment) was opened for a different card: its URL on this card is a cross-card
     mention (a coordination note), not this card's in-flight work.
-    2026-09-28, t_a8549f8b. Unknown head ref, or a branch naming no card id,
-    stays guarded (fail-safe, unchanged).
+    2026-09-28, t_a8549f8b. Unknown head ref, or a branch with no card id in
+    the owner position (even one mentioning an id in its topic, t_84471ec4),
+    stays guarded (fail-safe).
     """
     head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
     if not head:
         return False
-    ids = set(_CARD_ID_IN_BRANCH_RE.findall(head.lower()))
-    return bool(ids) and task_id.lower() not in ids
+    owner = _CARD_ID_OWNER_RE.match(head.lower().rsplit("/", 1)[-1])
+    return owner is not None and owner.group(0) != task_id.lower()
 
 
 def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
