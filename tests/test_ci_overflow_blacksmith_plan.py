@@ -102,6 +102,22 @@ def test_ledger_admits_a_plan_that_names_blacksmith():
     assert sum(1 for j in row["jobs"] if j["labels"] == BLACKSMITH) == 2
 
 
+def test_ledger_recounts_blacksmith_after_budget_demotion():
+    """A reservation the ledger cannot afford is demoted to POOL; the persisted summary must count
+    the Blacksmith slices actually admitted, not the planner's pre-ledger share (FleetReview ad229ed8)."""
+    api = _Contents()
+    led = Ledger(api, daily_limit=6000, clock=lambda: datetime(2026, 9, 28, 1, tzinfo=timezone.utc))
+    p = decide(bs=4)
+    assert p.summary["blacksmith"] == 4
+    led.daily_limit = 35 * 2 + 20   # affords core smoke, e2e and one slice; every Blacksmith slice demotes
+    res = led.reserve((1, 2, 1), p)
+    assert getattr(res, "reason", None) is None, res
+    admitted = sum(1 for j in res.plan.jobs if j.labels == BLACKSMITH)
+    assert res.plan.summary["blacksmith"] == admitted == 0
+    stored = next(iter(api.state["attempts"].values()))["plan"]["summary"]
+    assert stored["blacksmith"] == 0
+
+
 def _record(p, matrix):
     jobs = [{"job_id": j.job_id, "labels": j.labels, "reason": j.reason, "reserved_minutes": j.reserved_minutes}
             for j in p.jobs]
