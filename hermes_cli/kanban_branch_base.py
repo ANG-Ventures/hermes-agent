@@ -337,20 +337,41 @@ def check_checkout(
     return rep
 
 
-def head_landed_in(repo: Path, head: Optional[str], pr_heads: Sequence[str]) -> bool:
-    """True when ``head`` is (an ancestor of) one of ``pr_heads``: the merged PR
-    carried every commit this checkout has. False when it cannot be shown
-    (no head, unknown sha, git error) -- the caller keeps the guard."""
-    if not head:
+def _rc(repo: Path, *args: str) -> Optional[int]:
+    try:
+        return _git(repo, *args).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def pr_landed_checkout(rep: BaseReport, prs: Sequence[tuple[str, str]]) -> bool:
+    """True when one merged PR ``(head_sha, merge_commit_sha)`` provably landed
+    this checkout's work on the checkout's OWN trunk. All three must hold:
+
+    * the checkout HEAD is an ancestor of the PR head (the PR carried it);
+    * the merge commit is an ancestor of ``rep.trunk`` -- the PR merged into
+      this checkout's repository and trunk, not a fork or side branch
+      (FleetReview #1434, key 9212a9f6ac95);
+    * content: re-applying the checkout's change (merge-base..HEAD) onto the
+      merge commit is a clean no-op, so a later revert in the PR or a merge
+      that discarded the change does not count (key 8db3d1e0e4ce).
+
+    False whenever it cannot be shown -- the caller keeps the guard.
+    """
+    repo = Path(rep.repo)
+    if not (rep.head and rep.merge_base and rep.trunk):
         return False
-    for sha in pr_heads:
-        if not sha:
+    for head_sha, merge_sha in prs:
+        if not head_sha or not merge_sha:
             continue
-        try:
-            proc = _git(Path(repo), "merge-base", "--is-ancestor", head, sha)
-        except (OSError, subprocess.SubprocessError):
+        if _rc(repo, "merge-base", "--is-ancestor", rep.head, head_sha) != 0:
             continue
-        if proc.returncode == 0:
+        if _rc(repo, "merge-base", "--is-ancestor", merge_sha, rep.trunk) != 0:
+            continue
+        merged_tree = _out(repo, "rev-parse", "--verify", "--quiet", f"{merge_sha}^{{tree}}")
+        replay = _out(repo, "merge-tree", "--write-tree", "--no-messages",
+                      f"--merge-base={rep.merge_base}", merge_sha, rep.head)
+        if merged_tree and replay and replay.splitlines()[0].strip() == merged_tree:
             return True
     return False
 
