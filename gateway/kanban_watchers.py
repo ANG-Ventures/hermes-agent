@@ -709,26 +709,87 @@ def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
     return cards, observed_boards
 
 
+# A still-stuck guard episode re-pages this often; a new episode pages at once.
+_GUARD_STUCK_REMIND_SECONDS = 6 * 3600
+
+
+def _guard_stuck_state_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / "kanban-guard-stuck-pages.json"
+
+
 class _GuardStuckNotifier:
-    """Page once per (board, card) until it recovers; retry failed sends."""
+    """Page once per guard EPISODE, remind every 6h; retry failed sends.
 
-    def __init__(self) -> None:
-        self._delivered: set[tuple[str, str]] = set()
+    An episode is ``(board, card, reason, guarded_since)``: ``guarded_since``
+    only moves when an event that can change the guard's answer resets the
+    streak, so a probe blip (streak briefly stale) or a gateway restart is the
+    same episode and stays silent. With ``state_path`` the ledger survives a
+    restart. 2026-09-27: in-memory state re-paged t_a3ce620f x3 and t_779040d0
+    x2 within 2.5h (18:13 restart re-paged at 18:14).
+    """
 
-    def observe(self, cards, send, observed_boards=None) -> int:
-        current = {(board, item["task_id"]) for board, item in cards}
+    def __init__(self, state_path: Optional[Path] = None,
+                 remind_seconds: int = _GUARD_STUCK_REMIND_SECONDS) -> None:
+        self._state_path = state_path
+        self._remind = int(remind_seconds)
+        self._sent: dict[str, float] = self._load()
+
+    @staticmethod
+    def _key(board: str, item: dict) -> str:
+        return "|".join((str(board), str(item["task_id"]),
+                         str(item.get("reason") or "active_pr"),
+                         str(item.get("guarded_since") or "")))
+
+    def _load(self) -> dict[str, float]:
+        if self._state_path is None:
+            return {}
+        try:
+            import json
+
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            return {str(k): float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def _save(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            import json
+
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_name(f"{self._state_path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self._sent, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self._state_path)
+        except OSError:
+            logger.warning("kanban dispatcher: guard-stuck page ledger not saved", exc_info=True)
+
+    def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
+        now = time.time() if now is None else float(now)
+        current = {self._key(board, item) for board, item in cards}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
-        self._delivered = {
-            key for key in self._delivered
-            if key[0] not in observed_boards or key in current
+        before = dict(self._sent)
+        # Forget an episode only once it is gone from an observed board AND its
+        # last page is older than the reminder: a blip keeps the same key.
+        self._sent = {
+            key: at for key, at in self._sent.items()
+            if key in current or key.split("|", 1)[0] not in observed_boards
+            or now - at < self._remind
         }
         delivered = 0
         for board, item in cards:
-            key = board, item["task_id"]
-            if key not in self._delivered and send(board, item):
-                self._delivered.add(key)
+            key = self._key(board, item)
+            last = self._sent.get(key)
+            if last is not None and now - last < self._remind:
+                continue
+            if send(board, item):
+                self._sent[key] = now
                 delivered += 1
+        if self._sent != before:
+            self._save()
         return delivered
 
 
@@ -753,7 +814,8 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
         )
     message = (
         f"🛑 **Kanban dispatcher** · {detail}\n"
-        f"Board: `{board}` · Card: `{item['task_id']}`"
+        f"Board: `{board}` · Card: `{item['task_id']}`\n"
+        "-# Pages once per stuck episode; reminder every 6h while it stays stuck."
     )
     try:
         proc = subprocess.run(
@@ -2552,7 +2614,7 @@ class GatewayKanbanWatchersMixin:
         last_unwoken_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
-        guard_stuck_notifier = _GuardStuckNotifier()
+        guard_stuck_notifier = _GuardStuckNotifier(_guard_stuck_state_path())
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.

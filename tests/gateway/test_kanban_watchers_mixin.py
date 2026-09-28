@@ -279,8 +279,34 @@ def test_guard_stuck_notifier_pages_once_and_rearms():
     assert _stall_streak_is_bad(True, True, [("default", _FakeResult())], guard_stuck=True)
     assert notifier.observe([], send, observed_boards=set()) == 0  # lock/probe failure: unknown, not recovered
     assert notifier.observe([("default", item)], send) == 0
-    assert notifier.observe([], send, observed_boards={"default"}) == 0  # observed recovery
-    assert notifier.observe([("default", item)], send) == 1
+    assert notifier.observe([], send, observed_boards={"default"}) == 0  # observed absence (blip)
+    assert notifier.observe([("default", item)], send) == 0  # same episode: silent
+    new_episode = {**item, "guarded_since": 1_000}
+    assert notifier.observe([("default", new_episode)], send) == 1  # guard reset -> new episode
+
+
+def test_guard_stuck_notifier_survives_restart_and_reminds_every_6h(tmp_path):
+    from gateway.kanban_watchers import _GUARD_STUCK_REMIND_SECONDS, _GuardStuckNotifier
+    item = {"task_id": "t_test", "reason": "active_pr", "guarded_since": 100,
+            "clear_verb": "hermes kanban --board default requeue t_test '<reason>'"}
+    state = tmp_path / "state" / "guard.json"
+    sent = []
+    def send(board, row):
+        sent.append(row["task_id"])
+        return True
+    t0 = 10_000.0
+    assert _GuardStuckNotifier(state).observe([("default", item)], send, now=t0) == 1
+    # Gateway restart: a fresh notifier reads the ledger and stays silent.
+    restarted = _GuardStuckNotifier(state)
+    assert restarted.observe([("default", item)], send, now=t0 + 60) == 0
+    # Streak briefly stale (card absent from the probe), then back: same episode.
+    assert restarted.observe([], send, observed_boards={"default"}, now=t0 + 600) == 0
+    assert restarted.observe([("default", item)], send, now=t0 + 1200) == 0
+    # Still stuck 6h after the page: exactly one reminder.
+    assert restarted.observe([("default", item)], send, now=t0 + _GUARD_STUCK_REMIND_SECONDS) == 1
+    assert restarted.observe([("default", item)], send,
+                             now=t0 + _GUARD_STUCK_REMIND_SECONDS + 60) == 0
+    assert sent == ["t_test", "t_test"]
 
 
 def test_guard_stuck_notifier_retries_failed_send_after_unobserved_tick():
