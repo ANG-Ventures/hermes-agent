@@ -121,3 +121,35 @@ def test_missing_config_file_is_empty(tmp_path, monkeypatch):
     home = _home(tmp_path, monkeypatch)
     (home / "config.yaml").unlink()
     assert lcm_config._hermes_config_yaml() == {}
+
+
+def test_concurrent_misses_parse_once(tmp_path, monkeypatch):
+    """FleetReview #85: the cache lock was released across the parse, so N
+    threads missing together each parsed (and the slowest could overwrite a
+    newer entry). The miss path is serialized now: one parse."""
+    import threading
+    import time
+
+    _home(tmp_path, monkeypatch)
+    lcm_config._reset_config_yaml_cache()
+    calls = [0]
+    real = lcm_config._load_hermes_config_yaml
+
+    def slow(*args, **kwargs):
+        calls[0] += 1
+        time.sleep(0.2)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lcm_config, "_load_hermes_config_yaml", slow)
+    go = threading.Barrier(6)
+    out = []
+
+    def read():
+        go.wait()
+        out.append(lcm_config._hermes_config_yaml())
+
+    ts = [threading.Thread(target=read) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join(10) for t in ts]
+    assert len(out) == 6 and all(o["lcm"]["context_threshold"] == 0.66 for o in out)
+    assert calls[0] == 1
