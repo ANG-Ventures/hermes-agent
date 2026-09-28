@@ -2061,9 +2061,9 @@ def _caller_session_id() -> Optional[str]:
     # subprocess as in-gateway made every chat-turn ``claim --review`` bind
     # no session, and the following ``request-changes`` was refused
     # (t_0485b3ff: t_ddcd2170, t_c26be9b9, t_6500a97a stranded in running).
-    in_gateway = (
-        os.environ.get("_HERMES_GATEWAY") == "1" and "gateway.run" in sys.modules
-    )
+    # Importing ``gateway.run`` is not ownership either: it sets the marker at
+    # import time and CLI tools import it lazily (FleetReview 09c07e5eb0a9).
+    in_gateway = kb._process_is_gateway()
     try:
         from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
