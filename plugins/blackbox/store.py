@@ -913,10 +913,19 @@ def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
             (json.dumps({sub: count for sub, count in rows}), turn_id),
         )
 
-def insert_turn(record: TurnRecord) -> None:
-    """Persist one turn. Telemetry failures are logged but never raised."""
+def insert_turn(record: TurnRecord, *, provisional: bool = False) -> None:
+    """Persist one turn. Telemetry failures are logged but never raised.
+
+    ``provisional`` (a host abandoning an in-flight turn at shutdown): never
+    replaces an existing row for the turn and never moves the channel's
+    ``last_turn`` pointer. A real row written later upserts over it.
+    """
     try:
         with _connect() as conn:
+            if provisional and conn.execute(
+                "SELECT 1 FROM turns WHERE turn_id = ?", (record.turn_id,)
+            ).fetchone():
+                return
             conn.execute(
                 _INSERT_TURN_SQL,
                 (
@@ -999,14 +1008,15 @@ def insert_turn(record: TurnRecord) -> None:
                         scrub_and_truncate(call.get("result_preview", "")),
                     ),
                 )
-            conn.execute(
-                """
-                INSERT INTO last_turn(platform, chat_id, turn_id)
-                VALUES (?, ?, ?)
-                ON CONFLICT(platform, chat_id) DO UPDATE SET turn_id = excluded.turn_id
-                """,
-                (record.platform or "", record.chat_id or "", record.turn_id),
-            )
+            if not provisional:
+                conn.execute(
+                    """
+                    INSERT INTO last_turn(platform, chat_id, turn_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(platform, chat_id) DO UPDATE SET turn_id = excluded.turn_id
+                    """,
+                    (record.platform or "", record.chat_id or "", record.turn_id),
+                )
             if record.chat_id:
                 conn.execute("""
                     UPDATE turns SET gap_prev_turn_s = ts_start - (
@@ -1020,6 +1030,56 @@ def insert_turn(record: TurnRecord) -> None:
             _refresh_cache_monitoring(conn, record.turn_id)
     except Exception:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
+
+
+def ledger_turn_usage(turn_id: str) -> dict | None:
+    """Turn usage rebuilt from this turn's own ``turn_api_calls`` rows.
+
+    Used for a turn the host abandoned mid-flight: the per-call ledger is
+    written at the transport, so it holds every billed call even when the
+    conversation loop never folded them into its accumulator. A NULL bucket
+    stays unknown, never a measured 0. None when the turn has no rows.
+    """
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT input_tokens, output_tokens, cache_read, cache_write, "
+                "reasoning, provider, model FROM turn_api_calls "
+                "WHERE turn_id = ? ORDER BY seq",
+                (turn_id,),
+            ).fetchall()
+    except Exception:
+        logger.warning("blackbox ledger usage read failed", exc_info=True)
+        return None
+    if not rows:
+        return None
+    calls = [
+        {
+            "input_tokens": int(inp or 0),
+            "output_tokens": int(out or 0),
+            "cache_read_tokens": int(cr or 0),
+            "cache_write_tokens": int(cw or 0),
+            "reasoning_tokens": int(rs or 0),
+            "input_tokens_unknown": inp is None,
+            "output_tokens_unknown": out is None,
+            "cache_read_tokens_unknown": cr is None,
+            "cache_write_tokens_unknown": cw is None,
+            "usage_unknown": False,
+            "provider": prov or "",
+            "model": mdl or "",
+            "base_url": "",
+        }
+        for inp, out, cr, cw, rs, prov, mdl in rows
+    ]
+    usage: dict = {"api_calls": len(calls), "calls": calls}
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens", "reasoning_tokens"):
+        usage[key] = sum(c[key] for c in calls)
+    for key in ("input_tokens_unknown", "output_tokens_unknown",
+                "cache_read_tokens_unknown", "cache_write_tokens_unknown",
+                "usage_unknown"):
+        usage[key] = any(c[key] for c in calls)
+    return usage
 
 
 def _route_id_origin(route_id: str | None) -> str | None:

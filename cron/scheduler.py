@@ -1072,6 +1072,16 @@ _interrupted_job_ids: set = set()
 #   * ``_active_script_procs`` — live Popen handles it can terminate
 # ---------------------------------------------------------------------------
 _shutdown_event = threading.Event()
+# In-flight cron AIAgents (id -> agent), so a gateway shutdown that abandons a
+# still-running cron turn can record it (see live_cron_agents).
+_live_cron_agents: dict = {}
+_live_cron_agents_lock = threading.Lock()
+
+
+def live_cron_agents() -> list:
+    """Snapshot of the cron agents whose ``run_conversation`` is in flight."""
+    with _live_cron_agents_lock:
+        return list(_live_cron_agents.values())
 # Keyed by id() rather than a set: a Popen-like object is not guaranteed to be
 # hashable (test doubles routinely are not), and a registry that can only hold
 # hashable handles would silently fail closed on exactly the objects we most
@@ -7536,6 +7546,8 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
+        with _live_cron_agents_lock:
+            _live_cron_agents[id(agent)] = agent
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
@@ -7584,6 +7596,8 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+            with _live_cron_agents_lock:
+                _live_cron_agents.pop(id(agent), None)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.

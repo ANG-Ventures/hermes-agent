@@ -927,9 +927,10 @@ def emit_session_end(
 ):
     """Fire the per-turn ``on_session_end`` plugin hook exactly once.
 
-    ``provisional=True`` (host abandoning an in-flight turn) does NOT set the
-    per-turn emitted marker, so if the turn later unwinds, its real finalize
-    or backstop emit still fires and its row supersedes the provisional one.
+    ``provisional=True`` (host abandoning an in-flight turn) fires
+    ``on_turn_abandoned`` instead and does NOT set the per-turn emitted
+    marker, so if the turn later unwinds its real finalize or backstop emit
+    still fires. Returns False when a provisional emit stood down.
 
     Shared by ``finalize_turn`` (the normal loop exit) and
     ``emit_unfinalized_session_end`` (the backstop for the conversation loop's
@@ -1046,8 +1047,31 @@ def emit_session_end(
                     return False
                 if getattr(agent, "_current_turn_id", None) != turn_id:
                     return False
-            else:
-                agent._session_end_emitted_turn_id = turn_id
+                # NOT on_session_end: its consumers do end-of-turn teardown
+                # (file cleanup, call hangup) that must not run on a turn that
+                # is still live. Usage is left to the consumer's own per-call
+                # ledger; only identity + attribution travel here.
+                _invoke_hook(
+                    "on_turn_abandoned",
+                    session_id=agent.session_id,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    reason=turn_exit_reason,
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                    provider=getattr(agent, "provider", None) or "",
+                    chat_id=getattr(agent, "_chat_id", None) or "",
+                    chat_name=getattr(agent, "_chat_name", None) or "",
+                    user_message=original_user_message,
+                    parent_turn_id=getattr(agent, "_blackbox_parent_turn_id", None),
+                    parent_platform=getattr(agent, "_blackbox_parent_platform", None),
+                    parent_chat_id=getattr(agent, "_blackbox_parent_chat_id", None),
+                    parent_chat_name=getattr(agent, "_blackbox_parent_chat_name", None),
+                    is_subagent=bool(getattr(agent, "_blackbox_is_subagent", False)),
+                    depth=getattr(agent, "_blackbox_depth", None),
+                )
+                return True
+            agent._session_end_emitted_turn_id = turn_id
             _invoke_hook(
                 "on_session_end",
                 session_id=agent.session_id,
@@ -1066,9 +1090,6 @@ def emit_session_end(
                 final_response=final_response,
                 turn_usage=_turn_usage,
                 cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
-                # Only present when True: consumers keep live per-turn state
-                # (Blackbox tools / ts_start) for the real emit that may follow.
-                **({"provisional": True} if provisional else {}),
             )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
@@ -1109,11 +1130,11 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
 
     ``abandoned_reason`` marks a turn the HOST is abandoning while it is still
     in flight (gateway shutdown drain timed out, the process is about to
-    exit): it is recorded as ``interrupted`` with that exit reason. That emit
-    is provisional: it leaves the per-turn emitted marker unset (so a turn
-    that does unwind later still emits its real row, which the Blackbox
-    ``turns`` upsert lets supersede this one) and it does not settle
-    ``_billed_unaccounted``, which the turn's own thread still owns.
+    exit). That emit is provisional: it fires ``on_turn_abandoned`` (not
+    ``on_session_end``), leaves the per-turn emitted marker unset so a turn
+    that does unwind later still emits its real row (which supersedes the
+    provisional one), and does not settle ``_billed_unaccounted``, which the
+    turn's own thread still owns.
     """
     try:
         if not turn_id or getattr(agent, "_current_turn_id", None) != turn_id:
@@ -1144,19 +1165,6 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
             pass
         # Copy: an abandoned turn's own thread may still be appending.
         turn_calls = list(turn_calls)
-        if abandoned_reason:
-            # Billed responses parked for the loop to accept or settle already
-            # have turn_api_calls rows; count them WITHOUT consuming the live
-            # list. Read after the turn_calls copy: settlement empties the
-            # parked list before it appends, so an entry is never in both.
-            try:
-                from agent.conversation_loop import _unaccepted_billed_turn_call
-
-                for entry in list(getattr(agent, "_billed_unaccounted", None) or ()):
-                    if isinstance(entry, dict) and entry.get("turn_id", "") == turn_id:
-                        turn_calls.append(_unaccepted_billed_turn_call(entry))
-            except Exception:
-                pass
         res = result if isinstance(result, dict) else {}
         final_response = ""
         if abandoned_reason:

@@ -585,8 +585,8 @@ def _build_record(
     state = _session_state(session_id)
     with _lock:
         if kwargs.get("provisional"):
-            # Host is abandoning a still-live turn: record it but leave the
-            # live state (tools, ts_start) for the real emit that may follow.
+            # on_turn_abandoned: the turn is still live; record it but leave
+            # its state (tools, ts_start) for the real emit that may follow.
             state = dict(_sessions.get(session_id or "", state))
             state["tools"] = list(state.get("tools") or [])
             state["tool_calls"] = list(state.get("tool_calls") or [])
@@ -695,6 +695,59 @@ def _build_record(
     )
 
 
+def _on_turn_abandoned(
+    session_id: str = "",
+    turn_id: str = "",
+    reason: str = "",
+    model: str = "",
+    platform: str = "",
+    provider: str = "",
+    user_message: str = "",
+    **kwargs: Any,
+) -> None:
+    """Provisional interrupted row for a turn the host abandons mid-flight.
+
+    The gateway fires this at shutdown for turns that will never reach
+    ``on_session_end``. Usage comes from the turn's own ``turn_api_calls``
+    (authoritative for every billed call); the row never replaces an existing
+    one nor the channel's latest-turn pointer, and a real row written later
+    supersedes it.
+    """
+    try:
+        cfg = _config()
+        if cfg is None or not turn_id:
+            return
+        from plugins.blackbox import store
+
+        usage = store.ledger_turn_usage(str(turn_id)) or {}
+        for key in ("parent_turn_id", "parent_platform", "parent_chat_id",
+                    "parent_chat_name", "is_subagent", "depth"):
+            if key in kwargs:
+                usage[key] = kwargs[key]
+        record = _build_record(
+            session_id=session_id,
+            interrupted=True,
+            model=model,
+            platform=platform,
+            provider=provider,
+            user_message=user_message,
+            final_response="",
+            turn_usage=usage,
+            cfg=cfg,
+            kwargs={
+                "turn_id": turn_id,
+                "chat_id": kwargs.get("chat_id"),
+                "chat_name": kwargs.get("chat_name"),
+                "turn_exit_reason": reason,
+                "provisional": True,
+            },
+        )
+        if record is not None:
+            store.insert_turn(record, provisional=True)
+    except Exception:
+        logger.warning("blackbox on_turn_abandoned failed", exc_info=True)
+
+
 def _on_session_end(
     session_id: str = "",
     completed: bool = True,
@@ -790,6 +843,7 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_turn_abandoned", _on_turn_abandoned)
     # The slash command lives in commands.py; the loader only calls this
     # package-level register(), so delegate explicitly or /cost never wires in.
     try:

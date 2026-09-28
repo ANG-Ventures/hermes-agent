@@ -13996,6 +13996,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agents.extend(self._snapshot_running_agents().values())
         except Exception:
             pass
+        # Cron turns run on the scheduler's own pool, outside _running_agents
+        # (the drain already waits on them via _active_cron_job_count).
+        try:
+            from cron.scheduler import live_cron_agents
+
+            agents.extend(live_cron_agents())
+        except Exception:
+            pass
         try:
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
             # /v1/runs agents AND the _run_agent() turns (session chat, chat
