@@ -126,6 +126,7 @@ class TestStoreSessionReadsHideSuperseded:
         _seed_with_hidden_block(store)
         total = store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         store._conn.execute("DROP INDEX idx_msg_session_visible")
+        caplog.clear()  # store creation above may already have logged at INFO
         with caplog.at_level(logging.INFO, logger="plugins.context_engine.lcm.db_bootstrap"):
             ensure_messages_dedup_columns(store._conn)
             ensure_messages_dedup_columns(store._conn)

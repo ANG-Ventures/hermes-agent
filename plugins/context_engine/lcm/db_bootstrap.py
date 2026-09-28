@@ -3604,11 +3604,12 @@ def ensure_messages_dedup_columns(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_msg_session_visible "
             "ON messages(session_id, store_id) WHERE superseded_by IS NULL"
         )
-        logger.info(
-            "lcm: built idx_msg_session_visible over %d messages in %.1f ms "
-            "(one-time migration)",
-            rows, (time.monotonic() - started) * 1000.0,
-        )
+        if rows:  # a fresh, empty store has nothing to migrate: stay quiet
+            logger.info(
+                "lcm: built idx_msg_session_visible over %d messages in %.1f ms "
+                "(one-time migration)",
+                rows, (time.monotonic() - started) * 1000.0,
+            )
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
