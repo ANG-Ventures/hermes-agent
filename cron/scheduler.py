@@ -7556,9 +7556,14 @@ def run_job(
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         # Deregister when the TURN ends, not when this watcher gives up on it:
         # an inactivity-timed-out run can keep going until shutdown.
-        _cron_future.add_done_callback(
-            lambda _f, _k=id(agent): _forget_live_cron_agent(_k)
-        )
+        _cron_forget_in_finally = False
+        try:
+            _cron_future.add_done_callback(
+                lambda _f, _k=id(agent): _forget_live_cron_agent(_k)
+            )
+        except Exception:
+            # Not a real Future (test doubles): fall back to the watcher exit.
+            _cron_forget_in_finally = True
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -7606,6 +7611,8 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+            if _cron_forget_in_finally:
+                _forget_live_cron_agent(id(agent))
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
