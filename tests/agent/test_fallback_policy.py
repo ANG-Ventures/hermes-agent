@@ -1539,22 +1539,51 @@ def test_warm_refusal_returns_on_compaction(store, key):
     assert d.allowed and d.branch == "compaction"
 
 
-@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
-def test_warm_hard_cap_primary_copy_expired_or_absent(store, key, age):
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_warm_capped_copy_refuses_while_fallback_warm(store, key, mode):
+    """t_e001a935 / rig arm C: the relay dropped the primary's warm copy for a
+    model cap (warm_skip). That is "warm copy exists, not eligible" -> refuse,
+    never cap_expiry while the fallback copy is still warm (D6)."""
     st = _sticky_on_fallback(store, key)
-    d = _gate(st, T0 + 200, _warm("shadow", eligible=None, age=age, bound_eligible=False))
-    assert d.allowed and d.branch == "cap_expiry"
-    assert fp.recovery_row(st, d, T0 + 200)["expected_warm"] is False
-    assert "expired" in fp.format_recovery_rider(fp.recovery_row(st, d, T0 + 200))
+    obj = {**_warm(mode, eligible=None, age=None, bound_seat="sub-vps-6",
+                   bound_eligible=False),
+           "warm_skip": "model_capped", "warm_skipped": ["sub-vps-6"]}
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.reason == "no_warm_primary_seat"
+    assert d.warm["warm_gate"] == "refuse"
+    # then return normally: fallback cold (> 1h idle) or compaction
+    assert _gate(st, T0 + 1 + 61 * 60, obj).branch == "fallback_cold"
+    assert _gate(st, T0 + 200, obj, sid="sid-b").branch == "compaction"
 
 
-def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
+def test_parse_eligibility_warm_skip_fields():
+    e = fp.parse_eligibility({**_warm(), "warm_skip": "model_capped",
+                              "warm_skipped": ["sub-vps-6", ""]})
+    assert (e.warm_skip, e.warm_skipped) == ("model_capped", ("sub-vps-6",))
+    e = fp.parse_eligibility({**_warm(), "warm_skip": None, "warm_skipped": "junk"})
+    assert (e.warm_skip, e.warm_skipped) == (None, ())
+    assert fp.parse_eligibility(_warm()).warm_skipped == ()
+
+
+@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
+def test_warm_expired_copy_no_cap_expiry_while_fallback_warm(store, key, age):
+    """Ace 2026-09-25 19:35 "do not bother returning early": the warm-seat spec
+    P3 hard cap is rejected (fallback spec D6, Apollo ruling t_e001a935)."""
+    st = _sticky_on_fallback(store, key)
+    obj = _warm("shadow", eligible=None, age=age, bound_eligible=False)
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.branch is None
+    assert d.warm["warm_gate"] == "cap"
+    d = _gate(st, T0 + 1 + 61 * 60, obj)
+    assert d.allowed and d.branch == "fallback_cold"
+
+
+def test_warm_active_session_never_returns_early_on_cap(store, key):
     """Fallback called every 2 min for 3h (never cold); the relay's warm copy
-    of the primary ages from the last primary call with a 1h-tier window
-    (3300 s). The return lands no later than 55 min after that call."""
+    of the primary expires at 55 min. No cap_expiry return while the fallback
+    copy stays warm; the session stays sticky (D6, no time cap)."""
     last_primary = T0 - 60
     st = _sticky_on_fallback(store, key, last_primary=last_primary)
-    returned_at = None
     t = T0 + 120
     while t <= T0 + 3 * 3600:
         fp.note_fallback_success(store, key, t, "sid-a")
@@ -1563,14 +1592,8 @@ def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
         obj = _warm("enforce", eligible=None, age=age if age < 3300 else None,
                     bound_eligible=False)
         d = _gate(st, t + 1, obj)
-        if d.allowed:
-            returned_at = t + 1
-            assert d.branch == "cap_expiry"
-            break
-        assert d.reason == "no_warm_primary_seat"
+        assert not d.allowed and d.branch != "cap_expiry"
         t += 120
-    assert returned_at is not None
-    assert returned_at - last_primary <= 55 * 60 + 120  # first boundary after expiry
 
 
 @pytest.mark.parametrize("obj", [

@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import contextlib
 import ipaddress
 import concurrent.futures
 import dataclasses
@@ -4468,7 +4469,9 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
     """Track visible root child names and immediate directory mtimes.
 
     Category mtimes detect skill additions/removals within categories; child
-    names detect flat skill additions/removals. Hidden telemetry/curator files
+    names detect flat skill additions/removals; second-level directory mtimes
+    detect SKILL.md added to/removed from an existing category/skill directory.
+    Hidden telemetry/curator files
     and directories never invalidate the index. /reload-skills picks up deeper
     edits such as a frontmatter rename.
     """
@@ -4481,8 +4484,21 @@ def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], 
                     if entry.name.startswith("."):
                         continue
                     try:
-                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        is_dir = entry.is_dir()
+                        mtime = entry.stat().st_mtime_ns if is_dir else -1
                         out.append((entry.path, mtime))
+                    except OSError:
+                        continue
+                    if not is_dir:
+                        continue
+                    # category/skill dirs: adding or removing SKILL.md inside
+                    # one changes only that dir's mtime (C7 k99).
+                    try:
+                        with os.scandir(entry.path) as children:
+                            for child in children:
+                                if child.name.startswith(".") or not child.is_dir():
+                                    continue
+                                out.append((child.path, child.stat().st_mtime_ns))
                     except OSError:
                         continue
         except OSError:
@@ -14340,25 +14356,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if int(value.get("count", 0) or 0) >= self._STUCK_LOOP_THRESHOLD
             ]
 
-            for session_key in stuck_keys:
-                try:
-                    entry = self.session_store._entries.get(session_key)
-                    if entry and not entry.suspended:
-                        entry.suspended = True
-                        suspended += 1
-                        logger.warning(
-                            "Auto-suspended stuck session %s (active across %d "
-                            "consecutive restarts — likely a stuck loop)",
-                            session_key, counts[session_key]["count"],
-                        )
-                except Exception:
-                    pass
+            # Runs via asyncio.to_thread: the entry RMW and the snapshot must
+            # hold the store lock like every other session-store writer
+            # (``_save`` defers its durable I/O past the lock's release).
+            store_lock = getattr(self.session_store, "_lock", None)
+            with store_lock if store_lock is not None else contextlib.nullcontext():
+                for session_key in stuck_keys:
+                    try:
+                        entry = self.session_store._entries.get(session_key)
+                        if entry and not entry.suspended:
+                            entry.suspended = True
+                            suspended += 1
+                            logger.warning(
+                                "Auto-suspended stuck session %s (active across %d "
+                                "consecutive restarts — likely a stuck loop)",
+                                session_key, counts[session_key]["count"],
+                            )
+                    except Exception:
+                        pass
 
-            if suspended:
-                try:
-                    self.session_store._save()
-                except Exception:
-                    pass
+                if suspended:
+                    try:
+                        self.session_store._save()
+                    except Exception:
+                        pass
 
             for session_key in stuck_keys:
                 counts.pop(session_key, None)
@@ -25655,17 +25676,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if update_id is None:
             return False  # nothing to scope on — process
 
-        # Lazy-init the per-process HWM tracker + suppression counter.
-        if getattr(self, "_tg_redelivery_hwm", None) is None:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                _profile = get_active_profile_name() or "default"
-            except Exception:
-                _profile = "default"
-            self._tg_redelivery_profile = _profile
-            self._tg_redelivery_boot_hwm = _tgr.read_hwm(_hermes_home, _profile)
-            self._tg_redelivery_hwm = _tgr.TelegramHwmTracker(_hermes_home, _profile)
-            self._tg_redelivery_counter = _tgr.RedeliverySuppressionCounter()
+        # Lazy-init the per-process HWM tracker + suppression counter. This
+        # runs on worker threads (to_thread), so init is serialized; the tracker
+        # itself locks every mutation and flush.
+        with _tgr.TRACKER_INIT_LOCK:
+            if getattr(self, "_tg_redelivery_hwm", None) is None:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _profile = get_active_profile_name() or "default"
+                except Exception:
+                    _profile = "default"
+                self._tg_redelivery_profile = _profile
+                self._tg_redelivery_boot_hwm = _tgr.read_hwm(_hermes_home, _profile)
+                self._tg_redelivery_hwm = _tgr.TelegramHwmTracker(_hermes_home, _profile)
+                self._tg_redelivery_counter = _tgr.RedeliverySuppressionCounter()
 
         # Track this dispatch's update_id in the in-memory HWM (coalesced flush
         # happens elsewhere). This advances the HWM as the gateway processes.
@@ -32893,10 +32917,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    # INFO carries size + latency only: the words are the user's
+                    # speech (passwords, PII) and INFO logs are long-lived (Backfill C3).
                     logger.info(
-                        "stt: chat=%s transcribed %d chars in %.1fs: %r",
+                        "stt: chat=%s transcribed %d chars in %.1fs",
                         _stt_chat, len(transcript), time.monotonic() - _stt_started,
-                        transcript[:60].replace("\n", " "),
                     )
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
@@ -34633,7 +34658,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
             }
-            cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
+            # from_global_config re-reads the file: memoize only if it still
+            # holds the bytes the key was hashed from (C7 k102).
+            try:
+                import hashlib as _hashlib
+                recheck = _hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                recheck = None
+            if recheck == digest:
+                cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)
         except Exception:
             return cls._empty_honcho_cache_busting_config()

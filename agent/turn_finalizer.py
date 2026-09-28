@@ -1017,7 +1017,11 @@ def emit_session_end(
                     "depth": getattr(agent, "_blackbox_depth", None),
                     **_blackbox_compaction,
                 }
-            elif _blackbox_compaction:
+            elif any(k != "idle_compaction_fired" or v for k, v in _blackbox_compaction.items()):
+                # The prologue seeds {"idle_compaction_fired": False} on every
+                # turn; only a compaction that actually recorded something makes
+                # a call-less turn carry usage. Otherwise stay None so the store
+                # does not persist fabricated known zeros (C7 k84).
                 _turn_usage = dict(_blackbox_compaction)
         except Exception:
             _turn_usage = None

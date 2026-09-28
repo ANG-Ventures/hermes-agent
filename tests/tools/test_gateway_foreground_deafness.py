@@ -275,6 +275,20 @@ class TestToolWaitLongWatchdog:
         assert len(desc) <= wd.MAX_CMD_CHARS + 1
         assert "\n" not in desc
 
+    def test_secret_args_are_redacted_before_truncation(self, fast_watchdog):
+        """Backfill C3 (#1012): the long-wait line must not carry a credential, even
+        one the 240-char cut would otherwise leave as an unrecognisable fragment."""
+        wd = fast_watchdog
+        key = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
+        cmd = "x" * (wd.MAX_CMD_CHARS - 20) + " OPENAI_API_KEY=" + key
+        for args in ({"command": cmd},
+                     {"command": 'curl -H "Authorization: Bearer ' + key + '" https://api'},
+                     {"url": "https://h/cb?access_token=opaquevalue123456"}):
+            desc = wd.describe_call("terminal", args)
+            assert key[:14] not in desc, desc
+            assert "opaquevalue123456" not in desc, desc
+        assert wd.describe_call("terminal", {"command": "sleep 600"}) == "sleep 600"
+
     def test_e2e_real_registry_dispatch_of_real_terminal(self, fast_watchdog, caplog, cli_turn, tmp_path):
         """E2E through the real tool path: registry.dispatch -> terminal_tool ->
         local backend -> a real `sleep`. The watchdog must see it outstanding."""

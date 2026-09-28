@@ -361,6 +361,18 @@ class TestRendering:
         assert "write the report" in ctx
         assert "Now reading job-a" in ctx
 
+    def test_context_render_redacts_tool_arguments_and_results(self):
+        """Backfill C3 (#813): /resume-handoff returns this text to chat verbatim."""
+        key = "sk-" + "proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+        out = render_handoff_context({
+            "reason": "x",
+            "tool_calls": [{"name": "browser_type", "completed": True,
+                            "arguments": '{"text": "' + key + '"}',
+                            "result_preview": "Authorization: Bearer " + key}],
+        })
+        assert key not in out and "A1b2C3d4E5f6G7h8I9j0K1l2" not in out
+        assert "browser_type(" in out and "[completed]" in out
+
     def test_context_render_of_an_empty_handoff_is_empty(self):
         assert render_handoff_context(None) == ""
         assert render_handoff_context({}) == ""
@@ -406,3 +418,56 @@ class TestExpiredHandoffsAreReclaimed:
             "discord:999", {"created_at": time.time()}, root=tmp_path
         )
         assert handoff_path_for("discord:999", root=tmp_path).exists() is True
+
+
+class TestConcurrentReplacementSurvivesDelete:
+    """C5: a fresh handoff written between a read and the delete must survive."""
+
+    def _race(self, monkeypatch, path, fresh: str):
+        from pathlib import Path as _P
+        real = _P.read_text
+        state = {"fired": False}
+
+        def racing(self, *a, **k):
+            out = real(self, *a, **k)
+            if self == path and not state["fired"]:
+                state["fired"] = True
+                tmp = path.with_name(path.name + ".racer")
+                tmp.write_text(fresh, encoding="utf-8")
+                import os as _os
+                _os.replace(tmp, path)
+            return out
+
+        monkeypatch.setattr(_P, "read_text", racing)
+
+    def test_prune_keeps_fresh_replacement(self, tmp_path, monkeypatch):
+        from agent.turn_handoff import handoff_path_for
+        path = handoff_path_for("discord:race", root=tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"created_at": time.time() - HANDOFF_TTL_SECONDS - 60}),
+                        encoding="utf-8")
+        fresh = json.dumps({"created_at": time.time(), "marker": "fresh"})
+        self._race(monkeypatch, path, fresh)
+        assert prune_expired_handoffs(root=tmp_path) == 0
+        assert json.loads(path.read_text(encoding="utf-8"))["marker"] == "fresh"
+
+    def test_expired_peek_keeps_fresh_replacement(self, tmp_path, monkeypatch):
+        from agent.turn_handoff import handoff_path_for, peek_turn_handoff
+        path = handoff_path_for("discord:race2", root=tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"created_at": time.time() - HANDOFF_TTL_SECONDS - 60}),
+                        encoding="utf-8")
+        fresh = json.dumps({"created_at": time.time(), "marker": "fresh"})
+        self._race(monkeypatch, path, fresh)
+        assert peek_turn_handoff("discord:race2", root=tmp_path) is None
+        assert json.loads(path.read_text(encoding="utf-8"))["marker"] == "fresh"
+
+    def test_consume_takes_current_and_leaves_later_write(self, tmp_path):
+        from agent.turn_handoff import consume_turn_handoff, handoff_path_for
+        write_turn_handoff("discord:race3", {"created_at": time.time(), "n": 1}, root=tmp_path)
+        got = consume_turn_handoff("discord:race3", root=tmp_path)
+        assert got["n"] == 1
+        write_turn_handoff("discord:race3", {"created_at": time.time(), "n": 2}, root=tmp_path)
+        assert consume_turn_handoff("discord:race3", root=tmp_path)["n"] == 2
+        leftovers = [p.name for p in handoff_path_for("x", root=tmp_path).parent.iterdir()]
+        assert not [n for n in leftovers if ".claim-" in n]

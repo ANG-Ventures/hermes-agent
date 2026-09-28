@@ -121,7 +121,9 @@ def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
             return cls
     if exc_name in _CONN_EXC_NAMES:
         return "conn"
-    if http_status == 401:
+    # Last resort, same as the runtime classifier (error_classifier routes an
+    # otherwise-unrecognized 403 to FailoverReason.auth) (C7 k80).
+    if http_status in (401, 403):
         return "auth"
     return "unclassified"
 
@@ -222,7 +224,9 @@ def _scrub(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        # Persisted error preview: a non-navigation sink, so URL query credentials
+        # and user:pass@ userinfo are redacted too (Backfill C3).
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:  # noqa: BLE001
         return ""
 

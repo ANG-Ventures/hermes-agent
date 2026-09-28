@@ -1470,7 +1470,11 @@ def _extend_canonical_from_plugins() -> None:
             try:
                 provider_seam.publish(delta)
             except provider_seam.SeamCollision:
+                # A concurrent registration changed the labels between our
+                # read and the publish. Do not latch: the next read retries
+                # instead of losing these providers for the process lifetime.
                 logger.warning("canonical provider auto-extend skipped: label collision", exc_info=True)
+                return
         _canonical_extended = True
 
 

@@ -317,7 +317,12 @@ class LSPService:
             client = self._clients.get(key)
         if client is not None and client.is_running:
             return True
-        slot = host_slots.acquire(self._max_servers_per_host)
+        try:
+            slot = host_slots.acquire(self._max_servers_per_host)
+        except OSError as e:
+            # Unwritable/full lock dir: run without LSP rather than fail the write.
+            logger.debug("lsp host slot probe failed: %s", e)
+            return False
         if slot is None:
             return False
         slot.release()

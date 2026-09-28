@@ -267,6 +267,37 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+class _DesktopCronDispatchGate:
+    """Serve-process cron dispatch gate: the shared-checkout admission fence.
+
+    The gateway ticker passes ``_CronDispatchGate``; the desktop in-process
+    ticker passed nothing, so ``cron.scheduler.tick`` never consulted the serve
+    admission hold and could launch a cron agent after the serve process had
+    acknowledged quiescence (C7 k115). The gate is resolved per tick, so a hold
+    configured after the ticker thread started is still honoured.
+    """
+
+    def __call__(self) -> bool:
+        return True
+
+    def admit(self):
+        try:
+            from gateway.checkout_admission import AdmissionRefused, process_gate
+
+            gate = process_gate("serve")
+        except Exception:
+            # Same as the gateway's _checkout_admission_gate: an unresolvable
+            # gate is "disabled", never a permanent cron stop.
+            _log.exception("desktop cron: checkout admission gate unavailable")
+            return lambda: None
+        if gate is None:
+            return lambda: None
+        try:
+            return gate.admit("cron:tick", internal=False).release
+        except AdmissionRefused:
+            return None
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -297,6 +328,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
+        start_kwargs["can_dispatch"] = _DesktopCronDispatchGate()
         try:
             from hermes_cli.profiles import profiles_to_serve
 

@@ -1011,6 +1011,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "'superseded'; no --result/--summary required, but the "
                                  "pointer must be non-empty (an unnamed supersede is a "
                                  "silent delete of the work).")
+    p_complete.add_argument("--draft-ok", default=None, metavar="REASON",
+                            help="Audited per-card override for the DRAFT-PR refusal: the "
+                                 "handoff names a draft PR that is intentionally left open "
+                                 "(e.g. a CI vehicle for an upstream PR). The draft is not "
+                                 "routed to review; a completion_draft_override event records "
+                                 "the PRs and REASON. An empty REASON is refused.")
     p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
                                  "remote, not in the workspace. Verified with git ls-remote "
@@ -1778,6 +1784,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    refusal = _non_owner_lifecycle_refusal(args)
+    if refusal:
+        print(f"kanban: {refusal}", file=sys.stderr)
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -2088,6 +2099,59 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         return is_delegated_child_process_context()
     except Exception:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+#: Terminal/lifecycle writes a worker makes on its OWN card. Each one passes
+#: ``expected_run_id=_worker_run_id_for(tid)``, which is ``None`` for a process
+#: that does not own the grant, and ``None`` means "operator, no run guard".
+_WORKER_LIFECYCLE_ACTIONS: frozenset[str] = frozenset({
+    "complete",
+    "block",
+    "schedule",
+    "request-review",
+})
+
+
+def _lifecycle_target_ids(args: argparse.Namespace) -> list[str]:
+    ids = list(getattr(args, "task_ids", None) or [])
+    if getattr(args, "task_id", None):
+        ids.append(args.task_id)
+    ids.extend(getattr(args, "ids", None) or [])
+    return ids
+
+
+def _non_owner_lifecycle_refusal(args: argparse.Namespace) -> Optional[str]:
+    """Refuse a lifecycle write on the ambient worker card by a non-owner.
+
+    A process that inherited a worker's ``HERMES_KANBAN_TASK`` but does not hold
+    the owner grant (``HERMES_KANBAN_OWNER_PID`` names another pid) gets
+    ``expected_run_id=None`` from :func:`_worker_run_id_for`, which
+    ``complete_task``/``block_task`` read as an operator override with no run
+    guard. Without this gate such a process closes the live worker's card
+    (2026-08-12, t_09b90233: a nested process closed its parent's card).
+
+    Scope is the card the inherited env names. A shell with no worker env is an
+    operator and is unaffected; so is the owning worker, and a hand-driven
+    worker with no owner marker (``owns_kanban_worker_authority`` fails open).
+    """
+    if getattr(args, "kanban_action", None) not in _WORKER_LIFECYCLE_ACTIONS:
+        return None
+    ambient = os.environ.get("HERMES_KANBAN_TASK")
+    if not ambient or ambient not in _lifecycle_target_ids(args):
+        return None
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if is_dispatcher_owned_worker_context():
+            return None
+    except Exception:
+        return None
+    return (
+        f"this process inherited worker env for {ambient} but does not hold "
+        f"its owner grant; only the dispatcher's worker may "
+        f"{args.kanban_action} that card (run it from a shell without the "
+        f"worker env to act as an operator)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4482,6 +4546,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     superseded_by = getattr(args, "superseded_by", None)
+    draft_ok = getattr(args, "draft_ok", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -4492,9 +4557,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_none = getattr(args, "survivor_none", False)
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
-                         or survivor_unbound or survivor_none or survivor_reason or superseded_by):
+                         or survivor_unbound or survivor_none or survivor_reason or superseded_by
+                         or draft_ok is not None):
         print(
-            "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
+            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --survivor-ref / "
             "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
@@ -4558,8 +4624,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_none=survivor_none,
                     survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
+                    draft_ok=draft_ok,
                 )
-            except kb.EmptySupersedeError as supersede_err:
+            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
@@ -4582,7 +4649,25 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                           f"{outcome or 'handoff names a still-OPEN PR'}")
                 else:
                     print(f"Completed {tid}")
+                override = _draft_override_of(conn, tid, last_event)
+                if override:
+                    print(f"  draft override recorded for {', '.join(override['prs'])}: "
+                          f"{override['reason']}")
     return 0 if not failed else 1
+
+
+def _draft_override_of(conn, tid: str, after_event_id):
+    """This completion's ``completion_draft_override`` payload on ``tid``, or None."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND id > ? AND kind = "
+        "'completion_draft_override' ORDER BY id DESC LIMIT 1", (tid, after_event_id or 0),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:

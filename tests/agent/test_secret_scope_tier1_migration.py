@@ -262,3 +262,45 @@ class TestAzureIdentityPresence:
         assert not any(
             "EnvironmentCredential" in s for s in info.get("env_sources", [])
         )
+
+
+class TestOpenRouterClientPerProfile:
+    """Backfill C3 (#1238): the MoA client must never be reused across profile
+    secret scopes; one process-global client sent profile B's prompts under A's key."""
+
+    def _patch_resolver(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        import tools.openrouter_client as orc
+
+        monkeypatch.setattr(orc, "_clients", {}, raising=False)
+        monkeypatch.setattr(orc, "_client", None, raising=False)  # pre-fix global
+
+        def fake_resolve(provider, async_mode=False, **kw):
+            return {"built_with": ss.get_secret("OPENROUTER_API_KEY")}, "m"
+
+        monkeypatch.setattr(aux, "resolve_provider_client", fake_resolve)
+        return orc
+
+    def test_each_scope_gets_a_client_for_its_own_key(self, monkeypatch):
+        orc = self._patch_resolver(monkeypatch)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+        with _Scope({"OPENROUTER_API_KEY": "sk-or-profile-a"}):
+            a = orc.get_async_client()
+        with _Scope({"OPENROUTER_API_KEY": "sk-or-profile-b"}):
+            b = orc.get_async_client()
+        with _Scope({"OPENROUTER_API_KEY": "sk-or-profile-a"}):
+            a2 = orc.get_async_client()
+        assert a["built_with"] == "sk-or-profile-a"
+        assert b["built_with"] == "sk-or-profile-b"
+        assert a2 is a
+
+    def test_scope_without_key_is_refused_not_served_a_cached_client(self, monkeypatch):
+        orc = self._patch_resolver(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-other-profile-env")
+        ss.set_multiplex_active(True)
+        with _Scope({"OPENROUTER_API_KEY": "sk-or-profile-a"}):
+            orc.get_async_client()
+        with _Scope({"UNRELATED": "x"}):
+            with pytest.raises(ValueError):
+                orc.get_async_client()

@@ -1518,6 +1518,23 @@ class AsyncSessionStore:
 _DB_UNPINNED = object()
 
 
+def _claim_turn_marker_revision(entry, revision) -> bool:
+    """True when ``revision`` is the newest turn-marker write for ``entry``.
+
+    Called under the store lock at publish time. Every turn-marker write
+    allocates a monotonically increasing routing revision, and the durable
+    fast path keeps the highest one; a publish carrying an older revision
+    would leave memory disagreeing with disk (and a later clear acting on
+    the wrong token), so it is dropped.
+    """
+    if revision is None:
+        return True
+    if revision <= getattr(entry, "_turn_marker_revision", 0):
+        return False
+    entry._turn_marker_revision = revision
+    return True
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -2203,13 +2220,18 @@ class SessionStore:
             return
         with self._lock:
             items = list(self._entries.items())
+            # Entries are also rewritten IN PLACE (compression-tip heal), so
+            # the object identity alone cannot tell that a route moved on.
+            sids = {key: entry.session_id for key, entry in items}
         if not items:
             return
         plan = self._plan_stale_prune(db, items)
         if plan is None:
             return
         with self._lock:
-            self._apply_stale_prune_locked(plan, expected=dict(items))
+            self._apply_stale_prune_locked(
+                plan, expected=dict(items), expected_sids=sids
+            )
 
     def _plan_stale_prune(self, db, items):
         """Decide stale / repointed routes. Performs the state.db I/O.
@@ -2311,18 +2333,31 @@ class SessionStore:
             return None
         return stale_keys, repointed
 
-    def _apply_stale_prune_locked(self, plan, *, expected) -> None:
+    def _apply_stale_prune_locked(self, plan, *, expected, expected_sids=None) -> None:
         """Apply a prune plan. Caller holds ``_lock`` (or is lock-free)."""
         stale_keys, repointed = plan
         changed = False
+
+        def _moved(key) -> bool:
+            if expected is None:
+                return False
+            current = self._entries.get(key)
+            if current is not expected.get(key):
+                return True
+            return (
+                expected_sids is not None
+                and current is not None
+                and current.session_id != expected_sids.get(key)
+            )
+
         for key in stale_keys:
-            if expected is not None and self._entries.get(key) is not expected.get(key):
+            if _moved(key):
                 continue
             if key in self._entries:
                 del self._entries[key]
                 changed = True
         for key, recovered_entry in repointed.items():
-            if expected is not None and self._entries.get(key) is not expected.get(key):
+            if _moved(key):
                 continue
             self._entries[key] = recovered_entry
             changed = True
@@ -4319,6 +4354,7 @@ class SessionStore:
                 model_override=None,
             )
             candidate._model_override_identity_invalid = False
+            captured_override = (entry.model_override_identity, entry.model_override)
             self._reconcile_recovered_routing_locked()
             self._assert_unique_session_routes()
             generation = self._next_routing_generation_locked()
@@ -4328,14 +4364,22 @@ class SessionStore:
             pin_key = self._chat_pin_key(session_key)
 
         self._persist_routing_data(data, generation, require_primary=True)
+        superseded = []
 
         def _publish(current: "SessionEntry") -> None:
+            # A /model set that landed while the lock was released is NEWER
+            # than this clear: keep it (its own later snapshot is on disk, and
+            # _publish_persisted_entry re-saves the live entry if ours landed
+            # last), and leave its chat pin alone below.
+            if (current.model_override_identity, current.model_override) != captured_override:
+                superseded.append(True)
+                return
             current.model_override_identity = None
             current._model_override_identity_invalid = False
             current.model_override = None
 
         self._publish_persisted_entry(session_key, entry, generation, _publish)
-        if pin_key:
+        if pin_key and not superseded:
             from gateway.chat_model_pins import ChatModelPins
             ChatModelPins(self.sessions_dir).set(*pin_key, None)
         return True
@@ -4403,6 +4447,10 @@ class SessionStore:
         revision = self._save_entry(session_key, entry_data=candidate)
 
         def _publish(current: "SessionEntry") -> None:
+            # Persist and publish order can differ between concurrent marks;
+            # disk keeps the highest revision, so memory must too.
+            if not _claim_turn_marker_revision(current, revision):
+                return
             current.active_turn_token = token
             current.active_turn_started_at = now
             current.updated_at = now
@@ -4429,7 +4477,9 @@ class SessionStore:
         revision = self._save_entry(session_key, entry_data=candidate)
 
         def _publish(current: "SessionEntry") -> None:
-            if current.active_turn_token == token:
+            if current.active_turn_token == token and _claim_turn_marker_revision(
+                current, revision
+            ):
                 current.active_turn_token = None
                 current.active_turn_started_at = None
 
