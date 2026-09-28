@@ -278,7 +278,7 @@ def _ann(*tests):
         {"message": f"{t}: FAILED (not quarantined)"} for t in tests]
 
 
-def _queue_route(tmp_path, api: dict, *, run_id=42, pr="1328") -> dict:
+def _queue_route(tmp_path, api: dict, *, run_id=42, pr="1328", branch="", subject="") -> dict:
     step = _route_step()
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -290,6 +290,10 @@ def _queue_route(tmp_path, api: dict, *, run_id=42, pr="1328") -> dict:
     run = {"name": "CI", "workflow_id": 7, "id": run_id, "head_sha": "abc", "conclusion": "failure",
            "head_branch": f"gh-readonly-queue/main/pr-{pr}-dbc864fd2687ae3a61a03856201bd012a2967d56",
            "html_url": "https://x/42", "actor": {"login": "ang-fleet-lander[bot]"}, "event": "merge_group"}
+    if branch != "":
+        run["head_branch"] = branch
+    if subject:
+        run["head_commit"] = {"message": subject}
     out = tmp_path / "out"
     out.write_text("")
     env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
@@ -362,6 +366,46 @@ def test_queue_dedupe_api_error_fails_loud(tmp_path):
 def test_queue_signature_falls_back_to_job_name_without_slice(tmp_path):
     got = _queue_route(tmp_path, _api([]))
     assert got["summary"] == "PR #1328 ejected from the merge queue: Python tests / Run tests"
+
+
+def test_queue_retry_same_test_plus_new_unannotated_red_job_still_pages(tmp_path):
+    # FleetReview #1375 afff7c56: a lint job going red next to an already-paged test
+    # failure is a new fault; the signature must carry the unannotated job too.
+    api = _api([QTEST], prior_runs=[(30, "1328", "aaa")])
+    api["actions/runs/42/jobs"]["jobs"].append({"id": 950, "name": "Lint (ruff + ty) / ruff", "conclusion": "failure"})
+    api["check-runs/950/annotations"] = [{"message": "Process completed with exit code 1."}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts"
+    assert got["summary"] == f"PR #1328 ejected from the merge queue: Lint (ruff + ty) / ruff; {QTEST}"
+
+
+def _null_branch_prior(api, rid, pr):
+    # FleetReview #1375 f6fcb4be: the queue ref is deleted, head_branch comes back
+    # null (run 36354859649, 2026-09-27); the squash subject still names the PR.
+    runs = api["actions/workflows/7/runs"]["workflow_runs"]
+    for r in runs:
+        if r["id"] == rid:
+            r["head_branch"] = None
+            r["head_commit"] = {"message": f"fix(x): thing (#{pr})\n\nbody (#999)"}
+    return api
+
+
+def test_queue_retry_prior_run_with_deleted_ref_is_still_recognized(tmp_path):
+    api = _null_branch_prior(_api([QTEST], prior_runs=[(30, "1328", "aaa")]), 30, "1328")
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "none"
+    assert "already failed the queue" in got["_stdout"]
+
+
+def test_deleted_ref_prior_run_of_another_pr_still_pages(tmp_path):
+    api = _null_branch_prior(_api([QTEST], prior_runs=[(30, "1333", "aaa")]), 30, "1333")
+    assert _queue_route(tmp_path, api)["route"] == "alerts"
+
+
+def test_current_run_with_deleted_ref_takes_pr_from_commit_subject(tmp_path):
+    got = _queue_route(tmp_path, _api([QTEST]), branch=None, subject="fix(y): z (#1328)")
+    assert got["route"] == "alerts"
+    assert got["summary"] == f"PR #1328 ejected from the merge queue: {QTEST}"
 
 
 def test_post_step_puts_pr_summary_on_first_line():
