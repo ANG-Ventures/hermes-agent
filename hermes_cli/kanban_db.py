@@ -10645,6 +10645,31 @@ def complete_task(
                 # and the PR refs the review-card closer resolves on merged=true.
                 add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
+    # Negative-handoff gate (t_4209baaa): a handoff that SAYS it did not land
+    # ("NOT DEPLOYED", "STOP finding", outcome=partial, ...) is Needs-Apollo,
+    # not done (t_d0aee724, t_b6eb2944). Default-off: kanban.negative_handoff_review.
+    if candidate.status != 'review' and not approve_head_sha and not superseded_by:
+        from hermes_cli import kanban_negative_handoff as _neg
+        trigger = _neg.match((summary, result), metadata)
+        if trigger and configured_negative_handoff_review():
+            note = _neg.route_note(trigger)
+            ok, route_reason = request_review(
+                conn, task_id,
+                summary="\n".join(filter(None, [note, summary or result])),
+                metadata=dict(metadata or {}, negative_handoff=trigger),
+                reviewer=_neg.REVIEWER, expected_run_id=expected_run_id,
+                force=True, with_reason=True,
+            )
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id,
+                    "completion_routed_negative_handoff" if ok
+                    else "completion_route_refused",
+                    {"trigger": trigger, "reason": route_reason},
+                )
+            if ok:
+                add_comment(conn, task_id, "kanban", note)
+            return bool(ok)
     # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
     # without merge (e.g. auto-closed when its stacked base was deleted), so
     # the work is not on default. Refuse done unless the handoff carries a
@@ -12890,6 +12915,15 @@ def configured_max_review_rounds() -> int:
     except Exception:
         return DEFAULT_MAX_REVIEW_ROUNDS
     return rounds if rounds >= 0 else DEFAULT_MAX_REVIEW_ROUNDS
+
+
+def configured_negative_handoff_review() -> bool:
+    """``kanban.negative_handoff_review`` — route negative handoffs to review (default off)."""
+    try:
+        value, _source = _kanban_review_setting("negative_handoff_review", False)
+    except Exception:
+        return False
+    return value is True or str(value).strip().casefold() in ("1", "true", "yes", "on")
 
 
 def configured_review_policy() -> str:
