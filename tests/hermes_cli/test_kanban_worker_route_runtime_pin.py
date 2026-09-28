@@ -51,8 +51,10 @@ def _fresh_card_pin_cache():
     from hermes_cli import kanban_worker_route
 
     kanban_worker_route._card_pin_cache.clear()
+    kanban_worker_route._live_state.update(agent=None, cursor=0)
     yield
     kanban_worker_route._card_pin_cache.clear()
+    kanban_worker_route._live_state.update(agent=None, cursor=0)
 
 
 def _runtime_agent(provider, chain):
@@ -393,3 +395,54 @@ def test_unreadable_board_fails_open(board, monkeypatch):
                         model="claude-fable-5-1")
     assert _failover(agent, FailoverReason.overloaded) is True
     assert agent.model == "claude-opus-5-5"
+
+
+def test_model_only_pin_refuses_another_model(board):
+    """``set-model --model X`` without a provider still pins the model."""
+    from agent.error_classifier import FailoverReason
+
+    tid, run_id = board
+    _pin_card(tid, None, "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"},
+                         {"provider": "openai-codex", "model": "gpt-6-sol-900k"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert (agent.provider, agent.model) == ("claude-bpr", "claude-fable-5-1")
+    refused = _events(tid, "worker_route_pin_refused")
+    assert [r for r, _ in refused] == [run_id]
+    assert refused[0][1]["provider"] == "claude-bpr"
+    assert refused[0][1]["to_model"] == "claude-opus-5-5"
+    assert _events(tid, "worker_route_substituted") == []
+
+
+def test_model_only_pin_allows_same_model_elsewhere(board):
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, None, "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-apx-1", "model": "claude-fable-5-1"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is True
+    assert (agent.provider, agent.model) == ("claude-apx-1", "claude-fable-5-1")
+    assert _events(tid, "worker_route_pin_refused") == []
+
+
+def test_next_dispatch_write_does_not_change_running_policy(board):
+    """A non-live set-model after the run's first loop boundary applies to the
+    NEXT dispatch only: the running worker keeps the pin it spawned on."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"}],
+                        model="claude-fable-5-1")
+    agent._delegate_depth = 0
+    apply_pending_live_route(agent, iteration=0)  # first loop boundary
+    _pin_card(tid, "claude-bpr", "claude-opus-5-5")  # next-dispatch write
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert agent.model == "claude-fable-5-1"
+    assert _events(tid, "worker_route_substituted") == []
