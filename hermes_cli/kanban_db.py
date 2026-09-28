@@ -10012,6 +10012,14 @@ def reclaim_task(
     held_status = row["status"]
     preserve_status = held_status in ("blocked", "triage", "scheduled")
     with write_txn(conn):
+        if termination.get("operator_override") and (
+            _dead_claimer_release_at(conn, task_id)[1] != "launch_bound"
+        ):
+            # The override was granted on "no worker evidence". Worker evidence
+            # (a ``spawned``/``heartbeat`` event) that landed after that check
+            # voids it: re-read it under the write lock (FleetReview
+            # 8a8140b0725a on #1404).
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -10022,9 +10030,13 @@ def reclaim_task(
             # Fence to the run the termination verdict inspected: a gateway
             # dispatcher run reusing the same lock (spawn in flight, pid not
             # stamped yet) must not be released by it (FleetReview ffdcb1bab162).
-            "AND current_run_id IS ?",
+            "AND current_run_id IS ? "
+            # ... and to the worker pid it inspected: a pid stamped after the
+            # verdict is a live worker the verdict never saw (FleetReview
+            # 8a8140b0725a on #1404).
+            "AND worker_pid IS ?",
             (held_status if preserve_status else retry_status, task_id, prev_lock,
-             row["current_run_id"]),
+             row["current_run_id"], row["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
@@ -17827,10 +17839,18 @@ def _host_process_mentions_task(task_id: str) -> bool:
     try:
         # This CLI and the shell(s) that launched it name the task too.
         me = psutil.Process()
-        own = {me.pid, *(p.pid for p in me.parents())}
+        parents = me.parents()
         # Windows has no uids: never skip on uid there.
         _geteuid = getattr(os, "geteuid", None)
         my_euid = _geteuid() if _geteuid is not None else None
+        # Skipping ancestors must not skip the worker itself: an unstamped
+        # orphan that runs ``reclaim --operator`` on its own card is our
+        # ancestor (or this very process). Its env grant is inherited by every
+        # descendant, so check it before excluding anyone (FleetReview
+        # 2362caff15e1 on #1404).
+        if _caller_inside_task_worker(task_id, parents):
+            return True
+        own = {me.pid, *(p.pid for p in parents)}
         for proc in psutil.process_iter(["pid", "cmdline", "status", "uids"]):
             info = proc.info
             if info.get("pid") in own:
@@ -17851,6 +17871,50 @@ def _host_process_mentions_task(task_id: str) -> bool:
                 return True
     except Exception:
         return True
+    return False
+
+
+# Process title a dispatcher worker gives itself (hermes_cli/main.py
+# ``_set_process_title``). ``setproctitle`` overwrites argv AND the environ
+# block, so the title is the only place the task id survives in the process
+# table (FleetReview 1d1cb187c593 on #1404). Keep both sides in sync.
+KANBAN_WORKER_PROCTITLE = "hermes kanban-worker {task_id}"
+
+
+def _proc_is_titled_worker(cmdline, task_id: str) -> bool:
+    """True if ``cmdline`` is exactly ``task_id``'s rewritten worker title."""
+    joined = " ".join(str(a) for a in (cmdline or ()) if a).strip()
+    return joined == KANBAN_WORKER_PROCTITLE.format(task_id=task_id)
+
+
+def _caller_inside_task_worker(task_id: str, parents) -> bool:
+    """True if this process runs inside ``task_id``'s own worker tree.
+
+    The worker's env grant (``HERMES_KANBAN_TASK``) is inherited by every
+    subprocess it launches; delegated children have it scrubbed, so each
+    ancestor's env grant and process title are read too. A bare task id in
+    an ancestor's argv is NOT a match: the operator's own shell
+    (``sh -c '... reclaim t_x'``) names the task (FleetReview c18fd1d3b7f7
+    on #1442). An ancestor whose title or env cannot be read is skipped, as
+    every ancestor was before: a dispatcher worker is a same-uid Python
+    process whose argv and env are readable, while CI runners and containers
+    do have unreadable ancestors, and failing closed on them refused every
+    override there.
+    """
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return True
+    for parent in parents:
+        try:
+            if _proc_is_titled_worker(parent.cmdline(), task_id):
+                return True
+        except (psutil.Error, OSError):
+            pass
+        try:
+            env = parent.environ()
+        except (psutil.Error, OSError):
+            continue
+        if (env.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+            return True
     return False
 
 def _worker_survived_termination(termination: dict) -> bool:
