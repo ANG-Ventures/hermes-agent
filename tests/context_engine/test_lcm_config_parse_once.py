@@ -153,3 +153,37 @@ def test_concurrent_misses_parse_once(tmp_path, monkeypatch):
     [t.join(10) for t in ts]
     assert len(out) == 6 and all(o["lcm"]["context_threshold"] == 0.66 for o in out)
     assert calls[0] == 1
+
+
+def test_miss_rereads_the_file_under_the_parse_lock(tmp_path, monkeypatch):
+    """FleetReview on #1416: a thread that read the OLD text, then waited on the
+    parse lock while another thread cached a NEWER edit, parsed and stored the
+    old text over it (and returned it). The miss path re-reads under the lock."""
+    import threading
+
+    home = _home(tmp_path, monkeypatch)
+    lcm_config._reset_config_yaml_cache()
+    real_lock = lcm_config._CONFIG_YAML_PARSE_LOCK
+    waiting = threading.Event()
+
+    class _Lock:
+        def __enter__(self):
+            waiting.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
+
+    monkeypatch.setattr(lcm_config, "_CONFIG_YAML_PARSE_LOCK", _Lock())
+    out = []
+    newer = _CONFIG_YAML.replace("context_threshold: 0.66", "context_threshold: 0.77")
+    with real_lock:
+        t = threading.Thread(target=lambda: out.append(lcm_config._hermes_config_yaml()))
+        t.start()
+        assert waiting.wait(5)  # it has read the old text and wants the lock
+        (home / "config.yaml").write_text(newer, encoding="utf-8")
+        lcm_config._config_yaml_cache = (
+            str(home / "config.yaml"), newer, lcm_config._load_hermes_config_yaml(newer))
+    t.join(5)
+    assert out and out[0]["lcm"]["context_threshold"] == 0.77
+    assert lcm_config._config_yaml_cache[1] == newer

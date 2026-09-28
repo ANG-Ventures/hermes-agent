@@ -199,6 +199,13 @@ def _hermes_config_yaml() -> dict[str, Any]:
         cached = _config_yaml_cache
     if cached is None or cached[0] != key_path or cached[1] != text:
         with _CONFIG_YAML_PARSE_LOCK:
+            # Re-read under the lock: text read before it may predate an edit
+            # another thread already cached; parsing that would store (and
+            # return) the older config over the newer entry.
+            try:
+                text = cfg_path.read_text(encoding="utf-8")
+            except Exception:
+                return {}
             with _CONFIG_YAML_CACHE_LOCK:
                 cached = _config_yaml_cache
             if cached is None or cached[0] != key_path or cached[1] != text:

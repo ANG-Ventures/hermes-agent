@@ -1503,6 +1503,11 @@ def test_pool_budget_pinned_route_honours_an_explicit_probe(pool, bpr):
     assert got == 0
     # No explicit probe: the pinned lane still spends one subscription.
     assert ph.pool_budget_eligible("claude-bpx-22", {}, {}, _urls(None, bpr.url)) == 1
+    # An empty/malformed explicit probe is not a probe: the pinned lane keeps
+    # its relay health signal instead of failing open (FleetReview on #1416).
+    for bad in ("", "not-a-url"):
+        assert ph.pool_budget_eligible(
+            "claude-bpx-22", {"claude-bpx-22": bad}, {}, _urls(None, bpr.url)) == 1
 
 
 def test_steady_state_deferral_is_recorded_once(home, apr):
