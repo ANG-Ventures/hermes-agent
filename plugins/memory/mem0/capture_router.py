@@ -32,6 +32,7 @@ against the prefs pass (B's world pass leaks user-ops junk as low-value world ca
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -495,7 +496,7 @@ class CaptureRouter:
         # or writing a second file if the retry crosses midnight.
         existing = sorted({
             path for root in (self._staging_dir, self._brain_inbox)
-            for path in Path(root).glob(f"*/{turn_id}.md")
+            for path in Path(root).glob(f"*/{glob.escape(turn_id)}.md")
         })
         if existing:
             result["destination"] = (

@@ -132,8 +132,9 @@ def selective_rerun_verdict(original: list[dict], rerun: list[dict], probe_lines
 def _reused_jobs(prior: list[dict], jobs: list[dict]) -> list[str]:
     """Jobs of the later attempt that are the prior attempt's execution carried over (same start + runner)."""
     by_name = {j["name"]: j for j in prior}
+    # A job that never started (skipped in both attempts) carries nothing over.
     return [j["name"] for j in jobs
-            if (p := by_name.get(j["name"])) is not None
+            if (p := by_name.get(j["name"])) is not None and j.get("started_at") is not None
             and p["started_at"] == j["started_at"] and p["runner_name"] == j["runner_name"]]
 
 
@@ -150,12 +151,16 @@ def full_rerun_verdict(prior: list[dict], jobs: list[dict], probe_lines: dict[st
         m = PROBE_LINE.search(probe_lines.get(job["name"], ""))
         if m:
             planned.append({"job": job["name"], "executing": int(m.group(2)), "planned": int(m.group(3))})
-        elif not job["name"].endswith(_PLANNER_JOBS):
+        elif not job["name"].endswith(_PLANNER_JOBS) and job.get("started_at") is not None:
             missing.append(job["name"])
+    absent = sorted({j["name"] for j in prior} - {j["name"] for j in jobs})
     evidence = {"attempt": attempt, "slices": planned, "reused": reused, "missing_probe": missing,
+                "absent_jobs": absent,
                 "note": "GitHub-side half only: controller fresh reservation is exercised under ac3_live_*"}
     if reused:
         return check(name, "BLOCK", evidence, "jobs carried over from the prior attempt: selective, not full, re-run")
+    if absent:
+        return check(name, "BLOCK", evidence, f"prior-attempt job(s) absent from the re-run: {absent}")
     if missing or not planned:
         return check(name, "UNVERIFIABLE", evidence, f"slice job(s) without a PROBE line: {missing}")
     ok = all(p["executing"] == p["planned"] == attempt for p in planned)

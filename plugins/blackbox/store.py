@@ -973,7 +973,9 @@ def _route_id_origin(route_id: str | None) -> str | None:
 
 def _measured(usage: CanonicalUsage, field: str) -> int | None:
     """A bucket the provider did not report is stored NULL, never a measured 0."""
-    if getattr(usage, "usage_unknown", False) or getattr(usage, f"{field}_unknown", False):
+    # Per-bucket provenance only: an unavailable aggregate total (usage_unknown)
+    # must not discard buckets the provider did report.
+    if getattr(usage, f"{field}_unknown", False):
         return None
     return getattr(usage, field)
 

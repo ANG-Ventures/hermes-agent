@@ -64,3 +64,34 @@ def test_retry_does_not_restage_when_destination_mode_changes(tmp_path):
     assert result["staged_path"] == original
     assert result["destination"] == "staging"
     assert list((tmp_path / "inbox").rglob("turn-2.md")) == []
+
+
+def test_staged_lookup_matches_turn_id_literally_not_as_a_glob(tmp_path):
+    """turn_id 'turn[12]' must not pick up another turn's 'turn1.md' as its own."""
+    extracted = []
+
+    class _Router:
+        _stage_world_facts = CaptureRouter._stage_world_facts
+        route_turn = CaptureRouter.route_turn
+        _write = staticmethod(CaptureRouter._default_write)
+        def __init__(self):
+            self._staging_dir = str(tmp_path / "staged")
+            self._brain_inbox = str(tmp_path / "inbox")
+            self._staging_mode = True
+            self._now = lambda: __import__("datetime").datetime.now()
+        def two_pass_extract(self, *args):
+            extracted.append(args)
+            raise RuntimeError("extraction reached")
+
+        stats = {"fallback_passes": 0, "extract_errors": 0, "prefs_seen": 0,
+                 "world_deduped": 0, "world_staged": 0, "turns_routed": 0}
+
+    router = _Router()
+    other = router._stage_world_facts([{"class": "world_entity", "content": "other"}],
+                                       router._staging_dir, turn_id="turn1", session="s", ts=None)
+    try:
+        result = router.route_turn("user", "assistant", turn_id="turn[12]", session="s")
+    except RuntimeError:
+        result = {}
+    assert extracted, "a different turn's staged file was taken as this turn's"
+    assert result.get("staged_path") != other

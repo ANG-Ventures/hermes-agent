@@ -254,3 +254,22 @@ def test_full_rerun_with_every_job_replanned_passes():
     logs = {j["name"]: f"PROBE slice={j['name'][-1]} executing_attempt=2 planned_attempt=2"
             for j in fresh if "Run tests" in j["name"]}
     assert integ.full_rerun_verdict(A1, fresh, logs, attempt=2)["status"] == "PASS"
+
+
+def test_full_rerun_ignores_jobs_skipped_in_both_attempts():
+    """A conditional job skipped in both attempts (null start/runner) carried nothing over."""
+    skipped = {"name": "Python tests / Optional e2e", "runner_name": None, "started_at": None}
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    logs = {j["name"]: f"PROBE slice={j['name'][-1]} executing_attempt=2 planned_attempt=2"
+            for j in fresh if "Run tests" in j["name"]}
+    assert integ.full_rerun_verdict(A1 + [skipped], fresh + [dict(skipped)], logs, attempt=2)["status"] == "PASS"
+
+
+def test_full_rerun_blocks_when_a_prior_job_disappeared():
+    """Prior attempt ran slices a and b; a listing holding only b cannot certify a full re-run."""
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"}
+             for j in A1 if not j["name"].endswith("Run tests a")]
+    logs = {"Python tests / Run tests b": "PROBE slice=b executing_attempt=2 planned_attempt=2"}
+    result = integ.full_rerun_verdict(A1, fresh, logs, attempt=2)
+    assert result["status"] == "BLOCK"
+    assert result["evidence"]["absent_jobs"] == ["Python tests / Run tests a"]

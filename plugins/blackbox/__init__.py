@@ -124,7 +124,7 @@ def record_api_call(
     cfg = _config()
     if cfg is None:
         return
-    from agent.usage_pricing import CanonicalUsage, normalize_usage, prompt_tokens_unknown
+    from agent.usage_pricing import CanonicalUsage, normalize_usage
     from plugins.blackbox import store
 
     canonical = (
@@ -166,14 +166,16 @@ def record_api_call(
             cache_read=(
                 canonical.cache_read_tokens
                 if usage is not None
-                and not (canonical.cache_read_tokens_unknown or canonical.usage_unknown)
+                and not canonical.cache_read_tokens_unknown
                 else None
             ),
             reset=prefix_reset,
             prompt_tokens=(
                 canonical.input_tokens + canonical.cache_read_tokens
                 + canonical.cache_write_tokens
-                if usage is not None and not prompt_tokens_unknown(canonical)
+                if usage is not None and not (
+                    canonical.input_tokens_unknown or canonical.cache_read_tokens_unknown
+                    or canonical.cache_write_tokens_unknown)
                 else None
             ),
             compare_across_turns=prefix_compare_across_turns,
