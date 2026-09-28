@@ -779,6 +779,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"superseded_by must be a string, got {type(superseded_by).__name__}"
             )
         superseded_by = redact_sensitive_text(superseded_by, force=True)
+    draft_ok = args.get("draft_ok")
+    if draft_ok is not None:
+        if not isinstance(draft_ok, str):
+            return tool_error(
+                f"draft_ok must be a string reason, got {type(draft_ok).__name__}"
+            )
+        draft_ok = redact_sensitive_text(draft_ok, force=True)
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -914,7 +921,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     expected_run_id=_worker_run_id(tid),
                     survivor_pr=survivor_pr, survivor_ref=survivor_ref,
                     superseded_by=superseded_by,
+                    draft_ok=draft_ok,
                 )
+            except kb.EmptyDraftOverrideError as draft_err:
+                return tool_error(f"kanban_complete blocked: {draft_err}.")
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "
@@ -2185,6 +2195,16 @@ KANBAN_COMPLETE_SCHEMA = {
                     "after you VERIFIED the premise against current main "
                     "— and never with an empty value, which is refused. "
                     "Leave it unset for ordinary work."
+                ),
+            },
+            "draft_ok": {
+                "type": "string",
+                "description": (
+                    "Only when completion was refused because the handoff "
+                    "names a DRAFT PR that is INTENTIONALLY left open, e.g. "
+                    "a CI vehicle for an upstream PR: the reason. Recorded "
+                    "as an audited completion_draft_override event; the "
+                    "draft is not routed to review. Empty is refused."
                 ),
             },
             "summary": {

@@ -2532,6 +2532,10 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+    # Session that wrote the event (``task_events.actor_session_id``). The
+    # notifier uses it to skip waking the chat whose own session made the
+    # transition (t_a4890a77).
+    actor_session_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -4842,6 +4846,30 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+# Set by ``_home_session_guarded`` for the duration of one guarded mutator:
+# the first OUTERMOST write transaction the mutator opens re-runs the
+# home-session check under its write lock, before any write.
+_PENDING_HOME_CHECK: ContextVar[Optional[dict]] = ContextVar(
+    "kanban_pending_home_check", default=None
+)
+
+
+def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
+    pending = _PENDING_HOME_CHECK.get()
+    if pending is None or pending["done"]:
+        return
+    pending["done"] = True
+    token = _MUTATION_ACTOR.set(pending["actor"])
+    try:
+        pending["result"] = check_home_session(
+            conn, pending["task_id"], pending["action"]
+        )
+    finally:
+        _MUTATION_ACTOR.reset(token)
+    if pending["result"] is not None:
+        pending["home_before"] = _read_home_session(conn, pending["task_id"])
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """Context manager for an IMMEDIATE write transaction.
@@ -4891,6 +4919,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
+        _recheck_pending_home_session(conn)
         yield conn
     except Exception:
         try:
@@ -5168,7 +5197,10 @@ def backfill_unhomed(
                 conn, tid, "session_restamped",
                 {"session_id": UNHOMED_SESSION, "backfill": True},
             )
-        add_comment(conn, tid, author=author, body=UNHOMED_BACKFILL_COMMENT)
+            # Same transaction as the stamp: a failed comment must roll the
+            # stamp back, or the next run skips the card and the audit
+            # comment is lost for good (C5 backfill, PR #987 review).
+            add_comment(conn, tid, author=author, body=UNHOMED_BACKFILL_COMMENT)
         done.append(tid)
     return done
 
@@ -5578,6 +5610,117 @@ def _worker_owns_card(
     return row is not None
 
 
+# ---------------------------------------------------------------------------
+# Operator-token flag gate (harness-parity spec 4.7 layer i, AC-A6)
+# ---------------------------------------------------------------------------
+# ``--takeover`` / ``--operator`` let a CLI caller act on a card it does not
+# own. While a run is active on the card, those flags are refused unless the
+# process presents ``KANBAN_OPERATOR_TOKEN`` equal to the ``operator-token``
+# file beside the board (written 0600 by a launchd job, never by the gateway).
+# The dispatcher's own worker is exempt only when ``HERMES_KANBAN_OWNER_PID`` is
+# THIS pid: an exact pid match, never an env value alone and never ancestry.
+# This is a tripwire, not a wall: a same-uid process can read the file (AC-A6
+# arm 6, Q15). Every refusal leaves a ``takeover_refused`` event.
+OPERATOR_TOKEN_ENV = "KANBAN_OPERATOR_TOKEN"
+OPERATOR_TOKEN_FILENAME = "operator-token"
+OPERATOR_FLAG_GATED_ACTIONS: frozenset[str] = frozenset({
+    "complete", "block", "unblock", "reassign", "archive", "request-review",
+})
+
+
+class OperatorTokenRequiredError(ValueError):
+    """A flag override on a card with an active run lacked the operator token."""
+
+
+def operator_token_path() -> Path:
+    """``<root>/kanban/operator-token``: beside the boards, outside any profile."""
+    return kanban_home() / "kanban" / OPERATOR_TOKEN_FILENAME
+
+
+def _operator_token_state() -> str:
+    """``ok`` | ``absent`` | ``no_token_file`` | ``mismatch``. Never the value."""
+    import hmac
+
+    presented = (os.environ.get(OPERATOR_TOKEN_ENV) or "").strip()
+    if not presented:
+        return "absent"
+    try:
+        expected = operator_token_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return "no_token_file"
+    if not expected:
+        return "no_token_file"
+    if hmac.compare_digest(presented.encode(), expected.encode()):
+        return "ok"
+    return "mismatch"
+
+
+def _caller_holds_grant_for(task_id: str) -> bool:
+    """True only for the dispatcher's worker on its own card, by exact pid."""
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() != task_id:
+        return False
+    owner = (os.environ.get("HERMES_KANBAN_OWNER_PID") or "").strip()
+    try:
+        return int(owner) == os.getpid()
+    except ValueError:
+        return False
+
+
+def task_run_is_active(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None
+) -> bool:
+    """A run is active: ``current_run_id`` set and the claim not yet expired."""
+    row = conn.execute(
+        "SELECT current_run_id, claim_expires FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["current_run_id"] is None:
+        return False
+    expires = row["claim_expires"]
+    return bool(expires) and int(expires) > int(now if now is not None else time.time())
+
+
+def enforce_operator_flag_gate(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    action: str,
+    *,
+    flags: Iterable[str],
+    argv: Optional[Sequence[str]] = None,
+) -> None:
+    """Refuse ``flags`` on any of ``task_ids`` that has an active run, unless
+    the caller presents the operator token or owns the card's grant by pid.
+
+    Raises :class:`OperatorTokenRequiredError` after appending one
+    ``takeover_refused`` event (caller pid, argv, which flags, token state).
+    """
+    used = sorted({f for f in (flags or ()) if f})
+    if action not in OPERATOR_FLAG_GATED_ACTIONS or not used:
+        return
+    token = _operator_token_state()
+    if token == "ok":
+        return
+    for tid in dict.fromkeys(str(t) for t in (task_ids or ()) if t):
+        if _caller_holds_grant_for(tid) or not task_run_is_active(conn, tid):
+            continue
+        payload = {
+            "action": action,
+            "flags": used,
+            "caller_pid": os.getpid(),
+            "argv": list(argv if argv is not None else sys.argv),
+            "token": token,
+        }
+        with write_txn(conn, allow_nested=True):
+            _append_event(conn, tid, "takeover_refused", payload)
+        raise OperatorTokenRequiredError(
+            f"refused {action} {' '.join(used)} on {tid}: a run is active on it, "
+            f"and overriding a live run needs the operator token "
+            f"({OPERATOR_TOKEN_ENV}, token {token}). Recorded as a "
+            f"takeover_refused event. An operator presents it inline: "
+            f"{OPERATOR_TOKEN_ENV}=$(cat {operator_token_path()}) "
+            f"hermes kanban {action} {tid} ..."
+        )
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -5865,14 +6008,28 @@ def _home_session_guarded(action: str, task_param: str = "task_id"):
                 _read_home_session(conn, str(task_id))
                 if override is not None else _HOME_UNREAD
             )
+            # Fast refusal above; the AUTHORITATIVE check re-runs inside the
+            # mutator's own write transaction (see ``write_txn``), so a restamp
+            # between this read and the write cannot slip a foreign mutation
+            # through (C5 TOCTOU, PR #951 review). It also re-reads the home
+            # under the same lock, before any write (C7 k103 audit).
+            pending = {
+                "task_id": str(task_id), "action": action,
+                "actor": _MUTATION_ACTOR.get(), "done": False, "result": override,
+                "home_before": home_before,
+            }
             token = _MUTATION_ACTOR.set(None)
+            pending_token = _PENDING_HOME_CHECK.set(pending)
             try:
                 result = fn(conn, *args, **kwargs)
             finally:
+                _PENDING_HOME_CHECK.reset(pending_token)
                 _MUTATION_ACTOR.reset(token)
+            override = pending["result"]
             if override is not None and _mutation_succeeded(result):
                 record_foreign_action(
-                    conn, str(task_id), action, override, home_before=home_before
+                    conn, str(task_id), action, override,
+                    home_before=pending["home_before"],
                 )
             return result
 
@@ -9751,6 +9908,22 @@ class EmptySupersedeError(ValueError):
         )
 
 
+class EmptyDraftOverrideError(ValueError):
+    """Raised by ``complete_task`` when ``draft_ok`` is given but blank.
+
+    ``draft_ok`` lifts the DRAFT-PR completion refusal for ONE card
+    (t_f38605be); the reason is the audit record, so an empty one is refused.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: {task_id} passed an empty draft_ok; give the reason "
+            f"the named DRAFT PR is intentionally left open, e.g. 'CI vehicle for "
+            f"upstream PR o/r#N'. {task_id} is still in-flight (no state change)"
+        )
+
+
 def _enforce_branch_base(
     conn: sqlite3.Connection, task: "Task", metadata: Optional[dict]
 ) -> None:
@@ -9802,8 +9975,16 @@ def complete_task(
     survivor_none: bool = False,
     survivor_reason: Optional[str] = None,
     superseded_by: Optional[str] = None,
+    draft_ok: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``draft_ok`` is the audited per-card override for the DRAFT-PR refusal
+    (t_f38605be): a non-empty reason lets a handoff name an intentionally-open
+    draft PR. The draft is dropped from the open-PR route, and a
+    ``completion_draft_override`` event records the PRs and the reason. A blank
+    reason is refused (:class:`EmptyDraftOverrideError`); without it the
+    default :class:`DraftPrError` refusal is unchanged.
 
     ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on
     current main — the sibling card, PR or sha that did the work. The closing
@@ -9868,6 +10049,15 @@ def complete_task(
                 )
             raise EmptySupersedeError(task_id)
     run_outcome = "superseded" if superseded_by else "completed"
+    if draft_ok is not None:
+        draft_ok = str(draft_ok).strip()[:_SUPERSEDED_POINTER_MAX]
+        if not draft_ok:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_empty_draft_override",
+                    {"reason": "empty_draft_ok"},
+                )
+            raise EmptyDraftOverrideError(task_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -9963,6 +10153,7 @@ def complete_task(
                             metadata=metadata, survivor_pr=survivor_pr,
                         )
                     },
+                    draft_ok=draft_ok is not None,
                 )
             except _fresh.DraftPrError as draft_err:
                 with write_txn(conn):
@@ -9971,6 +10162,19 @@ def complete_task(
                         {"prs": draft_err.prs},
                     )
                 raise
+            overridden = freshness.get("draft_override") or []
+            if overridden:
+                # Audited, never silent (t_f38605be): the intentionally-open
+                # draft is a mention, not a route to review that would wait
+                # on a merge nobody intends.
+                override = {"prs": list(overridden), "reason": draft_ok}
+                with write_txn(conn):
+                    _append_event(conn, task_id, "completion_draft_override", override)
+                metadata = dict(metadata or {}, draft_override=override)
+                still_open = [
+                    r for r in still_open if f"{r.repo}#{r.number}" not in overridden
+                ]
+        if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
@@ -22274,6 +22478,9 @@ def _default_spawn(
     # own session-id stamping relies on them). Pop it here — mirrors the restart
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
+    # INV-A7: the operator token is presented inline by a human operator and
+    # must never ride into a worker by inheritance from the dispatcher's env.
+    env.pop(OPERATOR_TOKEN_ENV, None)
 
     # A worker imports the runtime tree its argv's venv points at — never a
     # dispatcher's PYTHONPATH/PYTHONHOME. sys.path beats the venv's editable
@@ -23746,6 +23953,9 @@ def unseen_events_for_sub(
             id=r["id"], task_id=r["task_id"], kind=r["kind"],
             payload=payload, created_at=r["created_at"],
             run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+            actor_session_id=(
+                (r["actor_session_id"] or None) if "actor_session_id" in r.keys() else None
+            ),
         ))
         max_id = max(max_id, int(r["id"]))
     return max_id, out

@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import contextlib
 import ipaddress
 import concurrent.futures
 import dataclasses
@@ -14355,25 +14356,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if int(value.get("count", 0) or 0) >= self._STUCK_LOOP_THRESHOLD
             ]
 
-            for session_key in stuck_keys:
-                try:
-                    entry = self.session_store._entries.get(session_key)
-                    if entry and not entry.suspended:
-                        entry.suspended = True
-                        suspended += 1
-                        logger.warning(
-                            "Auto-suspended stuck session %s (active across %d "
-                            "consecutive restarts — likely a stuck loop)",
-                            session_key, counts[session_key]["count"],
-                        )
-                except Exception:
-                    pass
+            # Runs via asyncio.to_thread: the entry RMW and the snapshot must
+            # hold the store lock like every other session-store writer
+            # (``_save`` defers its durable I/O past the lock's release).
+            store_lock = getattr(self.session_store, "_lock", None)
+            with store_lock if store_lock is not None else contextlib.nullcontext():
+                for session_key in stuck_keys:
+                    try:
+                        entry = self.session_store._entries.get(session_key)
+                        if entry and not entry.suspended:
+                            entry.suspended = True
+                            suspended += 1
+                            logger.warning(
+                                "Auto-suspended stuck session %s (active across %d "
+                                "consecutive restarts — likely a stuck loop)",
+                                session_key, counts[session_key]["count"],
+                            )
+                    except Exception:
+                        pass
 
-            if suspended:
-                try:
-                    self.session_store._save()
-                except Exception:
-                    pass
+                if suspended:
+                    try:
+                        self.session_store._save()
+                    except Exception:
+                        pass
 
             for session_key in stuck_keys:
                 counts.pop(session_key, None)
@@ -25670,17 +25676,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if update_id is None:
             return False  # nothing to scope on — process
 
-        # Lazy-init the per-process HWM tracker + suppression counter.
-        if getattr(self, "_tg_redelivery_hwm", None) is None:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                _profile = get_active_profile_name() or "default"
-            except Exception:
-                _profile = "default"
-            self._tg_redelivery_profile = _profile
-            self._tg_redelivery_boot_hwm = _tgr.read_hwm(_hermes_home, _profile)
-            self._tg_redelivery_hwm = _tgr.TelegramHwmTracker(_hermes_home, _profile)
-            self._tg_redelivery_counter = _tgr.RedeliverySuppressionCounter()
+        # Lazy-init the per-process HWM tracker + suppression counter. This
+        # runs on worker threads (to_thread), so init is serialized; the tracker
+        # itself locks every mutation and flush.
+        with _tgr.TRACKER_INIT_LOCK:
+            if getattr(self, "_tg_redelivery_hwm", None) is None:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _profile = get_active_profile_name() or "default"
+                except Exception:
+                    _profile = "default"
+                self._tg_redelivery_profile = _profile
+                self._tg_redelivery_boot_hwm = _tgr.read_hwm(_hermes_home, _profile)
+                self._tg_redelivery_hwm = _tgr.TelegramHwmTracker(_hermes_home, _profile)
+                self._tg_redelivery_counter = _tgr.RedeliverySuppressionCounter()
 
         # Track this dispatch's update_id in the in-memory HWM (coalesced flush
         # happens elsewhere). This advances the HWM as the gateway processes.
@@ -32415,22 +32424,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # Profile attribution: a per-source profile wins (multiplexed serving
-        # binds each inbound to the profile that owns it), but when the source
-        # carries none, fall back to the profile THIS gateway was launched with
-        # rather than binding "". An empty profile made every subprocess/tool
-        # that reads HERMES_SESSION_PROFILE (papercut attribution, delegate_tool,
-        # kanban_tools) silently resolve to the default profile's identity even
-        # on a sibling gateway launched with --profile <name>. getattr keeps
-        # bare runners built via object.__new__ (tests) working.
-        _profile = getattr(source, "profile", "") or ""
-        if not _profile:
-            _resolve = getattr(self, "_active_profile_name", None)
-            if callable(_resolve):
-                try:
-                    _profile = _resolve() or ""
-                except Exception:
-                    _profile = ""
         return set_session_vars(
             platform=source.platform.value,
             chat_id=source.chat_id,
@@ -32454,7 +32447,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key or "",
             session_id=session_id or "",
             message_id=str(message_id) if message_id else "",
-            profile=_profile,
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )

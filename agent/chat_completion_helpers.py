@@ -59,7 +59,9 @@ from agent.fork_ext.relay_headers import (
     _pool_lane_src,
     call_id_of,
     merge_pool_capability_headers,
+    route_id_of,
     stamp_call_id,
+    stamp_correlation_headers,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -276,7 +278,8 @@ def _emit_api_call_record(
             attribution=attribution,
             http_status=http_status,
             relay_synthetic="x-pool-unreachable" in pool_headers,
-            route_id=pool_headers.get("x-pool-route-id"),
+            # Relay-minted on pooled lanes; harness-minted on pinned lanes.
+            route_id=pool_headers.get("x-pool-route-id") or route_id_of(api_kwargs),
             cache_ttl_requested=_requested_cache_ttl(api_kwargs),
             call_id=call_id_of(api_kwargs),
             api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
@@ -301,6 +304,7 @@ def _emit_aux_api_call_record(
     model: str,
     usage: Any,
     api_mode: str,
+    route_id: Optional[str] = None,
 ) -> None:
     """Ledger one auxiliary-model call under the turn that made it.
 
@@ -328,7 +332,7 @@ def _emit_aux_api_call_record(
             attribution=f"aux:{task}",
             http_status=200,
             relay_synthetic=False,
-            route_id=None,
+            route_id=route_id,
         )
     except Exception:
         _note_api_call_recording_failure(agent)
@@ -1855,6 +1859,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # One fresh correlation id per HTTP attempt (bridge lanes only); the ledger
     # row for this attempt reads the same value back off api_kwargs.
     stamp_call_id(agent, api_kwargs)
+    # S7 D1: harness-minted route id (pinned lanes) + lane-src (bpr/pinned).
+    stamp_correlation_headers(agent, api_kwargs)
     if should_use_direct_api_call(agent):
         try:
             response = direct_api_call(agent, api_kwargs)
@@ -6650,6 +6656,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 result["failure_recorded"] = False
                 # Fresh correlation id per stream attempt (bridge lanes only).
                 stamp_call_id(agent, api_kwargs)
+                stamp_correlation_headers(agent, api_kwargs)
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),

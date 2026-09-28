@@ -22,6 +22,12 @@ failure or a missing fleet-merge.sh is recorded and the handoff proceeds —
 the pre-existing behavior. A draft is only refused on a positive ``draft: true``
 read. Kill switches: ``KANBAN_HANDOFF_FRESHNESS=0`` disables the whole gate,
 ``KANBAN_HANDOFF_AUTOMERGE=0`` only (c).
+
+Per-card override for (a) (t_f38605be): ``check(..., draft_ok=True)`` does not
+raise for drafts; it returns them in ``report["draft_override"]`` so the caller
+(``complete_task(draft_ok="<reason>")``) can record an audited
+``completion_draft_override`` event and drop the intentionally-open draft
+vehicle from the open-PR route. The default refusal is unchanged.
 """
 
 from __future__ import annotations
@@ -53,7 +59,9 @@ class DraftPrError(ValueError):
             f"handoff refused: {', '.join(self.prs)} "
             f"{'is a DRAFT PR' if len(self.prs) == 1 else 'are DRAFT PRs'}. "
             f"A draft is not landable and must not enter the review lane. "
-            f"Run `gh pr ready <n> -R <repo>` (or name the right PR), then retry. "
+            f"Run `gh pr ready <n> -R <repo>` (or name the right PR), then retry; "
+            f"if the draft is INTENTIONALLY left open, complete with "
+            f"--draft-ok/draft_ok \"<reason>\" (audited). "
             f"{task_id} is still in-flight (no state change)."
         )
 
@@ -153,7 +161,7 @@ ArmFn = Callable[[str, int, str, str], Optional[str]]
 
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
-          armable=None) -> dict:
+          armable=None, draft_ok: bool = False) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -164,7 +172,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
 
     Returns a report ``{"prs": {"o/r#n": {...}}}`` for the handoff metadata.
     All draft checks run before any mutation, so a refused handoff has changed
-    nothing on GitHub.
+    nothing on GitHub. With ``draft_ok`` drafts are not refused: they are listed
+    in ``report["draft_override"]`` and skipped by (b)/(c) (the caller audits).
     """
     report: dict = {"prs": {}, "checked_at": int(time.time())}
     # Never update-branch or arm a third-party PR (t_06dccfe3): the caller
@@ -192,10 +201,13 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             drafts.append(key)
+            entry["draft"] = True
             continue
         views.append((ref, key, pr, entry))
     if drafts:
-        raise DraftPrError(task_id, drafts)
+        if not draft_ok:
+            raise DraftPrError(task_id, drafts)
+        report["draft_override"] = drafts
 
     for ref, key, pr, entry in views:
         head = str(((pr.get("head") or {}).get("sha")) or "")

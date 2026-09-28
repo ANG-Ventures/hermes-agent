@@ -149,6 +149,25 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_draft_ok_must_be_a_nonempty_string(worker_env):
+    """draft_ok is an audited reason (t_f38605be): blank / non-string is refused."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    bad_type = json.loads(kt._handle_complete({"summary": "s", "draft_ok": True}))
+    assert "draft_ok must be a string" in bad_type["error"]
+    blank = json.loads(kt._handle_complete({"summary": "s", "draft_ok": "  "}))
+    assert "empty draft_ok" in blank["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        kinds = [e.kind for e in kb.list_events(conn, worker_env)]
+        assert "completion_blocked_empty_draft_override" in kinds
+    finally:
+        conn.close()
+    assert "draft_ok" in kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

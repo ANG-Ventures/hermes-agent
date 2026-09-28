@@ -516,7 +516,9 @@ def read_planned_restart(
                     pid_best, float(pid_best["epoch"])
                 ):
                     pid_best = row
-                continue
+            # Outside the prior life the row belongs to another process with a
+            # reused pid; it must not reach the window fallback either.
+            continue
         if ended_epoch is None:
             continue
         # The window fallback may not match a row written after this boot, or

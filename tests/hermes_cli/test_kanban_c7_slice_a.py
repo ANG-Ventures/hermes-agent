@@ -226,6 +226,24 @@ def test_k114_strip_overlay_restores_removed_path(monkeypatch, child_path, expec
     assert env["PATH"] == expected.replace(":", os.pathsep)
 
 
+@pytest.mark.parametrize("old,new,child_path,expected", [
+    ("/opt/bin:/usr/bin", "/usr/bin", "/usr/bin", "/opt/bin:/usr/bin"),
+    ("/a:/b:/c", "/b", "/venv:/b", "/venv:/a:/b:/c"),
+    ("/a:/b:/c:/d", "/x:/b:/d", "/x:/b:/d", "/a:/b:/c:/d"),
+])
+def test_k114_strip_overlay_keeps_removed_path_precedence(
+        monkeypatch, old, new, child_path, expected):
+    # FleetReview #1373 5796875694f5: removed components go back at their
+    # original position relative to retained ones, not appended.
+    from hermes_cli import process_env_files as pef
+
+    sep = lambda s: s.replace(":", os.pathsep)
+    monkeypatch.setattr(pef, "_OVERLAY", {"PATH": (sep(old), sep(new))})
+    env = {"PATH": sep(child_path)}
+    pef.strip_overlay(env)
+    assert env["PATH"] == sep(expected)
+
+
 # --- k115: the desktop cron ticker honours the serve admission hold ----
 
 
