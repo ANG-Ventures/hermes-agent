@@ -167,11 +167,13 @@ def derive_scanned_modules(repo: Path, roots=None) -> frozenset[str]:
 
 
 def _called_names(node: ast.AST) -> set[str]:
-    """Every callee name in ``node``, skipping offload-call argument subtrees.
+    """Every callee name in ``node``.
 
     ``asyncio.to_thread(self._save)`` and
-    ``loop.run_in_executor(None, partial(self._save))`` are the FIX, so their
-    arguments must not be attributed to the enclosing coroutine.
+    ``loop.run_in_executor(None, partial(self._save))`` are the FIX: a callable
+    passed by reference is not a call, so it is never attributed. A CALL in an
+    offload argument (``to_thread(f, self._save())``) runs eagerly on the
+    loop and is attributed (C5 #35 sibling).
     """
     out: set[str] = set()
     stack: list[ast.AST] = list(ast.iter_child_nodes(node))
@@ -180,8 +182,13 @@ def _called_names(node: ast.AST) -> set[str]:
         if isinstance(current, ast.Call):
             func = current.func
             if isinstance(func, ast.Attribute) and func.attr in _OFFLOAD_ATTRS:
-                # Offloaded: skip the whole argument subtree.
-                stack.append(func)
+                # The offload call itself is not a callee; its arguments are
+                # still evaluated on the loop, so keep walking them -- except
+                # a lambda argument, whose body is what runs off-loop.
+                stack.extend(
+                    child for child in ast.iter_child_nodes(current)
+                    if not isinstance(child, ast.Lambda)
+                )
                 continue
             if isinstance(func, ast.Name):
                 out.add(func.id)
@@ -194,14 +201,16 @@ def _called_names(node: ast.AST) -> set[str]:
 
 
 def _file_import_map(repo: Path, tree: ast.AST, modules) -> dict[str, str]:
-    """``local_name -> rel_path`` for every ``from X import name`` in a file.
+    """``local_name -> (rel_path, name)`` for ``from X import name`` in scope.
 
-    Includes function-local imports (the gateway imports lazily almost
-    everywhere).  Only targets inside the scanned module set are kept.
+    ``tree`` is a module (MODULE-LEVEL imports only -- a function-local import
+    binds only inside its own function, C5 #37) or a function (that
+    function's own local imports; nested defs excluded).  Only targets inside
+    the scanned module set are kept.
     """
     out: dict[str, str] = {}
     scanned = set(modules)
-    for node in ast.walk(tree):
+    for node in _scope_nodes(tree):
         if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
             continue
         target = _module_to_path(repo, node.module)
@@ -215,7 +224,18 @@ def _file_import_map(repo: Path, tree: ast.AST, modules) -> dict[str, str]:
     return out
 
 
-# Per-file import maps, populated by ``build_index`` (keyed by rel path).
+def _scope_nodes(tree: ast.AST):
+    """Nodes in ``tree``'s own scope: never descends into nested defs/classes."""
+    stack = list(ast.iter_child_nodes(tree))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+# Per-file MODULE-LEVEL import maps, populated by ``build_index``.
 _IMPORT_MAPS: dict[str, dict] = {}
 
 
@@ -241,6 +261,7 @@ def build_index(repo: Path, modules, *, noqa_token: str | None = None) -> dict:
                 "async": isinstance(node, ast.AsyncFunctionDef),
                 "calls": _called_names(node),
                 "line": node.lineno,
+                "imports": _file_import_map(repo, node, modules),
                 "noqa": token in decl and bool(
                     decl.split(token, 1)[1].strip()
                 ),
@@ -272,9 +293,14 @@ def find_onloop_sink_sites(
     start_roots=None,
 ) -> list[str]:
     """Generic walk: coroutines (under ``start_roots``, default all) reaching a sink."""
+    # Either half may be given alone; the other keeps its default (C5 #38:
+    # ``sink_dotted`` used to be dropped whenever ``sink_names`` was None).
     sinks = (
-        (frozenset(sink_names), frozenset(sink_dotted or ()))
-        if sink_names is not None
+        (
+            frozenset(_ATOMIC_SINK_NAMES if sink_names is None else sink_names),
+            frozenset(_OS_SINK_DOTTED if sink_dotted is None else sink_dotted),
+        )
+        if sink_names is not None or sink_dotted is not None
         else None
     )
     index = build_index(repo, modules, noqa_token=noqa_token)
@@ -326,7 +352,10 @@ def _search(start, index, by_name, sinks=None):
         if depth >= _MAX_DEPTH:
             continue
         for name in sorted(info["calls"]):
-            for callee in _resolve(name, key[0], start_file, index, by_name):
+            for callee in _resolve(
+                name, key[0], start_file, index, by_name,
+                local_imports=info.get("imports"),
+            ):
                 if callee in visited:
                     continue
                 callee_info = index.get(callee)
@@ -340,7 +369,8 @@ def _search(start, index, by_name, sinks=None):
     return None
 
 
-def _resolve(name: str, current_file: str, start_file: str, index, by_name):
+def _resolve(name: str, current_file: str, start_file: str, index, by_name,
+             local_imports=None):
     """Resolve a callee name to (file, fn) keys.
 
     Three tiers, narrowest first:
@@ -365,14 +395,20 @@ def _resolve(name: str, current_file: str, start_file: str, index, by_name):
             if stem == module:
                 yield key
         return
+    # A ``from X import name`` inside the calling function binds ``name``
+    # there, shadowing any same-file def (C5 #39).
+    imported = (local_imports or {}).get(name)
+    if imported is not None and imported in index:
+        yield imported
+        return
     for candidate_file in (current_file, start_file):
         key = (candidate_file, name)
         if key in index:
             yield key
             return
-    # An explicit ``from X import name`` in the current file is unambiguous
-    # even when ``name`` is defined in several modules (``switch_model`` is:
-    # hermes_cli/model_switch.py, run_agent.py, agent/...).
+    # An explicit module-level ``from X import name`` in the current file is
+    # unambiguous even when ``name`` is defined in several modules
+    # (``switch_model`` is: hermes_cli/model_switch.py, run_agent.py, agent/...).
     imported = _IMPORT_MAPS.get(current_file, {}).get(name)
     if imported is not None and imported in index:
         yield imported
