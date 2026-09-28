@@ -30,7 +30,6 @@
  "tests/agent/test_usage_anchor.py::TestAnchorInvalidation::test_explicit_invalidation_sites",
  "tests/cli/test_cli_active_agent_ref_wiring.py::test_mixin_does_not_use_bare_global_for_active_agent_ref",
  "tests/cli/test_cli_goal_interrupt.py::TestInterruptFlagLifecycle::test_chat_resets_flag_at_entry",
- "tests/context_engine/test_anchored_trigger_no_double_skew.py::test_pre_api_log_line_prints_compared_value",
  "tests/context_engine/test_lcm_multifact_disambiguation.py::test_baseline_repro_records_escalation_in_run_params",
  "tests/context_engine/test_lcm_multifact_disambiguation.py::test_harness_sets_fidelity_env_to_match_escalation_arm",
  "tests/context_engine/test_lcm_provenance_stamp_multipass.py::test_gate_source_uses_ge_1",
