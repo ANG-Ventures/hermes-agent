@@ -4842,6 +4842,30 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+# Set by ``_home_session_guarded`` for the duration of one guarded mutator:
+# the first OUTERMOST write transaction the mutator opens re-runs the
+# home-session check under its write lock, before any write.
+_PENDING_HOME_CHECK: ContextVar[Optional[dict]] = ContextVar(
+    "kanban_pending_home_check", default=None
+)
+
+
+def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
+    pending = _PENDING_HOME_CHECK.get()
+    if pending is None or pending["done"]:
+        return
+    pending["done"] = True
+    token = _MUTATION_ACTOR.set(pending["actor"])
+    try:
+        pending["result"] = check_home_session(
+            conn, pending["task_id"], pending["action"]
+        )
+    finally:
+        _MUTATION_ACTOR.reset(token)
+    if pending["result"] is not None:
+        pending["home_before"] = _read_home_session(conn, pending["task_id"])
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """Context manager for an IMMEDIATE write transaction.
@@ -4891,6 +4915,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
+        _recheck_pending_home_session(conn)
         yield conn
     except Exception:
         try:
@@ -5168,7 +5193,10 @@ def backfill_unhomed(
                 conn, tid, "session_restamped",
                 {"session_id": UNHOMED_SESSION, "backfill": True},
             )
-        add_comment(conn, tid, author=author, body=UNHOMED_BACKFILL_COMMENT)
+            # Same transaction as the stamp: a failed comment must roll the
+            # stamp back, or the next run skips the card and the audit
+            # comment is lost for good (C5 backfill, PR #987 review).
+            add_comment(conn, tid, author=author, body=UNHOMED_BACKFILL_COMMENT)
         done.append(tid)
     return done
 
@@ -5865,14 +5893,28 @@ def _home_session_guarded(action: str, task_param: str = "task_id"):
                 _read_home_session(conn, str(task_id))
                 if override is not None else _HOME_UNREAD
             )
+            # Fast refusal above; the AUTHORITATIVE check re-runs inside the
+            # mutator's own write transaction (see ``write_txn``), so a restamp
+            # between this read and the write cannot slip a foreign mutation
+            # through (C5 TOCTOU, PR #951 review). It also re-reads the home
+            # under the same lock, before any write (C7 k103 audit).
+            pending = {
+                "task_id": str(task_id), "action": action,
+                "actor": _MUTATION_ACTOR.get(), "done": False, "result": override,
+                "home_before": home_before,
+            }
             token = _MUTATION_ACTOR.set(None)
+            pending_token = _PENDING_HOME_CHECK.set(pending)
             try:
                 result = fn(conn, *args, **kwargs)
             finally:
+                _PENDING_HOME_CHECK.reset(pending_token)
                 _MUTATION_ACTOR.reset(token)
+            override = pending["result"]
             if override is not None and _mutation_succeeded(result):
                 record_foreign_action(
-                    conn, str(task_id), action, override, home_before=home_before
+                    conn, str(task_id), action, override,
+                    home_before=pending["home_before"],
                 )
             return result
 
