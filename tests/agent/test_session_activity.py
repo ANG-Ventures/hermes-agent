@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from agent.session_activity import (
     ACTIVITY_DESCRIPTION_MAX,
+    SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS,
     ActivityProvenance,
     bound_activity_description,
     build_activity_snapshot,
@@ -22,7 +23,13 @@ def test_bound_activity_description_truncates():
 def test_reset_session_activity_persist_window_clears_rate_limit():
     agent = SimpleNamespace(_session_activity_last_persist_mono=1234.5)
     reset_session_activity_persist_window(agent)
-    assert agent._session_activity_last_persist_mono == 0.0
+    # A cleared window must be due at ANY monotonic reading, including the
+    # first seconds after host boot (monotonic() counts from boot).
+    for now_mono in (0.0, 5.0, 59.9, 1_000_000.0):
+        assert (
+            now_mono - agent._session_activity_last_persist_mono
+            >= SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS
+        )
 
 
 def test_reset_session_activity_persist_window_swallows_missing_attr():

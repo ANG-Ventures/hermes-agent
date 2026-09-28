@@ -261,9 +261,66 @@ def stash_api_error(agent: Any, api_error: BaseException,
                                  "x-ratelimit-reset")},
             "body": body if isinstance(body, dict) else None,
             "exc": type(api_error).__name__,
+            "endpoint": _endpoint(api_error),
         }
     except Exception:  # noqa: BLE001
         logger.debug("fallback ledger: stash failed", exc_info=True)
+
+
+def _endpoint(api_error: BaseException) -> Optional[str]:
+    """``host:port`` the failing call was sent to (the request URL), or None.
+    t_21bba7dc: a connection drop on a relay lane names the relay it hit."""
+    try:
+        req = getattr(api_error, "request", None)
+        if req is None:
+            req = getattr(getattr(api_error, "response", None), "request", None)
+        url = getattr(req, "url", None)
+        host = getattr(url, "host", None)
+        if not host:
+            return None
+        port = getattr(url, "port", None)
+        return f"{host}:{port}" if port else str(host)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+RELAY_PROBE_TIMEOUT_S = 0.3
+
+
+def probe_listener(addr: Optional[str], timeout: float = RELAY_PROBE_TIMEOUT_S) -> Optional[bool]:
+    """TCP-connect ``host:port``: True = something is listening, False = not,
+    None = no address to probe. Never raises."""
+    if not addr or ":" not in addr:
+        return None
+    try:
+        import socket
+
+        host, _, port = addr.rpartition(":")
+        with socket.create_connection((host.strip("[]"), int(port)), timeout=timeout):
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _note_relay_conn(row: Dict[str, Any], pending: Optional[Dict[str, Any]]) -> None:
+    """t_21bba7dc: a conn failover on a relay lane with no hop/seat evidence
+    never reached a seat. Record the address it hit and whether the listener
+    is back now (in memory for the notice only; not ledger columns)."""
+    try:
+        from agent.fallback_policy import relay_conn_without_evidence
+
+        if not relay_conn_without_evidence(row):
+            return
+        addr = (pending or {}).get("endpoint")
+        if addr and not row.get("relay_addr"):
+            row["relay_addr"] = addr
+        if "relay_up" not in row:
+            up = probe_listener(row.get("relay_addr"))
+            row["relay_up"] = up
+            if up:
+                row["relay_up_ts"] = time.time()
+    except Exception:  # noqa: BLE001
+        logger.debug("fallback ledger: relay conn note failed", exc_info=True)
 
 
 _SEAT_UNSTATED = frozenset(("", "unknown", "none"))
@@ -489,6 +546,7 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             row = fill_pin_evidence(row, exc_name=pending.get("exc") if pending else None)
         except Exception:  # noqa: BLE001
             logger.debug("fallback ledger: pin seat/hop fill failed", exc_info=True)
+        _note_relay_conn(row, pending)
     return row
 
 

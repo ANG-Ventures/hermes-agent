@@ -901,8 +901,10 @@ def test_wiring_conn_failover_arms_sticky_not_legacy_clock(wired):
     assert row["trigger_class"] == "conn"
     assert row["sticky_until_epoch"] == pytest.approx(st.until_epoch)
     assert row["notice_text"].startswith("🔄 Model fallback")
-    assert " — connection error " in row["notice_text"]
-    assert any(" — connection error " in m for _k, m in a._announced)
+    # t_21bba7dc: no hop/seat evidence -> the relay never answered; no hop/sub rider.
+    want = " — the relay dropped the connection before answering"
+    assert want in row["notice_text"] and "hop unknown" not in row["notice_text"]
+    assert any(want in m for _k, m in a._announced)
 
 
 def test_wiring_b1_fallback_429_does_not_rearm_primary(wired):

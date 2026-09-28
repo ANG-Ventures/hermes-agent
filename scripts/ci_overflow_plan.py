@@ -16,6 +16,11 @@ POOL = ["self-hosted", "Linux", "X64", "hermes-ci"]
 X64 = ["ubuntu-latest"]
 ARM = ["ubuntu-24.04-arm"]
 APPROVED = {tuple(POOL), tuple(X64), tuple(ARM)}
+# The ONE paid label (t_fe4e801b). Never in APPROVED: a policy override (allowed_labels) can still not
+# select it (AC7). The planner emits it only for Policy.blacksmith_count reserved non-core x64 slices,
+# so the committed plan names it and plan == execution (AC6) covers it. x64 only (t_56b21c1e).
+BLACKSMITH = ["blacksmith-4vcpu-ubuntu-2404"]
+PLACEABLE = APPROVED | {tuple(BLACKSMITH)}
 TERMINAL = {"completed"}
 
 
@@ -33,6 +38,7 @@ class Policy:
     mode: str = "self-only"
     k_cap: object = None
     arm_count: int = 0
+    blacksmith_count: object = 0
     allowed_labels: list = field(default_factory=lambda: [POOL, X64, ARM])
     cost_slice: int = 35
     cost_e2e: int = 20
@@ -93,6 +99,10 @@ def plan(slices_with_weights, e2e, snapshot: Snapshot, policy: Policy, allowance
     if arm is None:
         incidents.append("invalid-arm")
         arm = 0
+    bs = 0 if policy.blacksmith_count in (None, "") else _natural(policy.blacksmith_count)
+    if bs is None:
+        incidents.append("invalid-blacksmith")
+        bs = 0
     jobs = sorted(slices_with_weights, key=lambda s: (not s["core"], s.get("index", slices_with_weights.index(s))))
     if e2e is not None:
         jobs.insert(1 if jobs and jobs[0]["core"] else 0, e2e)
@@ -129,10 +139,14 @@ def plan(slices_with_weights, e2e, snapshot: Snapshot, policy: Policy, allowance
         p.job_id == j["job_id"] and p.reserved_minutes for p in placements)),
         key=lambda s: (s["estimated_duration_s"], s.get("index", slices_with_weights.index(s))))
     arm_ids = {x["job_id"] for x in candidates[:arm]}
-    placements = [JobPlacement(p.job_id, _labels(ARM) if p.job_id in arm_ids else p.labels,
+    # Blacksmith takes the HEAVIEST reserved non-core x64 slices (ARM takes the lightest): it is the
+    # faster x64 venue, and the heavy tail is what queues behind the hosted cap.
+    bs_ids = {x["job_id"] for x in [c for c in reversed(candidates) if c["job_id"] not in arm_ids][:bs]}
+    placements = [JobPlacement(p.job_id, _labels(ARM) if p.job_id in arm_ids else
+                               list(BLACKSMITH) if p.job_id in bs_ids else p.labels,
                                p.reason, p.reserved_minutes) for p in placements]
     return Plan(placements, incidents, {"mode": mode, "available": available, "k_cap": k,
-        "reserved_minutes": allowance - remaining, "remaining_allowance": remaining,
+        "reserved_minutes": allowance - remaining, "remaining_allowance": remaining, "blacksmith": len(bs_ids),
         "budget_overrides_cloud_only": any(p.reason == "budget-overrides-cloud-only" for p in placements),
         "snapshot": asdict(snapshot), "exclusions": "Bootstrap, PR CI, OS jobs and storage outside this admission budget"})
 

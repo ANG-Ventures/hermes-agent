@@ -103,6 +103,9 @@ class LoadGate:
         self._last_logged_state: Optional[str] = None
         self._last_summary_at: Optional[float] = None
         self._admitted_since_summary = 0
+        # Per-board split of the last tick (gateway dispatcher, t_f78d1938):
+        # {slug: {ready, quota, spawned, starved_since}}.
+        self.boards: dict = {}
 
     # -- hysteresis (hard pause) -------------------------------------------
     def update(self, load1: float, load5: Optional[float] = None) -> Optional[str]:
@@ -254,6 +257,7 @@ class LoadGate:
             "max_spawn_per_tick": self.max_spawn_per_tick,
             "load5_floor": self.load5_floor,
             "ncpu": self.ncpu,
+            "boards": self.boards,
             "updated_at": time.time(),
         }
 
@@ -300,6 +304,77 @@ class LoadGate:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def split_allowance(
+    allowance: Optional[int],
+    demand: "list[tuple[str, int]]",
+    start: int = 0,
+) -> "dict[str, Optional[int]]":
+    """Round-robin one tick's spawn ``allowance`` across boards.
+
+    ``demand`` is ``[(slug, spawnable_count), ...]`` in board order. Boards
+    with demand get one spawn each in turn, starting at ``start`` (mod the
+    number of boards with demand -- pass a tick counter so the first pick
+    rotates), until the allowance or every board's demand is spent. Order
+    inside a board is left to ``dispatch_once`` (priority, then age).
+
+    2026-09-28: the allowance used to be consumed board-by-board in a fixed
+    order, default first; with 17 ready cards on default and allowance 4
+    the subs-ace board got ZERO spawns for 93 minutes with 7 ready P1 cards.
+
+    ``allowance is None`` (gate disabled) returns ``None`` for every board.
+    """
+    if allowance is None:
+        return {slug: None for slug, _ in demand}
+    quotas: "dict[str, Optional[int]]" = {slug: 0 for slug, _ in demand}
+    live = [(slug, int(n)) for slug, n in demand if int(n or 0) > 0]
+    left = max(0, int(allowance))
+    if not live or left == 0:
+        return quotas
+    k = int(start) % len(live)
+    order = live[k:] + live[:k]
+    while left > 0:
+        progressed = False
+        for slug, need in order:
+            if left <= 0:
+                break
+            if quotas[slug] < need:
+                quotas[slug] += 1
+                left -= 1
+                progressed = True
+        if not progressed:
+            break
+    return quotas
+
+
+def format_board_starvation_lines(
+    state: Optional[dict],
+    now: Optional[float] = None,
+    threshold_seconds: float = 600.0,
+) -> "list[str]":
+    """Lines for boards whose ready cards got no spawn for > threshold while
+    the gate had allowance (``hermes kanban diagnostics``, t_f78d1938)."""
+    boards = (state or {}).get("boards") or {}
+    if not isinstance(boards, dict):
+        return []
+    now = time.time() if now is None else float(now)
+    out = []
+    for slug in sorted(boards):
+        info = boards.get(slug) or {}
+        since = info.get("starved_since")
+        if not since:
+            continue
+        age = now - float(since)
+        if age < threshold_seconds:
+            continue
+        out.append(
+            f"Board starved: [{slug}] ready={info.get('ready')} got 0 spawns for "
+            f"{age / 60:.0f}m while the load gate had allowance "
+            f"(last quota={info.get('quota')}); check per-profile / host caps "
+            f"or run `hermes kanban --board {slug} dispatch`"
+        )
+    return out
 
 
 def sample_loadavg() -> "tuple[Optional[float], Optional[float]]":
