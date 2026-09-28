@@ -82,11 +82,18 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
+_GUARD_DISPLAY_RESET_KINDS = frozenset(
+    {"claimed", "spawned", *kb._RESPAWN_GUARD_FAILURE_RESET_KINDS}
+)
+
+
 def _fmt_current_respawn_guard(status: str, events) -> str:
     """``<reason> — <pr> (<state>)`` for the respawn guard holding a queued card.
 
     Only the newest ``respawn_guarded`` event counts, and only when no
-    ``claimed``/``spawned`` event came after it (the guard since let it go).
+    claim/spawn or guard-resetting event (operator requeue, status change,
+    reassign, ...) came after it: the guard let it go, or its answer may have
+    changed and the next dispatch tick re-records it if it still holds.
     Empty for any other status or when nothing is holding the card.
     """
     if status not in ("ready", "review"):
@@ -95,7 +102,7 @@ def _fmt_current_respawn_guard(status: str, events) -> str:
     for ev in events:
         if ev.kind == "respawn_guarded":
             held = ev
-        elif ev.kind in ("claimed", "spawned"):
+        elif ev.kind in _GUARD_DISPLAY_RESET_KINDS:
             held = None
     if held is None:
         return ""

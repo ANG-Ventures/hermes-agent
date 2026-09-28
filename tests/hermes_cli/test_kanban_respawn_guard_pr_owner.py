@@ -115,11 +115,14 @@ def test_dispatch_event_and_show_name_the_holding_pr(
     assert guard and "active_pr — https://github.com/o/home/pull/1271 (OPEN)" in guard[0]
 
 
-def test_show_has_no_guard_line_once_spawned(kanban_home):
+@pytest.mark.parametrize("kind", ["spawned", "requeued", "status", "unblocked"])
+def test_show_drops_guard_line_after_spawn_or_requeue(kanban_home, kind):
+    """A requeue authorizes the next spawn; show must not keep blaming the PR."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="alice")
         kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr", "pr": "u"})
-        kb._append_event(conn, tid, "spawned", {"pid": 1})
+        assert "guard:" in kc.run_slash(f"show {tid}")
+        kb._append_event(conn, tid, kind, {})
     assert "guard:" not in kc.run_slash(f"show {tid}")
 
 
