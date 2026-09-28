@@ -231,3 +231,89 @@ def test_provisional_emit_waiting_on_a_real_finalize_stands_down(ledger, monkeyp
     assert result["r"] == 0
     assert fired == []
     assert getattr(agent, "_session_end_abandoned_turn_id", None) is None
+
+
+def test_parked_billed_calls_are_counted_without_consuming_them(ledger, monkeypatch):
+    from agent import turn_finalizer as tf
+    import agent.conversation_loop as loop
+
+    captured = {}
+    from hermes_cli import lifecycle
+
+    monkeypatch.setattr(lifecycle, "invoke_hook",
+                        lambda name, **kw: captured.update(kw) or [])
+    call = {k: False for k in loop.USAGE_UNKNOWN_FIELDS}
+    call.update({k: 0 for k in ("output_tokens", "cache_read_tokens",
+                                 "cache_write_tokens", "reasoning_tokens",
+                                 "prompt_tokens", "completion_tokens", "total_tokens")})
+    call.update(input_tokens=7, output_tokens_unknown=False, latency_s=0.0,
+                composition=None, provider="claude-bpr", model="m", base_url="",
+                accepted=False)
+    monkeypatch.setattr(loop, "_unaccepted_billed_turn_call", lambda entry: dict(call))
+    tid = "20260928_113709_739608:4fad7ed1:abea944d"
+    agent = _agent(tid)
+    parked = [{"turn_id": tid, "response": object()},
+              {"turn_id": "other:turn:x", "response": object()}]
+    agent._billed_unaccounted = parked
+
+    assert tf.emit_abandoned_session_ends([agent], "gateway_restart") == 1
+
+    assert len(parked) == 2, "the live turn still owns the parked list"
+    calls = captured["turn_usage"]["calls"]
+    assert [c["input_tokens"] for c in calls] == [7]
+    assert captured["provisional"] is True
+
+
+def test_provisional_blackbox_record_keeps_live_session_state(ledger, monkeypatch):
+    sid = "20260927_164646_25b828"
+    tid = sid + ":4560194f:30f202b5"
+    blackbox._on_session_start(session_id=sid)
+    blackbox._session_state(sid)["tools"].append("terminal")
+    blackbox._on_session_end(session_id=sid, turn_id=tid, interrupted=True,
+                             model="m", platform="discord", provider="p",
+                             user_message="u", final_response="", turn_usage=None,
+                             provisional=True)
+    assert blackbox._sessions[sid]["tools"] == ["terminal"]
+
+
+def test_provisional_emit_skips_when_agent_moved_to_a_newer_turn(ledger, monkeypatch):
+    from agent import turn_finalizer as tf
+
+    fired = []
+    from hermes_cli import lifecycle
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", lambda name, **kw: fired.append(1) or [])
+    old = "20260927_233124_398b4d:ad3f5e38:2af4faa5"
+    agent = _agent(old)
+    agent._current_turn_id = old + "-next"
+    assert tf.emit_session_end(
+        agent, turn_id=old, effective_task_id="t", completed=False, failed=False,
+        interrupted=True, turn_exit_reason="gateway_restart",
+        original_user_message=None, final_response="", provisional=True,
+    ) is False
+    assert fired == []
+
+
+def test_abandoned_turn_is_written_to_the_profile_it_ran_in(ledger, tmp_path, monkeypatch):
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    prof = tmp_path / "profiles" / "p1"
+    prof.mkdir(parents=True)
+    tid = "20260927_122252_9388b5:4a38b91b:1cdf366b"
+    tok = set_hermes_home_override(str(prof))
+    try:
+        store._connect().close()
+        prof_db = store._db_path()
+        _in_flight_call(tid, http_status=200)
+    finally:
+        reset_hermes_home_override(tok)
+    assert _orphan_ids(prof_db) == [tid], "precondition"
+    agent = _agent(tid)
+    agent._turn_home = (tid, str(prof))
+
+    asyncio.run(_runner(monkeypatch)._finalize_shutdown_agents({"k": agent}))
+
+    assert _orphan_ids(prof_db) == []
+    with sqlite3.connect(ledger) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM turns WHERE turn_id = ?",
+                            (tid,)).fetchone() == (0,)

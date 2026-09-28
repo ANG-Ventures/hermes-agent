@@ -562,6 +562,38 @@ def _bump_counter(agent: Any, name: str, delta: Any) -> None:
     setattr(agent, name, int(getattr(agent, name, 0) or 0) + int(delta or 0))
 
 
+def _unaccepted_billed_turn_call(entry: dict[str, Any]) -> dict[str, Any]:
+    """The Blackbox ``_turn_calls`` dict for ONE billed-but-unaccepted response.
+
+    Pure: no agent/session side effects, so a host recording an abandoned turn
+    can include parked billed calls without touching the live turn's state.
+    """
+    provider = entry.get("provider") or None
+    usage = _canonical_usage_from_response(
+        entry.get("response"), provider=provider, api_mode=entry.get("api_mode") or None
+    )
+    call_flags = {key: bool(getattr(usage, key)) for key in USAGE_UNKNOWN_FIELDS}
+    return {
+        **call_flags,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "output_tokens_unknown": bool(usage.output_tokens_unknown),
+        "latency_s": 0.0,
+        "composition": None,
+        # Price at the serving route (Blackbox cost.py reads these).
+        "provider": provider or "",
+        "model": entry.get("model") or "",
+        "base_url": entry.get("base_url") or "",
+        "accepted": False,
+    }
+
+
 def _account_unaccepted_billed_call(
     agent: Any,
     entry: dict[str, Any],
@@ -598,25 +630,7 @@ def _account_unaccepted_billed_call(
         if is_set:
             setattr(agent, f"session_{flag}", True)
     if turn_calls is not None and entry.get("turn_id", "") == (turn_id or ""):
-        turn_calls.append({
-            **call_flags,
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cache_read_tokens": usage.cache_read_tokens,
-            "cache_write_tokens": usage.cache_write_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.output_tokens,
-            "total_tokens": usage.total_tokens,
-            "output_tokens_unknown": bool(usage.output_tokens_unknown),
-            "latency_s": 0.0,
-            "composition": None,
-            # Price at the serving route (Blackbox cost.py reads these).
-            "provider": provider or "",
-            "model": model,
-            "base_url": base_url or "",
-            "accepted": False,
-        })
+        turn_calls.append(_unaccepted_billed_turn_call(entry))
     cost_result = estimate_usage_cost(
         model, usage, provider=provider, base_url=base_url
     )

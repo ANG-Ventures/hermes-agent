@@ -584,7 +584,14 @@ def _build_record(
     now = time.time()
     state = _session_state(session_id)
     with _lock:
-        state = _sessions.pop(session_id or "", state)
+        if kwargs.get("provisional"):
+            # Host is abandoning a still-live turn: record it but leave the
+            # live state (tools, ts_start) for the real emit that may follow.
+            state = dict(_sessions.get(session_id or "", state))
+            state["tools"] = list(state.get("tools") or [])
+            state["tool_calls"] = list(state.get("tool_calls") or [])
+        else:
+            state = _sessions.pop(session_id or "", state)
     ts_start = _float_value(state.get("ts_start")) or now - _float_value(usage.get("latency_s"))
     ts_end = now
     tool_calls = list(state.get("tool_calls") or [])

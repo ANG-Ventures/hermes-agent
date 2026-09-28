@@ -1040,7 +1040,11 @@ def emit_session_end(
         # marker and stand down -- never write interrupted AFTER the real row.
         with _session_end_lock(agent):
             if provisional:
+                # Re-read under the lock: the turn may have finished (marker
+                # set) or the agent moved on to a newer turn while we waited.
                 if getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+                    return False
+                if getattr(agent, "_current_turn_id", None) != turn_id:
                     return False
             else:
                 agent._session_end_emitted_turn_id = turn_id
@@ -1062,6 +1066,9 @@ def emit_session_end(
                 final_response=final_response,
                 turn_usage=_turn_usage,
                 cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
+                # Only present when True: consumers keep live per-turn state
+                # (Blackbox tools / ts_start) for the real emit that may follow.
+                **({"provisional": True} if provisional else {}),
             )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
@@ -1073,19 +1080,19 @@ _SESSION_END_FALLBACK_LOCK = threading.RLock()
 
 
 def _session_end_lock(agent):
-    """Per-agent RLock serializing on_session_end emits for that agent."""
-    lock = getattr(agent, "_session_end_emit_lock", None)
+    """Per-agent RLock serializing on_session_end emits for that agent.
+
+    Read from the instance ``__dict__``, never ``getattr``: agent doubles with
+    a catch-all ``__getattr__`` would hand back a non-lock.
+    """
+    slots = getattr(agent, "__dict__", None)
+    if not isinstance(slots, dict):
+        return _SESSION_END_FALLBACK_LOCK
+    lock = slots.get("_session_end_emit_lock")
     if lock is not None:
         return lock
     with _SESSION_END_LOCKS_GUARD:
-        lock = getattr(agent, "_session_end_emit_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            try:
-                agent._session_end_emit_lock = lock
-            except Exception:
-                return _SESSION_END_FALLBACK_LOCK
-        return lock
+        return slots.setdefault("_session_end_emit_lock", threading.RLock())
 
 
 def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, abandoned_reason=None):
@@ -1137,6 +1144,19 @@ def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None, aband
             pass
         # Copy: an abandoned turn's own thread may still be appending.
         turn_calls = list(turn_calls)
+        if abandoned_reason:
+            # Billed responses parked for the loop to accept or settle already
+            # have turn_api_calls rows; count them WITHOUT consuming the live
+            # list. Read after the turn_calls copy: settlement empties the
+            # parked list before it appends, so an entry is never in both.
+            try:
+                from agent.conversation_loop import _unaccepted_billed_turn_call
+
+                for entry in list(getattr(agent, "_billed_unaccounted", None) or ()):
+                    if isinstance(entry, dict) and entry.get("turn_id", "") == turn_id:
+                        turn_calls.append(_unaccepted_billed_turn_call(entry))
+            except Exception:
+                pass
         res = result if isinstance(result, dict) else {}
         final_response = ""
         if abandoned_reason:
@@ -1215,8 +1235,28 @@ def emit_abandoned_session_ends(agents, reason):
         except Exception:
             pass
         turn_id = getattr(agent, "_current_turn_id", None)
-        if turn_id and emit_unfinalized_session_end(
-            agent, turn_id, abandoned_reason=reason
-        ):
-            emitted += 1
+        if not turn_id:
+            continue
+        # Write under the profile the turn ran in (multiplex gateway), not the
+        # shutdown thread's: its turn_api_calls live in that profile's ledger.
+        home = getattr(agent, "_turn_home", None)
+        token = None
+        if isinstance(home, tuple) and len(home) == 2 and home[0] == turn_id and home[1]:
+            try:
+                from hermes_constants import set_hermes_home_override
+
+                token = set_hermes_home_override(home[1])
+            except Exception:
+                token = None
+        try:
+            if emit_unfinalized_session_end(agent, turn_id, abandoned_reason=reason):
+                emitted += 1
+        finally:
+            if token is not None:
+                try:
+                    from hermes_constants import reset_hermes_home_override
+
+                    reset_hermes_home_override(token)
+                except Exception:
+                    pass
     return emitted
