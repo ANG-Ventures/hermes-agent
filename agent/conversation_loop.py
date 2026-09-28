@@ -1778,7 +1778,13 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 # re-process) the user sees a plain notice instead. Genuinely empty text and
 # "[SILENT]" are not placeholders: silent cron / no_agent turns keep their
 # existing path untouched.
-_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested.", "Proceeding."})
+_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested."})
+# "Proceeding." is an ordinary English reply, so it only counts as a
+# placeholder where the legacy closer can exist: the claude-bpx bridge lanes
+# (pool claude-bpr, pinned claude-bpx-N). Every other provider delivers it
+# verbatim (FleetReview #1332 key 9172f2d63927, t_4a1853f2).
+_BRIDGE_CLOSER_FINAL_TEXTS = frozenset({"Proceeding."})
+_BRIDGE_CLOSER_PROVIDER_RE = re.compile(r"^claude-bpx-\d+$|^claude-bpr$")
 _TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
 # Only exact known closers match. A shape rule ("<= 3 words ending in '.'
 # after tool results") was tried and removed: it cannot tell a closer from a
@@ -1787,18 +1793,24 @@ _TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
 # the only strings a model can still echo are the legacy ones listed above.
 
 
-def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
+def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged, provider=None):
     """Route a known placeholder final text.
 
     Returns ``"empty"`` when the placeholder should be treated as an empty
     post-tool response (the once-only nudge fires), ``"notice"`` when it must
     be replaced by :data:`_TURN_ENDED_WITHOUT_REPLY`, and ``None`` for every
     other text — including the empty string, which keeps its own ladder, and
-    a real short reply such as "Done.".
+    a real short reply such as "Done.". The bridge closer "Proceeding." is only
+    recognised when ``provider`` is a claude-bpx bridge lane.
     """
     if not isinstance(text, str):
         return None
-    if text.strip() not in _PLACEHOLDER_FINAL_TEXTS:
+    stripped = text.strip()
+    if stripped not in _PLACEHOLDER_FINAL_TEXTS and not (
+        stripped in _BRIDGE_CLOSER_FINAL_TEXTS
+        and isinstance(provider, str)
+        and _BRIDGE_CLOSER_PROVIDER_RE.match(provider.strip().lower())
+    ):
         return None
     if prior_was_tool and not already_nudged:
         return "empty"
@@ -9378,6 +9390,7 @@ def run_conversation(
                     final_response,
                     prior_was_tool=any(m.get("role") == "tool" for m in messages[-5:]),
                     already_nudged=getattr(agent, "_post_tool_empty_retried", False),
+                    provider=getattr(agent, "provider", None),
                 )
                 if _placeholder_route is not None:
                     logger.warning(
