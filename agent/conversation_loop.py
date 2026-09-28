@@ -4114,6 +4114,14 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    # Pin the route this request goes out on. Everything that
+                    # records or prices the call afterwards (the transport
+                    # chokepoint's ledger row and billed-response entry, the
+                    # accept-site accounting below) reads THIS, not the live
+                    # agent, which /model or a fallback may change while the
+                    # request is in flight (FleetReview 65e315f38776).
+                    _call_route.update(_live_route(agent))
+                    agent._inflight_request_route = dict(_call_route)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -4157,6 +4165,12 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                from agent.chat_completion_helpers import _live_route
+
+                # Route of THIS request; refreshed at the dispatch edge in
+                # _perform_api_call. Execution middleware that answers without
+                # dispatching leaves the route the request was built on.
+                _call_route = _live_route(agent)
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -4175,6 +4189,7 @@ def run_conversation(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
+                    agent._inflight_request_route = None
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:
@@ -5073,8 +5088,8 @@ def run_conversation(
                 if response is not None:
                     canonical_usage = _canonical_usage_from_response(
                         response,
-                        provider=agent.provider,
-                        api_mode=agent.api_mode,
+                        provider=_call_route["provider"] or None,
+                        api_mode=_call_route["api_mode"] or None,
                     )
                     # Aggregator-only usage is retained for cost pricing: MoA
                     # advisor tokens must be priced at each advisor's OWN model
@@ -5411,9 +5426,11 @@ def run_conversation(
                             # turn's FINAL route, so a mid-turn model switch
                             # misprices the turn vs its turn_api_calls rows
                             # (t_0c5c3822).
-                            "provider": agent.provider or "",
-                            "model": agent.model,
-                            "base_url": agent.base_url or "",
+                            # Captured at dispatch, not read back from the
+                            # agent after the call returns.
+                            "provider": _call_route["provider"],
+                            "model": _call_route["model"],
+                            "base_url": _call_route["base_url"],
                         })
                         _turn_call = _turn_calls[-1]
                     except Exception:
@@ -5447,7 +5464,7 @@ def run_conversation(
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%s out=%s total=%s latency=%.1fs%s",
-                        agent.session_api_calls, agent.model, agent.provider or "unknown",
+                        agent.session_api_calls, _call_route["model"], _call_route["provider"] or "unknown",
                         "unknown" if prompt_tokens_unknown(canonical_usage) else prompt_tokens,
                         # UNKNOWN != 0: an unmeasured output logged as `out=0`
                         # reads as a dead round-trip. Say `out=unknown` instead.
@@ -5464,9 +5481,9 @@ def run_conversation(
                     # aggregator does the full acting loop). Price the aggregator
                     # turn at its REAL model/provider, read from the MoA client's
                     # resolved aggregator slot.
-                    _agg_cost_model = agent.model
-                    _agg_cost_provider = agent.provider
-                    _agg_cost_base_url = agent.base_url
+                    _agg_cost_model = _call_route["model"]
+                    _agg_cost_provider = _call_route["provider"] or None
+                    _agg_cost_base_url = _call_route["base_url"] or None
                     # Only the real MoA client carries a resolved aggregator slot
                     # (a plain dict). A non-MoA client — or a MagicMock in tests,
                     # which synthesizes every attribute so hasattr/getattr can't
@@ -5481,8 +5498,8 @@ def run_conversation(
                     _agg_slot = _agg_slot_raw if isinstance(_agg_slot_raw, dict) else None
                     if _agg_slot and _agg_slot.get("model"):
                         _agg_cost_model = _agg_slot["model"]
-                        _agg_cost_provider = _agg_slot.get("provider") or agent.provider
-                        _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
+                        _agg_cost_provider = _agg_slot.get("provider") or _call_route["provider"] or None
+                        _agg_cost_base_url = _agg_slot.get("base_url") or _call_route["base_url"] or None
                         try:
                             if _turn_call is not None:
                                 _turn_call["pricing_calls"] = _build_moa_pricing_calls(
@@ -5507,7 +5524,7 @@ def run_conversation(
                                 _emit_composite_api_call_records(
                                     agent,
                                     _turn_call["pricing_calls"],
-                                    sub_harness=f"moa:{_moa_preset if isinstance(_moa_preset, str) and _moa_preset else agent.model}",
+                                    sub_harness=f"moa:{_moa_preset if isinstance(_moa_preset, str) and _moa_preset else _call_route['model']}",
                                 )
                         except Exception:
                             pass  # telemetry must never break the conversation loop
@@ -5584,11 +5601,11 @@ def run_conversation(
                                 estimated_cost_usd=_cost_delta,
                                 cost_status=_cost_status,
                                 cost_source=cost_result.source,
-                                billing_provider=agent.provider,
-                                billing_base_url=agent.base_url,
+                                billing_provider=_call_route["provider"] or None,
+                                billing_base_url=_call_route["base_url"] or None,
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
-                                model=agent.model,
+                                model=_call_route["model"],
                                 api_call_count=1,
                                 **_last_turn_snapshot_kwargs(canonical_usage),
                                 # UNKNOWN != 0. The cumulative flags are
