@@ -358,6 +358,20 @@ def _aux_interrupt_cancel_requested() -> bool:
         return False
 
 
+def _raise_if_aux_cancel_requested() -> None:
+    """Abort a streamed aux response on the next frame once the host cancelled.
+
+    The owner-thread poll in :func:`_run_protected_sync_provider_call` already
+    unwinds the request owner on cancel, but it leaves the provider worker to
+    finish the stream — for a chunked summary of a large context that is many
+    minutes of discarded generation (t_139733d1). Checking per frame lets the
+    stream consumer close the connection instead. BaseException, so provider
+    retry/fallback code that catches ``Exception`` cannot swallow it.
+    """
+    if _aux_interrupt_cancel_requested():
+        raise AuxiliaryExplicitCancellation()
+
+
 @contextlib.contextmanager
 def aux_interrupt_protection(
     active: bool = True,
@@ -526,6 +540,15 @@ def _anthropic_event_has_content(event: Any) -> bool:
             bool(_event_field(block, field)) for field in ("id", "name")
         )
     return False
+
+
+def _on_aux_anthropic_stream_event(event: Any) -> None:
+    """Per-event hook for streamed Anthropic aux calls: cancel, then liveness."""
+    _raise_if_aux_cancel_requested()
+    if _anthropic_event_has_content(event):
+        _notify_aux_provider_response()
+    else:
+        _notify_aux_timing_response()
 
 
 _CODEX_PROGRESS_DELTA_TYPES = frozenset(
@@ -2605,13 +2628,7 @@ class _AnthropicCompletionsAdapter:
             # stalled summary open. No-op when no hook is installed (None
             # keeps the fast get_final_message path).
             on_stream_event=(
-                (
-                    lambda event: (
-                        _notify_aux_provider_response()
-                        if _anthropic_event_has_content(event)
-                        else _notify_aux_timing_response()
-                    )
-                )
+                _on_aux_anthropic_stream_event
                 if _aux_progress_active()
                 else None
             ),
@@ -9994,6 +10011,7 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
+        _raise_if_aux_cancel_requested()
         # Every provider frame records transport-level timing (TTFP
         # telemetry, first-frame-wins); only a substantive payload below
         # ticks the forward-progress hook that keeps compression alive.

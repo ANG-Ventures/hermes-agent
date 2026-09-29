@@ -898,6 +898,30 @@ def _capture_authoritative_cooldown_under_lease(
     return True, copy.deepcopy(durable_state)
 
 
+class _SummaryCancelSignal:
+    """Event-like OR of the host hard-stop Event and a cancelled commit fence.
+
+    A fence that lost to cancellation refuses the commit in ``begin_commit``,
+    so every summary token generated after that point is discarded. Exposing
+    the fence to the aux cancel seam (``aux_interrupt_protection``) lets the
+    streamed summary call abort on the next chunk instead of running the
+    summary model to completion first (t_139733d1: gateway hygiene turn-hold
+    expiry burned 21-22 min of summary per abandoned attempt).
+    """
+
+    __slots__ = ("_hard_event", "_fence")
+
+    def __init__(self, hard_event: Any, fence: "CompressionCommitFence") -> None:
+        self._hard_event = hard_event
+        self._fence = fence
+
+    def is_set(self) -> bool:
+        if self._fence.is_cancelled:
+            return True
+        hard = self._hard_event
+        return hard is not None and bool(hard.is_set())
+
+
 class CompressionCommitFence:
     """Fence timeout cancellation against post-summary session mutation.
 
@@ -3933,6 +3957,7 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+    _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -4203,6 +4228,14 @@ def compress_context(
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
         _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+        # A cancelled commit fence discards the summary, so it also cancels
+        # the in-flight aux stream (t_139733d1). The hard-stop Event alone
+        # still gates the post-summary checks below.
+        _aux_cancel_signal = (
+            _SummaryCancelSignal(_hard_cancel_event, commit_fence)
+            if commit_fence is not None
+            else _hard_cancel_event
+        )
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -4215,7 +4248,7 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_event=_aux_cancel_signal
                 ), aux_cost_sink(_blackbox_cost_sink):
                     try:
                         compressed = compress_fn(engine_messages, **compress_kwargs)
@@ -4369,12 +4402,29 @@ def compress_context(
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
         _release_lock()
+        _fence_cancelled_summary = bool(
+            commit_fence is not None
+            and commit_fence.is_cancelled
+            and not (
+                _hard_cancel_event is not None and _hard_cancel_event.is_set()
+            )
+        )
+        if _fence_cancelled_summary:
+            logger.info(
+                "Compression summary aborted mid-stream: commit fence cancelled "
+                "by host (session=%s).",
+                agent.session_id or "none",
+            )
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
             commit_status="aborted",
             split_status="aborted",
-            failure_class="explicit_interrupt",
+            failure_class=(
+                "commit_fence_cancelled"
+                if _fence_cancelled_summary
+                else "explicit_interrupt"
+            ),
         )
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
