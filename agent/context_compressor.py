@@ -221,15 +221,34 @@ def _summary_refusal_route_key(call_kwargs: Dict[str, Any], main_model: str) -> 
     return f"{provider}|{model}|{base_url}"
 
 
+def _summary_refusal_request_key(route_key: str, request_context: str) -> str:
+    """Latch key: route plus every non-turn input of the summary request.
+
+    ``request_context`` carries the inputs a refusal may be caused by besides
+    the turns (previous summary, memory-provider context, focus topic,
+    user-turn template), so correcting any of them is a new request and is
+    sent (t_bf18e600). Output-size guidance and the date are left out: they
+    do not change what the model is asked to read.
+    """
+    digest = hashlib.sha256(
+        (request_context or "").encode("utf-8", "surrogatepass")
+    ).hexdigest()
+    return f"{route_key}|ctx={digest}"
+
+
 class _SummaryRefusalLatch:
     """Process-wide memory of (summary route, content) pairs a model refused.
 
     A safeguard refusal is deterministic for that content on that model, so
     re-sending it only buys another cold prefill and another refusal
-    (t_0970eb0b, sibling of the LCM latch in #1501). Matching is by content
-    PREFIX: the compressor's middle window grows at its end between passes,
-    so a later pass whose serialized input begins with refused content still
-    carries the refused turns. Bounded LRU; in memory only, not persisted.
+    (t_0970eb0b, sibling of the LCM latch in #1501). The route key includes
+    the request's non-turn inputs (``_summary_refusal_request_key``) and the
+    content is the BOUNDED turn text actually sent (t_bf18e600). Matching is
+    by content PREFIX: the middle window grows at its end between passes, so
+    a later request whose sent turns begin with everything a refused request
+    sent still carries the refused material; once input bounding drops part
+    of it, the prefix no longer matches and the request is sent. Bounded
+    LRU; in memory only, not persisted.
 
     Entries expire after ``ttl_seconds`` (t_2ba784cc): safeguard classifiers
     are broad and change over time, so one misfire must not pin content for
@@ -5287,6 +5306,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         *,
         focus_topic: Optional[str],
         memory_context: str,
+        refusal_context: str = "",
     ) -> Optional[str]:
         """Route a safeguard refusal: another model, or preserve the session.
 
@@ -5313,8 +5333,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Same kwargs ``_generate_summary`` will send, so the key checked
             # here is the key it latches (t_2ba784cc: a model-less entry keeps
             # ``summary_model``; keying the bare entry recursed forever).
-            key = _summary_refusal_route_key(
-                self._summary_refusal_call_route(route), self.model
+            key = _summary_refusal_request_key(
+                _summary_refusal_route_key(
+                    self._summary_refusal_call_route(route), self.model
+                ),
+                refusal_context,
             )
             if key in tried or _SUMMARY_REFUSALS.is_refused(key, refusal_content):
                 continue
@@ -5400,10 +5423,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if _name not in _pruned_skill_names:
                 _pruned_skill_names.append(_name)
         del _pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
-        # Unbounded serialized turns: the identity a safeguard-refusal latch
-        # keys on (a later pass over a grown window keeps it as a prefix).
-        _refusal_content = content_to_summarize
         content_to_summarize = self._bound_summary_input(content_to_summarize)
+        # The bounded turns actually sent: the content a safeguard-refusal
+        # latch matches on (t_bf18e600; unbounded turns latched requests
+        # whose bounding had already dropped the refused material).
+        _refusal_content = content_to_summarize
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
             _sanitized_memory_context,
@@ -5607,6 +5631,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
+        _bounded_previous_summary: Optional[str] = None
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress.
             # Bound the previous-summary block with the same aggregate cap as
@@ -5652,6 +5677,22 @@ Use this exact structure:
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
+        # Every non-turn input the model reads, for the refusal latch key. An
+        # auto-derived focus is left out: it quotes recent user turns, which
+        # later passes carry in the (prefix-matched) turns themselves, and
+        # keying on it would re-send refused turns on every new user message.
+        _refusal_focus = (
+            "" if getattr(self, "_summary_focus_is_auto", False) else (focus_topic or "")
+        )
+        _refusal_context = json.dumps(
+            [
+                _bounded_previous_summary,
+                _memory_section,
+                _refusal_focus,
+                bool(has_user_turn),
+            ],
+            ensure_ascii=False,
+        )
         _aux_route: Dict[str, str] = {}
         _refusal_route_key = ""
         try:
@@ -5697,7 +5738,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Never re-send content a route's safeguards already refused: the
             # refusal is deterministic, a resend is a guaranteed cold prefill
             # plus another refusal (t_0970eb0b).
-            _refusal_route_key = _summary_refusal_route_key(call_kwargs, self.model)
+            _refusal_route_key = _summary_refusal_request_key(
+                _summary_refusal_route_key(call_kwargs, self.model),
+                _refusal_context,
+            )
             if _SUMMARY_REFUSALS.is_refused(_refusal_route_key, _refusal_content):
                 raise _SummaryRouteAlreadyRefused(
                     "summary route already refused this content"
@@ -5774,6 +5818,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return self._handle_summary_refusal(
                     error, _refusal_content, turns_to_summarize,
                     focus_topic=focus_topic, memory_context=memory_context,
+                    refusal_context=_refusal_context,
                 )
             if isinstance(message, dict):
                 content = message.get("content")
@@ -5862,6 +5907,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return self._handle_summary_refusal(
                     error, _refusal_content, turns_to_summarize,
                     focus_topic=focus_topic, memory_context=memory_context,
+                    refusal_context=_refusal_context,
                 )
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
@@ -8419,6 +8465,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Deriving the auto focus topic scans recent user turns — only pay
             # for it when a summary will actually be generated.
             summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+            # An auto-derived focus quotes recent user turns, which enter the
+            # summarized window on later passes; it is not a separate request
+            # input for the safeguard-refusal latch (t_bf18e600).
+            self._summary_focus_is_auto = not focus_topic
             try:
                 summary = self._generate_summary(
                     turns_to_summarize,
@@ -8432,6 +8482,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._previous_summary = _previous_summary_before_scan
                 self._summary_has_user_turn = _summary_has_user_turn_before_scan
                 raise
+            finally:
+                self._summary_focus_is_auto = False
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
