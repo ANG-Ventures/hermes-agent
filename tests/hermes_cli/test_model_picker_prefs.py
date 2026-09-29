@@ -210,8 +210,8 @@ def entry_env(tmp_path, monkeypatch):
         monkeypatch.setattr(inventory, name, lambda *a: None)
     monkeypatch.setattr(inventory, "_prewarm_pricing_async", lambda *a, **kw: None)
     monkeypatch.setattr(inventory, "_apply_pricing", lambda *a, **kw: None)
-    monkeypatch.setattr(inventory, "_apply_capabilities", lambda *a: None)
-    monkeypatch.setattr(inventory, "_apply_featured", lambda *a: None)
+    monkeypatch.setattr(inventory, "_apply_capabilities", lambda *a, **kw: None)
+    monkeypatch.setattr(inventory, "_apply_featured", lambda *a, **kw: None)
     def write(picker, current="anthropic", excluded=()):
         config = {"model": {"provider": current, "default": "m1", "picker": picker},
                   "model_catalog": {"excluded_providers": list(excluded)},
