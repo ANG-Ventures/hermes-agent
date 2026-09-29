@@ -437,11 +437,23 @@ def _script_exit_page(job_name: str, error: str) -> str:
     cause_src = out_lines or err_lines or clean(sections["head"])
     lines = [f"⚠️ **{job_name}** · rc={rc}"]
     if cause_src:
-        lines.append(clip(_LEAD_GLYPHS_RE.sub("", cause_src[0]).lstrip("*").strip() or cause_src[0]))
-    ask = next((x for x in (out_lines + err_lines)[1:] if _ASK_LINE_RE.match(x)), None)
-    if ask:
-        lines.append(clip(ask))
-    extra = len(out_lines) + len(err_lines) - (1 if cause_src else 0) - (1 if ask else 0)
+        cause = _LEAD_GLYPHS_RE.sub("", cause_src[0]).replace("**", "").strip() or cause_src[0]
+        took = 1
+        if cause.endswith(":") and len(cause_src) > 1:  # "gbrain deploy parity (…):" + its content line
+            cause, took = f"{cause} {cause_src[1].replace('**', '').strip()}", 2
+        lines.append(clip(cause))
+    else:
+        took = 0
+    rest = (out_lines + err_lines)[took:]
+    ai = next((i for i, x in enumerate(rest) if _ASK_LINE_RE.match(x)), None)
+    used = 0
+    if ai is not None:
+        ask, used = rest[ai], 1
+        # a wrapped ask ("Fix (apx lane, one box):" / "... re-verify with") continues on its next line
+        if not re.search(r"[.!?)`]$", ask) and ai + 1 < len(rest):
+            ask, used = f"{ask} {rest[ai + 1]}", 2
+        lines.append(clip(ask.replace("**", "")))
+    extra = len(out_lines) + len(err_lines) - took - used
     if extra > 0:
         lines.append(f"-# +{extra} more output line(s) saved in the cron output")
     return "\n".join(lines)

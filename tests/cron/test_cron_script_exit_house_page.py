@@ -52,6 +52,16 @@ def test_stderr_only_uses_stderr_first_line():
     assert lines[:2] == ["⚠️ **fleet-model-drift-watch** · rc=2", "Traceback (most recent call last):"]
 
 
+def test_colon_header_joins_its_content_line_and_wrapped_ask_joins_its_tail():
+    err = ("Script exited with code 1\nstdout:\n⚠️ **gbrain deploy parity** (09:50 PDT):\n"
+           "live tree 816372a97 != master a84a9fea8 (ahead 1 / behind 0)\n"
+           "Fix: `fleet.sh deploy gbrain --restart` then re-verify with\n`verify-shipped.py --repo gbrain`.\nfooter")
+    lines = _summarize_cron_failure_for_delivery(JOB, err).splitlines()
+    assert lines[1] == "gbrain deploy parity (09:50 PDT): live tree 816372a97 != master a84a9fea8 (ahead 1 / behind 0)"
+    assert lines[2] == "Fix: `fleet.sh deploy gbrain --restart` then re-verify with `verify-shipped.py --repo gbrain`."
+    assert lines[3] == "-# +1 more output line(s) saved in the cron output"
+
+
 def test_agent_job_keeps_the_old_summary():
     job = dict(JOB, no_agent=False)
     assert _summarize_cron_failure_for_delivery(job, ERR).startswith("⚠️ Cron 'fleet-model-drift-watch' failed:")
