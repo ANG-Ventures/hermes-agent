@@ -9,6 +9,7 @@ import { resetSessionsLimit } from '@/store/layout'
 import { resetLiveSync } from '@/store/live-sync'
 import { invalidateProfileListFetches } from '@/store/profile'
 import { exitProjectScope } from '@/store/project-scope'
+import { clearRenderCache } from '@/store/render-cache'
 import {
   $unreadFinishedSessionIds,
   setActiveSessionId,
@@ -257,6 +258,9 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // fail the unique-match lookup that shows "Show earlier".
   clearTranscriptTails()
   clearTranscriptTailPaging()
+  // The persisted session-list paint is the same shape: the previous
+  // backend's rows must never paint as this one's on the next launch.
+  clearRenderCache()
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.

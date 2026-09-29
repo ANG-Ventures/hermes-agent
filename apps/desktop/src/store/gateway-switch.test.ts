@@ -149,6 +149,21 @@ describe('wipeSessionListsForGatewaySwitch', () => {
 
     expect(invalidateProfileListFetches).toHaveBeenCalled()
   })
+
+  it("wipes the persisted startup session-list paint so the next launch cannot paint the old backend's rows", () => {
+    const clear = vi.fn()
+    const desktop = window as unknown as { hermesDesktop?: Record<string, unknown> }
+    const previous = desktop.hermesDesktop
+    desktop.hermesDesktop = { ...previous, renderCache: { clear } }
+
+    try {
+      wipeSessionListsForGatewaySwitch()
+    } finally {
+      desktop.hermesDesktop = previous
+    }
+
+    expect(clear).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('beginGatewaySwitch / endGatewaySwitch — the shared switch commit point (#93937)', () => {

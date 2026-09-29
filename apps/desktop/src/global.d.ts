@@ -26,6 +26,16 @@ export type DesktopMachineProfile = MachineProfile
 declare global {
   interface Window {
     hermesDesktop: {
+      // Startup render cache: one scoped boot read + fire-and-forget writes.
+      // Main resolves the scope from this window's route; all fail-open.
+      renderCache?: {
+        read: () => Promise<{ enabled: boolean; sessions: unknown }>
+        putSessions: (data: unknown) => void
+        clear: () => void
+        dropProfile: (profile: string) => void
+        migrateProfile: (oldProfile: string, newProfile: string) => void
+        reportDivergence: (rows: number) => void
+      }
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.

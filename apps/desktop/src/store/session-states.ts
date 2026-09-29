@@ -48,6 +48,7 @@ import { dropPreviewTabsForProfile, migratePreviewTabsForProfile, setPreviewScop
 import { dropPreviewArtifactsForProfile, migratePreviewArtifactsForProfile } from './preview-status'
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait'
+import { dropRenderCacheForProfile, migrateRenderCacheForProfile } from './render-cache'
 import {
   $activeSessionId,
   $connection,
@@ -2688,6 +2689,9 @@ export function dropTilesForProfile(
   // The rail is a profile-keyed family too: a deleted profile's tabs must not
   // outlive it, or a later profile of the same name inherits them.
   dropPreviewTabsForProfile(name)
+  // Same for the persisted session-list paint: a later profile of the same
+  // name must not paint the deleted one's sessions at boot.
+  dropRenderCacheForProfile(name)
 }
 
 /**
@@ -2747,6 +2751,7 @@ export function migrateTilesForProfile(oldProfile: string, newProfile: string): 
 
   persistTiles()
   migrateTranscriptTailsForProfile(from, to)
+  migrateRenderCacheForProfile(from, to)
   migrateRememberedNavigationForProfile(from, to)
   migrateSessionOwnerHintsForProfile(from, to)
   migratePreviewArtifactsForProfile(from, to)

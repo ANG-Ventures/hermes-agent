@@ -24,6 +24,17 @@ const launchFlags: { localModels?: boolean; guestOnboarding?: boolean } | undefi
 const localSkin = ipcRenderer.sendSync('hermes:skin:local')
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
+  // Startup render cache: one scoped boot read + fire-and-forget writes.
+  // Main resolves the scope from this window's route; all fail-open there.
+  renderCache: {
+    read: () => ipcRenderer.invoke('hermes:render-cache:read'),
+    putSessions: (data: unknown) => ipcRenderer.send('hermes:render-cache:put-sessions', data),
+    clear: () => ipcRenderer.send('hermes:render-cache:clear'),
+    dropProfile: (profile: string) => ipcRenderer.send('hermes:render-cache:drop-profile', profile),
+    migrateProfile: (oldProfile: string, newProfile: string) =>
+      ipcRenderer.send('hermes:render-cache:migrate-profile', oldProfile, newProfile),
+    reportDivergence: (rows: number) => ipcRenderer.send('hermes:render-cache:report-divergence', rows)
+  },
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
   // Launch-flag fact: the app was started with --local, so the renderer may

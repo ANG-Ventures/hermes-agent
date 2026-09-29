@@ -97,6 +97,7 @@ import {
   shouldLatchRemoteReauthFailure,
   shouldLatchSshAuthFailure
 } from './backend-start-failure'
+import { createBootClock, formatCacheDivergence, formatCacheHit } from './boot-clock'
 import { describeBootstrapFailure } from './bootstrap-failure-copy'
 import {
   detectRemoteDisplay,
@@ -481,6 +482,8 @@ import {
   oauthLoginLoadUrlOptions,
   resolveRemoteRequestHeaders
 } from './remote-ws-headers'
+import { RenderCache, type RenderCacheScope } from './render-cache'
+import { readRenderCacheEnabled } from './render-cache-config'
 import { enableRendererAccessibility } from './renderer-accessibility'
 import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle'
 import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
@@ -658,6 +661,19 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
 const APP_ROOT = app.getAppPath()
+
+// Boot milestone clock: every cold-launch milestone is logged as
+// `[boot:t+<ms>ms] <name>` to desktop.log, anchored as early as the main module
+// evaluates, so startup latency is measurable from the log alone.
+const bootClock = createBootClock()
+
+function logBootMilestone(milestone: Parameters<typeof bootClock.mark>[0], detail?: string) {
+  try {
+    rememberLog(bootClock.mark(milestone, detail))
+  } catch {
+    // Instrumentation must never break boot.
+  }
+}
 
 // Device-local preference: block F12 from opening DevTools.
 // Set dynamically via IPC from the renderer Settings → Advanced.
@@ -13007,6 +13023,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         running: true,
         error: null
       })
+      logBootMilestone('handshake-done', '(remote)')
 
       return createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
     }
@@ -13365,6 +13382,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
       running: true,
       error: null
     })
+    logBootMilestone('handshake-done', '(local)')
 
     // A successful boot (including a soft restart that the repair-guard
     // chose over a hard reinstall, see #74874) means any in-flight repair
@@ -15361,6 +15379,104 @@ function recordWindowConnectionRoute(sender: Electron.WebContents, route: unknow
 }
 
 ipcMain.on('hermes:connection:active-route', (event, route) => recordWindowConnectionRoute(event.sender, route))
+
+// ---------------------------------------------------------------------------
+// Startup render cache: the last-known session list per window backend scope.
+// The scope is resolved from the SAME route the window's `hermes:connection`
+// dial uses, so a read can only ever return the list written for that
+// {connectionId, profile}. A legacy remote primary has no connection id to
+// scope by and is not cached. Every handler is fail-open.
+// ---------------------------------------------------------------------------
+const RENDER_CACHE_ENABLED = readRenderCacheEnabled(HERMES_HOME)
+let renderCacheInstance: null | RenderCache = null
+
+function renderCache(): null | RenderCache {
+  if (!RENDER_CACHE_ENABLED) {
+    return null
+  }
+
+  renderCacheInstance ??= new RenderCache({
+    dir: path.join(app.getPath('userData'), 'render-cache'),
+    appVersion: app.getVersion(),
+    log: rememberLog
+  })
+
+  return renderCacheInstance
+}
+
+function renderCacheScopeFor(sender: Electron.WebContents): null | RenderCacheScope {
+  const route = resolveDesktopConnectionRequest(undefined, windowConnectionRoutes.get(sender.id), primaryProfileKey())
+
+  const connectionId = route.connectionId ?? (primaryBackendIsRemote() ? null : 'local')
+
+  return connectionId ? { connectionId, profile: route.profile } : null
+}
+
+ipcMain.handle('hermes:render-cache:read', event => {
+  try {
+    const cache = renderCache()
+    const scope = cache ? renderCacheScopeFor(event.sender) : null
+
+    if (!cache || !scope) {
+      return { enabled: false, sessions: null }
+    }
+
+    const sessions = cache.readSessions(scope)
+    logBootMilestone('cache-paint')
+    rememberLog(formatCacheHit(sessions !== null, sessions?.sessions.length ?? 0))
+
+    return { enabled: true, sessions }
+  } catch {
+    return { enabled: false, sessions: null }
+  }
+})
+
+ipcMain.on('hermes:render-cache:put-sessions', (event, data) => {
+  try {
+    const scope = renderCacheScopeFor(event.sender)
+
+    if (scope) {
+      renderCache()?.putSessions(scope, data)
+    }
+  } catch {
+    // never throw into the renderer
+  }
+})
+
+ipcMain.on('hermes:render-cache:clear', () => {
+  try {
+    renderCache()?.clear()
+  } catch {
+    // best effort
+  }
+})
+
+ipcMain.on('hermes:render-cache:drop-profile', (_event, profile) => {
+  try {
+    renderCache()?.dropProfile(String(profile ?? ''))
+  } catch {
+    // best effort
+  }
+})
+
+ipcMain.on('hermes:render-cache:migrate-profile', (_event, oldProfile, newProfile) => {
+  try {
+    renderCache()?.migrateProfile(String(oldProfile ?? ''), String(newProfile ?? ''))
+  } catch {
+    // best effort
+  }
+})
+
+// How many rows the cached paint differed from the first live list by;
+// rows=0 means the cache matched live exactly.
+ipcMain.on('hermes:render-cache:report-divergence', (_event, rows) => {
+  try {
+    logBootMilestone('list-loaded', '(live reconcile)')
+    rememberLog(formatCacheDivergence(Number(rows) || 0))
+  } catch {
+    // never throw
+  }
+})
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -18842,6 +18958,7 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  logBootMilestone('app-ready')
   // Post-update relaunch detection (App Installer arm): when the previous
   // version wrote the one-shot pending-relaunch marker before quitting into
   // an OS package swap, consume it here — the renderer toasts "Hermes
@@ -18964,7 +19081,10 @@ app.whenReady().then(() => {
     isMac: IS_MAC,
     buildMenu: buildApplicationMenu,
     setApplicationMenu: menu => Menu.setApplicationMenu(menu),
-    createWindow
+    createWindow: () => {
+      createWindow()
+      logBootMilestone('window-created')
+    }
   })
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
@@ -19221,6 +19341,14 @@ app.on('before-quit', event => {
   // Kill open PTYs before environment teardown to avoid the node-pty#904
   // ThreadSafeFunction SIGABRT race.
   terminalIpc.disposeAllTerminalSessions()
+
+  // Persist the last debounce window of render-cache state synchronously,
+  // before backend shutdown starts: a clean quit never loses it.
+  try {
+    renderCacheInstance?.flush()
+  } catch {
+    // never block quit
+  }
 
   void backendShutdown.run()
 })

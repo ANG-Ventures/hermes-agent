@@ -11,6 +11,13 @@ import { useEffect, useRef } from 'react'
 
 import { createGatewayEventDedupe } from '@/app/gateway/gateway-event-dedupe'
 import { reportStartupLatency } from '@/app/gateway/report-startup-latency'
+import {
+  type CachedSessionPaint,
+  paintCachedSessionList,
+  reportCachedSessionPaint,
+  settleCachedSessionPaint,
+  writeThroughSessionList
+} from '@/app/render-cache-hydration'
 import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reauth'
 import type { DesktopBootProgress, HermesConnection, HermesWindowState } from '@/global'
 import { HermesGateway } from '@/hermes'
@@ -74,6 +81,7 @@ import {
   touchActiveGatewayBackend
 } from '@/store/profile'
 import { requestBackendRestart } from '@/store/recovery-requests'
+import { renderCacheScope } from '@/store/render-cache'
 import {
   $activeSessionId,
   $connection,
@@ -86,6 +94,7 @@ import {
   setConnection,
   setCurrentBranch,
   setCurrentCwd,
+  setSessions,
   setSessionsLoading
 } from '@/store/session'
 import { stampSecondaryProfileOwner } from '@/store/session-event-provenance'
@@ -104,6 +113,7 @@ import {
 } from '@/store/session-states'
 import { warnIfTerminalBackendUnavailable } from '@/store/terminal-backend-warning'
 import { isPeerInstanceWindow, windowProfileOverride } from '@/store/windows'
+import type { SessionInfo } from '@/types/hermes'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useConnectionsRegistry } from './use-connections-registry'
@@ -262,6 +272,21 @@ export function useGatewayBoot({
 
   useEffect(() => {
     let cancelled = false
+    // Startup render cache: the paint (validated once the boot connection
+    // resolves; kept across boot retries) and the live-list write-through.
+    let cachedSessionPaint: CachedSessionPaint | null = null
+    let cachedSessionPaintSettled = false
+    let stopSessionListWriteThrough: (() => void) | null = null
+
+    const sessionListStore = {
+      getSessions: () => $sessions.get(),
+      setSessions: (rows: SessionInfo[]) => setSessions(rows),
+      setSessionsLoading: (loading: boolean) => setSessionsLoading(loading)
+    }
+
+    // Only a window's own primary backend has a cache scope: profile-pinned
+    // helper windows and peer instances never read or write it.
+    const renderCacheWindow = () => !windowProfileOverride() && !isPeerInstanceWindow()
     const desktop = window.hermesDesktop
 
     // Window-state IPC (fullscreen / traffic-light position) that lands while
@@ -1424,6 +1449,16 @@ export function useGatewayBoot({
       // later initialization errors must not be reclassified as boot dials.
       let stage: 'resolving' | 'minting' | 'dialing' | 'connected' = 'resolving'
 
+      // Paint the last-known session list for this window's scope before any
+      // backend round-trip (fail-open; only into an empty sidebar).
+      if (!cachedSessionPaintSettled && !cachedSessionPaint && renderCacheWindow()) {
+        cachedSessionPaint = await paintCachedSessionList(sessionListStore)
+
+        if (cancelled) {
+          return
+        }
+      }
+
       try {
         // A profile-pinned helper window (the HUD) dials its target profile's
         // backend directly — ensureBackend spawns/reuses it from the pool.
@@ -1532,6 +1567,20 @@ export function useGatewayBoot({
         // the max is needed.
         await adoptPrimaryProfile(conn)
 
+        const sessionListScope = renderCacheWindow()
+          ? renderCacheScope(primaryRuntimeConnectionId(conn), $activeGatewayProfile.get())
+          : null
+
+        // A paint written for another scope than this boot resolved is
+        // retracted before the live list can merge over it.
+        if (!cachedSessionPaintSettled) {
+          cachedSessionPaintSettled = true
+
+          if (!settleCachedSessionPaint(cachedSessionPaint, sessionListScope, sessionListStore)) {
+            cachedSessionPaint = null
+          }
+        }
+
         setDesktopBootStep({
           phase: 'renderer.config',
           message: translateNow('boot.steps.loadingSettings'),
@@ -1562,6 +1611,23 @@ export function useGatewayBoot({
         completeDesktopBoot()
         bootCompleted = true
         bootRetryAttempt = 0
+        reportCachedSessionPaint(cachedSessionPaint, $sessions.get())
+        cachedSessionPaint = null
+
+        if (sessionListScope && !stopSessionListWriteThrough) {
+          stopSessionListWriteThrough = writeThroughSessionList({
+            resolved: sessionListScope,
+            activeScope: () => {
+              const connection = $connection.get()
+
+              return connection
+                ? renderCacheScope(primaryRuntimeConnectionId(connection), $activeGatewayProfile.get())
+                : null
+            },
+            subscribe: listener => $sessions.subscribe(listener)
+          })
+        }
+
         // A Docker/SSH terminal backend that fails its probe means shell
         // commands silently cannot run — say so once, with a way out. Cold
         // launch is the common path, so it must warn too, not only softSwitch.
@@ -1647,6 +1713,7 @@ export function useGatewayBoot({
 
     return () => {
       cancelled = true
+      stopSessionListWriteThrough?.()
       offSwitchLifecycle()
       endGatewaySwitch()
       clearReconnectTimer()
