@@ -231,7 +231,7 @@ class NtfyAdapter(BasePlatformAdapter):
     async def _run_stream(self) -> None:
         """Subscribe to the ntfy topic with automatic reconnection."""
         backoff_idx = 0
-        stream_start: float = 0.0
+        stream_start: float = float("-inf")
         url = f"{self._server}/{self._topic}/json"
         headers = self._auth_headers()
 

@@ -146,7 +146,7 @@ _local_model_lock = threading.Lock()
 # wasteful. A single long-lived daemon thread checks _last_transcription_time
 # and unloads the model after a configurable idle period, then exits. The next
 # voice message reloads the model and restarts the watcher transparently.
-_last_transcription_time: float = 0.0
+_last_transcription_time: float = float("-inf")  # monotonic; see tests/test_no_zero_seeded_monotonic_limiters.py
 _idle_unload_thread: Optional[threading.Thread] = None
 _idle_unload_stop = threading.Event()
 # Serializes watcher start checks so two concurrent transcriptions can't

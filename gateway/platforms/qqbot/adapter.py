@@ -526,7 +526,7 @@ class QQAdapter(BasePlatformAdapter):
           4915 → bot banned, stop reconnecting
         """
         backoff_idx = 0
-        connect_time = 0.0
+        connect_time = float("-inf")
         quick_disconnect_count = 0
 
         while self._running:
@@ -551,7 +551,7 @@ class QQAdapter(BasePlatformAdapter):
 
                 # Quick disconnect detection (permission issues, misconfiguration)
                 duration = time.monotonic() - connect_time
-                if duration < QUICK_DISCONNECT_THRESHOLD and connect_time > 0:
+                if duration < QUICK_DISCONNECT_THRESHOLD and connect_time > float("-inf"):
                     quick_disconnect_count += 1
                     logger.info(
                         "[%s] Quick disconnect (%.1fs), count: %d",

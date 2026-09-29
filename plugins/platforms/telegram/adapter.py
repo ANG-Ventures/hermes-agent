@@ -3335,7 +3335,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # attempt completes (task done) or chains to a new task well before
         # then, so a single long-lived task is unambiguously wedged.
         stuck_task_ref: Optional[asyncio.Task] = None
-        stuck_task_since = 0.0
+        stuck_task_since = float("-inf")
 
         while True:
             try:

@@ -34,7 +34,7 @@ _CACHE_TTL_SECONDS = 30.0
 _cache_lock = threading.Lock()
 _cached_policy: Optional[Dict[str, Any]] = None
 _cached_policy_path: Optional[str] = None
-_cached_policy_time: float = 0.0
+_cached_policy_time: float = float("-inf")
 
 
 def _get_default_config_path() -> Path:

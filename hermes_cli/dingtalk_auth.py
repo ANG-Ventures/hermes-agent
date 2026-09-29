@@ -115,14 +115,14 @@ def wait_for_registration_success(
     """
     deadline = time.monotonic() + expires_in
     retry_window = 120  # 2 minutes for transient errors
-    retry_start = 0.0
+    retry_start: float | None = None  # None = not retrying (monotonic has no safe 0)
 
     while time.monotonic() < deadline:
         time.sleep(interval)
         try:
             result = poll_registration(device_code)
         except RegistrationError:
-            if retry_start == 0:
+            if retry_start is None:
                 retry_start = time.monotonic()
             if time.monotonic() - retry_start < retry_window:
                 continue
@@ -130,7 +130,7 @@ def wait_for_registration_success(
 
         status = result["status"]
         if status == "WAITING":
-            retry_start = 0
+            retry_start = None
             if on_waiting:
                 on_waiting()
             continue
@@ -141,7 +141,7 @@ def wait_for_registration_success(
                 raise RegistrationError("authorization succeeded but credentials are missing")
             return cid, csecret
         # FAIL / EXPIRED / UNKNOWN
-        if retry_start == 0:
+        if retry_start is None:
             retry_start = time.monotonic()
         if time.monotonic() - retry_start < retry_window:
             continue

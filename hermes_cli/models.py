@@ -5228,7 +5228,7 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
 # other module caches here — a racing thread at worst duplicates one fetch.
 _github_model_catalog_cache: Optional[list[dict[str, Any]]] = None
 _github_model_catalog_cache_key: Optional[str] = None
-_github_model_catalog_cache_time: float = 0.0
+_github_model_catalog_cache_time: float = float("-inf")
 _GITHUB_MODEL_CATALOG_CACHE_TTL = 300  # 5 minutes
 
 
