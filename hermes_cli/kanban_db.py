@@ -23579,21 +23579,36 @@ def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
             return None
         cap = foreign_lane_cfg.get("shim_model_cap")
         cap = str(cap).strip() if isinstance(cap, str) else ""
-        return cap.rsplit("/", 1)[-1] or None
+        return cap or None
     except Exception as exc:
         _log.debug("kanban spawn: shim_model_cap unreadable at %r (%s)", hermes_home, exc)
         return None
 
 
-def _apply_shim_model_cap(model: str, cap: Optional[str]) -> tuple[str, Optional[str]]:
+def _apply_shim_model_cap(
+    model: str, cap: Optional[str], provider: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
     """Return ``(model_to_spawn, capped_from)``.
 
     ``capped_from`` is the card's model when the cap applied, else None. The
     cap applies only when both ids rank and the card's model ranks strictly
     above the cap; an equal or lower model, or an unrankable one, is untouched.
+    The spawn keeps the card's provider, so a provider-qualified cap
+    (``<provider>/<model>``) applies only when that provider IS the card's
+    effective provider; a different one is refused (logged, not capped)
+    rather than spawning a model the provider may not serve.
     """
     if not cap:
         return model, None
+    cap_provider, sep, cap_model = cap.rpartition("/")
+    if sep:
+        if cap_provider != (provider or ""):
+            _log.warning(
+                "kanban spawn: shim_model_cap %r ignored: its provider is not "
+                "the card's provider %r", cap, provider,
+            )
+            return model, None
+        cap = cap_model
     have, limit = _shim_model_rank(model), _shim_model_rank(cap)
     if have is None or limit is None or have <= limit:
         return model, None
@@ -23850,7 +23865,7 @@ def _default_spawn(
         # harness still reads the card's model from the board, so only the
         # shim moves. Unset = today's behaviour.
         model, capped_from = _apply_shim_model_cap(
-            model, _read_shim_model_cap(env.get("HERMES_HOME")),
+            model, _read_shim_model_cap(env.get("HERMES_HOME")), provider,
         )
         if capped_from:
             env[SHIM_MODEL_CAPPED_FROM_ENV] = capped_from

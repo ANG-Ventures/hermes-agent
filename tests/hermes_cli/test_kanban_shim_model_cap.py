@@ -120,3 +120,17 @@ def test_rank_orders_families():
     assert kb._shim_model_rank("claude-sonnet-5") < kb._shim_model_rank("anthropic/claude-opus-5")
     assert kb._shim_model_rank("gpt-5.5") is None
     assert kb._shim_model_rank("acme/opus-v1") is None
+
+
+@pytest.mark.parametrize("cap, card_provider, expected", [
+    ("claude-bpr/claude-sonnet-5", "claude-bpr", "claude-sonnet-5"),  # same provider: capped
+    ("anthropic/claude-sonnet-5", "claude-bpr", "claude-opus-5"),     # other provider: refused
+    ("anthropic/claude-sonnet-5", None, "claude-opus-5"),             # no card provider: refused
+])
+def test_provider_qualified_cap_only_on_matching_provider(
+    kanban_home, monkeypatch, cap, card_provider, expected,
+):
+    _profile(kanban_home, f"foreign_lane:\n  harness: claude-code-tui\n  shim_model_cap: {cap}\n")
+    model, _argv, env = _spawn(monkeypatch, "claude-opus-5", provider=card_provider)
+    assert model == expected
+    assert (kb.SHIM_MODEL_CAPPED_FROM_ENV in env) == (expected != "claude-opus-5")
