@@ -1072,6 +1072,15 @@ def emit_session_end(
                 )
                 return True
             agent._session_end_emitted_turn_id = turn_id
+            # (turn_id, marker) stamped by the CLI's signal handler before it
+            # interrupts the loop: names an external termination
+            # (``signal_15``) on THIS turn's row. Additive kwarg; None otherwise.
+            _stamp = getattr(agent, "_turn_terminal_error", None)
+            _terminal_error = (
+                _stamp[1]
+                if isinstance(_stamp, tuple) and len(_stamp) == 2 and _stamp[0] == turn_id
+                else None
+            )
             _invoke_hook(
                 "on_session_end",
                 session_id=agent.session_id,
@@ -1081,6 +1090,7 @@ def emit_session_end(
                 failed=failed,
                 interrupted=interrupted,
                 turn_exit_reason=turn_exit_reason,
+                terminal_error=_terminal_error,
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
                 provider=getattr(agent, "provider", None) or "",

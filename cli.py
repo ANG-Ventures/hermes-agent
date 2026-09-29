@@ -22270,6 +22270,16 @@ def main(
         try:
             _agent = getattr(cli, "agent", None)
             if _agent is not None:
+                # An external termination (not Ctrl-C) ends this turn: stamp
+                # the marker BEFORE interrupting, because the loop's own
+                # finalizer may write the turn's real row during the grace
+                # window below (it then wins over _finalize_signaled_kanban_worker)
+                # and only it can carry the marker into that row.
+                import signal as _sigmod
+                if signum != _sigmod.SIGINT:
+                    _agent._turn_terminal_error = (
+                        getattr(_agent, "_current_turn_id", None), f"signal_{int(signum)}",
+                    )
                 request_hard_interrupt(_agent, f"received signal {signum}")
                 try:
                     _grace = float(os.getenv("HERMES_SIGTERM_GRACE", "1.5"))

@@ -286,6 +286,26 @@ def test_profile_for_path():
     assert orphans.profile_for_path("/h/.hermes/blackbox/turns.db") == "default"
 
 
+def test_finalizer_carries_the_signal_stamp_into_the_real_row(db):
+    """The CLI signal handler stamps (turn_id, 'signal_15') before interrupting;
+    when the loop's own finalizer then writes the row (it wins over the signal
+    path), the marker travels with it. A stamp for another turn is ignored."""
+    for turn_id, stamp, want in (
+        ("sess:task:sig", ("sess:task:sig", "signal_15"), "signal_15"),
+        ("sess:task:other", ("sess:task:sig", "signal_15"), None),
+    ):
+        _priced_call(turn_id, 1, inp=10, out=5)
+        agent = SimpleNamespace(
+            _current_turn_id=turn_id, _current_task_id="task", session_id="sess",
+            model="claude-opus-4-8", provider="claude-bpr", platform="cli",
+            _blackbox_turn_calls=(turn_id, []), _turn_original_user_message=(turn_id, "go"),
+            _turn_terminal_error=stamp,
+        )
+        with patch("hermes_cli.lifecycle.invoke_hook", _route_session_end):
+            assert emit_unfinalized_session_end(agent, turn_id, exc=KeyboardInterrupt())
+        assert _turn_row(db, turn_id, "interrupted, terminal_error, api_calls") == (1, want, 1)
+
+
 def test_interrupted_session_end_prices_from_ledger_and_keeps_marker(db):
     """The signal path emits no turn_usage; the row is built from the ledger."""
     turn_id = "s:t:killed"
