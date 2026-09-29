@@ -73,15 +73,36 @@ def _call_name(func: ast.expr) -> str | None:
 _NUMERIC_WRAPPERS = {"int", "float", "round", "floor", "ceil", "trunc"}
 
 
-def _is_monotonic_call(node: ast.expr) -> bool:
+def _monotonic_aliases(tree: ast.AST) -> frozenset[str]:
+    """Names that refer to a monotonic clock function in this module.
+
+    ``from time import monotonic as _mono`` and ``_clock = time.monotonic``
+    make ``_mono()`` / ``_clock()`` monotonic calls.
+    """
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "time":
+            for alias in node.names:
+                if alias.name in _MONOTONIC_FUNCS:
+                    aliases.add(alias.asname or alias.name)
+        for target, value in _assign_pairs(node):
+            if isinstance(target, ast.Name) and isinstance(value, (ast.Name, ast.Attribute)):
+                if _call_name(value) in _MONOTONIC_FUNCS:
+                    aliases.add(target.id)
+    return frozenset(aliases)
+
+
+def _is_monotonic_call(node: ast.expr, aliases: frozenset[str] = frozenset()) -> bool:
     if not isinstance(node, ast.Call):
         return False
     func = node.func
+    if isinstance(func, ast.Name) and func.id in aliases:
+        return True
     # ``int(time.monotonic())`` is still an absolute boot-origin timestamp.
     # Only a DIRECT monotonic argument counts: ``int(time.monotonic() - t0)``
     # is a relative elapsed value and must not be treated as absolute.
     if _call_name(func) in _NUMERIC_WRAPPERS and node.args:
-        return _is_monotonic_call(node.args[0])
+        return _is_monotonic_call(node.args[0], aliases)
     if _call_name(func) in _MONOTONIC_FUNCS:
         return True
     # asyncio: ``loop.time()`` / ``asyncio.get_running_loop().time()``
@@ -254,6 +275,17 @@ def _assign_pairs(child: ast.AST):
         yield child.target, child.value
 
 
+def _class_nodes(cls: ast.ClassDef):
+    """Nodes of ``cls`` incl. its methods, but not nested classes (whose
+    ``self`` is a different object)."""
+    stack = list(ast.iter_child_nodes(cls))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, ast.ClassDef):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _build_scopes(tree: ast.Module) -> list[_Scope]:
     scopes: list[_Scope] = []
 
@@ -304,11 +336,21 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
             attrs: dict[str, list[ast.expr | None]] = {
                 k: list(v) for k, v in scope.bindings.items()
             }
-            for sub in ast.walk(scope.node):
+            for sub in _class_nodes(scope.node):
                 for target, value in _assign_pairs(sub):
                     attr = _self_attr(target)
                     if attr is not None:
                         attrs.setdefault(attr, []).append(value)
+                    elif (
+                        isinstance(target, ast.Subscript)
+                        and _self_attr(target.value) is not None
+                        and _const_key(target) is not _NO_KEY
+                        and value is not None
+                    ):
+                        # ``self.cache["ts"] = 0.0``
+                        attrs.setdefault(_self_attr(target.value), []).append(
+                            ast.Dict(keys=[ast.Constant(_const_key(target))], values=[value])
+                        )
             scope.attrs = attrs
     # Assignments under ``global``/``nonlocal`` bind in the resolved scope.
     for scope in scopes:
@@ -335,6 +377,7 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
         tree = ast.parse(source, filename=filename)
     hits: list[str] = []
     lines = source.splitlines()
+    aliases = _monotonic_aliases(tree)
     for scope in _build_scopes(tree):
         for node in _own_nodes(scope.node):
             if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
@@ -361,17 +404,17 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
             left_attr = _self_attr(left)
             if left_attr is not None:
                 left_is_mono = any(
-                    v is not None and _is_monotonic_call(v)
+                    v is not None and _is_monotonic_call(v, aliases)
                     for v in scope.class_attrs().get(left_attr, [])
                 )
             elif isinstance(left, ast.Name):
                 left_scope = scope.resolve(left.id)
                 left_is_mono = left_scope is not None and any(
-                    v is not None and _is_monotonic_call(v)
+                    v is not None and _is_monotonic_call(v, aliases)
                     for v in left_scope.bindings.get(left.id, [])
                 )
             else:
-                left_is_mono = _is_monotonic_call(left)
+                left_is_mono = _is_monotonic_call(left, aliases)
             if not left_is_mono:
                 continue
             if right_item:
@@ -586,6 +629,33 @@ def heartbeat_current_worker_from_env(progress_at=None):
             "def f():\n    return time.monotonic() - _cache['timestamp']\n",
             [],
             id="dict-literal-inf-and-other-key-zero-is-safe",
+        ),
+        pytest.param(
+            "from time import monotonic as _mono\nlast = 0.0\n"
+            "def f():\n    return _mono() - last\n",
+            ["last"],
+            id="import-as-alias",
+        ),
+        pytest.param(
+            "import time\n_clock = time.monotonic\n"
+            "def f():\n    last = 0\n    now = _clock()\n    return now - last\n",
+            ["last"],
+            id="assigned-function-alias",
+        ),
+        pytest.param(
+            "import time\nclass C:\n    def __init__(self):\n        self.c = {}\n"
+            "        self.c['ts'] = 0.0\n"
+            "    def f(self):\n        return time.monotonic() - self.c['ts']\n",
+            ["self.c['ts']"],
+            id="self-subscript-store-seed",
+        ),
+        pytest.param(
+            "import time\nclass Outer:\n"
+            "    class Inner:\n        def __init__(self):\n            self.last = 0.0\n"
+            "    def __init__(self):\n        self.last = float('-inf')\n"
+            "    def f(self):\n        return time.monotonic() - self.last\n",
+            [],
+            id="nested-class-self-not-conflated",
         ),
         pytest.param(
             "import time\ndef f(started):\n    last = 0\n"

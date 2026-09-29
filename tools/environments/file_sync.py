@@ -160,7 +160,7 @@ class FileSyncManager:
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
         self._upload_only_host_paths: set[str] = set()
-        self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
+        self._last_sync_time: float = float("-inf")  # monotonic; -inf ensures first sync runs (0.0 did not on a fresh boot)
         self._sync_interval = sync_interval
 
     def sync(self, *, force: bool = False) -> None:
