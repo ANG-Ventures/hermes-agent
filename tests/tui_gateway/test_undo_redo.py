@@ -135,3 +135,23 @@ def test_prompt_submit_clears_redo_stack_on_user_send(server, db, monkeypatch):
 
     assert resp["result"]["status"] == "streaming"
     assert state.redo_stack == []
+
+
+def test_core_reports_clamped_counts_not_requested(db):
+    """undo()/redo() expose what they DID so callers never echo the request."""
+    sk = "core-counts"
+    db.create_session(sk, source="tui")
+    for role, text in (("user", "q1"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a2")):
+        db.append_message(sk, role, text)
+
+    undo = hermes_undo.undo(sk, 7)
+    assert undo["half_turns"] == 4
+    assert len(undo["rewound_ids"]) == 4
+
+    redo = hermes_undo.redo(sk, 5)
+    assert redo["ops_redone"] == 1
+    assert redo["reactivated_count"] == 4
+
+    empty = hermes_undo.redo(sk, 2)
+    assert empty["ops_redone"] == 0
+    assert empty["reactivated_count"] == 0
