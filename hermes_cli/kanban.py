@@ -2030,7 +2030,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
-    "request-changes", "link", "specify", "decompose", "workspace",
+    "request-changes", "link", "unlink", "specify", "decompose", "workspace",
 })
 
 
@@ -4887,12 +4887,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"BLOCKED: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            # Provenance before the transition: blocking ends the run.
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
             if not kb.block_task(
                 conn,
                 tid,
@@ -4903,6 +4899,14 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    # Only after the transition landed: a refused or failed
+                    # block leaves no "BLOCKED:" comment (C5 #20, FleetReview
+                    # e6af55d359f5).
+                    kb.add_comment(
+                        conn, tid, author, f"BLOCKED: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -4954,12 +4958,19 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 current is not None and current.status == "scheduled"
                 and wake_at is not None
             )
-            if reason:
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"SCHEDULED: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            # Provenance before the transition: scheduling ends the run.
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
+
+            def _status_comment() -> None:
+                # Only after a mutation landed: a refused or failed schedule
+                # leaves no "SCHEDULED:" comment (C5 #20, FleetReview
+                # e6af55d359f5).
+                if reason:
+                    kb.add_comment(
+                        conn, tid, author, f"SCHEDULED: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
+
             if not already and not kb.schedule_task(
                 conn,
                 tid,
@@ -4970,12 +4981,16 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print(f"cannot schedule {tid}", file=sys.stderr)
                 continue
             if not already:
+                _status_comment()
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
             if wake_at is None:
                 continue
             ok, err = kb.set_schedule_wake(
                 conn, tid, wake_at=wake_at, actor=author, reason=reason,
             )
+            if ok and already:
+                # The wake reset is the only mutation on an already-scheduled card.
+                _status_comment()
             if not ok:
                 failed.append(tid)
                 print(f"cannot set wake for {tid}: {err}", file=sys.stderr)
@@ -4997,13 +5012,15 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # The "UNBLOCK:" comment commits atomically with the transition
+            # and only if it lands: no comment on a refused/failed unblock, and
+            # no window where a respawned worker sees the card without the
+            # reason (C5 #20, FleetReview e6af55d359f5 / aa67ba1c7513).
+            comment = None
             if reason:
                 _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"UNBLOCK: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
-            if not kb.unblock_task(conn, tid):
+                comment = (author, f"UNBLOCK: {reason}", _run_id, _sess_ref)
+            if not kb.unblock_task(conn, tid, comment=comment):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:

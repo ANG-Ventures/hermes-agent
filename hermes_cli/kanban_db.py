@@ -7762,6 +7762,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
+# Removing an edge re-promotes the child: a status write on it, same as link
+# (C5 #21, PR #951).
+@_home_session_guarded("unlink", task_param="child_id")
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -14494,8 +14497,19 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 @_home_session_guarded("unblock")
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    comment: Optional[tuple] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
+
+    ``comment`` = ``(author, body, run_id, session_ref)``: a status comment
+    written in the SAME transaction as the transition, and only when it
+    lands. A respawned worker can then never read the thread between the
+    card becoming dispatchable and the reason appearing, and a refused or
+    failed unblock leaves no comment (FleetReview aa67ba1c7513).
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -14549,6 +14563,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if comment is not None:
+            c_author, c_body, c_run_id, c_session_ref = comment
+            add_comment(
+                conn, task_id, c_author, c_body,
+                run_id=c_run_id, session_ref=c_session_ref,
+            )
         _append_event(
             conn, task_id, "unblocked",
             (

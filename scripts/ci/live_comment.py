@@ -62,6 +62,10 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+# Every GitHub call is bounded: a stalled socket must not hang the poller for
+# the life of the CI job (C5 #72, PR #1229).
+HTTP_TIMEOUT_S = 30
 import zipfile
 from pathlib import Path
 
@@ -151,7 +155,7 @@ def _api_request(url: str, token: str) -> dict:
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ci-live-comment",
     })
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
         data: dict = json.loads(resp.read())
         return data
 
@@ -166,7 +170,7 @@ def _api_get_paginated(url: str, token: str, list_key: str | None = None) -> lis
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "ci-live-comment",
         })
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             data = json.loads(resp.read())
             link_header = resp.headers.get("Link", "")
 
@@ -335,7 +339,7 @@ def upsert_comment(
         "User-Agent": "ci-live-comment",
     })
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             result = json.loads(resp.read())
             return result.get("id")
     except urllib.error.HTTPError as e:
