@@ -170,27 +170,45 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
     return isinstance(used, int) and not isinstance(used, bool) and used >= budget
 
 
-def _current_turn_tail_tool_index(messages: List[Dict[str, Any]]) -> Optional[int]:
+def _current_turn_tail_tool_index(
+    messages: List[Dict[str, Any]], turn_start_idx: Optional[int] = None
+) -> Optional[int]:
     """Index of the newest ``role:"tool"`` message of the CURRENT turn, else None.
 
-    The backward scan stops at the first ``role:"user"`` message: anything
-    before it belongs to a previous turn.  Appending there buries the text
-    before the previous final reply and the new user message (the model
-    ignores it) and mutates cached history (prompt-cache prefix break).
+    Anything before the current turn's user message belongs to a previous
+    turn.  Appending there buries the text before the previous final reply
+    and the new user message (the model ignores it) and mutates cached
+    history (prompt-cache prefix break).
+
+    ``turn_start_idx`` is the loop's ``current_turn_user_idx``.  When it
+    points at a user message, the scan runs back to it and passes over the
+    synthetic mid-turn user nudges (length continuation, Codex incomplete,
+    verify/kanban stop guards) that follow this turn's tool results.
+    Without a valid index the scan stops at the first ``role:"user"``.
     """
-    for i in range(len(messages) - 1, -1, -1):
+    bound_known = (
+        isinstance(turn_start_idx, int)
+        and not isinstance(turn_start_idx, bool)
+        and 0 <= turn_start_idx < len(messages)
+        and isinstance(messages[turn_start_idx], dict)
+        and messages[turn_start_idx].get("role") == "user"
+    )
+    lower = turn_start_idx + 1 if bound_known else 0
+    for i in range(len(messages) - 1, lower - 1, -1):
         msg = messages[i]
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
         if role == "tool":
             return i
-        if role == "user":
+        if role == "user" and not bound_known:
             return None
     return None
 
 
-def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+def _maybe_inject_run_budget_wrapup(
+    agent: Any, messages: List[Dict[str, Any]], turn_start_idx: Optional[int] = None
+) -> bool:
     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
 
     Cache-safe delivery: the notice is appended to the NEWEST ``role:"tool"``
@@ -213,7 +231,7 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
         return False
     if (time.time() - started) < 0.8 * float(budget):
         return False
-    i = _current_turn_tail_tool_index(messages)
+    i = _current_turn_tail_tool_index(messages, turn_start_idx)
     if i is not None:
         msg = messages[i]
         existing = msg.get("content", "")
@@ -2822,7 +2840,7 @@ def run_conversation(
         _pre_api_steer = agent._drain_pending_steer()
         if _pre_api_steer:
             _injected = False
-            _si = _current_turn_tail_tool_index(messages)
+            _si = _current_turn_tail_tool_index(messages, current_turn_user_idx)
             if _si is not None:
                 _sm = messages[_si]
                 from agent.prompt_builder import format_steer_marker
@@ -2830,15 +2848,18 @@ def run_conversation(
                 existing = _sm.get("content", "")
                 if isinstance(existing, str):
                     _sm["content"] = existing + marker
+                    _injected = True
                 else:
-                    # Multimodal content blocks — append text block
+                    # Multimodal content blocks — append text block.  On
+                    # failure _injected stays False and the steer is put back.
                     try:
                         blocks = list(existing) if existing else []
                         blocks.append({"type": "text", "text": marker})
                         _sm["content"] = blocks
+                        _injected = True
                     except Exception:
                         pass
-                _injected = True
+            if _injected:
                 logger.info(
                     "Delivered /steer to agent (pre-API, tool msg index %d) (%d chars)",
                     _si,
@@ -2865,7 +2886,7 @@ def run_conversation(
         # cache-safe channel as /steer (appended to the newest tool
         # result); dormant when no budget is set.
         if getattr(agent, "run_budget_seconds", None):
-            _maybe_inject_run_budget_wrapup(agent, messages)
+            _maybe_inject_run_budget_wrapup(agent, messages, current_turn_user_idx)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages

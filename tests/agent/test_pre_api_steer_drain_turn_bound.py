@@ -251,3 +251,95 @@ def test_run_budget_wrapup_never_lands_in_previous_turn_tool_result():
     assert _maybe_inject_run_budget_wrapup(agent, messages) is True
     assert RUN_BUDGET_WRAPUP_NOTICE in messages[-1]["content"]
     assert messages[2]["content"] == "old result"
+
+
+def test_steer_after_synthetic_mid_turn_nudge_still_injects_into_current_turn_tool():
+    """Synthetic user nudges (verify/kanban stop guards, length continuation,
+    Codex incomplete) follow this turn's tool results. They are not a turn
+    boundary: the pre-API drain must still reach THIS turn's tool result
+    instead of deferring the steer to pending_steer (a separate later turn)."""
+    agent = _make_agent()
+
+    def _execute_then_nudge(assistant_message, messages, effective_task_id, api_call_count=0):
+        for tc in assistant_message.tool_calls:
+            messages.append(make_tool_result_message("web_search", "new result", tc.id))
+        messages.append(
+            {"role": "user", "content": "verify before stopping", "_pre_verify_synthetic": True}
+        )
+
+    def _step(api_call_count, prev_tools):
+        if api_call_count == 2:
+            agent.steer(STEER)
+
+    result, sent = _run(
+        agent,
+        [
+            _response(finish_reason="tool_calls", tool_calls=[_tool_call("c1")]),
+            _response(content="done"),
+        ],
+        execute=_execute_then_nudge,
+        step_callback=_step,
+    )
+
+    assert result["final_response"] == "done"
+    tools = _tool_contents(sent[1])
+    assert tools["old1"] == "old result"
+    assert STEER in tools["c1"]
+    assert not result.get("pending_steer")
+
+
+def test_turn_tail_tool_index_uses_turn_start_and_rejects_invalid_index():
+    from agent.conversation_loop import _current_turn_tail_tool_index
+
+    messages = _history() + [
+        {"role": "user", "content": "new question"},  # index 4
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "new result"},  # 6
+        {"role": "user", "content": "nudge", "_kanban_stop_synthetic": True},
+    ]
+    assert _current_turn_tail_tool_index(messages, 4) == 6
+    # No tool after the turn start: never reaches the previous turn (index 2).
+    assert _current_turn_tail_tool_index(messages[:5], 4) is None
+    # Unknown/invalid bound: conservative first-user stop.
+    assert _current_turn_tail_tool_index(messages, None) is None
+    assert _current_turn_tail_tool_index(messages, 2) is None  # not a user row
+    assert _current_turn_tail_tool_index(messages, 99) is None
+
+
+def test_pre_api_append_failure_puts_steer_back_instead_of_claiming_delivery():
+    """A current-turn tool result whose content cannot take a text block must
+    not swallow the steer: no INFO delivery line, and the steer is handed back
+    as pending_steer instead of vanishing."""
+    import agent.conversation_loop as conversation_loop
+
+    agent = _make_agent()
+
+    def _execute_bad_content(assistant_message, messages, effective_task_id, api_call_count=0):
+        for tc in assistant_message.tool_calls:
+            # Truthy, non-str, non-iterable: list(content) raises.
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": 12345})
+
+    def _step(api_call_count, prev_tools):
+        if api_call_count == 2:
+            agent.steer(STEER)
+
+    info_lines: list[str] = []
+    real_info = conversation_loop.logger.info
+
+    def _capture_info(msg, *args, **kwargs):
+        info_lines.append(msg % args if args else msg)
+        return real_info(msg, *args, **kwargs)
+
+    with patch.object(conversation_loop.logger, "info", side_effect=_capture_info):
+        result, _sent = _run(
+            agent,
+            [
+                _response(finish_reason="tool_calls", tool_calls=[_tool_call("c1")]),
+                _response(content="done"),
+            ],
+            execute=_execute_bad_content,
+            step_callback=_step,
+        )
+
+    assert not any("Delivered /steer to agent (pre-API" in line for line in info_lines)
+    assert result.get("pending_steer") == STEER

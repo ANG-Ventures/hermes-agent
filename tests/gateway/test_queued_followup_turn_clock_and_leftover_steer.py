@@ -289,3 +289,45 @@ async def test_leftover_steer_slash_command_not_queued(monkeypatch, tmp_path, co
     texts = ([head.text] if head else []) + [e.text for e in overflow]
     assert "queued follow-up" in texts
     assert command not in texts, texts
+
+
+@pytest.mark.asyncio
+async def test_leftover_steer_stays_on_parent_key_when_followup_runs_elsewhere(monkeypatch, tmp_path):
+    """Documented behaviour: the leftover steer belongs to the PARENT
+    conversation, so when the queued follow-up's source maps to a different
+    next_session_key it is kept in the parent key's overflow (delivered on
+    that key's next drain, i.e. late) -- never injected into the other
+    conversation and never dropped."""
+    other_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-2002",
+        chat_type="group",
+        thread_id="99",
+    )
+
+    def script(idx, queue_followup):
+        if idx == 0:
+            queue_followup("queued follow-up")
+            return {
+                "final_response": "first answer",
+                "messages": [],
+                "api_calls": 1,
+                "pending_steer": "late steer text",
+            }
+        return {"final_response": f"answer {idx}", "messages": [], "api_calls": 1}
+
+    runner, _adapter, calls, _result = await _drive(
+        monkeypatch, tmp_path, script, followup_source=other_source
+    )
+
+    messages = [c["message"] for c in calls]
+    assert messages[:2] == ["first", "queued follow-up"]
+    assert not any("late steer text" in m for m in messages), messages
+    parent_overflow = [
+        e.text for e in runner._session_state(SESSION_KEY).conversation.queued_events
+    ]
+    assert parent_overflow == ["late steer text"]
+    other_key = runner._session_key_for_source(other_source)
+    other_state = runner._peek_session_state(other_key)
+    other_overflow = [e.text for e in other_state.conversation.queued_events] if other_state else []
+    assert "late steer text" not in other_overflow
