@@ -17,10 +17,22 @@ stays ``None`` and skew detection no-ops — it never produces a false positive.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _boot_fingerprint: str | None = None
+# Modules imported by gateway.boot_preload (None = preload never ran).
+_preloaded_modules: int | None = None
+_skew_logged = False
+
+
+def record_preload(modules: int) -> None:
+    """Record how many first-party modules the boot preload pinned in memory."""
+    global _preloaded_modules
+    _preloaded_modules = modules
 
 
 def _fingerprint() -> str | None:
@@ -65,4 +77,16 @@ def detect_code_skew() -> tuple[str, str] | None:
     boot_sha, cur_sha = _boot_fingerprint.rsplit(":", 1)[-1], current.rsplit(":", 1)[-1]
     if cur_sha and cur_sha != "unresolved" and cur_sha == boot_sha:
         return None
-    return _short(_boot_fingerprint), _short(current)
+    skew = _short(_boot_fingerprint), _short(current)
+    _log_skew_once(*skew)
+    return skew
+
+
+def _log_skew_once(boot: str, disk: str) -> None:
+    """One grep-able line per process: was the in-memory snapshot preloaded?"""
+    global _skew_logged
+    if _skew_logged:
+        return
+    _skew_logged = True
+    modules = "none" if _preloaded_modules is None else _preloaded_modules
+    logger.warning("PHASE=code_skew_preloaded modules=%s boot=%s disk=%s", modules, boot, disk)

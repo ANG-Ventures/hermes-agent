@@ -85,6 +85,26 @@ def test_cron_ceiling_is_the_slot_width():
     assert scheduler_ext.resolve_job_script_timeout(irregular, 7200, now=at) == (3600, "interval")
 
 
+
+def test_cron_slot_uses_configured_tz_not_host(monkeypatch):
+    """C5 #50: with no explicit ``now`` the slot is found on the configured clock."""
+    from zoneinfo import ZoneInfo
+
+    from cron import jobs as _jobs
+
+    la = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(_jobs, "_hermes_now", lambda: datetime(2026, 9, 24, 12, 0, tzinfo=la))
+    # LA noon sits in the 09:00 -> 17:00 slot (8 h); on a UTC host clock it is
+    # 19:00, the 17:00 -> 09:00 slot (16 h).
+    job = {"schedule": {"kind": "cron", "expr": "0 9,17 * * *"}}
+    assert scheduler_ext.resolve_job_script_timeout(job, 10**6) == (8 * 3600, "interval")
+    # Host-clock-independent witness: the leap-day slot spanning 2100 (not a
+    # leap year) is 8 years wide; around the real host date it is 4.
+    monkeypatch.setattr(_jobs, "_hermes_now", lambda: datetime(2099, 6, 1, tzinfo=la))
+    leap = {"schedule": {"kind": "cron", "expr": "0 0 29 2 *"}}
+    got, _ = scheduler_ext.resolve_job_script_timeout(leap, 10**9)
+    assert got > 7 * 365 * 86400
+
 def test_short_interval_gets_floor():
     job = {"schedule": {"kind": "cron", "expr": "* * * * *"}}
     got, _ = scheduler_ext.resolve_job_script_timeout(job, 7200)

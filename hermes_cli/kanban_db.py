@@ -2289,6 +2289,12 @@ class Task:
     # pool; the default is to WAIT for the sub.
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
+    # ``(model, provider)`` the card ROW pinned when this Task was claimed
+    # (:func:`_snapshot_claimed_card_pin`), before a lane override or a
+    # capped-pool rung mutates ``model_override`` in memory. In-memory only;
+    # ``_default_spawn`` hands it to the worker (t_a30417c3). ``None`` = not
+    # a claimed Task (no snapshot taken).
+    claimed_card_pin: Optional[tuple] = None
     next_eligible_at: Optional[int] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
@@ -7756,6 +7762,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
+# Removing an edge re-promotes the child: a status write on it, same as link
+# (C5 #21, PR #951).
+@_home_session_guarded("unlink", task_param="child_id")
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -8450,6 +8459,27 @@ def _append_event(
         )
     except Exception:  # pragma: no cover - the journal is a net, never a gate
         pass
+
+
+def _append_deferred_event_once(
+    conn: sqlite3.Connection, task_id: str, payload: dict,
+) -> None:
+    """Append a ``deferred`` event unless the card's newest event is already
+    the identical deferral. A steady-state backlog otherwise wrote one row per
+    backlogged card per dispatcher tick (FleetReview #83); a changed payload
+    (new counts, reason, provider) still records."""
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last[0] == "deferred":
+        try:
+            if json.loads(last[1] or "null") == payload:
+                return
+        except (TypeError, ValueError):
+            pass
+    _append_event(conn, task_id, "deferred", payload)
 
 
 def _end_run(
@@ -9227,6 +9257,21 @@ def _termination_window(entry) -> tuple:
     return getattr(entry, "owner_window", (None, None))
 
 
+def _snapshot_claimed_card_pin(task: Optional[Task]) -> Optional[Task]:
+    """Record the card-row pin on a freshly claimed ``task`` (t_a30417c3).
+
+    Called on the row read inside the claim transaction, so the snapshot is
+    the pin as claimed: a later ``set-model`` (no ``--live``) cannot reach
+    this run through the worker's own row read, and a lane override or a
+    dispatch rung applied afterwards is not a card pin.
+    """
+    if task is not None:
+        from hermes_cli.kanban_provider_health import model_override
+
+        task.claimed_card_pin = model_override(task)
+    return task
+
+
 @_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
@@ -9352,7 +9397,7 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
-        claimed = get_task(conn, task_id)
+        claimed = _snapshot_claimed_card_pin(get_task(conn, task_id))
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -9504,7 +9549,7 @@ def claim_review_task(
             session_ref=session_ref, operator_claim=operator_claim,
         ) is None:
             return None
-        return get_task(conn, task_id)
+        return _snapshot_claimed_card_pin(get_task(conn, task_id))
 
 
 def review_claim_run_for_session(
@@ -11081,6 +11126,7 @@ def _persist_scratch_completion_artifacts(
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     used_destinations: set[Path] = set()
+    copied_paths: list[str] = []
     changed = False
 
     def _discard_copies() -> None:
@@ -11154,13 +11200,14 @@ def _persist_scratch_completion_artifacts(
 
         used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
+        copied_paths.append(str(dest.resolve()))
         changed = True
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        # Only copies made HERE need an attachment row: an already-stored
+        # path in the list (a routed copy carried onto an approval) has one.
+        metadata["_staged_artifacts"] = copied_paths
 
 
 def _stage_routed_scratch_artifacts(
@@ -11239,13 +11286,14 @@ def _carry_routed_artifacts(
     task_id: str,
     metadata: Optional[dict],
 ) -> Optional[dict]:
-    """An approval without its own artifacts inherits the routed run's copies.
+    """The approving completion carries the routed run's copies.
 
     The gateway uploads files from the ``completed`` event only, so a bare
-    approval of a routed card would otherwise deliver nothing.
+    approval of a routed card would otherwise deliver nothing. An approval
+    that declares artifacts of its own gets the routed copies FIRST, then its
+    own (deduped) -- replacing one list with the other dropped the
+    implementer's files (FleetReview #1447 @aa9e59a3).
     """
-    if isinstance(metadata, dict) and metadata.get("artifacts"):
-        return metadata
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? "
         "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
@@ -11258,7 +11306,14 @@ def _carry_routed_artifacts(
     carried = routed.get("routed_artifacts") if isinstance(routed, dict) else None
     if not isinstance(carried, list) or not carried:
         return metadata
-    return dict(metadata or {}, artifacts=[str(a) for a in carried])
+    own = metadata.get("artifacts") if isinstance(metadata, dict) else None
+    if isinstance(own, str):
+        own = [own]
+    merged: list[str] = []
+    for item in [*carried, *(own if isinstance(own, (list, tuple)) else [])]:
+        if str(item) not in merged:
+            merged.append(str(item))
+    return dict(metadata or {}, artifacts=merged)
 
 
 def _insert_completion_attachment(
@@ -14463,8 +14518,19 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 @_home_session_guarded("unblock")
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    comment: Optional[tuple] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
+
+    ``comment`` = ``(author, body, run_id, session_ref)``: a status comment
+    written in the SAME transaction as the transition, and only when it
+    lands. A respawned worker can then never read the thread between the
+    card becoming dispatchable and the reason appearing, and a refused or
+    failed unblock leaves no comment (FleetReview aa67ba1c7513).
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -14518,6 +14584,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if comment is not None:
+            c_author, c_body, c_run_id, c_session_ref = comment
+            add_comment(
+                conn, task_id, c_author, c_body,
+                run_id=c_run_id, session_ref=c_session_ref,
+            )
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -21969,7 +22041,7 @@ def _dispatch_once_locked(
             )
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(conn, task_id, "deferred", payload)
+                    _append_deferred_event_once(conn, task_id, payload)
             return True, None
         skipped: list = []
         fallback = available_profile_fallback(
@@ -22005,7 +22077,7 @@ def _dispatch_once_locked(
             )
         if not dry_run:
             with write_txn(conn):
-                _append_event(conn, task_id, "deferred", payload)
+                _append_deferred_event_once(conn, task_id, payload)
         return True, None
 
     def note_lane_route(claimed, source):
@@ -23426,6 +23498,33 @@ def effective_worker_route(task: Task) -> str:
     return f"{provider_label}/{model_label}"
 
 
+def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
+    """argv for a native foreign-lane worker (``foreign_lane.worker_command``).
+
+    The runner ignores its own flags. ``-m/--provider/--reasoning`` state the
+    route this dispatcher resolved (card override, else the profile's model,
+    exactly as a shim's argv would), because the lane's model gate reads its
+    parent's argv to catch a card re-pinned between spawn and harness start.
+    """
+    argv = [sys.executable, "-m", "hermes_cli.kanban_native_worker"]
+    model = provider = None
+    if task.model_override:
+        from hermes_cli.kanban_provider_health import model_override
+
+        model, provider = model_override(task)
+    elif profile_home:
+        from hermes_cli.profiles import _read_config_model
+
+        model, provider = _read_config_model(Path(profile_home))
+    if model:
+        argv.extend(["-m", str(model)])
+        if provider:
+            argv.extend(["--provider", str(provider)])
+    if task.reasoning_effort:
+        argv.extend(["--reasoning", task.reasoning_effort])
+    return argv
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -23571,6 +23670,18 @@ def _default_spawn(
         env.pop("HERMES_KANBAN_EXIT_FILE", None)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # The card pin as CLAIMED (t_a30417c3): the worker's pin snapshot must
+    # not read the mutable row later, where a next-dispatch ``set-model``
+    # landing between this spawn and worker startup would become this run's
+    # pin. Only the claim-time row pin, never the lane/rung route. Popped when
+    # absent so a dispatcher running inside a worker never leaks its own.
+    from hermes_cli.kanban_worker_route import CLAIMED_CARD_PIN_ENV
+    if task.claimed_card_pin is not None:
+        _pin_model, _pin_provider = task.claimed_card_pin
+        env[CLAIMED_CARD_PIN_ENV] = json.dumps(
+            {"model": _pin_model, "provider": _pin_provider})
+    else:
+        env.pop(CLAIMED_CARD_PIN_ENV, None)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -23684,6 +23795,17 @@ def _default_spawn(
     ])
     # Every worker needs the result-aware exit path, not only goal-mode runs.
     cmd.append("-Q")
+    # Native foreign lane (harness-parity spec 9.6): a profile that sets
+    # ``foreign_lane.worker_command`` is worked by a no-LLM runner that execs
+    # the lane and makes its receipt's one board call. Same env, same owner
+    # grant, same log; only the argv differs. Unset keeps the shim above.
+    from hermes_cli.kanban_native_worker import worker_command as _native_worker_command
+    if _native_worker_command(env.get("HERMES_HOME")) is not None:
+        cmd = _native_worker_argv(task, env.get("HERMES_HOME"))
+        # Pin the runner to the tree THIS dispatcher imports, so the code that
+        # chose the native path is the code that runs it. The runner drops it
+        # again before it starts the lane.
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

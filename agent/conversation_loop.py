@@ -4129,7 +4129,17 @@ def run_conversation(
                     # accept-site accounting below) reads THIS, not the live
                     # agent, which /model or a fallback may change while the
                     # request is in flight (FleetReview 65e315f38776).
+                    # The MODEL is the one this payload actually carries: a
+                    # /model from another thread between building api_kwargs
+                    # and this edge changes agent.model but not the request
+                    # (FleetReview da84600f3b28).
                     _call_route.update(_live_route(agent))
+                    _sent_model = (
+                        next_api_kwargs.get("model")
+                        if isinstance(next_api_kwargs, dict) else None
+                    )
+                    if isinstance(_sent_model, str) and _sent_model:
+                        _call_route["model"] = _sent_model
                     agent._inflight_request_route = dict(_call_route)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -4180,6 +4190,8 @@ def run_conversation(
                 # _perform_api_call. Execution middleware that answers without
                 # dispatching leaves the route the request was built on.
                 _call_route = _live_route(agent)
+                if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("model"), str) and api_kwargs["model"]:
+                    _call_route["model"] = api_kwargs["model"]
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -6900,14 +6912,26 @@ def run_conversation(
                 )
                 _capacity_wait = None
                 if _is_pool_capacity:
-                    max_retries = max(max_retries, int(agent._capacity_retry_attempts))
+                    _cap_attempts = int(agent._capacity_retry_attempts)
+                    max_retries = max(max_retries, _cap_attempts)
+                    # The wall-clock budget counts time since the first pool
+                    # 503 of this block, request time included, not just our
+                    # own sleeps (FleetReview #84).
+                    _cap_now = time.monotonic()
+                    if _retry.capacity_started_at is None:
+                        _retry.capacity_started_at = _cap_now
+                    _retry.capacity_waited_s = max(
+                        _retry.capacity_waited_s, _cap_now - _retry.capacity_started_at
+                    )
                     _cap_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     _cap_ra_raw = None
                     if _cap_headers and hasattr(_cap_headers, "get"):
                         _cap_ra_raw = _cap_headers.get("retry-after") or _cap_headers.get("Retry-After")
                     _capacity_wait = capacity_retry_wait(
                         retry_count=retry_count,
-                        max_retries=max_retries,
+                        # The capacity path's OWN attempt budget: a larger
+                        # generic api_max_retries must not widen it (#29).
+                        max_retries=_cap_attempts,
                         raw_retry_after=_cap_ra_raw,
                         waited_s=_retry.capacity_waited_s,
                         max_wait_s=float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),

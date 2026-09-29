@@ -196,3 +196,30 @@ def test_watchdog_site_line_is_parseable_by_restart_notice(caplog):
     m = _BLOCKED_SITE_RE.search(site_line)
     assert m and m.group(1).endswith("blocked_in_repo_code"), site_line
     assert any("loop-thread stack:" in l and "blocked_in_repo_code" in l for l in lines)
+
+
+def test_blocked_loop_description_does_no_source_file_io(monkeypatch):
+    """C5 #34 (PR #969): the hard-exit watchdog must not read source files."""
+    import linecache
+
+    def no_io(*_a, **_k):
+        raise AssertionError("linecache touched from the hard-exit watchdog")
+    for name in ("getline", "getlines", "checkcache", "lazycache", "updatecache"):
+        monkeypatch.setattr(linecache, name, no_io)
+    ready = threading.Event()
+    stop = threading.Event()
+
+    def blocked_in_repo_code():
+        ready.set()
+        stop.wait(5)
+
+    th = threading.Thread(target=blocked_in_repo_code)
+    th.start()
+    try:
+        ready.wait(2)
+        site, stack = shutdown_watchdog.describe_blocked_loop_thread(th.ident)
+    finally:
+        stop.set()
+        th.join()
+    assert "blocked_in_repo_code" in site, (site, stack)
+    assert "blocked_in_repo_code" in stack

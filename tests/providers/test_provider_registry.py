@@ -9,6 +9,9 @@ import providers
 def isolate_provider_registry():
     generation = provider_seam.current()
     discovered = providers._discovered
+    # Isolate BEFORE the test too: a test must never see registrations a
+    # previous test (or import-time discovery) left behind.
+    _reset_registry()
 
     yield
 

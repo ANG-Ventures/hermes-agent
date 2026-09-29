@@ -238,7 +238,10 @@ def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict,
     route = pool_route(provider)
     if route is None:
         return None
-    if route[1] is not None:
+    url = (probes or {}).get(provider)
+    # Only a VALID explicit probe bypasses the pinned-route health signals;
+    # an empty/malformed one must not skip them (and read as unknown).
+    if route[1] is not None and not _valid_url(url):
         relay_url = (pool_urls or {}).get(route[0])
         relay = _fetch(relay_url, cache, provider) if _valid_url(relay_url) else None
         if relay is not None:
@@ -248,7 +251,6 @@ def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict,
             if box_url is not None and _fetch(box_url, cache, provider) is not None:
                 return 1
         return None  # Neither health signal was reachable: fail open.
-    url = (probes or {}).get(provider)
     if url is None:
         url = (pool_urls or {}).get(route[0])
     if not _valid_url(url):

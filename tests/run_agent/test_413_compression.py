@@ -1065,6 +1065,52 @@ class TestPreflightCompression:
         )
 
 
+    def test_pre_api_log_line_prints_the_compared_value(self, agent, caplog):
+        """FleetReview #14 (was a source-string pin): drive the real pre-API
+        branch with a measured skew so the calibrated (compared) figure is
+        ABOVE threshold while the raw rough estimate is BELOW it. The log's
+        first figure must be the compared one, so the logged ">=" is true."""
+        import re
+
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor._recent_skews = [1.3]
+        agent.context_compressor.emit_automatic_compaction_status = False
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+        caplog.set_level(logging.INFO, logger="agent.conversation_loop")
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=110_000),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=110_000),
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=lambda msgs, *a, **k: (msgs, agent._cached_system_prompt),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "hello",
+                conversation_history=[
+                    {"role": "user", "content": "earlier question"},
+                    {"role": "assistant", "content": "earlier answer"},
+                ],
+            )
+
+        assert mock_compress.call_count >= 1, "pre-API compression never ran"
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Pre-API compression: ~")]
+        assert lines, "no Pre-API compression log line"
+        m = re.match(r"Pre-API compression: ~([\d,]+) compared tokens >= ([\d,]+) threshold .*rough=~([\d,]+)",
+                     lines[0])
+        compared, threshold, rough = (int(g.replace(",", "")) for g in m.groups())
+        assert rough < threshold <= compared, lines[0]
+
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True

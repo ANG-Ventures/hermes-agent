@@ -1072,6 +1072,21 @@ _interrupted_job_ids: set = set()
 #   * ``_active_script_procs`` — live Popen handles it can terminate
 # ---------------------------------------------------------------------------
 _shutdown_event = threading.Event()
+# In-flight cron AIAgents (id -> agent), so a gateway shutdown that abandons a
+# still-running cron turn can record it (see live_cron_agents).
+_live_cron_agents: dict = {}
+_live_cron_agents_lock = threading.Lock()
+
+
+def _forget_live_cron_agent(key: int) -> None:
+    with _live_cron_agents_lock:
+        _live_cron_agents.pop(key, None)
+
+
+def live_cron_agents() -> list:
+    """Snapshot of the cron agents whose ``run_conversation`` is in flight."""
+    with _live_cron_agents_lock:
+        return list(_live_cron_agents.values())
 # Keyed by id() rather than a set: a Popen-like object is not guaranteed to be
 # hashable (test doubles routinely are not), and a registry that can only hold
 # hashable handles would silently fail closed on exactly the objects we most
@@ -3499,6 +3514,7 @@ def _is_channel_dm_topic(
 _HOST_DOWN_ALERTS_CHAT = "1480528231286181948"  # fleet #alerts
 _HOST_DOWN_LOGS_CHAT = "1480525090331561984"  # fleet #logs
 _HOST_DOWN_LEDGER = "suppressed.jsonl"
+_HOST_DOWN_PREFIX_KEY = "_host_down_prefix"
 _FLEET_HOSTS_REL = Path("scripts") / "lib" / "fleet-hosts.json"
 
 
@@ -3633,6 +3649,9 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict],
         for i in alerts_idx:
             new_targets[i]["chat_id"] = _HOST_DOWN_LOGS_CHAT
             new_targets[i].pop("thread_id", None)
+            # Per target: only the demoted copies wear the prefix; every other
+            # target gets the content unchanged (FleetReview #31).
+            new_targets[i][_HOST_DOWN_PREFIX_KEY] = prefix
         rec = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "producer": producers[0] if producers else "unknown",
@@ -3645,7 +3664,7 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict],
             pending_ledger.extend(rows)
         logger.info("Job '%s': host-down gate deferred #alerts delivery to #logs (%s)",
                     job.get("id"), ", ".join(hosts))
-        return f"{prefix} {content}", new_targets
+        return content, new_targets
     except Exception as e:  # fail open: never lose a page to the gate itself
         logger.warning("host-down gate error (delivering unchanged): %r", e)
         return content, targets
@@ -3803,8 +3822,14 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         if host_down_ledger and ("discord", _HOST_DOWN_LOGS_CHAT) in delivered_chats:
             _host_down_write_ledger(host_down_ledger)
             host_down_ledger.clear()
+    _unprefixed_delivery_content = cleaned_delivery_content
 
     for target in targets:
+        _host_down_prefix = target.pop(_HOST_DOWN_PREFIX_KEY, None)
+        cleaned_delivery_content = (
+            f"{_host_down_prefix} {_unprefixed_delivery_content}"
+            if _host_down_prefix else _unprefixed_delivery_content
+        )
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
@@ -7536,7 +7561,19 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
+        with _live_cron_agents_lock:
+            _live_cron_agents[id(agent)] = agent
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # Deregister when the TURN ends, not when this watcher gives up on it:
+        # an inactivity-timed-out run can keep going until shutdown.
+        _cron_forget_in_finally = False
+        try:
+            _cron_future.add_done_callback(
+                lambda _f, _k=id(agent): _forget_live_cron_agent(_k)
+            )
+        except Exception:
+            # Not a real Future (test doubles): fall back to the watcher exit.
+            _cron_forget_in_finally = True
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -7584,6 +7621,8 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+            if _cron_forget_in_finally:
+                _forget_live_cron_agent(id(agent))
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.

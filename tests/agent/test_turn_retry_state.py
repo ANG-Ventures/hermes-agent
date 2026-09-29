@@ -33,6 +33,7 @@ EXPECTED_FIELDS = {
     "has_retried_429",
     "auth_failover_attempted",
     "capacity_waited_s",
+    "capacity_started_at",
     "local_relay_waited_s",
     "local_relay_recoveries",
     "restart_with_compressed_messages",

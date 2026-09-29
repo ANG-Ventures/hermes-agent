@@ -289,6 +289,7 @@ def clear_cache() -> None:
     """Drop all cached PR states (tests; operator repair)."""
     _CACHE.clear()
     _REPO_EXISTS_CACHE.clear()
+    _DEPLOY_PROBE_STARVED.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +946,22 @@ def _deploy_checks(
     return out
 
 
+def _deploy_trigger(reason: Optional[str], body: Optional[str]) -> Optional[str]:
+    """Why ``_deploy_checks`` gated the card, for the refusal text (C5 #47).
+
+    Every mapped ref is gated once any deploy tree is named (fail-safe). The
+    trigger is surfaced so an over-gated card is visible, not silent.
+    """
+    if names_deploy_gate(reason):
+        return "the block reason states a deploy gate"
+    for label, text in (("block reason", reason), ("card body", body)):
+        if isinstance(text, str):
+            m = _DEPLOY_TREE_MENTION_RE.search(text)
+            if m:
+                return f"the {label} names deploy tree {m.group(0)}"
+    return None
+
+
 def _deploy_marker(pending: Iterable[tuple[str, Optional[str]]]) -> str:
     names = sorted({f"{tree}@{sha or 'unknown'}" for tree, sha in pending})
     return "<!-- gate-deploy:" + "|".join(names) + " -->"
@@ -955,6 +972,7 @@ _UNVERIFIABLE_TREE = "<no deploy tree>"
 
 def _awaiting_deploy_sentence(
     pending: list[tuple[PrRef, "_CacheEntry", Optional[str]]],
+    trigger: Optional[str] = None,
 ) -> str:
     parts = [
         f"{ref} MERGED, awaiting deploy of {(entry.sha or 'unknown')[:8]} "
@@ -969,10 +987,14 @@ def _awaiting_deploy_sentence(
         "so this gate will NOT auto-resolve: unblock it by hand once deployed."
         if any(tree is None for _, _, tree in pending) else ""
     )
+    why = (
+        f" Deploy-gated because {trigger}; every PR whose repo maps to a "
+        "deploy tree is gated (fail-safe)." if trigger else ""
+    )
     return (
         "gate held: " + "; ".join(parts) + ". The card's premise is the "
         "change being LIVE, so it stays blocked until the merge commit is an "
-        f"ancestor of the tree's HEAD.{tail}\n{marker}"
+        f"ancestor of the tree's HEAD.{why}{tail}\n{marker}"
     )
 
 
@@ -1227,6 +1249,14 @@ def _closed_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
 
 
 _PREFETCH_WORKERS = 6
+# Wall budget for one tick's deploy-ancestry probes (FleetReview #32). A probe
+# past it is not run; the locked pass reads the missing answer as
+# "unverified" and holds the card for the next tick.
+_PREFETCH_DEPLOY_BUDGET_S = 30.0
+# (tree, sha) pairs the last tick ran out of budget before probing. The next
+# tick probes them FIRST, so a slow early probe cannot starve later refs on
+# every tick: each tick answers at least one pair, oldest-starved first.
+_DEPLOY_PROBE_STARVED: list[tuple[str, str]] = []
 
 
 def _gate_candidates(
@@ -1268,8 +1298,8 @@ def _blocked_gate_refs(
     conn: sqlite3.Connection,
     *,
     contexts: Optional[dict[str, tuple[tuple, Optional[str]]]] = None,
-) -> list[tuple[str, list[PrRef], list[tuple[PrRef, Optional[str]]], Optional[float]]]:
-    """Snapshot in-scope blocked cards, their resolvable PR refs, deploy checks, and block time.
+) -> list[tuple[str, list[PrRef], list[tuple[PrRef, Optional[str]]], Optional[float], Optional[str]]]:
+    """Snapshot in-scope blocked cards, their resolvable PR refs, deploy checks, block time, and deploy trigger.
 
     ``contexts`` is a repo-context snapshot taken by the unlocked prefetch.
     When supplied this function performs NO subprocess I/O: a card absent from
@@ -1278,7 +1308,7 @@ def _blocked_gate_refs(
     it is None the caller is the direct, unlocked path and contexts are
     resolved inline.
     """
-    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, Optional[str]]], Optional[float]]] = []
+    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, Optional[str]]], Optional[float], Optional[str]]] = []
     for (
         task_id, fingerprint, workspace_path, body, reason, blocked_at,
     ) in _gate_candidates(conn):
@@ -1295,7 +1325,8 @@ def _blocked_gate_refs(
         refs = parse_pr_refs(reason, default_repo=default_repo)
         if refs:
             candidates.append(
-                (task_id, refs, _deploy_checks(refs, reason=reason, body=body), blocked_at)
+                (task_id, refs, _deploy_checks(refs, reason=reason, body=body),
+                 blocked_at, _deploy_trigger(reason, body))
             )
     return candidates
 
@@ -1392,7 +1423,7 @@ def _prefetch_deploys(
     every key the locked pass looks up is present here. Unmerged or
     SHA-less refs are skipped: they cannot be deployed yet.
     """
-    out: dict[tuple[str, str], bool] = {}
+    pending: list[tuple[str, str]] = []
     for ref, tree in checks:
         if tree is None:
             continue  # unmapped repo: no tree to probe; the locked pass holds it
@@ -1406,12 +1437,25 @@ def _prefetch_deploys(
             entry = _CACHE.get(key)
             if entry is not None and entry.state == "MERGED":
                 sha = entry.sha
-        if not sha or (tree, sha) in out:
-            continue
+        if sha and (tree, sha) not in pending:
+            pending.append((tree, sha))
+    # Last tick's starved pairs go first (still-wanted ones only), then the rest.
+    wanted = set(pending)
+    starved = [pair for pair in _DEPLOY_PROBE_STARVED if pair in wanted]
+    order = starved + [pair for pair in pending if pair not in set(starved)]
+    out: dict[tuple[str, str], bool] = {}
+    deadline = time.monotonic() + _PREFETCH_DEPLOY_BUDGET_S
+    for i, (tree, sha) in enumerate(order):
+        if out and time.monotonic() >= deadline:
+            # budget spent: the rest stay unanswered (unverified) this tick
+            # and are probed first next tick.
+            _DEPLOY_PROBE_STARVED[:] = order[i:]
+            return out
         try:
             out[(tree, sha)] = bool(deploy_fn(tree, sha))
         except Exception:  # defensive seam: unprovable deploy = not deployed
             out[(tree, sha)] = False
+    _DEPLOY_PROBE_STARVED.clear()
     return out
 
 
@@ -1460,7 +1504,7 @@ def reevaluate_pr_gates(
     # revalidation seam for an unlocked prefetch: if the card changed in the
     # interim, its fingerprint no longer matches the snapshot and it is skipped
     # (fail-safe), so this pass performs NO subprocess I/O of any kind.
-    for task_id, refs, deploy_checks, blocked_at in _blocked_gate_refs(
+    for task_id, refs, deploy_checks, blocked_at, deploy_trigger in _blocked_gate_refs(
         conn, contexts=None if prefetched is None else prefetched.contexts,
     ):
 
@@ -1575,7 +1619,7 @@ def reevaluate_pr_gates(
             elif not live:
                 pending.append((ref, entry, tree))
         if pending:
-            detail = _awaiting_deploy_sentence(pending)
+            detail = _awaiting_deploy_sentence(pending, deploy_trigger)
             marker = _deploy_marker(
                 (t or _UNVERIFIABLE_TREE, e.sha) for _, e, t in pending
             )

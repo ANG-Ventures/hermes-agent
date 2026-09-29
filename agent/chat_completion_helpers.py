@@ -62,6 +62,7 @@ from agent.fork_ext.relay_headers import (
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
+    stamp_bridge_lane,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -160,9 +161,16 @@ def _codex_sub_key(agent: Any) -> Optional[str]:
 
 
 
-def _api_call_identity(agent: Any, headers: dict[str, str]) -> tuple[Optional[str], str]:
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
-    return _route_identity(provider, headers, agent)
+def _api_call_identity(
+    agent: Any, headers: dict[str, str], provider: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """Identity of the main-lane call. ``provider`` is the route the call was
+    DISPATCHED on; defaults to the serving route, never a bare live read, so a
+    provider switch while the call is in flight cannot re-attribute it to the
+    new provider's subscription (FleetReview 73d9dc1df836)."""
+    if provider is None:
+        provider = _serving_route(agent)["provider"]
+    return _route_identity(str(provider or "").strip().lower(), headers, agent)
 
 
 def _route_identity(
@@ -275,7 +283,7 @@ def _emit_api_call_record(
         provider = route["provider"]
         model = route["model"]
         pool_headers = dict(headers or {})
-        sub_key, attribution = _api_call_identity(agent, pool_headers)
+        sub_key, attribution = _api_call_identity(agent, pool_headers, provider)
         seq = _next_api_call_seq(agent, turn_id)
         # Prefix-stability guard inputs (card t_c07124ab): the session the
         # request belongs to, and the one-shot marker the compressor leaves
@@ -415,14 +423,18 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     # A served call means the last stashed API error recovered in place; it
     # must not be attributed to a later, unrelated failover.
     agent._pending_fallback_error = None
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    # The route the call went out on, not the live agent (FleetReview
+    # 73d9dc1df836): a switch to/from a pooled provider mid-flight must not
+    # drop or mis-gate this call's ledger row.
+    _route = _serving_route(agent)
+    provider = _route["provider"].strip().lower()
     if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
         _note_api_call_recording_failure(agent)
         logger.warning(
             "pooled provider response lost pool_headers stamp; skipping "
             "per-call attribution (provider=%s api_mode=%s)",
             provider,
-            getattr(agent, "api_mode", ""),
+            _route["api_mode"],
         )
         return
     headers = getattr(response, "pool_headers", None)
@@ -1893,6 +1905,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     stamp_call_id(agent, api_kwargs)
     # S7 D1: harness-minted route id (pinned lanes) + lane-src (bpr/pinned).
     stamp_correlation_headers(agent, api_kwargs)
+    stamp_bridge_lane(agent, api_kwargs)
     if should_use_direct_api_call(agent):
         try:
             response = direct_api_call(agent, api_kwargs)
@@ -6689,6 +6702,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Fresh correlation id per stream attempt (bridge lanes only).
                 stamp_call_id(agent, api_kwargs)
                 stamp_correlation_headers(agent, api_kwargs)
+                stamp_bridge_lane(agent, api_kwargs)
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
