@@ -4764,7 +4764,9 @@ class MessageSender:
         # House-shape wrapper: content, then one "-# cron <name> · job <id> ·
         # reply ..." footer line (cron/scheduler.py CRON_WRAPPER_FOOTER_PREFIX).
         head, sep, last = content.rpartition("\n")
-        if sep and last.startswith("-# cron ") and " · job " in last:
+        if sep and re.fullmatch(
+            r'-# cron (.+) · job \S* · reply "stop reminder \1" to manage', last
+        ):
             return head.rstrip() or content
         if not content.startswith("Cronjob Response: "):
             return content

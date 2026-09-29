@@ -43,3 +43,13 @@ def test_strips_footer_keeps_failure_header():
 def test_leaves_unwrapped_content_alone():
     body = "plain text\n-# a producer's own subtext line"
     assert MessageSender.strip_cron_wrapper(body) == body
+
+
+def test_leaves_lookalike_footer_alone():
+    """Only the complete scheduler footer is stripped, not a user line that
+    merely starts like it (Prism P1 on #1495)."""
+    for body in (
+        "status\n-# cron nightly · job j1",
+        'status\n-# cron nightly · job j1 · reply "stop reminder other" to manage',
+    ):
+        assert MessageSender.strip_cron_wrapper(body) == body
