@@ -119,7 +119,7 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
             return {"state": "would-sync", "ok": True}
         publish_stage("Updating Python dependencies")
         refuse_foreign_owned_venv(root)
-        pm.sync_venv(explicit=True, project_root=root)
+        pm.sync_venv(explicit=True, project_root=root, evict_incompatible_plugins=True)
         collect_superseded_generations(root)
         publish_launchers(root)
         return {"state": "synced", "ok": True}
@@ -211,6 +211,18 @@ def refuse_foreign_owned_venv(project_root: Path) -> None:
             )
 
 
+#: The completion tails import the CLI (so prepare_launch) while the pending marker is armed.
+#: The lock-ancestry check covers that only under a live claim; an unwritable, expired or
+#: absent one (an installer run) would start a tail inside the tail, recursively.
+_TAIL_SCRIPTS = frozenset({"source_completion.py", "update_completion.py"})
+
+
+def _is_tail_script(root: Path, argv0: str) -> bool:
+    """Exact own-script identity; argv is not inherited by the processes a tail spawns."""
+    script = Path(argv0)
+    return script.name in _TAIL_SCRIPTS and script.resolve().parent == root / "hermes_cli"
+
+
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
@@ -223,10 +235,15 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """
     import os
     import sys
+
+    root = Path(project_root).resolve()
+    # sys.argv[0] is this process's script identity; *argv* carries only the command.
+    if _is_tail_script(root, sys.argv[0]):
+        return None
+
     from hermes_cli._parser import command_argv
     from hermes_cli.steward import read_install_stamp
 
-    root = Path(project_root).resolve()
     if (command_argv(argv)[:1] == ["pm"]
             or _METADATA_FLAGS & set(argv)
             or os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").lower() in ("1", "true", "yes")
@@ -252,19 +269,33 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
         lock = UpdateLock()
         if not lock.acquire():
             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
-        # The tail imports the application, whose entry point runs this very function:
-        # under the launching process's own claim (its pid is our ancestor) we ARE that
-        # tail and owe nothing — without this, a pending marker recurses forever.
-        if not lock.acquired and read_live_update() is not None:
-            return None
         try:
-            _finish_source_update(root, current=current, pending=pending)
+            # Under the launching update's own claim (its pid is our ancestor) a process it
+            # spawned owes no tail: that obligation is the updater's.
+            if not lock.acquired and read_live_update() is not None:
+                if current:
+                    return None
+                # A process the update spawns before its dependencies are current (a restarted
+                # gateway) would boot on a tree built for another interpreter. Sync — never the
+                # tail, which is the updater's — then relaunch below into a current install.
+                _sync_source_dependencies(root, arm=False)
+                if not pm.venv_is_current(project_root=root):
+                    # Relaunching would land back here and sync again, forever.
+                    raise RuntimeError("dependency sync left this install out of date")
+            else:
+                _finish_source_update(root, current=current, pending=pending)
         finally:
             lock.release()
     python = resolve_store_python(root)
     if python is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    if not current or python.absolute() != Path(sys.executable).absolute():
+    # Lexical identity, never resolve(): PM spells the store path through
+    # HERMES_HOME (which may carry '..') while sys.executable arrives
+    # normalized, so a raw compare re-execs every child forever (#122513). A
+    # venv interpreter symlinked to the same binary is still a different
+    # interpreter (its own sys.prefix) and must re-exec once.
+    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    if not current or not same:
         publish_launchers(root)
         return python
     return None
@@ -273,9 +304,8 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     """Sync dependencies when they are stale, then run the tail the marker still owes."""
     import sys
-    import pm
     from hermes_cli._early_recovery import _marker_owner_is_live
-    from pm.environments import activation_environment, runtime_facts_path
+    from pm.environments import activation_environment
 
     if not current:
         # Existing markers guard liveness, never create the completion obligation.
@@ -284,24 +314,7 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         if any(_marker_owner_is_live(marker) for marker in legacy_markers):
             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
         print("hermes: completing source-update dependencies...", file=sys.stderr, flush=True)
-        # Owed from before the sync commits: a crash between the commit and the
-        # tail must leave the tail, not a "current" install with nothing built.
-        refuse_foreign_owned_venv(root)
-        arm_completion(root)
-        # Main-era installs have no PM ledger; carry what their venv held.
-        # Established PM installs retain their recorded extras and plugin union instead.
-        from pm.client import ensure_tools_for_sync
-        from pm.extras import legacy_selection
-        extras = legacy_selection(root) if not runtime_facts_path(root).is_file() else None
-        # Same order as `hermes update`: an interrupted update or a hand-run
-        # `git pull` leaves this tree's lockfile ahead of the installed tools.
-        ensure_tools_for_sync()
-        pm.sync_venv(extras, explicit=True, project_root=root)
-        collect_superseded_generations(root)
-        # These can predate the swap. Once PM commits the replacement they
-        # must not make early recovery immediately rebuild it a second time.
-        for name in (".update-incomplete", ".lazy-refresh-incomplete"):
-            (root / name).unlink(missing_ok=True)
+        _sync_source_dependencies(root, arm=True)
     else:
         print("hermes: finishing an interrupted source update...", file=sys.stderr, flush=True)
     # Sync commits the dependency generation, but a source update also owes
@@ -328,6 +341,35 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
             "source update completion failed; run `hermes update` to finish it"
         )
     clear_completion(root)
+
+
+def _sync_source_dependencies(root: Path, *, arm: bool) -> None:
+    """Commit the tree's dependency generation; *arm* also owes the tail afterwards."""
+    import sys
+    import pm
+    from pm.client import ensure_tools_for_sync
+    from pm.environments import runtime_facts_path
+    from pm.extras import legacy_selection
+
+    if not arm:
+        print("hermes: preparing dependencies for this update...", file=sys.stderr, flush=True)
+    refuse_foreign_owned_venv(root)
+    if arm:
+        # Owed from before the sync commits: a crash between the commit and the
+        # tail must leave the tail, not a "current" install with nothing built.
+        arm_completion(root)
+    # Main-era installs have no PM ledger; carry what their venv held.
+    # Established PM installs retain their recorded extras and plugin union instead.
+    extras = legacy_selection(root) if not runtime_facts_path(root).is_file() else None
+    # Same order as `hermes update`: an interrupted update or a hand-run
+    # `git pull` leaves this tree's lockfile ahead of the installed tools.
+    ensure_tools_for_sync()
+    pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True)
+    collect_superseded_generations(root)
+    # These can predate the swap. Once PM commits the replacement they
+    # must not make early recovery immediately rebuild it a second time.
+    for name in (".update-incomplete", ".lazy-refresh-incomplete"):
+        (root / name).unlink(missing_ok=True)
 
 
 def relaunch_command(
