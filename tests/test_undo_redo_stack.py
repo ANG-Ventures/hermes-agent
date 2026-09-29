@@ -48,7 +48,12 @@ def test_undo_redo_transition_table_identity_and_redo_count(db):
     assert _active_ids(db, sid) == before[:-1]
 
     redone = hermes_undo.redo(sid, 1)
-    assert redone == {"reactivated_count": 1, "new_tail_id": ids[-1], "prefill_text": None}
+    assert redone == {
+        "reactivated_count": 1,
+        "new_tail_id": ids[-1],
+        "prefill_text": None,
+        "ops_redone": 1,
+    }
     assert _active_ids(db, sid) == before
     assert state.undo_stack == []
     assert [op.rewound_ids for op in state.redo_stack] == [[ids[-1]]]
