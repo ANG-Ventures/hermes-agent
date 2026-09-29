@@ -17,7 +17,7 @@ typed.
 
 from unittest.mock import patch
 
-from hermes_cli.models import validate_requested_model
+from hermes_cli.models_validate import validate_requested_model
 
 
 def _stub_probe(*_args, **_kwargs):
