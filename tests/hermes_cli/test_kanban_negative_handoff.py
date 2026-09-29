@@ -378,6 +378,24 @@ def test_negative_verdict_below_result_headline_is_scanned(conn, armed):
     "tests green\n[13:00:01] could not reach cache; retrying",
     "tests green\n$ ssh box  # could not resolve host first try",
     "tests green\nTraceback (most recent call last):",
+    # "<program>: message" tool output (FleetReview #1464 @03d1cc77).
+    "Deployment complete\nssh: Could not resolve hostname box\nRetried successfully",
+    "tests green\ncurl: (6) Could not resolve host: example.com",
+    "tests green\nfatal: could not read Username for 'https://github.com'",
+    "tests green\nerror: could not lock config file .git/config",
+    "tests green\n/usr/bin/ssh: Could not resolve hostname box",
+    "tests green\nbash: line 1: could not open /tmp/x",
+    "tests green\npython3.13: could not import site",
+    "tests green\nssh[4242]: Could not resolve hostname box",
 ])
 def test_pasted_log_lines_in_result_body_are_not_scanned(result):
     assert neg.match(neg.handoff_texts(GOOD, result)) is None
+
+
+@pytest.mark.parametrize("result, trigger", [
+    ("Rollout:\nstatus: blocked on credentials", "blocked on"),
+    ("Rollout:\nVerdict: could not deploy", "could not"),
+    ("Rollout:\nSsh access could not be granted", "could not"),
+])
+def test_prose_labels_are_still_scanned(result, trigger):
+    assert neg.match(neg.handoff_texts(GOOD, result)) == trigger
