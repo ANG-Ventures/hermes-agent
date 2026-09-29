@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -312,8 +313,17 @@ def _summary_route_key(model: str | None) -> str:
 _SUMMARY_REFUSALS = SummaryRefusalLatch()
 
 
-def _segment_key(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8", "surrogatepass")).hexdigest()
+def _segment_key(text: str, focus_topic: str = "", custom_instructions: str = "") -> str:
+    """Refusal-latch identity of one summary request (t_bf18e600).
+
+    Every model-visible input, not just the segment: a corrected focus topic or
+    custom instructions is a different request and must be sent.
+    """
+    identity = json.dumps(
+        [text or "", focus_topic or "", custom_instructions or ""],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _strip_reasoning_blocks(text: str) -> str:
@@ -747,7 +757,9 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
-    segment_key = _segment_key(text)
+    segment_key = _segment_key(
+        text, focus_topic=focus_topic, custom_instructions=custom_instructions
+    )
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,

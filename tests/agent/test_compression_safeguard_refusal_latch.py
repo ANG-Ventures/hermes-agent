@@ -210,3 +210,62 @@ def _clean_latch():
     _SUMMARY_REFUSALS.clear()
     yield
     _SUMMARY_REFUSALS.clear()
+
+
+# t_bf18e600 (Prism P1 on #1503): the latch identity must be the summary
+# request actually sent, not the unbounded serialized turns alone.
+
+
+def _direct_sends(compressor, turns, side_effect, **kwargs):
+    """call_llm sends for one direct ``_generate_summary`` call."""
+    compressor._clear_compression_failure_cooldown()
+    with patch("agent.context_compressor.call_llm", side_effect=side_effect) as call:
+        compressor._generate_summary(turns, **kwargs)
+    return call.call_count
+
+
+def test_changed_memory_context_is_resent():
+    compressor = _compressor()
+    turns = _messages()
+    assert _direct_sends(compressor, turns, _refuse, memory_context="bad memory") == 1
+    # Same request: still latched.
+    assert _direct_sends(compressor, turns, _refuse, memory_context="bad memory") == 0
+    # Corrected memory is a materially different request: it must be sent.
+    assert _direct_sends(compressor, turns, _refuse, memory_context="fixed memory") == 1
+
+
+def test_changed_focus_topic_is_resent():
+    compressor = _compressor()
+    turns = _messages()
+    assert _direct_sends(compressor, turns, _refuse, focus_topic="weapons") == 1
+    assert _direct_sends(compressor, turns, _refuse, focus_topic="weapons") == 0
+    assert _direct_sends(compressor, turns, _refuse, focus_topic="telescopes") == 1
+
+
+def test_grown_window_bounded_past_refused_turns_is_resent(monkeypatch):
+    """Input bounding can drop the refused material from a grown window; the
+    request actually sent then no longer carries it, so it must be sent."""
+    compressor = _compressor()
+    base = _messages(12, tag="Refused material " + "x" * 60)
+    base_len = len(compressor._serialize_for_summary(base))
+    monkeypatch.setattr(type(compressor), "_SUMMARY_INPUT_MAX_CHARS", base_len + 200)
+    grown = base + _messages(80, tag="Later turn " + "y" * 60)
+    assert len(compressor._serialize_for_summary(grown)) > base_len + 200
+    assert _direct_sends(compressor, base, _refuse) == 1
+    assert _direct_sends(compressor, base, _refuse) == 0
+    assert _direct_sends(compressor, grown, _refuse) == 1
+
+
+def test_explicit_compress_focus_change_is_resent_but_auto_focus_is_not():
+    """``/compress <focus>`` is a request input; the auto-derived focus (recent
+    user turns) is not, or every new user message would re-send refused turns."""
+    compressor = _compressor()
+    messages = _messages()
+    sends = []
+    for focus in ("weapons", "weapons", "telescopes"):
+        compressor._clear_compression_failure_cooldown()
+        with patch("agent.context_compressor.call_llm", side_effect=_refuse) as call:
+            compressor.compress(messages, current_tokens=999999, force=True, focus_topic=focus)
+        sends.append(call.call_count)
+    assert sends == [1, 0, 1]
+    assert compressor._summary_focus_is_auto is False

@@ -238,3 +238,28 @@ def test_refusal_latch_expires(monkeypatch):
     clock["now"] += 30 * 24 * 3600
     _run(model="claude-sonnet-5-5")
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "field,first,second",
+    [
+        ("focus_topic", "exploit details", "relay config"),
+        ("custom_instructions", "quote payloads verbatim", "omit payloads"),
+    ],
+)
+def test_changed_request_inputs_are_resent(monkeypatch, field, first, second):
+    """t_bf18e600: the latch identity is the whole request, not the segment
+    alone; correcting focus/custom instructions must reach the model."""
+    calls: list[dict] = []
+
+    def refuse(**kw):
+        calls.append(kw)
+        raise _bpx_safeguard_400()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", refuse)
+    breaker = SummaryCircuitBreaker(failure_threshold=99, cooldown_seconds=0)
+    _run(model="claude-sonnet-5-5", circuit_breaker=breaker, **{field: first})
+    _run(model="claude-sonnet-5-5", circuit_breaker=breaker, **{field: first})
+    assert len(calls) == 1  # same request: latched
+    _run(model="claude-sonnet-5-5", circuit_breaker=breaker, **{field: second})
+    assert len(calls) == 2  # different request: sent
