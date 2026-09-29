@@ -282,6 +282,37 @@ def _is_blocked_ip(ip: _IPAddress) -> bool:
             or ip.is_multicast or ip.is_unspecified or ip in _CGNAT_NETWORK)
 
 
+def ip_is_blocked(ip_str: str, *, block_private: bool) -> bool:
+    """Return True if a resolved IP must be refused for SSRF protection.
+
+    The single SSRF policy source reused by the yt-dlp egress proxy so it never
+    defines its own IP ranges. Composes the always-blocked cloud-metadata /
+    link-local floor (enforced regardless of ``block_private``) with the private/
+    loopback/CGNAT check (enforced only when ``block_private`` is True).
+
+    Fails CLOSED: an unparseable / empty string returns True (blocked), never
+    allow-through — a resolver that hands us garbage must not become a bypass.
+
+    Args:
+        ip_str: a resolved IP literal (IPv4, IPv6, or IPv4-mapped IPv6).
+        block_private: when True, also block RFC1918/loopback/link-local/
+            reserved/multicast/unspecified/CGNAT (the full ``_is_blocked_ip``
+            policy). When False, only the always-blocked metadata floor applies.
+
+    Returns:
+        True if the IP should be refused, False if it may be connected to.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str.strip())
+    except (ValueError, AttributeError):
+        return True  # not a parseable IP: fail closed
+    # Always-blocked floor (cloud metadata + link-local, IPv4-wrapped IPv6 judged by its embedded
+    # IPv4), enforced regardless of block_private or any config toggle.
+    if _is_always_blocked_ip(ip):
+        return True
+    return bool(block_private and _is_blocked_ip(ip))
+
+
 def is_always_blocked_url(url: str) -> bool:
     """True when the URL targets the always-blocked floor (cloud metadata) — only the sentinel
     hostnames/IPs, regardless of backend, routing, or ``allow_private_urls``. For callers that
