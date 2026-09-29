@@ -229,12 +229,17 @@ class _SummaryRefusalLatch:
     (t_0970eb0b, sibling of the LCM latch in #1501). Matching is by content
     PREFIX: the compressor's middle window grows at its end between passes,
     so a later pass whose serialized input begins with refused content still
-    carries the refused turns. Bounded LRU; process lifetime; not persisted.
+    carries the refused turns. Bounded LRU; in memory only, not persisted.
+
+    Entries expire after ``ttl_seconds`` (t_2ba784cc): safeguard classifiers
+    are broad and change over time, so one misfire must not pin content for
+    the life of the process.
     """
 
-    def __init__(self, max_entries: int = 1024) -> None:
+    def __init__(self, max_entries: int = 1024, ttl_seconds: float = 3600.0) -> None:
         self._max_entries = max(1, int(max_entries))
-        self._refused: "collections.OrderedDict[tuple[str, int, str], None]" = (
+        self._ttl_seconds = max(0.0, float(ttl_seconds))
+        self._refused: "collections.OrderedDict[tuple[str, int, str], float]" = (
             collections.OrderedDict()
         )
         self._lock = threading.Lock()
@@ -247,14 +252,17 @@ class _SummaryRefusalLatch:
         content = content or ""
         key = (route_key, len(content), self._digest(content))
         with self._lock:
-            self._refused[key] = None
+            self._refused[key] = time.monotonic() + self._ttl_seconds
             self._refused.move_to_end(key)
             while len(self._refused) > self._max_entries:
                 self._refused.popitem(last=False)
 
     def is_refused(self, route_key: str, content: str) -> bool:
         content = content or ""
+        now = time.monotonic()
         with self._lock:
+            for expired in [k for k, until in self._refused.items() if until <= now]:
+                del self._refused[expired]
             candidates = [k for k in self._refused if k[0] == route_key]
         digests: Dict[int, str] = {}
         for key in candidates:
@@ -5263,6 +5271,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _summary_refusal_call_route(self, route: Dict[str, Any]) -> Dict[str, Any]:
+        """Routing kwargs ``_generate_summary`` sends for a refusal override."""
+        call_route: Dict[str, Any] = {}
+        if self.summary_model:
+            call_route["model"] = self.summary_model
+        call_route.update(route)
+        return call_route
+
     def _handle_summary_refusal(
         self,
         error: str,
@@ -5290,18 +5306,29 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if isinstance(telemetry, dict):
             telemetry["failure_class"] = "summary_refusal_failure"
+        tried = getattr(self, "_summary_refusal_routes_tried", None)
+        if tried is None:
+            tried = set()
         for route in _compression_refusal_fallback_routes():
-            key = _summary_refusal_route_key(route, self.model)
-            if _SUMMARY_REFUSALS.is_refused(key, refusal_content):
+            # Same kwargs ``_generate_summary`` will send, so the key checked
+            # here is the key it latches (t_2ba784cc: a model-less entry keeps
+            # ``summary_model``; keying the bare entry recursed forever).
+            key = _summary_refusal_route_key(
+                self._summary_refusal_call_route(route), self.model
+            )
+            if key in tried or _SUMMARY_REFUSALS.is_refused(key, refusal_content):
                 continue
+            tried.add(key)
             logger.warning(
                 "%s Retrying once on fallback_chain route %s.", error, key,
             )
             previous = getattr(self, "_summary_refusal_route_override", None)
+            previous_tried = getattr(self, "_summary_refusal_routes_tried", None)
             self._summary_refusal_route_override = route
+            self._summary_refusal_routes_tried = tried
             try:
-                # Each recursion either returns or latches ``route``, so the
-                # chain is walked at most once per content.
+                # ``tried`` is shared down the recursion, so each route is
+                # sent at most once per refusal chain even if a key diverges.
                 return self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
@@ -5309,6 +5336,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 )
             finally:
                 self._summary_refusal_route_override = previous
+                self._summary_refusal_routes_tried = previous_tried
         self._record_compression_failure_cooldown(60, error)
         logger.warning("%s", error)
         return None

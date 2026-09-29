@@ -162,6 +162,49 @@ def test_fallback_chain_route_can_produce_the_summary():
     assert len(results[0]) < 12
 
 
+# --- t_2ba784cc (Prism P1 on #1503): loop and send must agree on the key ---
+
+
+def test_model_less_fallback_route_refusal_terminates():
+    """A fallback_chain entry may omit ``model`` (only ``provider`` is
+    required). ``_generate_summary`` then keeps ``summary_model`` in its
+    call kwargs, so the loop in ``_handle_summary_refusal`` must derive the
+    SAME latch key. When the keys diverged, a refusing model-less route was
+    latched under one key and checked under another, and compression
+    recursed until RecursionError."""
+    compressor = _compressor()
+    chain = [{"provider": "gemini-bridge"}]
+    seen = []
+
+    def call(**kwargs):
+        seen.append((kwargs.get("provider"), kwargs.get("model")))
+        raise _SafeguardRefusal()
+
+    with patch(
+        "agent.context_compressor._compression_refusal_fallback_routes",
+        return_value=chain,
+    ):
+        sends, results = _passes(compressor, [_messages()] * 2, call)
+    assert sends == [2, 0]  # primary + the fallback route, once each, then none
+    assert seen[1][0] == "gemini-bridge"
+    assert compressor._last_compress_aborted
+
+
+def test_compressor_refusal_latch_expires(monkeypatch):
+    """A refusal latch must not pin content for the life of the process:
+    safeguard classifiers misfire and change."""
+    import agent.context_compressor as cc
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(cc.time, "monotonic", lambda: clock["now"])
+    compressor = _compressor()
+    sends, _ = _passes(compressor, [_messages()] * 2, _refuse)
+    assert sends == [1, 0]
+    clock["now"] += 30 * 24 * 3600
+    sends, _ = _passes(compressor, [_messages()], _refuse)
+    assert sends == [1]
+
+
 @pytest.fixture(autouse=True)
 def _clean_latch():
     _SUMMARY_REFUSALS.clear()
