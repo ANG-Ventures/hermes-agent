@@ -3450,6 +3450,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    mark_commentary_send,
     merge_pending_message_event,
     prime_system_proxy_cache,
     utf16_len,
@@ -6801,7 +6802,10 @@ class TurnRunner:
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    # Interim commentary: never the turn-final, and a
+                    # split-capping adapter delivers it as one message
+                    # (t_784a01bd).
+                    metadata=mark_commentary_send(ctx._status_thread_metadata),
                 ),
                 ctx._loop_for_step,
                 logger=logger,

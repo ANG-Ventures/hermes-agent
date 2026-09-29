@@ -1,14 +1,28 @@
-"""Regression tests for the Discord split-delivery cap (issue #86581).
+"""Regression tests for the Discord split-delivery cap.
 
-A degenerate turn can produce tens of thousands of characters.  Without a
-ceiling, the adapter posts every 2000-char chunk back-to-back and floods the
-channel — the #86581 incident delivered 60,698 chars as 31 messages.  The
-cap keeps the first ``MAX_SPLIT_MESSAGES`` chunks and replaces the remainder
-with a short notice.
+History:
+
+* #86581 — a degenerate turn delivered 60,698 chars as 31 back-to-back
+  messages.  A cap of ``MAX_SPLIT_MESSAGES`` was added.
+* t_784a01bd (2026-09-29) — the #86581 cap was HEAD-preserving: it kept
+  ``chunks[:N-1]`` and dropped the rest.  A 12-chunk reply delivered its
+  opening narration and threw away the end, where a real reply keeps its
+  conclusion.  Interim commentary (between-tool-call narration) went through
+  the same path, so one narration block alone could hit the 8-message cap.
+
+Invariants pinned here:
+
+(a) a capped final reply always ENDS with its real last chunk;
+(b) the elision notice is present and states how many messages were elided;
+(c) never more than ``MAX_SPLIT_MESSAGES`` messages per logical response;
+(d) an interim commentary send is ONE message, never the truncation notice;
+(e) chunk indicators on the delivered set are consistent (no ``(1/12)``
+    next to ``(8/12)`` when only 7 content chunks were delivered).
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -39,11 +53,14 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
+from gateway.platforms.base import mark_commentary_send  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 MAX = DiscordAdapter.MAX_MESSAGE_LENGTH
 CAP = DiscordAdapter.MAX_SPLIT_MESSAGES
+_TAG = re.compile(r" \((\d+)/(\d+)\)$")
+NOTICE = "Response truncated"
 
 
 def _make_adapter():
@@ -51,8 +68,22 @@ def _make_adapter():
 
 
 def _huge_content(chars: int = 60_000) -> str:
-    # Distinct filler — this test is about SIZE, not repetition.
-    return " ".join(f"word-{i}-" + "x" * 12 for i in range(chars // 20))
+    # Distinct filler — this test is about SIZE, not repetition.  The last
+    # token is a sentinel standing in for the reply's conclusion.
+    body = " ".join(f"word-{i}-" + "x" * 12 for i in range(chars // 20))
+    return body + " FINAL-CONCLUSION-SENTINEL"
+
+
+def _assert_tags_consistent(messages):
+    """Every tagged message carries (i/total) with one shared total that
+    equals the number of tagged messages, numbered 1..total in order."""
+    tags = [_TAG.search(m) for m in messages]
+    tagged = [(int(t.group(1)), int(t.group(2))) for t in tags if t]
+    if not tagged:
+        return
+    totals = {total for _, total in tagged}
+    assert totals == {len(tagged)}, f"inconsistent chunk totals: {tagged}"
+    assert [i for i, _ in tagged] == list(range(1, len(tagged) + 1)), tagged
 
 
 class TestCapSplitChunks:
@@ -61,23 +92,50 @@ class TestCapSplitChunks:
         chunks = ["a", "b", "c"]
         assert adapter._cap_split_chunks(chunks) == chunks
 
-    def test_over_cap_keeps_n_minus_1_plus_notice(self):
+    def test_at_cap_unchanged(self):
         adapter = _make_adapter()
-        chunks = [f"chunk-{i}-" + "z" * 100 for i in range(40)]
+        chunks = [f"c{i}" for i in range(CAP)]
+        assert adapter._cap_split_chunks(chunks) == chunks
+
+    @pytest.mark.parametrize("n", [CAP + 1, 12, 40])
+    def test_over_cap_keeps_head_and_tail(self, n):
+        adapter = _make_adapter()
+        chunks = [f"chunk-{i}-" + "z" * 100 for i in range(n)]
+        capped = adapter._cap_split_chunks(chunks)
+        # (c) never more than the cap
+        assert len(capped) <= CAP
+        # (a) the reply ends with its real last chunk
+        assert capped[-1] == chunks[-1]
+        # context: the opening chunk is kept
+        assert capped[0] == chunks[0]
+        # (b) exactly one notice, stating the elided message count
+        notices = [c for c in capped if NOTICE in c]
+        assert len(notices) == 1
+        elided = n - (CAP - 1)
+        assert f"{elided} messages" in notices[0]
+        assert len(notices[0]) <= MAX
+        # the notice sits between the head and the tail, never at the end
+        assert capped.index(notices[0]) == 1
+        # the delivered content is chunks[0] + the last CAP-2 chunks
+        content = [c for c in capped if NOTICE not in c]
+        assert content == [chunks[0], *chunks[-(CAP - 2):]]
+
+    def test_indicator_tags_are_renumbered(self):
+        adapter = _make_adapter()
+        content = _huge_content(24_000)
+        chunks = adapter.truncate_message(content, MAX)
+        assert len(chunks) > CAP, "fixture must exceed the cap"
         capped = adapter._cap_split_chunks(chunks)
         assert len(capped) == CAP
-        assert capped[0] == chunks[0]
-        assert "Response truncated" in capped[-1]
-        assert "delivery limit" in capped[-1]
-        # The notice itself must stay under Discord's per-message cap.
-        assert len(capped[-1]) <= MAX
+        _assert_tags_consistent(capped)
+        # last delivered message carries the real end of the reply
+        assert "FINAL-CONCLUSION-SENTINEL" in capped[-1]
+        assert all(len(c) <= MAX for c in capped)
 
 
 class TestSendCap:
-    @pytest.mark.asyncio
-    async def test_send_caps_split_flood(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        adapter = _make_adapter()
+    @staticmethod
+    def _wire(adapter):
         sends = []
 
         async def fake_send(*, content, reference=None):
@@ -89,17 +147,72 @@ class TestSendCap:
             get_channel=lambda _cid: channel,
             fetch_channel=AsyncMock(),
         )
+        return sends
+
+    @pytest.mark.asyncio
+    async def test_send_caps_split_flood_and_keeps_conclusion(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = self._wire(adapter)
 
         result = await adapter.send("555", _huge_content())
 
         assert result.success is True
         assert len(sends) == CAP
-        assert "Response truncated" in sends[-1]
+        assert "FINAL-CONCLUSION-SENTINEL" in sends[-1]
+        assert NOTICE not in sends[-1]
+        assert sum(NOTICE in s for s in sends) == 1
+        _assert_tags_consistent(sends)
+
+    @pytest.mark.asyncio
+    async def test_interim_commentary_is_one_message(self, monkeypatch, tmp_path):
+        """(d) The measured 2026-09-29 case: a 12-chunk narration block."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = self._wire(adapter)
+        content = _huge_content(22_000)
+        assert len(adapter.truncate_message(content, MAX)) >= 12
+
+        result = await adapter.send(
+            "555", content, metadata=mark_commentary_send(None)
+        )
+
+        assert result.success is True
+        assert len(sends) == 1
+        assert NOTICE not in sends[0]
+        assert sends[0].endswith("(continued in session log)")
+        assert _TAG.search(sends[0]) is None
+        assert len(sends[0]) <= MAX
+        assert sends[0].startswith("word-0-")
+
+    @pytest.mark.asyncio
+    async def test_short_commentary_is_untouched(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = self._wire(adapter)
+
+        await adapter.send("555", "checking the log", metadata=mark_commentary_send(None))
+
+        assert sends == ["checking the log"]
+
+    @pytest.mark.asyncio
+    async def test_other_interim_sends_are_not_collapsed(self, monkeypatch, tmp_path):
+        """Heartbeats / approval fallbacks are marked ``_interim_send`` too;
+        only COMMENTARY collapses to one message — a plain-text approval
+        prompt must never lose its tail."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = self._wire(adapter)
+
+        await adapter.send("555", _huge_content(), metadata={"_interim_send": True})
+
+        assert len(sends) == CAP
+        assert "FINAL-CONCLUSION-SENTINEL" in sends[-1]
 
 
 class TestForumCap:
     @pytest.mark.asyncio
-    async def test_send_to_forum_caps_followup_chunks(self, monkeypatch, tmp_path):
+    async def test_send_to_forum_caps_and_keeps_conclusion(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         adapter = _make_adapter()
         thread_sends = []
@@ -126,12 +239,13 @@ class TestForumCap:
         assert result.success is True
         # 1 starter message + at most (CAP - 1) follow-up chunks.
         assert len(thread_sends) <= CAP - 1
-        assert "Response truncated" in thread_sends[-1]
+        assert "FINAL-CONCLUSION-SENTINEL" in thread_sends[-1]
+        assert sum(NOTICE in s for s in thread_sends) == 1
 
 
 class TestEditOverflowCap:
     @pytest.mark.asyncio
-    async def test_edit_overflow_split_capped(self, monkeypatch, tmp_path):
+    async def test_edit_overflow_split_capped_and_keeps_conclusion(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         adapter = _make_adapter()
         edits = []
@@ -153,4 +267,8 @@ class TestEditOverflowCap:
         # 1 in-place edit + at most (CAP - 1) continuation sends.
         assert len(edits) == 1
         assert len(sends) <= CAP - 1
-        assert "Response truncated" in (sends[-1] if sends else edits[-1])
+        assert "FINAL-CONCLUSION-SENTINEL" in sends[-1]
+        assert sum(NOTICE in s for s in sends) == 1
+        # the consumer keeps editing the LAST visible message: the real tail
+        assert result.message_id == str(9000 + len(sends))
+        _assert_tags_consistent([*edits, *sends])

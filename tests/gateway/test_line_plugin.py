@@ -167,6 +167,17 @@ class TestMarkdownAndChunking:
         chunks = split_for_line(text)
         assert len(chunks) <= 5
 
+    def test_split_over_cap_keeps_the_end(self):
+        # t_784a01bd: the cap must keep the reply's conclusion (its end),
+        # not truncate after bubble 5.
+        text = "\n\n".join([f"p{i}-" + "x" * 100 for i in range(1000)]) + "\n\nFINAL-SENTINEL"
+        chunks = split_for_line(text)
+        assert len(chunks) == 5
+        assert chunks[0].startswith("p0-")
+        assert chunks[-1].endswith("FINAL-SENTINEL")
+        assert "omitted" in chunks[0]
+        assert all(len(c) <= 4500 for c in chunks)
+
 
 # ---------------------------------------------------------------------------
 # 7. Inbound media normalization

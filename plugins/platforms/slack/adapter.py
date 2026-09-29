@@ -57,6 +57,7 @@ from gateway.platforms.base import (
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_video_from_bytes,
+    keep_head_and_tail_chunks,
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
@@ -1815,14 +1816,15 @@ class SlackAdapter(BasePlatformAdapter):
             chunks = [formatted]
         # Slack allows at most 5 POSTs per response_url. Reserve the flow:
         # 1 replace + up to 4 follow-ups; announce anything left over.
+        # Keep the first part and the LAST ones — a reply's conclusion is at
+        # its end (t_784a01bd); the notice rides the first part.
         _MAX_RESPONSE_URL_POSTS = 5
         if len(chunks) > _MAX_RESPONSE_URL_POSTS:
-            dropped = len(chunks) - _MAX_RESPONSE_URL_POSTS
-            chunks = chunks[:_MAX_RESPONSE_URL_POSTS]
-            chunks[-1] = (
-                chunks[-1].rstrip()
-                + f"\n\n_[Reply truncated: {dropped} more part(s) exceeded "
-                "Slack's ephemeral reply limit.]_"
+            chunks, elided = keep_head_and_tail_chunks(chunks, _MAX_RESPONSE_URL_POSTS)
+            chunks[0] = (
+                chunks[0].rstrip()
+                + f"\n\n_[Reply truncated: {len(elided)} part(s) from the middle "
+                "exceeded Slack's ephemeral reply limit; the end follows.]_"
             )
         try:
             async with aiohttp.ClientSession(trust_env=True) as session:

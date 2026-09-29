@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.platforms.base import mark_commentary_send
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -2712,8 +2713,9 @@ class GatewayStreamConsumer:
             # draft(final=true) — that would seal the live stream with
             # interim text and orphan the true final into a plain-send
             # duplicate (live finding, 2026-08-16 canary).
-            _md = dict(self.metadata) if self.metadata else {}
-            _md["_interim_send"] = True
+            # Also declares the COMMENTARY kind so a split-capping adapter
+            # (Discord) delivers it as one message (t_784a01bd).
+            _md = mark_commentary_send(self.metadata)
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
