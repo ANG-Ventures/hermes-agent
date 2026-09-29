@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import collections
 import contextlib
 import contextvars
 import copy
@@ -24,6 +25,7 @@ import json
 import logging
 import sqlite3
 import re
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -187,6 +189,124 @@ def _pinned_summary_call_kwargs() -> Dict[str, Any]:
         for field in _PINNED_ROUTE_FIELDS
         if route.get(field) not in (None, "")
     }
+
+
+# claude-bpx#394 returns 400 invalid_request_error code=safeguard_refusal; the
+# pre-#394 bridge returned a 500 carrying Claude Code's refusal text. Same test
+# as the LCM engine's ``_is_safeguard_refusal`` (plugins/context_engine/lcm/
+# escalation.py); duplicated because core must not import from a plugin.
+_SAFEGUARD_REFUSAL_MARKERS: tuple[str, ...] = (
+    "safeguard_refusal",
+    "safeguards flagged this",
+)
+
+
+def _is_summary_safeguard_refusal(exc: BaseException) -> bool:
+    """True when a summary call failed because the model's safeguards refused it."""
+    if getattr(exc, "code", None) == "safeguard_refusal":
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _SAFEGUARD_REFUSAL_MARKERS)
+
+
+def _summary_refusal_route_key(call_kwargs: Dict[str, Any], main_model: str) -> str:
+    """Stable pre-send identity of the route a summary call will take.
+
+    Built from the explicit ``call_llm`` kwargs, not the resolved route, so the
+    same compressor configuration maps to the same key before every send.
+    """
+    provider = str(call_kwargs.get("provider") or "task-default").strip().lower()
+    model = str(call_kwargs.get("model") or f"main:{main_model or ''}").strip().lower()
+    base_url = str(call_kwargs.get("base_url") or "").strip().lower()
+    return f"{provider}|{model}|{base_url}"
+
+
+class _SummaryRefusalLatch:
+    """Process-wide memory of (summary route, content) pairs a model refused.
+
+    A safeguard refusal is deterministic for that content on that model, so
+    re-sending it only buys another cold prefill and another refusal
+    (t_0970eb0b, sibling of the LCM latch in #1501). Matching is by content
+    PREFIX: the compressor's middle window grows at its end between passes,
+    so a later pass whose serialized input begins with refused content still
+    carries the refused turns. Bounded LRU; process lifetime; not persisted.
+    """
+
+    def __init__(self, max_entries: int = 1024) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._refused: "collections.OrderedDict[tuple[str, int, str], None]" = (
+            collections.OrderedDict()
+        )
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _digest(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def record(self, route_key: str, content: str) -> None:
+        content = content or ""
+        key = (route_key, len(content), self._digest(content))
+        with self._lock:
+            self._refused[key] = None
+            self._refused.move_to_end(key)
+            while len(self._refused) > self._max_entries:
+                self._refused.popitem(last=False)
+
+    def is_refused(self, route_key: str, content: str) -> bool:
+        content = content or ""
+        with self._lock:
+            candidates = [k for k in self._refused if k[0] == route_key]
+        digests: Dict[int, str] = {}
+        for key in candidates:
+            _route, length, digest = key
+            if length > len(content):
+                continue
+            if length not in digests:
+                digests[length] = self._digest(content[:length])
+            if digests[length] == digest:
+                with self._lock:
+                    if key in self._refused:
+                        self._refused.move_to_end(key)
+                return True
+        return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._refused.clear()
+
+
+_SUMMARY_REFUSALS = _SummaryRefusalLatch()
+
+
+class _SummaryRouteAlreadyRefused(RuntimeError):
+    """Raised before sending: this route already refused this content."""
+
+
+def _compression_refusal_fallback_routes() -> List[Dict[str, Any]]:
+    """``auxiliary.compression.fallback_chain`` entries as ``call_llm`` kwargs.
+
+    These are the user's declared alternate summary routes (e.g. a non-Claude
+    model). They are the only place a refused segment is re-sent: to a
+    DIFFERENT model, once each, never to a route that already refused it.
+    """
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+
+        chain = _get_auxiliary_task_config("compression").get("fallback_chain")
+    except Exception:  # pragma: no cover - config read is best-effort
+        return []
+    if not isinstance(chain, list):
+        return []
+    routes: List[Dict[str, Any]] = []
+    for entry in chain:
+        if not isinstance(entry, dict) or not entry.get("provider"):
+            continue
+        routes.append({
+            field: entry[field]
+            for field in _PINNED_ROUTE_FIELDS
+            if entry.get(field) not in (None, "")
+        })
+    return routes
 
 
 _SUMMARY_PERMANENT_QUOTA_MARKERS: tuple[str, ...] = (
@@ -5143,6 +5263,56 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _handle_summary_refusal(
+        self,
+        error: str,
+        refusal_content: str,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        focus_topic: Optional[str],
+        memory_context: str,
+    ) -> Optional[str]:
+        """Route a safeguard refusal: another model, or preserve the session.
+
+        The refused (route, content) pair is already latched by the caller.
+        Fallback decision for non-LCM sessions (t_0970eb0b): the refused turns
+        exist only in the live transcript, so dropping them for a smaller
+        segment or a deterministic placeholder is data loss. Instead, try each
+        ``auxiliary.compression.fallback_chain`` route that has not refused
+        this content (the place to configure a non-Claude summary model), and
+        if none remain, abort compression with the session preserved
+        unchanged (``_last_summary_refusal_failure``). The main model is NOT
+        tried: it is usually the same vendor with the same safeguards, and the
+        most expensive route to cold-prefill.
+        """
+        self._last_summary_error = error
+        self._last_summary_refusal_failure = True
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry["failure_class"] = "summary_refusal_failure"
+        for route in _compression_refusal_fallback_routes():
+            key = _summary_refusal_route_key(route, self.model)
+            if _SUMMARY_REFUSALS.is_refused(key, refusal_content):
+                continue
+            logger.warning(
+                "%s Retrying once on fallback_chain route %s.", error, key,
+            )
+            previous = getattr(self, "_summary_refusal_route_override", None)
+            self._summary_refusal_route_override = route
+            try:
+                # Each recursion either returns or latches ``route``, so the
+                # chain is walked at most once per content.
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    memory_context=memory_context,
+                )
+            finally:
+                self._summary_refusal_route_override = previous
+        self._record_compression_failure_cooldown(60, error)
+        logger.warning("%s", error)
+        return None
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
@@ -5202,6 +5372,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if _name not in _pruned_skill_names:
                 _pruned_skill_names.append(_name)
         del _pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
+        # Unbounded serialized turns: the identity a safeguard-refusal latch
+        # keys on (a later pass over a grown window keeps it as a prefix).
+        _refusal_content = content_to_summarize
         content_to_summarize = self._bound_summary_input(content_to_summarize)
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
@@ -5451,6 +5624,8 @@ Use this exact structure:
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
+        _aux_route: Dict[str, str] = {}
+        _refusal_route_key = ""
         try:
             call_kwargs = {
                 "task": "compression",
@@ -5478,7 +5653,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             # ``call_llm`` writes the one concrete route it actually selected;
             # do not independently pre-resolve a second, potentially stale
             # provider/model pair for telemetry or fast-lane certification.
-            _aux_route: Dict[str, str] = {}
             call_kwargs["route_info"] = _aux_route
             # A pinned route (stall fallback, #78981) is an explicit override:
             # it replaces task routing for this one call so the retry actually
@@ -5487,6 +5661,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             _pinned_route = _pinned_summary_call_kwargs()
             if _pinned_route:
                 call_kwargs.update(_pinned_route)
+            # A safeguard-refusal fallback (fallback_chain entry) overrides
+            # both, for this one recursive call only.
+            _refusal_override = getattr(self, "_summary_refusal_route_override", None)
+            if _refusal_override:
+                call_kwargs.update(_refusal_override)
+            # Never re-send content a route's safeguards already refused: the
+            # refusal is deterministic, a resend is a guaranteed cold prefill
+            # plus another refusal (t_0970eb0b).
+            _refusal_route_key = _summary_refusal_route_key(call_kwargs, self.model)
+            if _SUMMARY_REFUSALS.is_refused(_refusal_route_key, _refusal_content):
+                raise _SummaryRouteAlreadyRefused(
+                    "summary route already refused this content"
+                )
             # Compression is atomic: protect the in-flight summary call from a
             # mid-turn gateway interrupt. Without this, an incoming user message
             # aborts the summary and compression falls back to a degraded static
@@ -5555,11 +5742,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 route = _redact_compaction_text(f"provider={_aux_provider} model={_aux_model}")
                 route = re.sub(r"[\x00-\x1f\x7f]", "", route)[:160]
                 error = f"Context compression refused ({route}; category={category}). Original context preserved; review the provider refusal."
-                self._last_summary_error = error
-                self._last_summary_refusal_failure = True
-                self._record_compression_failure_cooldown(60, error)
-                logger.warning("%s", error)
-                return None
+                _SUMMARY_REFUSALS.record(_refusal_route_key, _refusal_content)
+                return self._handle_summary_refusal(
+                    error, _refusal_content, turns_to_summarize,
+                    focus_topic=focus_topic, memory_context=memory_context,
+                )
             if isinstance(message, dict):
                 content = message.get("content")
             else:
@@ -5613,6 +5800,41 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_refusal_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
+            # Safeguard refusal (400 safeguard_refusal from claude-bpx#394, or
+            # the pre-#394 500 carrying the refusal text) is deterministic for
+            # this content on this route. It must NOT take the generic path
+            # below: that falls back to the main model and then re-sends the
+            # same turns after a 60 s cooldown, forever (t_0970eb0b).
+            if isinstance(e, _SummaryRouteAlreadyRefused) or _is_summary_safeguard_refusal(e):
+                if isinstance(e, _SummaryRouteAlreadyRefused):
+                    logger.info(
+                        "Context compression: summary route %s already refused "
+                        "this content; not re-sending it",
+                        _refusal_route_key,
+                    )
+                else:
+                    _SUMMARY_REFUSALS.record(_refusal_route_key, _refusal_content)
+                _route_text = _redact_compaction_text(
+                    f"provider={_aux_route.get('provider') or self.provider or 'auto'} "
+                    f"model={_aux_route.get('model') or self.summary_model or self.model}"
+                )
+                _route_text = re.sub(r"[\x00-\x1f\x7f]", "", _route_text)[:160]
+                if isinstance(e, _SummaryRouteAlreadyRefused):
+                    error = (
+                        f"Context compression skipped: the summary route already "
+                        f"refused this content ({_route_text}). Original context "
+                        "preserved; configure auxiliary.compression.fallback_chain "
+                        "with a different summary model, or /new."
+                    )
+                else:
+                    error = (
+                        f"Context compression refused ({_route_text}; category=safeguard). "
+                        "Original context preserved; review the provider refusal."
+                    )
+                return self._handle_summary_refusal(
+                    error, _refusal_content, turns_to_summarize,
+                    focus_topic=focus_topic, memory_context=memory_context,
+                )
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
             #      a permanent misconfiguration, long cooldown is correct.
