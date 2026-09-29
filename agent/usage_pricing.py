@@ -700,6 +700,28 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         output_cost_per_million_above=Decimal("15.00"),
         cache_read_cost_per_million_above=Decimal("0.40"),
     ),
+    # ── OpenAI GPT-6.1 Sol ───────────────────────────────────────────────
+    # Released 2026-09-29 (OpenAI DevDay). Rates from models.dev api.json
+    # openai.models["gpt-6.1-sol"] (read 2026-09-29): same $2/$10 in/out and
+    # $2.50 cache write as gpt-6-sol, but cache read is $0.10 (gpt-6-sol:
+    # $0.20). Above 272K prompt tokens: $4 / $15 / $0.20 cache read.
+    # (Above-tier cache write $5 has no PricingEntry field; base rate applies.)
+    (
+        "openai",
+        "gpt-6.1-sol",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://openai.com/index/introducing-gpt-6-1-sol/",
+        pricing_version="openai-gpt-6.1-sol-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("4.00"),
+        output_cost_per_million_above=Decimal("15.00"),
+        cache_read_cost_per_million_above=Decimal("0.20"),
+    ),
     # Source: https://developers.openai.com/api/docs/models/gpt-6-luna
     (
         "openai",

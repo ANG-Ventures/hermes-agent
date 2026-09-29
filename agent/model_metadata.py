@@ -619,6 +619,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     # and the 5.6 series. Listed explicitly for the same reason as Astra.
     "gpt-6-astra": 1050000,
     "gpt-6-sol": 1050000,
+    # GPT-6.1 Sol (2026-09-29): models.dev lists 1,050,000 context / 922K
+    # max input / 128K output. Pre-staged before the Codex lane serves it.
+    "gpt-6.1-sol": 1050000,
     "gpt-6-luna": 1050000,
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
@@ -2854,6 +2857,7 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.4-mini": 272_000,
     "gpt-6-astra": 272_000,
     "gpt-6-sol": 272_000,
+    "gpt-6.1-sol": 272_000,
     "gpt-6-luna": 272_000,
     "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
@@ -2914,6 +2918,7 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     # unprobed future gpt-6 descendant can never inherit this cap.
     "gpt-6-sol": 872_000,
     "gpt-6-luna": 872_000,
+    # gpt-6.1-sol: add once the codex lane serves it and max_context_window is measured (2026-09-29)
 }
 
 # The advertised value the verified-above table is allowed to override.
@@ -2933,6 +2938,7 @@ _CODEX_900K_ELIGIBLE_BASES = frozenset({
     "gpt-6-astra",                # measured max_context_window 872,000
     "gpt-6-sol",                  # measured max_context_window 872,000
     "gpt-6-luna",                 # measured max_context_window 872,000
+    # gpt-6.1-sol: add once the codex lane serves it and max_context_window is measured (2026-09-29)
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
