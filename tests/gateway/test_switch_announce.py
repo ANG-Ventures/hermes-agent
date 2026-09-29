@@ -46,7 +46,7 @@ def _make_runner(monkeypatch, tmp_path, config_yaml="agent:\n  reasoning_effort:
     )
     monkeypatch.setattr(
         gateway_run, "_load_gateway_runtime_config",
-        lambda: _yaml_load(hermes_home / "config.yaml"),
+        lambda: _yaml_load(hermes_home / "config.yaml"), raising=False,
     )
 
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -65,7 +65,7 @@ def _make_runner(monkeypatch, tmp_path, config_yaml="agent:\n  reasoning_effort:
     # No ``send_choice_picker`` on the type → the text path is taken.
     del adapter.send_choice_picker
     runner.adapters = {Platform.DISCORD: adapter}
-    runner._adapter_for_source = lambda source: adapter
+    runner._delivery_adapter_for = lambda source: adapter
     return runner, adapter
 
 
@@ -80,9 +80,9 @@ class TestReasoningSwitchAnnounce:
         runner, adapter = _make_runner(monkeypatch, tmp_path)
         event = _make_event("/reasoning xhigh")
         session_key = runner._session_key_for_source(event.source)
-        runner._session_reasoning_overrides[session_key] = {
+        runner._set_session_reasoning_override(session_key, {
             "enabled": True, "effort": "high",
-        }
+        })
 
         await runner._handle_reasoning_command(event)
 
@@ -121,9 +121,9 @@ class TestReasoningSwitchAnnounce:
         runner, adapter = _make_runner(monkeypatch, tmp_path)
         event = _make_event("/reasoning high")
         session_key = runner._session_key_for_source(event.source)
-        runner._session_reasoning_overrides[session_key] = {
+        runner._set_session_reasoning_override(session_key, {
             "enabled": True, "effort": "high",
-        }
+        })
 
         await runner._handle_reasoning_command(event)
 
@@ -134,9 +134,9 @@ class TestReasoningSwitchAnnounce:
         runner, adapter = _make_runner(monkeypatch, tmp_path)
         event = _make_event("/reasoning reset")
         session_key = runner._session_key_for_source(event.source)
-        runner._session_reasoning_overrides[session_key] = {
+        runner._set_session_reasoning_override(session_key, {
             "enabled": True, "effort": "low",
-        }
+        })
 
         await runner._handle_reasoning_command(event)
 
@@ -314,7 +314,7 @@ class TestAnnounceIsBestEffort:
     @pytest.mark.asyncio
     async def test_no_adapter_is_not_an_error(self, tmp_path, monkeypatch):
         runner, _adapter = _make_runner(monkeypatch, tmp_path)
-        runner._adapter_for_source = lambda source: None
+        runner._delivery_adapter_for = lambda source: None
 
         await runner._announce_switch(_make_event("/x").source, "model", "a/b", "c/d")
 
@@ -354,14 +354,17 @@ class TestAnnounceLocaleCatalog:
         import pathlib
 
         locales_dir = pathlib.Path(gateway_run.__file__).resolve().parents[1] / "locales"
-        catalogs = sorted(locales_dir.glob("*.yaml"))
-        assert catalogs, "no locale catalogs found"
+        # Gateway catalogs only: ``*.tui.yaml`` are the TUI's own catalogs and carry no gateway keys.
+        catalogs = sorted(p for p in locales_dir.glob("*.yaml") if not p.name.endswith(".tui.yaml"))
+        assert len(catalogs) >= 17, f"expected the 17 gateway catalogs, found {len(catalogs)}"
 
         for path in catalogs:
             with path.open(encoding="utf-8") as fh:
                 data = yaml.safe_load(fh) or {}
             section = (data.get("gateway") or {}).get("switch_announce") or {}
-            for kind, dotted in gateway_run._SWITCH_ANNOUNCE_KEYS.items():
+            from gateway.slash_commands_model import _SWITCH_ANNOUNCE_KEYS
+
+            for kind, dotted in _SWITCH_ANNOUNCE_KEYS.items():
                 assert dotted == f"gateway.switch_announce.{kind}"
                 value = section.get(kind)
                 assert value, f"{path.name}: missing gateway.switch_announce.{kind}"
@@ -376,73 +379,42 @@ class TestOneTurnModelSwitchIsNotAnnounced:
     The override is reverted by ``_pending_one_turn_model_restores`` after a
     single turn, so announcing "A → B" with no second line to correct it leaves
     the channel believing B is still active. Reported in automated review on
-    #83463.
-
-    This is an AST contract test rather than a handler drive: the announce call
-    sits deep inside ``_handle_model_command`` behind provider resolution and a
-    live model-switch result, and the property that matters is structural —
-    the call must be dominated by a ``not one_turn`` guard.
+    #83463. Driven through the REAL commit point (``_commit_model_switch_locked``,
+    shared by the typed and picker paths) with only its collaborators stubbed.
     """
 
-    def _model_announce_call(self):
-        import ast
-        import inspect
+    async def _commit(self, monkeypatch, tmp_path, *, one_turn, picker=False):
+        from types import SimpleNamespace
 
-        import gateway.slash_commands as slash_commands
+        from gateway.slash_commands_model import _ModelSwitchContext
 
-        source = inspect.getsource(slash_commands)
-        tree = ast.parse(source)
-        found = []
-
-        class Visitor(ast.NodeVisitor):
-            def __init__(self):
-                self.guards = []
-
-            def visit_If(self, node):
-                self.guards.append(node.test)
-                for child in node.body:
-                    self.visit(child)
-                self.guards.pop()
-                for child in node.orelse:
-                    self.visit(child)
-
-            def visit_Call(self, node):
-                func = node.func
-                name = getattr(func, "attr", None)
-                if name == "_announce_switch":
-                    kind = None
-                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-                        kind = node.args[1].value
-                    found.append((kind, list(self.guards)))
-                self.generic_visit(node)
-
-        Visitor().visit(tree)
-        return found
-
-    def test_model_announce_is_guarded_by_not_one_turn(self):
-        import ast
-
-        calls = self._model_announce_call()
-        model_calls = [(kind, guards) for kind, guards in calls if kind == "model"]
-        assert model_calls, "no _announce_switch(..., 'model', ...) call found"
-
-        # At least one model announce site must sit under a `not one_turn` guard.
-        def mentions_not_one_turn(test):
-            for node in ast.walk(test):
-                if (
-                    isinstance(node, ast.UnaryOp)
-                    and isinstance(node.op, ast.Not)
-                    and isinstance(node.operand, ast.Name)
-                    and node.operand.id == "one_turn"
-                ):
-                    return True
-            return False
-
-        guarded = [
-            guards for _, guards in model_calls
-            if any(mentions_not_one_turn(g) for g in guards)
-        ]
-        assert guarded, (
-            "the /model announce is not guarded by `not one_turn`; a one-turn "
-            "switch would announce a change that silently reverts"
+        runner, adapter = _make_runner(monkeypatch, tmp_path)
+        runner._switch_cached_agent_model = MagicMock(return_value=None)
+        runner._record_switch_metrics = MagicMock()
+        runner._record_model_switch = AsyncMock(return_value=None)
+        runner._model_switch_confirmation = AsyncMock(return_value="switched")
+        source = _make_event("/model x").source
+        ctx = _ModelSwitchContext(
+            session_key="k", source=source, config_path=tmp_path / "hermes" / "config.yaml",
+            persist_global=False, one_turn=one_turn, current_model="old-model", current_provider="openrouter",
         )
+        result = SimpleNamespace(target_provider="anthropic", new_model="new-model")
+        reply = await runner._commit_model_switch_locked(result, ctx, source=source, picker=picker)
+        assert reply == "switched"
+        return _sent_texts(adapter)
+
+    @pytest.mark.asyncio
+    async def test_persistent_switch_announces_the_full_route(self, tmp_path, monkeypatch):
+        texts = await self._commit(monkeypatch, tmp_path, one_turn=False)
+        assert any("🔀 Model: openrouter/old-model → anthropic/new-model" in t for t in texts), texts
+
+    @pytest.mark.asyncio
+    async def test_one_turn_switch_is_not_announced(self, tmp_path, monkeypatch):
+        texts = await self._commit(monkeypatch, tmp_path, one_turn=True)
+        assert not any("🔀 Model:" in t for t in texts), texts
+
+    @pytest.mark.asyncio
+    async def test_picker_switch_announces_even_if_ctx_says_one_turn(self, tmp_path, monkeypatch):
+        """The picker is never one-turn (commit forces one_turn=False), so it announces."""
+        texts = await self._commit(monkeypatch, tmp_path, one_turn=True, picker=True)
+        assert any("🔀 Model:" in t for t in texts), texts
