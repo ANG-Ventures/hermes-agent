@@ -70,10 +70,13 @@ class SelfHostedBackend(Mem0Backend):
         import httpx
         headers = {"Content-Type": "application/json", **({"X-API-Key": api_key} if api_key else {})}  # key omitted only for AUTH_DISABLED servers
         # Connect-level retries keep one dropped SYN from counting toward the breaker. ``transport`` is injectable for tests.
-        # ``ca_bundle``: path to a PEM bundle for a server behind a private CA (httpx verifies against the
-        # system store only, so such a host fails TLS with no way to opt in). Empty = default verification.
+        # ``ca_bundle``: path to a PEM bundle for a server behind a private CA. Resolved through the shared
+        # ``resolve_httpx_verify`` (OS trust store via truststore; a missing/typo'd path warns and falls back
+        # to it instead of raising here and taking the whole backend down). Empty = OS trust store.
         if transport is None:
-            transport = httpx.HTTPTransport(retries=2, **({"verify": ca_bundle} if ca_bundle else {}))
+            from agent.ssl_verify import resolve_httpx_verify
+            verify = resolve_httpx_verify(ca_bundle=ca_bundle, base_url=host)
+            transport = httpx.HTTPTransport(retries=2, verify=verify)
         self._client = httpx.Client(base_url=host.rstrip("/"), headers=headers, timeout=30.0, transport=transport)
 
     def _json(self, method: str, path: str, **kwargs) -> Any:

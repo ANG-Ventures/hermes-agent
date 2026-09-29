@@ -159,6 +159,7 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "false", "choices": ["true", "false"]},
+            {"key": "ca_bundle", "description": "PEM CA bundle for a self-hosted server behind a private CA (blank = OS trust store)", "required": False},
         ]
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
