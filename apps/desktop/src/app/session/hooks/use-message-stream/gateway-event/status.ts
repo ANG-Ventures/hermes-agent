@@ -1,6 +1,5 @@
 import { isSessionNotOwnedError } from '@/app/session/hooks/use-prompt-actions/utils'
-import { translateNow, TRANSLATIONS } from '@/i18n'
-import { getRuntimeI18nLocale } from '@/i18n/runtime'
+import { runtimeTranslations, translateNow } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText } from '@/lib/chat-runtime'
 import type { ErrorSurface } from '@/lib/error-surface'
@@ -210,6 +209,36 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     return true
   }
 
+  if (event.type === 'background.complete') {
+    // prompt.background RPC (the TUI's /background path) reports the finished
+    // background turn here; the event carries the originating session id, so
+    // the result lands in the conversation that started the task. Persistent
+    // transcript line (not a toast), mirroring the TUI's `[bg <task_id>]`
+    // system line — without it the completion was indistinguishable from a
+    // lost task (#97635).
+    const text = coerceGatewayText(payload?.text).trim()
+
+    if (text && sessionId) {
+      const taskId = String(payload?.task_id ?? '').trim()
+
+      flushQueuedDeltas(sessionId)
+      updateSessionState(sessionId, state => ({
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            id: `background-complete-${taskId || Date.now()}`,
+            role: 'system',
+            parts: [textPart(taskId ? `[bg ${taskId}]\n${text}` : text, occurredAt)],
+            timestamp: occurredAt
+          }
+        ]
+      }))
+    }
+
+    return true
+  }
+
   if (event.type === 'notification.show') {
     // Driver-agnostic agent notice (credits usage/grant/depleted/restored
     // from `agent/credits_tracker.py`). The Ink TUI renders these in its
@@ -271,7 +300,7 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     // pre-turn failures — agent init, resume, cancelled-before-ready), and
     // burying it under a generic "couldn't finish" gloss would hide the one
     // instruction the user needs.
-    const card = surface ? errorCardText(TRANSLATIONS[getRuntimeI18nLocale()].assistant.thread, surface) : null
+    const card = surface ? errorCardText(runtimeTranslations().assistant.thread, surface) : null
     const toastMessage = card ? `${card.title}. ${card.body}` : errorMessage
 
     // A turn that errors out has also ended — drop any open blocking prompt
