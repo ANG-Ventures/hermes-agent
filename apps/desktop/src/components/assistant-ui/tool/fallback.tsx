@@ -50,6 +50,7 @@ import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { recordPreviewArtifact } from '@/store/preview-status'
 import { sessionApprovalRequest } from '@/store/prompts'
+import { $showToolActivity } from '@/store/tool-activity'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import {
@@ -360,12 +361,13 @@ function ToolEntry({ part }: ToolEntryProps) {
   // below and re-running buildToolView (full JSON.stringify of result) on every
   // stream delta — the freeze on big `/learn` runs. Re-derive a stable part from
   // the referentially-stable args/result so the memos hold across deltas.
-  const { args, completedAt, isError, result, toolResultMetadata, timestamp, toolCallId, toolName } = part
+  const { args, completedAt, interrupted, isError, result, toolResultMetadata, timestamp, toolCallId, toolName } = part
 
   const stablePart = useMemo<ToolPart>(
     () => ({
       args,
       completedAt,
+      interrupted,
       isError,
       result,
       toolResultMetadata,
@@ -374,7 +376,7 @@ function ToolEntry({ part }: ToolEntryProps) {
       toolName,
       type: 'tool-call'
     }),
-    [args, completedAt, isError, result, toolResultMetadata, timestamp, toolCallId, toolName]
+    [args, completedAt, interrupted, isError, result, toolResultMetadata, timestamp, toolCallId, toolName]
   )
 
   const disclosureId = toolEntryDisclosureId(messageId, stablePart)
@@ -650,7 +652,7 @@ function ToolEntry({ part }: ToolEntryProps) {
           )}
           {view.imageUrl && (
             <div className="max-w-72 overflow-hidden rounded-[0.25rem] border border-(--ui-stroke-tertiary)">
-              <MarkdownImage alt={copy.outputAlt} className="h-auto w-full object-cover" src={view.imageUrl} />
+              <MarkdownImage alt={copy.outputAlt} src={view.imageUrl} />
             </div>
           )}
           {hasSearchHits && view.searchHits && (
@@ -976,10 +978,12 @@ const ToolRun: FC<PropsWithChildren<{ endIndex: number; startIndex: number }>> =
   startIndex
 }) => {
   const messageRunning = useAuiState(selectMessageRunning)
+
   const { completedAt, count, entryIds, key, live, startedAt, summary, approvalActivity } = useToolRun(
     startIndex,
     endIndex
   )
+
   const sessionId = useStore(useSessionView().$runtimeId)
   const approval = useStore(useMemo(() => sessionApprovalRequest(sessionId), [sessionId]))
   const currentTurn = useAuiState(state => isCurrentTurnMessage(state.thread.messages, state.message.id))
@@ -1041,6 +1045,8 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
   endIndex,
   startIndex
 }) => {
+  const showToolActivity = useStore($showToolActivity)
+
   // Joined rather than returned as an array: assistant-ui compares selector
   // results with `Object.is` and re-runs them on every store update, so a
   // fresh array would re-render the whole group on every text delta.
@@ -1060,6 +1066,13 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
 
   const items = useMemo(() => splitRunItems(toolNameKey.split('\u0000')), [toolNameKey])
   const rows = Children.toArray(children)
+
+  // The run scaffold ("Explored N files") is part of the tool feed and follows
+  // display.tool_progress. Children still mount so clarify, diffs, and failed
+  // calls can render on their own.
+  if (!showToolActivity) {
+    return children
+  }
 
   return (
     <ToolEmbedContext.Provider value={false}>
@@ -1083,13 +1096,14 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
  * group-shape changes.
  */
 type TimelineToolCallProps = ToolCallMessagePartProps &
-  Pick<ToolPart, 'completedAt' | 'timestamp' | 'toolResultMetadata'>
+  Pick<ToolPart, 'completedAt' | 'interrupted' | 'timestamp' | 'toolResultMetadata'>
 
 export const ToolFallback = ({
   toolCallId,
   toolName,
   args,
   completedAt,
+  interrupted,
   isError,
   result,
   toolResultMetadata,
@@ -1098,6 +1112,7 @@ export const ToolFallback = ({
   const part: ToolPart = {
     args,
     completedAt,
+    interrupted,
     isError,
     result,
     toolResultMetadata,

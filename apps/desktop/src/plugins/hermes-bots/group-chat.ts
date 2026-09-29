@@ -59,6 +59,7 @@ let groupChatSyncTimer: ReturnType<typeof setTimeout> | null = null
 /** One room inside the bounded ui_meta projection: a compacted log plus the
  *  identity fields, without any of `GroupChat`'s runtime/orchestration state. */
 interface GroupChatSyncRoom {
+  holdDetection?: boolean
   image?: null | string
   log: GroupMessage[]
   members?: GroupMember[]
@@ -94,6 +95,67 @@ const groupChatSyncInFlightConnections = new Set<string>()
 const groupChatSyncRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const groupChatSyncRetryCounts = new Map<string, number>()
 export let groupChatSyncDisposed = false
+
+// Durable disband memory in the mirror's own tombstone shape (room key ->
+// tombstone revision). A pending sync job forgets its deletedRooms once the
+// retry ladder gives up or the window closes, and "missing remote rooms are
+// not deletions" — so a gateway mirror that missed the tombstone push would
+// re-merge the room on every later pull. This map rides every publish and
+// every pull merge until the room is gone from every mirror (#105275).
+const groupChatTombstones: Record<string, number> = {}
+const GROUP_CHAT_TOMBSTONES_KEY = 'group-chat-tombstones'
+
+export function groupChatTombstoneMemory(): Record<string, number> {
+  return { ...groupChatTombstones }
+}
+
+/** Remember a disband durably — ONLY by roomId. A name key would outlive the
+ *  room: a same-name recreate starts at syncRevision 0 and the memory is
+ *  applied on every pull with `deletedRevision >= syncRevision`, so the
+ *  fresh room would be deleted forever. Legacy name-only rooms keep the
+ *  job-scoped tombstone of the pending sync (the pre-#105275 behaviour).
+ *  Revision = the room's last known sync revision + 1, the ordering the
+ *  live tombstone merge applies. */
+export function rememberGroupChatTombstone(name: string, roomId?: null | string, syncRevision?: number) {
+  if (typeof roomId !== 'string' || !roomId) {
+    return Promise.resolve()
+  }
+
+  const key = `id:${roomId}`
+  groupChatTombstones[key] = Math.max(Number(groupChatTombstones[key] || 0), Math.max(0, Number(syncRevision || 0)) + 1)
+
+  for (const stale of Object.keys(groupChatTombstones)
+    .sort((left, right) => groupChatTombstones[right] - groupChatTombstones[left])
+    .slice(64)) {
+    delete groupChatTombstones[stale]
+  }
+
+  try {
+    return Promise.resolve(getPluginCtx()?.storage?.set?.(GROUP_CHAT_TOMBSTONES_KEY, { ...groupChatTombstones })).catch(
+      () => undefined
+    )
+  } catch {
+    return Promise.resolve()
+  }
+}
+
+export function hydrateGroupChatTombstones(value: unknown) {
+  for (const key of Object.keys(groupChatTombstones)) {
+    delete groupChatTombstones[key]
+  }
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return
+  }
+
+  for (const [key, revision] of Object.entries(value as Record<string, unknown>)) {
+    // Older builds persisted `name:` keys too; they are exactly the memory
+    // that blocks a same-name recreate, so they are dropped on hydrate.
+    if (key.startsWith('id:')) {
+      groupChatTombstones[key] = Math.max(0, Number(revision || 0))
+    }
+  }
+}
 
 /** Cut one room body to a per-message budget and mark the cut (the sync
  *  projection and the per-turn delta window share the convention).
@@ -292,6 +354,7 @@ export function groupChatSyncSnapshot(
           }
         : {}),
       log,
+      holdDetection: room.holdDetection !== false,
       revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
       members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
         name: String(member?.name || '').slice(0, 128),
@@ -482,15 +545,18 @@ export function mergeGroupChatSyncSnapshots(
     let identity: GroupChatSyncRoom | undefined
     let members: GroupMember[]
     let image: null | string | undefined
+    let holdDetection = true
 
     if (localRevision > remoteRevision) {
       identity = localRoom
       members = [...(localRoom?.members || [])]
       image = localRoom?.image
+      holdDetection = localRoom?.holdDetection !== false
     } else if (remoteRevision > localRevision) {
       identity = remoteRoom
       members = [...(remoteRoom?.members || [])]
       image = remoteRoom?.image
+      holdDetection = remoteRoom?.holdDetection !== false
     } else {
       identity = localRoom || remoteRoom
       const byId = new Map<string, GroupMember>()
@@ -501,6 +567,9 @@ export function mergeGroupChatSyncSnapshots(
 
       members = [...byId.values()]
       image = Object.prototype.hasOwnProperty.call(localRoom || {}, 'image') ? localRoom.image : remoteRoom?.image
+      holdDetection = Object.prototype.hasOwnProperty.call(localRoom || {}, 'holdDetection')
+        ? localRoom?.holdDetection !== false
+        : remoteRoom?.holdDetection !== false
     }
 
     rooms[key] = {
@@ -519,6 +588,7 @@ export function mergeGroupChatSyncSnapshots(
 
         return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
       }),
+      holdDetection,
       members,
       revision: Math.max(remoteRevision, localRevision),
       ...(omitted > 0
@@ -606,9 +676,22 @@ function groupChatSyncEnvelope(
 export function mergeRemoteGroupChatSnapshotIntoRooms(
   remote: GroupChatSyncSnapshot | null | undefined,
   current: Record<string, GroupChat> = $groupChats.get(),
-  { preserveRooms = [], deletedRooms = [] }: { deletedRooms?: string[]; preserveRooms?: string[] } = {}
+  {
+    preserveRooms = [],
+    deletedRooms = [],
+    tombstones = {}
+  }: { deletedRooms?: string[]; preserveRooms?: string[]; tombstones?: Record<string, number> } = {}
 ) {
   const remoteNorm = normalizeGroupChatSyncSnapshot(remote)
+
+  // Remote tombstones plus this Desktop's durable disband memory: a mirror
+  // that missed the tombstone push still projects the room, and without the
+  // local memory it would resurrect here on every pull (#105275).
+  const deleted: Record<string, number> = { ...tombstones }
+
+  for (const [key, at] of Object.entries(remoteNorm.deleted || {})) {
+    deleted[key] = Math.max(Number(deleted[key] || 0), Math.max(0, Number(at || 0)))
+  }
 
   const rooms: Record<string, GroupChat> = {
     ...(current || {})
@@ -616,6 +699,19 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
 
   const preserved = new Set(preserveRooms)
   const locallyDeleted = new Set(deletedRooms)
+
+  // deletedRooms names a pending local disband. It must hide the REMOTE copy
+  // of that room, but a live local record under the same name is newer than
+  // the disband (the disband itself leaves nothing, or only the flagged
+  // runtime tombstone, under that name): a same-name recreate that landed
+  // inside the sync window. Only the disbanded record itself may be dropped.
+  const dropLocallyDeleted = (name: null | string | undefined) => {
+    if (!name || (rooms[name] && !rooms[name].tombstone)) {
+      return
+    }
+
+    delete rooms[name]
+  }
 
   // Local rooms indexed by durable identity so an id-keyed projection room
   // finds its local twin even when the display name changed remotely.
@@ -652,11 +748,8 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
         continue
       }
 
-      delete rooms[displayName]
-
-      if (localName) {
-        delete rooms[localName]
-      }
+      dropLocallyDeleted(displayName)
+      dropLocallyDeleted(localName)
 
       continue
     }
@@ -726,9 +819,15 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
     rooms[targetName] = {
       ...existing,
       log: bounded.log,
+      holdDetection:
+        !isPreserved && remoteRevision >= localRevision
+          ? projected.holdDetection !== false
+          : existing.holdDetection !== false,
       watermarks: bounded.watermarks,
       sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
       stranded: existing.stranded && typeof existing.stranded === 'object' ? existing.stranded : {},
+      externalCursors:
+        existing.externalCursors && typeof existing.externalCursors === 'object' ? existing.externalCursors : {},
       members: [...members.values()],
       ...(projectedRoomId || existing.roomId
         ? {
@@ -746,7 +845,17 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
     }
   }
 
-  for (const [key, deletedAt] of Object.entries(remoteNorm.deleted || {})) {
+  // Re-index by roomId: a resurrected projection room may have just landed
+  // under a roomId no local twin carried when the index was first built.
+  localByRoomId.clear()
+
+  for (const [name, room] of Object.entries(rooms)) {
+    if (typeof room?.roomId === 'string' && room.roomId) {
+      localByRoomId.set(room.roomId, name)
+    }
+  }
+
+  for (const [key, deletedAt] of Object.entries(deleted)) {
     const deletedRoomId = key.startsWith('id:') ? key.slice(3) : null
 
     const targetName =
@@ -774,7 +883,7 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
   }
 
   for (const name of locallyDeleted) {
-    delete rooms[name]
+    dropLocallyDeleted(name)
   }
 
   return rooms
@@ -798,9 +907,12 @@ export function durableGroupChatRooms(all: Record<string, GroupChat> = $groupCha
 
     durable[name] = {
       log: room.log,
+      holdDetection: room.holdDetection !== false,
+      heldMessages: room.heldMessages || {},
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
       stranded: room.stranded || {},
+      externalCursors: room.externalCursors || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
       // remote-sync path (the only caller of this function) loses its
@@ -929,7 +1041,8 @@ export async function pullGroupChatServerState(connectionId: string = groupChatS
 
   const merged = mergeRemoteGroupChatSnapshotIntoRooms(remote, $groupChats.get(), {
     preserveRooms: pending?.changedRooms || [],
-    deletedRooms: pending?.deletedRooms || []
+    deletedRooms: pending?.deletedRooms || [],
+    tombstones: groupChatTombstones
   })
 
   $groupChats.set(merged)
@@ -1020,7 +1133,9 @@ async function flushGroupChatServerSync(connectionId?: string) {
 
   try {
     const remoteState = await groupChatRemoteSnapshot(job)
-    const local = groupChatSyncSnapshot($groupChats.get())
+    // The local snapshot carries the durable disband memory, so every publish
+    // re-tombstones a mirror whose original tombstone push was lost.
+    const local = groupChatSyncSnapshot($groupChats.get(), groupChatTombstones)
     const writeRevision = remoteState.revision + 1
 
     const snapshot = mergeGroupChatSyncSnapshots(remoteState.snapshot, local, {
@@ -1042,7 +1157,8 @@ async function flushGroupChatServerSync(connectionId?: string) {
 
         const mergedRooms = mergeRemoteGroupChatSnapshotIntoRooms(remoteState.snapshot, $groupChats.get(), {
           preserveRooms: pending?.changedRooms || [],
-          deletedRooms: pending?.deletedRooms || []
+          deletedRooms: pending?.deletedRooms || [],
+          tombstones: groupChatTombstones
         })
 
         $groupChats.set(mergedRooms)
@@ -1097,7 +1213,8 @@ async function flushGroupChatServerSync(connectionId?: string) {
 
       const mergedRooms = mergeRemoteGroupChatSnapshotIntoRooms(confirmedState.snapshot, $groupChats.get(), {
         preserveRooms: pending?.changedRooms || [],
-        deletedRooms: pending?.deletedRooms || []
+        deletedRooms: pending?.deletedRooms || [],
+        tombstones: groupChatTombstones
       })
 
       $groupChats.set(mergedRooms)
@@ -1195,7 +1312,7 @@ export function scheduleGroupChatServerSync(
   // debounce fires.
   const activeId = String(groupChatSyncConnectionId() || '')
 
-  const queueFor = (connectionId: string) => {
+  const queueFor = (connectionId: string, coalesced?: GroupChatSyncJob) => {
     const id = String(connectionId || '')
     const retryTimer = groupChatSyncRetryTimers.get(id)
 
@@ -1208,9 +1325,9 @@ export function scheduleGroupChatServerSync(
       id,
       mergeGroupChatSyncJobs(groupChatSyncPendingByConnection.get(id), {
         connectionId: id,
-        allowEmpty,
-        changedRooms,
-        deletedRooms
+        allowEmpty: Boolean(allowEmpty || coalesced?.allowEmpty),
+        changedRooms: [...new Set([...(coalesced?.changedRooms || []), ...changedRooms])],
+        deletedRooms: [...new Set([...(coalesced?.deletedRooms || []), ...deletedRooms])]
       })
     )
   }
@@ -1220,9 +1337,15 @@ export function scheduleGroupChatServerSync(
     groupChatSyncTimer = null
     void groupChatSyncTargetConnections()
       .then(targets => {
+        // An ordinary update inside the debounce window replaces the timer,
+        // so secondaries must inherit the active job's coalesced intent —
+        // a disband's deletedRooms included — or the tombstone lands on the
+        // active gateway only (#105275).
+        const coalesced = groupChatSyncPendingByConnection.get(activeId)
+
         for (const target of targets) {
           if (String(target || '') !== activeId) {
-            queueFor(target)
+            queueFor(target, coalesced)
           }
         }
       })
@@ -1488,6 +1611,8 @@ export function updateGroupChat(
 
       durable[name] = {
         log: room.log,
+        holdDetection: room.holdDetection !== false,
+        heldMessages: room.heldMessages || {},
         watermarks: room.watermarks,
         sessions: room.sessions || {},
         sessionOwners: room.sessionOwners || {},
@@ -1499,6 +1624,9 @@ export function updateGroupChat(
         // must too — otherwise a window restart silently releases a bot the
         // user explicitly stopped.
         holds: room.holds || {},
+        // #93813: per-member external-write reconcile cursors. Persisted so
+        // external posts aren't re-mirrored after a window restart.
+        externalCursors: room.externalCursors || {},
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
         members: Array.isArray(room.members) ? room.members : [],
@@ -1537,12 +1665,26 @@ export interface GroupHoldStamp extends GroupHold {
 }
 
 /** The room record as the coordination engine handles it: `GroupChat` plus
- *  `turn`, the runtime-only descriptor of the member currently mid-turn. Like
- *  `running`/`epoch` it never persists, so it has no place in the durable
- *  shape. Holds carry the fuller live stamp. */
+ *  runtime-only turn/cancellation state. Like `running`/`epoch` these fields
+ *  never persist, so they have no place in the durable shape. Holds carry the
+ *  fuller live stamp. */
 export interface GroupChatRoom extends GroupChat {
   holds?: Record<string, GroupHoldStamp>
+  /** Epoch minted by the latest explicit Stop action. A turn dispatched under
+   *  an older epoch is cancelled even when sticky hold detection is disabled. */
+  stoppedEpoch?: number
   turn?: GroupMember | null
+}
+
+/** Toggle automatic text-to-hold detection for one room. Turning it off also
+ *  releases existing sticky holds; already-consumed messages remain queued
+ *  and are delivered on each member's next visible turn. */
+export function setGroupChatHoldDetection(group: string, enabled: boolean) {
+  return updateGroupChat(group, (room: GroupChatRoom) => ({
+    ...room,
+    holdDetection: enabled,
+    ...(enabled ? {} : { holds: {} })
+  }))
 }
 
 /** Set or clear a group chat's room picture (small data URL, normalized by

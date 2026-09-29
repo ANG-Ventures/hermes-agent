@@ -6,12 +6,12 @@ print and issue strings to append. No printing inside workers — the caller pri
 
 from __future__ import annotations
 
+from pm import install_hint
 import concurrent.futures
 import errno
 import functools
 import os
 import socket
-import sys
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
@@ -279,8 +279,10 @@ def _probe_bedrock() -> ProbeResult:
         n = len(client.list_foundation_models().get("modelSummaries", []))
         return _row(name, "ok", f"({auth_var}, {region}, {n} models)", label=label)
     except ImportError:
-        pip = f"{sys.executable} -m pip install boto3"
-        return _row(name, "warn", f"(boto3 not installed — {pip})", [f"Install boto3 for Bedrock: {pip}"], label=label)
+        hint = ("From the Hermes environment, run: "
+                f"{install_hint('bedrock')}. "
+                "Then restart Hermes.")
+        return _row(name, "warn", "(boto3 not installed)", [hint], label=label)
     except Exception as e:
         err_name = type(e).__name__
         return _row(name, "warn", f"({err_name}: {e})", [f"AWS Bedrock: {err_name} — check IAM permissions for bedrock:ListFoundationModels"], label=label)
@@ -311,7 +313,9 @@ def _probe_azure_entra() -> ProbeResult:
     except Exception as exc:
         return _row(name, "warn", f"(adapter import failed: {exc})", [f"Azure Foundry adapter import failed: {exc}"], label=label)
     if not has_azure_identity_installed():
-        return _row(name, "warn", "(azure-identity not installed)", [f"Install azure-identity: {sys.executable} -m pip install azure-identity"], label=label)
+        return _row(name, "warn", "(azure-identity not installed)", ["From the Hermes environment, run: "
+                     f"{install_hint('azure-identity')}. "
+                     "Then restart Hermes."], label=label)
     entra_cfg = model_cfg.get("entra") or {}
     scope = (str(entra_cfg.get("scope") or "").strip() if isinstance(entra_cfg, dict) else "") or SCOPE_AI_AZURE_DEFAULT
     info = describe_active_credential(config=EntraIdentityConfig(scope=scope), timeout_seconds=10.0)
@@ -368,6 +372,41 @@ def _probe_ipv6_path() -> ProbeResult:
     return _row(name, "ok", f"(IPv6 path to {host} reachable)")  # refused/reset also prove a live path
 
 
+# /rate_limit is reachable by EVERY token type and does not count against the quota. /user answers
+# 403 "Resource not accessible by integration" for App installation tokens (the GITHUB_TOKEN every
+# Actions job exports), which would paint a valid token red.
+GITHUB_API_PROBE_URL = "https://api.github.com/rate_limit"
+
+
+def _probe_github_token() -> ProbeResult:
+    """Validate a configured ``GITHUB_TOKEN``/``GH_TOKEN`` against api.github.com (#115257).
+
+    A dead PAT in ``.env`` used to fail every git-auth clone with a message that never named the
+    token; the resolver now falls through to the gh CLI, and this row tells the user WHICH file
+    still carries the stale token so they can remove it.
+    """
+    name = "GitHub token"
+    from hermes_cli.config import get_env_value, load_env
+    var = next((v for v in ("GITHUB_TOKEN", "GH_TOKEN") if get_env_value(v)), None)
+    if var is None:
+        return _skip(name)  # the Skills Hub section already reports gh-CLI / no-token state
+    from hermes_cli.doctor import _DHH
+    where = f"{_DHH}/.env" if var in load_env() else "the environment"
+    try:
+        import httpx
+        r = httpx.get(GITHUB_API_PROBE_URL, timeout=10, headers={
+            "Authorization": f"Bearer {get_env_value(var)}", "User-Agent": _HERMES_USER_AGENT,
+            "Accept": "application/vnd.github+json"})
+    except Exception as e:
+        return _row(name, "fail", f"({e})", ["Check network connectivity"])
+    if r.status_code == 200:
+        return _row(name, "ok", f"({var} from {where} accepted by api.github.com)")
+    if r.status_code == 401:
+        return _row(name, "fail", f"({var} in {where} rejected by api.github.com — expired or revoked)",
+                    [f"{var} in {where} is expired or revoked: remove it (gh CLI login is used instead) or paste a fresh token"])
+    return _row(name, "fail", f"(HTTP {r.status_code} from api.github.com)")
+
+
 def build_probes() -> list:
     """(label, callable) pairs in display order."""
     global _APIKEY_PROVIDERS_CACHE
@@ -379,6 +418,7 @@ def build_probes() -> list:
         # functools.partial binds each row's args so every callable keeps its own provider.
         *((row[0], functools.partial(_probe_apikey_provider, *row)) for row in _APIKEY_PROVIDERS_CACHE),
         ("AWS Bedrock", _probe_bedrock), ("Azure Foundry (Entra ID)", _probe_azure_entra),
+        ("GitHub token", _probe_github_token),
     ]
 
 
