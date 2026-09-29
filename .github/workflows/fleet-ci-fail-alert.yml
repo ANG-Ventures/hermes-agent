@@ -251,6 +251,56 @@ jobs:
               SIG=""; echo "::warning::cannot read the failing tests of run $WF_RUN_ID; paging"
             fi
           fi
+          # ALREADY-RED FOLD (t_be1b9134). One broken test on trunk ejects EVERY PR
+          # the queue tries (2026-09-28: 2 tests, 6 PRs, 9 ejection pages + 5 main
+          # pages in 3h). The per-PR dedupe above cannot see that: each PR is new.
+          # A merge_group or default-branch red whose failing tests (pytest node
+          # ids only) ALL already failed, in the last 12h, a default-branch push run
+          # or ANOTHER PR's merge_group run of this workflow is the same fault: it
+          # goes to #logs (ci-fail-known route, which falls back to #alerts if that
+          # POST fails). The first red of each test still pages, and main-red-watch
+          # owns the main episode + fix card. SIG items are "; "-separated; ANY
+          # item that is not a pytest node id (a failed job with no FAILED
+          # annotation: lint, Windows-only, a segfaulted slice) blocks the fold, so
+          # a new red job next to an old test still pages. A new test, or any API
+          # error -> no fold (page). A queue run whose ref was deleted
+          # (head_branch null) is matched to its PR by the squash subject "(#N)".
+          FOLD_RUN=""
+          if [ "$ROUTE" = alerts ] && [ -n "$WF_ID" ] \
+             && { [ -n "$PR_NUM" ] || { [ "$WF_EVENT" = push ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; }; }; then
+            if [ -z "$PR_NUM" ]; then SIG="$(sig_of "$WF_RUN_ID")" || SIG=""; fi
+            items_of() { sed 's/; /\n/g' <<< "$1" | grep -v '^$' | sort -u; }
+            if [ -n "$SIG" ] && ! items_of "$SIG" | grep -qv '::'; then
+              SINCE12="$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-12H +%Y-%m-%dT%H:%M:%SZ)"
+              CANDS="$(api "actions/workflows/$WF_ID/runs?status=failure&per_page=50" \
+                | jq -r --argjson id "$WF_RUN_ID" --arg since "$SINCE12" --arg def "$DEFAULT_BRANCH" --arg pr "$PR_NUM" \
+                  '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
+                    | (if (.head_branch // "") != ""
+                        then ((.head_branch | capture("^gh-readonly-queue/.+/pr-(?<n>[0-9]+)-[0-9a-f]+$") | .n) // "")
+                        else ((((.head_commit.message // "") + "\n") | split("\n")[0] | capture("\\(#(?<n>[0-9]+)\\)$") | .n) // "") end) as $qpr
+                    | select((.event == "push" and .head_branch == $def)
+                        or (.event == "merge_group" and $qpr != "" and $qpr != $pr))
+                    | .id][:8][]')" || CANDS=error
+              if [ "$CANDS" = error ]; then
+                echo "::warning::already-red fold: run lookup failed; paging"
+              else
+                LEFT="$(items_of "$SIG")"
+                for prev in $CANDS; do
+                  PSIG="$(sig_of "$prev")" || { LEFT="__error__"; echo "::warning::already-red fold: cannot read run $prev; paging"; break; }
+                  NEXT="$(comm -23 <(printf '%s\n' "$LEFT") <(items_of "$PSIG") | grep -v '^$' || true)"
+                  [ "$NEXT" != "$LEFT" ] && FOLD_RUN="${FOLD_RUN:+$FOLD_RUN,}$prev"   # name only runs that covered a test
+                  LEFT="$NEXT"
+                  [ -z "$LEFT" ] && break
+                done
+                if [ -z "$LEFT" ]; then
+                  ROUTE=logs; CARD="already-red (run ${FOLD_RUN})"
+                  echo "fold: '$SIG' already failed run(s) $FOLD_RUN in the last 12h -> #logs"
+                else
+                  FOLD_RUN=""
+                fi
+              fi
+            fi
+          fi
           # PLACEMENT PROBE (t_c58e7200). ci-placement-probe.yml is dispatched by
           # p4_bench.py inside a bench window, and each wave is graded by
           # p4_gates.py; the nightly bench cron pages #alerts + files a card on a
@@ -282,6 +332,10 @@ jobs:
           SUMMARY=""
           if [ -n "$PR_NUM" ]; then
             SUMMARY="PR #$PR_NUM ejected from the merge queue: ${SIG:-failing job unknown}"
+            [ -n "$FOLD_RUN" ] && SUMMARY="PR #$PR_NUM ejected on an already-red test (also failed run $FOLD_RUN): $SIG"
+            [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
+          elif [ -n "$FOLD_RUN" ]; then
+            SUMMARY="main red on an already-red test (also failed run $FOLD_RUN): $SIG"
             [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
           fi
           echo "pr=$PR_NUM" >> "$GITHUB_OUTPUT"
