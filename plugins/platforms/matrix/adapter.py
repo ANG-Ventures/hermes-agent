@@ -4685,7 +4685,7 @@ class MatrixAdapter(BasePlatformAdapter):
         explicitly named rooms win over stale/conflicting DM account data.
         """
         cached = self._room_identities.get(room_id)
-        cached_at = self._room_identity_cached_at.get(room_id, 0.0)
+        cached_at = self._room_identity_cached_at.get(room_id, float("-inf"))
         cache_fresh = (
             self._room_identity_ttl_seconds <= 0
             or time.monotonic() - cached_at <= self._room_identity_ttl_seconds

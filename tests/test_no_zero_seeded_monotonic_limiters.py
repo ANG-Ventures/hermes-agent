@@ -103,6 +103,23 @@ def _is_zero_literal(node: ast.expr | None) -> bool:
     )
 
 
+def _is_zero_default(node: ast.expr | None) -> bool:
+    """``0`` / ``0.0``, or a missing-key default ``x.get(key, 0)``.
+
+    ``last = stamps.get(chat_id, 0.0)`` seeds a per-key limiter exactly like a
+    literal: the first key reads as "attempted at boot".
+    """
+    if _is_zero_literal(node):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and len(node.args) == 2
+        and _is_zero_literal(node.args[1])
+    )
+
+
 class _Scope:
     def __init__(self, node: ast.AST, parent: "_Scope | None", is_function: bool):
         self.node = node
@@ -205,7 +222,7 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
             if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
                 continue
             right = node.right
-            if not isinstance(right, ast.Name):
+            if not isinstance(right, ast.Name) and not _is_zero_default(right):
                 continue
             left = node.left
             if isinstance(left, ast.Name):
@@ -218,10 +235,14 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
                 left_is_mono = _is_monotonic_call(left)
             if not left_is_mono:
                 continue
+            if not isinstance(right, ast.Name):
+                # inline ``<monotonic> - stamps.get(key, 0.0)``
+                hits.append(f"{filename}:{node.lineno}: {ast.unparse(right.func.value)}.get")
+                continue
             right_scope = scope.resolve(right.id)
             if right_scope is None:
                 continue
-            if any(_is_zero_literal(v) for v in right_scope.bindings.get(right.id, [])):
+            if any(_is_zero_default(v) for v in right_scope.bindings.get(right.id, [])):
                 hits.append(f"{filename}:{node.lineno}: {right.id}")
     return hits
 
@@ -306,6 +327,24 @@ def heartbeat_current_worker_from_env(progress_at=None):
             "    if math.floor(time.monotonic()) - last >= 30:\n        last = 1\n",
             ["last", "last"],
             id="round-and-floor-wrapped-monotonic",
+        ),
+        pytest.param(
+            "import time\ndef f(stamps, k):\n    now = time.monotonic()\n"
+            "    last = stamps.get(k, 0.0)\n    if now - last < 30:\n        return False\n",
+            ["last"],
+            id="dict-get-zero-default-bound",
+        ),
+        pytest.param(
+            "import time\ndef f(stamps, k):\n    now = time.monotonic()\n"
+            "    return now - stamps.get(k, 0.0) < 3600\n",
+            ["stamps.get"],
+            id="dict-get-zero-default-inline",
+        ),
+        pytest.param(
+            "import time\ndef f(stamps, k):\n    now = time.time()\n"
+            "    return now - stamps.get(k, 0.0) < 3600\n",
+            [],
+            id="dict-get-wall-clock-is-safe",
         ),
         pytest.param(
             "import time\ndef f(started):\n    last = 0\n"

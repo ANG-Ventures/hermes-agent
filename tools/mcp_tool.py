@@ -6094,7 +6094,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
         if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+            opened_at = _server_breaker_opened_at.get(server_name, float("-inf"))
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
