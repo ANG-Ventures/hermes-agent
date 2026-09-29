@@ -5,8 +5,8 @@ engines, and ``ContextEngine`` is the published contract those engines
 implement. But two host sites read attributes that live only on the built-in
 ``ContextCompressor``:
 
-* ``agent/turn_context.py`` idle-compaction floor — ``summary_target_ratio``
-* ``agent/turn_context.py`` deferred-preflight log — ``last_real_prompt_tokens``
+* ``agent/turn_context_compaction.py`` idle-compaction floor — ``summary_target_ratio``
+* ``agent/turn_context_compaction.py`` deferred-preflight log — ``last_real_prompt_tokens``
 
 Neither was declared on the ABC and neither read was guarded, so an engine that
 implements exactly the four abstract members raises ``AttributeError`` mid-turn
