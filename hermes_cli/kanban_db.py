@@ -6869,6 +6869,7 @@ def create_task(
                         inherited_origin
                         or format_origin_line(session_id, created_by=created_by),
                     )
+                ruled_mint = None
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -6894,6 +6895,19 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                    if task_status == "triage":
+                        # r16 K: a child minted under an already-ruled parent
+                        # has nothing left to rule -- it lands in todo (the
+                        # normal parent gating then promotes it) instead of a
+                        # triage card Apollo hand-resolves every sweep. Only an
+                        # explicit ``NEEDS RULING:`` body line keeps the park.
+                        from . import kanban_worker_policy as _kwp_mint
+
+                        ruled_mint = _kwp_mint.resolve_ruled_mint(
+                            conn, parents=parents, body=body,
+                        )
+                        if ruled_mint is not None:
+                            task_status = "todo"
                 elif triage:
                     task_status = "triage"
                 else:
@@ -6937,6 +6951,27 @@ def create_task(
                             )
                         except Exception:
                             branch_name = None
+
+                # Placeholder-assignee lint for worker-minted cards: a human /
+                # operator lane ('apollo', 'human:x', 'default', ...) is never
+                # spawnable for a worker's child. Ruled-parent children ride
+                # the parent's lane; anything else falls back to
+                # kanban.default_assignee or the create is refused.
+                from . import kanban_worker_policy as _kwp_lint
+
+                assignee, assignee_remap, assignee_err = (
+                    _kwp_lint.resolve_worker_assignee(
+                        assignee,
+                        parent_lane=(
+                            ruled_mint.get("parent_assignee") if ruled_mint else None
+                        ),
+                    )
+                    if assignee and _kwp_lint.is_dispatched_worker()
+                    else (assignee, None, None)
+                )
+                if assignee_err:
+                    raise ValueError(assignee_err)
+                assignee = _canonical_assignee(assignee) if assignee else assignee
 
                 near_dups: list[dict] = []
                 same: list[dict] = []
@@ -7067,6 +7102,15 @@ def create_task(
                         flagship_override_author or created_by or "operator",
                         override_comment(flagship_override_reason),
                     )
+                if ruled_mint is not None:
+                    _append_event(
+                        conn,
+                        task_id,
+                        _kwp_mint.RULED_MINT_EVENT,
+                        _kwp_mint.ruled_mint_event_payload(ruled_mint),
+                    )
+                if assignee_remap is not None:
+                    _append_event(conn, task_id, "assignee_remapped", assignee_remap)
                 if forced_status and task_status == forced_status:
                     # Audit the brake on the card itself so the park is
                     # explicable without reading config: WHY this card is not

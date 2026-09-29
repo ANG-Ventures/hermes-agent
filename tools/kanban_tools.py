@@ -1647,12 +1647,9 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
-    from hermes_cli import kanban_worker_policy as _worker_policy
-    assignee, assignee_remap, assignee_err = _worker_policy.resolve_worker_assignee(
-        assignee
-    )
-    if assignee_err:
-        return tool_error(f"kanban_create: {assignee_err}")
+    # Placeholder-assignee lint (``default``/``apollo``/``human:x``) runs
+    # inside ``create_task`` so it can see the parent's lane (r16 K); the
+    # remap is read back from its ``assignee_remapped`` event below.
     body = args.get("body")
     parents = args.get("parents") or []
     parents_kind = args.get("parents_kind")
@@ -1782,11 +1779,14 @@ def _handle_create(args: dict, **kw) -> str:
                 force_reason=force_reason,
             )
             dup_warning = kb.near_duplicate_warning(conn, new_tid)
-            if assignee_remap is not None:
-                with kb.write_txn(conn):
-                    kb._append_event(
-                        conn, new_tid, "assignee_remapped", assignee_remap,
-                    )
+            _remap_row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND "
+                "kind = 'assignee_remapped' ORDER BY id DESC LIMIT 1",
+                (new_tid,),
+            ).fetchone()
+            assignee_remap = (
+                json.loads(_remap_row[0]) if _remap_row and _remap_row[0] else None
+            )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(
                 conn, new_tid, wake=args.get("wake") is True,
