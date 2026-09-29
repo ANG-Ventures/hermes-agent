@@ -251,3 +251,54 @@ async def test_config_loader_failure_cannot_collapse_the_kill_deadline(monkeypat
     monkeypatch.setattr("gateway.status._read_pid_record",
                         lambda path=None: _pid_record_with_budget(tmp_path, 300.0))
     assert run_mod._replace_takeover_grace_s(42) >= 300.0
+
+
+# --- Unknown lease: a guessed floor is not destructive authority --------------------------------
+# @andrexibiza's P1 on f2523128: a LEGACY gateway publishes no ``stop_budget_s``, but it may have
+# snapshotted a 180s (or 600s) drain at its own start. The successor has no upper bound on that
+# lease, so no finite floor may authorize SIGKILL. After the bounded wait it must abort the
+# replacement and leave the old gateway (and its PID record / locks) alone.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_state", ["lowered_to_zero", "unreadable"])
+async def test_unknown_legacy_lease_never_force_kills_at_the_floor(monkeypatch, tmp_path, config_state):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "0")
+    monkeypatch.setenv("HERMES_CRON_DRAIN_TIMEOUT", "0")
+
+    import gateway.run as run_mod
+    from gateway.restart import REPLACE_TAKEOVER_GRACE_UNKNOWN_LEASE_FLOOR_S
+
+    if config_state == "unreadable":
+        def _boom(*_a, **_kw):
+            raise RuntimeError("config.yaml is unreadable")
+
+        monkeypatch.setattr(run_mod._REAL_GATEWAY_RUNNER_CLASS, "_load_restart_drain_timeout",
+                            classmethod(_boom))
+        monkeypatch.setattr(run_mod._REAL_GATEWAY_RUNNER_CLASS, "_load_cron_drain_timeout",
+                            classmethod(_boom))
+
+    events, clock, old_alive = _install_replace_stubs(
+        monkeypatch, tmp_path,
+        pid_record=_pid_record_with_budget(tmp_path, None),  # legacy: no stop_budget_s at all
+        old_exits_at_s=150.0,  # still legitimately draining a 180s snapshotted lease at the floor
+    )
+    cleanup = []
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: cleanup.append("remove_pid_file"))
+    monkeypatch.setattr("gateway.status.release_all_scoped_locks",
+                        lambda **kwargs: cleanup.append("release_all_scoped_locks") or 0)
+
+    ok = await run_mod._start_gateway_replace_existing_instance(42, replace=True)
+
+    forced = [e for e in events if e[2] is True]
+    assert not forced, (
+        f"SIGKILL fired at t={forced[0][3]}s against a legacy gateway whose lease is unknown"
+    )
+    assert events and events[0][:3] == ("terminate", 42, False)
+    # Bounded: the replacement gives up without destruction instead of waiting forever.
+    assert ok is False
+    assert clock["t"] >= REPLACE_TAKEOVER_GRACE_UNKNOWN_LEASE_FLOOR_S
+    assert clock["t"] < 150.0
+    assert old_alive["v"] is True  # the old gateway is left to finish its own drain
+    assert cleanup == []  # its PID record and scoped locks are still its own

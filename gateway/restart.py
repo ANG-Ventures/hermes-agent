@@ -381,8 +381,10 @@ REPLACE_TAKEOVER_GRACE_HEADROOM_S = 30.0
 # started before this field existed) or its record/config is unreadable. An unknown lease must not
 # be treated as the shortest lease: config is re-read in the REPLACEMENT process and can have been
 # lowered (or made unparseable) since the old process snapshotted its own, so a config-derived
-# answer can authorize a SIGKILL while the old gateway is still legitimately draining. Fail closed
-# on the same conservative bound systemd already uses for "stuck". Caught by @andrexibiza.
+# answer can authorize a SIGKILL while the old gateway is still legitimately draining. With an
+# unknown lease this floor is only how long ``--replace`` waits before ABORTING without SIGKILL:
+# it is a lower bound on the old lease, never an upper one, so it grants no destructive authority.
+# Caught by @andrexibiza.
 REPLACE_TAKEOVER_GRACE_UNKNOWN_LEASE_FLOOR_S = SYSTEMD_TIMEOUT_STOP_SEC_FLOOR
 
 
