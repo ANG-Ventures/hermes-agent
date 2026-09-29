@@ -13,6 +13,7 @@ import contextlib
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
+import weakref
 import atexit
 import base64
 import binascii
@@ -3283,16 +3284,19 @@ async def _blocking_io(fn, *args):
     return await loop.run_in_executor(None, fn, *args)
 
 
-_SESSION_DB_HEAVY_READ_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+# Keyed by the loop OBJECT, weakly: an id() key outlives its loop and can be reused by a
+# new loop, handing it a semaphore bound to the dead one (FleetReview P2 backfill #92).
+_SESSION_DB_HEAVY_READ_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _session_db_heavy_read_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
-    key = id(loop)
-    semaphore = _SESSION_DB_HEAVY_READ_SEMAPHORES.get(key)
+    semaphore = _SESSION_DB_HEAVY_READ_SEMAPHORES.get(loop)
     if semaphore is None:
         semaphore = asyncio.Semaphore(2)
-        _SESSION_DB_HEAVY_READ_SEMAPHORES[key] = semaphore
+        _SESSION_DB_HEAVY_READ_SEMAPHORES[loop] = semaphore
     return semaphore
 
 

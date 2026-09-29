@@ -1105,6 +1105,48 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
 _FROZEN_TOOL_SNAPSHOT_GENERATION: int = 2_147_483_647
 
 
+# In-flight fork cache tags per parent session. Two forks alive at once under
+# the SAME tag share one slot-keyed cache scope and evict each other
+# (FleetReview #91); a sequential fork reuses the base tag so its slot stays
+# warm across reviews.
+_FORK_TAGS_LOCK = threading.Lock()
+_FORK_TAGS_IN_FLIGHT: Dict[Tuple[Any, str], set] = {}
+
+
+def _release_fork_cache_tag(session_id: Any, base: str, tag: str) -> None:
+    with _FORK_TAGS_LOCK:
+        held = _FORK_TAGS_IN_FLIGHT.get((session_id, base))
+        if held is not None:
+            held.discard(tag)
+            if not held:
+                _FORK_TAGS_IN_FLIGHT.pop((session_id, base), None)
+
+
+def _claim_fork_cache_tag(fork: Any, session_id: Any, base: str) -> str:
+    """``base`` when no other live fork of this parent holds it, else
+    ``base-2``, ``base-3``... Released when the fork closes (or is collected)."""
+    import weakref
+
+    with _FORK_TAGS_LOCK:
+        held = _FORK_TAGS_IN_FLIGHT.setdefault((session_id, base), set())
+        tag, n = base, 1
+        while tag in held:
+            n += 1
+            tag = f"{base}-{n}"
+        held.add(tag)
+    release = weakref.finalize(fork, _release_fork_cache_tag, session_id, base, tag)
+    close = getattr(fork, "close", None)
+    if callable(close):
+        def _close_and_release(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return close(*args, **kwargs)
+            finally:
+                release()
+
+        fork.close = _close_and_release
+    return tag
+
+
 def build_cache_parity_fork(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -1329,8 +1371,10 @@ def build_cache_parity_fork(
     # this tag to the cache scope ONLY for slot-keyed providers; content-
     # addressed providers keep the shared scope (see
     # agent/prompt_cache_scope.py).
-    review_agent._prompt_cache_fork_tag = (
-        "review" if write_origin == "background_review" else str(write_origin or "fork")
+    review_agent._prompt_cache_fork_tag = _claim_fork_cache_tag(
+        review_agent,
+        agent.session_id,
+        "review" if write_origin == "background_review" else str(write_origin or "fork"),
     )
     # The fork shares the parent's live session_id (pinned above for
     # prefix-cache parity). It is single-lifecycle and calls close()

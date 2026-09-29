@@ -23,6 +23,12 @@ jobs:
         with:
           fetch-depth: 0  # Full history needed for git log
           filter: tree:0 # treeless: commit graph only; ~1 GiB pack otherwise blows the job timeout on self-hosted
+          # Only these two paths are read. A full treeless checkout lazily fetched every tree+blob and
+          # hit HTTP 429 from the promisor remote, ejecting #1413 from the merge queue (t_2a6d0f40).
+          sparse-checkout: |
+            /contributors/
+            /scripts/release.py
+          sparse-checkout-cone-mode: false
 
       - name: Check for unmapped contributor emails
         id: check-emails

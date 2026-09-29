@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.ci_overflow_plan import APPROVED, ARM  # noqa: E402
+from scripts.ci_overflow_plan import ARM, BLACKSMITH, PLACEABLE  # noqa: E402
 from scripts.ci_overflow_request import is_core  # noqa: E402
 
 LEDGER_BRANCH = "ci-overflow-ledger"
@@ -93,10 +93,13 @@ def validate_record(state, *, repository_id: int, run_id: int, run_attempt: int,
             raise PlanInvalid("job entry schema")
         if job["job_id"] in labels:
             raise PlanInvalid("duplicate job id")
-        if tuple(job["labels"]) not in APPROVED:
+        if tuple(job["labels"]) not in PLACEABLE:
             raise PlanInvalid(f"label set not allowlisted for {job['job_id']}")
         if job["labels"] == ARM and job["job_id"] in never_arm:
             raise PlanInvalid(f"{job['job_id']} may not run on ARM")
+        # Paid venue: the planner only names it for reserved non-core slices (t_fe4e801b).
+        if job["labels"] == BLACKSMITH and (job["job_id"] in never_arm or not job["reserved_minutes"]):
+            raise PlanInvalid(f"{job['job_id']} may not run on Blacksmith")
         labels[job["job_id"]] = job["labels"]
     if set(labels) != want_ids:
         raise PlanInvalid("job id set incomplete or foreign")

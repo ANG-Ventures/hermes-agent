@@ -203,9 +203,9 @@ NOTIONAL_OPENROUTER_PROVIDERS = frozenset({
 # cash cost is $0 (flat Kimi membership); for cost visibility their K3 turns
 # are priced at the OpenRouter ``moonshotai/kimi-k3`` snapshot below and carry
 # status "estimated". Membership model ids (k3, k3-256k) and the harness id
-# (kimi-k3) all normalize to that one vendor model. Other membership ids
-# (kimi-for-coding*, a different model family) stay unpriced rather than
-# borrowing K3 rates.
+# (kimi-k3) all normalize to that one vendor model. The K2.x ids the cpa
+# proxy serves have their own rows next to K3 (t_a9b4f1ad). kimi-for-coding*
+# (a different model family, not served by cpa) stays unpriced.
 # Vendor membership is decided by the shared _infer_vendor_from_model(), never
 # by the provider name alone. kimi-code is now an alias of the multi-vendor
 # ``cpa`` proxy lane and stays here only for rows recorded before the rename;
@@ -393,6 +393,12 @@ class PricingEntry:
     input_cost_per_million_above: Optional[Decimal] = None
     output_cost_per_million_above: Optional[Decimal] = None
     cache_read_cost_per_million_above: Optional[Decimal] = None
+    # Announced rate change. When a vendor publishes the rates a model will
+    # switch to on a known date, the row carries both: from ``superseded_at``
+    # (tz-aware, inclusive) ``get_pricing_entry`` returns ``superseded_by``
+    # instead of this entry. See ``_effective_pricing_entry``.
+    superseded_at: Optional[datetime] = None
+    superseded_by: Optional["PricingEntry"] = None
 
 
 @dataclass(frozen=True)
@@ -438,6 +444,67 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://openrouter.ai/moonshotai/kimi-k3",
         pricing_version="openrouter-kimi-k3-2026-09-27",
+    ),
+    # ── Moonshot Kimi K2.x (membership ids the cpa proxy serves) ──────────
+    # Notional list prices so these turns read "estimated", not "unknown"
+    # (t_a9b4f1ad). Membership cash cost stays $0. Source: models.dev
+    # 2026-09-28, first-party ``moonshotai`` row first, else the moonshot row
+    # a gateway republishes, else OpenRouter ``moonshotai/*``. USD per 1M
+    # tokens; cache write priced at input (none published). Ids with no public
+    # price alias onto a sibling row below the dict.
+    # models.dev openrouter moonshotai/kimi-k2 2026-09-28 (no cache price: cache read = input)
+    ("moonshotai", "kimi-k2"): PricingEntry(
+        input_cost_per_million=Decimal("0.57"),
+        output_cost_per_million=Decimal("2.30"),
+        cache_read_cost_per_million=Decimal("0.57"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
+    ),
+    # models.dev openrouter moonshotai/kimi-k2-thinking 2026-09-28
+    ("moonshotai", "kimi-k2-thinking"): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
+    ),
+    # models.dev llmgateway-providers moonshot/kimi-k2.5 2026-09-28
+    ("moonshotai", "kimi-k2.5"): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("3.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
+    ),
+    # models.dev moonshotai 2026-09-28
+    ("moonshotai", "kimi-k2.6"): PricingEntry(
+        input_cost_per_million=Decimal("0.95"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.16"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
+    ),
+    # models.dev moonshotai 2026-09-28
+    ("moonshotai", "kimi-k2.7-code"): PricingEntry(
+        input_cost_per_million=Decimal("0.95"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.19"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
+    ),
+    # models.dev moonshotai 2026-09-28
+    ("moonshotai", "kimi-k2.7-code-highspeed"): PricingEntry(
+        input_cost_per_million=Decimal("1.90"),
+        output_cost_per_million=Decimal("8.00"),
+        cache_read_cost_per_million=Decimal("0.38"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
     ),
     # ── xAI Grok ─────────────────────────────────────────────────────────
     # Priced from OpenRouter's live catalog snapshot (per-1M in/out; cache
@@ -522,6 +589,26 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://openrouter.ai/x-ai/grok-4.20-multi-agent",
         pricing_version="xai-pricing-2026-07",
+    ),
+    # models.dev poe/helicone xai/grok-3-mini 2026-09-28 (no first-party xai row)
+    ("xai", "grok-3-mini"): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="modelsdev-2026-09-28",
+    ),
+    # grok-3-mini-fast: absent from models.dev/OpenRouter 2026-09-28; xAI's
+    # published launch rate (grok-3-mini-fast-beta) is $0.60/$4.00, NOT the
+    # grok-3-mini rate. No cache-read rate published: cache read = input.
+    ("xai", "grok-3-mini-fast"): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.60"),
+        source="official_docs_snapshot",
+        source_url="https://docs.x.ai/docs/models",
+        pricing_version="xai-grok-3-mini-fast-launch-2025",
     ),
     # ── OpenAI GPT-5.6 series (Sol/Terra/Luna) ───────────────────────────
     # Announced in limited preview 2026-06-26; GA 2026-07-09 at the same
@@ -912,6 +999,22 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
+    # Claude Sonnet 5.5 (launched 2026-09-28). Sonnet 5.5 launch 2026-09-28, same list
+    # as Sonnet 5's announced rate: $2/$10 per MTok in/out, cache read $0.20; cache
+    # write $2.50 (1.25x input, 5-minute TTL).
+    # Source: https://www.anthropic.com/claude-sonnet-5-5
+    (
+        "anthropic",
+        "claude-sonnet-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://www.anthropic.com/claude-sonnet-5-5",
+        pricing_version="anthropic-sonnet-5-5-2026-09",
+    ),
     # Claude Sonnet 5 (released 2026-06-30). List price $3/$15; cache read $0.30 (0.1x input).
     # Intro pricing $2/$10 in/out runs through 2026-08-31 — the cost-book uses the
     # standing LIST rate (as the rest of this table does), so it does not under-count
@@ -1194,8 +1297,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # Google Gemini
     # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
     # These are the launch rates Google lists "through December 31, 2026"; the
-    # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027", so this row
-    # must be re-read then.
+    # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027". Both are
+    # encoded: the launch row switches to the 2027 row at 2027-01-01T00:00Z.
     (
         "google",
         "gemini-3.8-flash",
@@ -1206,6 +1309,15 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://ai.google.dev/gemini-api/docs/pricing",
         pricing_version="google-pricing-2026-09-28",
+        superseded_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        superseded_by=PricingEntry(
+            input_cost_per_million=Decimal("1.50"),
+            output_cost_per_million=Decimal("7.50"),
+            cache_read_cost_per_million=Decimal("0.15"),
+            source="official_docs_snapshot",
+            source_url="https://ai.google.dev/gemini-api/docs/pricing",
+            pricing_version="google-pricing-2027-01-01",
+        ),
     ),
     (
         "google",
@@ -1369,6 +1481,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="anthropic-list-2026-07",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-sonnet-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://www.anthropic.com/claude-sonnet-5-5",
+        pricing_version="anthropic-sonnet-5-5-2026-09",
     ),
     (
         "bedrock",
@@ -1704,6 +1828,24 @@ for _alias, _canonical in {
         ("google", _canonical)
     ]
 del _alias, _canonical
+
+# Ids the cpa proxy serves (t_a9b4f1ad). Dated grok-4.20 ids: models.dev xai
+# 2026-09-28 prices each at the undated row's rate (1.25/2.5/0.2), so alias
+# rather than duplicate. The rest have NO public price as of 2026-09-28 and
+# borrow a sibling row (named per id) so the turn reads "estimated".
+for _vendor, _alias, _canonical in (
+    ("xai", "grok-4.20-0309-reasoning", "grok-4.20"),  # models.dev xai
+    ("xai", "grok-4.20-0309-non-reasoning", "grok-4.20"),  # models.dev xai
+    ("xai", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent"),  # models.dev xai
+    ("xai", "grok-4.7-build-fast", "grok-build-0.1"),  # sibling grok-build-0.1
+    ("xai", "grok-composer-2.5-fast", "grok-build-0.1"),  # sibling grok-build-0.1
+    ("moonshotai", "kimi-k2.8", "kimi-k2.7-code"),  # sibling kimi-k2.7-code
+    ("moonshotai", "kimi-k2.8-code", "kimi-k2.7-code"),  # sibling kimi-k2.7-code
+):
+    _OFFICIAL_DOCS_PRICING[(_vendor, _alias)] = _OFFICIAL_DOCS_PRICING[
+        (_vendor, _canonical)
+    ]
+del _vendor, _alias, _canonical
 
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
@@ -2578,13 +2720,54 @@ def _pricing_entry_from_metadata(
     )
 
 
+def _is_unpriced_proxy_route(route: BillingRoute) -> bool:
+    """True for a proxy-lane route whose served vendor has no pricing lane.
+
+    ``resolve_billing_route`` re-routes a proxy turn to its vendor's notional
+    lane (``_PROXY_VENDOR_PRICING_LANE``); a route still carrying the proxy's
+    own provider name is one it refused. Such a turn must stay unpriced: the
+    M1 vendor fallback in ``_lookup_official_docs_pricing`` would otherwise
+    price e.g. ``claude-*`` via ``cpa`` at Anthropic rates the proxy has no
+    lane for.
+    """
+    return route.provider in NOTIONAL_PROXY_PROVIDERS
+
+
+def _effective_pricing_entry(
+    entry: Optional[PricingEntry], now: Optional[datetime] = None
+) -> Optional[PricingEntry]:
+    """Follow an entry's announced rate changes that have taken effect by ``now``."""
+    when = now or _UTC_NOW()
+    while (
+        entry is not None
+        and entry.superseded_at is not None
+        and entry.superseded_by is not None
+        and when >= entry.superseded_at
+    ):
+        entry = entry.superseded_by
+    return entry
+
+
 def get_pricing_entry(
     model_name: str,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Optional[PricingEntry]:
+    return _effective_pricing_entry(
+        _resolve_pricing_entry(model_name, provider, base_url, api_key)
+    )
+
+
+def _resolve_pricing_entry(
+    model_name: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    if _is_unpriced_proxy_route(route):
+        return None
     if route.billing_mode == "subscription_included":
         return PricingEntry(
             input_cost_per_million=_ZERO,
@@ -2669,6 +2852,8 @@ def is_known_model(
     except Exception:
         # Never let a probe raise into a caller on the record path.
         return True
+    if _is_unpriced_proxy_route(route):
+        return False
     if route.billing_mode == "subscription_included":
         return True
     # Dynamic-catalog and endpoint-metadata routes are out of scope (see above).

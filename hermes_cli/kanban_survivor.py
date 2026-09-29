@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
@@ -1528,6 +1529,112 @@ def _base(repo, published):
     return min(candidates)[1]
 
 
+#: A full object id (SHA-1 or SHA-256); anything else in `bases` is not a
+#: base and must never reach git's argv, where it could parse as an option.
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def _recorded_base(repo, recorded, published, base):
+    """``recorded`` when it is a safe, NEWER base than ``base``; else ``base``.
+
+    ``_base`` can only rank published heads present in the local object store.
+    When a remote branch has moved past what this checkout fetched, its tip
+    is absent and the nearest ranked head can be far older than the fork
+    point, so the patch drags in the published history between them
+    (t_93fba703: 111 files, 5.2 MB for a one-file card). The recorded base
+    (HEAD at dispatch) is the fork point. It is used only when it is
+    ``base`` or a descendant of it, an ancestor of HEAD, and contained in the
+    local remote-tracking ref of a branch the durable remote still advertises,
+    AND it is reachable from that branch's LIVE tip (see
+    `_reachable_from_live`). Otherwise nothing changes.
+    """
+    if not isinstance(recorded, str) or not _OBJECT_ID.fullmatch(recorded) or recorded == base:
+        return base
+    # ONE spawn answers presence and containment for every tracking ref at
+    # once (a missing object exits non-zero). A per-published-head loop here
+    # starves the terminal transition on a many-headed fork
+    # (test_kanban_terminal_transition_ref_cost), so it is checked first.
+    # Keep each ref's (remote, branch): a remote name may itself contain `/`,
+    # so the pair cannot be re-parsed from the tracking ref name.
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": (ref["remote"], ref["branch"])
+                  for ref in published}
+    listed = _git(repo, "for-each-ref", "--contains", recorded, "--format=%(refname)",
+                  "refs/remotes", check=False)
+    if listed.returncode:
+        return base
+    matched = set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+    if not matched:
+        return base
+    if _git(repo, "merge-base", "--is-ancestor", recorded, "HEAD", check=False).returncode:
+        return base
+    if base is not None and _git(repo, "merge-base", "--is-ancestor", base, recorded,
+                                 check=False).returncode:
+        return base
+    # A tracking ref is only what this checkout LAST fetched; the live branch
+    # may since have been force-pushed to unrelated history, and a server may
+    # still STORE the orphaned commit until gc (FleetReview P1s on #1449), so
+    # neither the tracking ref nor object presence proves a fresh clone of the
+    # branch can reach it. Prove reachability from the live tip instead.
+    # Network only here, after every cheap local check passed; one fetch per
+    # matched branch (normally one), never per published head, and ONE
+    # overall budget: a hung remote must not cost 120 s per matched branch.
+    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
+    for ref in sorted(matched):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        remote, branch = advertised[ref]
+        if _reachable_from_live(repo, remote, branch, recorded, timeout=remaining):
+            return recorded
+    return base
+
+
+#: TOTAL budget for proving the recorded base against live branches. A timeout just
+#: keeps the older published base: a larger patch, never a lost one.
+_LIVE_BASE_TIMEOUT = 120
+
+
+def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOUT):
+    """True only if ``sha`` is an ancestor of ``remote``'s LIVE ``branch`` tip.
+
+    Fetches the branch into a throwaway bare repository that borrows
+    ``repo``'s objects (the `_content_advisory` pattern), so the workspace's
+    own refs and object store are never written. A ref at ``sha`` in the
+    probe makes negotiation advertise it as a ``have``, so when ``sha`` is on
+    the branch the server sends only ``sha..tip``, not the whole history.
+    """
+    objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects",
+                   check=False)
+    url = _git(repo, "remote", "get-url", remote, check=False)
+    # The probe must share the workspace's object format: a default (SHA-1)
+    # probe rejects a 64-hex SHA-256 base at `update-ref`.
+    fmt = _git(repo, "rev-parse", "--show-object-format", check=False)
+    if objects.returncode or url.returncode or fmt.returncode:
+        return False
+    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.decode().strip())
+    with tempfile.TemporaryDirectory(prefix="kanban-base-") as tmp:
+        probe = Path(tmp) / "probe.git"
+        try:
+            _git(repo, "init", "-q", "--bare",
+                 f"--object-format={fmt.stdout.decode().strip()}", str(probe))
+            if _git(probe, "update-ref", "refs/heads/recorded", sha, env=env,
+                    check=False).returncode:
+                return False
+            fetched = _git(
+                probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
+                "fetch", "-q", "--no-tags", "candidate",
+                f"+refs/heads/{branch}:refs/heads/candidate",
+                env=dict(env, KANBAN_FETCH_URL=url.stdout.decode().strip()),
+                check=False, timeout=timeout,
+            )
+            if fetched.returncode:
+                return False
+            return _git(probe, "merge-base", "--is-ancestor", sha, "refs/heads/candidate",
+                        env=env, check=False).returncode == 0
+        except (subprocess.TimeoutExpired, SurvivorUnavailable, OSError):
+            return False
+
+
 def _snapshot(repo, base, prefix, *, irreversible_delete=False):
     """A bundle when ``base`` is None, else a binary patch against ``base``.
 
@@ -1584,11 +1691,12 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
 _SNAPSHOT_TIMEOUT = 300
 
 
-def _capture(repo, key, workspace):
+def _capture(repo, key, workspace, recorded=None):
     """One repository's survivor material: (remote ref, base, snapshot bytes).
 
     Extracted verbatim from `preserve`'s loop so the object-reading steps sit
-    inside a single `try` the caller can classify. Behaviour is unchanged.
+    inside a single `try` the caller can classify. ``recorded`` is the
+    repository's dispatch-time base from `bases` (see `_recorded_base`).
     """
     storage_cache = {}
     published = list(_published_refs(repo, workspace, storage_cache))
@@ -1611,7 +1719,7 @@ def _capture(repo, key, workspace):
                 })
         if ref:
             return ref, None, None
-    base = _base(repo, published)
+    base = _recorded_base(repo, recorded, published, _base(repo, published))
     prefix = "" if key == "." else key + "/"
     return None, base, _snapshot(repo, base, prefix)
 
@@ -2840,7 +2948,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 refs.append(dict(stub_ref, repository=key))
                 continue
             try:
-                ref, base, data = _capture(repo, key, workspace)
+                ref, base, data = _capture(repo, key, workspace, (bases or {}).get(key))
                 irreversible = False
                 if base is not None and data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
                     # Only deleted-file preimages are dropped, and those are

@@ -15,8 +15,12 @@ from agent.usage_pricing import (
     CanonicalUsage,
     NOTIONAL_PROXY_PROVIDERS,
     UNKNOWN_VENDOR,
+    _PROXY_VENDOR_PRICING_LANE,
+    _infer_vendor_from_model,
     attribute_route,
     estimate_usage_cost,
+    get_pricing_entry,
+    is_known_model,
 )
 from plugins import blackbox
 from plugins.blackbox import store
@@ -97,6 +101,21 @@ def test_proxy_grok_turn_prices_like_xai_oauth():
 def test_proxy_unknown_model_stays_unpriced():
     usage = CanonicalUsage(input_tokens=1_000, output_tokens=100)
     assert estimate_usage_cost("frobnicate-9", usage, provider="cpa").amount_usd is None
+
+
+@pytest.mark.parametrize("provider", _PROXIES)
+@pytest.mark.parametrize("model", ["claude-opus-4-5", "gemini-2.5-pro"])
+def test_proxy_vendor_without_pricing_lane_stays_unpriced(provider, model):
+    # The served vendor is recognised and has a direct-lane rate, but no proxy
+    # pricing lane: the vendor fallback must not borrow that rate.
+    assert _infer_vendor_from_model(model) not in _PROXY_VENDOR_PRICING_LANE
+    usage = CanonicalUsage(input_tokens=1_000, output_tokens=100)
+    result = estimate_usage_cost(model, usage, provider=provider)
+    assert result.amount_usd is None and result.status == "unknown"
+    assert get_pricing_entry(model, provider=provider) is None
+    assert is_known_model(model, provider=provider) is False
+    # The same model is priced on its own vendor's route.
+    assert get_pricing_entry(model, provider=_infer_vendor_from_model(model)) is not None
 
 
 def test_every_registered_provider_maps_to_a_named_family():

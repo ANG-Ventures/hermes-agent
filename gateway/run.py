@@ -4028,8 +4028,15 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-async def _probe_audio_duration(path: str) -> Optional[str]:
-    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
+_FFPROBE_TIMEOUT_S = 5.0
+
+
+async def _probe_audio_duration(path: str, *, allow_subprocess: bool = True) -> Optional[str]:
+    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure.
+
+    ``allow_subprocess=False`` keeps to the in-process header reads (wav/ogg)
+    and never spawns ffprobe.
+    """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".wav":
@@ -4055,17 +4062,28 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         except Exception:
             pass
 
+    if not allow_subprocess:
+        return None
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_FFPROBE_TIMEOUT_S)
         if proc.returncode == 0:
             return _format_duration(float(stdout.decode().strip()))
-    except Exception:
-        pass
+    except BaseException as exc:
+        # Timed out or cancelled (e.g. by a caller's wait_for): never leave
+        # ffprobe running behind us (FleetReview #115).
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not isinstance(exc, Exception):
+            raise
 
     return None
 
@@ -4111,9 +4129,12 @@ async def _inbound_log_preview(event) -> str:
         return text[:80].replace("\n", " ")
     duration = None
     if voice_paths:
+        # A log label must not cost the admitted turn an ffprobe spawn (up to
+        # the whole timeout): header reads only; anything else logs "?s"
+        # (FleetReview #115).
         try:
             duration = await asyncio.wait_for(
-                _probe_audio_duration(os.path.abspath(voice_paths[0])),
+                _probe_audio_duration(os.path.abspath(voice_paths[0]), allow_subprocess=False),
                 timeout=_VOICE_LOG_PROBE_TIMEOUT_S,
             )
         except Exception:
@@ -13825,6 +13846,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+        # Turns still in flight here (drain + interrupt-settle expired while
+        # blocked in a provider stream or a tool) never return from
+        # run_conversation before the process exits, so on_session_end never
+        # fires and Blackbox keeps their turn_api_calls with no turns row.
+        # Record them as interrupted now; finished turns are skipped by the
+        # per-turn emitted marker. Off-loop + bounded like the hooks below.
+        await self._emit_abandoned_turn_session_ends(active_agents)
         for agent in active_agents.values():
             # Persist any in-flight transcript to the SQLite session store
             # before teardown (#13121).  An agent forcibly interrupted by the
@@ -13977,6 +14005,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # enough for a normal trace-export flush, small enough that a wedged
     # plugin can never eat the systemd stop window.
     _FINALIZE_TIMEOUT_S = 10.0
+
+    async def _emit_abandoned_turn_session_ends(
+        self, active_agents: Dict[str, Any]
+    ) -> None:
+        # Drain-start snapshot PLUS whatever is running now: a pending
+        # sentinel promoted to a real agent during the drain is only in the
+        # live map. The helper de-duplicates.
+        agents = [
+            a for a in active_agents.values() if a is not _AGENT_PENDING_SENTINEL
+        ]
+        try:
+            agents.extend(self._snapshot_running_agents().values())
+        except Exception:
+            pass
+        # Cron turns run on the scheduler's own pool, outside _running_agents
+        # (the drain already waits on them via _active_cron_job_count).
+        try:
+            from cron.scheduler import live_cron_agents
+
+            agents.extend(live_cron_agents())
+        except Exception:
+            pass
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            # /v1/runs agents AND the _run_agent() turns (session chat, chat
+            # completions, responses) -- same two registries the drain
+            # interrupt walks; the helper de-duplicates by identity.
+            for _reg in ("_active_run_agents", "_shutdown_interruptible_agents"):
+                agents.extend(
+                    a for a in list(getattr(adapter, _reg, {}).values()) if a is not None
+                )
+        except Exception:
+            pass
+        if not agents:
+            return
+        reason = (
+            "gateway_restart"
+            if getattr(self, "_restart_requested", False)
+            else "gateway_shutdown"
+        )
+        # Passed by reference, never called here: the hook chain can price an
+        # unaccepted billed call (a model-metadata fetch), so it must run on
+        # the housekeeping pool, not the loop.
+        from agent.turn_finalizer import emit_abandoned_session_ends
+
+        try:
+            emitted = await asyncio.wait_for(
+                self._run_housekeeping_in_executor(
+                    "finalize", emit_abandoned_session_ends, agents, reason
+                ),
+                timeout=self._FINALIZE_TIMEOUT_S,
+            )
+            if emitted:
+                logger.info(
+                    "Shutdown: recorded %d in-flight turn(s) as interrupted (%s)",
+                    emitted,
+                    reason,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Abandoned-turn on_session_end hooks exceeded %ss; proceeding.",
+                self._FINALIZE_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.debug("Abandoned-turn on_session_end emit failed: %s", exc)
 
     async def _finalize_session_off_loop(
         self,
@@ -25265,21 +25358,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
+                # Through the once-helper (FleetReview #101): it records the
+                # echoed count on the event, so a pending/busy path that later
+                # echoes the same event's transcripts sends only the unsent tail.
                 if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                        await self._echo_pending_stt_transcripts_once(
+                            event,
+                            _echo_adapter,
+                            source,
+                            _successful_transcripts,
+                            metadata=self._thread_metadata_for_source(
+                                source, self._reply_anchor_for_event(event)
+                            ),
+                        )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -40641,6 +40734,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _loop.run_in_executor(None, discover_mcp_tools)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
+
+    # Pin one coherent code snapshot: import every first-party module now,
+    # while the tree still matches what booted, so a later fast-forward of the
+    # checkout can't feed a function-scoped import a newer module than its
+    # already-cached dependencies (see gateway/boot_preload.py).  Worker thread
+    # so the loop stays responsive; best-effort, never aborts boot.
+    try:
+        from gateway.boot_preload import preload_first_party_modules
+        await asyncio.get_running_loop().run_in_executor(None, preload_first_party_modules)
+    except Exception as e:
+        logger.warning("Boot preload failed: %s", e)
 
     # Start the gateway
     try:

@@ -4123,3 +4123,19 @@ def test_dispatch_respawn_guard_detail_names_error_and_age(kanban_home, monkeypa
         assert payload["error"] == "HTTP 429: usage limit reached"
         assert payload["recorded_at"] == now
         assert payload["eligible_at"] == now + 300
+
+
+def test_prior_worker_page_names_the_latest_rejections_pid(kanban_home):
+    """FleetReview P2 backfill #26: the page names the LATEST refusal's PID, not MAX(pid)."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pid moved", assignee="alice")
+        kb._append_event(conn, tid, "claim_rejected",
+                         {"reason": "prior_worker_still_alive", "prev_pid": 99})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='claim_rejected'",
+                     (now - 901, tid))
+        kb._append_event(conn, tid, "claim_rejected",
+                         {"reason": "prior_worker_still_alive", "prev_pid": 42})
+        stuck = [x for x in kb.respawn_guard_stuck_tasks(conn, now=now)
+                 if x["reason"] == "prior_worker_still_alive"]
+        assert [x["prev_pid"] for x in stuck] == [42]

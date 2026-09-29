@@ -129,15 +129,32 @@ def test_session_without_the_claim_is_refused(board, monkeypatch):
         assert all(c.run_id is None for c in kb.list_comments(conn, board))
 
 
+def _claim_refused(monkeypatch, tid, session):
+    """An unbindable caller's ``claim --review`` is refused up front
+    (t_c3cf232e): it could never be used, and accepting it only stranded the
+    card in ``running`` under the exited CLI's pid."""
+    _as_session(monkeypatch, session)
+    out = cli.run_slash(f"claim {tid} --review {TAKEOVER}")
+    assert "Claimed" not in out and "no session identity" in out, out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "review" and task.claim_lock is None
+
+
 def test_sessionless_claim_is_not_bound_and_refused(board, monkeypatch):
-    _claim(monkeypatch, board, None)
+    _claim_refused(monkeypatch, board, None)
+    out = cli.run_slash(
+        f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())}'
+    )
+    assert "cannot request changes" in out, out
+    assert _status(board) == "review"
+    # An explicit --takeover is the operator's override: a card parked in
+    # review is sent back without any claim (t_c3cf232e scope add).
     out = cli.run_slash(
         f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
     )
-    assert "cannot request changes" in out, out
-    # t_0485b3ff: the unbound claim is released, never stranded in running.
-    assert "released" in out, out
-    assert _status(board) == "review"
+    assert "Requested changes" in out, out
+    assert _status(board) == "ready"
 
 
 def test_delegate_child_caller_is_refused_even_with_the_claiming_session(board, monkeypatch):
@@ -164,12 +181,11 @@ def test_delegate_child_cannot_inherit_the_run_via_the_resolver(board, monkeypat
 
 def test_cron_session_cannot_bind_a_review_claim(board, monkeypatch):
     cron = "cron_abc123_20260925_150000"
-    _claim(monkeypatch, board, cron)
+    _claim_refused(monkeypatch, board, cron)
     out = cli.run_slash(
         f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
     )
     assert "cannot request changes" in out, out
-    # The cron claim bound no session: released back to review, not stranded.
     assert _status(board) == "review"
 
 
@@ -223,17 +239,30 @@ def test_in_process_gateway_still_borrows_no_env_session(monkeypatch):
     import types
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
     monkeypatch.setenv("HERMES_SESSION_ID", OTHER_SESSION)
-    monkeypatch.setitem(sys.modules, "gateway.run", types.ModuleType("gateway.run"))
+    fake_run = types.ModuleType("gateway.run")
+    runner = object()
+    fake_run._gateway_runner_ref = lambda: runner  # the gateway PROCESS
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
     assert contextvars.Context().run(cli._caller_session_id) is None
     monkeypatch.delitem(sys.modules, "gateway.run")
     assert contextvars.Context().run(cli._caller_session_id) == OTHER_SESSION
+
+
+def _legacy_unbound_claim(tid):
+    """An unbound review claim as the pre-t_c3cf232e CLI (or a legacy row)
+    left it: ``claim --review`` now refuses a sessionless caller, so build the
+    state directly to keep covering ``release_unbound_review_claim``."""
+    with kb.connect() as conn:
+        task = kb.claim_review_task(conn, tid, session_ref=None)
+    assert task is not None and task.status == "running"
+    return task.current_run_id
 
 
 def test_unbound_claim_is_released_and_sent_back_by_a_bindable_session(board, monkeypatch):
     """A claim taken with no session (the pre-fix gateway shape) no longer
     strands: request-changes from a bindable session releases it and sends
     back through the parked-review path in the same call."""
-    _claim(monkeypatch, board, None)
+    _legacy_unbound_claim(board)
     _as_session(monkeypatch, SESSION)
     out = cli.run_slash(
         f'request-changes {board} "BEHAVIOUR: fix guard" --coverage {shlex.quote(_coverage_json())} {TAKEOVER}'
@@ -247,7 +276,7 @@ def test_unbound_claim_is_released_and_sent_back_by_a_bindable_session(board, mo
 
 
 def test_unbound_claim_held_by_a_live_other_process_is_not_released(board, monkeypatch):
-    _claim(monkeypatch, board, None)
+    _legacy_unbound_claim(board)
     with kb.connect() as conn:
         host = kb._claimer_id().rpartition(":")[0]
         conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", (f"{host}:1", board))
@@ -263,7 +292,7 @@ def test_unbound_claim_held_by_a_live_other_process_is_not_released(board, monke
 
 def test_unbound_claim_held_on_a_remote_host_is_not_released(board, monkeypatch):
     """FleetReview af22d38d1623: a remote lock is not proof its claimer is gone."""
-    _claim(monkeypatch, board, None)
+    _legacy_unbound_claim(board)
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?",
                      ("some-other-host:4242", board))
@@ -281,7 +310,7 @@ def test_unbound_claim_held_on_a_remote_host_is_not_released(board, monkeypatch)
 
 def test_worker_attached_after_the_reads_blocks_the_release(board, monkeypatch):
     """FleetReview cbacb005a819: release conditions are rechecked in the txn."""
-    _claim(monkeypatch, board, None)
+    _legacy_unbound_claim(board)
     with kb.connect() as conn:
         host = kb._claimer_id().rpartition(":")[0]
         conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", (f"{host}:1", board))

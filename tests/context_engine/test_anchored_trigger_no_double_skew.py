@@ -184,15 +184,6 @@ def test_compared_tokens_match_what_the_gate_tested() -> None:
         assert fired == (compared >= THRESHOLD)
 
 
-def test_pre_api_log_line_prints_compared_value(caplog) -> None:
-    """Source-level pin: the Pre-API log's first figure is the compared value."""
-    import inspect
-
-    from agent import conversation_loop
-
-    src = inspect.getsource(conversation_loop)
-    i = src.index('"Pre-API compression: ~%s compared tokens >= %s threshold "')
-    window = src[i : i + 600]
-    assert "_trigger_compare_tokens_for(" in window
-    assert "_should_compress_request(" in src
-    assert "should_compress_calibrated\", _compressor.should_compress" not in src
+# The Pre-API log line is pinned behaviourally in tests/run_agent/
+# test_413_compression.py::TestPreflightCompression::
+# test_pre_api_log_line_prints_the_compared_value (FleetReview #14).

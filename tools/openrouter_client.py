@@ -17,16 +17,17 @@ _clients: dict = {}
 
 
 def _current_key() -> str:
-    try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+    """Return the ACTIVE profile's OpenRouter key.
 
-        try:
-            return get_secret("OPENROUTER_API_KEY") or ""
-        except UnscopedSecretError:
-            pass
+    Fail-closed under multiplex: ``UnscopedSecretError`` propagates. The only
+    consumer (MoA) runs in-turn, so an unscoped call there is a missing scope,
+    not a startup probe, and ``os.environ`` would be the host profile's key.
+    """
+    try:
+        from agent.secret_scope import get_secret
     except Exception:
-        pass
-    return os.getenv("OPENROUTER_API_KEY") or ""
+        return os.getenv("OPENROUTER_API_KEY") or ""
+    return get_secret("OPENROUTER_API_KEY") or ""
 
 
 def get_async_client():
@@ -68,4 +69,4 @@ def check_api_key() -> bool:
             pass
     except Exception:
         pass
-    return bool(_current_key())
+    return bool(os.getenv("OPENROUTER_API_KEY"))

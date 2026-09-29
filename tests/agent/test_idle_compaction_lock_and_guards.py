@@ -53,7 +53,7 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     return agent
 
 
-def _run_prologue(agent, history, user_message="hello again"):
+def _run_prologue(agent, history, user_message="hello again", estimate=None):
     """Invoke ``build_turn_context`` the way ``conversation_loop`` does.
 
     The token-threshold preflight gate is pinned False so these tests
@@ -64,7 +64,7 @@ def _run_prologue(agent, history, user_message="hello again"):
          patch("agent.turn_context._should_run_preflight_estimate",
                return_value=False), \
          patch("agent.turn_context.estimate_request_tokens_rough",
-               return_value=999_999):
+               **({"side_effect": estimate} if estimate else {"return_value": 999_999})):
         return build_turn_context(
             agent=agent,
             user_message=user_message,
@@ -111,6 +111,36 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
         ev == "lifecycle" and "Resumed after" in str(msg) for ev, msg in events
     ), f"expected idle status line, got: {events}"
 
+
+
+def test_idle_compaction_bookkeeping_raise_keeps_turn_state(tmp_path: Path) -> None:
+    """C5 #42: the post-compaction token estimate is telemetry. If it raises,
+    the turn must still get the re-derived history and re-anchored index."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_BOOKKEEPING"
+    db.create_session(sid, source="cli")
+    agent = _prep_idle_agent(db, sid)
+    calls = []
+
+    def _estimate(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            return 999_999  # the idle trigger's own estimate
+        raise RuntimeError("bookkeeping estimate failed")
+
+    # Engine left no post-size, so turn_context falls back to its own estimate.
+    with patch("agent.conversation_compression._record_blackbox_compaction",
+               lambda *a, **k: None):
+        ctx = _run_prologue(agent, _history(), estimate=_estimate)
+
+    agent.context_compressor.compress.assert_called_once()
+    assert len(calls) == 2
+    assert agent._blackbox_compaction.get("idle_compaction_fired") is True
+    # Re-anchored on the compacted list (mock compressor output), not the
+    # stale pre-compaction index (21 rows -> 2).
+    assert len(ctx.messages) < 21
+    assert 0 <= ctx.current_turn_user_idx < len(ctx.messages)
+    assert agent._persist_user_message_idx == ctx.current_turn_user_idx
 
 def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None:
     """An idle-triggered compress racing another path must sit the round out.

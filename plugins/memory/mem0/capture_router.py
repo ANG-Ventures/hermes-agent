@@ -566,9 +566,34 @@ class CaptureRouter:
     # -- staged write -------------------------------------------------------
     @staticmethod
     def _default_write(path: str, content: str) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        # Publish atomically: route_turn treats an existing <turn_id>.md as a completed stage,
+        # so a crash mid-write must never leave a truncated file at the final path. The temp
+        # name does not end in .md, so neither that lookup nor an inbox sweep can pick it up.
+        # Every write gets its own random O_EXCL temp file: two same-process writers staging the
+        # same path must not share (and truncate/rename) one PID-derived temp name. Created with
+        # 0o666 so the kernel applies the process umask, exactly as a plain open() would; never
+        # fchmod to a fixed mode, which would widen files under a restrictive umask (e.g. 077).
+        dirname = os.path.dirname(path)
+        os.makedirs(dirname, exist_ok=True)
+        while True:
+            tmp = os.path.join(dirname, f"{os.path.basename(path)}.{os.urandom(8).hex()}.tmp")
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                break
+            except FileExistsError:
+                continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _stage_world_facts(self, facts: List[Dict[str, Any]], dest_dir: str, *,
                            turn_id: str, session: str, ts: Optional[str]) -> str:

@@ -28,6 +28,14 @@ ACTIVITY_DESCRIPTION_MAX = 120
 # cadence. force_persist (terminal stamps) is the only bypass.
 SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 
+# "Never persisted" / "window cleared" value for
+# ``agent._session_activity_last_persist_mono``. It is compared against
+# ``time.monotonic()``, which counts from host boot, so 0.0 is NOT "long ago":
+# during the first 60s after boot (fresh CI VM, gateway started at login)
+# ``monotonic() - 0.0 < 60`` and the first stamp plus every force_persist
+# terminal label were silently rate-limited out. -inf is always due.
+SESSION_ACTIVITY_PERSIST_NEVER = float("-inf")
+
 
 class ActivityProvenance(str, Enum):
     """Where a durable/in-memory activity stamp came from."""
@@ -70,7 +78,7 @@ def reset_session_activity_persist_window(agent: Any) -> None:
     text (e.g. "context compression in progress" after /compress).
     """
     try:
-        agent._session_activity_last_persist_mono = 0.0
+        agent._session_activity_last_persist_mono = SESSION_ACTIVITY_PERSIST_NEVER
     except Exception:
         pass
 

@@ -389,6 +389,7 @@ def test_live_event_survives_a_transient_card_read_failure(worker_card):
     task_id, _ = worker_card
     agent = _worker_agent()
     _set_live(task_id, touch_effort=True, effort="low")
+    kwr.card_pinned_route()  # the poll's pin snapshot; the flaky read is the poll's own
     real_get_task = kb.get_task
     calls = []
 

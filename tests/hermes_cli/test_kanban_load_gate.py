@@ -214,3 +214,89 @@ def test_run_daemon_applies_gate(kanban_home, monkeypatch):
     assert "load1=146.0" in captured[0]["spawn_paused"]
     assert gate.state == "paused"
     assert klg.read_state()["state"] == "paused"
+
+
+# --- per-board split of one tick's allowance (t_f78d1938) -------------------
+
+
+def _simulate_ticks(split, ticks, allowance, ready):
+    """Drive ``split`` for N ticks; each tick every board spawns its quota."""
+    got = []
+    for t in range(ticks):
+        demand = [(slug, n) for slug, n in ready.items()]
+        quotas = split(allowance, demand, start=t)
+        got.append(dict(quotas))
+        for slug, q in quotas.items():
+            ready[slug] -= q or 0
+    return got
+
+
+def test_split_allowance_never_starves_the_second_board():
+    """2 boards, allowance 4, A has 10 ready, B has 3 -> B gets >= 1 every
+    tick while it has ready work. The fixed-order consumer this replaces
+    gave A 4/4 on every tick and B nothing (subs-ace 0 spawns for 93 min)."""
+    got = _simulate_ticks(klg.split_allowance, 3, 4, {"a": 10, "b": 3})
+    assert [g["b"] for g in got] == [2, 1, 0]
+    assert all(sum(g.values()) == 4 for g in got)
+    assert [g["a"] for g in got] == [2, 3, 4]
+
+
+def test_fixed_order_mutant_goes_red():
+    def fixed_order(allowance, demand, start=0):
+        left, out = allowance, {}
+        for slug, n in demand:
+            out[slug] = min(n, left)
+            left -= out[slug]
+        return out
+
+    got = _simulate_ticks(fixed_order, 2, 4, {"a": 10, "b": 3})
+    assert any(g["b"] == 0 for g in got)  # the starvation the split removes
+
+
+def test_split_allowance_rotates_first_pick_when_allowance_is_one():
+    firsts = [
+        [s for s, q in klg.split_allowance(1, [("a", 5), ("b", 5), ("c", 5)], start=t).items() if q][0]
+        for t in range(6)
+    ]
+    assert firsts == ["a", "b", "c", "a", "b", "c"]
+
+
+def test_split_allowance_edges():
+    assert klg.split_allowance(None, [("a", 3)]) == {"a": None}
+    assert klg.split_allowance(0, [("a", 3), ("b", 1)]) == {"a": 0, "b": 0}
+    # demand below allowance: every board gets its whole demand, no more
+    assert klg.split_allowance(4, [("a", 1), ("b", 0), ("c", 2)]) == {"a": 1, "b": 0, "c": 2}
+
+
+def test_board_starvation_lines_threshold():
+    state = {"boards": {
+        "subs-ace": {"ready": 7, "quota": 1, "spawned": 0, "starved_since": 1000.0},
+        "default": {"ready": 3, "quota": 2, "spawned": 2, "starved_since": None},
+        "young": {"ready": 1, "quota": 1, "spawned": 0, "starved_since": 1500.0},
+    }}
+    lines = klg.format_board_starvation_lines(state, now=1000.0 + 700)
+    assert len(lines) == 1 and "[subs-ace]" in lines[0] and "ready=7" in lines[0]
+    assert klg.format_board_starvation_lines(None) == []
+
+
+def test_dispatch_once_names_the_cap_that_refused(kanban_home, monkeypatch):
+    """A manual dispatch that spawns 0 must say which cap refused."""
+    _board_with_ready(kanban_home, monkeypatch, 4)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=0)
+    assert res.spawned == [] and "load gate" in (res.spawn_capped or "")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, max_spawn=2)
+    assert len(res.spawned) == 2 and res.spawn_capped is None
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, max_spawn=2)
+    assert res.spawned == [] and "max_spawn=2" in (res.spawn_capped or "")
+
+
+def test_count_spawnable_demand(kanban_home, monkeypatch):
+    _board_with_ready(kanban_home, monkeypatch, 3)
+    with kb.connect_closing() as conn:
+        assert kb.count_spawnable_demand(conn) == 3
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: False, raising=False)
+    with kb.connect_closing() as conn:
+        assert kb.count_spawnable_demand(conn) == 0

@@ -413,7 +413,10 @@ def test_compression_heartbeat_stop_persists_completed_over_in_progress(
     sessions show "context compression completed", not a stale "in progress".
     """
     from agent.conversation_compression import _CompressionActivityHeartbeat
-    from agent.session_activity import ActivityProvenance
+    from agent.session_activity import (
+        ActivityProvenance,
+        reset_session_activity_persist_window,
+    )
 
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "HEARTBEAT_PERSIST_COMPLETED_TEST"
@@ -424,7 +427,10 @@ def test_compression_heartbeat_stop_persists_completed_over_in_progress(
     hb = _CompressionActivityHeartbeat(agent, interval_seconds=3600.0)
     hb.start()
 
-    agent._session_activity_last_persist_mono = 0.0
+    # Clear the persist window via the real API. A literal 0.0 is not "long
+    # ago": monotonic() counts from boot and a fresh CI VM is <60s old (the
+    # heavy-ci flake of run 36328699837).
+    reset_session_activity_persist_window(agent)
     agent._touch_activity(
         "context compression in progress",
         provenance=ActivityProvenance.AGENT_COMPRESSION,

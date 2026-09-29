@@ -183,10 +183,10 @@ def test_cli_gate_covers_reclaim_operator_only(conn, monkeypatch):
     monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
     tid, _ = _running_card(conn, _host(_dead_pid()))
     with pytest.raises(kb.OperatorTokenRequiredError):
-        kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--operator"], argv=["x"])
+        kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--operator"])
     assert _events(conn, tid, "takeover_refused")[-1]["flags"] == ["--operator"]
     # --takeover on reclaim keeps its prior, ungated behaviour.
-    kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--takeover"], argv=["x"])
+    kb.enforce_operator_flag_gate(conn, [tid], "reclaim", flags=["--takeover"])
     assert len(_events(conn, tid, "takeover_refused")) == 1
 
 
@@ -233,3 +233,150 @@ def test_cli_reclaim_passes_operator(monkeypatch):
     monkeypatch.setattr(kb, "connect_closing", lambda *a, **k: contextlib.nullcontext(None))
     kc._cmd_reclaim(argparse.Namespace(task_id="t_x", reason="r", operator="apollo: why"))
     assert seen == {"reason": "r", "operator": "apollo: why"}
+
+
+# --- FleetReview post-merge P1s on #1404 (t_1c3ccb41) -------------------------
+
+_TASK_ENV = "HERMES_KANBAN_TASK"
+
+
+def test_scan_matches_when_caller_runs_inside_the_task_worker(monkeypatch):
+    """2362caff15e1: the worker is our ancestor, so the process scan skips it."""
+    monkeypatch.setenv(_TASK_ENV, "t_scan")
+    assert _scan_with(monkeypatch, []) is True
+    monkeypatch.setenv(_TASK_ENV, "t_other")
+    assert _scan_with(monkeypatch, []) is False
+
+
+def test_operator_refused_from_inside_own_unstamped_worker(conn, operator_token, monkeypatch):
+    lock = _host(_dead_pid())
+    tid, _ = _running_card(conn, lock)
+    monkeypatch.setenv(_TASK_ENV, tid)
+    assert kb.reclaim_task(conn, tid, operator="apollo: x") is False
+    assert not _events(conn, tid, "reclaimed")
+    assert conn.execute("SELECT claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()[0] == lock
+
+
+def test_scan_sees_worker_ancestor_when_child_env_is_scrubbed(tmp_path):
+    """A delegated child has the grant scrubbed; the ancestor's env still names it."""
+    tid = "t_" + secrets.token_hex(4)
+    inner = (
+        "import os, sys\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "sys.exit(0 if kb._host_process_mentions_task(os.environ['SCAN_TID']) else 1)\n"
+    )
+    outer = (
+        "import os, subprocess, sys\n"
+        f"env = {{k: v for k, v in os.environ.items() if k != {_TASK_ENV!r}}}\n"
+        f"env['SCAN_TID'] = {tid!r}\n"
+        f"sys.exit(subprocess.call([sys.executable, '-c', {inner!r}], env=env))\n"
+    )
+    repo = Path(kb.__file__).resolve().parents[1]
+    env = {**os.environ, _TASK_ENV: tid, "PYTHONPATH": str(repo)}
+    # The outer "worker" must not name the task in argv: only its env does.
+    rc = subprocess.call([sys.executable, "-c", outer], env=env, cwd=str(repo), timeout=120)
+    assert rc == 0
+
+
+def test_scan_ignores_operator_shell_ancestor_naming_task():
+    """c18fd1d3b7f7 (#1442): ``sh -c '... reclaim t_x'`` names the task but is
+    the operator's shell, not the worker."""
+    tid = "t_" + secrets.token_hex(4)
+    inner = (
+        "import os, sys\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "sys.exit(1 if kb._host_process_mentions_task(os.environ['SCAN_TID']) else 0)\n"
+    )
+    outer = (
+        "import subprocess, sys\n"
+        f"# hermes kanban reclaim {tid} --operator 'apollo: x'\n"
+        f"sys.exit(subprocess.call([sys.executable, '-c', {inner!r}]))\n"
+    )
+    repo = Path(kb.__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != _TASK_ENV}
+    env.update(SCAN_TID=tid, PYTHONPATH=str(repo))
+    rc = subprocess.call([sys.executable, "-c", outer], env=env, cwd=str(repo), timeout=120)
+    assert rc == 0
+
+
+def _stamp_between_check_and_update(monkeypatch, action):
+    real = kb._host_process_mentions_task
+
+    def racing(task_id):
+        with kb.connect() as other:
+            action(other, task_id)
+        return real(task_id)
+
+    monkeypatch.setattr(kb, "_host_process_mentions_task", racing)
+
+
+def test_operator_release_rechecks_worker_pid_inside_txn(conn, operator_token, monkeypatch):
+    """8a8140b0725a: a pid stamped after the liveness check must void the release."""
+    lock = _host(_dead_pid())
+    tid, run_id = _running_card(conn, lock)
+    _stamp_between_check_and_update(
+        monkeypatch, lambda c, t: kb._set_worker_pid(c, t, os.getpid(), run_id=run_id),
+    )
+    assert kb.reclaim_task(conn, tid, operator="apollo: x") is False
+    row = conn.execute("SELECT claim_lock, worker_pid FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["claim_lock"] == lock and row["worker_pid"] == os.getpid()
+    assert not _events(conn, tid, "reclaimed")
+
+
+def test_operator_release_rechecks_worker_evidence_inside_txn(conn, operator_token, monkeypatch):
+    lock = _host(_dead_pid())
+    tid, _ = _running_card(conn, lock)
+    _stamp_between_check_and_update(
+        monkeypatch, lambda c, t: kb.heartbeat_worker(c, t, note="orphan alive"),
+    )
+    assert kb.reclaim_task(conn, tid, operator="apollo: x") is False
+    assert conn.execute("SELECT claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()[0] == lock
+    assert not _events(conn, tid, "reclaimed")
+
+
+def test_worker_process_title_keeps_task_id(monkeypatch):
+    """1d1cb187c593: setproctitle rewrites argv; the title must still name the task."""
+    from hermes_cli import main as hmain
+
+    titles = []
+    monkeypatch.setitem(sys.modules, "setproctitle", SimpleNamespace(setproctitle=titles.append))
+    monkeypatch.setenv(_TASK_ENV, "t_scan")
+    hmain._set_process_title()
+    assert titles[-1] == kb.KANBAN_WORKER_PROCTITLE.format(task_id="t_scan")
+    # The scan recognises the rewritten title (macOS pads argv with empties).
+    rewritten = [titles[-1], "", "", ""]
+    assert kb._proc_is_titled_worker(rewritten, "t_scan")
+    assert not kb._proc_is_titled_worker(["sh", "-c", "hermes kanban reclaim t_scan"], "t_scan")
+    monkeypatch.delenv(_TASK_ENV)
+    euid = getattr(os, "geteuid", lambda: None)()
+    assert _scan_with(monkeypatch, [_FakeProc(999997, rewritten, euid=euid)]) is True
+    hmain._set_process_title()
+    assert titles[-1] == "hermes"
+
+
+class _FakeParent:
+    def __init__(self, cmdline=None, env=None):
+        self._cmdline, self._env = cmdline, env
+
+    def cmdline(self):
+        if self._cmdline is None:
+            raise psutil.AccessDenied(1)
+        return self._cmdline
+
+    def environ(self):
+        if self._env is None:
+            raise psutil.AccessDenied(1)
+        return self._env
+
+
+def test_ancestor_check_skips_unreadable_and_matches_grant_or_title(monkeypatch):
+    """CI runners/containers have unreadable ancestors; they are not the worker.
+    Failing closed on them refused every override there (#1442 CI)."""
+    monkeypatch.delenv(_TASK_ENV, raising=False)
+    unreadable = _FakeParent()
+    shell = _FakeParent(["sh", "-c", "hermes kanban reclaim t_scan"], env={})
+    assert kb._caller_inside_task_worker("t_scan", [unreadable, shell]) is False
+    granted = _FakeParent(["hermes"], env={_TASK_ENV: "t_scan"})
+    assert kb._caller_inside_task_worker("t_scan", [unreadable, granted]) is True
+    titled = _FakeParent([kb.KANBAN_WORKER_PROCTITLE.format(task_id="t_scan")])
+    assert kb._caller_inside_task_worker("t_scan", [titled]) is True

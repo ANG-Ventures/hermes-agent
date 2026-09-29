@@ -433,6 +433,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_EXIT_FILE",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # The dispatcher exports the claimed card's model pin into every worker
+    # (kanban_worker_route.CLAIMED_CARD_PIN_ENV). Left ambient it shadows the
+    # per-test fixture board's pin and flips the worker-route pin tests.
+    "KANBAN_CLAIMED_CARD_PIN",
     # Pytest is routinely launched from a delegated worker.  The worker
     # lineage marker must not make parent-state tests run as delegated
     # children; tests that exercise child behavior set it explicitly.
@@ -861,6 +865,12 @@ def _isolate_session_contextvars():
         yield
         if token is not None:
             rc._SESSION_CWD.reset(token)
+        # The test may have imported session_context and bound vars: put the
+        # whole family back to the fresh-process _UNSET state (no pre-test
+        # tokens exist to restore, and fresh IS the pre-test state).
+        sc = sys.modules.get("gateway.session_context")
+        if sc is not None:
+            sc.reset_session_vars()
         return
     tokens = sc.reset_session_vars()
     yield
@@ -1761,8 +1771,14 @@ def _live_system_guard(request, monkeypatch):
             return False
         try:
             return _psutil.Process(pid).create_time() == created
-        except Exception:
+        except _psutil.NoSuchProcess:
             return True  # gone: the signal is a no-op
+        except _psutil.AccessDenied:
+            return False  # unverifiable identity: fail closed (C5 #71)
+        except Exception:
+            # Probe machinery broken (e.g. a test stubbed sys.modules["psutil"]),
+            # not evidence of a foreign process: trust the snapshot record.
+            return True
     _spawned_children = {}
 
     def _remember_spawned_child(pid: int) -> None:
@@ -1791,8 +1807,16 @@ def _live_system_guard(request, monkeypatch):
                 return True
             try:
                 walker = _psutil.Process(pid)
-            except Exception:
+            except _psutil.NoSuchProcess:
                 # The recorded child is gone, so the signal is a no-op.
+                return True
+            except _psutil.AccessDenied:
+                # Exists but unverifiable: fail closed (C5 #71).
+                return False
+            except Exception:
+                # Probe machinery broken (e.g. a test stubbed
+                # sys.modules["psutil"]), not evidence of a foreign process:
+                # the pid is on our spawn record, so trust it.
                 return True
             started_at = _spawned_children[pid]
             if started_at is not None:
@@ -1805,9 +1829,12 @@ def _live_system_guard(request, monkeypatch):
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
+        except _psutil.NoSuchProcess:
             # Stale PID — kill would be a no-op anyway, allow it.
             return True
+        except Exception:
+            # Exists but unverifiable (AccessDenied): fail closed (C5 #71).
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
