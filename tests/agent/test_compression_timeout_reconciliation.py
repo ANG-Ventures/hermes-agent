@@ -141,10 +141,12 @@ class TestResolverWiring:
             "agent.auxiliary_client._effective_aux_timeout",
             lambda task, timeout: 300.0,
         )
+        # Upstream #114594 floors idle at the aux budget even when set explicitly, so an operator
+        # idle ABOVE the inner deadline is the one honoured verbatim (not lifted to inner+headroom).
         idle, ceiling = cc.resolve_context_compression_timeouts(
-            {"context_timeout_seconds": 45.0, "context_total_ceiling_seconds": 1200.0}
+            {"context_timeout_seconds": 450.0, "context_total_ceiling_seconds": 1200.0}
         )
-        assert idle == 45.0
+        assert idle == 450.0
         assert ceiling == 1200.0
 
     def test_resolver_survives_aux_config_failure(self, monkeypatch):
