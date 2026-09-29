@@ -284,11 +284,11 @@ class TestErrorHonesty:
         real = db.restore_ids
         calls = {"n": 0}
 
-        def flaky(session_id, ids):
+        def flaky(session_id, ids, **kwargs):
             calls["n"] += 1
             if calls["n"] > 1:
                 raise sqlite3.OperationalError("database is locked")
-            return real(session_id, ids)
+            return real(session_id, ids, **kwargs)
 
         monkeypatch.setattr(db, "restore_ids", flaky)
         result = hermes_undo.redo(sid, 2)
@@ -360,16 +360,10 @@ class TestSchemaMigration:
         first.create_session("s", source="test")
         first.close()
 
-        # Rebuild the table without redo_count, emulating an older database.
+        # Drop redo_count, emulating an older database. DROP COLUMN (not a table rebuild): views
+        # over ``sessions`` (the FTS source views) must keep resolving.
         con = sqlite3.connect(path)
-        cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
-        keep = [c for c in cols if c != "redo_count"]
-        con.execute("PRAGMA foreign_keys=OFF")
-        con.execute(
-            f"CREATE TABLE sessions_old AS SELECT {','.join(keep)} FROM sessions"
-        )
-        con.execute("DROP TABLE sessions")
-        con.execute("ALTER TABLE sessions_old RENAME TO sessions")
+        con.execute("ALTER TABLE sessions DROP COLUMN redo_count")
         con.commit()
         after_drop = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
         con.close()
@@ -386,3 +380,37 @@ class TestSchemaMigration:
         finally:
             reopened.close()
 
+
+class TestCompositeCarrierRedo:
+    """Rewinding a compaction carrier INSERTS a hidden handoff row as the new head. Redo must retire it
+    in the same write, or the restored carrier sits next to its own scaffold (summary shown twice)."""
+
+    def test_redo_of_a_carrier_rewind_restores_the_exact_active_set(self, tmp_path):
+        from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
+
+        db = SessionDB(db_path=tmp_path / "carrier.db")
+        try:
+            sid = "carrier-redo"
+            db.create_session(sid, source="tui")
+            db.append_message(sid, "user", "older ask")
+            db.append_message(sid, "assistant", "older reply")
+            db.append_message(
+                sid, "user",
+                f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n{_SUMMARY_END_MARKER}\n\nREAL ASK")
+            db.append_message(sid, "assistant", "failed")
+            before = [m["_row_id"] for m in db.get_messages_as_conversation(sid, include_row_ids=True)]
+
+            outcome = db.rewind_user_turn(sid, -1)
+            assert isinstance(outcome.replacement_id, int)  # precondition: the carrier path ran
+            assert outcome.replacement_id not in before
+            hermes_undo.clear_state()
+            hermes_undo.record_rewind(sid, db, outcome.turns_undone, outcome)
+
+            result = hermes_undo.redo(sid, 1)
+
+            after = [m["_row_id"] for m in db.get_messages_as_conversation(sid, include_row_ids=True)]
+            assert result["reactivated_count"] == len(outcome.rewound_ids)
+            assert after == before
+        finally:
+            db.close()
+            hermes_undo.clear_state()

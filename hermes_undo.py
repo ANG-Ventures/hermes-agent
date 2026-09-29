@@ -64,6 +64,8 @@ class UndoOp:
 
     n: int
     rewound_ids: List[int]
+    #: Rows the rewind INSERTED (a carrier rewind's compaction-handoff replacement); retired on redo.
+    inserted_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -112,7 +114,9 @@ def clear_state(session_id: Optional[str] = None) -> None:
         _states.pop(session_id, None)
 
 
-def record_undo(session_id: str, n: int, rewound_ids: List[int]) -> None:
+def record_undo(
+    session_id: str, n: int, rewound_ids: List[int], inserted_ids: Optional[List[int]] = None,
+) -> None:
     """Bank a committed rewind so ``/redo`` can replay it.
 
     *rewound_ids* are the rows the rewind actually deactivated — the
@@ -128,7 +132,8 @@ def record_undo(session_id: str, n: int, rewound_ids: List[int]) -> None:
     if not ids:
         return
     state = get_state(session_id)
-    state.undo_stack.append(UndoOp(n=n, rewound_ids=ids))
+    inserted = [int(i) for i in (inserted_ids or []) if i is not None]
+    state.undo_stack.append(UndoOp(n=n, rewound_ids=ids, inserted_ids=inserted))
     state.redo_stack.clear()
 
 
@@ -182,7 +187,7 @@ def redo(session_id: str, m: int = 1) -> Dict[str, Any]:
     for _ in range(k):
         op = state.undo_stack.pop()
         try:
-            reactivated = db.restore_ids(session_id, op.rewound_ids)
+            reactivated = db.restore_ids(session_id, op.rewound_ids, deactivate_ids=op.inserted_ids)
         except Exception as exc:
             # redo() does one write per operation. If an earlier operation
             # already committed, its rows are live in the DB, so this exception
@@ -301,3 +306,20 @@ def on_user_message_appended(session_id: str) -> None:
     state = get_state(session_id)
     state.undo_stack.clear()
     state.redo_stack.clear()
+
+
+def record_rewind(session_id: str, session_db: Any, n: int, outcome: Any) -> None:
+    """Bank a committed ``SessionDB.rewind_user_turn`` outcome (the shared rewind every surface uses).
+
+    Only a plain ``/undo`` should call this: ``/retry`` and rollback replace the turn rather than
+    leaving a branch to return to. Best-effort: bookkeeping must never fail the undo that committed.
+    """
+    global _session_db
+    try:
+        if session_db is not None:
+            _session_db = session_db
+        replacement = getattr(outcome, "replacement_id", None)
+        record_undo(session_id, n, list(getattr(outcome, "rewound_ids", None) or []),
+                    [replacement] if isinstance(replacement, int) else None)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("redo bookkeeping skipped for %s: %r", session_id, exc)

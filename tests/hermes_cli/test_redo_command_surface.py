@@ -9,8 +9,8 @@ from hermes_cli.commands import (
     EXACT_MATCH_ONLY_COMMANDS,
     GATEWAY_KNOWN_COMMANDS,
     resolve_command,
-    slack_native_slashes,
 )
+from hermes_cli.commands_platforms import slack_native_slashes
 
 
 class TestRegistry:
@@ -150,7 +150,7 @@ class TestLocaleKeys:
 
         import yaml
 
-        files = sorted(glob.glob(os.path.join(_locale_dir(), "*.yaml")))
+        files = sorted([p for p in glob.glob(os.path.join(_locale_dir(), "*.yaml")) if not p.endswith(".tui.yaml")])
         assert files, "no locale files found"
         for path in files:
             with open(path, encoding="utf-8") as handle:
@@ -166,7 +166,7 @@ class TestLocaleKeys:
 
         import yaml
 
-        for path in sorted(glob.glob(os.path.join(_locale_dir(), "*.yaml"))):
+        for path in sorted([p for p in glob.glob(os.path.join(_locale_dir(), "*.yaml")) if not p.endswith(".tui.yaml")]):
             with open(path, encoding="utf-8") as handle:
                 data = yaml.safe_load(handle) or {}
             redo = (data.get("gateway") or {}).get("redo") or {}
