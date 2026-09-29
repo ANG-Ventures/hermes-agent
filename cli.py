@@ -1334,6 +1334,13 @@ def _emit_interrupted_session_end(
     # gateway — the gateway owns the lifecycle now (#88234).
     if session_id in _handed_off_session_ids:
         return
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    # The turn finalizer marks the turn it already emitted for and
+    # _current_turn_id is never cleared, so a signal/Ctrl-C that lands AFTER
+    # the turn finished (session flush, printing, post-turn work) must not
+    # upsert an interrupted row over the real completed one (Prism P1, #1504).
+    if turn_id and getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+        return
     if session_id:
         try:
             cli.session_id = session_id
@@ -1346,7 +1353,7 @@ def _emit_interrupted_session_end(
             "on_session_end",
             session_id=session_id,
             task_id=getattr(agent, "_current_task_id", "") or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            turn_id=turn_id,
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             completed=False,
             interrupted=True,

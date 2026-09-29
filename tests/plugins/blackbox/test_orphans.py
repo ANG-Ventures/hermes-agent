@@ -217,6 +217,23 @@ def test_repair_marks_the_row_even_when_only_aux_calls_exist(db):
     )
 
 
+def test_repair_skips_a_store_whose_profile_drops_subagent_turns(tmp_path, db, capsys):
+    """Prism P1 on #1504: with record_subagents=false, orphans may be deliberate
+    subagent drops the ledger cannot tell apart; the store is reported, not repaired.
+    The config is the TARGET store's profile config, not the invoking process's."""
+    (tmp_path / "config.yaml").write_text("blackbox:\n  enabled: true\n  record_subagents: false\n")
+    assert orphans.store_config(str(db))["record_subagents"] is False
+    turn_id = "s:t:maybe-subagent"
+    _priced_call(turn_id, 1, inp=10, out=5)
+    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, False)]}
+    assert orphans.main([str(db), "--since", "0", "--settle-s", "0", "--repair"]) == 1
+    assert "skipped 1 orphan turn(s)" in capsys.readouterr().out
+    assert [t for t, _ts, _e in _orphans(db)] == [turn_id]
+    (tmp_path / "config.yaml").write_text("blackbox:\n  enabled: true\n")
+    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, True)]}
+    assert _orphans(db) == []
+
+
 def test_profile_for_path():
     assert orphans.profile_for_path("/h/.hermes/profiles/daedalus/blackbox/turns.db") == "daedalus"
     assert orphans.profile_for_path("/h/.hermes/blackbox/turns.db") == "default"

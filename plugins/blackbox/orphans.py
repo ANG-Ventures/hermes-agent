@@ -131,6 +131,42 @@ def _orphan_route(conn: sqlite3.Connection, turn_id: str) -> tuple[str, str, flo
     return str(provider or ""), str(model or ""), float(first or 0.0), float(last or 0.0)
 
 
+def store_config(path: str) -> dict:
+    """The ``blackbox:`` block of the profile that OWNS ``path``.
+
+    A repair process runs under one profile but writes every profile's store;
+    ``record_subagents`` / ``store_text`` are per profile, so read the target
+    home's own config.yaml (``<home>/blackbox/turns.db`` -> ``<home>/config.yaml``).
+    """
+    from plugins import blackbox
+
+    cfg = dict(blackbox._DEFAULTS)
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        home = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+        block = read_user_config_raw(os.path.join(home, "config.yaml")).get("blackbox")
+        if isinstance(block, dict):
+            cfg.update(block)
+    except Exception:
+        pass
+    return cfg
+
+
+def repairable(path: str) -> tuple[bool, str]:
+    """Whether every orphan in ``path`` is a defect the repair may close.
+
+    The ledger carries no subagent identity. A profile with
+    ``record_subagents: false`` drops subagent turns on purpose, so its
+    orphans mix deliberate drops with real losses and a synthesized row would
+    book excluded subagent spend as a top-level turn: such a store is
+    reported, never repaired.
+    """
+    if not bool(store_config(path).get("record_subagents", True)):
+        return False, "record_subagents is false for this profile: orphans may be deliberate subagent drops"
+    return True, ""
+
+
 def repair_record(path: str, turn_id: str):
     """Build the flagged ``TurnRecord`` for one orphan from its ledger rows."""
     from plugins import blackbox
@@ -143,7 +179,7 @@ def repair_record(path: str, turn_id: str):
     finally:
         conn.close()
     usage = store.ledger_turn_usage(turn_id, db_path=path) or {}
-    cfg = blackbox._config() or dict(blackbox._DEFAULTS)
+    cfg = store_config(path)
     record = blackbox._build_record(
         session_id=turn_id.split(":", 1)[0],
         interrupted=True,
@@ -174,17 +210,19 @@ def repair(
 
     A row is only ever written where none exists (``insert_turn(provisional=
     True)`` is ``ON CONFLICT DO NOTHING``), so a turn whose real row lands
-    between the scan and the write keeps the real row. With ``apply=False``
-    nothing is written and every entry reports ``False``.
+    between the scan and the write keeps the real row. A store that is not
+    ``repairable()`` is skipped whole (every entry ``False``). With
+    ``apply=False`` nothing is written and every entry reports ``False``.
     """
     from plugins.blackbox import store
 
     out: dict[str, list[tuple[str, bool]]] = {}
     for path, rows in sorted(results.items()):
+        ok, _why = repairable(path)
         done: list[tuple[str, bool]] = []
         for turn_id, _last_ts, _errs in rows:
             written = False
-            if apply:
+            if apply and ok:
                 record = repair_record(path, turn_id)
                 written = record is not None and store.insert_turn(
                     record, provisional=True, db_path=path
@@ -221,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
         n_written = 0
         for path, rows in sorted(written.items()):
             if not rows:
+                continue
+            can, why = repairable(path)
+            if not can:
+                print(f"skipped {len(rows)} orphan turn(s) in {path}: {why}")
                 continue
             ok_n = sum(1 for _tid, ok in rows if ok)
             n_written += ok_n
