@@ -49,6 +49,12 @@ _CARD_DESTINATION_REFUSALS = {
 }
 
 
+def _snapshot_reasoning(agent: Any) -> Any:
+    """Copy of the completed agent's effective ``reasoning_config`` (None when unknown)."""
+    cfg = getattr(agent, "reasoning_config", None) if agent else None
+    return dict(cfg) if isinstance(cfg, dict) else cfg
+
+
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
     """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
     say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
@@ -1970,6 +1976,11 @@ class TurnRunner:
             "input_tokens": getattr(agent, "session_prompt_tokens", 0) if has_comp else 0,
             "output_tokens": getattr(agent, "session_completion_tokens", 0) if has_comp else 0,
             "model": getattr(agent, "model", None) if agent else None,
+            "provider": getattr(agent, "provider", None) if agent else None,
+            "requested_provider": getattr(agent, "requested_provider", None) if agent else None,
+            # Fallback can change reasoning after the session override was applied: snapshot the
+            # live agent, not the gateway's original configuration.
+            "reasoning_config": _snapshot_reasoning(agent),
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
         }
         compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
