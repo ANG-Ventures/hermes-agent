@@ -145,17 +145,31 @@ def _next_api_call_seq(agent: Any, turn_id: str) -> int:
 
 
 def _codex_sub_key(agent: Any) -> Optional[str]:
-    pool = getattr(agent, "_credential_pool", None)
-    if pool is None:
-        return None
+    """``codex:<account[:8]>`` for the Codex OAuth token this call was sent with.
+
+    The wire credential is ``agent.api_key``: the client (and its
+    ``ChatGPT-Account-ID`` header) is built from it on init, on pool rotation
+    and on fallback activation. A fallback-attached pool is a fresh
+    ``load_pool()`` whose selection cursor is unset, so ``pool.current()``
+    alone left every fallback-to-Codex call unattributed (t_6144ccf0). The
+    pool cursor is consulted only when the agent key carries no account claim.
+    Never guesses: an opaque token with no pool selection records NULL.
+    """
     try:
-        current = pool.current()
-        if current is None:
-            return None
         from hermes_cli.auth import get_codex_account_id
 
-        account_id = get_codex_account_id(current.access_token)
-        return f"codex:{account_id[:8]}" if account_id else None
+        candidates = [getattr(agent, "api_key", None)]
+        pool = getattr(agent, "_credential_pool", None)
+        current = pool.current() if pool is not None else None
+        if current is not None:
+            candidates.append(getattr(current, "access_token", None))
+        for token in candidates:
+            if not isinstance(token, str) or not token:
+                continue
+            account_id = get_codex_account_id(token)
+            if account_id:
+                return f"codex:{account_id[:8]}"
+        return None
     except Exception:
         return None
 
