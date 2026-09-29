@@ -21,10 +21,13 @@ turn's own ``turn_api_calls`` aggregates (ts span, calls, tokens, primary
 route, cost): ``interrupted=1``, ``terminal_error='orphan_repair'``. The
 insert is ``ON CONFLICT DO NOTHING`` and never moves a channel's last-turn
 pointer, so a real row (present or written concurrently) always wins and a
-repaired row can never pass as a normal one. Orphans exist because the
-process that owned the turn was killed before ``on_session_end`` (SIGKILL,
-a pre-fix worker); the row's chat/platform attribution is unknown and left
-empty.
+repaired row can never pass as a normal one; it is fenced on the ledger it
+was aggregated from, so a call landing mid-repair skips the turn for the
+next run. Orphans exist because the process that owned the turn was killed
+before ``on_session_end`` (SIGKILL, a pre-fix worker); the row's
+chat/platform attribution is unknown and left empty. A store whose profile
+config is unreadable or has ``record_subagents: false`` is reported and
+never written (its orphans may be deliberate subagent drops).
 """
 
 from __future__ import annotations
@@ -131,25 +134,30 @@ def _orphan_route(conn: sqlite3.Connection, turn_id: str) -> tuple[str, str, flo
     return str(provider or ""), str(model or ""), float(first or 0.0), float(last or 0.0)
 
 
-def store_config(path: str) -> dict:
-    """The ``blackbox:`` block of the profile that OWNS ``path``.
+def store_config(path: str) -> dict | None:
+    """The EFFECTIVE ``blackbox:`` block of the profile that OWNS ``path``.
 
     A repair process runs under one profile but writes every profile's store;
     ``record_subagents`` / ``store_text`` are per profile, so read the target
-    home's own config.yaml (``<home>/blackbox/turns.db`` -> ``<home>/config.yaml``).
+    home's own config.yaml (``<home>/blackbox/turns.db`` -> ``<home>/config.yaml``)
+    the way the live recorder sees it: user file + the administrator's
+    managed-scope overlay + ``${ENV}`` expansion. None when the file cannot be
+    read or parsed -- an unknown config is not permission to write.
     """
     from plugins import blackbox
 
-    cfg = dict(blackbox._DEFAULTS)
     try:
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        from hermes_cli.managed_scope import apply_managed_overlay
 
         home = os.path.dirname(os.path.dirname(os.path.abspath(path)))
-        block = read_user_config_raw(os.path.join(home, "config.yaml")).get("blackbox")
-        if isinstance(block, dict):
-            cfg.update(block)
+        data = apply_managed_overlay(read_user_config_raw(os.path.join(home, "config.yaml")))
+        block = _expand_env_vars(data).get("blackbox")
     except Exception:
-        pass
+        return None
+    cfg = dict(blackbox._DEFAULTS)
+    if isinstance(block, dict):
+        cfg.update(block)
     return cfg
 
 
@@ -160,15 +168,27 @@ def repairable(path: str) -> tuple[bool, str]:
     ``record_subagents: false`` drops subagent turns on purpose, so its
     orphans mix deliberate drops with real losses and a synthesized row would
     book excluded subagent spend as a top-level turn: such a store is
-    reported, never repaired.
+    reported, never repaired. An unreadable profile config is treated the
+    same way (fail closed).
     """
-    if not bool(store_config(path).get("record_subagents", True)):
+    cfg = store_config(path)
+    if cfg is None:
+        return False, "profile config unreadable: cannot tell deliberate subagent drops from losses"
+    if not bool(cfg.get("record_subagents", True)):
         return False, "record_subagents is false for this profile: orphans may be deliberate subagent drops"
     return True, ""
 
 
 def repair_record(path: str, turn_id: str):
-    """Build the flagged ``TurnRecord`` for one orphan from its ledger rows."""
+    """Build the flagged ``TurnRecord`` for one orphan from its ledger rows.
+
+    Returns ``(record, fence)``: ``fence`` is the ``(last_call_ts, call_count)``
+    the record was aggregated from, which ``insert_turn(ledger_fence=...)``
+    re-checks inside its write transaction so a call that lands after this
+    read can never be summarised away. ``(None, None)`` when the ledger could
+    not be read (a failed read must not become a zero-usage row) or the
+    profile records no such turn.
+    """
     from plugins import blackbox
     from plugins.blackbox import store
 
@@ -176,10 +196,21 @@ def repair_record(path: str, turn_id: str):
     try:
         conn.execute("PRAGMA busy_timeout=5000")
         provider, model, first_ts, last_ts = _orphan_route(conn, turn_id)
+        n_calls, n_main = conn.execute(
+            "SELECT COUNT(*), SUM(COALESCE(lane_family, '') != 'aux' "
+            "AND parent_call_id IS NULL) FROM turn_api_calls WHERE turn_id = ?",
+            (turn_id,),
+        ).fetchone()
     finally:
         conn.close()
-    usage = store.ledger_turn_usage(turn_id, db_path=path) or {}
+    usage = store.ledger_turn_usage(turn_id, db_path=path)
+    if usage is None:
+        if int(n_main or 0) > 0:
+            return None, None  # main-lane rows exist but the read failed
+        usage = {}  # verified aux-only: a flagged 0-call row still closes the orphan
     cfg = store_config(path)
+    if cfg is None:
+        return None, None
     record = blackbox._build_record(
         session_id=turn_id.split(":", 1)[0],
         interrupted=True,
@@ -197,10 +228,11 @@ def repair_record(path: str, turn_id: str):
             "terminal_error": REPAIR_MARKER,
         },
     )
-    if record is not None:
-        record.ts_start = first_ts
-        record.ts_end = last_ts or first_ts
-    return record
+    if record is None:
+        return None, None
+    record.ts_start = first_ts
+    record.ts_end = last_ts or first_ts
+    return record, (last_ts, int(n_calls or 0))
 
 
 def repair(
@@ -210,9 +242,18 @@ def repair(
 
     A row is only ever written where none exists (``insert_turn(provisional=
     True)`` is ``ON CONFLICT DO NOTHING``), so a turn whose real row lands
-    between the scan and the write keeps the real row. A store that is not
+    between the scan and the write keeps the real row, and only while the
+    ledger still matches what was aggregated (``ledger_fence``), so a call
+    that lands in between is never summarised away. A store that is not
     ``repairable()`` is skipped whole (every entry ``False``). With
     ``apply=False`` nothing is written and every entry reports ``False``.
+
+    Liveness is the caller's ``settle_before`` (``--settle-s``): a turn whose
+    last call is older than that is taken as dead. A turn that is merely
+    parked on a longer tool call gets a flagged row too; if it later
+    finalizes, its real row upserts over the flagged one, and if it dies
+    unfinalized the flagged row keeps the usage as of the repair -- partial
+    by construction, which is what the ``orphan_repair`` marker says.
     """
     from plugins.blackbox import store
 
@@ -223,9 +264,9 @@ def repair(
         for turn_id, _last_ts, _errs in rows:
             written = False
             if apply and ok:
-                record = repair_record(path, turn_id)
+                record, fence = repair_record(path, turn_id)
                 written = record is not None and store.insert_turn(
-                    record, provisional=True, db_path=path
+                    record, provisional=True, db_path=path, ledger_fence=fence
                 )
             done.append((turn_id, bool(written)))
         out[path] = done

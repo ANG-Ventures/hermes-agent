@@ -970,6 +970,7 @@ def insert_turn(
     provisional: bool = False,
     move_last_turn: bool = True,
     db_path: Path | str | None = None,
+    ledger_fence: tuple[float, int] | None = None,
 ) -> bool:
     """Persist one turn. Telemetry failures are logged but never raised.
 
@@ -978,11 +979,26 @@ def insert_turn(
     already has a row, and the channel's ``last_turn`` pointer is never
     moved. A real row written later upserts over it. Returns True when a row
     was written. ``db_path`` targets another profile's store.
+
+    ``ledger_fence=(last_call_ts, call_count)``: write only while the turn's
+    ``turn_api_calls`` still match exactly that; the check and the insert
+    share one IMMEDIATE transaction, so a record aggregated from the ledger
+    (orphan repair) can never summarise away a call that landed in between.
     """
     try:
         # Positional only when targeting another store: tests stub _connect
         # with zero-arg fakes, and this profile's own store needs no argument.
         with (_connect(db_path) if db_path else _connect()) as conn:
+            if ledger_fence is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                last_ts, n_calls = conn.execute(
+                    "SELECT MAX(ts), COUNT(*) FROM turn_api_calls WHERE turn_id = ?",
+                    (record.turn_id,),
+                ).fetchone()
+                if (float(last_ts or 0.0), int(n_calls or 0)) != (
+                    float(ledger_fence[0] or 0.0), int(ledger_fence[1]),
+                ):
+                    return False
             cur = conn.execute(
                 _INSERT_TURN_PROVISIONAL_SQL if provisional else _INSERT_TURN_SQL,
                 (

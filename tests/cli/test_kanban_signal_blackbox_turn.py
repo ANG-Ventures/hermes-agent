@@ -34,8 +34,8 @@ def ledger(tmp_path, monkeypatch):
 def _worker_cli(session_id, turn_id):
     agent = SimpleNamespace(
         session_id=session_id, _current_turn_id=turn_id, _current_task_id="",
-        _current_api_request_id="", model="claude-opus-5-5", platform="cli",
-        interrupt=lambda *_a, **_k: None,
+        _current_api_request_id="", model="claude-opus-5-5", provider="claude-bpr",
+        platform="cli", interrupt=lambda *_a, **_k: None,
     )
     return SimpleNamespace(agent=agent, session_id=session_id)
 
@@ -82,9 +82,40 @@ def test_signaled_worker_turn_gets_a_turns_row(ledger, monkeypatch):
         # Flagged as a signal kill (t_50422844), and priced from the turn's own
         # ledger rows rather than recorded as a 0-token turn.
         assert conn.execute(
-            "SELECT interrupted, terminal_error, api_calls, input_tokens, output_tokens "
-            "FROM turns WHERE turn_id = ?", (turn_id,),
-        ).fetchone() == (1, "signal_15", 1, 10, 5)
+            "SELECT interrupted, terminal_error, api_calls, input_tokens, output_tokens, "
+            "provider, lane_family FROM turns WHERE turn_id = ?", (turn_id,),
+        ).fetchone() == (1, "signal_15", 1, 10, 5, "claude-bpr", "bpx/bpr")
+
+
+def test_signal_stands_down_while_the_finalizer_holds_the_emit_lock(ledger, monkeypatch):
+    """Prism P1 on #1504: the marker check + emit run under the finalizer's
+    per-agent lock; a real emit in progress wins."""
+    import threading
+    from agent.turn_finalizer import _session_end_lock
+
+    _route_session_end_to_blackbox(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_flush_one_shot_session_store", lambda _cli: None)
+    turn_id = "20260929_161500_1ocked:t_busy:0badf00d"
+    _in_flight_call(turn_id)
+    worker = _worker_cli(turn_id.split(":")[0], turn_id)
+    lock = _session_end_lock(worker.agent)
+    held = threading.Event()
+    release = threading.Event()
+
+    def finalizer_thread():
+        with lock:
+            held.set()
+            release.wait(10)
+
+    t = threading.Thread(target=finalizer_thread, daemon=True)
+    t.start()
+    held.wait(5)
+    try:
+        cli_mod._finalize_signaled_kanban_worker(worker, 15)
+    finally:
+        release.set()
+        t.join(5)
+    assert _orphans(ledger), "the signal path must not have written while the lock was held"
 
 
 def test_signal_after_the_turn_finalized_leaves_the_real_row_alone(ledger, monkeypatch):

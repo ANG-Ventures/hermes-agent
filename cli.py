@@ -1335,35 +1335,55 @@ def _emit_interrupted_session_end(
     if session_id in _handed_off_session_ids:
         return
     turn_id = getattr(agent, "_current_turn_id", "") or ""
-    # The turn finalizer marks the turn it already emitted for and
-    # _current_turn_id is never cleared, so a signal/Ctrl-C that lands AFTER
-    # the turn finished (session flush, printing, post-turn work) must not
-    # upsert an interrupted row over the real completed one (Prism P1, #1504).
-    if turn_id and getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
-        return
     if session_id:
         try:
             cli.session_id = session_id
         except Exception:
             pass
 
+    # The turn finalizer marks the turn it already emitted for (under the
+    # per-agent emit lock) and _current_turn_id is never cleared, so a
+    # signal/Ctrl-C that lands AFTER the turn finished -- or while the worker
+    # thread is unwinding through its finalizer during the grace window --
+    # must not upsert an interrupted row over the real completed one (Prism
+    # P1 x2, #1504). Check the marker and emit under that same lock; if the
+    # lock is busy for longer than the signal path can afford, the real emit
+    # is in progress and this one stands down.
+    lock = None
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=session_id,
-            task_id=getattr(agent, "_current_task_id", "") or "",
-            turn_id=turn_id,
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            completed=False,
-            interrupted=True,
-            model=getattr(agent, "model", None),
-            platform=getattr(agent, "platform", None) or "cli",
-            reason=reason,
-            terminal_error=terminal_error,
-        )
+        from agent.turn_finalizer import _session_end_lock
+        lock = _session_end_lock(agent)
+        if not lock.acquire(timeout=2.0):
+            return
     except Exception:
-        pass
+        lock = None
+    try:
+        if turn_id and getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+            return
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=session_id,
+                task_id=getattr(agent, "_current_task_id", "") or "",
+                turn_id=turn_id,
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                completed=False,
+                interrupted=True,
+                model=getattr(agent, "model", None),
+                provider=getattr(agent, "provider", None) or "",
+                platform=getattr(agent, "platform", None) or "cli",
+                reason=reason,
+                terminal_error=terminal_error,
+            )
+        except Exception:
+            pass
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 def _finalize_signaled_kanban_worker(cli, signum) -> None:

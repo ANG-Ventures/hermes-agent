@@ -153,16 +153,45 @@ def test_repair_never_touches_an_existing_row(db):
     turn_id = "s:t:real"
     _priced_call(turn_id, 1, inp=10, out=5)
     assert [t for t, _ts, _e in _orphans(db)] == [turn_id]
-    record = orphans.repair_record(str(db), turn_id)
+    record, fence = orphans.repair_record(str(db), turn_id)
     assert record.terminal_error == orphans.REPAIR_MARKER and record.interrupted
+    assert fence == (101.0, 1)
     # The real on_session_end lands between the scan and the write.
     blackbox._on_session_end(
         session_id="s", turn_id=turn_id, completed=True, failed=False,
         turn_exit_reason="text_response(stop)", model="claude-opus-4-8",
         provider="claude-bpr", final_response="done", platform="cli", chat_id="c1",
     )
-    assert store.insert_turn(record, provisional=True, db_path=str(db)) is False
+    assert store.insert_turn(record, provisional=True, db_path=str(db), ledger_fence=fence) is False
     assert _turn_row(db, turn_id, "terminal_error, interrupted, final_text") == (None, 0, "done")
+
+
+def test_repair_is_fenced_on_the_ledger_it_was_aggregated_from(db):
+    """Prism P1 on #1504 (stale repair): a call that lands between the
+    aggregate read and the insert must not be summarised away."""
+    turn_id = "s:t:still-running"
+    _priced_call(turn_id, 1, inp=10, out=5)
+    record, fence = orphans.repair_record(str(db), turn_id)
+    assert (record.api_calls, fence) == (1, (101.0, 1))
+    _priced_call(turn_id, 2, inp=20, out=5)  # the worker was only parked on a tool
+    assert store.insert_turn(record, provisional=True, db_path=str(db), ledger_fence=fence) is False
+    assert _turn_row(db, turn_id, "turn_id") is None
+    # The next run aggregates the grown ledger.
+    record, fence = orphans.repair_record(str(db), turn_id)
+    assert (record.api_calls, record.input_tokens, fence) == (2, 30, (102.0, 2))
+    assert store.insert_turn(record, provisional=True, db_path=str(db), ledger_fence=fence) is True
+    assert _orphans(db) == []
+
+
+def test_failed_ledger_read_never_becomes_a_zero_usage_repair(db, monkeypatch):
+    """Prism P1 on #1504: ledger_turn_usage() -> None on a DB error must not
+    be read as 'no main-lane calls'."""
+    turn_id = "s:t:locked"
+    _priced_call(turn_id, 1, inp=10, out=5)
+    monkeypatch.setattr(store, "ledger_turn_usage", lambda *_a, **_k: None)
+    assert orphans.repair_record(str(db), turn_id) == (None, None)
+    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, False)]}
+    assert _turn_row(db, turn_id, "turn_id") is None
 
 
 def test_losing_provisional_insert_leaves_the_real_rows_tool_calls_alone(db):
@@ -186,8 +215,9 @@ def test_losing_provisional_insert_leaves_the_real_rows_tool_calls_alone(db):
         (turn_id,)).fetchone()
     conn.close()
 
-    assert store.insert_turn(orphans.repair_record(str(db), turn_id), provisional=True,
-                             db_path=str(db)) is False
+    record, fence = orphans.repair_record(str(db), turn_id)
+    assert store.insert_turn(record, provisional=True, db_path=str(db),
+                             ledger_fence=fence) is False
 
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     assert conn.execute("SELECT name FROM turn_tool_calls WHERE turn_id=? ORDER BY seq",
@@ -229,9 +259,26 @@ def test_repair_skips_a_store_whose_profile_drops_subagent_turns(tmp_path, db, c
     assert orphans.main([str(db), "--since", "0", "--settle-s", "0", "--repair"]) == 1
     assert "skipped 1 orphan turn(s)" in capsys.readouterr().out
     assert [t for t, _ts, _e in _orphans(db)] == [turn_id]
+    # An unreadable config fails closed too (Prism P1: unknown != permission).
+    (tmp_path / "config.yaml").write_text("blackbox: [unterminated\n")
+    assert orphans.store_config(str(db)) is None
+    assert orphans.repairable(str(db))[0] is False
+    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, False)]}
     (tmp_path / "config.yaml").write_text("blackbox:\n  enabled: true\n")
     assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, True)]}
     assert _orphans(db) == []
+
+
+def test_store_config_applies_the_managed_overlay(tmp_path, db, monkeypatch):
+    """The eligibility check sees what the live recorder sees: the
+    administrator's managed-scope overlay, not only the user file."""
+    from hermes_cli import managed_scope
+
+    (tmp_path / "config.yaml").write_text("blackbox:\n  enabled: true\n")
+    monkeypatch.setattr(managed_scope, "apply_managed_overlay",
+                        lambda cfg: {**cfg, "blackbox": {**cfg.get("blackbox", {}), "record_subagents": False}})
+    assert orphans.store_config(str(db))["record_subagents"] is False
+    assert orphans.repairable(str(db))[0] is False
 
 
 def test_profile_for_path():
