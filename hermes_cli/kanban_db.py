@@ -2289,6 +2289,12 @@ class Task:
     # pool; the default is to WAIT for the sub.
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
+    # ``(model, provider)`` the card ROW pinned when this Task was claimed
+    # (:func:`_snapshot_claimed_card_pin`), before a lane override or a
+    # capped-pool rung mutates ``model_override`` in memory. In-memory only;
+    # ``_default_spawn`` hands it to the worker (t_a30417c3). ``None`` = not
+    # a claimed Task (no snapshot taken).
+    claimed_card_pin: Optional[tuple] = None
     next_eligible_at: Optional[int] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
@@ -9227,6 +9233,21 @@ def _termination_window(entry) -> tuple:
     return getattr(entry, "owner_window", (None, None))
 
 
+def _snapshot_claimed_card_pin(task: Optional[Task]) -> Optional[Task]:
+    """Record the card-row pin on a freshly claimed ``task`` (t_a30417c3).
+
+    Called on the row read inside the claim transaction, so the snapshot is
+    the pin as claimed: a later ``set-model`` (no ``--live``) cannot reach
+    this run through the worker's own row read, and a lane override or a
+    dispatch rung applied afterwards is not a card pin.
+    """
+    if task is not None:
+        from hermes_cli.kanban_provider_health import model_override
+
+        task.claimed_card_pin = model_override(task)
+    return task
+
+
 @_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
@@ -9352,7 +9373,7 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
-        claimed = get_task(conn, task_id)
+        claimed = _snapshot_claimed_card_pin(get_task(conn, task_id))
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -9504,7 +9525,7 @@ def claim_review_task(
             session_ref=session_ref, operator_claim=operator_claim,
         ) is None:
             return None
-        return get_task(conn, task_id)
+        return _snapshot_claimed_card_pin(get_task(conn, task_id))
 
 
 def review_claim_run_for_session(
@@ -23581,6 +23602,18 @@ def _default_spawn(
         env.pop("HERMES_KANBAN_EXIT_FILE", None)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # The card pin as CLAIMED (t_a30417c3): the worker's pin snapshot must
+    # not read the mutable row later, where a next-dispatch ``set-model``
+    # landing between this spawn and worker startup would become this run's
+    # pin. Only the claim-time row pin, never the lane/rung route. Popped when
+    # absent so a dispatcher running inside a worker never leaks its own.
+    from hermes_cli.kanban_worker_route import CLAIMED_CARD_PIN_ENV
+    if task.claimed_card_pin is not None:
+        _pin_model, _pin_provider = task.claimed_card_pin
+        env[CLAIMED_CARD_PIN_ENV] = json.dumps(
+            {"model": _pin_model, "provider": _pin_provider})
+    else:
+        env.pop(CLAIMED_CARD_PIN_ENV, None)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
