@@ -120,15 +120,32 @@ def test_clearing_nulls_memory_and_disk(store_factory, tmp_path):
     assert "reasoning_override" not in _sessions_json(tmp_path)[session_key]
 
 
-def test_expiry_finalization_drops_the_persisted_override(store_factory):
-    """Session finalization is a conversation boundary — drop the override."""
+def test_session_reset_drops_the_persisted_override(store_factory):
+    """/new (reset_session) is a conversation boundary — the fresh route carries no override.
+
+    (Upstream removed time-triggered expiry finalization in 1d5d059410, so reset is the boundary
+    that exercises this now.)"""
     store = store_factory()
     entry = store.get_or_create_session(_make_source())
     store.set_reasoning_override(entry.session_key, OVERRIDE)
 
-    store.set_expiry_finalized(entry)
+    store.reset_session(entry.session_key)
 
     assert store.get_reasoning_override(entry.session_key) is None
+    assert store_factory().get_reasoning_override(entry.session_key) is None
+
+
+def test_switch_session_carries_the_override_like_the_model_pin(store_factory):
+    """switch_session keeps the route's persisted /model pin (a re-pin is not a boundary); the
+    reasoning half travels with it. /resume clears both explicitly after the switch."""
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_reasoning_override(entry.session_key, OVERRIDE)
+
+    switched = store.switch_session(entry.session_key, "20990101_000000_target")
+
+    assert switched is not None
+    assert store.get_reasoning_override(entry.session_key) == OVERRIDE
 
 
 def test_live_in_memory_override_wins_over_persisted(store_factory):
