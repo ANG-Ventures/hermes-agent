@@ -23561,12 +23561,15 @@ def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
     if not hermes_home:
         return None
     try:
-        import yaml
+        # Presence-sensitive read of ANOTHER profile's file (unset = no cap),
+        # so the raw owner primitive + env expansion, not load_config() (which
+        # reads this process's home and merges defaults).
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
 
         path = Path(hermes_home) / "config.yaml"
         if not path.is_file():
             return None
-        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        cfg = _expand_env_vars(read_user_config_raw(path))
         # Not a kanban.* key: a profile's foreign_lane section. The local name
         # must not collide with a name test_kanban_config_keys binds to
         # .get("kanban") (its scan is file-wide, not scope-aware).
