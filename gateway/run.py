@@ -5961,7 +5961,7 @@ class TurnRunner:
         progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
         progress_msg_id = None   # ID of the current progress message to edit
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
-        _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
+        _last_edit_ts = float("-inf")  # -inf: monotonic origin is boot; Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
         _progress_len_fn = (
@@ -9690,7 +9690,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_lobby_reminder_ts.get(chat_id, 0.0)
+        last = self._telegram_lobby_reminder_ts.get(chat_id, float("-inf"))
         if now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
             return False
         self._telegram_lobby_reminder_ts[chat_id] = now
@@ -13339,7 +13339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
-        last_status_at = 0.0
+        last_status_at = float("-inf")  # loop.time() is monotonic (origin = boot)
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
@@ -15391,7 +15391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop = asyncio.get_running_loop()
         wait_started = loop.time()
         deadline = wait_started + timeout
-        last_status_at = 0.0
+        last_status_at = float("-inf")  # loop.time() is monotonic (origin = boot)
         # busy_policy=interrupt (safe-restart intent row) means "restart now".
         # Re-read every second: the intent usually lands MID-wait (2026-09-23:
         # wait began 03:59, deploy-lane interrupt intent 04:05, gateway then sat
@@ -31160,7 +31160,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_capability_hint_ts.get(chat_id, 0.0)
+        last = self._telegram_capability_hint_ts.get(chat_id, float("-inf"))
         if now - last < self._TELEGRAM_CAPABILITY_HINT_COOLDOWN_S:
             return False
         self._telegram_capability_hint_ts[chat_id] = now

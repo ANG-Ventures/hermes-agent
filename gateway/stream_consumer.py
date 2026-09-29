@@ -295,7 +295,7 @@ class GatewayStreamConsumer:
         self._segment_preview_message_ids: "set[str]" = set()
         self._already_sent = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
-        self._last_edit_time = 0.0
+        self._last_edit_time = float("-inf")  # monotonic; 0.0 delays the first edit on fresh boot
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).

@@ -446,7 +446,7 @@ class TestMCPReloadTimeout:
         class FakeCLI:
             _config_mtime = 0.0
             _config_mcp_servers = {}
-            _last_config_check = 0.0
+            _last_config_check = float("-inf")
             _command_running = False
             config = {}
             agent = None

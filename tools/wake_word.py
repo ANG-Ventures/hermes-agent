@@ -1013,7 +1013,7 @@ class WakeWordDetector:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._callback_inflight = threading.Event()
-        self._last_fire = 0.0
+        self._last_fire = float("-inf")  # monotonic; 0.0 drops the first wake on fresh boot
         self._lock = threading.Lock()
         # Client-capture PCM queue (int16 mono frames). Local mode ignores this.
         import queue as _queue

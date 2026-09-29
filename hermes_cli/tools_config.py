@@ -840,7 +840,7 @@ def _cua_driver_contract_status(binary: Optional[str] = None) -> dict:
     now = time.monotonic()
     if (
         _CUA_DRIVER_CONTRACT_CACHE.get("fingerprint") == fingerprint
-        and now - _CUA_DRIVER_CONTRACT_CACHE.get("checked_at", 0.0) < 30.0
+        and now - _CUA_DRIVER_CONTRACT_CACHE.get("checked_at", float("-inf")) < 30.0
     ):
         return dict(_CUA_DRIVER_CONTRACT_CACHE["state"])
 

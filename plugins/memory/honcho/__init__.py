@@ -305,7 +305,7 @@ class HonchoMemoryProvider(MemoryProvider):
         self._last_dialectic_turn = -999
 
         # Liveness + observability state
-        self._prefetch_thread_started_at: float = 0.0   # monotonic ts of current thread
+        self._prefetch_thread_started_at: float = float("-inf")   # monotonic ts of current thread
         self._prefetch_result_fired_at: int = -999      # turn the pending result was fired at
         self._dialectic_empty_streak: int = 0           # consecutive empty returns
 

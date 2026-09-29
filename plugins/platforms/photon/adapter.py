@@ -816,7 +816,7 @@ class PhotonAdapter(BasePlatformAdapter):
         # Monotonic timestamp of the last real upstream activity (inbound
         # message or a successful probe). The watchdog skips its own probe when
         # natural traffic already proved the channel live within the interval.
-        self._last_upstream_activity = 0.0
+        self._last_upstream_activity = float("-inf")
         self._respawn_lock: Optional[asyncio.Lock] = None
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).

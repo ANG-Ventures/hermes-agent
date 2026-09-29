@@ -1038,7 +1038,7 @@ class TestDialecticLiveness:
         stuck.start()
         p._prefetch_thread = stuck
         # timeout=2.0, multiplier=2.0, so anything older than 4s is stale
-        p._prefetch_thread_started_at = 0.0  # very old (1970 monotonic baseline)
+        p._prefetch_thread_started_at = float("-inf")  # never (monotonic origin is boot, not 1970)
 
         p.queue_prefetch("what changed in the repo today")
         # New thread should have been spawned since stuck one is stale
