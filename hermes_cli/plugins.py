@@ -225,6 +225,9 @@ VALID_HOOKS: Set[str] = {
     "transform_api_error_classification",
     "on_session_start",
     "on_session_end",
+    # A host (gateway shutdown) abandoning a turn that is still in flight and
+    # will never reach on_session_end. Observers only; no teardown semantics.
+    "on_turn_abandoned",
     "on_session_finalize",
     "on_session_reset",
     # Successful skill lifecycle facts. The local skill name is available to

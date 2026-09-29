@@ -4129,7 +4129,17 @@ def run_conversation(
                     # accept-site accounting below) reads THIS, not the live
                     # agent, which /model or a fallback may change while the
                     # request is in flight (FleetReview 65e315f38776).
+                    # The MODEL is the one this payload actually carries: a
+                    # /model from another thread between building api_kwargs
+                    # and this edge changes agent.model but not the request
+                    # (FleetReview da84600f3b28).
                     _call_route.update(_live_route(agent))
+                    _sent_model = (
+                        next_api_kwargs.get("model")
+                        if isinstance(next_api_kwargs, dict) else None
+                    )
+                    if isinstance(_sent_model, str) and _sent_model:
+                        _call_route["model"] = _sent_model
                     agent._inflight_request_route = dict(_call_route)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -4180,6 +4190,8 @@ def run_conversation(
                 # _perform_api_call. Execution middleware that answers without
                 # dispatching leaves the route the request was built on.
                 _call_route = _live_route(agent)
+                if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("model"), str) and api_kwargs["model"]:
+                    _call_route["model"] = api_kwargs["model"]
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,

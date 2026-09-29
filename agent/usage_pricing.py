@@ -393,6 +393,12 @@ class PricingEntry:
     input_cost_per_million_above: Optional[Decimal] = None
     output_cost_per_million_above: Optional[Decimal] = None
     cache_read_cost_per_million_above: Optional[Decimal] = None
+    # Announced rate change. When a vendor publishes the rates a model will
+    # switch to on a known date, the row carries both: from ``superseded_at``
+    # (tz-aware, inclusive) ``get_pricing_entry`` returns ``superseded_by``
+    # instead of this entry. See ``_effective_pricing_entry``.
+    superseded_at: Optional[datetime] = None
+    superseded_by: Optional["PricingEntry"] = None
 
 
 @dataclass(frozen=True)
@@ -1291,8 +1297,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # Google Gemini
     # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
     # These are the launch rates Google lists "through December 31, 2026"; the
-    # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027", so this row
-    # must be re-read then.
+    # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027". Both are
+    # encoded: the launch row switches to the 2027 row at 2027-01-01T00:00Z.
     (
         "google",
         "gemini-3.8-flash",
@@ -1303,6 +1309,15 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://ai.google.dev/gemini-api/docs/pricing",
         pricing_version="google-pricing-2026-09-28",
+        superseded_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        superseded_by=PricingEntry(
+            input_cost_per_million=Decimal("1.50"),
+            output_cost_per_million=Decimal("7.50"),
+            cache_read_cost_per_million=Decimal("0.15"),
+            source="official_docs_snapshot",
+            source_url="https://ai.google.dev/gemini-api/docs/pricing",
+            pricing_version="google-pricing-2027-01-01",
+        ),
     ),
     (
         "google",
@@ -2718,7 +2733,33 @@ def _is_unpriced_proxy_route(route: BillingRoute) -> bool:
     return route.provider in NOTIONAL_PROXY_PROVIDERS
 
 
+def _effective_pricing_entry(
+    entry: Optional[PricingEntry], now: Optional[datetime] = None
+) -> Optional[PricingEntry]:
+    """Follow an entry's announced rate changes that have taken effect by ``now``."""
+    when = now or _UTC_NOW()
+    while (
+        entry is not None
+        and entry.superseded_at is not None
+        and entry.superseded_by is not None
+        and when >= entry.superseded_at
+    ):
+        entry = entry.superseded_by
+    return entry
+
+
 def get_pricing_entry(
+    model_name: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[PricingEntry]:
+    return _effective_pricing_entry(
+        _resolve_pricing_entry(model_name, provider, base_url, api_key)
+    )
+
+
+def _resolve_pricing_entry(
     model_name: str,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
