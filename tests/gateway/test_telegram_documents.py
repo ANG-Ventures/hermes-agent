@@ -337,6 +337,36 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.await_args.args[0]
         assert event.media_types == ["audio/ogg"]
 
+    @pytest.mark.asyncio
+    async def test_media_download_timeouts_are_floors_over_the_configured_client(self, adapter):
+        """An operator value above a floor wins; the per-request override must never LOWER it."""
+        adapter._ptb_request_timeouts = {"read_timeout": 90.0, "connect_timeout": 5.0, "pool_timeout": 8.0}
+        file_obj = _make_file_obj(b"OggS voice bytes")
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100)
+        msg.voice.get_file = AsyncMock(return_value=file_obj)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        expected = {"read_timeout": 90.0, "connect_timeout": 10.0, "pool_timeout": 10.0}
+        assert msg.voice.get_file.await_args.kwargs == expected
+        assert file_obj.download_as_bytearray.await_args.kwargs == expected
+
+    def test_build_ptb_requests_records_the_configured_timeouts(self, adapter, monkeypatch):
+        import asyncio
+        import types
+        from unittest.mock import patch
+
+        from plugins.platforms.telegram import adapter as tg
+
+        monkeypatch.setenv("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "75")
+        built: list = []
+        with patch.object(tg, "HTTPXRequest", lambda **kw: built.append(kw) or types.SimpleNamespace()), \
+                patch.object(adapter, "_instrument_polling_request", side_effect=lambda r: r):
+            asyncio.run(adapter._build_ptb_requests())
+        assert built and built[0]["read_timeout"] == 75.0
+        assert adapter._ptb_request_timeouts["read_timeout"] == 75.0
+
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio
     async def test_native_video_is_cached(self, adapter):

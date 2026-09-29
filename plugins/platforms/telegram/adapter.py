@@ -2985,6 +2985,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # tolerance, not bandwidth), so 60s rides out congested-link buffer stalls.
             "media_write_timeout": 60.0,
         }
+        # The media download path raises these to its own floors; keep the operator's values so a knob
+        # set above a floor still wins there instead of being lowered by the per-request override.
+        self._ptb_request_timeouts = {k: request_kwargs[k] for k in ("pool_timeout", "connect_timeout", "read_timeout")}
         # CLOSE_WAIT fd leak: PTB's httpx.AsyncClient has no keepalive tuning; inject platform_httpx_limits()
         # while preserving PTB's max_connections (httpx_kwargs is spread last, so `limits` here wins).
         # CLOSE_WAIT fd leak (#31599, same class as #18451): PTB's HTTPXRequest builds the underlying
@@ -6205,6 +6208,9 @@ class TelegramAdapter(BasePlatformAdapter):
     # Downloads are CDN payload transfers, not JSON API calls: the bot-default read timeout is routinely
     # too short for a voice note on a slow file-CDN edge, so every retry hits the same wall. Give the
     # download path its own per-request budget; retries then only have to cover genuine flakes.
+    # These are FLOORS over the client's configured timeouts (``_build_ptb_requests``): a higher operator
+    # value wins. No write timeout: a download is a GET, so PTB uses the general write budget, and the
+    # response body is bounded by the read timeout.
     _MEDIA_READ_TIMEOUT_S = 30.0
     _MEDIA_CONNECT_TIMEOUT_S = 10.0
     _MEDIA_POOL_TIMEOUT_S = 10.0
@@ -6218,8 +6224,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.run import _is_transient_network_error
         attempts = self._MEDIA_DOWNLOAD_ATTEMPTS
-        timeouts = {"read_timeout": self._MEDIA_READ_TIMEOUT_S, "connect_timeout": self._MEDIA_CONNECT_TIMEOUT_S,
-                    "pool_timeout": self._MEDIA_POOL_TIMEOUT_S}
+        configured = getattr(self, "_ptb_request_timeouts", None) or {}
+        floors = {"read_timeout": self._MEDIA_READ_TIMEOUT_S, "connect_timeout": self._MEDIA_CONNECT_TIMEOUT_S,
+                  "pool_timeout": self._MEDIA_POOL_TIMEOUT_S}
+        timeouts = {k: max(floor, configured.get(k) or 0.0) for k, floor in floors.items()}
         for attempt in range(1, attempts + 1):
             try:
                 file_obj = await source.get_file(**timeouts)
