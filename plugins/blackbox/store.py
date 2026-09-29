@@ -980,7 +980,9 @@ def insert_turn(
     was written. ``db_path`` targets another profile's store.
     """
     try:
-        with _connect(db_path) as conn:
+        # Positional only when targeting another store: tests stub _connect
+        # with zero-arg fakes, and this profile's own store needs no argument.
+        with (_connect(db_path) if db_path else _connect()) as conn:
             cur = conn.execute(
                 _INSERT_TURN_PROVISIONAL_SQL if provisional else _INSERT_TURN_SQL,
                 (
@@ -1105,7 +1107,9 @@ def ledger_turn_usage(turn_id: str, db_path: Path | str | None = None) -> dict |
     stays unknown, never a measured 0. None when the turn has no rows.
     """
     try:
-        with _connect(db_path) as conn:
+        # Positional only when targeting another store: tests stub _connect
+        # with zero-arg fakes, and this profile's own store needs no argument.
+        with (_connect(db_path) if db_path else _connect()) as conn:
             rows = conn.execute(
                 "SELECT input_tokens, output_tokens, cache_read, cache_write, "
                 "reasoning, provider, model FROM turn_api_calls "
