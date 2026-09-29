@@ -16,12 +16,19 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 import { $registryVersion } from '@/contrib/registry'
 import { matchesQuery, useMediaQuery } from '@/hooks/use-media-query'
 import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
+import { recordFeatureUse } from '@/store/desktop-metrics'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $connection } from '@/store/session'
 import { setAppearance } from '@/store/translucency'
 
 import { $accentOverride } from './accent-override'
-import { $backendCustomCSS, $backendThemes, $pendingSkinApply, localDisplaySkinName, localDisplaySkinProfile } from './backend-sync'
+import {
+  $backendCustomCSS,
+  $backendThemes,
+  $pendingSkinApply,
+  localDisplaySkinName,
+  localDisplaySkinProfile
+} from './backend-sync'
 import { $chatFontFamily, resolveChatFontFamily } from './chat-font'
 import { harmonize, readableInk } from './color'
 import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
@@ -95,13 +102,14 @@ export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
 // into. A desktop-side pick remains the source of truth, and switching to a
 // different profile cannot borrow a skin from this machine's initial profile.
 const readBootProfileKey = () => normalizeProfileKey(storedString(LAST_PROFILE_KEY))
-const BOOT_PROFILE_KEY = typeof window === 'undefined' ? 'default' : localDisplaySkinProfile ?? readBootProfileKey()
+const BOOT_PROFILE_KEY = typeof window === 'undefined' ? 'default' : (localDisplaySkinProfile ?? readBootProfileKey())
 
 // Provider state keeps the raw pick so a name nothing resolves YET (a backend
 // skin the gateway hasn't seeded on this launch) isn't flattened to the default
 // for the rest of the session — it paints as soon as the registry can resolve it.
 const storedSkin = (profile: string): string =>
-  skinPref.stored(profile) ?? (profile === BOOT_PROFILE_KEY ? localDisplaySkinName ?? DEFAULT_SKIN_NAME : DEFAULT_SKIN_NAME)
+  skinPref.stored(profile) ??
+  (profile === BOOT_PROFILE_KEY ? (localDisplaySkinName ?? DEFAULT_SKIN_NAME) : DEFAULT_SKIN_NAME)
 
 /** Everything a peer window could change that this one has to repaint for. */
 const APPEARANCE_KEYS = new Set([SKIN_KEY, PROFILE_SKINS_KEY, MODE_KEY, PROFILE_MODES_KEY])
@@ -532,12 +540,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setTheme = useCallback((name: string) => {
     const next = normalizeSkin(name)
+    recordFeatureUse('skins')
     setPreview(null)
     setThemeNameState(next)
     skinPref.assign(liveProfile(), next)
   }, [])
 
   const setMode = useCallback((next: ThemeMode) => {
+    recordFeatureUse('skins')
     setPreview(null)
     setModeState(next)
     modePref.assign(liveProfile(), next)

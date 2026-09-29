@@ -251,9 +251,7 @@ const $paneSharePartners = modeLayout.atom<Record<string, string>>(
   () => ({}),
   Codecs.json(value =>
     value && typeof value === 'object'
-      ? Object.fromEntries(
-          Object.entries(value).filter(([, partner]) => typeof partner === 'string' && partner)
-        )
+      ? Object.fromEntries(Object.entries(value).filter(([, partner]) => typeof partner === 'string' && partner))
       : {}
   )
 )
@@ -321,8 +319,8 @@ function rememberPaneShare(tree: LayoutNode, paneId: string) {
     // partner-validated, so it records without a partner and falls back to
     // even on any mismatched recall.
     const partnerGroup = parent.children[partner] as LayoutNode
-    const partnerPane =
-      partnerGroup.type === 'group' && partnerGroup.panes.length === 1 ? partnerGroup.panes[0] : null
+
+    const partnerPane = partnerGroup.type === 'group' && partnerGroup.panes.length === 1 ? partnerGroup.panes[0] : null
 
     $paneShares.set({ ...$paneShares.get(), [paneId]: share })
 
@@ -939,7 +937,7 @@ export function removeTreePane(paneId: string) {
  *  Usually the root itself (Default, Focus); in a column-root layout (Terminal
  *  deck, Quad) it's the row child that holds sessions/workspace/files. Returns
  *  null when the tree has no row split with side-eligible panes. */
-function rootRow(): SplitNode | null {
+export function rootRow(): SplitNode | null {
   const tree = $layoutTree.get()
 
   if (!tree || tree.type !== 'split') {
@@ -1718,15 +1716,7 @@ export function dockPaneBeside(paneId: string, anchorPaneId: string) {
 
   const next = findGroupOfPane(tree, paneId)
     ? movePaneOp(tree, paneId, { groupId: anchor.id, pos })
-    : insertAtGroup(
-        tree,
-        anchor.id,
-        paneId,
-        pos,
-        undefined,
-        true,
-        recalledEdgeWeights(paneId, anchorPaneId)
-      )
+    : insertAtGroup(tree, anchor.id, paneId, pos, undefined, true, recalledEdgeWeights(paneId, anchorPaneId))
 
   if (next && next !== tree) {
     commit(next)
