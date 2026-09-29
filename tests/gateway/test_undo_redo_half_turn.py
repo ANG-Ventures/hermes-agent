@@ -342,3 +342,55 @@ def test_tail_preview_strips_both_marker_and_reply_pointer(store):
     assert "actual question here" in msg
     assert "Triggering message id" not in msg
     assert "Replying to" not in msg
+
+
+# ── Count honesty (t_b4f07acf): replies render what the core DID ─────────
+
+
+def test_undo_n_reports_requested_count_when_history_is_deep_enough(store):
+    src = _source("undo-n")
+    entry = store.get_or_create_session(src)
+    _seed(store._db, entry.session_id)
+    runner = _runner(store)
+
+    msg = asyncio.run(runner._handle_undo_command(_event("/undo 3", src)))
+
+    assert "Undid 3 half-turn(s) (3 message(s))" in msg
+
+
+def test_undo_n_beyond_history_reports_clamped_half_turns(store):
+    src = _source("undo-clamp")
+    entry = store.get_or_create_session(src)
+    _seed(store._db, entry.session_id)  # 4 half-turns
+    runner = _runner(store)
+
+    msg = asyncio.run(runner._handle_undo_command(_event("/undo 9", src)))
+
+    assert "Undid 4 half-turn(s) (4 message(s))" in msg
+    assert "Undid 9" not in msg
+
+
+def test_redo_n_beyond_undo_stack_reports_ops_actually_redone(store):
+    src = _source("redo-clamp")
+    entry = store.get_or_create_session(src)
+    _seed(store._db, entry.session_id)
+    runner = _runner(store)
+
+    asyncio.run(runner._handle_undo_command(_event("/undo", src)))
+    msg = asyncio.run(runner._handle_redo_command(_event("/redo 3", src)))
+
+    assert "Redid 1 undo operation(s) (1 message(s) restored)" in msg
+    assert "Redid 3" not in msg
+
+
+def test_redo_n_within_undo_stack_reports_each_op(store):
+    src = _source("redo-n")
+    entry = store.get_or_create_session(src)
+    _seed(store._db, entry.session_id)
+    runner = _runner(store)
+
+    asyncio.run(runner._handle_undo_command(_event("/undo", src)))
+    asyncio.run(runner._handle_undo_command(_event("/undo", src)))
+    msg = asyncio.run(runner._handle_redo_command(_event("/redo 2", src)))
+
+    assert "Redid 2 undo operation(s) (2 message(s) restored)" in msg

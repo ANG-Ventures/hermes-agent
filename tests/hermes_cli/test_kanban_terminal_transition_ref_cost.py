@@ -98,7 +98,12 @@ def _spawns_during(monkeypatch, fn):
 # assertion fires again, re-measure the SLOPE across two ref counts before
 # raising it: a per-ref regression shows as a difference between the two, not as
 # a larger number at one.
-SPAWN_CEILING = 40
+#
+# Raised 40 -> 45 for t_93fba703, which added ONE fixed call per `preserve`
+# (`git for-each-ref --contains <recorded base> refs/remotes`, in
+# `_recorded_base`). Measured flat: 40 spawns at 6 heads and 40 at 60 (main
+# was 38 at both).
+SPAWN_CEILING = 45
 
 
 def test_complete_is_not_starved_by_ref_count(board, monkeypatch):

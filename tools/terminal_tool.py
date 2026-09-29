@@ -2910,6 +2910,22 @@ _POLL_SLEEP_RE = re.compile(
     re.IGNORECASE,
 )
 _POLL_SLEEP_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+# A loop ends at `done` in command position (after ; & | ( newline {).
+_POLL_LOOP_DONE_RE = re.compile(r"(?:^|[;&|(\n{])\s*done\b")
+
+
+def _inside_loop(unquoted: str, pos: int) -> bool:
+    """True when ``pos`` falls between a for/while/until keyword and its
+    ``done`` (condition or body). Nesting is counted, so a sleep after an
+    inner loop closes but before the outer one does still counts."""
+    events = [(m.start(), 1) for m in _POLL_LOOP_KEYWORD_RE.finditer(unquoted)]
+    events += [(m.start(), -1) for m in _POLL_LOOP_DONE_RE.finditer(unquoted)]
+    depth = 0
+    for at, delta in sorted(events):
+        if at >= pos:
+            break
+        depth = max(0, depth + delta)
+    return depth > 0
 # `watch CMD` repeats until interrupted — always a poll. Anchored at command
 # position so `gh run watch` / `npm run watch` / `--watch` don't match.
 _WATCH_COMMAND_RE = re.compile(
@@ -2935,7 +2951,7 @@ def _gateway_polling_loop_guidance(command: str) -> str | None:
     elif _POLL_LOOP_KEYWORD_RE.search(unquoted):
         for m in _POLL_SLEEP_RE.finditer(unquoted):
             secs = float(m.group(1)) * _POLL_SLEEP_UNITS[m.group(2).lower()]
-            if secs >= POLL_LOOP_MIN_SLEEP_S:
+            if secs >= POLL_LOOP_MIN_SLEEP_S and _inside_loop(unquoted, m.start()):
                 literal = f"sleep {m.group(1)}{m.group(2)} inside a for/while/until loop"
                 break
     if literal is None:

@@ -174,6 +174,9 @@ def _hermes_config_path() -> Path:
 # its text changed -- so a config edit is still seen on the next read, with no
 # mtime-granularity staleness. Contract: docs/lcm-init-boot-cost-contract.md.
 _CONFIG_YAML_CACHE_LOCK = threading.Lock()
+# Serializes the miss path (check -> parse -> store): concurrent misses parse
+# once, and a slow parse of older text can never overwrite a newer entry.
+_CONFIG_YAML_PARSE_LOCK = threading.Lock()
 _config_yaml_cache: tuple[str, str, dict[str, Any]] | None = None
 
 
@@ -195,10 +198,21 @@ def _hermes_config_yaml() -> dict[str, Any]:
     with _CONFIG_YAML_CACHE_LOCK:
         cached = _config_yaml_cache
     if cached is None or cached[0] != key_path or cached[1] != text:
-        parsed = _load_hermes_config_yaml(text)
-        with _CONFIG_YAML_CACHE_LOCK:
-            _config_yaml_cache = (key_path, text, parsed)
-        cached = (key_path, text, parsed)
+        with _CONFIG_YAML_PARSE_LOCK:
+            # Re-read under the lock: text read before it may predate an edit
+            # another thread already cached; parsing that would store (and
+            # return) the older config over the newer entry.
+            try:
+                text = cfg_path.read_text(encoding="utf-8")
+            except Exception:
+                return {}
+            with _CONFIG_YAML_CACHE_LOCK:
+                cached = _config_yaml_cache
+            if cached is None or cached[0] != key_path or cached[1] != text:
+                parsed = _load_hermes_config_yaml(text)
+                with _CONFIG_YAML_CACHE_LOCK:
+                    _config_yaml_cache = (key_path, text, parsed)
+                cached = (key_path, text, parsed)
     # Callers only read today; the copy keeps one caller's mutation from
     # leaking into every later engine load.
     return copy.deepcopy(cached[2])

@@ -166,8 +166,11 @@ async def _loop_ticks_while_rename_is_held(held, do_mark):
     order = {}
 
     async def sibling():
-        await asyncio.sleep(0)
-        order["ticked_before_release"] = not released.is_set()
+        # FleetReview #60: tick only once the write is INSIDE the held rename;
+        # a tick before that proves nothing about the loop during the stall.
+        while not held.entered.is_set() and not released.is_set():
+            await asyncio.sleep(0.005)
+        order["ticked_before_release"] = held.entered.is_set() and not released.is_set()
 
     def _release_later():
         held.entered.wait(5.0)

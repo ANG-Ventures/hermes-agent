@@ -2030,7 +2030,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
-    "request-changes", "link", "specify", "decompose", "workspace",
+    "request-changes", "link", "unlink", "specify", "decompose", "workspace",
 })
 
 
@@ -2879,8 +2879,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"`hermes kanban boards list`)\n"
         )
     _print_triage_banner(triage_ids, stranded)
+    other_boards = (
+        _home_cards_on_other_boards(home_session_ids, args)
+        if home_session_ids is not None else None
+    )
     if not tasks:
         print("(no matching tasks)")
+        if other_boards:
+            print(other_boards)
         return 0
     caller = None
     if not (getattr(args, "flat_all", False) or args.session
@@ -2889,9 +2895,50 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not caller:
         for t in tasks:
             print(_fmt_task_line(t, refusals.get(t.id)))
+        if other_boards:
+            # --home spans every board (the cross-board index the
+            # kanban-home-cards block reads, C5 #32), so its hint is true.
+            print(other_boards)
         return 0
     print(_format_session_grouped(tasks, kb.home_ids(caller), refusals))
     return 0
+
+
+def _home_cards_on_other_boards(
+    session_ids: Any, args: argparse.Namespace,
+) -> Optional[str]:
+    """``list --home`` section: OPEN home cards on boards other than this one.
+
+    One read of the cross-board home index (``kanban_home_index``), the same
+    source the kanban-home-cards block renders from. Filters the index cannot
+    evaluate (assignee/tenant/workflow/archived) skip the section; an
+    unavailable index prints a one-line note instead of scanning boards.
+    """
+    if (args.assignee or getattr(args, "mine", False) or args.tenant
+            or args.archived or getattr(args, "workflow_template_id", None)
+            or getattr(args, "current_step_key", None)):
+        return None
+    from hermes_cli import kanban_home_index
+    try:
+        cards = kanban_home_index.open_cards(list(session_ids), timeout_s=1.0)
+    except kanban_home_index.IndexUnavailable as exc:
+        return f"(other boards: home index unavailable: {exc})"
+    except Exception as exc:  # listing must never fail on the extra section
+        return f"(other boards: home index read failed: {type(exc).__name__})"
+    current = kb.get_current_board()
+    rows = [
+        c for c in cards
+        if (c.get("board") or kb.DEFAULT_BOARD) != current
+        and (not args.status or c.get("status") == args.status)
+    ]
+    if not rows:
+        return None
+    rows.sort(key=lambda c: (str(c.get("board")), str(c.get("id"))))
+    lines = [f"\nOTHER BOARDS ({len(rows)} open home card{'s' if len(rows) != 1 else ''}):"]
+    for c in rows:
+        title = " ".join(str(c.get("title") or "").split())
+        lines.append(f"  {c.get('id')}  {c.get('status')}  {title}  [board {c.get('board')}]")
+    return "\n".join(lines)
 
 
 def _cmd_home_lint(args: argparse.Namespace) -> int:
@@ -4887,12 +4934,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"BLOCKED: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            # Provenance before the transition: blocking ends the run.
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
             if not kb.block_task(
                 conn,
                 tid,
@@ -4903,6 +4946,14 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    # Only after the transition landed: a refused or failed
+                    # block leaves no "BLOCKED:" comment (C5 #20, FleetReview
+                    # e6af55d359f5).
+                    kb.add_comment(
+                        conn, tid, author, f"BLOCKED: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -4954,12 +5005,19 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 current is not None and current.status == "scheduled"
                 and wake_at is not None
             )
-            if reason:
-                _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"SCHEDULED: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
+            # Provenance before the transition: scheduling ends the run.
+            _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
+
+            def _status_comment() -> None:
+                # Only after a mutation landed: a refused or failed schedule
+                # leaves no "SCHEDULED:" comment (C5 #20, FleetReview
+                # e6af55d359f5).
+                if reason:
+                    kb.add_comment(
+                        conn, tid, author, f"SCHEDULED: {reason}",
+                        run_id=_run_id, session_ref=_sess_ref,
+                    )
+
             if not already and not kb.schedule_task(
                 conn,
                 tid,
@@ -4970,12 +5028,16 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print(f"cannot schedule {tid}", file=sys.stderr)
                 continue
             if not already:
+                _status_comment()
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
             if wake_at is None:
                 continue
             ok, err = kb.set_schedule_wake(
                 conn, tid, wake_at=wake_at, actor=author, reason=reason,
             )
+            if ok and already:
+                # The wake reset is the only mutation on an already-scheduled card.
+                _status_comment()
             if not ok:
                 failed.append(tid)
                 print(f"cannot set wake for {tid}: {err}", file=sys.stderr)
@@ -4997,13 +5059,15 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # The "UNBLOCK:" comment commits atomically with the transition
+            # and only if it lands: no comment on a refused/failed unblock, and
+            # no window where a respawned worker sees the card without the
+            # reason (C5 #20, FleetReview e6af55d359f5 / aa67ba1c7513).
+            comment = None
             if reason:
                 _run_id, _sess_ref = safe_comment_provenance(tid)
-                kb.add_comment(
-                    conn, tid, author, f"UNBLOCK: {reason}",
-                    run_id=_run_id, session_ref=_sess_ref,
-                )
-            if not kb.unblock_task(conn, tid):
+                comment = (author, f"UNBLOCK: {reason}", _run_id, _sess_ref)
+            if not kb.unblock_task(conn, tid, comment=comment):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:

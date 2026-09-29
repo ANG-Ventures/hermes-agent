@@ -160,3 +160,134 @@ def test_route_change_during_the_call_does_not_restamp_that_call(captured_turn_u
     # Session cost is the sum of each call at its OWN request route.
     expected = _price("gpt-4o", "openai", calls[0]) + _price("gpt-4o-mini", "openrouter", calls[1])
     assert agent.session_estimated_cost_usd == pytest.approx(expected)
+
+
+def test_model_switch_before_dispatch_prices_the_model_the_payload_carries(
+    captured_turn_usage, monkeypatch,
+):
+    """FleetReview da84600f3b28: a /model from another thread AFTER api_kwargs
+    is built but BEFORE the dispatch edge changes agent.model, not the payload.
+    The call must be recorded at the model the request actually sent."""
+    import hermes_cli.middleware as middleware
+    import plugins.blackbox as blackbox
+
+    ledger = []
+    monkeypatch.setattr(
+        blackbox, "record_api_call", lambda **kw: ledger.append(kw.get("model")),
+    )
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = lambda *a, **kw: _response()
+
+    def _switch_then_dispatch(request, next_call, **_ctx):
+        agent.model = "gpt-4o-mini"  # payload already built on gpt-4o
+        return next_call(request)
+
+    monkeypatch.setattr(middleware, "run_llm_execution_middleware", _switch_then_dispatch)
+    agent.run_conversation("hello")
+
+    requested = [
+        c.kwargs.get("model") for c in agent.client.chat.completions.create.call_args_list
+    ]
+    assert requested == ["gpt-4o"]
+    calls = captured_turn_usage["turn_usage"]["calls"]
+    assert [c.get("model") for c in calls] == requested
+    assert ledger == requested
+
+
+def _identity_agent(*, dispatched: str, live: str):
+    agent = SimpleNamespace(
+        provider=live, model="m", base_url="", api_mode="chat_completions",
+        _current_turn_id="turn-1", session_id="s",
+    )
+    agent._inflight_request_route = {
+        "provider": dispatched, "model": "m", "base_url": "", "api_mode": "chat_completions",
+    }
+    return agent
+
+
+@pytest.mark.parametrize(
+    "dispatched,live,want",
+    [
+        ("xai-oauth", "gemini-bridge", ("xai-oauth", "supergrok", "pinned")),
+        ("xai-oauth", "openai", ("xai-oauth", "supergrok", "pinned")),
+        ("openai", "gemini-bridge", ("openai", None, "wire")),
+    ],
+)
+def test_ledger_identity_comes_from_the_dispatched_provider(monkeypatch, dispatched, live, want):
+    """FleetReview 73d9dc1df836: the ledger row's sub_key/attribution must be
+    derived from the provider the call was dispatched on, same as its
+    ``provider`` column, not from the live agent after a switch."""
+    import plugins.blackbox as blackbox
+    from agent.chat_completion_helpers import _emit_api_call_record
+
+    rows = []
+    monkeypatch.setattr(blackbox, "record_api_call", lambda **kw: rows.append(kw))
+    _emit_api_call_record(_identity_agent(dispatched=dispatched, live=live), usage=None, headers={})
+    assert [(r["provider"], r["sub_key"], r["attribution"]) for r in rows] == [want]
+
+
+def test_switch_to_pooled_provider_mid_flight_keeps_the_ledger_row(monkeypatch):
+    """Same class: the pooled-provider header guard in
+    _record_successful_api_call must gate on the dispatched provider. A
+    non-pooled call finishing after a switch TO claude-bpr has no pool
+    headers by design and must still be ledgered."""
+    import plugins.blackbox as blackbox
+    from agent import fallback_wiring
+    from agent.chat_completion_helpers import _record_successful_api_call
+
+    rows = []
+    monkeypatch.setattr(blackbox, "record_api_call", lambda **kw: rows.append(kw))
+    monkeypatch.setattr(fallback_wiring, "note_success", lambda *a, **k: None)
+    agent = _identity_agent(dispatched="openai", live="claude-bpr")
+    _record_successful_api_call(agent, SimpleNamespace(usage=None))
+    assert [r["provider"] for r in rows] == ["openai"]
+
+
+def _codex_jwt(account_id: str) -> str:
+    import base64
+    import json
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    claims = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    return f"{seg({'alg': 'none'})}.{seg(claims)}.sig"
+
+
+def test_codex_credential_change_during_the_call_does_not_restamp_its_account(
+    captured_turn_usage, monkeypatch,
+):
+    """FleetReview 659603b36aec: the Codex account a call is attributed to is
+    the credential it was DISPATCHED with. A credential rotation or a switch
+    from another thread while the request is on the wire must not stamp the
+    completed call's tokens to the NEW account (the route snapshot already
+    pins the provider; the account must be pinned with it).
+    """
+    import plugins.blackbox as blackbox
+
+    ledger = []
+    monkeypatch.setattr(
+        blackbox, "record_api_call",
+        lambda **kw: ledger.append((kw.get("provider"), kw.get("sub_key"))),
+    )
+    agent = _make_agent()
+    agent.provider = "openai-codex"
+    agent.api_key = _codex_jwt("aaaaaaaa-dispatch")
+    rotated = iter([_codex_jwt("bbbbbbbb-rotated"), _codex_jwt("cccccccc-rotated")])
+    responses = iter([_response(tool_calls=[_tool_call()], content=None), _response()])
+
+    def _create(*args, **kwargs):
+        # The request is already on the wire with the current key; another
+        # thread rotates the credential before the call returns.
+        agent.api_key = next(rotated)
+        return next(responses)
+
+    agent.client.chat.completions.create.side_effect = _create
+    agent.run_conversation("hello")
+
+    # Call 1 went out on account aaaaaaaa, call 2 on the key rotated in during
+    # call 1 (bbbbbbbb). Neither is stamped to the key live at completion.
+    assert ledger == [
+        ("openai-codex", "codex:aaaaaaaa"),
+        ("openai-codex", "codex:bbbbbbbb"),
+    ]

@@ -33,6 +33,9 @@ on:
       - "Deploy Site"
       - "Build Skills Index"
       - "Skills Index Freshness Check"
+      # Synthetic P4 bench probe (t_c58e7200). Bench waves stay silent here;
+      # see the PLACEMENT PROBE gate in the route step.
+      - "CI placement probe"
     types:
       - completed
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
@@ -115,6 +118,7 @@ jobs:
           WF_BRANCH="$(f .head_branch)"; WF_SHA="$(f .head_sha)"
           WF_CONCLUSION="$(f .conclusion)"; WF_URL="$(f .html_url)"
           WF_ACTOR="$(f .actor.login)"; WF_EVENT="$(f .event)"
+          WF_SUBJECT="$(f .head_commit.message | head -n1)"
           {
             echo "wf_name=$WF_NAME"; echo "wf_run_id=$WF_RUN_ID"
             echo "wf_branch=$WF_BRANCH"; echo "wf_sha=$WF_SHA"; echo "wf_url=$WF_URL"
@@ -193,29 +197,36 @@ jobs:
           # the failing tests in its first line. Signature = the pytest node ids the
           # test jobs annotate "FAILED (not quarantined)", else the failed job names
           # with the slice number stripped (a test moves between slices as the tree
-          # changes). Any API error keeps the page (fail loud).
+          # changes). A failed job with no such annotation (lint, a slice that
+          # timed out) adds its stripped name, so a new red job alongside an old
+          # test failure is a new signature. Any API error keeps the page (fail loud).
+          # PR = the gh-readonly-queue/<base>/pr-N-<sha> branch; once the queue ref
+          # is deleted the API can return head_branch null, so the squash commit
+          # subject's trailing "(#N)" is the durable fallback (both agreed on
+          # 100/100 merge_group CI runs, 2026-09-28).
           PR_NUM=""; SIG=""
           if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = merge_group ]; then
             PR_NUM="$(sed -nE 's#^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p' <<< "$WF_BRANCH")"
+            if [ -z "$WF_BRANCH" ]; then
+              PR_NUM="$(sed -nE 's#^.*\(\#([0-9]+)\)$#\1#p' <<< "$WF_SUBJECT")"
+            fi
           fi
           api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
           sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
-            local jobs ids id ann got
+            local jobs failed id name ann got items=""
             jobs="$(api "actions/runs/$1/jobs?filter=latest&per_page=100")" || return 1
-            ids="$(jq -r '.jobs[] | select(.conclusion == "failure") | .id' <<< "$jobs")" || return 1
-            ann=""
-            for id in $ids; do
-              got="$(api "check-runs/$id/annotations?per_page=100")" || return 1
-              ann+="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
-              ann+=$'\n'
-            done
-            ann="$(grep -v '^$' <<< "$ann" | sort -u | paste -sd ' ' -)"
-            if [ -z "$ann" ]; then
-              ann="$(jq -r '[.jobs[] | select(.conclusion == "failure") | .name
-                | select(test("Tests complete|All required checks") | not)
-                | sub(" slice [0-9]+/[0-9]+$"; "")] | unique | join("; ")' <<< "$jobs")" || return 1
-            fi
-            printf '%s' "$ann"
+            failed="$(jq -r '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"' <<< "$jobs")" || return 1
+            while IFS=$'\t' read -r id name; do
+              [ -n "$id" ] || continue
+              got="$(api "check-runs/$id/annotations?per_page=100" < /dev/null)" || return 1
+              ann="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
+              if [ -n "$ann" ]; then
+                items+="$ann"$'\n'
+              elif ! grep -qE 'Tests complete|All required checks' <<< "$name"; then
+                items+="$(sed -E 's# slice [0-9]+/[0-9]+$##' <<< "$name")"$'\n'
+              fi
+            done <<< "$failed"
+            printf '%s' "$(grep -v '^$' <<< "$items" | sort -u | paste -sd ';' - | sed 's/;/; /g')"
           }
           if [ -n "$PR_NUM" ]; then
             if SIG="$(sig_of "$WF_RUN_ID")" && [ -n "$SIG" ]; then
@@ -223,7 +234,9 @@ jobs:
               PRIOR="$(api "actions/workflows/$WF_ID/runs?event=merge_group&status=failure&per_page=50" \
                 | jq -r --argjson id "$WF_RUN_ID" --arg pr "$PR_NUM" --arg since "$SINCE" \
                   '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
-                    | select((.head_branch // "") | test("^gh-readonly-queue/.+/pr-" + $pr + "-[0-9a-f]+$"))
+                    | select(if (.head_branch // "") != ""
+                        then .head_branch | test("^gh-readonly-queue/.+/pr-" + $pr + "-[0-9a-f]+$")
+                        else ((.head_commit.message // "") + "\n") | split("\n")[0] | test("\\(#" + $pr + "\\)$") end)
                     | .id][:5][]')" || PRIOR=error
               if [ "$PRIOR" = error ]; then
                 echo "::warning::prior merge_group run lookup failed; paging"
@@ -246,29 +259,35 @@ jobs:
           # or ANOTHER PR's merge_group run of this workflow is the same fault: it
           # goes to #logs (ci-fail-known route, which falls back to #alerts if that
           # POST fails). The first red of each test still pages, and main-red-watch
-          # owns the main episode + fix card. A job-name signature (no node ids), a
-          # new test, or any API error -> no fold (page).
+          # owns the main episode + fix card. SIG items are "; "-separated; ANY
+          # item that is not a pytest node id (a failed job with no FAILED
+          # annotation: lint, Windows-only, a segfaulted slice) blocks the fold, so
+          # a new red job next to an old test still pages. A new test, or any API
+          # error -> no fold (page). A queue run whose ref was deleted
+          # (head_branch null) is matched to its PR by the squash subject "(#N)".
           FOLD_RUN=""
           if [ "$ROUTE" = alerts ] && [ -n "$WF_ID" ] \
              && { [ -n "$PR_NUM" ] || { [ "$WF_EVENT" = push ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; }; }; then
             if [ -z "$PR_NUM" ]; then SIG="$(sig_of "$WF_RUN_ID")" || SIG=""; fi
-            if [ -n "$SIG" ] && ! tr ' ' '\n' <<< "$SIG" | grep -qv '::'; then
+            items_of() { sed 's/; /\n/g' <<< "$1" | grep -v '^$' | sort -u; }
+            if [ -n "$SIG" ] && ! items_of "$SIG" | grep -qv '::'; then
               SINCE12="$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-12H +%Y-%m-%dT%H:%M:%SZ)"
               CANDS="$(api "actions/workflows/$WF_ID/runs?status=failure&per_page=50" \
                 | jq -r --argjson id "$WF_RUN_ID" --arg since "$SINCE12" --arg def "$DEFAULT_BRANCH" --arg pr "$PR_NUM" \
                   '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
+                    | (if (.head_branch // "") != ""
+                        then ((.head_branch | capture("^gh-readonly-queue/.+/pr-(?<n>[0-9]+)-[0-9a-f]+$") | .n) // "")
+                        else ((((.head_commit.message // "") + "\n") | split("\n")[0] | capture("\\(#(?<n>[0-9]+)\\)$") | .n) // "") end) as $qpr
                     | select((.event == "push" and .head_branch == $def)
-                        or (.event == "merge_group"
-                            and ((.head_branch // "") | test("^gh-readonly-queue/.+/pr-[0-9]+-[0-9a-f]+$"))
-                            and ($pr == "" or ((.head_branch // "") | test("/pr-" + $pr + "-") | not))))
+                        or (.event == "merge_group" and $qpr != "" and $qpr != $pr))
                     | .id][:8][]')" || CANDS=error
               if [ "$CANDS" = error ]; then
                 echo "::warning::already-red fold: run lookup failed; paging"
               else
-                LEFT="$(tr ' ' '\n' <<< "$SIG" | sort -u)"
+                LEFT="$(items_of "$SIG")"
                 for prev in $CANDS; do
                   PSIG="$(sig_of "$prev")" || { LEFT="__error__"; echo "::warning::already-red fold: cannot read run $prev; paging"; break; }
-                  NEXT="$(comm -23 <(printf '%s\n' "$LEFT") <(tr ' ' '\n' <<< "$PSIG" | sort -u) | grep -v '^$' || true)"
+                  NEXT="$(comm -23 <(printf '%s\n' "$LEFT") <(items_of "$PSIG") | grep -v '^$' || true)"
                   [ "$NEXT" != "$LEFT" ] && FOLD_RUN="${FOLD_RUN:+$FOLD_RUN,}$prev"   # name only runs that covered a test
                   LEFT="$NEXT"
                   [ -z "$LEFT" ] && break
@@ -279,6 +298,34 @@ jobs:
                 else
                   FOLD_RUN=""
                 fi
+              fi
+            fi
+          fi
+          # PLACEMENT PROBE (t_c58e7200). ci-placement-probe.yml is dispatched by
+          # p4_bench.py inside a bench window, and each wave is graded by
+          # p4_gates.py; the nightly bench cron pages #alerts + files a card on a
+          # red wave. The window file is local to the controller host, so GitHub
+          # cannot see it. The proxy is the dispatcher: every bench wave is
+          # dispatched with an ang-fleet-workers[bot] token (all 310 bot-dispatched
+          # probe runs were bench waves, measured 2026-09-28), so a bot red is silent.
+          # A red dispatched by anyone else (a hand `gh workflow run`) pages ONCE
+          # per wave: a later red of the same wave in the last 24h is silent.
+          # Any API error keeps the page (fail loud).
+          if [ "$ROUTE" = alerts ] && [ "$WF_NAME" = "CI placement probe" ]; then
+            WF_TITLE="$(f .display_title)"
+            WAVE="$(sed -nE 's/^placement probe (.+) #[^ #]+$/\1/p' <<< "$WF_TITLE")"
+            if [ "$WF_ACTOR" = "ang-fleet-workers[bot]" ]; then
+              ROUTE=none; echo "no page: bench-dispatched probe run; the bench grades and pages its wave"
+            elif [ -n "$WAVE" ]; then
+              SINCE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)"
+              PRIOR="$(api "actions/workflows/$WF_ID/runs?event=workflow_dispatch&status=failure&per_page=100" \
+                | jq -r --argjson id "$WF_RUN_ID" --arg p "placement probe $WAVE #" --arg since "$SINCE" \
+                  '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
+                    | select((.display_title // "") | startswith($p)) | .id][0] // ""')" || PRIOR=error
+              if [ "$PRIOR" = error ]; then
+                echo "::warning::prior probe run lookup failed; paging"
+              elif [ -n "$PRIOR" ]; then
+                ROUTE=none; echo "no page: probe wave '$WAVE' already paged (run $PRIOR)"
               fi
             fi
           fi

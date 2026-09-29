@@ -62,6 +62,7 @@ from agent.fork_ext.relay_headers import (
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
+    stamp_bridge_lane,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -144,25 +145,46 @@ def _next_api_call_seq(agent: Any, turn_id: str) -> int:
 
 
 def _codex_sub_key(agent: Any) -> Optional[str]:
-    pool = getattr(agent, "_credential_pool", None)
-    if pool is None:
-        return None
+    """``codex:<account[:8]>`` for the Codex OAuth token this call was sent with.
+
+    The wire credential is ``agent.api_key``: the client (and its
+    ``ChatGPT-Account-ID`` header) is built from it on init, on pool rotation
+    and on fallback activation. A fallback-attached pool is a fresh
+    ``load_pool()`` whose selection cursor is unset, so ``pool.current()``
+    alone left every fallback-to-Codex call unattributed (t_6144ccf0). The
+    pool cursor is consulted only when the agent key carries no account claim.
+    Never guesses: an opaque token with no pool selection records NULL.
+    """
     try:
-        current = pool.current()
-        if current is None:
-            return None
         from hermes_cli.auth import get_codex_account_id
 
-        account_id = get_codex_account_id(current.access_token)
-        return f"codex:{account_id[:8]}" if account_id else None
+        candidates = [getattr(agent, "api_key", None)]
+        pool = getattr(agent, "_credential_pool", None)
+        current = pool.current() if pool is not None else None
+        if current is not None:
+            candidates.append(getattr(current, "access_token", None))
+        for token in candidates:
+            if not isinstance(token, str) or not token:
+                continue
+            account_id = get_codex_account_id(token)
+            if account_id:
+                return f"codex:{account_id[:8]}"
+        return None
     except Exception:
         return None
 
 
 
-def _api_call_identity(agent: Any, headers: dict[str, str]) -> tuple[Optional[str], str]:
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
-    return _route_identity(provider, headers, agent)
+def _api_call_identity(
+    agent: Any, headers: dict[str, str], provider: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """Identity of the main-lane call. ``provider`` is the route the call was
+    DISPATCHED on; defaults to the serving route, never a bare live read, so a
+    provider switch while the call is in flight cannot re-attribute it to the
+    new provider's subscription (FleetReview 73d9dc1df836)."""
+    if provider is None:
+        provider = _serving_route(agent)["provider"]
+    return _route_identity(str(provider or "").strip().lower(), headers, agent)
 
 
 def _route_identity(
@@ -187,8 +209,39 @@ def _route_identity(
     if provider in _PINNED_PROVIDER_KEYS:
         return _PINNED_PROVIDER_KEYS[provider], "pinned"
     if provider == "openai-codex" and codex_from_agent and agent is not None:
-        return _codex_sub_key(agent), "wire"
+        return _dispatched_codex_sub_key(agent), "wire"
     return None, "wire"
+
+
+# Key under which the dispatch edge pins the Codex account of the in-flight
+# request inside ``agent._inflight_request_route``. Not a route field:
+# ``_serving_route`` strips it so route consumers see only the route.
+_DISPATCH_CODEX_SUB_KEY = "codex_sub_key"
+
+
+def _dispatch_route_snapshot(agent: Any, route: dict) -> dict:
+    """The in-flight snapshot for a request dispatched on ``route``.
+
+    Pins the Codex account at the dispatch edge, beside the route: the
+    agent's ``api_key`` and pool cursor are mutable (credential rotation, a
+    fallback or ``/model`` from another thread), so reading them when the call
+    completes would stamp its tokens to whichever account is live THEN
+    (FleetReview 659603b36aec). Only the derived ``codex:<acct[:8]>`` key is
+    held, never the token.
+    """
+    snap = dict(route)
+    if str(route.get("provider") or "").strip().lower() == "openai-codex":
+        snap[_DISPATCH_CODEX_SUB_KEY] = _codex_sub_key(agent)
+    return snap
+
+
+def _dispatched_codex_sub_key(agent: Any) -> Optional[str]:
+    """Codex account of the in-flight request; live read only outside a
+    stamped dispatch (where the live credential IS the one in use)."""
+    snap = getattr(agent, "_inflight_request_route", None)
+    if isinstance(snap, dict) and _DISPATCH_CODEX_SUB_KEY in snap:
+        return snap[_DISPATCH_CODEX_SUB_KEY]
+    return _codex_sub_key(agent)
 
 
 
@@ -248,7 +301,7 @@ def _serving_route(agent: Any) -> dict[str, str]:
     """
     snap = getattr(agent, "_inflight_request_route", None)
     if isinstance(snap, dict):
-        return dict(snap)
+        return {k: v for k, v in snap.items() if k != _DISPATCH_CODEX_SUB_KEY}
     return _live_route(agent)
 
 
@@ -275,7 +328,7 @@ def _emit_api_call_record(
         provider = route["provider"]
         model = route["model"]
         pool_headers = dict(headers or {})
-        sub_key, attribution = _api_call_identity(agent, pool_headers)
+        sub_key, attribution = _api_call_identity(agent, pool_headers, provider)
         seq = _next_api_call_seq(agent, turn_id)
         # Prefix-stability guard inputs (card t_c07124ab): the session the
         # request belongs to, and the one-shot marker the compressor leaves
@@ -415,14 +468,18 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     # A served call means the last stashed API error recovered in place; it
     # must not be attributed to a later, unrelated failover.
     agent._pending_fallback_error = None
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    # The route the call went out on, not the live agent (FleetReview
+    # 73d9dc1df836): a switch to/from a pooled provider mid-flight must not
+    # drop or mis-gate this call's ledger row.
+    _route = _serving_route(agent)
+    provider = _route["provider"].strip().lower()
     if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
         _note_api_call_recording_failure(agent)
         logger.warning(
             "pooled provider response lost pool_headers stamp; skipping "
             "per-call attribution (provider=%s api_mode=%s)",
             provider,
-            getattr(agent, "api_mode", ""),
+            _route["api_mode"],
         )
         return
     headers = getattr(response, "pool_headers", None)
@@ -1893,6 +1950,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     stamp_call_id(agent, api_kwargs)
     # S7 D1: harness-minted route id (pinned lanes) + lane-src (bpr/pinned).
     stamp_correlation_headers(agent, api_kwargs)
+    stamp_bridge_lane(agent, api_kwargs)
     if should_use_direct_api_call(agent):
         try:
             response = direct_api_call(agent, api_kwargs)
@@ -6689,6 +6747,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Fresh correlation id per stream attempt (bridge lanes only).
                 stamp_call_id(agent, api_kwargs)
                 stamp_correlation_headers(agent, api_kwargs)
+                stamp_bridge_lane(agent, api_kwargs)
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
