@@ -2182,6 +2182,8 @@ def reassign_task_endpoint(
             receipt=receipt,
         )
         if not ok:
+            if receipt.get("hold_error"):
+                raise HTTPException(status_code=409, detail=receipt["hold_error"])
             if receipt.get("reclaim_error"):
                 raise HTTPException(
                     status_code=409,

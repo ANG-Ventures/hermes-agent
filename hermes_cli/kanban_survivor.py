@@ -3108,6 +3108,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
+            push_unpushed_survivor(conn, task_id, workspace)
         if worktree_root is not None:
             # Preserve upstream's handle-release retry, still without --force.
             result = _git(worktree_root, "worktree", "remove", str(workspace), check=False)
@@ -3139,3 +3140,117 @@ def _store(conn, task_id, name, data, content_type):
         kb.add_attachment(conn, task_id, filename=path.name, stored_path=str(path),
                           content_type=content_type, size=len(data), uploaded_by="harness")
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+
+# --------------------------------------------------------------------------- NOT PUSHED -> pushed
+# t_947cea0e (2026-09-29): a 22 KB implementation.patch was recorded as a
+# ``NOT PUSHED`` survivor attachment and the design was lost until the card was
+# re-minted (t_af7d0f70). A patch attachment is a recovery artifact nobody
+# looks at; a branch on the remote is what a reviewer or the next worker finds.
+# So when a card that is NOT done records a NOT PUSHED survivor with bytes in
+# it, every repository with unpublished work is pushed as a synthesized commit
+# (working tree incl. untracked, parent HEAD; the worker's index and branch are
+# untouched) to ``kanban-survivor/<task_id>`` on its push remote, and the ref is
+# commented on the card (t_dadfedb2). Pushed by URL so no remote-tracking ref
+# changes: the next capture still records the patch too. Best-effort: a failed
+# push is commented as a failure and never blocks the capture or the removal.
+
+SURVIVOR_BRANCH_PREFIX = "kanban-survivor/"
+_PUSH_TIMEOUT = 120
+
+
+def _unpushed_patch_survivor(conn, task_id):
+    row = conn.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    try:
+        survivor = json.loads(row[0]) if row and row[0] else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(survivor, dict) or survivor.get("notice") != "NOT PUSHED":
+        return None
+    if survivor.get("kind") == "patch" and int(survivor.get("bytes") or 0) > 0:
+        return survivor
+    if survivor.get("kind") == "bundle" and survivor.get("bundles"):
+        return survivor
+    return None
+
+
+def _push_target(repo):
+    """``(remote name, push url)``: the branch's upstream remote, else origin, else the first."""
+    names = []
+    upstream = _git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False)
+    if upstream.returncode == 0 and b"/" in upstream.stdout:
+        names.append(upstream.stdout.decode().strip().split("/", 1)[0])
+    names.append("origin")
+    names.extend(_git(repo, "remote", check=False).stdout.decode().split())
+    for name in names:
+        url = _git(repo, "remote", "get-url", "--push", name, check=False)
+        if url.returncode == 0 and url.stdout.strip():
+            return name, url.stdout.decode().strip()
+    return None, None
+
+
+def _worktree_commit(repo, task_id):
+    """A commit of the whole working tree (tracked + untracked, not ignored) on HEAD."""
+    with tempfile.TemporaryDirectory(prefix="kanban-push-index-") as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+        index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip())
+        if index.exists():
+            shutil.copy2(index, env["GIT_INDEX_FILE"])
+        else:
+            _git(repo, "read-tree", "--empty", env=env)
+        _git(repo, "add", "-A", "--", ".", env=env, lazy_fetch=True)
+        tree = _git(repo, "write-tree", env=env).stdout.decode().strip()
+    head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
+    parents = ["-p", head.stdout.decode().strip()] if head.returncode == 0 else []
+    identity = dict(os.environ, GIT_AUTHOR_NAME="Kanban survivor", GIT_COMMITTER_NAME="Kanban survivor",
+                    GIT_AUTHOR_EMAIL="kanban@localhost", GIT_COMMITTER_EMAIL="kanban@localhost")
+    return _git(repo, "commit-tree", tree, *parents, "-m",
+                f"kanban survivor: {task_id} workspace (was NOT PUSHED)", env=identity).stdout.decode().strip()
+
+
+def push_unpushed_survivor(conn, task_id, workspace):
+    """Push a not-done card's NOT PUSHED survivor work and comment the ref. Never raises."""
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None or task.status == "done" or _unpushed_patch_survivor(conn, task_id) is None:
+            return []
+        workspace = Path(workspace)
+        branch = SURVIVOR_BRANCH_PREFIX + task_id
+        results = []
+        for repo in _repos(workspace):
+            key = str(repo.relative_to(workspace)) if repo != workspace else "."
+            try:
+                head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
+                dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+                if not dirty and head.returncode == 0 and _remote_survivor(
+                        repo, head.stdout.decode().strip(), list(_published_refs(repo, workspace))):
+                    continue
+                name, url = _push_target(repo)
+                if not url:
+                    results.append({"repository": key, "error": "no push remote configured"})
+                    continue
+                sha = _worktree_commit(repo, task_id)
+                _git(repo, "push", "--force", "--no-verify", url, f"{sha}:refs/heads/{branch}",
+                     timeout=_PUSH_TIMEOUT)
+                results.append({"repository": key, "remote": name, "url": _ext.redact(url),
+                                "branch": branch, "sha": sha})
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                results.append({"repository": key, "error": _ext.redact(str(exc))})
+        if not results:
+            return []
+        pushed = [r for r in results if "sha" in r]
+        failed = [r for r in results if "error" in r]
+        lines = [f"survivor pushed ({task.status}, was NOT PUSHED): "
+                 f"{r['url']} {r['branch']} @ {r['sha']} (repository {r['repository']})" for r in pushed]
+        lines += [f"survivor push FAILED for repository {r['repository']}: {r['error']}; "
+                  "only the patch attachment holds this work" for r in failed]
+        kb.add_comment(conn, task_id, "kanban", "\n".join(lines))
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "workspace_survivor_pushed",
+                             {"pushed": pushed, "failed": failed})
+        return results
+    except Exception:  # noqa: BLE001 - best-effort; the capture already landed
+        _log.exception("kanban survivor: push of NOT PUSHED survivor failed for %s", task_id)
+        return []
