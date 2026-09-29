@@ -16,6 +16,8 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 
 
 @pytest.fixture
@@ -40,8 +42,8 @@ def test_create_notify_chat_writes_subscription(kanban_home):
         "--notify-thread 67890"
     )
     tid = _created_id(out)
-    with kb.connect_closing() as conn:
-        subs = kb.list_notify_subs(conn, tid)
+    with kbc.connect_closing() as conn:
+        subs = kbn.list_notify_subs(conn, tid)
     assert len(subs) == 1
     assert subs[0]["platform"] == "discord"
     assert subs[0]["chat_id"] == "12345"
@@ -53,8 +55,8 @@ def test_create_without_notify_flags_writes_no_subscription(kanban_home):
     # must not invent a target. Zero rows is the correct, documented behaviour.
     out = kc.run_slash("create 'unwatched'")
     tid = _created_id(out)
-    with kb.connect_closing() as conn:
-        subs = kb.list_notify_subs(conn, tid)
+    with kbc.connect_closing() as conn:
+        subs = kbn.list_notify_subs(conn, tid)
     assert subs == []
 
 
