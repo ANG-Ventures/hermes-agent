@@ -15,6 +15,7 @@ from hermes_cli.config import (
     read_raw_config,
 )
 from hermes_cli.web_server_memory import _normalize_memory_provider_name
+from tools.wake_word import _PROVIDER_PREFERENCE
 
 if TYPE_CHECKING:
     from hermes_cli.model_switch import ModelSwitchResult
@@ -82,7 +83,13 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "local", "docker", "ssh", "modal", "daytona", "vercel_sandbox", "singularity",
     ),
     # sync with _SUPPORTED_VERCEL_RUNTIMES in terminal_tool.py
-    "terminal.vercel_runtime": _select("Vercel Sandbox runtime", "node24", "node22", "python3.13"),
+    "terminal.vercel_image": {
+        "type": "string",
+        "description": "Vercel Sandbox image: a Vercel managed image (vercel/sandbox/universal:latest) or a VCR repository[:tag]",
+    },
+    "terminal.vercel_runtime": _select(
+        "Legacy Vercel Sandbox runtime (deprecated by Vercel; a pinned runtime overrides the image; clear to use the image)",
+        "node24", "node22", "python3.13", clearable=True),
     "terminal.modal_mode": _select("Modal sandbox mode", "sandbox", "function"),
     "proxy.enabled": {
         "type": "boolean",
@@ -108,6 +115,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         ),
         "category": "security",
     },
+    "wake_word.provider": _select(
+        "Wake engine. Auto selects a platform-supported engine; Porcupine requires PORCUPINE_ACCESS_KEY.",
+        "auto", *_PROVIDER_PREFERENCE,
+    ),
     "tts.provider": _select(
         "Text-to-speech provider",
         "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper",
@@ -170,6 +181,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "subagent_stop are never moved onto a timeout worker."
         ),
     },
+    "plugins.load_timeout_seconds": {
+        "type": "number",
+        "description": (
+            "Deadline (seconds) for one plugin's import + register() at load. A plugin that "
+            "overruns it is skipped with the reason 'load timed out' and the rest keep loading. "
+            "0 disables the deadline; values above 600 are clamped."
+        ),
+    },
 }
 
 # Small categories fold into a bigger tab to avoid one-field orphan tabs. Several sources
@@ -205,6 +224,8 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "nous": "agent",
     "connections": "agent",
     "auth": "security",
+    # `fallback.min_switch_reset_seconds` is the only schema-surfaced fallback field.
+    "fallback": "agent",
 }
 
 

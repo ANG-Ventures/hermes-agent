@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 
 import { type ChatMessage, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { stopVoicePlayback } from '@/lib/voice-playback'
+import { $autoSpeakReplies } from '@/store/voice-prefs'
 
 import { useVoiceConversation } from './use-voice-conversation'
 
@@ -19,13 +20,18 @@ const mocks = vi.hoisted(() => ({
   }
 }))
 
-vi.mock('@/hermes', () => ({
+vi.mock('@/hermes', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   getApiRequestConnection: () => null,
   getApiRequestProfile: () => null,
   hermesApi: mocks.config,
   speakText: vi.fn()
 }))
-vi.mock('@/api/client', () => ({ profileScoped: (value: unknown) => value }))
+vi.mock('@/api/client', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  ownerScoped: (value: unknown) => value ?? {},
+  profileScoped: (value: unknown) => value
+}))
 vi.mock('./use-mic-recorder', () => ({ useMicRecorder: () => ({ handle: mocks.mic, level: 0 }) }))
 vi.mock('@/lib/voice-barge-in', () => ({ monitorSpeechDuringPlayback: () => vi.fn() }))
 vi.mock('@/lib/thinking-sound', () => ({ startThinkingSound: vi.fn(), stopThinkingSound: vi.fn() }))
@@ -46,6 +52,7 @@ class TestAudio extends EventTarget {
 }
 
 afterEach(() => {
+  $autoSpeakReplies.set(false)
   cleanup()
   stopVoicePlayback()
   vi.useRealTimers()
@@ -54,6 +61,9 @@ afterEach(() => {
 })
 
 it('speaks a sealed narration while busy and keeps the session open for the final reply', async () => {
+  // This test drives the TTS playback path, gated by the read-aloud toggle
+  // (#44263); opt in like the app does when replies are spoken.
+  $autoSpeakReplies.set(true)
   vi.useFakeTimers()
   TestAudio.instances = []
   vi.stubGlobal('Audio', TestAudio)
