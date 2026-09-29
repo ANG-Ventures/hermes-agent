@@ -60,6 +60,11 @@ def test_run_counts_archives_without_usage_rows(tmp_path, monkeypatch, consolida
 
     monkeypatch.setattr(curator, "apply_automatic_transitions", automatic)
     monkeypatch.setattr(curator, "_run_llm_review", review)
+    # The fixture has no usage rows, so the real candidate list is empty and the review fork is
+    # skipped ("no candidates"). Supply one so the consolidate arm reaches the stubbed review.
+    monkeypatch.setattr(
+        curator, "_render_candidate_list", lambda: "- archive-one\n- archive-two\n- keeper"
+    )
     curator.run_curator_review(synchronous=True, consolidate=consolidate)
     report_dir = Path(curator.load_state()["last_report_path"])
     report = json.loads((report_dir / "run.json").read_text())
