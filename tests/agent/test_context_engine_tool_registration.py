@@ -22,7 +22,7 @@ to expose tools. Two hardening rules that upstream already applies to the
    engine tool is registered into ``agent.tools`` / ``valid_tool_names`` and
    can never be routed to the engine.
 
-Both host sites (``agent_init`` at build, ``tools/mcp_tool`` on snapshot
+Both host sites (``agent_init`` at build, ``tools/mcp_tool_agent`` on snapshot
 rebuild) now share one entry point, ``collect_engine_tool_schemas``.
 """
 
@@ -137,7 +137,7 @@ def test_every_core_tool_name_is_refused():
 def test_dispatch_order_is_what_makes_shadowing_a_bug():
     """Pin the invariant the reserved-name guard exists to protect.
 
-    ``execute_tool_calls_sequential`` resolves literal built-in names before it
+    The sequential dispatcher resolves built-in (inline) tools before it
     consults ``_context_engine_tool_names``; if that order ever inverted, the
     guard's rationale would need revisiting.
     """
@@ -145,12 +145,11 @@ def test_dispatch_order_is_what_makes_shadowing_a_bug():
 
     from agent import tool_executor
 
-    src = inspect.getsource(tool_executor.execute_tool_calls_sequential)
-    assert "_context_engine_tool_names" in src
-    engine_branch_at = src.index("_context_engine_tool_names")
-    earlier = src[:engine_branch_at]
+    src = inspect.getsource(tool_executor._resolve_sequential_dispatch)
+    assert "_context_engine_tool_names" in src and "INLINE_TOOL_EXECUTORS" in src
+    assert src.index("INLINE_TOOL_EXECUTORS") < src.index("_context_engine_tool_names")
     shadowed_before_engine = [
-        name for name in _HERMES_CORE_TOOLS if f'function_name == "{name}"' in earlier
+        name for name in _HERMES_CORE_TOOLS if name in tool_executor.INLINE_TOOL_EXECUTORS
     ]
     assert shadowed_before_engine, (
         "expected built-in tool names to be dispatched before the "
@@ -163,8 +162,8 @@ def test_dispatch_order_is_what_makes_shadowing_a_bug():
 
 
 def test_snapshot_rebuild_applies_the_same_guards():
-    """tools/mcp_tool's re-injection must not diverge from agent_init."""
-    from tools import mcp_tool
+    """tools/mcp_tool_agent's re-injection must not diverge from agent_init."""
+    from tools import mcp_tool_agent
 
     victim = _core_name()
     agent = types.SimpleNamespace()
@@ -177,7 +176,7 @@ def test_snapshot_rebuild_applies_the_same_guards():
 
     tools_list: list = []
     name_set: set = set()
-    staged = mcp_tool._reinject_post_build_tools(agent, tools_list, name_set)
+    staged = mcp_tool_agent._reinject_post_build_tools(agent, tools_list, name_set)
 
     assert "engine_grep" in staged
     assert victim not in staged
@@ -186,7 +185,7 @@ def test_snapshot_rebuild_applies_the_same_guards():
 
 
 def test_snapshot_rebuild_survives_a_raising_engine():
-    from tools import mcp_tool
+    from tools import mcp_tool_agent
 
     agent = types.SimpleNamespace()
     agent.tools = []
@@ -198,7 +197,7 @@ def test_snapshot_rebuild_survives_a_raising_engine():
 
     tools_list: list = []
     name_set: set = set()
-    staged = mcp_tool._reinject_post_build_tools(agent, tools_list, name_set)
+    staged = mcp_tool_agent._reinject_post_build_tools(agent, tools_list, name_set)
 
     assert staged == set()
     assert tools_list == []

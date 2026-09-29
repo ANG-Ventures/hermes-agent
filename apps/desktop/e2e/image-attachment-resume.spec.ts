@@ -14,21 +14,21 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
+import { writeEnvFile, writeMockProviderConfig } from '../../../tests-js/scripts/mock-provider-config'
+import { type MockServer, startMockServer } from '../../../tests-js/scripts/mock-server'
+
 import {
   buildAppEnv,
   createSandbox,
   launchDesktop,
   type Sandbox,
   waitForAppReady,
-  writeEnvFile,
-  writeMockProviderConfig,
 } from './fixtures'
-import { type MockServer, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
 import { type ElectronApplication, expect, type Page, test } from './test'
 
-// A seeded session has no generated title, so every label falls back to the
-// session preview — the first 60 characters of the first user message.
+// The builder-provided title now labels the sidebar row directly (seeded
+// sessions no longer fall back to the first-user-message preview).
 const SESSION_TITLE = 'E2E attached image session'
 const CAPTION = 'E2E attached image must survive a relaunch'
 const IMAGE_DIR = 'Application Support/e2e shots'
@@ -90,7 +90,17 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
 }
 
 function sessionRow(page: Page) {
-  return page.locator('[data-slot="sidebar"] button').filter({ hasText: CAPTION }).first()
+  return page.locator('[data-slot="sidebar"] button').filter({ hasText: SESSION_TITLE }).first()
+}
+
+// Inactive tabs stay mounted under a data-pane-hidden ancestor. Match the
+// renderer's keep-alive visibility policy instead of relying on DOM order.
+const SURFACE = '[data-composer-target]:not([data-pane-hidden] [data-composer-target])'
+
+function activeViewportText(surfaceSelector: string): string {
+  const surfaces = document.querySelectorAll(surfaceSelector)
+
+  return surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? ''
 }
 
 async function openSeededSession(page: Page): Promise<void> {
@@ -98,23 +108,38 @@ async function openSeededSession(page: Page): Promise<void> {
   await row.waitFor({ state: 'visible', timeout: 60_000 })
   await row.click()
   await page.waitForFunction(
-    expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-    CAPTION,
+    ([expected, surfaceSelector]: [string, string]) => {
+      const surfaces = document.querySelectorAll(surfaceSelector)
+      const text = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? ''
+
+      return text.includes(expected)
+    },
+    [CAPTION, SURFACE] as [string, string],
     { timeout: 30_000 },
   )
 }
 
+/**
+ * The sidebar "+" opens a NEW TAB beside the current chat instead of replacing
+ * it, so the seeded session stays mounted in its own surface. Assert the new
+ * surface is empty rather than waiting for the old caption to leave the page.
+ */
 async function openNewSession(page: Page): Promise<void> {
   await page.locator('[data-slot="sidebar"] button[aria-label="New session"]').first().click()
   await page.waitForFunction(
-    expected => !(document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-    CAPTION,
+    ([expected, surfaceSelector]: [string, string]) => {
+      const surfaces = document.querySelectorAll(surfaceSelector)
+      const text = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? ''
+
+      return surfaces.length > 0 && !text.includes(expected)
+    },
+    [CAPTION, SURFACE] as [string, string],
     { timeout: 15_000 },
   )
 }
 
 async function transcriptText(page: Page): Promise<string> {
-  return page.evaluate(() => document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '')
+  return page.evaluate(activeViewportText, SURFACE)
 }
 
 async function assertRendersThumbnail(page: Page, label: string): Promise<void> {
@@ -147,13 +172,15 @@ test.describe('attached image resume', () => {
     fixture = await setupSeededDesktop()
     await waitForAppReady(fixture, 120_000)
 
-    // The sidebar labels a session by its preview, so the caption has to lead
-    // the persisted turn — a leading directive reads as a truncated file path.
+    // The sidebar labels a seeded session by its title. Whatever the label
+    // source, an attachment directive must never leak into it as a file path.
     const row = sessionRow(fixture.page)
     await row.waitFor({ state: 'visible', timeout: 60_000 })
 
     const label = (await row.textContent())?.trim() ?? ''
-    expect(label.startsWith(CAPTION), `sidebar label should open with the caption: ${label}`).toBe(true)
+    expect(label.startsWith(SESSION_TITLE), `sidebar label should open with the title: ${label}`).toBe(true)
+    expect(label, `sidebar label should not leak the image path: ${label}`).not.toContain(IMAGE_NAME)
+    expect(label, `sidebar label should not render the directive: ${label}`).not.toContain('@image:')
 
     await openSeededSession(fixture.page)
     await assertRendersThumbnail(fixture.page, 'first open')
