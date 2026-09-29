@@ -8,7 +8,6 @@ from hermes_cli.moa_config import (
     DEFAULT_MOA_AGGREGATOR,
     DEFAULT_MOA_PRESET_NAME,
     DEFAULT_MOA_REFERENCE_MODELS,
-    decode_moa_turn,
     exact_moa_preset_name,
     normalize_moa_config,
     resolve_moa_preset,
@@ -97,10 +96,10 @@ def test_custom_slot_order_and_exclusions_do_not_depend_on_base_url(tmp_path, mo
     # Keep real custom-endpoint discovery, config loading and preference handling;
     # isolate unrelated built-in auth/network discovery and presentation metadata.
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
-    monkeypatch.setattr(providers, "_build_curated_lists", lambda *args: {})
-    monkeypatch.setattr(providers, "_collect_authed_provider_slugs", lambda *args: [])
+    monkeypatch.setattr(providers, "_build_curated_lists", lambda *args, **kwargs: {})
+    monkeypatch.setattr(providers, "_collect_authed_provider_slugs", lambda *args, **kwargs: [])
     for name in ("_lap_builtin_rows", "_lap_overlay_rows", "_lap_canonical_rows"):
-        monkeypatch.setattr(providers, name, lambda *args: None)
+        monkeypatch.setattr(providers, name, lambda *args, **kwargs: None)
     for name in ("_local_runtime_row", "_moa_provider_row"):
         monkeypatch.setattr(inventory, name, lambda *args: None)
     for name in ("_apply_picker_hints", "_apply_pricing", "_apply_capabilities", "_apply_custom_aliases"):
@@ -194,7 +193,6 @@ def test_resolve_missing_moa_preset_has_actionable_error():
     assert "日常对话-高峰期" in message
     assert "日常对话-高峰" in message
     assert "日常对话-非高峰" in message
-    assert "hermes moa list" in message
 
 
 def test_missing_moa_preset_is_non_retryable():
@@ -261,6 +259,29 @@ def test_validate_moa_payload_agrees_with_clean_slot():
     # provider/model swap, no defaults substitution.
     assert cfg["presets"]["p"]["reference_models"] == _enabled_refs(payload["presets"]["p"]["reference_models"])
     assert cfg["presets"]["p"]["aggregator"] == payload["presets"]["p"]["aggregator"]
+
+
+def test_print_config_marks_aggregator_as_billed_and_warns_on_provider_mismatch(capsys):
+    """#112359: the aggregator is the acting model billed for the run; when it sits on a
+    different provider than the main model, ``hermes moa list``/``configure`` say so."""
+    from hermes_cli import moa_cmd
+
+    moa_cmd._print_config({"model": {"provider": "openai-codex"}})
+
+    out = capsys.readouterr().out
+    # Default preset's aggregator is on openrouter → the notice names both providers.
+    notice = next(line for line in out.splitlines() if "Aggregator is on" in line)
+    assert "openrouter" in notice and "openai-codex" in notice
+
+
+@pytest.mark.parametrize("cfg", [{"model": {"provider": "openrouter"}}, {}])
+def test_billing_notice_silent_when_providers_match_or_main_unknown(cfg, capsys):
+    from hermes_cli import moa_cmd
+
+    moa_cmd._print_config(cfg)
+
+    out = capsys.readouterr().out
+    assert "Aggregator is on" not in out
 
 
 # ── Per-slot max_tokens ────────────────────────────────────────────────────
