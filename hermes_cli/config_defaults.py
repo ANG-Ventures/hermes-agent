@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Bridge admission classification is opt-in per profile. With this off,
+        # bpr/bpx-N requests keep their previous header bytes.
+        "bridge_background_lane": False,
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —
@@ -3169,6 +3172,10 @@ DEFAULT_CONFIG = {
         # review does NOT re-spawn the reviewer — the card is blocked
         # (needs_input) for the orchestrator/human to take over. 0 disables.
         "max_review_rounds": 3,
+        # True: a completion whose handoff says it did not land ("NOT
+        # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
+        # (human:apollo) instead of done. See kanban_negative_handoff.py.
+        "negative_handoff_review": False,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
         # or "qa:required" get a reviewer session (being a task_links parent

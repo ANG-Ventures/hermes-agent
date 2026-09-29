@@ -1072,6 +1072,21 @@ _interrupted_job_ids: set = set()
 #   * ``_active_script_procs`` — live Popen handles it can terminate
 # ---------------------------------------------------------------------------
 _shutdown_event = threading.Event()
+# In-flight cron AIAgents (id -> agent), so a gateway shutdown that abandons a
+# still-running cron turn can record it (see live_cron_agents).
+_live_cron_agents: dict = {}
+_live_cron_agents_lock = threading.Lock()
+
+
+def _forget_live_cron_agent(key: int) -> None:
+    with _live_cron_agents_lock:
+        _live_cron_agents.pop(key, None)
+
+
+def live_cron_agents() -> list:
+    """Snapshot of the cron agents whose ``run_conversation`` is in flight."""
+    with _live_cron_agents_lock:
+        return list(_live_cron_agents.values())
 # Keyed by id() rather than a set: a Popen-like object is not guaranteed to be
 # hashable (test doubles routinely are not), and a registry that can only hold
 # hashable handles would silently fail closed on exactly the objects we most
@@ -5245,6 +5260,15 @@ def _is_shutdown_kill_returncode(returncode: Any) -> bool:
     return returncode in {-int(sig) for sig in kill_signals}
 
 
+def _is_restart_killed(job_id: Any) -> bool:
+    """Peek (do not consume) whether ``job_id``'s script was killed by shutdown.
+
+    The flag is consumed in ``run_one_job``'s finally (re-queue request); the
+    delivery path only needs to know it so a restart kill is not paged."""
+    with _script_procs_lock:
+        return str(job_id) in _restart_killed_job_ids
+
+
 def _consume_restart_killed(job_id: Any) -> bool:
     """Pop and return whether ``job_id``'s script was killed by shutdown."""
     key = str(job_id)
@@ -7537,7 +7561,19 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
+        with _live_cron_agents_lock:
+            _live_cron_agents[id(agent)] = agent
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # Deregister when the TURN ends, not when this watcher gives up on it:
+        # an inactivity-timed-out run can keep going until shutdown.
+        _cron_forget_in_finally = False
+        try:
+            _cron_future.add_done_callback(
+                lambda _f, _k=id(agent): _forget_live_cron_agent(_k)
+            )
+        except Exception:
+            # Not a real Future (test doubles): fall back to the watcher exit.
+            _cron_forget_in_finally = True
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -7585,6 +7621,8 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+            if _cron_forget_in_finally:
+                _forget_live_cron_agent(id(agent))
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -8605,6 +8643,19 @@ def _run_one_job_body(
             else:
                 if success:
                     deliver_content = final_response
+                elif _is_restart_killed(job["id"]):
+                    # Killed by the gateway shutdown drain (-15/-9 while
+                    # draining): not a job failure. The run is still recorded
+                    # below and run_one_job re-queues one fire after restart;
+                    # the only thing skipped is the page and the failure
+                    # incident (t_e0aa9875: 'Cronjob Failed: mirrors-refresh
+                    # ... Killed by gateway shutdown' after a routine restart).
+                    logger.info(
+                        "PHASE=cron_restart_kill job=%s: script killed by gateway "
+                        "shutdown — not paged; re-fires after restart",
+                        job.get("name") or job["id"],
+                    )
+                    deliver_content = ""
                 else:
                     # Durable failure incident: record this job+error
                     # signature once and, when the operator already acked it,

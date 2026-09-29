@@ -2518,6 +2518,11 @@ class _AnthropicCompletionsAdapter:
         if _opts and hasattr(_client, "with_options"):
             try:
                 _client = _client.with_options(**_opts)
+                # The SDK copy re-reads ANTHROPIC_API_KEY when api_key is
+                # None; a bearer-only client must stay bearer-only or the
+                # Anthropic key is sent to a non-Anthropic endpoint.
+                if getattr(self._client, "api_key", "") is None:
+                    _client.api_key = None
             except Exception:
                 _client = self._client  # never break the call over an options quirk
 
@@ -7650,6 +7655,49 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: bedrock converse (%s, %s)",
                          final_model, region)
 
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
+    elif pconfig.auth_type == "oauth_kimi":
+        # kimi-oauth (Kimi Code membership): the managed login's rotating
+        # JWT is served per request by the auth.json token provider, on the
+        # Anthropic Messages wire at api.kimi.com/coding.
+        from agent.anthropic_adapter import build_anthropic_client
+        from hermes_cli.auth import (
+            KIMI_OAUTH_INFERENCE_BASE_URL,
+            resolve_kimi_oauth_runtime_credentials,
+        )
+
+        if explicit_api_key:
+            # No stored login needed. build_anthropic_client swaps the key
+            # for the token provider only when this login issued it.
+            api_key = explicit_api_key
+            base_url = explicit_base_url or KIMI_OAUTH_INFERENCE_BASE_URL
+        else:
+            try:
+                creds = resolve_kimi_oauth_runtime_credentials(as_token_provider=True)
+            except Exception as exc:
+                logger.debug("resolve_provider_client: kimi-oauth unavailable: %s", exc)
+                return None, None
+            api_key = creds["api_key"]
+            base_url = explicit_base_url or creds["base_url"]
+        base_url = base_url.strip().rstrip("/")
+        default_model = _get_aux_model_for_provider(provider)
+        final_model = _normalize_resolved_model(model or default_model, provider)
+        if not final_model:
+            logger.debug("resolve_provider_client: kimi-oauth has no model to use")
+            return None, None
+        try:
+            real_client = build_anthropic_client(api_key, base_url)
+        except Exception as exc:
+            logger.warning("resolve_provider_client: cannot create kimi-oauth client: %s", exc)
+            return None, None
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model,
+            api_key=explicit_api_key or "kimi-oauth-bearer-via-http-hook",
+            base_url=base_url,
+        )
+        logger.debug("resolve_provider_client: kimi-oauth (%s)", final_model)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 

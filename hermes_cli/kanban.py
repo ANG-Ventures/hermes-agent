@@ -2061,9 +2061,9 @@ def _caller_session_id() -> Optional[str]:
     # subprocess as in-gateway made every chat-turn ``claim --review`` bind
     # no session, and the following ``request-changes`` was refused
     # (t_0485b3ff: t_ddcd2170, t_c26be9b9, t_6500a97a stranded in running).
-    in_gateway = (
-        os.environ.get("_HERMES_GATEWAY") == "1" and "gateway.run" in sys.modules
-    )
+    # Importing ``gateway.run`` is not ownership either: it sets the marker at
+    # import time and CLI tools import it lazily (FleetReview 09c07e5eb0a9).
+    in_gateway = kb._process_is_gateway()
     try:
         from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
@@ -4284,7 +4284,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     try:
         from hermes_cli import kanban_load_gate as _klg
 
-        print(_klg.format_state_line(_klg.read_state()))
+        _gate_state = _klg.read_state()
+        print(_klg.format_state_line(_gate_state))
+        for _line in _klg.format_board_starvation_lines(_gate_state):
+            print(_line)
     except Exception:
         pass
 
@@ -5598,6 +5601,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ),
             "gate_auto_resolved": getattr(res, "gate_auto_resolved", []),
             "gate_closed_unmerged": getattr(res, "gate_closed_unmerged", []),
+            "spawn_paused": getattr(res, "spawn_paused", None),
+            "spawn_capped": getattr(res, "spawn_capped", None),
+            "memory_pressure": getattr(res, "memory_pressure", None),
         }, indent=2))
         return 0
     if res.skipped_locked:
@@ -5641,6 +5647,19 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"a human: {', '.join(gate_closed)}"
         )
     print(f"Spawned:      {len(res.spawned)}")
+    # Say WHY nothing (or less than asked) spawned: a bare "Spawned: 0" with
+    # dispatchable cards on the board is indistinguishable from an idle board
+    # (t_f78d1938: manual `dispatch --max 3` spawned 0 of 2 with no reason).
+    if getattr(res, "spawn_capped", None):
+        print(f"  capped: {res.spawn_capped}")
+    if getattr(res, "spawn_paused", None):
+        print(f"  paused: {res.spawn_paused}")
+    if getattr(res, "memory_pressure", None):
+        print(
+            f"  memory pressure {res.memory_pressure}: "
+            + ("no new workers this tick" if res.memory_pressure == "critical"
+               else "at most 1 new worker this tick")
+        )
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         route = res.spawn_routes.get(tid, "unknown/unknown")

@@ -158,6 +158,23 @@ PINNED_PROVIDER_FAILURE_REASON = "pinned_provider_unavailable"
 
 _RATE_LIMIT_REASONS = frozenset({"rate_limit", "billing", "upstream_rate_limit"})
 _card_pin_cache: dict = {}
+# JSON ``{"model", "provider"}`` the dispatcher sets from the card ROW at claim
+# time (t_a30417c3); seeds the pin snapshot so the worker never reads a row a
+# later ``set-model`` may already have changed. Absent = older dispatcher.
+CLAIMED_CARD_PIN_ENV = "KANBAN_CLAIMED_CARD_PIN"
+
+
+def _claimed_card_pin_from_env():
+    raw = os.environ.get(CLAIMED_CARD_PIN_ENV)
+    if not raw:
+        return None
+    try:
+        pin = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(pin, dict):
+        return None
+    return pin.get("model"), pin.get("provider")
 
 # The two Claude relay POOL faces. A card pinned to one means "this model on
 # the pool", not one wire, so failing over to the SIBLING pool for the SAME
@@ -173,24 +190,33 @@ def _is_sibling_pool_same_model(pinned, to_provider, from_model, to_model) -> bo
     return bool(src) and src == str(to_model or "").strip().lower()
 
 
-def card_pinned_provider() -> Optional[str]:
-    """The provider pinned on THIS worker's card row, else None.
+def card_pinned_route() -> tuple:
+    """``(model, provider)`` pinned on THIS worker's card row, else ``(None, None)``.
 
     Only a card pin (``hermes kanban set-model``, persisted in
     ``tasks.model_override`` / ``provider_override``) counts. A board-wide
     lane override and a capped-pool dispatch fallback rung ALSO reach the
     worker as ``--provider``, but the dispatcher applies them to the in-memory
     claim only and never writes them to the card, so reading the row is what
-    tells a card pin apart from a lane default. Fails open (None) when the
-    board cannot be read: an unreadable pin must not strand a worker without
-    its fallback chain.
+    tells a card pin apart from a lane default. The dispatcher hands the row
+    pin as claimed via ``CLAIMED_CARD_PIN_ENV`` (t_a30417c3); the row is read
+    only when that is absent (older dispatcher). Fails open ``(None, None)``
+    when the board cannot be read: an unreadable pin must not strand a worker
+    without its fallback chain.
     """
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if not task_id or not _is_owning_worker():
-        return None
+        return None, None
     if task_id in _card_pin_cache:
         return _card_pin_cache[task_id]
-    provider = None
+    claimed = _claimed_card_pin_from_env()
+    if claimed is not None:
+        model, provider = claimed
+        provider = (str(provider or "")).strip().lower() or None
+        model = (str(model or "")).strip() or None
+        _card_pin_cache[task_id] = (model, provider)
+        return model, provider
+    model = provider = None
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_provider_health import model_override
@@ -201,22 +227,34 @@ def card_pinned_provider() -> Optional[str]:
         finally:
             conn.close()
         if task is not None:
-            _model, provider = model_override(task)
+            model, provider = model_override(task)
     except Exception:
         logger.debug("kanban card pin lookup failed for %s", task_id, exc_info=True)
-        return None
+        return None, None
     provider = (provider or "").strip().lower() or None
-    _card_pin_cache[task_id] = provider
-    return provider
+    model = (model or "").strip() or None
+    _card_pin_cache[task_id] = (model, provider)
+    return model, provider
+
+
+def card_pinned_provider() -> Optional[str]:
+    """The provider pinned on THIS worker's card row, else None."""
+    return card_pinned_route()[1]
+
+
+def _norm(value) -> str:
+    return str(value or "").strip().lower()
 
 
 def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     """True when a card-pinned worker must NOT fail over to ``to_provider``.
 
-    Refuses only when (a) the card pins a provider, (b) this run is actually
-    serving on that pin (a dispatch fallback rung may have moved it), and
-    (c) the fallback target is a different provider. Same-provider entries
-    (another model / key on the pinned lane) stay allowed, and so does the
+    Refuses only when (a) the card pins a provider and/or a model, (b) this
+    run is actually serving on that pin (a dispatch fallback rung may have
+    moved it), and (c) the fallback target is a different pinned provider OR,
+    when the pin names a model, a different model (t_1d2ba891; a model-only
+    pin allows the same model on any provider). Same-provider entries for the
+    pinned model (another key on the lane) stay allowed, and so does the
     sibling Claude pool for the identical model when the pin is a pool face
     (claude-bpr <-> claude-apr); that swap is recorded by the normal
     ``worker_route_substituted`` (stage=runtime) event. The first refusal
@@ -224,26 +262,39 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     agent so a failed result exits retry-preserving
     (:func:`apply_pin_refusal_to_result`).
     """
-    pinned = card_pinned_provider()
-    if not pinned:
+    pinned_model, pinned = card_pinned_route()
+    if not pinned and not pinned_model:
         return False
     primary = getattr(agent, "_primary_runtime", None)
     primary = primary if isinstance(primary, dict) else {}
     serving = str(primary.get("provider") or getattr(agent, "provider", "") or "").strip().lower()
-    if serving != pinned:
-        return False
-    if str(to_provider or "").strip().lower() == pinned:
+    if pinned and serving != pinned:
         return False
     serving_model = primary.get("model") or getattr(agent, "model", None)
-    if _is_sibling_pool_same_model(pinned, to_provider, serving_model, to_model):
-        return False
+    # A pin with a model pins the MODEL too (t_1d2ba891): claude-bpr's chain
+    # swapped a claude-fable-5-1 pin onto claude-opus-5-5 on the same lane.
+    # Only while the run actually serves the pinned model; a run spawned on
+    # another model (dispatch rung) is off the model pin, like the provider
+    # check above, and keeps the provider-only rule.
+    if pinned_model and _norm(serving_model) != _norm(pinned_model):
+        if not pinned:
+            return False
+        pinned_model = None
+    model_ok = not pinned_model or _norm(to_model) == _norm(pinned_model)
+    if model_ok:
+        if not pinned:
+            return False  # model-only pin: the same model on any provider
+        if _norm(to_provider) == pinned:
+            return False
+        if _is_sibling_pool_same_model(pinned, to_provider, serving_model, to_model):
+            return False
     reason_value = str(getattr(reason, "value", reason) or "") or None
     if not isinstance(getattr(agent, "_kanban_pin_refused_failover", None), dict):
         agent._kanban_pin_refused_failover = {
-            "provider": pinned, "to_provider": to_provider, "reason": reason_value,
+            "provider": pinned or serving, "to_provider": to_provider, "reason": reason_value,
         }
         record_worker_route_pin_refused(
-            provider=pinned, model=getattr(agent, "model", None),
+            provider=pinned or serving, model=getattr(agent, "model", None),
             reason=reason_value, rate_limited=reason_value in _RATE_LIMIT_REASONS,
             stage="runtime", to_provider=to_provider, to_model=to_model,
         )
@@ -538,6 +589,10 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
         run_id = None
     if run_id is None:
         return active_system_prompt
+    # Snapshot this run's card pin before its first provider call, so a later
+    # next-dispatch ``set-model`` (no ``--live``) never changes the failover
+    # policy of the run already in flight; only a live switch below moves it.
+    card_pinned_route()
 
     try:
         from hermes_cli import kanban_db as kb
@@ -590,6 +645,12 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
     if gate_error:
         _refuse_live(task_id, run_id, event_id, gate_error, model_target)
         route_changes = False
+    elif touch_model and model and not route_changes:
+        # A live pin onto the route already serving switches nothing but
+        # still pins this run from here on.
+        _card_pin_cache[task_id] = (
+            model.strip() or None, (provider or "").strip().lower() or None,
+        )
     if not route_changes and not effort_changes:
         return active_system_prompt  # already on it (e.g. written before spawn)
 
@@ -648,7 +709,13 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
         if isinstance(primary, dict):
             primary["reasoning_config"] = dict(new_reasoning) if new_reasoning else None
 
-    _card_pin_cache.pop(task_id, None)  # the pin may have moved with the route
+    if route_changes:
+        # The pin moves with a live route switch and ONLY with it: re-snapshot
+        # from the route now serving, not from a later (next-dispatch) row.
+        _card_pin_cache[task_id] = (
+            (agent.model or model or "").strip() or None,
+            (agent.provider or "").strip().lower() or None if provider else None,
+        )
     after = _route_snapshot(agent)
     logger.warning(
         "PHASE=kanban_worker_route_switched task=%s run=%s iteration=%s %s -> %s",
