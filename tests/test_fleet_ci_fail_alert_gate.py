@@ -430,3 +430,78 @@ def test_known_red_and_fallback_transport_failures_turn_the_step_red(tmp_path):
     proc, _ = _post(tmp_path, known_code="transport", alerts_code="transport")
     assert proc.returncode != 0
     assert "both failed (HTTP 000)" in proc.stderr
+
+
+# --- CI placement probe (t_c58e7200) ----------------------------------------
+# ci-speed-lint R5: the probe is workflow_dispatch-only, so this listener is its
+# notifier. Bench waves (dispatched by ang-fleet-workers[bot]) are graded and paged
+# by the bench itself; a hand-dispatched red pages once per wave.
+PROBE = "CI placement probe"
+
+
+def test_probe_is_listened_to():
+    assert PROBE in _workflow()["on"]["workflow_run"]["workflows"]
+
+
+def _probe_route(tmp_path, *, actor="Kyzcreig", title="placement probe hand1 #0", prior=None,
+                 branch="main") -> dict:
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_API_CURL)
+    (bindir / "curl").chmod(0o755)
+    api = {} if prior is None else {"actions/workflows/9/runs": {"workflow_runs": prior}}
+    (tmp_path / "api.json").write_text(json.dumps(api))
+    log = tmp_path / "curl.log"
+    log.write_text("")
+    run = {"name": PROBE, "workflow_id": 9, "id": 500, "head_branch": branch, "head_sha": "abc",
+           "conclusion": "failure", "html_url": "https://x/500", "actor": {"login": actor},
+           "event": "workflow_dispatch", "display_title": title}
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
+           "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got["_curl"] = log.read_text()
+    got["_stdout"] = proc.stdout
+    return got
+
+
+_NOW = "2099-01-01T00:00:00Z"  # always inside the 24h window
+
+
+def test_probe_hand_dispatched_red_pages(tmp_path):
+    got = _probe_route(tmp_path, prior=[])
+    assert got["route"] == "alerts"
+
+
+def test_probe_bench_wave_red_is_silent_without_api_calls(tmp_path):
+    got = _probe_route(tmp_path, actor="ang-fleet-workers[bot]", title="placement probe n20260928T0050-burst #3")
+    assert got["route"] == "none" and got["_curl"] == ""
+
+
+def test_probe_second_red_of_same_wave_is_silent(tmp_path):
+    prior = [{"id": 499, "created_at": _NOW, "display_title": "placement probe hand1 #1"}]
+    got = _probe_route(tmp_path, prior=prior)
+    assert got["route"] == "none" and "already paged (run 499)" in got["_stdout"]
+
+
+def test_probe_red_of_other_or_longer_wave_still_pages(tmp_path):
+    prior = [{"id": 499, "created_at": _NOW, "display_title": "placement probe hand10 #0"},
+             {"id": 498, "created_at": _NOW, "display_title": "placement probe other #0"},
+             {"id": 501, "created_at": _NOW, "display_title": "placement probe hand1 #2"},  # later run
+             {"id": 497, "created_at": "2000-01-01T00:00:00Z", "display_title": "placement probe hand1 #3"}]
+    assert _probe_route(tmp_path, prior=prior)["route"] == "alerts"
+
+
+def test_probe_dedupe_api_error_fails_loud(tmp_path):
+    assert _probe_route(tmp_path, prior=None)["route"] == "alerts"
+
+
+def test_probe_red_on_worker_branch_stays_silent(tmp_path):
+    got = _probe_route(tmp_path, branch="ci/placement-no-checkout-t_eb230c34", prior=[])
+    assert got["route"] == "none"
