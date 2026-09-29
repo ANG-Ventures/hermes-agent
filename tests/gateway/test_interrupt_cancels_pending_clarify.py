@@ -45,7 +45,7 @@ def _bare_runner():
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
     runner._restore_pending_one_turn_model_override = MagicMock()
-    runner._adapter_for_source = MagicMock(return_value=None)
+    runner._delivery_adapter_for = MagicMock(return_value=None)
     runner._thread_metadata_for_source = MagicMock(return_value=None)
     runner._release_running_agent_state = MagicMock()
     runner._evict_cached_agent = MagicMock()
@@ -238,7 +238,7 @@ async def test_interrupted_waiter_and_successor_ownership(release, mode, sentine
             paused.set()
             await resume.wait()
 
-    runner._adapter_for_source.return_value = Adapter()
+    runner._delivery_adapter_for.return_value = Adapter()
     source = _source()
     event = SimpleNamespace(source=source)
     if not release:
@@ -254,7 +254,9 @@ async def test_interrupted_waiter_and_successor_ownership(release, mode, sentine
         runner._async_session_store = SimpleNamespace(
             _store=runner.session_store,
             get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_key="caller")))
+        runner._same_chat_runs = MagicMock(return_value=[])
         runner._sibling_thread_run_keys = MagicMock(return_value=[SESSION_KEY])
+        runner._chat_scoped_run_keys = MagicMock(return_value=[SESSION_KEY])
         runner._is_user_authorized_for_source = MagicMock(return_value=True)
         operation = runner._handle_stop_command(event)
     interrupt = asyncio.create_task(operation)
@@ -316,7 +318,8 @@ async def test_interrupted_generation_cannot_register_again_or_overwrite_answer(
     turn = object.__new__(TurnRunner)
     turn._ctx = SimpleNamespace(
         session_key=SESSION_KEY, _status_adapter=MagicMock(),
-        _run_still_current=lambda: runner._is_session_run_current(SESSION_KEY, generation))
+        _run_still_current=lambda: runner._is_session_run_current(SESSION_KEY, generation),
+        _status_chat_id="12345", _status_thread_metadata=None)
     entry = clarify_gateway.register("won-answer", SESSION_KEY, "question?", None, owner=turn)
     assert clarify_gateway.resolve_gateway_clarify(entry.clarify_id, "already won")
     await runner._interrupt_and_clear_session(
