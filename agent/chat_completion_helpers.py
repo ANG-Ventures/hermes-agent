@@ -209,8 +209,39 @@ def _route_identity(
     if provider in _PINNED_PROVIDER_KEYS:
         return _PINNED_PROVIDER_KEYS[provider], "pinned"
     if provider == "openai-codex" and codex_from_agent and agent is not None:
-        return _codex_sub_key(agent), "wire"
+        return _dispatched_codex_sub_key(agent), "wire"
     return None, "wire"
+
+
+# Key under which the dispatch edge pins the Codex account of the in-flight
+# request inside ``agent._inflight_request_route``. Not a route field:
+# ``_serving_route`` strips it so route consumers see only the route.
+_DISPATCH_CODEX_SUB_KEY = "codex_sub_key"
+
+
+def _dispatch_route_snapshot(agent: Any, route: dict) -> dict:
+    """The in-flight snapshot for a request dispatched on ``route``.
+
+    Pins the Codex account at the dispatch edge, beside the route: the
+    agent's ``api_key`` and pool cursor are mutable (credential rotation, a
+    fallback or ``/model`` from another thread), so reading them when the call
+    completes would stamp its tokens to whichever account is live THEN
+    (FleetReview 659603b36aec). Only the derived ``codex:<acct[:8]>`` key is
+    held, never the token.
+    """
+    snap = dict(route)
+    if str(route.get("provider") or "").strip().lower() == "openai-codex":
+        snap[_DISPATCH_CODEX_SUB_KEY] = _codex_sub_key(agent)
+    return snap
+
+
+def _dispatched_codex_sub_key(agent: Any) -> Optional[str]:
+    """Codex account of the in-flight request; live read only outside a
+    stamped dispatch (where the live credential IS the one in use)."""
+    snap = getattr(agent, "_inflight_request_route", None)
+    if isinstance(snap, dict) and _DISPATCH_CODEX_SUB_KEY in snap:
+        return snap[_DISPATCH_CODEX_SUB_KEY]
+    return _codex_sub_key(agent)
 
 
 
@@ -270,7 +301,7 @@ def _serving_route(agent: Any) -> dict[str, str]:
     """
     snap = getattr(agent, "_inflight_request_route", None)
     if isinstance(snap, dict):
-        return dict(snap)
+        return {k: v for k, v in snap.items() if k != _DISPATCH_CODEX_SUB_KEY}
     return _live_route(agent)
 
 
