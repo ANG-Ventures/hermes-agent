@@ -84,6 +84,7 @@ def test_cap_applied_to_provider_partition_form(kanban_home, monkeypatch):
 @pytest.mark.parametrize("card_model", [
     "claude-sonnet-5", "claude-haiku-4-5", "gpt-5.5",
     "acme/opus-v1",  # non-Claude alias with a family word: never capped
+    "claude-custom-opus-v1",  # claude- prefixed custom alias: never capped
 ])
 def test_cap_not_applied_at_or_below_cap_or_unranked(kanban_home, monkeypatch, card_model):
     _profile(kanban_home, CAP)
@@ -120,6 +121,9 @@ def test_rank_orders_families():
     assert kb._shim_model_rank("claude-sonnet-5") < kb._shim_model_rank("anthropic/claude-opus-5")
     assert kb._shim_model_rank("gpt-5.5") is None
     assert kb._shim_model_rank("acme/opus-v1") is None
+    assert kb._shim_model_rank("claude-custom-opus-v1") is None
+    assert kb._shim_model_rank("claude-opus-v1") is None
+    assert kb._shim_model_rank("claude-haiku-4-5-20251001") == 1
 
 
 @pytest.mark.parametrize("cap, card_provider, expected", [

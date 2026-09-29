@@ -23527,6 +23527,7 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
 
 _SHIM_MODEL_FAMILY_RANK = (("haiku", 1), ("sonnet", 2), ("opus", 3))
 SHIM_MODEL_CAPPED_FROM_ENV = "HERMES_KANBAN_SHIM_MODEL_CAPPED_FROM"
+_SHIM_MODEL_ID_RE = re.compile(r"claude-(haiku|sonnet|opus)-\d[0-9a-z.-]*$")
 
 
 def _shim_model_rank(model: Optional[str]) -> Optional[int]:
@@ -23537,14 +23538,14 @@ def _shim_model_rank(model: Optional[str]) -> Optional[int]:
     never fires on a model the dispatcher cannot place (fail-open to today).
     """
     name = str(model or "").rsplit("/", 1)[-1].lower()
-    # Only recognized Claude ids rank: a custom alias like ``acme/opus-v1``
-    # must never be swapped for a Claude model on the card's provider.
-    if not name.startswith("claude-"):
+    # Only recognized Claude model-id shapes rank (``claude-<family>-<digit>``
+    # e.g. claude-opus-5, claude-sonnet-4-5, claude-haiku-4-5-20251001).
+    # A custom alias (``acme/opus-v1``, ``claude-custom-opus-v1``) never ranks,
+    # so it is never swapped for a Claude model on the card's provider.
+    m = _SHIM_MODEL_ID_RE.match(name)
+    if not m:
         return None
-    for family, rank in _SHIM_MODEL_FAMILY_RANK:
-        if family in name:
-            return rank
-    return None
+    return dict(_SHIM_MODEL_FAMILY_RANK)[m.group(1)]
 
 
 def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
