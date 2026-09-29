@@ -366,12 +366,13 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = GuardedList(__name__, "CANONICAL_PROV
 # credentials, not here: ``models._provider_has_credentials`` / ``_lap_canonical_rows`` route
 # through ``auth.get_auth_status`` (external_process → the binary resolves; OAuth → auth.json /
 # credential-pool entry), so an admitted row reads authenticated=False until the user signs in.
-_canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
-
-
 def _plugin_provider_enters_picker(pp) -> bool:
-    """Picker admission for a plugin model-provider profile: any slug without a built-in row."""
-    return pp.name not in _canonical_slugs
+    """Picker admission for a plugin model-provider profile: any slug without a canonical row.
+
+    Read from the committed ``CANONICAL_PROVIDERS`` generation, not a side set, so the guard
+    cannot disagree with the list after ``provider_seam.restore`` reverts it.
+    """
+    return all(p.slug != pp.name for p in CANONICAL_PROVIDERS)
 
 
 def sync_plugin_provider_catalog() -> int:
@@ -409,7 +410,6 @@ def sync_plugin_provider_catalog() -> int:
     if "_KNOWN_PROVIDER_NAMES" in provider_seam.FACADES:
         delta["_KNOWN_PROVIDER_NAMES"] = {e.slug for e in entries}
     provider_seam.publish(delta)
-    _canonical_slugs.update(e.slug for e in entries)
     return len(entries)
 
 

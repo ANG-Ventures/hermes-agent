@@ -319,19 +319,21 @@ def publish(delta: Mapping[str, Any]) -> Generation:
 def restore(gen: Generation) -> None:
     """Swap back to a saved generation (``saved = current()``) and rewrite every mirror.
 
-    For callers that must undo registrations made in between: test isolation,
-    and ``hermes plugins doctor``, which imports a plugin copy and then removes
-    what it registered.
+    For callers that must undo registrations made in between (test isolation,
+    :func:`_reset`). A container registered after ``gen`` was saved keeps its
+    current data.
     """
     global _current
     with _lock:
+        # A container registered after ``gen`` was saved has no entry in it. Carry its
+        # current data forward: skipping it would leave the facade reading a name the
+        # generation lacks (KeyError on every read) while its base storage still holds data.
+        late = {name: _current[name] for name in FACADES if gen.get(name) is None}
+        if late:
+            gen = _with(gen, late)
         _current = gen
         for name in FACADES:
-            try:
-                data = gen[name]
-            except KeyError:
-                continue
-            _mirror(name, data)
+            _mirror(name, gen[name])
 
 
 def _reset(*names: str) -> None:

@@ -20,7 +20,6 @@ def test_late_registered_provider_reaches_picker_catalog(monkeypatch):
 
     # this module is imported (the snapshot exists) before the registration below
     monkeypatch.setattr(catalog, "CANONICAL_PROVIDERS", list(catalog.CANONICAL_PROVIDERS))
-    monkeypatch.setattr(catalog, "_canonical_slugs", set(catalog._canonical_slugs))
     monkeypatch.setattr(catalog, "_PROVIDER_LABELS", dict(catalog._PROVIDER_LABELS))
     monkeypatch.setattr("hermes_cli.models.CANONICAL_PROVIDERS", catalog.CANONICAL_PROVIDERS)
     monkeypatch.setattr("hermes_cli.models._PROVIDER_LABELS", catalog._PROVIDER_LABELS)
