@@ -204,7 +204,7 @@ jobs:
           # is deleted the API can return head_branch null, so the squash commit
           # subject's trailing "(#N)" is the durable fallback (both agreed on
           # 100/100 merge_group CI runs, 2026-09-28).
-          PR_NUM=""; SIG=""
+          PR_NUM=""; SIG=""; QUEUE_READ_OK=0
           if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = merge_group ]; then
             PR_NUM="$(sed -nE 's#^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p' <<< "$WF_BRANCH")"
             if [ -z "$WF_BRANCH" ]; then
@@ -241,6 +241,7 @@ jobs:
               if [ "$PRIOR" = error ]; then
                 echo "::warning::prior merge_group run lookup failed; paging"
               else
+                QUEUE_READ_OK=1
                 for prev in $PRIOR; do
                   if [ "$(sig_of "$prev" || echo __error__)" = "$SIG" ]; then
                     ROUTE=none; echo "no page: PR #$PR_NUM already failed the queue on '$SIG' (run $prev)"; break
@@ -278,6 +279,17 @@ jobs:
                 ROUTE=none; echo "no page: probe wave '$WAVE' already paged (run $PRIOR)"
               fi
             fi
+          fi
+          # ONE QUEUE FAULT, ONE #alerts LINE (r12 A, t_0843231f). A merge-queue ejection is the
+          # queue fault seen through one PR: on 2026-09-28/29 one broken test paged 7 per-PR
+          # "ejected" lines here PLUS the home-side mq-ejection-watch / mq-cascade-alert /
+          # throughput / armed-not-merged pages. The home-side episode pager
+          # (hermes-home scripts/lib/mq_episode.py) owns #alerts for the queue: ONE line per
+          # (repo, failing test set). So a readable, deduped ejection goes to #logs, keeping
+          # the PR + failing tests. A signature or lookup error still pages (fail loud).
+          if [ "$ROUTE" = alerts ] && [ -n "$PR_NUM" ] && [ -n "$SIG" ] && [ "$QUEUE_READ_OK" = 1 ]; then
+            ROUTE=logs; CARD="t_0843231f: merge-queue ejection; the queue episode owns the #alerts line"
+            echo "#logs: PR #$PR_NUM queue ejection on '$SIG' (the merge-queue episode pages #alerts)"
           fi
           SUMMARY=""
           if [ -n "$PR_NUM" ]; then

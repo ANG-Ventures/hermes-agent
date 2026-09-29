@@ -327,9 +327,12 @@ def _api(current_tests, prior_runs=(), prior_tests=None, slice_="6/16"):
     return api
 
 
-def test_first_queue_ejection_pages_naming_pr_and_test(tmp_path):
+def test_first_queue_ejection_goes_to_logs_naming_pr_and_test(tmp_path):
+    # r12 A (t_0843231f): the queue fault's ONE #alerts line comes from the home-side merge-queue episode;
+    # the per-PR ejection is its detail -> #logs, still naming the PR and the failing test.
     got = _queue_route(tmp_path, _api([QTEST]))
-    assert got["route"] == "alerts"
+    assert got["route"] == "logs"
+    assert got["card"].startswith("t_0843231f")   # the #logs template names why it is not in #alerts
     assert got["pr"] == "1328"
     assert got["summary"] == f"PR #1328 ejected from the merge queue: {QTEST}"
 
@@ -342,15 +345,15 @@ def test_queue_retry_same_pr_same_test_is_silent(tmp_path):
     assert "already failed the queue" in got["_stdout"]
 
 
-def test_queue_retry_new_failing_test_still_pages(tmp_path):
+def test_queue_retry_new_failing_test_still_reported(tmp_path):
     got = _queue_route(tmp_path, _api([QTEST], prior_runs=[(30, "1328", "aaa")], prior_tests=["tests/x.py::t"]))
-    assert got["route"] == "alerts"
+    assert got["route"] == "logs"
 
 
 def test_other_pr_same_test_still_pages(tmp_path):
     # A prior failure of a DIFFERENT PR is not this PR's page; the lookup filters by PR.
     got = _queue_route(tmp_path, _api([QTEST], prior_runs=[(30, "1333", "aaa")]))
-    assert got["route"] == "alerts"
+    assert got["route"] == "logs"
 
 
 def test_queue_dedupe_api_error_fails_loud(tmp_path):
@@ -375,7 +378,7 @@ def test_queue_retry_same_test_plus_new_unannotated_red_job_still_pages(tmp_path
     api["actions/runs/42/jobs"]["jobs"].append({"id": 950, "name": "Lint (ruff + ty) / ruff", "conclusion": "failure"})
     api["check-runs/950/annotations"] = [{"message": "Process completed with exit code 1."}]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts"
+    assert got["route"] == "logs"
     assert got["summary"] == f"PR #1328 ejected from the merge queue: Lint (ruff + ty) / ruff; {QTEST}"
 
 
@@ -399,12 +402,12 @@ def test_queue_retry_prior_run_with_deleted_ref_is_still_recognized(tmp_path):
 
 def test_deleted_ref_prior_run_of_another_pr_still_pages(tmp_path):
     api = _null_branch_prior(_api([QTEST], prior_runs=[(30, "1333", "aaa")]), 30, "1333")
-    assert _queue_route(tmp_path, api)["route"] == "alerts"
+    assert _queue_route(tmp_path, api)["route"] == "logs"
 
 
 def test_current_run_with_deleted_ref_takes_pr_from_commit_subject(tmp_path):
     got = _queue_route(tmp_path, _api([QTEST]), branch=None, subject="fix(y): z (#1328)")
-    assert got["route"] == "alerts"
+    assert got["route"] == "logs"
     assert got["summary"] == f"PR #1328 ejected from the merge queue: {QTEST}"
 
 
