@@ -179,7 +179,12 @@ def _fallback_client() -> MagicMock:
 class _FakeClock:
     """``time`` stand-in for the loop: ``sleep`` advances the clock instead
     of blocking, so a 90s capacity budget runs in microseconds and the test
-    can assert on the REQUESTED waits. Everything else delegates."""
+    can assert on the REQUESTED waits. Everything else delegates.
+
+    The clock is FROZEN at construction and moves only via ``sleep`` /
+    ``_offset``: the capacity budget reads ``monotonic()`` deltas, so real
+    elapsed test time must not leak in (a loaded CI runner turned the 3.0s
+    clamp into 2.75s — t_667df80c)."""
 
     def __init__(self, sleeps: list[float]):
         import time as _real
@@ -187,15 +192,18 @@ class _FakeClock:
         self._real = _real
         self._offset = 0.0
         self._sleeps = sleeps
+        self._t0 = _real.time()
+        self._m0 = _real.monotonic()
+        self._p0 = _real.perf_counter()
 
     def time(self):
-        return self._real.time() + self._offset
+        return self._t0 + self._offset
 
     def monotonic(self):
-        return self._real.monotonic() + self._offset
+        return self._m0 + self._offset
 
     def perf_counter(self):
-        return self._real.perf_counter() + self._offset
+        return self._p0 + self._offset
 
     def sleep(self, secs):
         self._sleeps.append(float(secs))
