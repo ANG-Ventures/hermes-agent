@@ -7247,14 +7247,100 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+class ReviewHoldRequired(RuntimeError):
+    """Reassigning a ``review`` card with an open own PR needs a changes request.
+
+    t_947cea0e (2026-09-29): an operator posted CHANGES REQUESTED as a comment
+    and ran ``assign <card> daedalus``. The card stayed in ``review``, no worker
+    was ever dispatched, and the hold had no owner (t_dadfedb2).
+    """
+
+
+def review_hold_open_prs(conn: sqlite3.Connection, task_id: str, *, query_fn=None) -> list:
+    """The card's own fleet PRs that are OPEN or unreadable while it sits in ``review``.
+
+    Own PRs are what any run recorded (:func:`_card_recorded_pr_refs`), never prose
+    mentions. Unreadable fails closed, as on the completion path; so does a host
+    with no PR lookup at all. Empty for a card that is not in ``review``.
+    """
+    from . import kanban_open_pr as _open_pr
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] != "review":
+        return []
+    refs = _open_pr.split_fleet(_open_pr.extract_pr_refs(
+        survivor_pr=_card_recorded_pr_refs(conn, task_id)))[0]
+    if not refs:
+        return []
+    query_fn = _open_pr.memo_query(query_fn)
+    if query_fn is None:
+        return [f"{r.repo}#{r.number}" for r in refs]
+    opened, unverified = _open_pr.unmerged_refs(refs, query_fn=query_fn, primary=refs)
+    return [f"{r.repo}#{r.number}" for r in opened + unverified]
+
+
+def _reassign_request_changes(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str], reason: str,
+    operator: Optional[str],
+) -> Optional[str]:
+    """Route a reassign of a ``review`` card through :func:`request_changes`.
+
+    Same event and payload as ``request-changes --operator``: the review run is
+    opened and closed as the caller, ``changes_requested`` carries
+    ``"operator": "<who>: <why>"`` (hermes-home changes_hold.py keys on it), the
+    card lands ``ready`` and the implementer is restored. Returns that
+    implementer; raises :class:`ReviewHoldRequired` on refusal.
+    """
+    who = (str(operator or "").strip() or _event_actor()[0] or "operator").split(":", 1)[0].strip()
+    ok, detail = request_changes(
+        conn, task_id, reason=reason, claimer=who,
+        operator=f"{who}: reassign to {profile or '(unassigned)'}: {reason}",
+    )
+    if not ok:
+        raise ReviewHoldRequired(
+            f"cannot reassign {task_id}: --request-changes refused: {detail}"
+        )
+    return detail
+
+
 @_home_session_guarded("assign")
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    request_changes_reason: Optional[str] = None,
+    operator: Optional[str] = None,
+    pr_query=None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
+
+    A card in ``review`` whose own PR is open (or unreadable) is refused with
+    :class:`ReviewHoldRequired` unless ``request_changes_reason`` is given; with
+    it the reassign goes through :func:`request_changes` (card ``ready``,
+    implementer restored, ``changes_requested`` with ``operator``), then
+    ``profile`` becomes the assignee if it differs from the implementer.
     """
     profile = _canonical_assignee(profile)
+    changes_reason = str(request_changes_reason or "").strip()
+    if not changes_reason:
+        held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
+        if held:
+            raise ReviewHoldRequired(
+                f"cannot reassign {task_id}: it is in review with open PR(s) "
+                f"{', '.join(held)}. Reassigning would leave it in review with no "
+                f"worker. Pass --request-changes \"<reason>\" to send it back "
+                f"(changes_requested, status ready) or land/close the PR first."
+            )
+    else:
+        implementer = _reassign_request_changes(
+            conn, task_id, profile, changes_reason, operator,
+        )
+        if implementer == profile:
+            notify_task_updated(conn, task_id, ("assignee", "status"))
+            return True
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -10230,8 +10316,16 @@ def reassign_task(
     reclaim_first: bool = False,
     reason: Optional[str] = None,
     receipt: Optional[dict] = None,
+    request_changes_reason: Optional[str] = None,
+    operator: Optional[str] = None,
+    pr_query=None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
+
+    ``request_changes_reason`` / ``operator`` / ``pr_query`` pass through to
+    :func:`assign_task` (the review-hold gate). A :class:`ReviewHoldRequired`
+    refusal is written to ``receipt["hold_error"]`` when a receipt is given,
+    else raised.
 
     This is the recovery path for "this profile's model is broken, try
     a different one". If ``reclaim_first`` is True, any active claim is
@@ -10273,7 +10367,15 @@ def reassign_task(
     # committed reclaim, *any* assign failure must preserve that receipt;
     # even its post-commit observer can raise after assignment landed.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(
+            conn, task_id, profile, request_changes_reason=request_changes_reason,
+            operator=operator, pr_query=pr_query,
+        )
+    except ReviewHoldRequired as exc:
+        if receipt is None:
+            raise
+        receipt["hold_error"] = str(exc)
+        return False
     except BaseException as exc:  # noqa: BLE001 - post-reclaim receipt boundary
         if receipt is not None and receipt.get("reclaimed"):
             if isinstance(exc, RuntimeError) and str(exc).startswith(

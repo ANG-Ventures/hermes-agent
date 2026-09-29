@@ -772,6 +772,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+    p_assign.add_argument(
+        "--request-changes", default=None, dest="request_changes", metavar="REASON",
+        help="Required to hand a card in review with an open PR back: records "
+             "changes_requested (operator), status ready, assignee = implementer",
+    )
 
     # --- set-model (per-task model/provider/effort override) ---
     p_set_model = sub.add_parser(
@@ -958,6 +963,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reassign.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+    p_reassign.add_argument(
+        "--request-changes", default=None, dest="request_changes", metavar="REASON",
+        help="Required to hand a card in review with an open PR back: records "
+             "changes_requested (operator), status ready, assignee = implementer",
     )
 
     # --- diagnostics (board-wide health) ---
@@ -3249,7 +3259,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+        try:
+            ok = kb.assign_task(
+                conn, args.task_id, profile,
+                request_changes_reason=getattr(args, "request_changes", None),
+                operator=_profile_author(),
+            )
+        except kb.ReviewHoldRequired as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -4192,8 +4210,17 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             reclaim_first=reclaim_first,
             reason=getattr(args, "reason", None),
             receipt=receipt,
+            request_changes_reason=getattr(args, "request_changes", None),
+            operator=_profile_author(),
         )
     reclaimed = bool(receipt.get("reclaimed"))
+    if not ok and receipt.get("hold_error"):
+        print(
+            receipt["hold_error"]
+            + (" (the claim WAS reclaimed first)" if reclaimed else ""),
+            file=sys.stderr,
+        )
+        return 1
     if not ok:
         if receipt.get("reclaim_error"):
             print(
