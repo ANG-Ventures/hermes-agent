@@ -465,6 +465,31 @@ _HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
 # hold, and cancel a fresh compressor on every single turn; deliberately
 # outside the failure-streak ladder above.
 _HYGIENE_TURNHOLD_RETRY_SECONDS = 60.0
+# Consecutive turn-hold deferrals for one session back off x4 per rung
+# (60 -> 240 -> 960 -> 3600s cap). Each deferral still pays the summary
+# model's prompt ingestion for the whole transcript; a session too large to
+# summarise inside the turn-hold budget will defer every time, so a flat
+# 60s spacing re-bought that input on nearly every turn (t_139733d1). Kept
+# in-process and separate from the failure streak: this is not a failure.
+_HYGIENE_TURNHOLD_BACKOFF_FACTOR = 4.0
+
+
+def _hygiene_turnhold_retry_seconds(gateway, session_id: str) -> float:
+    """Bump this session's turn-hold deferral streak; return its retry-after."""
+    streaks = getattr(gateway, "_hygiene_turnhold_deferral_streaks", None)
+    if not isinstance(streaks, dict):
+        streaks = {}
+        try:
+            gateway._hygiene_turnhold_deferral_streaks = streaks
+        except Exception:
+            pass
+    streak = int(streaks.get(session_id, 0)) + 1
+    streaks[session_id] = streak
+    return min(
+        _HYGIENE_TURNHOLD_RETRY_SECONDS
+        * (_HYGIENE_TURNHOLD_BACKOFF_FACTOR ** (streak - 1)),
+        _HYGIENE_COOLDOWN_MAX_SECONDS,
+    )
 
 
 def _hygiene_cooldown_for_failure(
@@ -27177,7 +27202,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene turn-hold",
                                             )
                                             _hyg_cleanup_deferred = True
-                                            # Short, NON-escalating retry-after. Without
+                                            # Retry-after on its own deferral ladder
+                                            # (_hygiene_turnhold_retry_seconds). Without
                                             # it, every subsequent turn re-spawns a fresh
                                             # compressor, holds it for the turn-hold
                                             # budget, and cancels it again — a per-turn
@@ -27186,10 +27212,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # NOT _hygiene_cooldown_for_failure: the
                                             # compressor is healthy, so the failure streak
                                             # must not advance (behavior witness below);
-                                            # only the flat retry spacing is recorded.
+                                            # only the deferral retry spacing is recorded.
                                             _record_hygiene_cooldown(
                                                 self, session_entry.session_id,
-                                                _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                                                _hygiene_turnhold_retry_seconds(
+                                                    self, session_entry.session_id
+                                                ),
                                                 "hygiene compression deferred: "
                                                 "turn-hold budget expired while the "
                                                 "summary was still streaming",
@@ -31672,6 +31700,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         streaks = getattr(self, "_hygiene_compression_failure_streaks", None)
         if isinstance(streaks, dict):
             streaks.pop(session_id, None)
+        deferrals = getattr(self, "_hygiene_turnhold_deferral_streaks", None)
+        if isinstance(deferrals, dict):
+            deferrals.pop(session_id, None)
 
     async def _announce_hygiene_compaction(
         self,
