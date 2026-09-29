@@ -403,7 +403,7 @@ async def search_sessions(
             # these outrank message-content hits, and a titled session stays findable after it
             # scrolls out of the client's loaded list.
             for row in db.search_sessions_by_title(
-                q, limit=safe_limit, include_archived=True, source=source_filter,
+                q, limit=safe_limit, source=source_filter,
                 sources=source_list or None, exclude_sources=exclude_list or None):
                 title = (row.get("title") or "").strip()
                 display_name = (row.get("display_name") or "").strip()

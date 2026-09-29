@@ -5008,10 +5008,28 @@ class TestSessionTitleSearch:
         self._seed(db, "miss", title="Errands", source="telegram", started_at=400)
 
         ids = [h["id"] for h in db.search_sessions_by_title("voice discord")]
-        # Both tokens (channel + platform) beat one token; a title token beats a
-        # platform-only row; the telegram row matches nothing.
-        assert ids == ["thread", "titled", "platform_only"]
-        assert [h["id"] for h in db.search_sessions_by_title("tg")] == ["miss"]
+        # Both tokens (channel + platform) beat one token; a platform token alone never
+        # admits a row (platform_only, miss), it only ranks rows a text token matched.
+        assert ids == ["thread", "titled"]
+        assert db.search_sessions_by_title("tg") == []
+        assert db.search_sessions_by_title("discord") == []
+
+    def test_platform_token_alone_does_not_flood(self, db):
+        for i in range(30):
+            self._seed(db, f"cli{i}", title=f"Groceries {i}", source="cli", started_at=100 + i)
+        self._seed(db, "named", title="cli wrapper notes", source="cli", started_at=1)
+        # Only a row whose text contains the token qualifies; the 30 unrelated titled CLI
+        # sessions stay out, so they cannot displace content hits in the endpoint.
+        assert [h["id"] for h in db.search_sessions_by_title("cli")] == ["named"]
+
+    def test_excludes_archived_like_the_sidebar(self, db):
+        self._seed(db, "live", title="needle live", started_at=300)
+        self._seed(db, "arch", title="needle archived", started_at=900)
+        db._conn.execute("UPDATE sessions SET archived = 1 WHERE id = 'arch'")
+        db._conn.commit()
+        assert [h["id"] for h in db.search_sessions_by_title("needle")] == ["live"]
+        assert [h["id"] for h in db.search_sessions_by_title(
+            "needle", include_archived=True)] == ["arch", "live"]
 
     def test_excludes_untitled_hidden_subagent_and_filtered_rows(self, db):
         self._seed(db, "untitled")  # no title, no display path
@@ -5027,9 +5045,9 @@ class TestSessionTitleSearch:
         assert [h["id"] for h in db.search_sessions_by_title("needle", exclude_sources=["cron"])] == [
             "parent"]
         assert [h["id"] for h in db.search_sessions_by_title("needle", source="cron")] == ["cron_run"]
-        # A platform-only query still requires human-facing text (title or display path).
-        cli_ids = {h["id"] for h in db.search_sessions_by_title("cli")}
-        assert "parent" in cli_ids and "untitled" not in cli_ids
+        # A platform token only ranks; it never admits a row without a text hit.
+        assert db.search_sessions_by_title("cli") == []
+        assert [h["id"] for h in db.search_sessions_by_title("visible cli")] == ["parent"]
 
     def test_like_wildcards_are_literal_and_empty_query_is_empty(self, db):
         self._seed(db, "pct", title="100% coverage plan")

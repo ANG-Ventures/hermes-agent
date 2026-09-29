@@ -1275,7 +1275,7 @@ class SessionSessionsMixin:
         return s
 
     def search_sessions_by_title(
-        self, query: str, limit: int = 20, include_archived: bool = True, source: str = None,
+        self, query: str, limit: int = 20, include_archived: bool = False, source: str = None,
         sources: List[str] = None, exclude_sources: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search listable sessions by title, channel/thread name (``display_name``) and platform.
@@ -1284,11 +1284,14 @@ class SessionSessionsMixin:
         ``display_name`` carries a messaging session's server/channel/thread path, so these hits
         should outrank message-content hits. Matching is per whitespace token: a token counts when
         it is a substring of the title or display path, or names the row's platform
-        (``_PLATFORM_SEARCH_ALIASES``). Rows matching more tokens rank first; ties break on where
+        (``_PLATFORM_SEARCH_ALIASES``). A row qualifies only when some token hits its title or
+        display path; a platform token ranks rows but never admits one on its own, so a bare
+        ``cli`` does not return every titled CLI session ahead of content hits. Rows matching
+        more tokens rank first; ties break on where
         the best match landed (whole-query title exact > prefix > substring > token in title >
         token in display path > platform only), then recency. Visibility matches the sidebar:
-        sub-agent runs, compression continuations and hidden rows are excluded, and only rows with
-        a title or display path are candidates.
+        sub-agent runs, compression continuations, hidden and archived rows are excluded, and only
+        rows with a title or display path are candidates.
         """
         needle = " ".join((query or "").lower().split())
         if not needle or limit <= 0:
@@ -1311,23 +1314,15 @@ class SessionSessionsMixin:
                 "LOWER(COALESCE(s.display_name, '')) LIKE ? ESCAPE '\\'",
             ]
             text_params += [pattern, pattern]
-        text_hit = f"({' OR '.join(text_clauses)})"
-        platform_sources = sorted(
-            {src for tok in tokens for src in _PLATFORM_SEARCH_ALIASES.get(tok, ())})
-        if platform_sources:
-            where.append(
-                f"({text_hit} OR s.source IN ({_session_ids_placeholders(platform_sources)}))")
-            params += text_params + platform_sources
-        else:
-            where.append(text_hit)
-            params += text_params
-        # SQL only narrows (text hits before platform-only rows, then recency); Python ranks.
+        where.append(f"({' OR '.join(text_clauses)})")
+        params += text_params
+        # SQL only narrows (text hits, newest first); Python ranks.
         rows = self._read_all(
             f"SELECT s.id, s.title, s.display_name, s.source, s.model, s.started_at, "
             f"{_sql_session_last_active('s')} AS last_active, {_PREVIEW_COL_SQL} "
             f"FROM sessions s {_where_sql(where)} "
-            f"ORDER BY CASE WHEN {text_hit} THEN 0 ELSE 1 END, s.started_at DESC, s.id DESC LIMIT ?",
-            params + text_params + [max(limit * 8, 80)],
+            f"ORDER BY s.started_at DESC, s.id DESC LIMIT ?",
+            params + [max(limit * 8, 80)],
         )
 
         def rank(item: Tuple[int, sqlite3.Row]) -> Tuple[int, int, int]:
