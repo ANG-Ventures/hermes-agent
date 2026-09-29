@@ -49,10 +49,11 @@ Known limits (deliberate, flagged on #64934):
 """
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,10 @@ class TurnLeaseToken:
         "generation",
         "released",
         "tool_name_hint",
-        "owner_task",
+        "_owner_task",
+        "_workers",
+        "release_requested",
+        "_notify",
     )
 
     def __init__(
@@ -173,10 +177,58 @@ class TurnLeaseToken:
         # parked in. Diagnostic only; never read on any correctness path.
         self.tool_name_hint: Optional[Callable[[], Optional[str]]] = None
         # Optional: the asyncio task whose ``finally`` releases this token, set
-        # by the dispatch layer. Once that task is done() nothing can release
-        # the token any more, so a waiter may reclaim it
-        # (``_reclaim_dead_holder``). None = never reclaimed (standalone use).
-        self.owner_task: Optional["asyncio.Task[Any]"] = None
+        # by the dispatch layer (see the ``owner_task`` property). None = never
+        # reclaimed (standalone use).
+        self._owner_task: Optional["asyncio.Task[Any]"] = None
+        # Executor work items (concurrent.futures / asyncio futures) running
+        # on this turn's behalf. A cancelled handler task does NOT stop them:
+        # the agent thread keeps writing the transcript until it returns, so
+        # the lease stays held until every one is done (FleetReview #1409).
+        self._workers: List[Any] = []
+        # Set by release_when_idle(): the owner asked to release but a worker
+        # is still running; the release happens when the last one finishes.
+        self.release_requested = False
+        # Registry callback (thread-safe) re-checking this holder when its
+        # owner task or a worker finishes. Bound by the registry on acquire.
+        self._notify: Optional[Callable[[], None]] = None
+
+    @property
+    def owner_task(self) -> Optional["asyncio.Task[Any]"]:
+        return self._owner_task
+
+    @owner_task.setter
+    def owner_task(self, task: Optional["asyncio.Task[Any]"]) -> None:
+        """Bind the task whose ``finally`` releases this token.
+
+        Once that task is done() and no worker is running, nothing can release
+        the token any more (e.g. a CancelledError landing on an await in the
+        finally, 2026-09-27), so the registry frees it back to the lock's FIFO
+        queue the moment the task finishes.
+        """
+        self._owner_task = task
+        if task is not None:
+            task.add_done_callback(self._fire_notify)
+
+    def add_worker(self, future: Any) -> None:
+        """Track an executor work item that belongs to this turn."""
+        if self.released or future is None:
+            return
+        self._workers = [f for f in self._workers if not f.done()]
+        self._workers.append(future)
+        future.add_done_callback(self._fire_notify)
+
+    def pending_workers(self) -> List[Any]:
+        """Work items still running on this turn's behalf."""
+        self._workers = [f for f in self._workers if not f.done()]
+        return list(self._workers)
+
+    def _fire_notify(self, *_args: Any) -> None:
+        notify = self._notify
+        if notify is not None:
+            try:
+                notify()
+            except Exception:
+                logger.debug("turn lease holder notify failed", exc_info=True)
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
@@ -184,6 +236,27 @@ class TurnLeaseToken:
             f"owner_key={self.owner_key!r}, generation={self.generation}, "
             f"released={self.released})"
         )
+
+
+# The lease token of the turn running in the current asyncio context. Set once
+# the lease is acquired; tasks the turn spawns (the agent's executor task)
+# inherit it, so turn-pool work items can attach themselves to the token.
+_CURRENT_TOKEN: "contextvars.ContextVar[Optional[TurnLeaseToken]]" = (
+    contextvars.ContextVar("turn_lease_current_token", default=None)
+)
+
+
+def bind_current_token(token: Optional[TurnLeaseToken]) -> None:
+    """Mark ``token`` as the lease of the turn running in this context."""
+    _CURRENT_TOKEN.set(token)
+
+
+def current_token() -> Optional[TurnLeaseToken]:
+    """The held lease token of the current turn, if any."""
+    token = _CURRENT_TOKEN.get()
+    if token is None or token.released:
+        return None
+    return token
 
 
 class _SessionLease:
@@ -299,44 +372,85 @@ class SessionTurnLeaseRegistry:
         lease = self._leases.get(token.session_id)
         return lease is not None and lease.holder is token
 
-    def _reclaim_dead_holder(
-        self,
-        session_id: str,
-        lease: _SessionLease,
-        token: TurnLeaseToken,
-    ) -> bool:
-        """Hand a lease whose holder's task is done() to ``token``.
+    def _bind_notifier(self, token: TurnLeaseToken) -> None:
+        """Let ``token`` wake the registry when its task or a worker ends.
 
-        A holder releases only from its own task's ``finally``. When that task
-        is already done() and the token is still the holder, the release was
-        skipped (e.g. a CancelledError landing on an await in the finally,
-        2026-09-27) and nothing will ever free it. The lock stays locked and
-        ownership moves to ``token``; queued waiters keep waiting on the same
-        lock. Refused while the holder's task is still running.
+        Worker callbacks fire on executor threads, so the re-check is always
+        marshalled onto the event loop that acquired the lease.
         """
-        holder = lease.holder
-        task = getattr(holder, "owner_task", None) if holder is not None else None
-        if holder is None or task is None or not task.done():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        def _notify() -> None:
+            try:
+                loop.call_soon_threadsafe(self._check_holder, token)
+            except RuntimeError:
+                pass  # loop closed: nothing left to serialize
+
+        token._notify = _notify
+
+    def _check_holder(self, token: Optional[TurnLeaseToken]) -> bool:
+        """Free ``token``'s lease once nothing can use or release it any more.
+
+        Two cases, both only when no worker of the turn is still running:
+
+        * the owner asked to release (``release_when_idle``) while a worker ran;
+        * the owner task is done() without releasing (dead holder).
+
+        The lock is RELEASED, never handed to a caller, so the next turn is the
+        head of the lock's FIFO queue: a later message cannot overtake a turn
+        that was already waiting (FleetReview #1409).
+        """
+        if token is None or token.released:
             return False
-        if not lease.lock.locked():
+        lease = self._leases.get(token.session_id)
+        if lease is None or lease.holder is not token:
+            return False
+        if token.pending_workers():
+            return False
+        if token.release_requested:
+            return self.release(token)
+        task = token.owner_task
+        if task is None or not task.done():
             return False
         held = time.time() - lease.acquired_at if lease.acquired_at else -1.0
         logger.warning(
-            "PHASE=turn_lease_reclaimed session=%s key=%s gen=%s held=%.0fs "
-            "new_key=%s new_gen=%s: the holder's task finished without "
-            "releasing the turn lease",
-            session_id,
-            holder.owner_key,
-            holder.generation,
-            held,
+            "PHASE=turn_lease_reclaimed session=%s key=%s gen=%s held=%.0fs: "
+            "the holder's task finished without releasing the turn lease; "
+            "releasing it to the next queued turn",
+            token.session_id,
             token.owner_key,
             token.generation,
+            held,
         )
-        holder.released = True
-        lease.holder = token
-        lease.acquired_at = time.time()
-        lease.last_used = lease.acquired_at
-        lease.stale_logged = False
+        return self.release(token)
+
+    def release_when_idle(self, token: Optional[TurnLeaseToken]) -> bool:
+        """Release ``token`` now, or as soon as its last worker finishes.
+
+        A cancelled turn handler unwinds while its agent thread may still be
+        running (and writing the transcript). Handing the lease to the next
+        turn then would interleave two writers, so the release is deferred to
+        the worker's completion. Returns True when released or deferred.
+        """
+        if token is None or token.released:
+            return False
+        pending = token.pending_workers()
+        if not pending:
+            return self.release(token)
+        token.release_requested = True
+        logger.info(
+            "turn lease release deferred on session %s (key %s gen %s): %d "
+            "agent worker(s) still running",
+            token.session_id,
+            token.owner_key,
+            token.generation,
+            len(pending),
+        )
+        # A worker may have finished between the checks above.
+        self._check_holder(token)
         return True
 
     def _log_stale_holder(
@@ -403,8 +517,9 @@ class SessionTurnLeaseRegistry:
         token = TurnLeaseToken(session_id, owner_key, int(generation))
         lease = self._get_or_create(session_id)
 
-        if self._reclaim_dead_holder(session_id, lease, token):
-            return token
+        # A holder that can no longer release is freed back to the lock's
+        # queue; this caller then queues behind any turn already waiting.
+        self._check_holder(lease.holder)
 
         if lease.lock.locked():
             holder = lease.holder
@@ -465,8 +580,6 @@ class SessionTurnLeaseRegistry:
         try:
             await asyncio.wait_for(lease.lock.acquire(), timeout=wait)
         except asyncio.TimeoutError:
-            if self._reclaim_dead_holder(session_id, lease, token):
-                return token
             holder = lease.holder
             logger.error(
                 "turn lease wait timed out after %.0fs on session %s "
@@ -494,6 +607,7 @@ class SessionTurnLeaseRegistry:
         lease.holder = token
         lease.acquired_at = time.time()
         lease.last_used = lease.acquired_at
+        self._bind_notifier(token)
         return token
 
     def rebind(self, token: Optional[TurnLeaseToken], new_session_id: str) -> bool:

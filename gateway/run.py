@@ -3429,6 +3429,8 @@ from gateway.turn_lease import (
     DEFAULT_STALE_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    bind_current_token,
+    current_token as current_turn_lease_token,
 )
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
@@ -25122,8 +25124,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
                 # inside _run_agent returns False, and the old sentinel-only check here
                 # missed the leftover real agent — locking the session out forever (#28686).
+                # ...but only while the slot is still THIS turn's. The lease
+                # is released above, before the await, so a queued turn on
+                # the same key may already have claimed the slot and
+                # registered its agent; clearing it here would make /stop
+                # miss the live turn (FleetReview #1409).
                 try:
-                    self._release_running_agent_state(_quick_key)
+                    _slot_task = getattr(self, "_running_agent_tasks", {}).get(_quick_key)
+                    if (
+                        _slot_task is None
+                        or _slot_task is asyncio.current_task()
+                        or _slot_task.done()
+                    ):
+                        self._release_running_agent_state(_quick_key)
+                    else:
+                        logger.debug(
+                            "Skipping running-state release for %s: the slot "
+                            "belongs to a newer turn",
+                            _quick_key,
+                        )
                 finally:
                     if _checkout_ticket is not None:
                         _checkout_ticket.release()
@@ -26534,6 +26553,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # _handle_message releases the lease. If that task ends without
                 # releasing, a waiter may reclaim the lease (2026-09-27 leak).
                 _lease_token.owner_task = asyncio.current_task()
+                # Turn-pool work items submitted from this turn (run_sync)
+                # attach to the token; the lease is not freed while one runs.
+                bind_current_token(_lease_token)
                 # Diagnostic hint so a LATER waiter's PHASE=stale_lease_holder
                 # line can name the tool this turn is parked in.
                 try:
@@ -32792,7 +32814,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             return ctx.run(func, *call_args)
 
-        return await loop.run_in_executor(executor, _timed, *args)
+        if pool != "turn":
+            return await loop.run_in_executor(executor, _timed, *args)
+        # Track the concurrent future itself: the asyncio wrapper reports
+        # done() on cancel while the thread is still running.
+        cfut = executor.submit(_timed, *args)
+        token = current_turn_lease_token()
+        if token is not None:
+            token.add_worker(cfut)
+        return await asyncio.wrap_future(cfut, loop=loop)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work.
@@ -35619,7 +35649,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn.lease_token = None
         turn.lease_generation = None
         try:
-            return registry.release(token)
+            # Deferred while this turn's agent worker thread still runs: a
+            # cancelled handler does not stop it (FleetReview #1409).
+            return registry.release_when_idle(token)
         except Exception:
             logger.warning("Failed to release turn lease for %s", session_key, exc_info=True)
             return False
