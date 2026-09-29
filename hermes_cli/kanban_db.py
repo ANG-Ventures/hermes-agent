@@ -23537,6 +23537,10 @@ def _shim_model_rank(model: Optional[str]) -> Optional[int]:
     never fires on a model the dispatcher cannot place (fail-open to today).
     """
     name = str(model or "").rsplit("/", 1)[-1].lower()
+    # Only recognized Claude ids rank: a custom alias like ``acme/opus-v1``
+    # must never be swapped for a Claude model on the card's provider.
+    if not name.startswith("claude-"):
+        return None
     for family, rank in _SHIM_MODEL_FAMILY_RANK:
         if family in name:
             return rank
@@ -23545,6 +23549,9 @@ def _shim_model_rank(model: Optional[str]) -> Optional[int]:
 
 def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
     """``foreign_lane.shim_model_cap`` from the assignee profile's config.yaml.
+
+    Only honoured on a foreign-lane shim profile, i.e. one whose
+    ``foreign_lane.harness`` is set; any other profile returns None.
 
     Read raw at spawn time (no restart to flip). Unset, empty, unreadable or
     malformed all return None = today's behaviour (the shim runs the card's
@@ -23563,8 +23570,14 @@ def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
         # must not collide with a name test_kanban_config_keys binds to
         # .get("kanban") (its scan is file-wide, not scope-aware).
         foreign_lane_cfg = cfg.get("foreign_lane") if isinstance(cfg, dict) else None
-        cap = (foreign_lane_cfg.get("shim_model_cap")
-               if isinstance(foreign_lane_cfg, dict) else None)
+        if not isinstance(foreign_lane_cfg, dict):
+            return None
+        # Scope: only a real foreign-lane shim profile (one that names its
+        # harness) caps. Any other profile's tasks keep the card's model.
+        harness = foreign_lane_cfg.get("harness")
+        if not (isinstance(harness, str) and harness.strip()):
+            return None
+        cap = foreign_lane_cfg.get("shim_model_cap")
         cap = str(cap).strip() if isinstance(cap, str) else ""
         return cap.rsplit("/", 1)[-1] or None
     except Exception as exc:

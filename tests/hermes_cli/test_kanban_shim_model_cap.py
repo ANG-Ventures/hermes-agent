@@ -25,6 +25,9 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+CAP = "foreign_lane:\n  harness: claude-code-tui\n  shim_model_cap: claude-sonnet-5\n"
+
+
 def _profile(kanban_home, cap_block: str) -> None:
     prof = kanban_home / "profiles" / "cc-worker"
     prof.mkdir(parents=True)
@@ -62,7 +65,7 @@ def _spawn(monkeypatch, model: str, provider: str | None = "claude-bpr"):
 
 
 def test_cap_applied_when_card_model_ranks_above(kanban_home, monkeypatch):
-    _profile(kanban_home, "foreign_lane:\n  shim_model_cap: claude-sonnet-5\n")
+    _profile(kanban_home, CAP)
     model, argv, env = _spawn(monkeypatch, "claude-opus-5")
     assert model == "claude-sonnet-5"
     assert argv.count("-m") == 1
@@ -71,16 +74,19 @@ def test_cap_applied_when_card_model_ranks_above(kanban_home, monkeypatch):
 
 
 def test_cap_applied_to_provider_partition_form(kanban_home, monkeypatch):
-    _profile(kanban_home, "foreign_lane:\n  shim_model_cap: claude-sonnet-5\n")
+    _profile(kanban_home, CAP)
     model, argv, env = _spawn(monkeypatch, "claude-bpr/claude-opus-5", provider=None)
     assert model == "claude-sonnet-5"
     assert argv[argv.index("--provider") + 1] == "claude-bpr"
     assert env[kb.SHIM_MODEL_CAPPED_FROM_ENV] == "claude-opus-5"
 
 
-@pytest.mark.parametrize("card_model", ["claude-sonnet-5", "claude-haiku-4-5", "gpt-5.5"])
+@pytest.mark.parametrize("card_model", [
+    "claude-sonnet-5", "claude-haiku-4-5", "gpt-5.5",
+    "acme/opus-v1",  # non-Claude alias with a family word: never capped
+])
 def test_cap_not_applied_at_or_below_cap_or_unranked(kanban_home, monkeypatch, card_model):
-    _profile(kanban_home, "foreign_lane:\n  shim_model_cap: claude-sonnet-5\n")
+    _profile(kanban_home, CAP)
     model, _argv, env = _spawn(monkeypatch, card_model)
     assert model == card_model
     assert kb.SHIM_MODEL_CAPPED_FROM_ENV not in env
@@ -91,6 +97,8 @@ def test_cap_not_applied_at_or_below_cap_or_unranked(kanban_home, monkeypatch, c
     "foreign_lane:\n  harness: claude-code-tui\n",  # section, no cap
     "foreign_lane:\n  shim_model_cap: ''\n",        # empty
     "foreign_lane:\n  shim_model_cap: null\n",      # null
+    # cap set but not a foreign-lane shim profile (no harness): not honoured
+    "foreign_lane:\n  shim_model_cap: claude-sonnet-5\n",
 ])
 def test_cap_unset_is_todays_behaviour(kanban_home, monkeypatch, block):
     _profile(kanban_home, block)
@@ -111,3 +119,4 @@ def test_rank_orders_families():
     assert kb._shim_model_rank("claude-haiku-4-5") < kb._shim_model_rank("claude-sonnet-5")
     assert kb._shim_model_rank("claude-sonnet-5") < kb._shim_model_rank("anthropic/claude-opus-5")
     assert kb._shim_model_rank("gpt-5.5") is None
+    assert kb._shim_model_rank("acme/opus-v1") is None
