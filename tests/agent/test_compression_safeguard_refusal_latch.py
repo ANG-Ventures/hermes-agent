@@ -205,6 +205,40 @@ def test_compressor_refusal_latch_expires(monkeypatch):
     assert sends == [1]
 
 
+# --- t_f03a8117: the task-default route inherits the main endpoint ---
+
+
+def test_latch_keys_on_the_inherited_main_endpoint():
+    """Two gateway sessions on the same model name behind different endpoints
+    share the process-wide latch. With no explicit provider/base_url the
+    summary call is sent to the session's main runtime endpoint, so a refusal
+    on endpoint A must not suppress the same content on endpoint B."""
+    ok = {"choices": [{"finish_reason": "stop", "message": {"content": "Checked the telescope inventory."}}]}
+    a = _compressor(summary_model="")
+    a.provider, a.base_url = "custom", "http://endpoint-a:8000/v1"
+    sends, _ = _passes(a, [_messages()] * 2, _refuse)
+    assert sends == [1, 0]  # latched on endpoint A
+
+    b = _compressor(summary_model="")
+    b.provider, b.base_url = "custom", "http://endpoint-b:8000/v1"
+    sends, _ = _passes(b, [_messages()], lambda **_: ok)
+    assert sends == [1]
+    assert not b._last_compress_aborted
+
+
+def test_model_less_fallback_route_terminates_with_main_endpoint():
+    """Loop and send still derive one key once the endpoint is in it."""
+    compressor = _compressor()
+    compressor.base_url = "http://endpoint-a:8000/v1"
+    with patch(
+        "agent.context_compressor._compression_refusal_fallback_routes",
+        return_value=[{"provider": "gemini-bridge"}],
+    ):
+        sends, _ = _passes(compressor, [_messages()] * 2, _refuse)
+    assert sends == [2, 0]
+    assert compressor._last_compress_aborted
+
+
 @pytest.fixture(autouse=True)
 def _clean_latch():
     _SUMMARY_REFUSALS.clear()

@@ -209,16 +209,25 @@ def _is_summary_safeguard_refusal(exc: BaseException) -> bool:
     return any(marker in text for marker in _SAFEGUARD_REFUSAL_MARKERS)
 
 
-def _summary_refusal_route_key(call_kwargs: Dict[str, Any], main_model: str) -> str:
+def _summary_refusal_route_key(
+    call_kwargs: Dict[str, Any], main_model: str, main_base_url: str = ""
+) -> str:
     """Stable pre-send identity of the route a summary call will take.
 
     Built from the explicit ``call_llm`` kwargs, not the resolved route, so the
     same compressor configuration maps to the same key before every send.
+    A task-default or bare ``custom`` route without an explicit ``base_url``
+    is sent to the session's main runtime endpoint, so that endpoint is part
+    of the key: the latch is process-wide, and two sessions on the same model
+    name behind different endpoints must not share it (t_f03a8117).
     """
-    provider = str(call_kwargs.get("provider") or "task-default").strip().lower()
+    raw_provider = str(call_kwargs.get("provider") or "").strip().lower()
+    provider = raw_provider or "task-default"
     model = str(call_kwargs.get("model") or f"main:{main_model or ''}").strip().lower()
-    base_url = str(call_kwargs.get("base_url") or "").strip().lower()
-    return f"{provider}|{model}|{base_url}"
+    base_url = str(call_kwargs.get("base_url") or "").strip()
+    if not base_url and raw_provider in ("", "auto", "custom"):
+        base_url = str(main_base_url or "").strip()
+    return f"{provider}|{model}|{base_url.rstrip('/').lower()}"
 
 
 def _summary_refusal_request_key(route_key: str, request_context: str) -> str:
@@ -5335,7 +5344,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # ``summary_model``; keying the bare entry recursed forever).
             key = _summary_refusal_request_key(
                 _summary_refusal_route_key(
-                    self._summary_refusal_call_route(route), self.model
+                    self._summary_refusal_call_route(route), self.model, self.base_url
                 ),
                 refusal_context,
             )
@@ -5739,7 +5748,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # refusal is deterministic, a resend is a guaranteed cold prefill
             # plus another refusal (t_0970eb0b).
             _refusal_route_key = _summary_refusal_request_key(
-                _summary_refusal_route_key(call_kwargs, self.model),
+                _summary_refusal_route_key(call_kwargs, self.model, self.base_url),
                 _refusal_context,
             )
             if _SUMMARY_REFUSALS.is_refused(_refusal_route_key, _refusal_content):

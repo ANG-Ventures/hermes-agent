@@ -283,7 +283,9 @@ def _summary_route_key(model: str | None) -> str:
     A model-only override likewise inherits the task provider. Latching on the
     alias would keep a refusal pinned after the route is re-pointed at a model
     that accepts the segment, so resolve provider/model/base_url the same way
-    ``call_llm`` does and key on that. Falls back to the alias on any error.
+    ``call_llm`` does and key on that, including the endpoint an ``auto`` or
+    bare ``custom`` route inherits from the main runtime. Falls back to the
+    alias on any error.
     """
     alias = (model or "").strip()
     try:
@@ -299,12 +301,20 @@ def _summary_route_key(model: str | None) -> str:
         )
         provider = (provider or "").strip().lower()
         resolved_model = (resolved_model or "").strip()
+        base_url = (base_url or "").strip()
+        inherits_endpoint = provider in ("", "auto", "custom")
         if provider in ("", "auto"):
             main_provider = (aux._read_main_provider() or "").strip().lower()
             provider = f"auto>{main_provider}" if main_provider else "auto"
         if not resolved_model:
             resolved_model = (aux._read_main_model_for_aux() or "").strip()
-        return f"{alias or _DEFAULT_ROUTE_KEY}=>{provider}|{resolved_model}|{(base_url or '').strip()}"
+        if not base_url and inherits_endpoint:
+            # ``auto`` sends to the live main runtime endpoint
+            # (``_resolve_auto_route``); a bare ``custom`` uses the main
+            # endpoint too. Two sessions on the same model name behind
+            # different endpoints must not share a latch (t_f03a8117).
+            base_url = (aux._read_main_base_url() or "").strip()
+        return f"{alias or _DEFAULT_ROUTE_KEY}=>{provider}|{resolved_model}|{base_url.rstrip('/').lower()}"
     except Exception:
         logger.debug("LCM summary route resolution failed for %r", alias, exc_info=True)
         return alias or _DEFAULT_ROUTE_KEY
