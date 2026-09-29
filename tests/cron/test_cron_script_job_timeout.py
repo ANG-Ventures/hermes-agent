@@ -175,7 +175,7 @@ def _capture_run_job_script(monkeypatch):
 
     calls = []
 
-    def fake(script_path, workdir=None, cancel_event=None, **kwargs):
+    def fake(script_path, workdir=None, cancel_event=None, interpreter=None, **kwargs):
         calls.append(kwargs)
         return True, ""
 

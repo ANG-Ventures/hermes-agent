@@ -112,7 +112,8 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
         from cron.scheduler_script import _job_script_kwargs, _run_job_script
 
         return _run_job_script(
-            monitor_script, workdir=_field(job, "workdir") or None, **_job_script_kwargs(job))
+            monitor_script, workdir=_field(job, "workdir") or None,
+            interpreter=job.get("interpreter"), **_job_script_kwargs(job))
     monitor_url = _field(job, "monitor_url")
     if monitor_url:
         return _fetch_monitor_url(monitor_url)
