@@ -1,7 +1,10 @@
 import { Box, Text, useInput, wrapAnsi } from '@hermes/ink'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
+import { messages } from '../i18n/runtime.js'
+import { useT } from '../i18n/useT.js'
 import { isMac } from '../lib/platform.js'
+import { clarifyBatchRevisitState } from '../lib/text.js'
 import type { Theme } from '../theme.js'
 import type { ApprovalReq, ClarifyReq, ConfirmReq } from '../types.js'
 
@@ -12,7 +15,13 @@ const APPROVAL_OPTS = ['once', 'session', 'always', 'deny'] as const
 // tirith warning present → backend downgrades "always" to session scope, so drop it.
 const APPROVAL_OPTS_NO_ALWAYS = APPROVAL_OPTS.filter(o => o !== 'always')
 const APPROVAL_OPTS_SMART_DENY = ['once', 'deny'] as const
-const LABELS = { always: 'Always allow', deny: 'Deny', once: 'Allow once', session: 'Allow this session' } as const
+
+const approvalLabels = (): Record<ApprovalChoice, string> => {
+  const p = messages().prompt.approval
+
+  return { always: p.always, deny: p.deny, once: p.once, session: p.session }
+}
+
 const CMD_PREVIEW_LINES = 10
 
 type ApprovalChoice = 'always' | 'deny' | 'once' | 'session'
@@ -81,6 +90,7 @@ export function approvalAction(
 }
 
 export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptProps) {
+  const T = useT()
   const [sel, setSel] = useState(0)
   const opts = approvalOptions(req)
 
@@ -109,7 +119,7 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
   return (
     <Box borderColor={t.color.warn} borderStyle="double" flexDirection="column" paddingX={1}>
       <Text bold color={t.color.warn}>
-        ⚠ approval required · {req.description}
+        {T.prompt.approval.title} · {req.description}
       </Text>
 
       <Box flexDirection="column" paddingLeft={1}>
@@ -119,11 +129,7 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
           </Text>
         ))}
 
-        {overflow > 0 ? (
-          <Text color={t.color.muted}>
-            … +{overflow} more line{overflow === 1 ? '' : 's'} (full text above)
-          </Text>
-        ) : null}
+        {overflow > 0 ? <Text color={t.color.muted}>{T.prompt.approval.moreLines(overflow)}</Text> : null}
       </Box>
 
       <Text />
@@ -132,7 +138,7 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
         <Text key={o}>
           <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? '▸ ' : '  '}
-            {i + 1}. {LABELS[o]}
+            {i + 1}. {approvalLabels()[o]}
           </Text>
         </Text>
       ))}
@@ -142,27 +148,146 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
   )
 }
 
-export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: ClarifyPromptProps) {
+export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, onQuestionAnswer, req, t }: ClarifyPromptProps) {
+  const T = useT()
   const [sel, setSel] = useState(0)
   const [custom, setCustom] = useState('')
   const [typing, setTyping] = useState(false)
   const choices = req.choices ?? []
+  const batch = req.questions ?? []
+  const isBatch = batch.length > 0
+
+  // ── Batch (A-compact) state: status list + one expanded active question.
+  // `active` walks the QUESTION list (Tab/Shift-Tab cycle it, any order);
+  // `sel` is reused as the cursor within the active question's choice rows.
+  const answers = req.answers ?? {}
+  const firstUnanswered = batch.findIndex(q => answers[q.qid] === undefined)
+  const [active, setActive] = useState(Math.max(0, firstUnanswered))
+
+  const moveActive = (delta: number) => {
+    const next = (active + delta + batch.length) % batch.length
+    const question = batch[next]
+    // Re-visit restore, same model as the CLI panel: a choice answer puts
+    // the cursor back on its row; a typed answer lands on Other with the
+    // text staged so Enter edits it instead of retyping.
+    const restored = clarifyBatchRevisitState(question?.choices ?? [], question ? answers[question.qid] : undefined)
+
+    setActive(next)
+    setSel(restored.sel)
+    setCustom(restored.custom)
+    setTyping(false)
+  }
+
+  // After a lock the overlay is re-patched with the new answers map — jump
+  // the cursor to the next unanswered question (stay put when editing).
+  useEffect(() => {
+    if (!isBatch) {
+      return
+    }
+
+    const current = batch[active]
+
+    if (current && answers[current.qid] === undefined) {
+      return
+    }
+
+    const next = batch.findIndex(q => answers[q.qid] === undefined)
+
+    if (next >= 0) {
+      setActive(next)
+      setSel(0)
+      setCustom('')
+      setTyping(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by the answers map only
+  }, [req.answers])
 
   const heading = (
     <Text bold>
       <Text color={t.color.accent}>ask</Text>
-      <Text color={t.color.text}> {req.question}</Text>
+      <Text color={t.color.text}> {isBatch ? `${batch.length} questions` : req.question}</Text>
     </Text>
   )
 
+  const activeQuestion = isBatch ? batch[active] : undefined
+  const activeChoices = activeQuestion ? (activeQuestion.choices ?? []) : choices
+  const answeredCount = isBatch ? batch.filter(q => answers[q.qid] !== undefined).length : 0
+  const remainingCount = isBatch ? batch.length - answeredCount : 0
+
+  const lockActive = (value: string) => {
+    if (activeQuestion) {
+      onQuestionAnswer?.(activeQuestion.qid, value)
+      setSel(0)
+      setCustom('')
+      setTyping(false)
+    }
+  }
+
   useInput((ch, key) => {
     if (key.escape) {
-      typing && choices.length ? setTyping(false) : onCancel()
+      if (typing) {
+        setTyping(false)
+
+        return
+      }
+
+      onCancel()
 
       return
     }
 
-    if (typing || !choices.length) {
+    if (typing) {
+      return
+    }
+
+    if (isBatch) {
+      // Tab / Shift-Tab cycle the active question (with wrap) — the
+      // selected question is always the expanded one, like the CLI panel.
+      if (key.tab) {
+        moveActive(key.shift ? -1 : 1)
+
+        return
+      }
+
+      if (!activeQuestion) {
+        return
+      }
+
+      if (activeChoices.length === 0) {
+        // Open-ended question: any keypress starts typing (TextInput below).
+        setTyping(true)
+
+        return
+      }
+
+      if (key.upArrow && sel > 0) {
+        setSel(s => s - 1)
+      }
+
+      if (key.downArrow && sel < activeChoices.length) {
+        setSel(s => s + 1)
+      }
+
+      if (key.return) {
+        if (sel === activeChoices.length) {
+          setTyping(true)
+        } else if (activeChoices[sel]) {
+          lockActive(activeChoices[sel]!)
+        }
+
+        return
+      }
+
+      const n = parseInt(ch)
+
+      if (n >= 1 && n <= activeChoices.length) {
+        lockActive(activeChoices[n - 1]!)
+      }
+
+      return
+    }
+
+    if (!choices.length) {
       return
     }
 
@@ -185,6 +310,73 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
     }
   })
 
+  if (isBatch) {
+    const enterAction = remainingCount === 1 ? T.prompt.clarify.confirmAndContinue : T.prompt.clarify.lockAnswer
+    const hint = typing ? T.prompt.clarify.batchTypingHint(enterAction) : T.prompt.clarify.batchHint(enterAction)
+
+    return (
+      <Box flexDirection="column">
+        {heading}
+
+        {batch.map((q, i) => {
+          const answer = answers[q.qid]
+          const isActive = i === active
+          const marker = answer !== undefined ? '✓' : isActive ? '▸' : '·'
+
+          return (
+            <Box flexDirection="column" key={q.qid}>
+              <Text>
+                <Text bold={isActive} color={isActive ? t.color.text : t.color.muted}>
+                  {marker} {q.question}
+                </Text>
+              </Text>
+
+              {answer !== undefined ? (
+                // The locked answer on its own line, in the ok color, so the
+                // current answers stay readable while Tab walks the list.
+                <Box paddingLeft={2}>
+                  <Text color={answer ? t.color.ok : t.color.muted} italic={!answer}>
+                    {answer || T.prompt.clarify.skipped}
+                  </Text>
+                </Box>
+              ) : null}
+
+              {isActive ? (
+                typing || activeChoices.length === 0 ? (
+                  <Box paddingLeft={2}>
+                    <Text color={t.color.label}>{'> '}</Text>
+                    <TextInput
+                      color={t.color.text}
+                      columns={Math.max(20, cols - 8)}
+                      onChange={setCustom}
+                      onSubmit={lockActive}
+                      value={custom}
+                    />
+                  </Box>
+                ) : (
+                  <Box flexDirection="column" paddingLeft={2}>
+                    {[...activeChoices, T.prompt.clarify.other].map((c, ci) => (
+                      <Text key={ci}>
+                        <Text color={t.color.muted} {...chipRowProps(t, sel === ci)}>
+                          {sel === ci ? '▸ ' : '  '}
+                          {ci + 1}. {c}
+                        </Text>
+                      </Text>
+                    ))}
+                  </Box>
+                )
+              ) : null}
+            </Box>
+          )
+        })}
+
+        <Text color={t.color.muted}>
+          {answeredCount}/{batch.length} answered · {hint}
+        </Text>
+      </Box>
+    )
+  }
+
   if (typing || !choices.length) {
     return (
       <Box flexDirection="column">
@@ -202,8 +394,8 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
         </Box>
 
         <Text color={t.color.muted}>
-          Enter send · Esc {choices.length ? 'back' : 'cancel'} ·{' '}
-          {isMac ? 'Cmd+C copy · Cmd+V paste · Ctrl+C cancel' : 'Ctrl+C cancel'}
+          {T.prompt.clarify.typingHint(choices.length ? T.prompt.clarify.back : T.prompt.clarify.cancel)}{' '}
+          {isMac ? T.prompt.clarify.macClipboardHint : T.prompt.clarify.ctrlCCancel}
         </Text>
       </Box>
     )
@@ -213,7 +405,7 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
     <Box flexDirection="column">
       {heading}
 
-      {[...choices, 'Other (type your answer)'].map((c, i) => (
+      {[...choices, T.prompt.clarify.other].map((c, i) => (
         <Text key={i}>
           <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? '▸ ' : '  '}
@@ -228,6 +420,7 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
 }
 
 export function ConfirmPrompt({ onCancel, onConfirm, req, t }: ConfirmPromptProps) {
+  const T = useT()
   const [sel, setSel] = useState(0)
 
   useInput((ch, key) => {
@@ -257,8 +450,8 @@ export function ConfirmPrompt({ onCancel, onConfirm, req, t }: ConfirmPromptProp
   const accent = req.danger ? t.color.error : t.color.warn
 
   const rows = [
-    { color: t.color.text, label: req.cancelLabel ?? 'No' },
-    { color: req.danger ? t.color.error : t.color.text, label: req.confirmLabel ?? 'Yes' }
+    { color: t.color.text, label: req.cancelLabel ?? T.prompt.confirm.cancel },
+    { color: req.danger ? t.color.error : t.color.text, label: req.confirmLabel ?? T.prompt.confirm.confirm }
   ]
 
   return (
@@ -284,7 +477,7 @@ export function ConfirmPrompt({ onCancel, onConfirm, req, t }: ConfirmPromptProp
         </Text>
       ))}
 
-      <Text color={t.color.muted}>↑/↓ select · Enter confirm · Y/N quick · Esc cancel</Text>
+      <Text color={t.color.muted}>{T.prompt.confirm.hint}</Text>
     </Box>
   )
 }
@@ -300,6 +493,8 @@ interface ClarifyPromptProps {
   cols?: number
   onAnswer: (s: string) => void
   onCancel: () => void
+  /** Batch mode: lock one question's answer (clarify.respond + question_id). */
+  onQuestionAnswer?: (qid: string, s: string) => void
   req: ClarifyReq
   t: Theme
 }
