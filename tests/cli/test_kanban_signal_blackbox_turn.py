@@ -34,8 +34,8 @@ def ledger(tmp_path, monkeypatch):
 def _worker_cli(session_id, turn_id):
     agent = SimpleNamespace(
         session_id=session_id, _current_turn_id=turn_id, _current_task_id="",
-        _current_api_request_id="", model="claude-opus-5-5", platform="cli",
-        interrupt=lambda *_a, **_k: None,
+        _current_api_request_id="", model="claude-opus-5-5", provider="claude-bpr",
+        platform="cli", interrupt=lambda *_a, **_k: None,
     )
     return SimpleNamespace(agent=agent, session_id=session_id)
 
@@ -79,8 +79,69 @@ def test_signaled_worker_turn_gets_a_turns_row(ledger, monkeypatch):
     assert _orphans(ledger) == []
     import sqlite3
     with sqlite3.connect(ledger) as conn:
-        assert conn.execute("SELECT interrupted FROM turns WHERE turn_id = ?",
-                            (turn_id,)).fetchone() == (1,)
+        # Flagged as a signal kill (t_50422844), and priced from the turn's own
+        # ledger rows rather than recorded as a 0-token turn.
+        assert conn.execute(
+            "SELECT interrupted, terminal_error, api_calls, input_tokens, output_tokens, "
+            "provider, lane_family FROM turns WHERE turn_id = ?", (turn_id,),
+        ).fetchone() == (1, "signal_15", 1, 10, 5, "claude-bpr", "bpx/bpr")
+
+
+def test_signal_stands_down_while_the_finalizer_holds_the_emit_lock(ledger, monkeypatch):
+    """Prism P1 on #1504: the marker check + emit run under the finalizer's
+    per-agent lock; a real emit in progress wins."""
+    import threading
+    from agent.turn_finalizer import _session_end_lock
+
+    _route_session_end_to_blackbox(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_flush_one_shot_session_store", lambda _cli: None)
+    turn_id = "20260929_161500_1ocked:t_busy:0badf00d"
+    _in_flight_call(turn_id)
+    worker = _worker_cli(turn_id.split(":")[0], turn_id)
+    lock = _session_end_lock(worker.agent)
+    held = threading.Event()
+    release = threading.Event()
+
+    def finalizer_thread():
+        with lock:
+            held.set()
+            release.wait(10)
+
+    t = threading.Thread(target=finalizer_thread, daemon=True)
+    t.start()
+    held.wait(5)
+    try:
+        cli_mod._finalize_signaled_kanban_worker(worker, 15)
+    finally:
+        release.set()
+        t.join(5)
+    assert _orphans(ledger), "the signal path must not have written while the lock was held"
+
+
+def test_signal_after_the_turn_finalized_leaves_the_real_row_alone(ledger, monkeypatch):
+    """Prism P1 on #1504: _current_turn_id is never cleared, so a SIGTERM that
+    lands after the finalizer wrote the real row must not upsert an
+    interrupted/signal_15 row over it."""
+    _route_session_end_to_blackbox(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_flush_one_shot_session_store", lambda _cli: None)
+    turn_id = "20260929_160000_c0ffee:t_done:0badcafe"
+    _in_flight_call(turn_id)
+    blackbox._on_session_end(
+        session_id=turn_id.split(":")[0], turn_id=turn_id, completed=True, failed=False,
+        turn_exit_reason="text_response(stop)", model="claude-opus-5-5",
+        provider="claude-bpr", final_response="all done", platform="cli",
+    )
+    worker = _worker_cli(turn_id.split(":")[0], turn_id)
+    worker.agent._session_end_emitted_turn_id = turn_id  # the finalizer's marker
+
+    cli_mod._finalize_signaled_kanban_worker(worker, 15)
+
+    import sqlite3
+    with sqlite3.connect(ledger) as conn:
+        assert conn.execute(
+            "SELECT interrupted, terminal_error, final_text FROM turns WHERE turn_id = ?",
+            (turn_id,),
+        ).fetchone() == (0, None, "all done")
 
 
 def test_flush_runs_before_session_end_and_failures_are_contained(monkeypatch):
@@ -88,9 +149,9 @@ def test_flush_runs_before_session_end_and_failures_are_contained(monkeypatch):
     monkeypatch.setattr(cli_mod, "_flush_one_shot_session_store",
                         lambda _cli: (order.append("flush"), 1 / 0))
     monkeypatch.setattr(cli_mod, "_emit_interrupted_session_end",
-                        lambda _cli, reason: order.append(reason))
+                        lambda _cli, reason, terminal_error=None: order.append((reason, terminal_error)))
     cli_mod._finalize_signaled_kanban_worker(SimpleNamespace(agent=None), 15)
-    assert order == ["flush", "signal_15"]
+    assert order == ["flush", ("signal_15", "signal_15")]
 
 
 def test_kanban_signal_path_calls_the_finalizer():  # noqa: source-proxy wiring of a closure nested in main() that only a real signal reaches and that ends in os._exit; the finalizer itself is exercised behaviourally above

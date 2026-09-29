@@ -102,8 +102,10 @@ def _assert_live_store_write_allowed(path: Path) -> None:
             )
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+    """Open this profile's store, or ``db_path`` (the orphan repair CLI
+    writes flagged rows into every profile's store from one process)."""
+    path = Path(db_path) if db_path else _db_path()
     _assert_live_store_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
@@ -963,17 +965,40 @@ def _refresh_turn_route(conn: sqlite3.Connection, turn_id: str) -> None:
 
 
 def insert_turn(
-    record: TurnRecord, *, provisional: bool = False, move_last_turn: bool = True
+    record: TurnRecord,
+    *,
+    provisional: bool = False,
+    move_last_turn: bool = True,
+    db_path: Path | str | None = None,
+    ledger_fence: tuple[float, int] | None = None,
 ) -> bool:
     """Persist one turn. Telemetry failures are logged but never raised.
 
-    ``provisional`` (a host abandoning an in-flight turn at shutdown): the
-    insert atomically does nothing when the turn already has a row, and the
-    channel's ``last_turn`` pointer is never moved. A real row written later
-    upserts over it. Returns True when a row was written.
+    ``provisional`` (a host abandoning an in-flight turn at shutdown, or the
+    orphan repair CLI): the insert atomically does nothing when the turn
+    already has a row, and the channel's ``last_turn`` pointer is never
+    moved. A real row written later upserts over it. Returns True when a row
+    was written. ``db_path`` targets another profile's store.
+
+    ``ledger_fence=(last_call_ts, call_count)``: write only while the turn's
+    ``turn_api_calls`` still match exactly that; the check and the insert
+    share one IMMEDIATE transaction, so a record aggregated from the ledger
+    (orphan repair) can never summarise away a call that landed in between.
     """
     try:
-        with _connect() as conn:
+        # Positional only when targeting another store: tests stub _connect
+        # with zero-arg fakes, and this profile's own store needs no argument.
+        with (_connect(db_path) if db_path else _connect()) as conn:
+            if ledger_fence is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                last_ts, n_calls = conn.execute(
+                    "SELECT MAX(ts), COUNT(*) FROM turn_api_calls WHERE turn_id = ?",
+                    (record.turn_id,),
+                ).fetchone()
+                if (float(last_ts or 0.0), int(n_calls or 0)) != (
+                    float(ledger_fence[0] or 0.0), int(ledger_fence[1]),
+                ):
+                    return False
             cur = conn.execute(
                 _INSERT_TURN_PROVISIONAL_SQL if provisional else _INSERT_TURN_SQL,
                 (
@@ -1039,6 +1064,12 @@ def insert_turn(
                     *_route_columns(record.provider, record.model),
                 ),
             )
+            if provisional and cur.rowcount == 0:
+                # The real row landed first: leave it, its tool calls and its
+                # route/served-subs stamps exactly as they are (Prism P1 on
+                # #1504 -- the side effects below used to run before this
+                # check and wiped the real turn's turn_tool_calls).
+                return False
             _refresh_served_subs(conn, record.turn_id)
             _refresh_turn_route(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
@@ -1057,8 +1088,6 @@ def insert_turn(
                         scrub_and_truncate(call.get("result_preview", "")),
                     ),
                 )
-            if provisional and cur.rowcount == 0:
-                return False
             if move_last_turn and not provisional:
                 conn.execute(
                     """
@@ -1085,46 +1114,82 @@ def insert_turn(
         return False
 
 
-def ledger_turn_usage(turn_id: str) -> dict | None:
+#: Marks every token bucket unknown: for a row that must be written (the
+#: process is exiting) when the ledger could not be read. Never known zeros.
+LEDGER_USAGE_UNREADABLE: dict = {
+    "usage_unknown": True, "input_tokens_unknown": True, "output_tokens_unknown": True,
+    "cache_read_tokens_unknown": True, "cache_write_tokens_unknown": True,
+}
+
+
+def _ledger_call(inp, out, cr, cw, rs, prov, mdl) -> dict:
+    return {
+        "input_tokens": int(inp or 0),
+        "output_tokens": int(out or 0),
+        "cache_read_tokens": int(cr or 0),
+        "cache_write_tokens": int(cw or 0),
+        "reasoning_tokens": int(rs or 0),
+        "input_tokens_unknown": inp is None,
+        "output_tokens_unknown": out is None,
+        "cache_read_tokens_unknown": cr is None,
+        "cache_write_tokens_unknown": cw is None,
+        "usage_unknown": inp is None and out is None and cr is None and cw is None,
+        "provider": prov or "",
+        "model": mdl or "",
+        "base_url": "",
+    }
+
+
+def ledger_turn_usage(
+    turn_id: str, db_path: Path | str | None = None, *, raise_on_error: bool = False
+) -> dict | None:
     """Turn usage rebuilt from this turn's own ``turn_api_calls`` rows.
 
     Used for a turn the host abandoned mid-flight: the per-call ledger is
     written at the transport, so it holds every billed call even when the
     conversation loop never folded them into its accumulator. A NULL bucket
-    stays unknown, never a measured 0. None when the turn has no rows.
+    stays unknown, never a measured 0. None when the turn has no main-lane
+    rows. A composite (MoA) parent carries its physical children as
+    ``pricing_calls`` so ``compute_turn_cost`` prices the real routes, not
+    the virtual ``moa`` preset.
+
+    A failed read returns None too unless ``raise_on_error`` -- callers that
+    must not mistake "could not read" for "no calls" (the orphan repair, the
+    signal-path row) pass it and handle the exception.
     """
     try:
-        with _connect() as conn:
+        # Positional only when targeting another store: tests stub _connect
+        # with zero-arg fakes, and this profile's own store needs no argument.
+        with (_connect(db_path) if db_path else _connect()) as conn:
             rows = conn.execute(
                 "SELECT input_tokens, output_tokens, cache_read, cache_write, "
-                "reasoning, provider, model FROM turn_api_calls "
+                "reasoning, provider, model, seq FROM turn_api_calls "
                 f"WHERE turn_id = ? AND {_NOT_AUX} AND {_NOT_COMPOSITE_CHILD} "
                 "ORDER BY seq",
                 (turn_id,),
             ).fetchall()
+            children = conn.execute(
+                "SELECT input_tokens, output_tokens, cache_read, cache_write, "
+                "reasoning, provider, model, parent_call_id FROM turn_api_calls "
+                "WHERE turn_id = ? AND parent_call_id IS NOT NULL ORDER BY seq",
+                (turn_id,),
+            ).fetchall()
     except Exception:
+        if raise_on_error:
+            raise
         logger.warning("blackbox ledger usage read failed", exc_info=True)
         return None
     if not rows:
         return None
-    calls = [
-        {
-            "input_tokens": int(inp or 0),
-            "output_tokens": int(out or 0),
-            "cache_read_tokens": int(cr or 0),
-            "cache_write_tokens": int(cw or 0),
-            "reasoning_tokens": int(rs or 0),
-            "input_tokens_unknown": inp is None,
-            "output_tokens_unknown": out is None,
-            "cache_read_tokens_unknown": cr is None,
-            "cache_write_tokens_unknown": cw is None,
-            "usage_unknown": inp is None and out is None and cr is None and cw is None,
-            "provider": prov or "",
-            "model": mdl or "",
-            "base_url": "",
-        }
-        for inp, out, cr, cw, rs, prov, mdl in rows
-    ]
+    physical: dict = {}
+    for *cols, parent in children:
+        physical.setdefault(parent, []).append(_ledger_call(*cols))
+    calls = []
+    for *cols, seq in rows:
+        call = _ledger_call(*cols)
+        if seq in physical:
+            call["pricing_calls"] = physical[seq]
+        calls.append(call)
     usage: dict = {"api_calls": len(calls), "calls": calls}
     for key in ("input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "reasoning_tokens"):

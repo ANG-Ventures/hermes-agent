@@ -1311,8 +1311,15 @@ def _notify_session_finalize(
         pass
 
 
-def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") -> None:
-    """Best-effort on_session_end hook for interrupted non-interactive runs."""
+def _emit_interrupted_session_end(
+    cli, *, reason: str = "keyboard_interrupt", terminal_error: str | None = None
+) -> None:
+    """Best-effort on_session_end hook for interrupted non-interactive runs.
+
+    ``terminal_error`` names how the turn was closed from outside the loop
+    (``signal_15``); blackbox stores it on the turn row so a killed worker's
+    turn is distinguishable from a user interrupt.
+    """
     agent = getattr(cli, "agent", None)
     if agent is None:
         return
@@ -1327,28 +1334,56 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
     # gateway — the gateway owns the lifecycle now (#88234).
     if session_id in _handed_off_session_ids:
         return
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
     if session_id:
         try:
             cli.session_id = session_id
         except Exception:
             pass
 
+    # The turn finalizer marks the turn it already emitted for (under the
+    # per-agent emit lock) and _current_turn_id is never cleared, so a
+    # signal/Ctrl-C that lands AFTER the turn finished -- or while the worker
+    # thread is unwinding through its finalizer during the grace window --
+    # must not upsert an interrupted row over the real completed one (Prism
+    # P1 x2, #1504). Check the marker and emit under that same lock; if the
+    # lock is busy for longer than the signal path can afford, the real emit
+    # is in progress and this one stands down.
+    lock = None
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=session_id,
-            task_id=getattr(agent, "_current_task_id", "") or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            completed=False,
-            interrupted=True,
-            model=getattr(agent, "model", None),
-            platform=getattr(agent, "platform", None) or "cli",
-            reason=reason,
-        )
+        from agent.turn_finalizer import _session_end_lock
+        lock = _session_end_lock(agent)
+        if not lock.acquire(timeout=2.0):
+            return
     except Exception:
-        pass
+        lock = None
+    try:
+        if turn_id and getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+            return
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=session_id,
+                task_id=getattr(agent, "_current_task_id", "") or "",
+                turn_id=turn_id,
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                completed=False,
+                interrupted=True,
+                model=getattr(agent, "model", None),
+                provider=getattr(agent, "provider", None) or "",
+                platform=getattr(agent, "platform", None) or "cli",
+                reason=reason,
+                terminal_error=terminal_error,
+            )
+        except Exception:
+            pass
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 def _finalize_signaled_kanban_worker(cli, signum) -> None:
@@ -1367,7 +1402,8 @@ def _finalize_signaled_kanban_worker(cli, signum) -> None:
     except Exception:
         pass
     try:
-        _emit_interrupted_session_end(cli, reason=f"signal_{int(signum)}")
+        reason = f"signal_{int(signum)}"
+        _emit_interrupted_session_end(cli, reason=reason, terminal_error=reason)
     except Exception:
         pass
 
@@ -22234,6 +22270,16 @@ def main(
         try:
             _agent = getattr(cli, "agent", None)
             if _agent is not None:
+                # An external termination (not Ctrl-C) ends this turn: stamp
+                # the marker BEFORE interrupting, because the loop's own
+                # finalizer may write the turn's real row during the grace
+                # window below (it then wins over _finalize_signaled_kanban_worker)
+                # and only it can carry the marker into that row.
+                import signal as _sigmod
+                if signum != _sigmod.SIGINT:
+                    _agent._turn_terminal_error = (
+                        getattr(_agent, "_current_turn_id", None), f"signal_{int(signum)}",
+                    )
                 request_hard_interrupt(_agent, f"received signal {signum}")
                 try:
                     _grace = float(os.getenv("HERMES_SIGTERM_GRACE", "1.5"))

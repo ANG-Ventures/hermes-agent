@@ -689,8 +689,14 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        # An explicit marker names how a turn that never finished was closed
+        # (``signal_15``: the kanban dispatcher killed the worker;
+        # ``orphan_repair``: synthesized by ``orphans --repair``). Otherwise a
+        # failed turn carries its exit reason and a finished one stays NULL.
         terminal_error=(
-            str(kwargs.get("turn_exit_reason") or "failed")
+            str(kwargs["terminal_error"])
+            if kwargs.get("terminal_error")
+            else str(kwargs.get("turn_exit_reason") or "failed")
             if kwargs.get("failed")
             else None
         ),
@@ -800,6 +806,22 @@ def _on_session_end(
             except Exception:
                 pass
             return
+        from plugins.blackbox import store
+
+        if turn_usage is None and interrupted and kwargs.get("turn_id"):
+            # A turn the process is abandoning (SIGTERM'd kanban worker,
+            # Ctrl-C) never folded its accumulator, but every billed call is
+            # already in turn_api_calls: price the row from the ledger rather
+            # than recording a 0-token turn under real spend. The row must be
+            # written regardless (the process is exiting), so a ledger that
+            # could not be read yields UNKNOWN buckets, never measured zeros.
+            try:
+                turn_usage = store.ledger_turn_usage(
+                    str(kwargs["turn_id"]), raise_on_error=True
+                )
+            except Exception:
+                logger.warning("blackbox ledger usage read failed", exc_info=True)
+                turn_usage = dict(store.LEDGER_USAGE_UNREADABLE)
         record = _build_record(
             session_id=session_id,
             interrupted=interrupted,
@@ -814,8 +836,6 @@ def _on_session_end(
         )
         if record is None:
             return
-
-        from plugins.blackbox import store
 
         # Serialized with provisional writes/refreshes for the same process:
         # dropping the entry and writing the real row under the lock means a
