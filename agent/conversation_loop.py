@@ -4140,7 +4140,12 @@ def run_conversation(
                     )
                     if isinstance(_sent_model, str) and _sent_model:
                         _call_route["model"] = _sent_model
-                    agent._inflight_request_route = dict(_call_route)
+                    from agent.chat_completion_helpers import _dispatch_route_snapshot
+
+                    # The credential identity is pinned with the route: the
+                    # agent key may rotate while the call is in flight
+                    # (FleetReview 659603b36aec).
+                    agent._inflight_request_route = _dispatch_route_snapshot(agent, _call_route)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
