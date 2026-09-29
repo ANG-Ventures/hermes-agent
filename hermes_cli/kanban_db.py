@@ -4008,6 +4008,73 @@ def repair_db(
         )
 
 
+# ---------------------------------------------------------------------------
+# Status-change audit (Q15 option B, harness-parity spec 4.7)
+# ---------------------------------------------------------------------------
+# A raw ``UPDATE tasks`` writes no task_events row, so a same-uid process can
+# move a card to 'done' and back to 'running' and leave a clean row. This
+# persistent trigger mirrors every change of status / current_run_id /
+# worker_pid into an append-only audit table, whoever the writer is.
+#
+# Attribution marker: the persistent trigger always writes source='unknown'.
+# Every read-write kanban_db connection installs a per-connection TEMP trigger
+# that restamps the row it just caused as 'kanban_db:<pid>'. TEMP objects live
+# only in the connection that created them, so a kanban_db connection being
+# open elsewhere never stamps a raw client's write (sqlite3 CLI, python
+# sqlite3, a script). Forging the marker needs a writer that knows this schema
+# and deliberately recreates the temp trigger or edits the audit table; the
+# naive restore (arm A6-6) cannot produce it. Same uid, so this is a tripwire,
+# not a wall (Q15 option C is the wall).
+_STATUS_AUDIT_SQL = """
+CREATE TABLE IF NOT EXISTS task_status_audit (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    old_status     TEXT,
+    new_status     TEXT,
+    old_run_id     INTEGER,
+    new_run_id     INTEGER,
+    old_worker_pid INTEGER,
+    new_worker_pid INTEGER,
+    changed_at     INTEGER NOT NULL,
+    source         TEXT NOT NULL DEFAULT 'unknown'
+);
+CREATE INDEX IF NOT EXISTS idx_status_audit_task    ON task_status_audit(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_status_audit_changed ON task_status_audit(changed_at);
+CREATE TRIGGER IF NOT EXISTS trg_tasks_status_audit
+AFTER UPDATE OF status, current_run_id, worker_pid ON tasks
+WHEN OLD.status IS NOT NEW.status
+  OR OLD.current_run_id IS NOT NEW.current_run_id
+  OR OLD.worker_pid IS NOT NEW.worker_pid
+BEGIN
+    INSERT INTO task_status_audit (
+        task_id, old_status, new_status, old_run_id, new_run_id,
+        old_worker_pid, new_worker_pid, changed_at, source
+    ) VALUES (
+        NEW.id, OLD.status, NEW.status, OLD.current_run_id, NEW.current_run_id,
+        OLD.worker_pid, NEW.worker_pid, CAST(strftime('%s', 'now') AS INTEGER),
+        'unknown'
+    );
+END;
+"""
+
+
+def _ensure_status_audit(conn: sqlite3.Connection) -> None:
+    """Create the audit table + trigger. Runs after the additive column
+    migrations so every column the trigger names exists on legacy DBs."""
+    conn.executescript(_STATUS_AUDIT_SQL)
+
+
+def _install_status_audit_marker(conn: sqlite3.Connection) -> None:
+    """Per-connection TEMP trigger: stamp audit rows this connection causes."""
+    pid = int(os.getpid())
+    conn.execute(
+        "CREATE TEMP TRIGGER IF NOT EXISTS kanban_status_audit_source "
+        "AFTER INSERT ON main.task_status_audit WHEN NEW.source = 'unknown' "
+        f"BEGIN UPDATE task_status_audit SET source = 'kanban_db:{pid}' "
+        "WHERE id = NEW.id; END"
+    )
+
+
 def _schema_is_present(conn: sqlite3.Connection) -> bool:
     """Whether an open connection actually sees the kanban schema.
 
@@ -4099,6 +4166,11 @@ def connect(
             conn.close()
             raise
         if schema_present:
+            try:
+                _install_status_audit_marker(conn)
+            except Exception:
+                conn.close()
+                raise
             return conn
         # The cache says "initialized", the file says otherwise: it was deleted
         # or replaced under a live process, and the open above silently
@@ -4175,7 +4247,9 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _ensure_status_audit(conn)
                     _INITIALIZED_PATHS.add(resolved)
+                _install_status_audit_marker(conn)
         except Exception:
             conn.close()
             if creating:
@@ -25195,6 +25269,20 @@ def gc_events(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
             (cutoff,),
+        )
+    return int(cur.rowcount or 0)
+
+
+def gc_status_audit(
+    conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
+) -> int:
+    """Delete ``task_status_audit`` rows older than ``older_than_seconds``
+    (any task status: the audit is read by a run's post-run reconciliation,
+    which never looks back further than its own run). Returns rows deleted."""
+    cutoff = int(time.time()) - int(older_than_seconds)
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM task_status_audit WHERE changed_at < ?", (cutoff,),
         )
     return int(cur.rowcount or 0)
 

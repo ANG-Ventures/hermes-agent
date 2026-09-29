@@ -6835,11 +6835,15 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
         )
+        removed_audit = kb.gc_status_audit(
+            conn, older_than_seconds=event_days * 24 * 3600,
+        )
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_audit} status-audit row(s), "
+          f"{removed_logs} log file(s) removed")
     return 0
 
 
