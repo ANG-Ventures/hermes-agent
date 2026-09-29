@@ -23559,8 +23559,12 @@ def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
         if not path.is_file():
             return None
         cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        section = cfg.get("foreign_lane") if isinstance(cfg, dict) else None
-        cap = section.get("shim_model_cap") if isinstance(section, dict) else None
+        # Not a kanban.* key: a profile's foreign_lane section. The local name
+        # must not collide with a name test_kanban_config_keys binds to
+        # .get("kanban") (its scan is file-wide, not scope-aware).
+        foreign_lane_cfg = cfg.get("foreign_lane") if isinstance(cfg, dict) else None
+        cap = (foreign_lane_cfg.get("shim_model_cap")
+               if isinstance(foreign_lane_cfg, dict) else None)
         cap = str(cap).strip() if isinstance(cap, str) else ""
         return cap.rsplit("/", 1)[-1] or None
     except Exception as exc:
