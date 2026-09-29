@@ -1701,6 +1701,25 @@ There is no `hermes config set` support for `reasoning_overrides` keys — edit 
 
 The override applies automatically everywhere: CLI startup, messaging gateway, Desktop/TUI, cron jobs, `/model` mid-session switches, and fallback model activation.
 
+## Service Tier (Fast / Ultrafast)
+
+`agent.service_tier` selects a provider processing tier that is sent on **every** request of a session. `/fast` changes it for the current session; `/fast <tier> --global` persists it here.
+
+```yaml
+agent:
+  service_tier: ""   # empty/normal = standard. Options: fast (alias priority/on), ultrafast
+```
+
+| Value | Wire value | Where it is sent |
+|-------|------------|------------------|
+| `fast` / `priority` / `on` | `service_tier: "priority"` (Codex backend: `"fast"`), Anthropic `speed: "fast"` | Models on the documented Priority / Codex Fast / Anthropic Fast contracts |
+| `ultrafast` | `service_tier: "ultrafast"` | OpenAI Ultrafast models (currently `gpt-6-astra`) on the native OpenAI API (`openai-api`) or Codex backend (`openai-codex`), Responses API only |
+| empty / `normal` / `off` | nothing | — |
+
+The tier is route-gated on every surface (CLI, messaging gateway, `hermes serve` / TUI, `hermes -z`): an unsupported model, a proxy, or a Chat Completions route gets **no** tier (a warning is logged) rather than a different paid tier. `ultrafast` never falls back to `priority`.
+
+OpenAI reports the tier that actually served each request. Hermes records it as `service_tier_served` in the turn result (and in `hermes -z --usage-file` reports, next to the requested `service_tier`) and logs a warning when they differ on the OpenAI API — e.g. an `ultrafast` request served at `default` was rate-limited to Standard. The Codex backend (`openai-codex`) reports `default` for every tier, so there the value is recorded but not treated as a downgrade.
+
 ## Tool-Use Enforcement
 
 Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.

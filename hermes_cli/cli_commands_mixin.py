@@ -3955,11 +3955,16 @@ class CLICommandsMixin:
         except Exception:
             feature_name = "Fast mode"
 
+        from hermes_cli.fast_mode_contracts import service_tier_word
+
+        if self.service_tier == "ultrafast":
+            feature_name = "OpenAI Ultrafast"
+        usage = "Usage: /fast [normal|fast|ultrafast|status] [--global]"
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or parts[1].strip().lower() == "status":
-            status = "fast" if self.service_tier == "priority" else "normal"
+            status = service_tier_word(self.service_tier)
             _cprint(f"  {_ACCENT}{feature_name}: {status}{_RST}")
-            _cprint(f"  {_DIM}Usage: /fast [normal|fast|status] [--global]{_RST}")
+            _cprint(f"  {_DIM}{usage}{_RST}")
             return
 
         arg_tokens = parts[1].strip().lower().split()
@@ -3973,13 +3978,24 @@ class CLICommandsMixin:
             self.service_tier = "priority"
             saved_value = "fast"
             label = "FAST"
+        elif arg == "ultrafast":
+            from cli import HermesCLI
+
+            capability = HermesCLI._fast_capability(self, "ultrafast")
+            if not capability.supported:
+                _cprint(f"  {_DIM}(._.) {capability.reason}{_RST}")
+                return
+            self.service_tier = "ultrafast"
+            saved_value = "ultrafast"
+            label = "ULTRAFAST"
+            feature_name = "OpenAI Ultrafast"
         elif arg in {"normal", "off"}:
             self.service_tier = None
             saved_value = "normal"
             label = "NORMAL"
         else:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Usage: /fast [normal|fast|status] [--global]{_RST}")
+            _cprint(f"  {_DIM}{usage}{_RST}")
             return
 
         self.agent = None  # Force agent re-init with new service-tier config

@@ -171,9 +171,11 @@ gateway:
     family_anthropic_fast: Anthropic Fast
     family_codex_fast: Codex Fast
     family_openai_priority: OpenAI API Priority Processing
+    family_openai_ultrafast: OpenAI Ultrafast
     family_unsupported: Fast
     label_fast: FAST
     label_normal: NORMAL
+    label_ultrafast: ULTRAFAST
     model_switch_unavailable: '⚡ Fast: unavailable on `{route}`; requests will use normal speed.'
     not_supported: ⚡ /fast is slegs beskikbaar vir OpenAI-modelle wat Priority Processing ondersteun.
     picker_title: '⚡ **Priority Processing**\n\nHuidige modus: `{mode}`\n\nKies \''n opsie:'

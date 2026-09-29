@@ -351,9 +351,9 @@ class CLIAgentSetupMixin:
         """Build the effective model/runtime config for a single user turn.
 
         Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        toggled `/fast` on (any static tier: fast/priority or ultrafast) and
+        the current route supports it, attach `request_overrides` so the API
+        call carries that tier.
         """
         from hermes_cli.models import resolve_fast_mode_capability
 
@@ -393,6 +393,7 @@ class CLIAgentSetupMixin:
                 model=route["model"],
                 provider=runtime["provider"],
                 api_mode=runtime["api_mode"],
+                tier=service_tier,
             )
             overrides = capability.request_overrides
         except Exception:
