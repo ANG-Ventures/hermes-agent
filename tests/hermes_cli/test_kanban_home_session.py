@@ -283,6 +283,100 @@ def test_cli_foreign_complete_refused_then_override(kanban_home, monkeypatch):
         )
 
 
+@pytest.mark.parametrize("verb,blocked", [("block", False), ("unblock", True),
+                                           ("schedule", False)])
+def test_cli_refused_status_verb_leaves_no_status_comment(kanban_home, monkeypatch,
+                                                          verb, blocked):
+    """C5 #20 (PR #951): the guard refuses BEFORE the status comment is written."""
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=blocked)
+        before = _comments(conn, tid)
+    out = kc.run_slash(f"{verb} {tid} 'why not'")
+    assert f"refused {verb}" in out, out
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid) == before
+
+
+def _status_cmd(verb, tid):
+    # unblock takes its reason as --reason; block/schedule take it positionally.
+    if verb == "unblock":
+        return f"unblock --reason 'why not' {tid}"
+    return f"{verb} {tid} 'why not'"
+
+
+@pytest.mark.parametrize("verb,state", [("block", "done"), ("unblock", "ready"),
+                                         ("schedule", "done")])
+def test_cli_failed_status_verb_leaves_no_status_comment(kanban_home, monkeypatch,
+                                                         verb, state):
+    """FleetReview e6af55d359f5: an ALLOWED verb whose transition fails (wrong
+    state) must not leave a BLOCKED:/UNBLOCK:/SCHEDULED: comment behind."""
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=False)
+        if state == "done":
+            assert kb.complete_task(conn, tid, result="x")
+        before = _comments(conn, tid)
+    out = kc.run_slash(_status_cmd(verb, tid))
+    assert "refused" not in out, out
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid) == before
+
+
+@pytest.mark.parametrize("verb,blocked,prefix", [("block", False, "BLOCKED:"),
+                                                 ("unblock", True, "UNBLOCK:"),
+                                                 ("schedule", False, "SCHEDULED:")])
+def test_cli_successful_status_verb_writes_status_comment(kanban_home, monkeypatch,
+                                                          verb, blocked, prefix):
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=blocked)
+    kc.run_slash(_status_cmd(verb, tid))
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid)[-1] == f"{prefix} why not"
+
+
+def test_unblock_comment_commits_with_the_transition(kanban_home):
+    """FleetReview aa67ba1c7513: the card never becomes dispatchable without
+    its UNBLOCK: reason — the comment is in the same transaction."""
+    seen = []
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        real = kb.add_comment
+
+        def spy(c, t, *a, **k):
+            # Inside the unblock txn: the status write is not yet committed.
+            seen.append(c.in_transaction)
+            return real(c, t, *a, **k)
+
+        kb.add_comment = spy
+        try:
+            assert kb.unblock_task(conn, tid, comment=("apollo", "UNBLOCK: go", None, None))
+        finally:
+            kb.add_comment = real
+        assert seen == [True]
+        assert _comments(conn, tid)[-1] == "UNBLOCK: go"
+        assert kb.get_task(conn, tid).status == "ready"
+        # A failed unblock (card no longer blocked) writes nothing.
+        assert not kb.unblock_task(conn, tid, comment=("apollo", "UNBLOCK: again", None, None))
+        assert _comments(conn, tid)[-1] == "UNBLOCK: go"
+
+
+def test_cli_schedule_wake_reset_on_scheduled_card_writes_comment(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, blocked=False)
+        assert kb.schedule_task(conn, tid)
+    kc.run_slash(f"schedule {tid} --at 4102444800 'later'")
+    with kb.connect_closing() as conn:
+        assert _comments(conn, tid)[-1] == "SCHEDULED: later"
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+
 def test_cli_comment_on_foreign_card_is_unaffected(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
     with kb.connect_closing() as conn:
@@ -403,6 +497,24 @@ def _link(conn, tid):
     kb.link_tasks(conn, parent, tid)
 
 
+_LINKED_PARENT: dict = {}
+
+
+def _linked(conn, **kw):
+    """A ready card demoted to todo by an open parent (no actor bound)."""
+    tid = _ready(conn, **kw)
+    parent = kb.create_task(conn, title="p", assignee="x", session_id=OTHER)
+    kb.link_tasks(conn, parent, tid)
+    _LINKED_PARENT[tid] = parent
+    return tid
+
+
+def _unlink(conn, tid):
+    # C5 #21/#22/#24 (PR #951): removing the edge re-promotes the child, so it
+    # is a status write on the child exactly like link.
+    kb.unlink_tasks(conn, _LINKED_PARENT[tid], tid)
+
+
 # (setup, mutation) for every newly guarded status writer. Each mutation is
 # first proven to CHANGE the card with no actor bound, so a refusal is real.
 _ROUND2 = {
@@ -412,6 +524,7 @@ _ROUND2 = {
         c, t, summary="s", reviewer="argus", force=True)),
     "request-changes": (_review_run, lambda c, t: covered_request_changes(c, t, reason="fix")),
     "link": (_ready, _link),
+    "unlink": (_linked, _unlink),
     "specify": (_triage, lambda c, t: kb.specify_triage_task(c, t, body="spec")),
     "decompose": (_triage, lambda c, t: kb.decompose_triage_task(
         c, t, root_assignee="worker-a",

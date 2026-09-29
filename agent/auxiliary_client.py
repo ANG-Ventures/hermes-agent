@@ -230,10 +230,20 @@ def _openai_http_client_kwargs(
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
     try:
         from agent.process_bootstrap import build_keepalive_http_client
+        # S7 D1 (t_ebbae2c8 / t_d5f71d8e): the aux route id is recorded from
+        # what the WIRE saw (request header sent? relay x-pool-route-id?), not
+        # from kwargs intent. Inert outside an aux_route_scope.
+        from agent.fork_ext.relay_headers import (
+            anote_aux_http_response,
+            note_aux_http_response,
+        )
         client = build_keepalive_http_client(
             str(base_url or ""),
             async_mode=async_mode,
             verify=_resolve_aux_verify(base_url),
+            event_hooks={"response": [
+                anote_aux_http_response if async_mode else note_aux_http_response
+            ]},
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves
@@ -2571,9 +2581,23 @@ class _AnthropicCompletionsAdapter:
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
 
+        # S7 D1 (t_d5f71d8e): the kwargs allow-list above used to drop the
+        # caller's extra_headers, so x-hermes-route-id (and the gemini-bridge
+        # claims) never reached claude-apr / claude-apx-N while the ledger
+        # recorded the id as sent. Forward them; the Anthropic SDK takes
+        # ``extra_headers`` per request.
+        caller_extra_headers = kwargs.get("extra_headers")
+        if isinstance(caller_extra_headers, dict) and caller_extra_headers:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **caller_extra_headers,
+            }
+        from agent.fork_ext.relay_headers import note_aux_http_response
+
         response = create_anthropic_message(
             _client,
             anthropic_kwargs,
+            on_response=note_aux_http_response,
             # Per streamed event: record provider-response timing always, but
             # tick the forward-progress hook (hosts watching liveness —
             # gateway session hygiene / the compression commit fence) only

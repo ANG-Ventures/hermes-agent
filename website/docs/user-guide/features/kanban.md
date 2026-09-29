@@ -684,6 +684,35 @@ hermes kanban pins --stale-hours 24   # exits 1 if a card pin is older (daily li
 
 **Why a reason is required (don't re-ban pins).** Fork PR #1116 (2026-09-26) refused every single-sub route after cards and lanes pinned to `claude-apx-0` put workers on Ace's personal sub. That sub was reachable under the alias `claude-api-proxy`. The result was 95× 429 plus 46× 401 in one day. The real hole was an *undeclared* route onto sub 0 hidden behind an alias, not pinning itself. So the aliases stay refused, sub 0 is reserved out of the pools, and a deliberate pin is allowed again with a logged reason (#1317 spec, #1318 implementation). Do not reintroduce a blanket "workers never pin" rule.
 
+### Cards worked by another coding harness (foreign lanes)
+
+A card can be worked by a coding harness other than Hermes. The assignee picks the harness: a thin Hermes shim profile claims the card like any worker, hands it to the harness in the card's worktree, then checks the result itself (it reruns the card's test command, reads the diff, and reads the served model from the harness's own log) and writes the board. The operator runbook is the fleet skill `kanban-foreign-lane`; this section is the short version.
+
+| Assignee | Harness | Brain | State (2026-09-28) |
+|---|---|---|---|
+| `cc-worker` | Claude Code, the interactive TUI (`claude-code-tui`) | `cpr-cli` (a pool-picked Claude sub) | Live. The TUI has been the default since 08:25 PT (t_ee57a556). |
+| `codex-worker` | `codex exec` | `bpr` | Not for production yet (t_8371a38c). |
+| `opencode-worker` | OpenCode | `cliproxy:gpt-6-astra` | Live (t_e2f3590d). |
+| `pi-worker` | Pi | `cliproxy:gpt-6-astra` | Live (t_a1c6bc3d). |
+
+A foreign-lane card must name one test command in its body, and its workspace must be a git worktree on the card's branch. Otherwise the shim blocks it.
+
+**Model and effort.** `set-model` works on these cards the same way, with three differences:
+
+- One model and one effort per card. The shim and the harness both run what the card says. The effort reaches Claude Code as its own `--effort` flag. With no card effort the harness runs `medium`.
+- `max` and `xhigh` run only when an operator profile (`default`, `apollo` or `aegis`) set that effort on the card. The receipt names who, in `effort_unlocked_by`. From anywhere else the card blocks `effort_not_allowed`.
+- The runner checks the model against the harness's allowlist (`harness-models.yaml` in the skill) when the card starts, not when you run `set-model`. A typo blocks the card within seconds with `model_not_servable`.
+
+```bash
+hermes kanban set-model t_abcd claude-sonnet-5 --effort high     # harness and shim
+hermes kanban set-model t_abcd --provider claude-bpx-6 --model claude-haiku-4-5 \
+    --pin-sub "benchmark on one sub"                              # one sub: brain cpx-cli:6
+```
+
+The run's metadata (`hermes kanban show <id> --json`, `runs[-1].metadata`) carries the receipt: `model` and `model_source` (card, lane, profile or delegation), `effort` and `effort_source`, `served_model` (what the harness log says ran), and for the TUI `drive: tui` and `entrypoint: cli`.
+
+**Billing.** On a Claude subscription the interactive TUI draws about half the headless rate. The measured figures are 0.50x against `claude -p` (t_da5d8919), and 0.52x in production with the shim's own turns counted, 0.42x with them subtracted (t_b54c8715). The cron job `cc-worker-receipt-watch` checks every new cc-worker receipt every 10 minutes and pages #alerts if one leaves the interactive class. It prints nothing while all receipts are green. On a ChatGPT subscription the Codex TUI and `codex exec` draw the same rate (0.97x to 1.02x, t_bf914621), so `codex-worker` stays on `codex exec`.
+
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
 Kanban's per-profile configs make the planner/worker cost split natural. Decomposing a project into well-scoped cards takes frontier-level judgment; executing a card that already carries a clear goal, context, and handoff evidence usually doesn't — and the workers are where the vast majority of tokens are spent, so the worker model is where the cost lives. Run your orchestrator/dispatcher profile on a frontier model and point worker profiles at inexpensive models. Each profile has its own `config.yaml` under `~/.hermes/profiles/<name>/`, and the dispatcher injects the profile-scoped `HERMES_HOME` when it spawns `hermes -p <assignee>`, so each worker reads its own profile's model settings:

@@ -136,6 +136,11 @@ REACHABLE_BASELINE = frozenset({
     # ``stop``/``_stop_impl -> requests.get`` entries (same coroutines).
     "gateway/run.py _stop_impl -> requests.delete",
     "gateway/run.py stop -> requests.delete",
+    # Pre-existing; surfaced (not introduced) when function-local imports
+    # started shadowing same-file fallback defs (C5 #39): providers.get_label
+    # defaults to allow_network=True. Same shape as the matrix entry above.
+    "plugins/platforms/telegram/adapter.py _handle_model_picker_callback -> requests.get",
+    "plugins/platforms/telegram/adapter.py send_model_picker -> requests.get",
 })
 
 # Coroutines this change took off the network path. They must stay off it.

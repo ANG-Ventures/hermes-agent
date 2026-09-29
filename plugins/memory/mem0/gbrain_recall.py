@@ -66,6 +66,10 @@ _NON_LOOKUP_LEADERS = {
     "nope", "yup", "sounds", "great", "perfect", "good", "nice", "cool",
 }
 
+# "do" + a subject pronoun is a question auxiliary ("do you remember ...",
+# "do we have ...") — a lookup, not the imperative "do it" / "do that".
+_QUESTION_SUBJECTS = {"you", "we", "i", "they", "he", "she", "y'all", "ya"}
+
 _TOKEN_REFRESH_MARGIN_S = 120.0
 
 # Process-wide token cache: one auth per process, not per turn. Keyed by
@@ -276,6 +280,8 @@ def is_lookup_intent(query: str, min_tokens: int) -> bool:
         return False
     first = "".join(ch for ch in toks[0] if ch.isalpha())
     if first in _NON_LOOKUP_LEADERS:
+        if first == "do" and len(toks) > 1 and toks[1].strip(",.!?") in _QUESTION_SUBJECTS:
+            return True
         return False
     return True
 
