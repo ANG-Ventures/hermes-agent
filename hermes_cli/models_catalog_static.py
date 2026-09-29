@@ -371,9 +371,11 @@ def _plugin_provider_enters_picker(pp) -> bool:
     """Picker admission for a plugin model-provider profile: any slug without a canonical row.
 
     Read from the committed ``CANONICAL_PROVIDERS`` generation, not a side set, so the guard
-    cannot disagree with the list after ``provider_seam.restore`` reverts it.
+    cannot disagree with the list after ``provider_seam.restore`` reverts it. Read through
+    ``provider_seam.current()`` rather than the module global: a rebound global (a test's
+    ``monkeypatch.setattr``) must not let a built-in slug be re-admitted into the generation.
     """
-    return all(p.slug != pp.name for p in CANONICAL_PROVIDERS)
+    return all(p.slug != pp.name for p in provider_seam.current().CANONICAL_PROVIDERS)
 
 
 def sync_plugin_provider_catalog() -> int:
