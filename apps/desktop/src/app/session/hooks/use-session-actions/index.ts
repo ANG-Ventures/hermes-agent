@@ -30,8 +30,9 @@ import {
 import { markReasoningEffortPending } from '@/lib/chat-runtime'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+import { latestSessionTodoSnapshot } from '@/lib/todos'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { $clarifyRequests } from '@/store/clarify'
+import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
 import { announceGoneSessionDraft, announceNewSessionDraftKey, migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $connectionRequests } from '@/store/connection-request'
@@ -57,16 +58,18 @@ import {
   ensureGatewayProfile,
   isLegacyNewChatProfile,
   normalizeProfileKey,
+  resolveActiveSourceOwnerRoute,
   resolveNewChatOwnerRoute
 } from '@/store/profile'
 import { $projectScope } from '@/store/project-scope'
-import { resolveNewSessionCwd } from '@/store/projects'
-import { receiveApprovalRequest, replayPendingApproval } from '@/store/prompts'
+import { projectProfile, resolveNewSessionCwd } from '@/store/projects'
+import { clearAllPrompts, receiveApprovalRequest, replayPendingApproval } from '@/store/prompts'
 import { clearStoredTranscriptReadOnly, markStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $activeSessionStoredIdRotation,
   $connection,
   $currentCwd,
+  $currentCwdExplicit,
   $currentFastMode,
   $currentModel,
   $currentProvider,
@@ -86,6 +89,7 @@ import {
   setBusy,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentCwdExplicit,
   setCurrentCwdTransient,
   setCurrentServiceTier,
   setCurrentUsage,
@@ -358,6 +362,9 @@ async function desktopSessionCreateParams(
     cols: 96,
     source: 'desktop',
     ...(cwd && { cwd }),
+    // #52589: explicit provenance for the shipped cwd — an inherited app-global
+    // workspace must not override the target profile's configured terminal.cwd.
+    ...(cwd && { cwd_explicit: $currentCwdExplicit.get() }),
     ...(profile ? { profile: capturedRoute?.targetProfile || profile } : {}),
     ...(includeComposerSelection
       ? {
@@ -596,6 +603,10 @@ export function useSessionActions({
       setCurrentServiceTier('')
       setYoloActive(false)
       setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
+      // #52589 provenance: only a deliberate string workspace target is an explicit
+      // cwd choice. A plain new chat (or a detached `null`) is not — its inherited
+      // launch/project workspace must yield to a named profile's configured cwd.
+      setCurrentCwdExplicit(typeof workspaceTarget === 'string')
 
       if (!hasWorkspaceTarget) {
         // In a project → the repo's default-branch checkout; not in a project →
@@ -868,6 +879,19 @@ export function useSessionActions({
       const listed = options?.listed ?? true
 
       try {
+        // A tile anchored at a project path belongs to the profile the project
+        // tree is rendered under — the same owner the fresh-draft "+" pins
+        // (#79005). The occupied-chat "+" and project-row drags reach this
+        // path instead, where a stale $newChatProfile pin would otherwise win
+        // and land the session in the wrong profile (#124265). All-profiles
+        // view has no owner and keeps the ordinary fallback.
+        const projectOwnerProfile =
+          options?.profile === undefined && typeof options?.cwd === 'string'
+            ? (projectProfile() ?? undefined)
+            : undefined
+
+        const optionProfile = options?.profile ?? projectOwnerProfile
+
         // Fresh tile → the caller's workspace when one was named (the sidebar
         // "+" on a project/worktree lane), explicit null means Home/detached,
         // else the resolved new-session cwd (project scope → configured default).
@@ -875,26 +899,29 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const explicitTarget =
-          options?.profile !== undefined ||
-          options?.cwd !== undefined ||
-          options?.workspaceScope?.ownerRoute !== undefined
+          optionProfile !== undefined || options?.cwd !== undefined || options?.workspaceScope?.ownerRoute !== undefined
 
         const defaultTarget = options?.route === undefined && !explicitTarget ? defaultNewSessionTarget() : null
 
+        // The project tree is rendered by the ACTIVE source: its profile pairs
+        // with that source, never with the source a stale new-chat pin captured
+        // on another connection (right profile, wrong host).
         const capturedRoute =
           options?.route !== undefined
             ? options.route
             : (options?.workspaceScope?.ownerRoute ??
-              (defaultTarget ? defaultTarget.route : resolveNewChatOwnerRoute(options?.profile)))
+              (defaultTarget
+                ? defaultTarget.route
+                : projectOwnerProfile
+                  ? resolveActiveSourceOwnerRoute(projectOwnerProfile)
+                  : resolveNewChatOwnerRoute(optionProfile)))
 
         // A named local profile uses the legacy profile-only transport (no
         // connectionId). Tab-strip "+" omits `options.profile`; the draft or
         // active profile is still the owner. Unique non-default local roster
         // names stay authoritative; default/remote/duplicate stay unresolved.
         const requestedProfile = normalizeProfileKey(
-          typeof options?.profile === 'string' && options.profile
-            ? options.profile
-            : defaultTarget?.profile || $newChatProfile.get() || $activeGatewayProfile.get()
+          optionProfile || defaultTarget?.profile || $newChatProfile.get() || $activeGatewayProfile.get()
         )
 
         const legacyOwnerProfile =
@@ -915,22 +942,37 @@ export function useSessionActions({
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
 
+        // #52589 provenance for the tile path: an explicitly-passed cwd is a
+        // deliberate workspace pick; a resolved default is inherited.
+        setCurrentCwdExplicit(typeof options?.cwd === 'string')
+
         // Bot-workspace tabs target an agent profile without switching the
         // window's ambient composer. Do not leak that unrelated session's
         // composer selection (manual model/provider, reasoning effort, fast
         // flag) into the bot's chat; omitting them lets the selected profile
         // supply its configured defaults. Ordinary Sessions tiles keep the
         // sticky composer override.
-        const params = {
-          ...(await desktopSessionCreateParams(
-            cwd,
-            capturedRoute,
-            requestedProfile,
-            options?.route === null || defaultTarget?.route === null,
-            workspaceScope.workspaceMode !== 'bots'
-          )),
-          ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
-        }
+        //
+        // No `hidden` here, in either mode. Only Bot Mode's PLUMBING sessions
+        // are born hidden, and each mints its own row: the canonical Bot Chat
+        // (`hermes-bots/canonical-chat.ts`) and group member sessions
+        // (`hermes-bots/group-turns.ts`). Every session this path creates is a
+        // side chat the user asked for by hand — "New chat with this bot" and
+        // the Bot Mode tab-strip "+" / ⌘T — so it is an ordinary conversation
+        // in the bot's profile and stays listed, exactly as
+        // `apps/desktop/src/AGENTS.md` and the hide sweep's title allow-list
+        // (`hermes-bots/session-sweep.ts`) already promise. Blanket-hiding the
+        // mode stranded them: unlisted in the Sessions sidebar, skipped by
+        // `/resume`, and reachable only while their tab stayed open, since the
+        // bot row opens the canonical chat and "Open recent session" reads
+        // `last_session`, which never reports a hidden row.
+        const params = await desktopSessionCreateParams(
+          cwd,
+          capturedRoute,
+          requestedProfile,
+          options?.route === null || defaultTarget?.route === null,
+          workspaceScope.workspaceMode !== 'bots'
+        )
 
         // Same lease chain as createBackendSessionForSend: owner socket held
         // across the create, then the foreground hold carries it until the
@@ -1397,7 +1439,7 @@ export function useSessionActions({
               }
 
               if (usage) {
-                setCurrentUsage(current => ({ ...current, ...usage }))
+                setCurrentUsage(current => ({ ...current, ...usage, compressions: usage.compressions }))
               }
 
               publishDegradedWarmCache()
@@ -1698,6 +1740,14 @@ export function useSessionActions({
                 pendingClarifyProjection?.messages ??
                 clearedClarifyProjection?.messages ??
                 activatedMessages
+
+              if (!running) {
+                restoreSessionTodosFromSnapshot(
+                  cachedRuntimeId,
+                  latestSessionTodoSnapshot(visibleActivatedMessages),
+                  false
+                )
+              }
 
               releaseTranscriptView()
 
@@ -2051,6 +2101,14 @@ export function useSessionActions({
 
         restoreSessionTodosFromSnapshot(resumed.session_id, resumed.todo_state, resumedRunning)
 
+        if (!resumedRunning && prefetchApplied && prefetchMatchesResumedSession && prefetchedTranscriptMessages) {
+          restoreSessionTodosFromSnapshot(
+            resumed.session_id,
+            latestSessionTodoSnapshot(prefetchedTranscriptMessages),
+            false
+          )
+        }
+
         // Crash-survivable turn progress: fold a journaled in-flight tail
         // (persisted by use-session-state-cache while the turn streamed;
         // survives renderer/app death) back onto the restored transcript. The
@@ -2074,11 +2132,28 @@ export function useSessionActions({
         // must not mask a lost transcript (a retry that reloads real history
         // is safer than surfacing the in-flight turn alone). Recovery only
         // ever appends, so this matches the final transcript's emptiness.
-        if (sessionShouldHaveTranscript(stored) && preferredMessages.length === 0) {
+        //
+        // "Should have a transcript" is not the cached sessions-list row alone.
+        // That row is a cache of backend truth and lags the two flows that
+        // report a vanished thread: after a wake/reconnect the list can still
+        // carry the respawned backend's session at message_count 0, and a
+        // compression tip can show 0 rows while the stored transcript is
+        // intact. Conditioning the latch on it alone paints a blank thread
+        // UNLATCHED — no retry, no error, just an empty chat that looks like
+        // lost history. The resume RPC is authoritative and always reports the
+        // stored size (`message_count`, filled from state.db even when
+        // `messages_omitted`), so treat it — and a non-empty REST page — as the
+        // other rungs of the same ladder.
+        const saidToHaveTranscript =
+          sessionShouldHaveTranscript(stored) ||
+          (resumed.message_count || 0) > 0 ||
+          Boolean(prefetchedResult?.messages.length)
+
+        if (saidToHaveTranscript && preferredMessages.length === 0) {
           // Roll back a provisional cached-tail paint and drop its entry: the
-          // authoritative sources say this session has no transcript, so the
-          // cache no longer reflects backend truth and must not survive to
-          // mislead the retry (or the next wake).
+          // latched attempt painted no history from any source, so the
+          // display-only cache must not survive to mask the retry (or the next
+          // wake) as a transcript that loaded.
           if (cachedTailPaint !== null && $messages.get() === cachedTailPaint) {
             setMessages([])
             dropTranscriptTail(storedSessionId, sessionRestScope)
@@ -2823,7 +2898,17 @@ export function useSessionActions({
       // delete lands in the same tick, which used to leave the doomed route in
       // place and let the generic 4001 recovery rebind it.
       const wasSelected = selectedStoredSessionIdRef.current === storedSessionId
-      const closingRuntimeId = wasSelected ? activeSessionIdRef.current : null
+
+      // Resolve the doomed session's live runtime from the SELECTION or the
+      // stored→runtime map. Deleting a NON-selected (sidebar/background) session
+      // used to skip this entirely, so its in-flight turn kept running and could
+      // surface an approval/clarify prompt for a conversation that no longer
+      // exists (#75587).
+      const closingRuntimeId =
+        (wasSelected ? activeSessionIdRef.current : null) ??
+        runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ??
+        null
+
       const previousMessages = $messages.get()
       const previousPinned = $pinnedSessionIds.get()
 
@@ -2858,6 +2943,43 @@ export function useSessionActions({
 
       try {
         if (closingRuntimeId) {
+          // Deleting a session must END its turn, not just drop the row.
+          // `session.close` tears down the runtime but does not walk the
+          // interrupt path that releases approval / clarify / sudo / secret
+          // waits, so a blocked run could outlive its sidebar row and surface a
+          // blocking prompt (and native notification) for a conversation that is
+          // gone (#75587). Mark the runtime interrupted first so a
+          // blocking-input request already queued on the transport is dropped
+          // instead of parking its overlay, then interrupt, then close.
+          let previousInterruptState: Pick<ClientSessionState, 'interrupted' | 'needsInput'> | null = null
+
+          updateSessionState(closingRuntimeId, state => {
+            previousInterruptState = { interrupted: state.interrupted, needsInput: state.needsInput }
+
+            return { ...state, interrupted: true, needsInput: false }
+          })
+
+          try {
+            await requestForSessionProfile(removedOwner, requestGateway, 'session.interrupt', {
+              session_id: closingRuntimeId
+            })
+          } catch (error) {
+            // A missing runtime has no turn left to stop. Any other failure means
+            // deletion cannot safely continue: restore the live state and let the
+            // outer rollback put the conversation back in the sidebar.
+            if (!isSessionGoneError(error)) {
+              updateSessionState(closingRuntimeId, state =>
+                previousInterruptState ? { ...state, ...previousInterruptState } : state
+              )
+              throw error
+            }
+          }
+
+          // Catch a blocking-input request already queued before the interrupted
+          // flag became visible to this renderer.
+          clearAllPrompts(closingRuntimeId)
+          clearClarifyRequest(undefined, closingRuntimeId)
+
           await requestForSessionProfile(removedOwner, requestGateway, 'session.close', {
             session_id: closingRuntimeId
           }).catch(() => undefined)
@@ -2933,7 +3055,8 @@ export function useSessionActions({
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef,
-      startFreshSessionDraft
+      startFreshSessionDraft,
+      updateSessionState
     ]
   )
 
