@@ -23498,6 +23498,33 @@ def effective_worker_route(task: Task) -> str:
     return f"{provider_label}/{model_label}"
 
 
+def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
+    """argv for a native foreign-lane worker (``foreign_lane.worker_command``).
+
+    The runner ignores its own flags. ``-m/--provider/--reasoning`` state the
+    route this dispatcher resolved (card override, else the profile's model,
+    exactly as a shim's argv would), because the lane's model gate reads its
+    parent's argv to catch a card re-pinned between spawn and harness start.
+    """
+    argv = [sys.executable, "-m", "hermes_cli.kanban_native_worker"]
+    model = provider = None
+    if task.model_override:
+        from hermes_cli.kanban_provider_health import model_override
+
+        model, provider = model_override(task)
+    elif profile_home:
+        from hermes_cli.profiles import _read_config_model
+
+        model, provider = _read_config_model(Path(profile_home))
+    if model:
+        argv.extend(["-m", str(model)])
+        if provider:
+            argv.extend(["--provider", str(provider)])
+    if task.reasoning_effort:
+        argv.extend(["--reasoning", task.reasoning_effort])
+    return argv
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -23768,6 +23795,17 @@ def _default_spawn(
     ])
     # Every worker needs the result-aware exit path, not only goal-mode runs.
     cmd.append("-Q")
+    # Native foreign lane (harness-parity spec 9.6): a profile that sets
+    # ``foreign_lane.worker_command`` is worked by a no-LLM runner that execs
+    # the lane and makes its receipt's one board call. Same env, same owner
+    # grant, same log; only the argv differs. Unset keeps the shim above.
+    from hermes_cli.kanban_native_worker import worker_command as _native_worker_command
+    if _native_worker_command(env.get("HERMES_HOME")) is not None:
+        cmd = _native_worker_argv(task, env.get("HERMES_HOME"))
+        # Pin the runner to the tree THIS dispatcher imports, so the code that
+        # chose the native path is the code that runs it. The runner drops it
+        # again before it starts the lane.
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
