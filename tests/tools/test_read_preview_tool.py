@@ -1,17 +1,10 @@
-"""Tests for the desktop-gated ``read_preview`` tool."""
+"""Tests for the GUI-surface ``read_preview`` tool."""
 
 import json
 
 from tools import read_preview_tool as rp
 
 
-def test_gated_on_desktop(monkeypatch):
-    """Hidden unless HERMES_DESKTOP is set (mirrors read_terminal)."""
-    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
-    assert rp.check_read_preview_requirements() is False
-
-    monkeypatch.setenv("HERMES_DESKTOP", "1")
-    assert rp.check_read_preview_requirements() is True
 
 
 def test_requires_callback():

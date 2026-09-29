@@ -212,17 +212,90 @@ async def test_absent_flag_is_treated_as_no_failure():
     assert "could not be saved" not in result.lower()
 
 
-def test_compressor_exposes_a_persist_failure_signal():
-    """The producing half of the contract: the flag exists and defaults False.
+def _real_agent(session_db, session_id):
+    """Real AIAgent on a real SessionDB; only the summariser is stubbed (no network)."""
+    import os
 
-    The gateway's report is only as honest as the signal it reads, so pin that
-    `compress_context` publishes `_last_compaction_persist_failed` on the agent.
-    """
-    import inspect
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
 
-    from agent import conversation_compression
+        agent = AIAgent(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1", model="test/model",
+            quiet_mode=True, session_db=session_db, session_id=session_id,
+            skip_context_files=True, skip_memory=True,
+        )
+    agent.compression_in_place = True
+    agent._session_db_created = True
+    agent.context_compressor.compress = lambda messages, **_kw: [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
+        {"role": "assistant", "content": "kept reply 1"},
+        {"role": "user", "content": "kept question"},
+        {"role": "assistant", "content": "kept reply 2"},
+    ]
+    agent.context_compressor._last_compress_aborted = False
+    agent.context_compressor._last_summary_error = None
+    agent.context_compressor.compression_count = 1
+    return agent
 
-    src = inspect.getsource(conversation_compression.compress_context)
-    assert "_last_compaction_persist_failed" in src, (
-        "compress_context must publish the persist-failure signal the gateway reads"
+
+def _run_real_compress(archive_raises: bool) -> bool:
+    """Drive compress_context against a real SessionDB; return the published flag."""
+    import tempfile
+    from pathlib import Path
+
+    from agent.conversation_compression import compress_context
+    from hermes_state import SessionDB
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = SessionDB(db_path=Path(tmp) / "persist.db")
+        try:
+            sid = "20260929_030000_persist"
+            db.create_session(sid, "gateway", model="test/model")
+            agent = _real_agent(db, sid)
+            messages = [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(8)
+            ]
+            agent._flush_messages_to_session_db(messages)
+
+            def _locked(*_a, **_kw):
+                raise RuntimeError("database is locked (concurrent drain)")
+
+            if archive_raises:
+                with patch.object(SessionDB, "archive_and_compact", _locked):
+                    compress_context(agent, messages, approx_tokens=900_000, system_message="sys")
+            else:
+                compress_context(agent, messages, approx_tokens=900_000, system_message="sys")
+            return getattr(agent, "_last_compaction_persist_failed", None), agent
+        finally:
+            db.close()
+
+
+def test_compressor_publishes_persist_failure_when_the_commit_raises():
+    """Producer half, behaviourally: a rolled-back commit sets the flag the surfaces read."""
+    flag, agent = _run_real_compress(archive_raises=True)
+    assert flag is True
+    assert agent._last_compaction_in_place is False
+
+
+def test_compressor_clears_persist_failure_on_a_committed_compaction():
+    """Control: a commit that lands must not be reported as a save failure."""
+    flag, agent = _run_real_compress(archive_raises=False)
+    assert flag is False
+    assert agent._last_compaction_in_place is True
+
+
+def test_compress_now_reports_persist_failed_and_discards_the_notification():
+    """Every surface goes through compress_now: it must not call this 'compressed'."""
+    from agent import conversation_compression_manual as manual
+
+    history = _make_history()
+    agent_instance = _make_agent(
+        history, [history[0], {"role": "assistant", "content": "summary"}, history[-1]],
+        persist_failed=True,
     )
+    with patch("agent.conversation_compression.finalize_context_engine_compression_notification") as fin:
+        result = manual.compress_now(agent_instance, history, manual.CompressRequest())
+    assert result.status == "persist_failed"
+    assert result.after_messages == history
+    fin.assert_called_with(agent_instance, committed=False)
+    assert "could not be saved" in "\n".join(manual.render_compress_result(result))
