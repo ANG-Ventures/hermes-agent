@@ -27,6 +27,7 @@ def no_identity(monkeypatch):
 @pytest.mark.parametrize("command", [
     f"launchctl kickstart -k gui/501/{SIB}",
     f"launchctl bootout gui/501/{SIB}",
+    f"launchctl kill SIGTERM gui/501/{SIB}",
     "systemctl --user restart hermes-gateway-aegis.service",
 ])
 def test_sibling_service_is_allowed_for_a_supervised_gateway(as_default_gateway, command):
@@ -39,6 +40,9 @@ def test_sibling_service_is_allowed_for_a_supervised_gateway(as_default_gateway,
     f"launchctl kickstart -k gui/501/{SIB}; launchctl kickstart -k gui/501/ai.hermes.gateway",
     f"L={SIB}; launchctl kickstart -k gui/501/$L",
     f"pkill -f {SIB}",
+    "launchctl kill SIGTERM gui/501/ai.hermes.gateway",
+    f"launchctl kill SIGTERM gui/501/{SIB}; kill 99",
+    f"launchctl kill SIGTERM gui/501/{SIB} && killall python",
     f"launchctl kickstart -k gui/501/{SIB} && hermes gateway restart",
     f"launchctl submit -l {SIB} -- /bin/sh restart.sh",
     "launchctl kickstart -k gui/501/ai.hermes.gatewayx",
@@ -52,6 +56,13 @@ def test_sibling_view_is_symmetric(monkeypatch):
     monkeypatch.setenv("XPC_SERVICE_NAME", SIB)
     assert not blocked("launchctl kickstart -k gui/501/ai.hermes.gateway")
     assert blocked(f"launchctl kickstart -k gui/501/{SIB}")
+
+
+@pytest.mark.parametrize("label", [
+    "hermes-gateway-aegis.service", "ai.hermes.gateway-aegis.plist", "HERMES-GATEWAY-aegis.SERVICE",
+])
+def test_profile_key_strips_service_suffix(label):
+    assert guard._gateway_profile_key(label) == "aegis"
 
 
 def test_without_supervisor_identity_every_gateway_label_stays_blocked(no_identity):

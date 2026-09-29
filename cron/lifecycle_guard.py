@@ -390,6 +390,10 @@ _FULL_GATEWAY_SERVICE_LABEL_RE = re.compile(
     r"(?i)(?<![\w.\-])(ai\.hermes\.gateway(?:-[a-z0-9_\-]+)?|hermes-gateway(?:-[a-z0-9_\-]+)?)"
     r"(?:\.(?:service|plist))?(?![\w.\-])")
 _PROCESS_KILLER_RE = re.compile(r"(?i)\b(?:p?kill|killall|taskkill|stop-process)\b")
+# ``launchctl kill <signal> <service-target>`` is a launchd lifecycle verb that names a service
+# label, not a process pattern; drop it before the killer scan so the killer is keyed on the
+# executable. A standalone ``kill``/``pkill`` elsewhere in the command still fails closed.
+_LAUNCHCTL_KILL_VERB_RE = re.compile(r"(?i)\blaunchctl\s+kill\b")
 _SIBLING_LABEL_PLACEHOLDER = "sibling-service"
 
 
@@ -416,7 +420,7 @@ def _self_gateway_service_names() -> frozenset[str]:
 def _gateway_profile_key(label: str) -> str:
     """Profile a gateway service label belongs to: ``ai.hermes.gateway-x`` / ``hermes-gateway-x``
     (``.service``/``.plist`` optional) -> ``x``; the default profile's labels -> ``""``."""
-    name = re.sub(r"(?i)\\.(?:service|plist)$", "", label.strip()).casefold()
+    name = re.sub(r"(?i)\.(?:service|plist)$", "", label.strip()).casefold()
     for base in ("ai.hermes.gateway", "hermes-gateway"):
         if name == base:
             return ""
@@ -429,7 +433,7 @@ def _mask_sibling_gateway_labels(text: str) -> str:
     """Replace full gateway service labels with a neutral token when EVERY gateway label in *text*
     names a sibling of this process; otherwise return *text* unchanged (fail closed)."""
     if not _HERMES_GATEWAY_LABEL_RE.search(text) or "$" in text or "`" in text \
-            or _PROCESS_KILLER_RE.search(text):
+            or _PROCESS_KILLER_RE.search(_LAUNCHCTL_KILL_VERB_RE.sub(" ", text)):
         return text
     labels = list(_FULL_GATEWAY_SERVICE_LABEL_RE.finditer(text))
     if not labels or len(labels) != len(_HERMES_GATEWAY_LABEL_RE.findall(text)):
