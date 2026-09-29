@@ -45,3 +45,18 @@ def _block_real_claude_keychain(monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_aa.platform, "system", lambda: "Linux", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_summary_refusal_latch():
+    """The compressor's safeguard-refusal latch is process-wide by design;
+    clear it so one test's refused (route, content) pair cannot suppress a
+    send in another test that reuses the same fixture text."""
+    try:
+        from agent.context_compressor import _SUMMARY_REFUSALS
+    except Exception:
+        yield
+        return
+    _SUMMARY_REFUSALS.clear()
+    yield
+    _SUMMARY_REFUSALS.clear()
