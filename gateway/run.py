@@ -39000,6 +39000,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _leftover_steer:
                     pending = _leftover_steer
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+            elif result and result.get("pending_steer") and adapter and session_key:
+                # A follow-up already owns the next turn. Queue the leftover
+                # steer behind it instead of dropping it (2026-09-29).
+                self._enqueue_fifo(
+                    session_key,
+                    MessageEvent(
+                        text=result["pending_steer"],
+                        message_type=MessageType.TEXT,
+                        source=source,
+                    ),
+                    adapter,
+                )
+                logger.info(
+                    "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
+                    session_key,
+                    len(result["pending_steer"]),
+                )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -39262,6 +39279,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
+
+                # The follow-up is a NEW turn on the parent's slot: re-stamp
+                # the turn clock and ack debounce so a busy/steer ack reports
+                # this turn's elapsed, not the parent's (2026-09-29).
+                _followup_state = self._peek_session_state(session_key)
+                if _followup_state is not None and _followup_state.turn.started_ts:
+                    _followup_state.turn.started_ts = time.time()
+                    _followup_state.turn.busy_ack_ts = 0.0
 
                 followup_result = await self._run_agent(
                     message=next_message,
