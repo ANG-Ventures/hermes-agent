@@ -689,7 +689,7 @@ class TermuxAudioRecorder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._recording = False
-        self._start_time = 0.0
+        self._start_time = float("-inf")
         self._recording_path: Optional[str] = None
         self._current_rms = 0
 
@@ -832,7 +832,7 @@ class AudioRecorder:
         self._stream: Any = None
         self._frames: List[Any] = []
         self._recording = False
-        self._start_time: float = 0.0
+        self._start_time: float = float("-inf")
         self._sample_rate: int = SAMPLE_RATE
         # Silence detection state
         self._has_spoken = False
@@ -922,10 +922,10 @@ class AudioRecorder:
                     self._dip_start = 0.0  # Reset dip tracker
                     if self._speech_start == 0.0:
                         self._speech_start = now
-                    elif not self._has_spoken and now - self._speech_start >= self._min_speech_duration:
+                    elif not self._has_spoken and now - self._speech_start >= self._min_speech_duration:  # zero-seed-ok: 0.0 is the guarded "not started" sentinel (== 0.0 check above)
                         self._has_spoken = True
                         logger.debug("Speech confirmed (%.2fs above threshold)",
-                                     now - self._speech_start)
+                                     now - self._speech_start)  # zero-seed-ok: inside the guarded elif
                     # After speech is confirmed, only reset silence timer if
                     # speech is sustained (>0.3s above threshold).  Brief
                     # spikes from ambient noise should NOT reset the timer.
@@ -939,7 +939,7 @@ class AudioRecorder:
                         self._resume_dip_start = 0.0  # Above threshold — no dip
                         if self._resume_start == 0.0:
                             self._resume_start = now
-                        elif now - self._resume_start >= self._min_speech_duration:
+                        elif now - self._resume_start >= self._min_speech_duration:  # zero-seed-ok: 0.0 is the guarded "not started" sentinel (== 0.0 check above)
                             self._silence_start = 0.0
                             self._resume_start = 0.0
                 elif self._has_spoken:
@@ -949,7 +949,7 @@ class AudioRecorder:
                     if self._resume_start > 0:
                         if self._resume_dip_start == 0.0:
                             self._resume_dip_start = now
-                        elif now - self._resume_dip_start >= self._max_dip_tolerance:
+                        elif now - self._resume_dip_start >= self._max_dip_tolerance:  # zero-seed-ok: 0.0 is the guarded "not started" sentinel (== 0.0 check above)
                             # Sustained dip — user actually stopped speaking
                             self._resume_start = 0.0
                             self._resume_dip_start = 0.0
@@ -958,10 +958,10 @@ class AudioRecorder:
                     # Tolerate brief dips (micro-pauses between syllables).
                     if self._dip_start == 0.0:
                         self._dip_start = now
-                    elif now - self._dip_start >= self._max_dip_tolerance:
+                    elif now - self._dip_start >= self._max_dip_tolerance:  # zero-seed-ok: 0.0 is the guarded "not started" sentinel (== 0.0 check above)
                         # Dip lasted too long -- genuine silence, reset
                         logger.debug("Speech attempt reset (dip lasted %.2fs)",
-                                     now - self._dip_start)
+                                     now - self._dip_start)  # zero-seed-ok: inside the guarded elif
                         self._speech_start = 0.0
                         self._dip_start = 0.0
 
@@ -973,7 +973,7 @@ class AudioRecorder:
                     # User was speaking and now is silent
                     if self._silence_start == 0.0:
                         self._silence_start = now
-                    elif now - self._silence_start >= self._silence_duration:
+                    elif now - self._silence_start >= self._silence_duration:  # zero-seed-ok: 0.0 is the guarded "not started" sentinel (== 0.0 check above)
                         logger.info("Silence detected (%.1fs), auto-stopping",
                                     self._silence_duration)
                         should_fire = True

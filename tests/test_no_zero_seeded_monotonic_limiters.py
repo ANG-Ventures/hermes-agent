@@ -134,6 +134,16 @@ class _Scope:
         self.globals: set[str] = set()
         self.nonlocals: set[str] = set()
         self.bindings: dict[str, list[ast.expr | None]] = {}
+        self.attrs: dict[str, list[ast.expr | None]] = {}  # ClassDef only
+
+    def class_attrs(self) -> dict[str, list[ast.expr | None]]:
+        """Attribute seeds of the nearest enclosing class ({} if none)."""
+        scope = self
+        while scope is not None:
+            if isinstance(scope.node, ast.ClassDef):
+                return scope.attrs
+            scope = scope.parent
+        return {}
 
     @property
     def module(self) -> "_Scope":
@@ -180,6 +190,50 @@ def _own_nodes(scope_node: ast.AST):
         stack.extend(ast.iter_child_nodes(node))
 
 
+_SELF_NAMES = {"self", "cls"}
+_PRAGMA = "zero-seed-ok:"
+
+
+def _target_pairs(target: ast.expr, value: ast.expr | None):
+    """Yield ``(target, value)`` pairs, pairing unpacked targets element-wise.
+
+    ``last, count = 0.0, 0`` binds ``last`` to ``0.0``. When the value can't be
+    paired (``a, b = fn()``), each target is bound to ``None`` (unknown).
+    """
+    if isinstance(target, (ast.Tuple, ast.List)):
+        elts = target.elts
+        paired = (
+            isinstance(value, (ast.Tuple, ast.List))
+            and len(value.elts) == len(elts)
+            and not any(isinstance(e, ast.Starred) for e in elts)
+        )
+        for i, elt in enumerate(elts):
+            if isinstance(elt, ast.Starred):
+                elt = elt.value
+            yield from _target_pairs(elt, value.elts[i] if paired else None)
+        return
+    yield target, value
+
+
+def _self_attr(node: ast.expr) -> str | None:
+    """``self.x`` / ``cls.x`` -> ``"x"``."""
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in _SELF_NAMES
+    ):
+        return node.attr
+    return None
+
+
+def _assign_pairs(child: ast.AST):
+    if isinstance(child, ast.Assign):
+        for target in child.targets:
+            yield from _target_pairs(target, child.value)
+    elif isinstance(child, ast.AnnAssign):
+        yield child.target, child.value
+
+
 def _build_scopes(tree: ast.Module) -> list[_Scope]:
     scopes: list[_Scope] = []
 
@@ -206,16 +260,27 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
                 scope.globals.update(child.names)
             elif isinstance(child, ast.Nonlocal):
                 scope.nonlocals.update(child.names)
-            elif isinstance(child, ast.Assign):
-                for target in child.targets:
+            else:
+                for target, value in _assign_pairs(child):
                     if isinstance(target, ast.Name):
-                        scope.bindings.setdefault(target.id, []).append(child.value)
-            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
-                scope.bindings.setdefault(child.target.id, []).append(child.value)
+                        scope.bindings.setdefault(target.id, []).append(value)
             if isinstance(child, _SCOPE_NODES):
                 visit(child, scope)
 
     visit(tree, None)
+    # Instance/class state: ``self.x = ...`` anywhere in the class, plus
+    # class-body ``x = ...``, all readable as ``self.x``.
+    for scope in scopes:
+        if isinstance(scope.node, ast.ClassDef):
+            attrs: dict[str, list[ast.expr | None]] = {
+                k: list(v) for k, v in scope.bindings.items()
+            }
+            for sub in ast.walk(scope.node):
+                for target, value in _assign_pairs(sub):
+                    attr = _self_attr(target)
+                    if attr is not None:
+                        attrs.setdefault(attr, []).append(value)
+            scope.attrs = attrs
     # Assignments under ``global``/``nonlocal`` bind in the resolved scope.
     for scope in scopes:
         for name in scope.globals | scope.nonlocals:
@@ -234,15 +299,31 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
         warnings.simplefilter("ignore")
         tree = ast.parse(source, filename=filename)
     hits: list[str] = []
+    lines = source.splitlines()
     for scope in _build_scopes(tree):
         for node in _own_nodes(scope.node):
             if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
                 continue
+            # Reviewed escape for a guarded 0 sentinel (``if x == 0: x = now``
+            # ``elif now - x >= T``): ``# zero-seed-ok: <reason>`` on the line.
+            if _PRAGMA in lines[node.lineno - 1]:
+                continue
             right = node.right
-            if not isinstance(right, ast.Name) and not _is_zero_default(right):
+            right_attr = _self_attr(right)
+            if (
+                not isinstance(right, ast.Name)
+                and right_attr is None
+                and not _is_zero_default(right)
+            ):
                 continue
             left = node.left
-            if isinstance(left, ast.Name):
+            left_attr = _self_attr(left)
+            if left_attr is not None:
+                left_is_mono = any(
+                    v is not None and _is_monotonic_call(v)
+                    for v in scope.class_attrs().get(left_attr, [])
+                )
+            elif isinstance(left, ast.Name):
                 left_scope = scope.resolve(left.id)
                 left_is_mono = left_scope is not None and any(
                     v is not None and _is_monotonic_call(v)
@@ -251,6 +332,10 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
             else:
                 left_is_mono = _is_monotonic_call(left)
             if not left_is_mono:
+                continue
+            if right_attr is not None:
+                if any(_is_zero_default(v) for v in scope.class_attrs().get(right_attr, [])):
+                    hits.append(f"{filename}:{node.lineno}: {ast.unparse(right)}")
                 continue
             if not isinstance(right, ast.Name):
                 # inline ``<monotonic> - stamps.get(key, 0.0)`` (or getattr/``or 0``)
@@ -379,6 +464,50 @@ def heartbeat_current_worker_from_env(progress_at=None):
             "    c = stamps.get(k) or 0.0\n    return now - a, now - b, now - c\n",
             ["a", "b", "c"],
             id="getattr-setdefault-or-zero-defaults",
+        ),
+        pytest.param(
+            "import time\nclass L:\n    def __init__(self):\n        self.last_attempt = 0.0\n"
+            "    def tick(self):\n        if time.monotonic() - self.last_attempt < 60:\n"
+            "            return False\n        self.last_attempt = time.monotonic()\n",
+            ["self.last_attempt"],
+            id="instance-attribute-seed",
+        ),
+        pytest.param(
+            "import time\nclass L:\n    last = 0\n"
+            "    def tick(self):\n        now = time.monotonic()\n        return now - self.last\n",
+            ["self.last"],
+            id="class-attribute-seed",
+        ),
+        pytest.param(
+            "import time\nclass L:\n    def __init__(self):\n        self.last = float('-inf')\n"
+            "    def tick(self):\n        return time.monotonic() - self.last\n",
+            [],
+            id="instance-attribute-inf-is-safe",
+        ),
+        pytest.param(
+            "import time\nclass L:\n    def __init__(self):\n        self.last = 0\n"
+            "    def tick(self):\n        return time.time() - self.last\n",
+            [],
+            id="instance-attribute-wall-clock-is-safe",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    last, count = 0.0, 0\n"
+            "    if time.monotonic() - last > 5:\n        last = time.monotonic()\n",
+            ["last"],
+            id="tuple-unpacked-seed",
+        ),
+        pytest.param(
+            "import time\nclass L:\n    def __init__(self):\n        self.a, self.b = 0.0, 1\n"
+            "    def tick(self):\n        return time.monotonic() - self.a\n",
+            ["self.a"],
+            id="tuple-unpacked-attribute-seed",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    start = 0.0\n    now = time.monotonic()\n"
+            "    if start == 0.0:\n        start = now\n"
+            "    elif now - start >= 1:  # zero-seed-ok: guarded sentinel\n        pass\n",
+            [],
+            id="pragma-guarded-sentinel",
         ),
         pytest.param(
             "import time\ndef f(started):\n    last = 0\n"

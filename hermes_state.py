@@ -4760,7 +4760,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # The gateway shares one SessionDB across every agent, so that turns
         # a momentary blip into a permanent global convoy. Expires after
         # _READ_OPEN_RETRY_SECONDS so the read path self-heals.
-        self._read_open_failed_at = 0.0
+        self._read_open_failed_at = float("-inf")
         self._wal_active = False
         self._write_count = 0
         # One-shot guard for the runtime FTS rebuild recovery on the write

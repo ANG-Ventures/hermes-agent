@@ -1681,7 +1681,7 @@ class SlashCommandCompleter(Completer):
         self._skill_bundles_provider = skill_bundles_provider
         # Cached project file list for fuzzy @ completions
         self._file_cache: list[str] = []
-        self._file_cache_time: float = 0.0
+        self._file_cache_time: float = float("-inf")
         self._file_cache_cwd: str = ""
 
     def _command_allowed(self, slash_command: str) -> bool:

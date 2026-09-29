@@ -13,7 +13,7 @@ def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
         cfg.update(extra_config)
     obj.config = cfg
     obj._agent_running = False
-    obj._last_config_check = 0.0
+    obj._last_config_check = float("-inf")
     obj._config_mcp_servers = mcp_servers or {}
 
     cfg_file = tmp_path / "config.yaml"
@@ -115,7 +115,7 @@ class TestMCPConfigWatch:
         with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
             obj._check_config_mcp_changes()
             # Second pass: same file content, new mtime — no reload, no change.
-            obj._last_config_check = 0.0
+            obj._last_config_check = float("-inf")
             obj._config_mtime = 0.0
             obj._check_config_mcp_changes()
 

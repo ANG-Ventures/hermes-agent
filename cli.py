@@ -5230,9 +5230,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._stream_table_buf: list[str] = []
         self._in_stream_table = False
         self._pending_edit_snapshots = {}
-        self._last_input_mode_recovery = 0.0
+        self._last_input_mode_recovery = float("-inf")  # monotonic; 0.0 = "just now" on fresh boot
         self._input_mode_recovery_notice_shown = False
-        self._last_termios_drift_check = 0.0
+        self._last_termios_drift_check = float("-inf")
         self._termios_drift_notice_shown = False
         
         # Configuration - priority: CLI args > env vars > config file
@@ -5662,7 +5662,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pet_kitty_pending: str = ""
         self._pet_frame_idx: int = 0
         self._pet_lock = threading.Lock()
-        self._pet_cfg_checked: float = 0.0
+        self._pet_cfg_checked: float = float("-inf")
         self._pet_anim_running: bool = False
         self._pet_anim_thread = None
         # Transient reaction beats (wave/jump/failed) + steady reasoning flag.
@@ -18573,7 +18573,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cfg_path = _get_config_path()
         self._config_mtime: float = _cfg_path.stat().st_mtime if _cfg_path.exists() else 0.0
         self._config_mcp_servers: dict = self.config.get("mcp_servers") or {}
-        self._last_config_check: float = 0.0  # monotonic time of last check
+        self._last_config_check: float = float("-inf")  # monotonic time of last check
 
         # Clarify tool state: interactive question/answer with the user.
         # When the agent calls the clarify tool, _clarify_state is set and
