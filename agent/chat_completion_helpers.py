@@ -86,9 +86,9 @@ _POOL_HEADER_NAMES = (
 # Relay-pool providers whose responses carry the x-pool-* attribution headers.
 _POOLED_PROVIDERS = frozenset({"claude-apr", "claude-bpr"})
 _PINNED_PROVIDER_KEYS = {
-    "xai-oauth": "supergrok",
     "gemini-bridge": "gemini",
 }
+XAI_SUB_PREFIX_LEN = 8  # usage meter key = OIDC sub[:8] lowercase (registry.xai_key)
 _PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
 _POOL_SUB_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _API_CALL_SEQ_INIT_LOCK = threading.Lock()
@@ -175,6 +175,43 @@ def _codex_sub_key(agent: Any) -> Optional[str]:
 
 
 
+def _xai_sub_key(agent: Any) -> Optional[str]:
+    """``<sub[:8]>`` of the xAI OAuth token this call was sent with.
+
+    xAI meters per account (Heavy / Lite are separate subscriptions) keyed by
+    the token's OIDC ``sub`` claim, lowercased to 8 chars. Same wire-first rule
+    as :func:`_codex_sub_key`: ``agent.api_key`` is the credential the client
+    was built from; the pool cursor is consulted only when it carries no
+    ``sub``. Never guesses: no ``sub`` anywhere records NULL (t_59a605d1; the
+    old ``supergrok`` pin named a bucket retired 2026-09-22).
+    """
+    try:
+        from hermes_cli.auth import _decode_jwt_claims
+
+        candidates = [getattr(agent, "api_key", None)]
+        pool = getattr(agent, "_credential_pool", None)
+        current = pool.current() if pool is not None else None
+        if current is not None:
+            candidates.append(getattr(current, "access_token", None))
+        for token in candidates:
+            if not isinstance(token, str) or not token:
+                continue
+            sub = _decode_jwt_claims(token).get("sub")
+            if isinstance(sub, str) and len(sub.strip()) >= XAI_SUB_PREFIX_LEN:
+                return sub.strip()[:XAI_SUB_PREFIX_LEN].lower()
+        return None
+    except Exception:
+        return None
+
+
+# Providers whose subscription account is read from the credential the
+# request was sent with (not a relay header, not a constant).
+_WIRE_ACCOUNT_KEY_FNS = {
+    "openai-codex": _codex_sub_key,
+    "xai-oauth": _xai_sub_key,
+}
+
+
 def _api_call_identity(
     agent: Any, headers: dict[str, str], provider: Optional[str] = None,
 ) -> tuple[Optional[str], str]:
@@ -208,40 +245,41 @@ def _route_identity(
         return provider, "pinned"
     if provider in _PINNED_PROVIDER_KEYS:
         return _PINNED_PROVIDER_KEYS[provider], "pinned"
-    if provider == "openai-codex" and codex_from_agent and agent is not None:
-        return _dispatched_codex_sub_key(agent), "wire"
+    if provider in _WIRE_ACCOUNT_KEY_FNS and codex_from_agent and agent is not None:
+        return _dispatched_wire_sub_key(agent, provider), "wire"
     return None, "wire"
 
 
-# Key under which the dispatch edge pins the Codex account of the in-flight
-# request inside ``agent._inflight_request_route``. Not a route field:
-# ``_serving_route`` strips it so route consumers see only the route.
-_DISPATCH_CODEX_SUB_KEY = "codex_sub_key"
+# Key under which the dispatch edge pins the credential account (Codex / xAI)
+# of the in-flight request inside ``agent._inflight_request_route``. Not a
+# route field: ``_serving_route`` strips it so route consumers see only the route.
+_DISPATCH_SUB_KEY = "wire_sub_key"
 
 
 def _dispatch_route_snapshot(agent: Any, route: dict) -> dict:
     """The in-flight snapshot for a request dispatched on ``route``.
 
-    Pins the Codex account at the dispatch edge, beside the route: the
+    Pins the Codex / xAI account at the dispatch edge, beside the route: the
     agent's ``api_key`` and pool cursor are mutable (credential rotation, a
     fallback or ``/model`` from another thread), so reading them when the call
     completes would stamp its tokens to whichever account is live THEN
-    (FleetReview 659603b36aec). Only the derived ``codex:<acct[:8]>`` key is
-    held, never the token.
+    (FleetReview 659603b36aec). Only the derived account key is held, never
+    the token.
     """
     snap = dict(route)
-    if str(route.get("provider") or "").strip().lower() == "openai-codex":
-        snap[_DISPATCH_CODEX_SUB_KEY] = _codex_sub_key(agent)
+    fn = _WIRE_ACCOUNT_KEY_FNS.get(str(route.get("provider") or "").strip().lower())
+    if fn is not None:
+        snap[_DISPATCH_SUB_KEY] = fn(agent)
     return snap
 
 
-def _dispatched_codex_sub_key(agent: Any) -> Optional[str]:
-    """Codex account of the in-flight request; live read only outside a
+def _dispatched_wire_sub_key(agent: Any, provider: str) -> Optional[str]:
+    """Credential account of the in-flight request; live read only outside a
     stamped dispatch (where the live credential IS the one in use)."""
     snap = getattr(agent, "_inflight_request_route", None)
-    if isinstance(snap, dict) and _DISPATCH_CODEX_SUB_KEY in snap:
-        return snap[_DISPATCH_CODEX_SUB_KEY]
-    return _codex_sub_key(agent)
+    if isinstance(snap, dict) and _DISPATCH_SUB_KEY in snap:
+        return snap[_DISPATCH_SUB_KEY]
+    return _WIRE_ACCOUNT_KEY_FNS[provider](agent)
 
 
 
@@ -301,7 +339,7 @@ def _serving_route(agent: Any) -> dict[str, str]:
     """
     snap = getattr(agent, "_inflight_request_route", None)
     if isinstance(snap, dict):
-        return {k: v for k, v in snap.items() if k != _DISPATCH_CODEX_SUB_KEY}
+        return {k: v for k, v in snap.items() if k != _DISPATCH_SUB_KEY}
     return _live_route(agent)
 
 

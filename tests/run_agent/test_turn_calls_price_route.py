@@ -208,8 +208,8 @@ def _identity_agent(*, dispatched: str, live: str):
 @pytest.mark.parametrize(
     "dispatched,live,want",
     [
-        ("xai-oauth", "gemini-bridge", ("xai-oauth", "supergrok", "pinned")),
-        ("xai-oauth", "openai", ("xai-oauth", "supergrok", "pinned")),
+        ("xai-oauth", "gemini-bridge", ("xai-oauth", None, "wire")),
+        ("xai-oauth", "openai", ("xai-oauth", None, "wire")),
         ("openai", "gemini-bridge", ("openai", None, "wire")),
     ],
 )

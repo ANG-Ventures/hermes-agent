@@ -116,7 +116,6 @@ def test_429_then_200_records_zero_token_error_then_success(recorded):
     [
         ("claude-apx-7", "claude-apx-7"),
         ("claude-bpx-12", "claude-bpx-12"),
-        ("xai-oauth", "supergrok"),
         ("gemini-bridge", "gemini"),
     ],
 )
@@ -224,6 +223,74 @@ def test_openai_codex_opaque_key_and_no_selection_records_null(recorded):
     assert recorded[0]["sub_key"] is None
     assert recorded[0]["attribution"] == "wire"
 
+
+
+def _xai_jwt(sub: str) -> str:
+    import base64
+    import json
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    return f"{seg({'alg': 'none'})}.{seg({'sub': sub, 'tier': 'x'})}.sig"
+
+
+_XAI_HEAVY = "F797A9F4-0000-4000-8000-000000000001"
+_XAI_LITE = "1C74FA86-0000-4000-8000-000000000002"
+
+
+def test_xai_oauth_pooled_lite_call_stamps_lite_account(recorded):
+    # t_59a605d1: the pin stamped every xai-oauth call 'supergrok', a bucket
+    # retired when xAI went per-account. The call was sent with the Lite
+    # credential (agent.api_key), so it belongs to the Lite meter sub[:8].
+    agent = _agent("turn-xai", "xai-oauth")
+    agent._credential_pool = SimpleNamespace(
+        current=lambda: SimpleNamespace(access_token=_xai_jwt(_XAI_HEAVY))
+    )
+    agent.api_key = _xai_jwt(_XAI_LITE)
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(1000, 50)))
+
+    assert recorded[0]["sub_key"] == "1c74fa86"
+    assert recorded[0]["attribution"] == "wire"
+
+
+def test_xai_oauth_pool_cursor_used_when_agent_key_has_no_sub(recorded):
+    agent = _agent("turn-xai-cursor", "xai-oauth")
+    agent._credential_pool = SimpleNamespace(
+        current=lambda: SimpleNamespace(access_token=_xai_jwt(_XAI_HEAVY))
+    )
+    agent.api_key = "opaque-test-token"
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 5)))
+
+    assert recorded[0]["sub_key"] == "f797a9f4"
+
+
+def test_xai_oauth_without_sub_records_null_never_supergrok(recorded):
+    agent = _agent("turn-xai-opaque", "xai-oauth")
+    agent._credential_pool = _FreshPool(_xai_jwt(_XAI_HEAVY))
+    agent.api_key = "opaque-test-token"
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 5)))
+
+    assert recorded[0]["sub_key"] is None
+    assert recorded[0]["attribution"] == "wire"
+
+
+def test_xai_oauth_account_pinned_at_dispatch_edge(recorded):
+    # Rotation between dispatch and completion must not re-attribute the call.
+    agent = _agent("turn-xai-rotate", "xai-oauth")
+    agent.api_key = _xai_jwt(_XAI_LITE)
+    agent._inflight_request_route = cch._dispatch_route_snapshot(
+        agent, {"provider": "xai-oauth", "model": "grok", "base_url": "", "api_mode": "chat_completions"}
+    )
+    agent.api_key = _xai_jwt(_XAI_HEAVY)  # pool rotated while the call was on the wire
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 5)))
+
+    assert recorded[0]["sub_key"] == "1c74fa86"
+    assert "wire_sub_key" not in cch._serving_route(agent)
 
 
 def test_delegated_subagent_stamps_own_turn_id(recorded):

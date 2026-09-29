@@ -106,10 +106,11 @@ def test_three_advisors_plus_aggregator_yield_five_rows(db):
     assert all(r["sub_harness"] == "moa:default" for r in children)
     assert [r["lane_family"] for r in children] == ["codex", "openrouter", "xai", "bpx/bpr"]
     assert all(r["http_status"] == 200 for r in children)
-    # Relay identity: pinned route and a relay pick's served-by header.
+    # Relay identity: a relay pick's served-by header.
     by_provider = {r["provider"]: r for r in children}
+    # An xai advisor's credential is unknown too: NULL, never the retired 'supergrok'.
     assert (by_provider["xai-oauth"]["sub_key"], by_provider["xai-oauth"]["attribution"]) == (
-        "supergrok", "pinned")
+        None, "wire")
     assert by_provider["claude-bpr"]["sub_key"] == "sub-vps-3"
     # An advisor never ran on the agent's credential pool: codex account unknown.
     assert by_provider["openai-codex"]["sub_key"] is None
