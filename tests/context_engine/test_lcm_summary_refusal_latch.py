@@ -178,3 +178,63 @@ def test_content_filter_finish_is_a_refusal(monkeypatch):
     _run(model="claude-sonnet-5-5")
     _run(model="claude-sonnet-5-5")
     assert len(calls) == 1
+
+
+# --- t_2ba784cc: the latch must expire and must key on the resolved route ---
+
+
+def _pin_default_route(monkeypatch, main: dict) -> None:
+    """Compression task on ``auto``: call_llm follows the live main runtime."""
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux, "_resolve_task_provider_model",
+        lambda task=None, provider=None, model=None, **_: (
+            provider or "auto", model, None, None, None),
+    )
+    monkeypatch.setattr(aux, "_read_main_provider", lambda: main["provider"])
+    monkeypatch.setattr(aux, "_read_main_model_for_aux", lambda: main["model"])
+
+
+def test_default_route_latch_follows_a_model_switch(monkeypatch):
+    main = {"provider": "claude-bpr", "model": "claude-sonnet-5-5"}
+    _pin_default_route(monkeypatch, main)
+    served: list[str] = []
+
+    def route(**kw):
+        served.append(main["model"])
+        if main["model"] == "claude-sonnet-5-5":
+            raise _bpx_safeguard_400()
+        return _ok("short summary of the segment")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    assert _run()[1] == 3
+    assert _run()[1] == 3  # still latched on the same resolved route
+    assert served == ["claude-sonnet-5-5"]
+
+    # /model switch: the "<task-default>" alias now resolves elsewhere.
+    main.update(provider="openai-codex", model="gpt-5.5")
+    assert _run() == ("short summary of the segment", 1)
+    assert served == ["claude-sonnet-5-5", "gpt-5.5"]
+
+
+def test_refusal_latch_expires(monkeypatch):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock["now"])
+    calls: list[int] = []
+
+    def refuse(**kw):
+        calls.append(1)
+        raise _bpx_safeguard_400()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", refuse)
+    _run(model="claude-sonnet-5-5")
+    clock["now"] += 60
+    _run(model="claude-sonnet-5-5")
+    assert len(calls) == 1  # still inside the latch window
+
+    # A misfiring / since-changed classifier gets another try eventually,
+    # instead of forcing L3 truncation for the life of the gateway process.
+    clock["now"] += 30 * 24 * 3600
+    _run(model="claude-sonnet-5-5")
+    assert len(calls) == 2
