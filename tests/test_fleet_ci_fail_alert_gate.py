@@ -386,3 +386,102 @@ def test_known_red_and_fallback_transport_failures_turn_the_step_red(tmp_path):
     proc, _ = _post(tmp_path, known_code="transport", alerts_code="transport")
     assert proc.returncode != 0
     assert "both failed (HTTP 000)" in proc.stderr
+
+
+# --- already-red fold (t_be1b9134) --------------------------------------------
+# 2026-09-28 20:07-23:19Z: main flapped red and six PRs were ejected on the same
+# two tests, 15 #alerts pages. The fixture is the recorded API state of every run
+# behind those pages; each page is replayed through the REAL route step, in page
+# order, with the runs list the API would have served (ids below the replayed one
+# are filtered by the step itself). created_at is pinned inside the window.
+R10 = json.loads((ROOT / "tests" / "fixtures" / "fleet_ci_fail_alert" / "r10_2026-09-28.json").read_text())
+PROXY = "tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts"
+KANBAN = "tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback"
+
+
+def _r10_api() -> dict:
+    wid = R10["runs"][0]["workflow_id"]
+    listed = [dict(r, created_at="2099-01-01T00:00:00Z") for r in R10["runs"] if r["conclusion"] == "failure"]
+    api = {f"actions/workflows/{wid}/runs?status=failure": {"workflow_runs": listed},
+           f"actions/workflows/{wid}/runs?event=merge_group": {
+               "workflow_runs": [r for r in listed if r["event"] == "merge_group"]}}
+    for rid, jobs in R10["jobs"].items():
+        api[f"actions/runs/{rid}/jobs"] = {"jobs": jobs}
+    for cid, msgs in R10["annotations"].items():
+        api[f"check-runs/{cid}/annotations"] = [{"message": m} for m in msgs]
+    return api
+
+
+def _replay(tmp_path: Path, run_id: int, api: dict) -> dict:
+    step = _route_step()
+    run = next(r for r in R10["runs"] if r["id"] == run_id)
+    d = tmp_path / str(run_id)
+    (d / "bin").mkdir(parents=True)
+    (d / "bin" / "curl").write_text(_FAKE_API_CURL)
+    (d / "bin" / "curl").chmod(0o755)
+    (d / "api.json").write_text(json.dumps(api))
+    out = d / "out"
+    out.write_text("")
+    payload = dict(run, html_url=f"https://x/{run_id}", actor={"login": "github-merge-queue[bot]"})
+    env = {"PATH": f"{d / 'bin'}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(d / "curl.log"), "FAKE_API": str(d / "api.json"), "GH_TOKEN": "x",
+           "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main", "REPLAY_RUN_ID": "",
+           "RUN_JSON": json.dumps(payload), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got["_stdout"] = proc.stdout
+    return got
+
+
+def test_replay_2026_09_28_folds_already_red_tests_to_logs(tmp_path):
+    api = _r10_api()
+    routes = {int(rid): _replay(tmp_path, int(rid), api) for _ts, rid, _pr in R10["pages"]}
+    paged = sorted(rid for rid, g in routes.items() if g["route"] == "alerts")
+    # Still paging, each a DIFFERENT fault or one the fold cannot prove is repeated:
+    #   36475808846 main 9d81866f  Windows-only job (job-name signature)
+    #   36476853851 main aa9e59a3  slice 13: all tests passed, pytest exited non-zero
+    #   36477241100 PR #1453       first red of test_no_new_source_proxy_asserts
+    #   36477804956 main 51e9b286  slice 3: segfault in test_usageless_response_accounting
+    #   36496636054 main ebf35a80  kanban test red but NOT annotated (no quarantine list on base)
+    assert paged == [36475808846, 36476853851, 36477241100, 36477804956, 36496636054]
+    folded = {rid: g for rid, g in routes.items() if g["route"] == "logs"}
+    assert len(folded) == 10 and len(routes) == 15
+    for rid, g in folded.items():
+        assert g["card"].startswith("already-red (run "), (rid, g)
+    # every ejection after the first proxy-asserts page folds, naming the PR
+    ejected = {g["pr"] for g in folded.values() if g["pr"]}
+    assert ejected == {"1426", "1453", "1458", "1459", "1463", "1464"}
+    assert routes[36489068867]["summary"].startswith("PR #1463 ejected on an already-red test (also failed run ")
+    # main 553943bd failed only the kanban test, already red on PR #1426's queue run; 71546f7d then on 553943bd
+    for rid, anchor in ((36490159001, 36489800880), (36494384491, 36490159001)):
+        assert routes[rid]["route"] == "logs" and routes[rid]["card"] == f"already-red (run {anchor})"
+        assert routes[rid]["summary"].startswith(f"main red on an already-red test (also failed run {anchor})")
+    # PR #1453's 23:14 run failed both tests: two different runs cover them, both named
+    assert routes[36496092766]["card"].count(",") == 1
+
+
+def test_fold_needs_every_failing_test_already_red(tmp_path):
+    # PR #1453's 23:14 run failed BOTH tests; drop the kanban test from every earlier run and it pages.
+    api = _r10_api()
+    for key, anns in api.items():
+        if key.startswith("check-runs/"):
+            api[key] = [a for a in anns if KANBAN not in a["message"]]
+    api["check-runs/" + str(next(j["id"] for j in R10["jobs"]["36496092766"] if "16/16" in j["name"])) + "/annotations"] = (
+        [{"message": f"{KANBAN}[guard]: FAILED (not quarantined)"}])
+    assert _replay(tmp_path, 36496092766, api)["route"] == "alerts"
+
+
+def test_fold_lookup_error_pages(tmp_path):
+    api = _r10_api()
+    del api[next(k for k in api if k.endswith("runs?status=failure"))]
+    assert _replay(tmp_path, 36490221633, api)["route"] == "alerts"
+
+
+def test_fold_ignores_the_same_prs_own_earlier_runs(tmp_path):
+    # Only another PR (or main) proves the test is not this PR's defect. Keep only PR #1463's own
+    # 22:04 kanban run as a candidate: its 23:00 proxy run must not fold on it.
+    api = _r10_api()
+    key = next(k for k in api if k.endswith("runs?status=failure"))
+    api[key]["workflow_runs"] = [r for r in api[key]["workflow_runs"] if "/pr-1463-" in (r["head_branch"] or "")]
+    assert _replay(tmp_path, 36494513399, api)["route"] == "alerts"

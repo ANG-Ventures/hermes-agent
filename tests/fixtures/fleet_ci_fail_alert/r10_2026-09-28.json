@@ -1,0 +1,4458 @@
+{
+"_comment": "Recorded 2026-09-28 from ANG-Ventures/hermes-agent (t_be1b9134): every CI run behind the 15 'CI FAILED' #alerts pages 20:07-23:19Z plus the two main runs between them. `pages` is [page time, run id, PR or null] in page order.",
+"annotations": {
+"109109291929": [
+"Process completed with exit code 1."
+],
+"109112590769": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests-os",
+"tests-os concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109113062918": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_tui_launcher_skips_plugin_discovery.py: rc=-6 timed_out=False \u2014 not a plain test failure, gating",
+"Process completed with exit code 1."
+],
+"109115304436": [
+"Process completed with exit code 1.",
+"tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109115511810": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109115628303": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109116277531": [
+"Process completed with exit code 1.",
+"tests/run_agent/test_usageless_response_accounting.py: rc=-11 timed_out=False \u2014 not a plain test failure, gating",
+"Process completed with exit code 1."
+],
+"109117773186": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109118107353": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109118776457": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109118914899": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109124543532": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1."
+],
+"109126930793": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109127003772": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109153264234": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1."
+],
+"109155317365": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109156063877": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109156106279": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1."
+],
+"109156866657": [
+"Process completed with exit code 1.",
+"tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109157472034": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1."
+],
+"109157498459": [
+"Process completed with exit code 1.",
+"tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109158267767": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109158381124": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109159153886": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109159385347": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109159558687": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109159630827": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109159943044": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109160127246": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109170765161": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1."
+],
+"109171152469": [
+"Process completed with exit code 1.",
+"tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109172585892": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109172650159": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109173440189": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109173445712": [
+"Process completed with exit code 1.",
+"tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109173637660": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109175287906": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109175354771": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1."
+],
+"109175718462": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109176202925": [
+"Process completed with exit code 1.",
+"tests/ci/test_no_new_source_proxy_asserts.py::test_no_new_source_proxy_asserts: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109176203101": [
+"Process completed with exit code 1.",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]: FAILED (not quarantined)",
+"tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]: FAILED (not quarantined)",
+"Process completed with exit code 1.",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109177494625": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109177564061": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109177755063": [
+"Process completed with exit code 1.",
+"no quarantine checker/list on base 03d1cc77040963e9745332215427464ac297c79c \u2014 the failure gates",
+"Process completed with exit code 1."
+],
+"109178043456": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109178156458": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109179688553": [
+"Process completed with exit code 1.",
+"required tests job not successful: test result=failure",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+],
+"109179745785": [
+"Process completed with exit code 1.",
+"1 job(s) failed: tests",
+"tests concluded 'failure'; expected 'success' or 'skipped'",
+"\"The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026. For more information, see https://github.com/actions/runner-images/issues/14748\""
+]
+},
+"jobs": {
+"36475808846": [
+{
+"conclusion": "success",
+"id": 109109108071,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109109108271,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109109290514,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109109290530,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109109290546,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109109290608,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109109290660,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109109290662,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109109290684,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "skipped",
+"id": 109109291526,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "success",
+"id": 109109291656,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "success",
+"id": 109109291715,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "success",
+"id": 109109291755,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109109291831,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "success",
+"id": 109109291868,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109109291887,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "failure",
+"id": 109109291929,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109109291976,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109109291989,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109109292063,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "skipped",
+"id": 109109292083,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109109292095,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109109292296,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109109293892,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "skipped",
+"id": 109109293953,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109109411077,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109109654679,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109109654948,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109109654973,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109109654974,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109109654979,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109109654980,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109109655001,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109109655012,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109109655028,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109109655052,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109109655053,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109109655055,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109109655090,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109109655109,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109109655139,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109109655180,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109109655193,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "skipped",
+"id": 109109655373,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109112485964,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "success",
+"id": 109112486072,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "failure",
+"id": 109112590769,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109112727861,
+"name": "CI timing report"
+}
+],
+"36476853851": [
+{
+"conclusion": "success",
+"id": 109112848412,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109112848840,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109112928268,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109112928281,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "success",
+"id": 109112928303,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109112928339,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109112928398,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109112928427,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109112928536,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109112929135,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109112929179,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109112929396,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "success",
+"id": 109112929417,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109112929420,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109112929456,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109112929494,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "success",
+"id": 109112929590,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "success",
+"id": 109112929636,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "success",
+"id": 109112929748,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "skipped",
+"id": 109112930169,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109112930360,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109112930403,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109112930589,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109112930839,
+"name": "Review label gate"
+},
+{
+"conclusion": "skipped",
+"id": 109112931485,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109113062526,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109113062755,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109113062785,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109113062816,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109113062845,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109113062850,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109113062859,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109113062865,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109113062873,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109113062885,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109113062894,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109113062907,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "failure",
+"id": 109113062918,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109113062939,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109113062940,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109113062973,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109113062996,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "skipped",
+"id": 109113063214,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109113124461,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "failure",
+"id": 109115511810,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109115513624,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109115628303,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109115848601,
+"name": "CI timing report"
+}
+],
+"36477241100": [
+{
+"conclusion": "success",
+"id": 109113911731,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109113912290,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109114073063,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109114277678,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109114277721,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109114278440,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109114278449,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109114278451,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109114278498,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109114278537,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "skipped",
+"id": 109114278585,
+"name": "Installer tests"
+},
+{
+"conclusion": "success",
+"id": 109114278611,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "skipped",
+"id": 109114278649,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109114278829,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109114278832,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109114278913,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109114279250,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109114279264,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109114279329,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109114279392,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109114279406,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109114280222,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109115168795,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109115303408,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109115304203,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109115304257,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109115304316,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109115304317,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109115304323,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109115304353,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109115304357,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109115304365,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109115304370,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109115304381,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109115304416,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109115304421,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "failure",
+"id": 109115304436,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109115304480,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109115304683,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109115304689,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "failure",
+"id": 109117773186,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109117775788,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109118107353,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109118246869,
+"name": "CI timing report"
+}
+],
+"36477804956": [
+{
+"conclusion": "success",
+"id": 109115979895,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109115980576,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109116159050,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109116159258,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109116159264,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109116159322,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109116159332,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109116159333,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109116159338,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "skipped",
+"id": 109116160116,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109116160130,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "success",
+"id": 109116160231,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109116160291,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "success",
+"id": 109116160395,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109116160535,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109116160687,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109116160785,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109116160828,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "skipped",
+"id": 109116160848,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "success",
+"id": 109116160931,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "success",
+"id": 109116160977,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "skipped",
+"id": 109116161048,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "success",
+"id": 109116161086,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109116162341,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "skipped",
+"id": 109116163011,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109116189340,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109116276814,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109116277477,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109116277484,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109116277489,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109116277501,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109116277507,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109116277523,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "failure",
+"id": 109116277531,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109116277535,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109116277550,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109116277573,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109116277587,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109116277632,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109116277667,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109116277680,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109116277693,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "skipped",
+"id": 109116277699,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109116277739,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "failure",
+"id": 109118776457,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109118778121,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109118914899,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109119000811,
+"name": "CI timing report"
+}
+],
+"36480232265": [
+{
+"conclusion": "success",
+"id": 109123773684,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109123775460,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109124118534,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109124118556,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "success",
+"id": 109124118573,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109124118660,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109124118714,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109124118774,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109124118918,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "skipped",
+"id": 109124119468,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "success",
+"id": 109124119542,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109124119718,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109124119721,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109124119765,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109124119838,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109124119873,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109124119967,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "success",
+"id": 109124119975,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "success",
+"id": 109124120138,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "skipped",
+"id": 109124120239,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109124120278,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "skipped",
+"id": 109124120323,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109124120950,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109124121168,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "skipped",
+"id": 109124121594,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109124543158,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109124543514,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "failure",
+"id": 109124543532,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109124543577,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109124543626,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109124543633,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109124543634,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109124543658,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109124543669,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109124543677,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109124543693,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109124543695,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109124543748,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109124543757,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109124543773,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109124543905,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109124543921,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109124544639,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "skipped",
+"id": 109124546320,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "failure",
+"id": 109126930793,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109126932958,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109127003772,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109127093856,
+"name": "CI timing report"
+}
+],
+"36489068867": [
+{
+"conclusion": "success",
+"id": 109153017414,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109153018103,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109153093486,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109153093635,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109153094124,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109153094142,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109153094154,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109153094207,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109153094244,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109153094248,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109153094299,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109153094709,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109153094821,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109153094978,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109153095057,
+"name": "Installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109153095062,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109153095306,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109153095347,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109153095798,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109153095891,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109153096678,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109153166800,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109153181135,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109153264004,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109153264169,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109153264184,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109153264206,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109153264210,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109153264218,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109153264219,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "failure",
+"id": 109153264234,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109153264235,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109153264245,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109153264255,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109153264257,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109153264268,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109153264305,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109153264322,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109153264327,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109153264331,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "failure",
+"id": 109155317365,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109155319525,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109156063877,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109156464049,
+"name": "CI timing report"
+}
+],
+"36489800880": [
+{
+"conclusion": "success",
+"id": 109155401223,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109155402037,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "skipped",
+"id": 109155769417,
+"name": "Installer tests"
+},
+{
+"conclusion": "success",
+"id": 109155769462,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109155769578,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "skipped",
+"id": 109155769628,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109155769770,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109155770105,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "success",
+"id": 109155770161,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "skipped",
+"id": 109155770250,
+"name": "Docs Site"
+},
+{
+"conclusion": "success",
+"id": 109155770252,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109155770272,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109155770283,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109155770448,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109155770455,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109155770509,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "success",
+"id": 109155770528,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109155770550,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109155770864,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109155771037,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109155771603,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109155829680,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109156042828,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109156105755,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109156106223,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109156106258,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109156106275,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "failure",
+"id": 109156106279,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109156106285,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109156106325,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109156106347,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109156106352,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109156106389,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109156106391,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109156106412,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109156106418,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109156106476,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109156106510,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109156106543,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109156106625,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "failure",
+"id": 109158267767,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109158270052,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109158381124,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109158436939,
+"name": "CI timing report"
+}
+],
+"36490104875": [
+{
+"conclusion": "success",
+"id": 109156392458,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109156392900,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109156547356,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109156689624,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109156689759,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109156690163,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109156690175,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109156690218,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109156690241,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109156690254,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109156690337,
+"name": "Installer tests"
+},
+{
+"conclusion": "success",
+"id": 109156690467,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109156690515,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109156690606,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109156690647,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109156690951,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109156691004,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109156691028,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109156691040,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109156691254,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109156691663,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109156692526,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109156785103,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109156866074,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109156866500,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109156866521,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109156866528,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109156866534,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109156866543,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109156866548,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109156866556,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109156866578,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109156866580,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109156866637,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "failure",
+"id": 109156866657,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109156866678,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109156866700,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109156866710,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109156866765,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109156866774,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "failure",
+"id": 109159153886,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109159161553,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109159385347,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109159688226,
+"name": "CI timing report"
+}
+],
+"36490159001": [
+{
+"conclusion": "success",
+"id": 109156569609,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109156569990,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109156776293,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "success",
+"id": 109156776338,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109156776355,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109156776490,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109156776516,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109156776524,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109156776547,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "skipped",
+"id": 109156777113,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "success",
+"id": 109156777197,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "success",
+"id": 109156777262,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109156777477,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109156777494,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "success",
+"id": 109156777557,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109156777585,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109156777648,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "success",
+"id": 109156777742,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109156777793,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109156777828,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "success",
+"id": 109156777845,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "success",
+"id": 109156777893,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "skipped",
+"id": 109156778044,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109156779507,
+"name": "Review label gate"
+},
+{
+"conclusion": "skipped",
+"id": 109156780172,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109157116759,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109157470794,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "skipped",
+"id": 109157471763,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109157471776,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109157471859,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109157471866,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109157471881,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109157471923,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109157471924,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109157471986,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109157471990,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109157472021,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "failure",
+"id": 109157472034,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109157472099,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109157472107,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109157472184,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109157472186,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109157472235,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109157472663,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "failure",
+"id": 109159943044,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109159944615,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109160127246,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109160399276,
+"name": "CI timing report"
+}
+],
+"36490221633": [
+{
+"conclusion": "success",
+"id": 109156780152,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109156780310,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109157069457,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109157069528,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109157070230,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109157070246,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109157070274,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "skipped",
+"id": 109157070296,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109157070328,
+"name": "Docs Site"
+},
+{
+"conclusion": "success",
+"id": 109157070390,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109157070435,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109157070477,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109157070486,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109157070578,
+"name": "Installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109157070657,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109157070729,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109157070760,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109157070770,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109157070886,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109157071010,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109157072346,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109157098872,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109157427744,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109157497912,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109157498331,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109157498385,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109157498401,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109157498420,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109157498436,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109157498439,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109157498448,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "failure",
+"id": 109157498459,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109157498464,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109157498466,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109157498476,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109157498495,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109157498519,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109157498525,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109157498571,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109157498791,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "failure",
+"id": 109159558687,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109159560958,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109159630827,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109159701653,
+"name": "CI timing report"
+}
+],
+"36494384491": [
+{
+"conclusion": "success",
+"id": 109170397681,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109170398071,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109170671556,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109170692382,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109170692409,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "success",
+"id": 109170692428,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109170692512,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109170692592,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109170692614,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109170692629,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "skipped",
+"id": 109170693134,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109170693313,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109170693403,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109170693526,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109170693585,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109170693601,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "success",
+"id": 109170693607,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109170693660,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109170693665,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109170693717,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "success",
+"id": 109170693836,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "skipped",
+"id": 109170693869,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109170693946,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "success",
+"id": 109170694078,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "skipped",
+"id": 109170694677,
+"name": "Review label gate"
+},
+{
+"conclusion": "skipped",
+"id": 109170694804,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109170764722,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109170765110,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109170765124,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109170765149,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109170765154,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "failure",
+"id": 109170765161,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109170765164,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109170765165,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109170765171,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109170765214,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109170765224,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109170765238,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109170765246,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109170765259,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109170765273,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109170765275,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109170765296,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "skipped",
+"id": 109170765462,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "failure",
+"id": 109172585892,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109172587704,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109172650159,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109172712232,
+"name": "CI timing report"
+}
+],
+"36494513399": [
+{
+"conclusion": "success",
+"id": 109170812273,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109170813016,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109170990375,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109170990382,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109170990732,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109170990793,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109170990804,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109170990813,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109170990835,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109170990843,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "skipped",
+"id": 109170991046,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109170991329,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109170991438,
+"name": "Installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109170991486,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109170991517,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109170991686,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109170991732,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109170992020,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109170992172,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109170992179,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109170992841,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109171012584,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109171088345,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109171151776,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109171152309,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109171152330,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109171152401,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109171152407,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109171152416,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109171152420,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109171152451,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109171152455,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109171152462,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "failure",
+"id": 109171152469,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109171152471,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109171152473,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109171152482,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109171152523,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109171152532,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109171152542,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "failure",
+"id": 109173440189,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109173441424,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109173637660,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109173906352,
+"name": "CI timing report"
+}
+],
+"36494568825": [
+{
+"conclusion": "success",
+"id": 109172838195,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109172838491,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109172940916,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109172940939,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "success",
+"id": 109172940962,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109172940968,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109172940972,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109172941021,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109172941112,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109172941713,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109172941725,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109172941772,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109172941776,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "skipped",
+"id": 109172941799,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "success",
+"id": 109172941829,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109172941834,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "skipped",
+"id": 109172941855,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109172941857,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109172942014,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "success",
+"id": 109172942025,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "skipped",
+"id": 109172942138,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "success",
+"id": 109172942194,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "skipped",
+"id": 109172942242,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109172943409,
+"name": "Review label gate"
+},
+{
+"conclusion": "skipped",
+"id": 109172943605,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109173107584,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109173108057,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109173108064,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109173108083,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109173108086,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109173108098,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109173108103,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109173108109,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109173108127,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109173108136,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109173108153,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109173108164,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109173108174,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109173108200,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109173108203,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109173108231,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109173108303,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "skipped",
+"id": 109173108354,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109173136553,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109175009184,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "success",
+"id": 109175009241,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "success",
+"id": 109175076584,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109175309733,
+"name": "CI timing report"
+}
+],
+"36495212297": [
+{
+"conclusion": "success",
+"id": 109173070117,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109173070595,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109173134771,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109173134821,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109173135378,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109173135380,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109173135427,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109173135434,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109173135442,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109173135455,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109173135483,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "skipped",
+"id": 109173135659,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109173135666,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109173135864,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109173135870,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109173135899,
+"name": "Installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109173136022,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109173136043,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109173136064,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109173136508,
+"name": "Review label gate"
+},
+{
+"conclusion": "skipped",
+"id": 109173136843,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "success",
+"id": 109173256582,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109173375000,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109173445157,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109173445616,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109173445648,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109173445653,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109173445655,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109173445679,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109173445698,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "failure",
+"id": 109173445712,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109173445733,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109173445740,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109173445752,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109173445755,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109173445761,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109173445774,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109173445798,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109173445800,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109173445870,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "failure",
+"id": 109175287906,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109175289059,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109175718462,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109175881165,
+"name": "CI timing report"
+}
+],
+"36495796647": [
+{
+"conclusion": "success",
+"id": 109174953100,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109174953500,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109175041762,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109175041811,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "skipped",
+"id": 109175042060,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109175042605,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109175042607,
+"name": "Installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109175042665,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "success",
+"id": 109175042829,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109175042844,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109175042857,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109175042898,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109175042901,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "skipped",
+"id": 109175042932,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "success",
+"id": 109175042959,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109175042989,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109175043072,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109175043104,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109175043162,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109175043167,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109175045120,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109175158860,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109175301444,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109175354133,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "success",
+"id": 109175354380,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109175354397,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109175354427,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109175354457,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109175354465,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109175354472,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109175354518,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109175354558,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109175354567,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109175354570,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109175354577,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109175354578,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109175354678,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109175354710,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109175354726,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "failure",
+"id": 109175354771,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "failure",
+"id": 109177494625,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109177496539,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109177564061,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109177652392,
+"name": "CI timing report"
+}
+],
+"36496092766": [
+{
+"conclusion": "success",
+"id": 109175897759,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109175898044,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109176058449,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "success",
+"id": 109176058550,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "success",
+"id": 109176058689,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109176058725,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109176058768,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109176058778,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109176058781,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109176058852,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "skipped",
+"id": 109176059382,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109176059781,
+"name": "Check uv.lock"
+},
+{
+"conclusion": "skipped",
+"id": 109176060004,
+"name": "Installer tests"
+},
+{
+"conclusion": "skipped",
+"id": 109176060103,
+"name": "Rust tests"
+},
+{
+"conclusion": "skipped",
+"id": 109176060121,
+"name": "JS & TS checks"
+},
+{
+"conclusion": "skipped",
+"id": 109176060170,
+"name": "Lint Docker scripts"
+},
+{
+"conclusion": "skipped",
+"id": 109176060314,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "skipped",
+"id": 109176060324,
+"name": "Docs Site"
+},
+{
+"conclusion": "skipped",
+"id": 109176060423,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109176060458,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "skipped",
+"id": 109176060715,
+"name": "Review label gate"
+},
+{
+"conclusion": "success",
+"id": 109176095251,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "success",
+"id": 109176161377,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109176202730,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "failure",
+"id": 109176202925,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109176202935,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109176202946,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "success",
+"id": 109176202970,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109176203022,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109176203033,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109176203037,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109176203038,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109176203044,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109176203064,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109176203099,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "failure",
+"id": 109176203101,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109176203102,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109176203124,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109176203140,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109176203192,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "failure",
+"id": 109178043456,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109178044725,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109178156458,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109178238634,
+"name": "CI timing report"
+}
+],
+"36496636054": [
+{
+"conclusion": "success",
+"id": 109177622449,
+"name": "Detect affected areas"
+},
+{
+"conclusion": "success",
+"id": 109177622835,
+"name": "OSV scan / Scan lockfiles / osv-scan"
+},
+{
+"conclusion": "success",
+"id": 109177687657,
+"name": "JS & TS checks / JS & TS checks"
+},
+{
+"conclusion": "success",
+"id": 109177687715,
+"name": "JS & TS checks / UI tests (shard 1/3)"
+},
+{
+"conclusion": "success",
+"id": 109177687797,
+"name": "JS & TS checks / UI tests (shard 2/3)"
+},
+{
+"conclusion": "success",
+"id": 109177687809,
+"name": "JS & TS checks / UI tests (shard 3/3)"
+},
+{
+"conclusion": "success",
+"id": 109177688037,
+"name": "Docs Site / docs-site-checks"
+},
+{
+"conclusion": "success",
+"id": 109177688040,
+"name": "Check no committed infographics / check-no-committed-infographics"
+},
+{
+"conclusion": "skipped",
+"id": 109177688097,
+"name": "Desktop E2E"
+},
+{
+"conclusion": "success",
+"id": 109177688126,
+"name": "Check contributors / check-attribution"
+},
+{
+"conclusion": "skipped",
+"id": 109177688243,
+"name": "Deny unrelated histories"
+},
+{
+"conclusion": "skipped",
+"id": 109177688485,
+"name": "package-lock.json diff"
+},
+{
+"conclusion": "skipped",
+"id": 109177688601,
+"name": "Supply-chain scan"
+},
+{
+"conclusion": "success",
+"id": 109177689124,
+"name": "Rust tests / cargo test (bootstrap installer)"
+},
+{
+"conclusion": "success",
+"id": 109177689233,
+"name": "OS-specific tests / Windows-only tests"
+},
+{
+"conclusion": "success",
+"id": 109177689265,
+"name": "OS-specific tests / macOS-only tests"
+},
+{
+"conclusion": "success",
+"id": 109177689278,
+"name": "Installer tests / PowerShell installer tests"
+},
+{
+"conclusion": "success",
+"id": 109177689358,
+"name": "Python tests / Generate slices"
+},
+{
+"conclusion": "success",
+"id": 109177689397,
+"name": "Lint Docker scripts / Lint docker/ shell scripts (shellcheck)"
+},
+{
+"conclusion": "success",
+"id": 109177689419,
+"name": "Python lints / ruff enforcement (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109177689429,
+"name": "Lint Docker scripts / Lint Dockerfile (hadolint)"
+},
+{
+"conclusion": "success",
+"id": 109177689457,
+"name": "Python lints / Windows footguns (blocking)"
+},
+{
+"conclusion": "success",
+"id": 109177689459,
+"name": "Check uv.lock / uv lock --check"
+},
+{
+"conclusion": "skipped",
+"id": 109177690089,
+"name": "Review label gate"
+},
+{
+"conclusion": "skipped",
+"id": 109177690858,
+"name": "Python lints / ruff + ty diff"
+},
+{
+"conclusion": "success",
+"id": 109177754375,
+"name": "Python tests / e2e"
+},
+{
+"conclusion": "skipped",
+"id": 109177754526,
+"name": "Python tests / Placement"
+},
+{
+"conclusion": "success",
+"id": 109177754925,
+"name": "Python tests / Run tests slice 2/16"
+},
+{
+"conclusion": "success",
+"id": 109177754954,
+"name": "Python tests / Run tests slice 13/16"
+},
+{
+"conclusion": "success",
+"id": 109177754959,
+"name": "Python tests / Run tests slice 8/16"
+},
+{
+"conclusion": "success",
+"id": 109177754961,
+"name": "Python tests / Run tests slice 7/16"
+},
+{
+"conclusion": "success",
+"id": 109177754984,
+"name": "Python tests / Run tests slice 9/16"
+},
+{
+"conclusion": "success",
+"id": 109177754991,
+"name": "Python tests / Run tests slice 6/16"
+},
+{
+"conclusion": "success",
+"id": 109177754999,
+"name": "Python tests / Run tests slice 4/16"
+},
+{
+"conclusion": "success",
+"id": 109177755006,
+"name": "Python tests / Run tests slice 11/16"
+},
+{
+"conclusion": "success",
+"id": 109177755008,
+"name": "Python tests / Run tests slice 10/16"
+},
+{
+"conclusion": "success",
+"id": 109177755019,
+"name": "Python tests / Run tests slice 14/16"
+},
+{
+"conclusion": "success",
+"id": 109177755026,
+"name": "Python tests / Run tests slice 3/16"
+},
+{
+"conclusion": "failure",
+"id": 109177755063,
+"name": "Python tests / Run tests slice 16/16"
+},
+{
+"conclusion": "success",
+"id": 109177755064,
+"name": "Python tests / Run tests slice 5/16"
+},
+{
+"conclusion": "success",
+"id": 109177755075,
+"name": "Python tests / Run tests slice 1/16"
+},
+{
+"conclusion": "success",
+"id": 109177755148,
+"name": "Python tests / Run tests slice 15/16"
+},
+{
+"conclusion": "success",
+"id": 109177755170,
+"name": "Python tests / Run tests slice 12/16"
+},
+{
+"conclusion": "success",
+"id": 109177780330,
+"name": "OSV scan / Emit review status"
+},
+{
+"conclusion": "failure",
+"id": 109179688553,
+"name": "Python tests / Tests complete"
+},
+{
+"conclusion": "skipped",
+"id": 109179689905,
+"name": "Python tests / save-durations"
+},
+{
+"conclusion": "failure",
+"id": 109179745785,
+"name": "All required checks pass"
+},
+{
+"conclusion": "success",
+"id": 109179807816,
+"name": "CI timing report"
+}
+]
+},
+"pages": [
+[
+"2026-09-28T20:07:17.628000+00:00",
+"36475808846",
+null
+],
+[
+"2026-09-28T20:15:17.793000+00:00",
+"36476853851",
+null
+],
+[
+"2026-09-28T20:24:11.044000+00:00",
+"36477241100",
+"1453"
+],
+[
+"2026-09-28T20:24:14.775000+00:00",
+"36477804956",
+null
+],
+[
+"2026-09-28T22:04:35.123000+00:00",
+"36489068867",
+"1463"
+],
+[
+"2026-09-28T22:10:28.914000+00:00",
+"36489800880",
+"1426"
+],
+[
+"2026-09-28T22:14:35.243000+00:00",
+"36490221633",
+"1464"
+],
+[
+"2026-09-28T22:15:28.349000+00:00",
+"36490104875",
+"1459"
+],
+[
+"2026-09-28T22:16:23.826000+00:00",
+"36490159001",
+null
+],
+[
+"2026-09-28T22:55:06.668000+00:00",
+"36494384491",
+null
+],
+[
+"2026-09-28T23:00:31.356000+00:00",
+"36494513399",
+"1463"
+],
+[
+"2026-09-28T23:07:46.416000+00:00",
+"36495212297",
+"1458"
+],
+[
+"2026-09-28T23:11:50.708000+00:00",
+"36495796647",
+"1458"
+],
+[
+"2026-09-28T23:14:01.417000+00:00",
+"36496092766",
+"1453"
+],
+[
+"2026-09-28T23:19:18.229000+00:00",
+"36496636054",
+null
+]
+],
+"runs": [
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T23:11:13Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "ebf35a800f47c5385dddeec740e3a6b1b070594e",
+"id": 36496636054,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T23:05:18Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1453-b482cdb8759172ea902de18ac9dab5a19f0acc6a",
+"head_sha": "8deb52f322b03627f3c2e99ccee5427e5da62a44",
+"id": 36496092766,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T23:02:05Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1458-ebf35a800f47c5385dddeec740e3a6b1b070594e",
+"head_sha": "b482cdb8759172ea902de18ac9dab5a19f0acc6a",
+"id": 36495796647,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:55:45Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1458-35e734a2ee4021a8419ca057c8f5f5997061d0b1",
+"head_sha": "2114f4ddb6adc8b929a421fb51f44720673a0754",
+"id": 36495212297,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "success",
+"created_at": "2026-09-28T22:48:51Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "03d1cc77040963e9745332215427464ac297c79c",
+"id": 36494568825,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:48:15Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1463-f3a6a4def2071c761bc13feca8bedccefa423724",
+"head_sha": "35e734a2ee4021a8419ca057c8f5f5997061d0b1",
+"id": 36494513399,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:46:53Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "71546f7d8256d367754e6dc3fac47f024e349e68",
+"id": 36494384491,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:04:58Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1464-075839dba1b84db13fb05aaa52951b84caa4568b",
+"head_sha": "32477c7341baf40248a0d027713268ddae3fd83e",
+"id": 36490221633,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:04:21Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "553943bd80a78b9cea4dab97d448d63dde0b5f6e",
+"id": 36490159001,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:03:50Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1459-1cd7d57ad049b7097e6273f598393359c236a411",
+"head_sha": "075839dba1b84db13fb05aaa52951b84caa4568b",
+"id": 36490104875,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T22:00:52Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1426-2fe2c2eb04b60a91c71b37a5a2a35655003aaa28",
+"head_sha": "7a30ea75f4d460892f2dcfaf14644042aeb8c555",
+"id": 36489800880,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T21:53:45Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1463-553943bd80a78b9cea4dab97d448d63dde0b5f6e",
+"head_sha": "b5e7b615ebef02f0a7aa435af63ad473ff8220bf",
+"id": 36489068867,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T20:35:03Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "37695d68c48ac85d998ce2a8a163a75ed422da89",
+"id": 36480232265,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T20:14:38Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "51e9b2864c21241b6af9b743d9898bdb1ce00bcd",
+"id": 36477804956,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T20:09:53Z",
+"event": "merge_group",
+"head_branch": "gh-readonly-queue/main/pr-1453-51e9b2864c21241b6af9b743d9898bdb1ce00bcd",
+"head_sha": "491cc6da4bee51da3c1985b2b9ba87a34ffdaf41",
+"id": 36477241100,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T20:06:31Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "aa9e59a3610584e9c20f2f51c01986fe4fd08d8a",
+"id": 36476853851,
+"name": "CI",
+"workflow_id": 340224912
+},
+{
+"conclusion": "failure",
+"created_at": "2026-09-28T19:57:31Z",
+"event": "push",
+"head_branch": "main",
+"head_sha": "9d81866fb374f1024668dff137b789a0a6138364",
+"id": 36475808846,
+"name": "CI",
+"workflow_id": 340224912
+}
+]
+}
