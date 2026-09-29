@@ -353,3 +353,83 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
     assert completes[0]["status"] == "complete"
+
+
+# ── Every terminal turn failure reaches a log/journal line (t_e8118410) ─
+#
+# A long-lived ``hermes serve`` failed every warm turn for ~4 h with a
+# stale-module ImportError and left no line in journald or errors.log: the
+# failure only existed in the client-bound frame. These pin that each
+# terminal-failure path writes one stderr (journald) line and one WARNING.
+
+
+_STALE = "cannot import name 'SESSION_ACTIVITY_PERSIST_NEVER' from 'agent.session_activity'"
+
+
+def _journal_lines(capsys):
+    return [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("[gateway-turn-error]")]
+
+
+def test_returned_error_turn_is_logged(emits, turn_env, capsys, caplog):
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {"final_response": "", "error": _STALE, "failed": True},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "what time is it")
+    with caplog.at_level("WARNING", logger=server.logger.name):
+        server._run_prompt_submit("rid", "sid", session, "what time is it")
+
+    lines = _journal_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "session=session-key" in lines[0] and _STALE in lines[0]
+    assert any(_STALE in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_exception_turn_is_logged(emits, turn_env, capsys):
+    def _boom(*a, **k):
+        raise ImportError(_STALE)
+
+    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_boom, clear_interrupt=lambda: None)
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "what time is it")
+    server._run_prompt_submit("rid", "sid", session, "what time is it")
+
+    lines = _journal_lines(capsys)
+    assert len(lines) == 1, lines
+    assert _STALE in lines[0]
+
+
+def test_agent_init_failure_turn_is_logged(emits, capsys):
+    # The agent-build path (_wait_agent_for_prompt error) funnels through
+    # _emit_terminal_turn_error with a plain string.
+    session = _session()
+    server._emit_terminal_turn_error("sid", session, _STALE, error_surface={"layer": "runtime"})
+
+    lines = _journal_lines(capsys)
+    assert len(lines) == 1, lines
+    assert _STALE in lines[0]
+
+
+def test_compute_host_turn_error_is_logged(emits, capsys, monkeypatch):
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    session = _session()
+    server._on_compute_host_turn_done("rid", "sid", session, {"type": "turn.error", "message": _STALE})
+
+    lines = _journal_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "source=compute_host" in lines[0] and _STALE in lines[0]
+
+
+def test_successful_turn_writes_no_error_line(emits, turn_env, capsys):
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {"final_response": "It's 4:56 PM."},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "what time is it")
+    server._run_prompt_submit("rid", "sid", session, "what time is it")
+    assert _journal_lines(capsys) == []
