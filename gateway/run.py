@@ -39002,15 +39002,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
             elif result and result.get("pending_steer") and adapter and session_key:
                 # A follow-up already owns the next turn. Queue the leftover
-                # steer behind it instead of dropping it (2026-09-29).
-                self._enqueue_fifo(
-                    session_key,
+                # steer behind it instead of dropping it (2026-09-29). Use the
+                # overflow tail, never the head slot: the depth-cap branch
+                # below re-seats pending_event in the head slot and would
+                # overwrite it; the next drain promotes the overflow head.
+                self._session_state(session_key).conversation.queued_events.append(
                     MessageEvent(
                         text=result["pending_steer"],
                         message_type=MessageType.TEXT,
                         source=source,
-                    ),
-                    adapter,
+                    )
                 )
                 logger.info(
                     "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
@@ -39283,10 +39284,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # The follow-up is a NEW turn on the parent's slot: re-stamp
                 # the turn clock and ack debounce so a busy/steer ack reports
                 # this turn's elapsed, not the parent's (2026-09-29).
-                _followup_state = self._peek_session_state(session_key)
-                if _followup_state is not None and _followup_state.turn.started_ts:
-                    _followup_state.turn.started_ts = time.time()
-                    _followup_state.turn.busy_ack_ts = 0.0
+                for _followup_key in {session_key, next_session_key}:
+                    _followup_state = self._peek_session_state(_followup_key) if _followup_key else None
+                    if _followup_state is not None and _followup_state.turn.started_ts:
+                        _followup_state.turn.started_ts = time.time()
+                        _followup_state.turn.busy_ack_ts = 0.0
 
                 followup_result = await self._run_agent(
                     message=next_message,

@@ -2840,10 +2840,9 @@ def run_conversation(
                         pass
                 _injected = True
                 logger.info(
-                    "Delivered /steer to agent (pre-API, tool msg index %d) (%d chars): %s",
+                    "Delivered /steer to agent (pre-API, tool msg index %d) (%d chars)",
                     _si,
                     len(_pre_api_steer),
-                    _pre_api_steer[:120] + ("..." if len(_pre_api_steer) > 120 else ""),
                 )
             if not _injected:
                 # No tool message to inject into — put it back so

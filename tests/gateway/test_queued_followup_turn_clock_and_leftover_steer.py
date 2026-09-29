@@ -86,7 +86,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _drive(monkeypatch, tmp_path, script):
+async def _drive(monkeypatch, tmp_path, script, *, prepare=None, followup_source=None):
     """Run ``_run_agent`` with a stub agent; ``script(call_index, queue_followup)``
     returns the result dict for each turn (and may queue follow-ups)."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
@@ -133,9 +133,11 @@ async def _drive(monkeypatch, tmp_path, script):
 
     def queue_followup(text):
         adapter._pending_messages[SESSION_KEY] = MessageEvent(
-            text=text, message_type=MessageType.TEXT, source=_source()
+            text=text, message_type=MessageType.TEXT, source=followup_source or _source()
         )
 
+    if prepare is not None:
+        prepare(runner)
     result = await runner._run_agent(
         message="first",
         context_prompt="",
@@ -185,3 +187,66 @@ async def test_leftover_steer_not_dropped_when_followup_is_queued(monkeypatch, t
     messages = [c["message"] for c in calls]
     assert messages[:2] == ["first", "queued follow-up"]
     assert any("late steer text" in m for m in messages[2:]), messages
+
+
+@pytest.mark.asyncio
+async def test_leftover_steer_survives_recursion_depth_cap(monkeypatch, tmp_path):
+    """At the depth cap the follow-up is re-seated in the head slot instead of
+    recursing; that must not overwrite the queued leftover steer."""
+
+    def script(idx, queue_followup):
+        queue_followup("queued follow-up")
+        return {
+            "final_response": "first answer",
+            "messages": [],
+            "api_calls": 1,
+            "pending_steer": "late steer text",
+        }
+
+    def prepare(runner):
+        runner._MAX_INTERRUPT_DEPTH = 0  # cap hit on the first drain
+
+    runner, adapter, calls, _result = await _drive(
+        monkeypatch, tmp_path, script, prepare=prepare
+    )
+
+    assert [c["message"] for c in calls] == ["first"]
+    head = adapter._pending_messages.get(SESSION_KEY)
+    overflow = list(runner._session_state(SESSION_KEY).conversation.queued_events)
+    texts = ([head.text] if head else []) + [e.text for e in overflow]
+    assert "queued follow-up" in texts
+    assert "late steer text" in texts, texts
+
+
+@pytest.mark.asyncio
+async def test_followup_under_other_session_key_restamps_that_key(monkeypatch, tmp_path):
+    other_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-2002",
+        chat_type="group",
+        thread_id="99",
+    )
+    seen = {}
+
+    def script(idx, queue_followup):
+        if idx == 0:
+            queue_followup("queued follow-up")
+            return {"final_response": "first answer", "messages": [], "api_calls": 1}
+        turn = seen["runner"]._session_state(seen["other_key"]).turn
+        seen["during_followup"] = (turn.started_ts, turn.busy_ack_ts)
+        return {"final_response": "second answer", "messages": [], "api_calls": 1}
+
+    def prepare(runner):
+        other_key = runner._session_key_for_source(other_source)
+        assert other_key != SESSION_KEY
+        seen["other_key"] = other_key
+        seen["runner"] = runner
+        other = runner._session_state(other_key)
+        other.turn.started_ts = time.time() - PARENT_AGE_S
+        other.turn.busy_ack_ts = time.time() - 5
+
+    await _drive(monkeypatch, tmp_path, script, prepare=prepare, followup_source=other_source)
+
+    started_ts, busy_ack_ts = seen["during_followup"]
+    assert time.time() - started_ts < 60
+    assert busy_ack_ts == 0.0
