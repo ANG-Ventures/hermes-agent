@@ -101,7 +101,7 @@ DRIVER = textwrap.dedent(
     out["in_known_names"] = PROBE in models._KNOWN_PROVIDER_NAMES
 
     # Picker + /model label resolution: CALL them, don't just import them.
-    from hermes_cli.model_switch import list_picker_providers
+    from hermes_cli.model_switch_providers import list_picker_providers
     from hermes_cli.models import provider_label
 
     rows = list_picker_providers(max_models=50)
