@@ -7,8 +7,8 @@ import openai
 import pytest
 
 from agent.error_classifier import FailoverReason, classify_api_error
-from tests.run_agent.test_primary_runtime_restore import _make_agent
-from tests.run_agent.test_provider_fallback import _make_agent as _fallback_agent, _mock_client
+from tests.agent.test_primary_runtime_restore import _make_agent
+from tests.agent.test_provider_fallback import _make_agent as _fallback_agent, _mock_client
 
 
 SAFETY_MESSAGE = (
@@ -60,7 +60,7 @@ def test_fallback_display_keeps_routing_reason_and_cooldown(status):
         patch("agent.fallback_cooldown._arm_rate_limit_cooldown", return_value=None) as cooldown,
     ):
         assert agent._try_activate_fallback(reason=classified.reason, display_reason=classified.display_reason)
-    cooldown.assert_called_once_with(agent, classified.reason)
+    cooldown.assert_called_once_with(agent, classified.reason, reset_at=None)
     assert "content policy blocked" in agent._pending_fallback_notice[-1]
     assert agent.model == "glm-5.2"
 
