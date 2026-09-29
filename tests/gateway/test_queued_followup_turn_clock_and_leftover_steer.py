@@ -219,7 +219,10 @@ async def test_leftover_steer_survives_recursion_depth_cap(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_followup_under_other_session_key_restamps_that_key(monkeypatch, tmp_path):
+async def test_followup_under_other_session_key_leaves_that_turns_clock(monkeypatch, tmp_path):
+    """A follow-up whose source maps to a DIFFERENT key must not re-stamp that
+    key: a live started_ts there belongs to another running turn (its stale-lock
+    age and busy-ack debounce must not move). The parent's own key is re-stamped."""
     other_source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-2002",
@@ -227,6 +230,8 @@ async def test_followup_under_other_session_key_restamps_that_key(monkeypatch, t
         thread_id="99",
     )
     seen = {}
+    other_started = time.time() - PARENT_AGE_S
+    other_ack = time.time() - 5
 
     def script(idx, queue_followup):
         if idx == 0:
@@ -242,11 +247,45 @@ async def test_followup_under_other_session_key_restamps_that_key(monkeypatch, t
         seen["other_key"] = other_key
         seen["runner"] = runner
         other = runner._session_state(other_key)
-        other.turn.started_ts = time.time() - PARENT_AGE_S
-        other.turn.busy_ack_ts = time.time() - 5
+        other.turn.started_ts = other_started
+        other.turn.busy_ack_ts = other_ack
 
-    await _drive(monkeypatch, tmp_path, script, prepare=prepare, followup_source=other_source)
+    _runner, _adapter, calls, _result = await _drive(
+        monkeypatch, tmp_path, script, prepare=prepare, followup_source=other_source
+    )
 
-    started_ts, busy_ack_ts = seen["during_followup"]
-    assert time.time() - started_ts < 60
-    assert busy_ack_ts == 0.0
+    assert seen["during_followup"] == (other_started, other_ack)
+    assert time.time() - calls[1]["started_ts"] < 60
+    assert calls[1]["busy_ack_ts"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/stop", "/new"])
+async def test_leftover_steer_slash_command_not_queued(monkeypatch, tmp_path, command):
+    """A leftover steer that is a gateway command must be discarded, like the
+    pending-text guard does, not queued behind the follow-up. At the depth cap
+    nothing re-drains the overflow here, so a queued "/stop" would later be read
+    as a real command by the normal inbound path."""
+
+    def script(idx, queue_followup):
+        queue_followup("queued follow-up")
+        return {
+            "final_response": "first answer",
+            "messages": [],
+            "api_calls": 1,
+            "pending_steer": command,
+        }
+
+    def prepare(runner):
+        runner._MAX_INTERRUPT_DEPTH = 0  # inspect the queue without re-draining
+
+    runner, adapter, calls, _result = await _drive(
+        monkeypatch, tmp_path, script, prepare=prepare
+    )
+
+    assert [c["message"] for c in calls] == ["first"]
+    head = adapter._pending_messages.get(SESSION_KEY)
+    overflow = list(runner._session_state(SESSION_KEY).conversation.queued_events)
+    texts = ([head.text] if head else []) + [e.text for e in overflow]
+    assert "queued follow-up" in texts
+    assert command not in texts, texts

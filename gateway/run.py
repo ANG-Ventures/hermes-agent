@@ -39006,18 +39006,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # overflow tail, never the head slot: the depth-cap branch
                 # below re-seats pending_event in the head slot and would
                 # overwrite it; the next drain promotes the overflow head.
-                self._session_state(session_key).conversation.queued_events.append(
-                    MessageEvent(
-                        text=result["pending_steer"],
-                        message_type=MessageType.TEXT,
-                        source=source,
+                # Apply the same slash-command guard as the pending text below:
+                # a leftover "/stop" or "/new" must never reach the agent.
+                _leftover_text = result["pending_steer"]
+                _leftover_is_cmd = False
+                _leftover_parts = _leftover_text.strip().split(None, 1)
+                if _leftover_parts and _leftover_parts[0].startswith("/"):
+                    _leftover_cmd_word = _leftover_parts[0][1:].lower()
+                    if _leftover_cmd_word:
+                        try:
+                            from hermes_cli.commands import resolve_command as _rc_leftover
+                            _leftover_is_cmd = bool(_rc_leftover(_leftover_cmd_word))
+                        except Exception:
+                            pass
+                if _leftover_is_cmd:
+                    logger.info(
+                        "Discarding command '/%s' from leftover /steer — "
+                        "commands must not be passed as agent input",
+                        _leftover_cmd_word,
                     )
-                )
-                logger.info(
-                    "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
-                    session_key,
-                    len(result["pending_steer"]),
-                )
+                else:
+                    self._session_state(session_key).conversation.queued_events.append(
+                        MessageEvent(
+                            text=_leftover_text,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                        )
+                    )
+                    logger.info(
+                        "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
+                        session_key,
+                        len(_leftover_text),
+                    )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -39283,12 +39303,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # The follow-up is a NEW turn on the parent's slot: re-stamp
                 # the turn clock and ack debounce so a busy/steer ack reports
-                # this turn's elapsed, not the parent's (2026-09-29).
-                for _followup_key in {session_key, next_session_key}:
-                    _followup_state = self._peek_session_state(_followup_key) if _followup_key else None
-                    if _followup_state is not None and _followup_state.turn.started_ts:
-                        _followup_state.turn.started_ts = time.time()
-                        _followup_state.turn.busy_ack_ts = 0.0
+                # this turn's elapsed, not the parent's (2026-09-29). Only the
+                # key this run claimed (session_key): a different
+                # next_session_key with a live started_ts belongs to ANOTHER
+                # running turn, whose clock and ack debounce must not move.
+                _followup_state = self._peek_session_state(session_key) if session_key else None
+                if _followup_state is not None and _followup_state.turn.started_ts:
+                    _followup_state.turn.started_ts = time.time()
+                    _followup_state.turn.busy_ack_ts = 0.0
 
                 followup_result = await self._run_agent(
                     message=next_message,
