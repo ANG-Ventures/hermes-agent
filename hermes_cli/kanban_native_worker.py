@@ -215,7 +215,8 @@ def run() -> int:
     err_file = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(argv, cwd=workspace or None, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=err_file, env=env, text=True)
+                                stdout=subprocess.PIPE, stderr=err_file, env=env, text=True,
+                                encoding="utf-8", errors="replace")
     except OSError as exc:
         return 0 if _block(f"native worker: lane could not start: {exc}") else 1
 
@@ -229,7 +230,10 @@ def run() -> int:
         # No board write: the dispatcher's timeout/reclaim path owns this card.
         os._exit(128 + signum)
 
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):  # SIGHUP is POSIX-only
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
         signal.signal(sig, _forward)
     beat = _Heartbeat(started)
     beat.start()
