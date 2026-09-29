@@ -102,8 +102,10 @@ def _assert_live_store_write_allowed(path: Path) -> None:
             )
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+    """Open this profile's store, or ``db_path`` (the orphan repair CLI
+    writes flagged rows into every profile's store from one process)."""
+    path = Path(db_path) if db_path else _db_path()
     _assert_live_store_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
@@ -963,17 +965,22 @@ def _refresh_turn_route(conn: sqlite3.Connection, turn_id: str) -> None:
 
 
 def insert_turn(
-    record: TurnRecord, *, provisional: bool = False, move_last_turn: bool = True
+    record: TurnRecord,
+    *,
+    provisional: bool = False,
+    move_last_turn: bool = True,
+    db_path: Path | str | None = None,
 ) -> bool:
     """Persist one turn. Telemetry failures are logged but never raised.
 
-    ``provisional`` (a host abandoning an in-flight turn at shutdown): the
-    insert atomically does nothing when the turn already has a row, and the
-    channel's ``last_turn`` pointer is never moved. A real row written later
-    upserts over it. Returns True when a row was written.
+    ``provisional`` (a host abandoning an in-flight turn at shutdown, or the
+    orphan repair CLI): the insert atomically does nothing when the turn
+    already has a row, and the channel's ``last_turn`` pointer is never
+    moved. A real row written later upserts over it. Returns True when a row
+    was written. ``db_path`` targets another profile's store.
     """
     try:
-        with _connect() as conn:
+        with _connect(db_path) as conn:
             cur = conn.execute(
                 _INSERT_TURN_PROVISIONAL_SQL if provisional else _INSERT_TURN_SQL,
                 (
@@ -1085,7 +1092,7 @@ def insert_turn(
         return False
 
 
-def ledger_turn_usage(turn_id: str) -> dict | None:
+def ledger_turn_usage(turn_id: str, db_path: Path | str | None = None) -> dict | None:
     """Turn usage rebuilt from this turn's own ``turn_api_calls`` rows.
 
     Used for a turn the host abandoned mid-flight: the per-call ledger is
@@ -1094,7 +1101,7 @@ def ledger_turn_usage(turn_id: str) -> dict | None:
     stays unknown, never a measured 0. None when the turn has no rows.
     """
     try:
-        with _connect() as conn:
+        with _connect(db_path) as conn:
             rows = conn.execute(
                 "SELECT input_tokens, output_tokens, cache_read, cache_write, "
                 "reasoning, provider, model FROM turn_api_calls "

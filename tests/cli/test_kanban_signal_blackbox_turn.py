@@ -79,8 +79,12 @@ def test_signaled_worker_turn_gets_a_turns_row(ledger, monkeypatch):
     assert _orphans(ledger) == []
     import sqlite3
     with sqlite3.connect(ledger) as conn:
-        assert conn.execute("SELECT interrupted FROM turns WHERE turn_id = ?",
-                            (turn_id,)).fetchone() == (1,)
+        # Flagged as a signal kill (t_50422844), and priced from the turn's own
+        # ledger rows rather than recorded as a 0-token turn.
+        assert conn.execute(
+            "SELECT interrupted, terminal_error, api_calls, input_tokens, output_tokens "
+            "FROM turns WHERE turn_id = ?", (turn_id,),
+        ).fetchone() == (1, "signal_15", 1, 10, 5)
 
 
 def test_flush_runs_before_session_end_and_failures_are_contained(monkeypatch):
@@ -88,9 +92,9 @@ def test_flush_runs_before_session_end_and_failures_are_contained(monkeypatch):
     monkeypatch.setattr(cli_mod, "_flush_one_shot_session_store",
                         lambda _cli: (order.append("flush"), 1 / 0))
     monkeypatch.setattr(cli_mod, "_emit_interrupted_session_end",
-                        lambda _cli, reason: order.append(reason))
+                        lambda _cli, reason, terminal_error=None: order.append((reason, terminal_error)))
     cli_mod._finalize_signaled_kanban_worker(SimpleNamespace(agent=None), 15)
-    assert order == ["flush", "signal_15"]
+    assert order == ["flush", ("signal_15", "signal_15")]
 
 
 def test_kanban_signal_path_calls_the_finalizer():  # noqa: source-proxy wiring of a closure nested in main() that only a real signal reaches and that ends in os._exit; the finalizer itself is exercised behaviourally above

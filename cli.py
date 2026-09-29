@@ -1311,8 +1311,15 @@ def _notify_session_finalize(
         pass
 
 
-def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") -> None:
-    """Best-effort on_session_end hook for interrupted non-interactive runs."""
+def _emit_interrupted_session_end(
+    cli, *, reason: str = "keyboard_interrupt", terminal_error: str | None = None
+) -> None:
+    """Best-effort on_session_end hook for interrupted non-interactive runs.
+
+    ``terminal_error`` names how the turn was closed from outside the loop
+    (``signal_15``); blackbox stores it on the turn row so a killed worker's
+    turn is distinguishable from a user interrupt.
+    """
     agent = getattr(cli, "agent", None)
     if agent is None:
         return
@@ -1346,6 +1353,7 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
             model=getattr(agent, "model", None),
             platform=getattr(agent, "platform", None) or "cli",
             reason=reason,
+            terminal_error=terminal_error,
         )
     except Exception:
         pass
@@ -1367,7 +1375,8 @@ def _finalize_signaled_kanban_worker(cli, signum) -> None:
     except Exception:
         pass
     try:
-        _emit_interrupted_session_end(cli, reason=f"signal_{int(signum)}")
+        reason = f"signal_{int(signum)}"
+        _emit_interrupted_session_end(cli, reason=reason, terminal_error=reason)
     except Exception:
         pass
 

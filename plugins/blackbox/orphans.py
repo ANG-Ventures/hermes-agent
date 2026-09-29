@@ -9,12 +9,22 @@ on the invariant instead of relying on someone noticing a missing failure.
 
 CLI (stdout is empty and exit 0 when clean, so a no_agent cron stays silent)::
 
-    python -m plugins.blackbox.orphans [--since-hours 24] [--settle-s 3600] \
-        [--max 0] [DB ...]
+    python -m plugins.blackbox.orphans [--since-hours 24] [--settle-s 3600] \\
+        [--max 0] [--repair [--dry-run]] [DB ...]
 
 With no DB arguments it scans ``<home>/blackbox/turns.db`` plus every
 ``<home>/profiles/*/blackbox/turns.db`` (home = the Hermes home root). Databases are opened
 read-only (``mode=ro``, never ``immutable=1`` -- they are live WAL stores).
+
+``--repair`` writes ONE flagged ``turns`` row per orphan, built from the
+turn's own ``turn_api_calls`` aggregates (ts span, calls, tokens, primary
+route, cost): ``interrupted=1``, ``terminal_error='orphan_repair'``. The
+insert is ``ON CONFLICT DO NOTHING`` and never moves a channel's last-turn
+pointer, so a real row (present or written concurrently) always wins and a
+repaired row can never pass as a normal one. Orphans exist because the
+process that owned the turn was killed before ``on_session_end`` (SIGKILL,
+a pre-fix worker); the row's chat/platform attribution is unknown and left
+empty.
 """
 
 from __future__ import annotations
@@ -90,6 +100,100 @@ def scan(
     return out
 
 
+REPAIR_MARKER = "orphan_repair"
+
+
+def profile_for_path(path: str) -> str:
+    """``.../profiles/<name>/blackbox/turns.db`` -> name; the root store -> default."""
+    parts = os.path.normpath(path).split(os.sep)
+    if len(parts) >= 4 and parts[-4] == "profiles" and parts[-2] == "blackbox":
+        return parts[-3]
+    return "default"
+
+
+def _orphan_route(conn: sqlite3.Connection, turn_id: str) -> tuple[str, str, float, float]:
+    """(provider, model, first_ts, last_ts) from the orphan's own calls.
+
+    The primary route is the first main-lane call's (what a live turn would
+    have recorded); an orphan with only aux calls falls back to its first
+    call so the row still names the route that produced it.
+    """
+    first, last = conn.execute(
+        "SELECT MIN(ts), MAX(ts) FROM turn_api_calls WHERE turn_id = ?", (turn_id,)
+    ).fetchone()
+    row = conn.execute(
+        "SELECT provider, model FROM turn_api_calls WHERE turn_id = ? "
+        "ORDER BY (COALESCE(lane_family, '') = 'aux'), (parent_call_id IS NOT NULL), seq "
+        "LIMIT 1",
+        (turn_id,),
+    ).fetchone()
+    provider, model = (row or ("", ""))
+    return str(provider or ""), str(model or ""), float(first or 0.0), float(last or 0.0)
+
+
+def repair_record(path: str, turn_id: str):
+    """Build the flagged ``TurnRecord`` for one orphan from its ledger rows."""
+    from plugins import blackbox
+    from plugins.blackbox import store
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        provider, model, first_ts, last_ts = _orphan_route(conn, turn_id)
+    finally:
+        conn.close()
+    usage = store.ledger_turn_usage(turn_id, db_path=path) or {}
+    cfg = blackbox._config() or dict(blackbox._DEFAULTS)
+    record = blackbox._build_record(
+        session_id=turn_id.split(":", 1)[0],
+        interrupted=True,
+        model=model,
+        platform="",
+        provider=provider,
+        user_message="",
+        final_response="",
+        turn_usage=usage,
+        cfg=cfg,
+        kwargs={
+            "turn_id": turn_id,
+            "profile": profile_for_path(path),
+            "provisional": True,
+            "terminal_error": REPAIR_MARKER,
+        },
+    )
+    if record is not None:
+        record.ts_start = first_ts
+        record.ts_end = last_ts or first_ts
+    return record
+
+
+def repair(
+    results: dict[str, list[tuple[str, float, int]]], *, apply: bool = True
+) -> dict[str, list[tuple[str, bool]]]:
+    """Write one flagged row per orphan; ``(turn_id, written)`` per store.
+
+    A row is only ever written where none exists (``insert_turn(provisional=
+    True)`` is ``ON CONFLICT DO NOTHING``), so a turn whose real row lands
+    between the scan and the write keeps the real row. With ``apply=False``
+    nothing is written and every entry reports ``False``.
+    """
+    from plugins.blackbox import store
+
+    out: dict[str, list[tuple[str, bool]]] = {}
+    for path, rows in sorted(results.items()):
+        done: list[tuple[str, bool]] = []
+        for turn_id, _last_ts, _errs in rows:
+            written = False
+            if apply:
+                record = repair_record(path, turn_id)
+                written = record is not None and store.insert_turn(
+                    record, provisional=True, db_path=path
+                )
+            done.append((turn_id, bool(written)))
+        out[path] = done
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Count turn_api_calls turn_ids with no parent turns row."
@@ -99,12 +203,35 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--since", type=float, default=None, help="epoch lower bound (overrides --since-hours)")
     ap.add_argument("--settle-s", type=float, default=DEFAULT_SETTLE_S)
     ap.add_argument("--max", type=int, default=0, help="orphans tolerated before failing")
+    ap.add_argument(
+        "--repair", action="store_true",
+        help=f"write a flagged turns row (interrupted=1, terminal_error={REPAIR_MARKER}) "
+             "for every orphan in the window from its turn_api_calls aggregates; "
+             "never touches an existing row",
+    )
+    ap.add_argument("--dry-run", action="store_true", help="with --repair: list, write nothing")
     args = ap.parse_args(argv)
 
     now = time.time()
     since = args.since if args.since is not None else now - args.since_hours * 3600.0
     results = scan(args.dbs or default_db_paths(), since=since, settle_before=now - args.settle_s)
     total = sum(len(v) for v in results.values())
+    if args.repair:
+        written = repair(results, apply=not args.dry_run)
+        n_written = 0
+        for path, rows in sorted(written.items()):
+            if not rows:
+                continue
+            ok_n = sum(1 for _tid, ok in rows if ok)
+            n_written += ok_n
+            head = f"would repair {len(rows)}" if args.dry_run else f"repaired {ok_n}/{len(rows)}"
+            print(f"{head} orphan turn(s) in {path}")
+            for tid, ok in rows:
+                note = "" if ok or args.dry_run else "  (not written: row exists now or insert failed)"
+                print(f"    {tid}{note}")
+        if args.dry_run:
+            return 0 if total <= args.max else 1
+        return 0 if n_written == total else 1
     if total <= args.max:
         return 0
     print(
