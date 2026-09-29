@@ -6,6 +6,9 @@ import pytest
 import yaml
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -49,7 +52,7 @@ def test_missing_mount_never_creates_workspace(home, precreate):
         root.mkdir(parents=True)
     configure(home, root)
     with pytest.raises(ValueError, match='workspaces_root_unmounted'):
-        kb.resolve_workspace(scratch(), board='default')
+        kbw.resolve_workspace(scratch(), board='default')
     assert not (root / 'default').exists()
     assert root.exists() == precreate
 
@@ -98,7 +101,7 @@ def test_create_scratch_keeps_admitted_mount_anchor(home, monkeypatch):
     monkeypatch.setattr(policy, 'validate_target', vanish_after_admission)
     target = root / 'default' / 't_probe'
     with pytest.raises(ValueError, match='workspaces_root_unmounted'):
-        kb.resolve_workspace(scratch(), board='default')
+        kbw.resolve_workspace(scratch(), board='default')
     assert not target.exists()
 
 
@@ -107,18 +110,18 @@ def test_persisted_path_missing_after_config_rollback_is_not_recreated(home, mon
     root.mkdir(parents=True)
     configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
-    path = kb.resolve_workspace(scratch(), board='default')
+    path = kbw.resolve_workspace(scratch(), board='default')
     path.rmdir()
     (home / 'config.yaml').write_text('kanban: {}\n')
     monkeypatch.setattr('os.path.ismount', lambda p: False)
     with pytest.raises(ValueError, match='stranded_by_mount_loss|workspaces_root_unmounted'):
-        kb.resolve_workspace(scratch(str(path)), board='default')
+        kbw.resolve_workspace(scratch(str(path)), board='default')
     assert not path.exists()
 
 
 def test_durable_explicit_scratch_keeps_creation_contract(home):
     path = home / 'durable' / 'new-workspace'
-    assert kb.resolve_workspace(scratch(str(path)), board='default') == path
+    assert kbw.resolve_workspace(scratch(str(path)), board='default') == path
     assert path.is_dir()
 
 
@@ -127,22 +130,22 @@ def test_persisted_dir_cannot_bypass_registered_mount(home, monkeypatch):
     root.mkdir(parents=True)
     configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
-    path = kb.resolve_workspace(scratch(), board='default')
+    path = kbw.resolve_workspace(scratch(), board='default')
     (home / 'config.yaml').write_text('kanban: {}\n')
     monkeypatch.setattr('os.path.ismount', lambda p: False)
     task = SimpleNamespace(id='t_probe', workspace_kind='dir', workspace_path=str(path))
     with pytest.raises(ValueError, match='workspaces_root_unmounted'):
-        kb.resolve_workspace(task, board='default')
+        kbw.resolve_workspace(task, board='default')
 
 
 @pytest.mark.parametrize('dry_run', [False, True])
 def test_dispatch_refuses_before_spawn_or_failure_count(home, dry_run):
     root = home / 'absent-volume' / 'kanban-workspaces'
     configure(home, root)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.create_task(conn, title='mount probe', assignee='default')
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args), dry_run=dry_run)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args), dry_run=dry_run)
         assert not calls
         assert not result.spawned
         assert not result.auto_blocked
@@ -161,19 +164,19 @@ def test_restart_marks_missing_persisted_workspace_without_recreating(home, monk
     root.mkdir(parents=True)
     configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
-    path = kb.resolve_workspace(scratch(), board='default')
+    path = kbw.resolve_workspace(scratch(), board='default')
     path.rmdir()
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title='lost workspace', assignee='default',
                                  workspace_kind=kind, workspace_path=str(path))
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
         assert not calls
         assert task_id in result.stranded_by_mount_loss
         assert not path.exists()
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='stranded_by_mount_loss'",
                             (task_id,)).fetchone()[0] == 1
-        retry = kb.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
+        retry = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
         assert task_id in retry.stranded_by_mount_loss
         assert not calls
         assert not path.exists()
@@ -190,12 +193,12 @@ def test_board_symlink_cannot_redirect_creation(home, monkeypatch):
     configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
     with pytest.raises((OSError, ValueError)):
-        kb.resolve_workspace(scratch(), board='default')
+        kbw.resolve_workspace(scratch(), board='default')
     assert not (outside / 't_probe').exists()
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title='symlink target', assignee='default')
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
         assert task_id in [item[0] for item in result.workspace_refused]
 
 
@@ -204,7 +207,7 @@ def test_persisted_workspace_race_is_never_recreated(home, monkeypatch):
     root.mkdir(parents=True)
     configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
-    path = kb.resolve_workspace(scratch(), board='default')
+    path = kbw.resolve_workspace(scratch(), board='default')
     from hermes_cli import kanban_workspace_policy as policy
     real_validate = policy.validate_persisted
 
@@ -213,7 +216,7 @@ def test_persisted_workspace_race_is_never_recreated(home, monkeypatch):
         candidate.rmdir()
 
     monkeypatch.setattr(policy, 'validate_persisted', delete_after_validation)
-    assert kb.resolve_workspace(scratch(str(path)), board='default') == path
+    assert kbw.resolve_workspace(scratch(str(path)), board='default') == path
     assert not path.exists()
 
 
@@ -228,10 +231,10 @@ def test_post_claim_mount_race_requeues_without_failure_charge(home, monkeypatch
         raise policy.WorkspaceUnavailable(f'workspaces_root_unmounted: {root}')
 
     monkeypatch.setattr(policy, 'create_scratch', vanish_during_create)
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title='mount race', assignee='default')
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == 'ready'
         assert task.consecutive_failures == 0
@@ -246,7 +249,7 @@ def test_review_post_claim_mount_race_returns_to_review(home, monkeypatch):
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
     from hermes_cli import kanban_workspace_policy as policy
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title='review mount race', assignee='default')
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
@@ -259,7 +262,7 @@ def test_review_post_claim_mount_race_returns_to_review(home, monkeypatch):
             raise policy.WorkspaceUnavailable(f'workspaces_root_unmounted: {root}')
 
         monkeypatch.setattr(policy, 'create_scratch', vanish_during_create)
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == 'review'
         assert task.current_run_id is None
@@ -273,7 +276,7 @@ def test_most_specific_historical_root_wins(home, monkeypatch):
     path = specific / 'default' / 't_probe'
     path.mkdir(parents=True)
     (home / 'config.yaml').write_text('kanban: {}\n')
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         conn.execute(
             "INSERT INTO workspace_mount_roots(root, mount_path) VALUES (?, ?), (?, ?)",
             (str(broad), str(broad), str(specific), str(broad)),
@@ -290,7 +293,7 @@ def test_most_specific_historical_root_wins(home, monkeypatch):
             conn, title='nested fence', assignee='default',
             workspace_kind='scratch', workspace_path=str(path),
         )
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
         assert task_id in result.stranded_by_mount_loss
 
 
@@ -310,10 +313,10 @@ def test_unwritable_mount_refuses_before_claim(home, monkeypatch):
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(policy.os, 'open', refuse_probe)
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title='read-only mount', assignee='default')
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kw: calls.append(args))
         assert not calls
         assert task_id in [item[0] for item in result.workspace_refused]
         assert 'workspaces_root_unwritable' in dict(result.workspace_refused)[task_id]
