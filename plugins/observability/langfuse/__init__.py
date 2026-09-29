@@ -82,6 +82,11 @@ _USAGE_FIELDS = (
     ("cache_creation_input_tokens", "cache_write_tokens", "cache_write_cost_per_million"),
     ("reasoning_tokens", "reasoning_tokens", None),
 )
+# ``CostResult.components`` class -> Langfuse cost_details key (mirrors the usage_details keys).
+_COST_COMPONENT_KEYS = (
+    ("input", "input"), ("output", "output"),
+    ("cache_read_input_tokens", "cache_read"), ("cache_creation_input_tokens", "cache_write"),
+)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -522,20 +527,14 @@ def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
     if cost.status != "included" and float(cost.amount_usd) > 0:
         cost_details["total"] = float(cost.amount_usd)
 
-    # Per-type breakdown for dashboards; keys mirror usage_details.
-    try:
-        from decimal import Decimal
-
-        from agent.usage_pricing import get_pricing_entry
-
-        entry = get_pricing_entry(model, provider=provider, base_url=base_url)
-        for key, attr, rate_attr in _USAGE_FIELDS if entry else ():
-            rate = getattr(entry, rate_attr, None) if rate_attr else None
-            tokens = getattr(canonical, attr)
-            if rate is not None and tokens:
-                cost_details[key] = float(Decimal(tokens) * rate / Decimal("1000000"))
-    except Exception:  # pragma: no cover - canonical total remains usable
-        pass
+    # Per-type breakdown for dashboards; keys mirror usage_details. Read off
+    # ``CostResult.components`` (the rates actually billed) rather than re-deriving from the
+    # entry's BASE rates: above a context tier those understate every line, so the per-type keys
+    # stopped summing to the ``total`` sent above.
+    for key, component in _COST_COMPONENT_KEYS:
+        amount = getattr(cost, "components", {}).get(component)
+        if amount:
+            cost_details[key] = float(amount)
 
     return usage_details, cost_details
 
