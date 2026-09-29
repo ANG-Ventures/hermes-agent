@@ -634,6 +634,39 @@ def _load_direct_aliases() -> tuple[dict[str, DirectAlias], bool]:
     return merged, True
 
 
+def _configured_but_unlisted_message(
+    model: str, provider: str, provider_label: str = ""
+) -> str | None:
+    """Message for a user-configured model the live listing omitted, or None.
+
+    A proxy fronting a subscription (CLIProxyAPI ``cpa`` et al.) drops a model
+    from ``/v1/models`` while every account behind it is quota-exhausted. The
+    generic "not found ... Similar models: ..." then reads as a typo when the
+    id is real (2026-09-29: ``/model k3`` -> ``kimi-k3`` during a kimi 5-hour
+    cap). A ``model.aliases`` / ``model_aliases`` entry naming this exact
+    provider+model is the user's own evidence the id exists, so say so.
+    """
+    _ensure_direct_aliases()
+    want_model = (model or "").strip().lower()
+    want_provider = (provider or "").strip().lower()
+    names = sorted(
+        name
+        for name, alias in DIRECT_ALIASES.items()
+        if (alias.model or "").strip().lower() == want_model
+        and (alias.provider or "").strip().lower() == want_provider
+    )
+    if not names:
+        return None
+    label = provider_label or provider
+    return (
+        f"Model `{model}` is configured (alias `{names[0]}`) but {label} is "
+        f"not listing it right now. The model name is valid; the provider "
+        f"cannot serve it at the moment, most often because the subscription "
+        f"quota is exhausted. Wait for the quota window to reset, or pick "
+        f"another model."
+    )
+
+
 def _ensure_direct_aliases() -> None:
     """Refresh DIRECT_ALIASES from config on every call (hot reload).
 
@@ -2486,6 +2519,10 @@ def switch_model(
             validation = {"accepted": True, "persist": True, "recognized": False, "message": validation.get("message", "")}
         else:
             msg = validation.get("message", "Invalid model")
+            if validation.get("not_listed"):
+                msg = _configured_but_unlisted_message(
+                    new_model, target_provider, provider_label
+                ) or msg
             return ModelSwitchResult(
                 success=False,
                 new_model=new_model,

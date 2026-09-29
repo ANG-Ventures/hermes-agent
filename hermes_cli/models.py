@@ -7642,6 +7642,10 @@ def validate_requested_model(
             "accepted": False,
             "persist": False,
             "recognized": False,
+            # The live listing answered and omitted the id. Callers that hold
+            # independent evidence the id is real (a user-configured alias)
+            # use this to report "exists but unavailable" instead.
+            "not_listed": True,
             "message": (
                 f"Model `{requested}` was not found in this provider's model listing."
                 f"{suggestion_text}"
