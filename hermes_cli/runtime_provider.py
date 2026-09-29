@@ -26,7 +26,7 @@ from hermes_cli.auth import (  # resolve_external_process_provider_credentials i
     resolve_nous_runtime_credentials, resolve_codex_runtime_credentials, resolve_xai_oauth_runtime_credentials,
     resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,  # noqa: F401
-    has_usable_secret, is_actual_local_base_url, normalize_actual_base_url,
+    has_usable_secret, is_actual_local_base_url, looks_like_openrouter_key, normalize_actual_base_url,
 )
 from hermes_cli import config as _config_mod
 from hermes_cli import models as _models  # attribute access keeps ``hermes_cli.models.<name>`` patches effective
@@ -317,6 +317,20 @@ def _config_base_url_for_provider(model_cfg: Dict[str, Any], provider: str) -> s
     return str(model_cfg.get("base_url") or "").strip().rstrip("/") if _same_registered_provider(provider, configured_provider) else ""
 
 
+def is_foreign_provider_endpoint(provider: Optional[str], base_url: Optional[str]) -> bool:
+    """True when ``base_url`` is another built-in provider's canonical endpoint, not ``provider``'s.
+
+    A persisted session route that pairs one provider with another's endpoint is left over from a
+    switch that kept the old URL (openai-codex + the Nous Portal URL sent the Codex slug to the Portal).
+    Only registered providers are judged: a custom or proxy URL is never another provider's canonical one.
+    """
+    pconfig = PROVIDER_REGISTRY.get(str(provider or "").strip().lower())
+    url = str(base_url or "").strip().rstrip("/")
+    if pconfig is None or not url or url == (pconfig.inference_base_url or "").rstrip("/"):
+        return False
+    return any(url == (other.inference_base_url or "").rstrip("/") for other in PROVIDER_REGISTRY.values())
+
+
 def _anthropic_base_url_override_ok(base_url: str) -> bool:
     """Whether a configured ``model.base_url`` plausibly speaks the Anthropic Messages protocol:
     official Anthropic/Claude hosts, Azure Foundry, or ``/anthropic`` / Kimi ``/coding`` proxies
@@ -520,6 +534,13 @@ def _pool_entry_mode_and_url(provider, entry, model_cfg, effective_model, base_u
             # only when the pool row still carries the canonical URL).
             if base_url in ("", default_url):
                 base_url = _config_base_url_for_provider(model_cfg, provider) or base_url
+        if provider == "xai":
+            # Env-seeded rows keep the registry host. model.base_url is the relay
+            # override, and only while the row is still that host — an explicit
+            # per-credential endpoint stays authoritative (#121347).
+            canonical = (PROVIDER_REGISTRY["xai"].inference_base_url or "").rstrip("/")
+            if base_url.rstrip("/") in ("", canonical):
+                base_url = _config_base_url_for_provider(model_cfg, provider) or base_url
         return api_mode, base_url or (default_url() if callable(default_url) else default_url)
     if provider == "anthropic":
         return "anthropic_messages", _anthropic_cfg_base_url(model_cfg) or base_url or _ANTHROPIC_DEFAULT_BASE_URL
@@ -535,11 +556,11 @@ def _pool_entry_mode_and_url(provider, entry, model_cfg, effective_model, base_u
             api_mode = _parse_api_mode(model_cfg.get("api_mode")) or api_mode
         api_mode = _azure_inferred_api_mode(effective_model, api_mode)
         return api_mode, (re.sub(r"/v1/?$", "", base_url) if api_mode == "anthropic_messages" else base_url)
-    # Honour model.base_url only when the pool entry carries no explicit base_url (i.e. it fell
-    # back to the registry default). Env var overrides win.
+    # Missing and registry-default endpoints may use this provider's configured URL.
+    # An explicit per-credential endpoint remains authoritative.
     pconfig = PROVIDER_REGISTRY.get(provider)
-    if pconfig and base_url.rstrip("/") == pconfig.inference_base_url.rstrip("/"):
-        base_url = _config_base_url_for_provider(model_cfg, provider) or base_url
+    if pconfig and (not base_url or base_url.rstrip("/") == pconfig.inference_base_url.rstrip("/")):
+        base_url = _config_base_url_for_provider(model_cfg, provider) or base_url or pconfig.inference_base_url
     return _configured_or_fallback_api_mode(provider, model_cfg, base_url, effective_model, opencode_by_model=True), base_url
 
 
@@ -1069,30 +1090,6 @@ def format_runtime_provider_error(error: Exception) -> str:
     return format_auth_error(error) if isinstance(error, AuthError) else str(error)
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import os  # noqa: F401,E402
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'custom_provider_aliases': ('hermes_cli.providers', 'custom_provider_aliases'),
-    'custom_provider_slug': ('hermes_cli.providers', 'custom_provider_slug'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
-
-
 def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested: Optional[str] = None,
                                   target_model: Optional[str] = None, explicit_base_url: Optional[str] = None,
                                   explicit_api_key: Optional[str] = None,
@@ -1107,7 +1104,7 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
     re-raised: a fallback entry's failure is not what the operator configured first (#81209). The entry's
     ``model`` is the model the caller must send.
     """
-    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.auth import AuthError, primary_failure_wording
     try:
         return resolve_runtime_provider(requested=requested, target_model=target_model,
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
@@ -1136,10 +1133,7 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
             runtime["provider"] = effective_runtime_provider(entry, runtime)
             # A rate-limit/quota cap is transient (credentials are fine, re-auth cannot help); the log must not
             # mislabel it as an auth failure (#32790).
-            if is_rate_limited_auth_error(primary_exc):
-                logger.warning("Primary provider rate-limited (429): %s. Falling back to %s/%s",
-                               primary_exc, provider, model)
-            else:
-                logger.warning("Primary provider auth failed (%s). Falling back to %s/%s", primary_exc, provider, model)
+            logger.warning("Primary provider %s (%s). Falling back to %s/%s",
+                           primary_failure_wording(primary_exc)[0], primary_exc, provider, model)
             return runtime, entry
         raise primary_exc
