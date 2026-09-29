@@ -3514,6 +3514,7 @@ def _is_channel_dm_topic(
 _HOST_DOWN_ALERTS_CHAT = "1480528231286181948"  # fleet #alerts
 _HOST_DOWN_LOGS_CHAT = "1480525090331561984"  # fleet #logs
 _HOST_DOWN_LEDGER = "suppressed.jsonl"
+_HOST_DOWN_PREFIX_KEY = "_host_down_prefix"
 _FLEET_HOSTS_REL = Path("scripts") / "lib" / "fleet-hosts.json"
 
 
@@ -3648,6 +3649,9 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict],
         for i in alerts_idx:
             new_targets[i]["chat_id"] = _HOST_DOWN_LOGS_CHAT
             new_targets[i].pop("thread_id", None)
+            # Per target: only the demoted copies wear the prefix; every other
+            # target gets the content unchanged (FleetReview #31).
+            new_targets[i][_HOST_DOWN_PREFIX_KEY] = prefix
         rec = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "producer": producers[0] if producers else "unknown",
@@ -3660,7 +3664,7 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict],
             pending_ledger.extend(rows)
         logger.info("Job '%s': host-down gate deferred #alerts delivery to #logs (%s)",
                     job.get("id"), ", ".join(hosts))
-        return f"{prefix} {content}", new_targets
+        return content, new_targets
     except Exception as e:  # fail open: never lose a page to the gate itself
         logger.warning("host-down gate error (delivering unchanged): %r", e)
         return content, targets
@@ -3818,8 +3822,14 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         if host_down_ledger and ("discord", _HOST_DOWN_LOGS_CHAT) in delivered_chats:
             _host_down_write_ledger(host_down_ledger)
             host_down_ledger.clear()
+    _unprefixed_delivery_content = cleaned_delivery_content
 
     for target in targets:
+        _host_down_prefix = target.pop(_HOST_DOWN_PREFIX_KEY, None)
+        cleaned_delivery_content = (
+            f"{_host_down_prefix} {_unprefixed_delivery_content}"
+            if _host_down_prefix else _unprefixed_delivery_content
+        )
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")

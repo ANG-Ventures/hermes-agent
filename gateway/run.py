@@ -4026,8 +4026,15 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-async def _probe_audio_duration(path: str) -> Optional[str]:
-    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
+_FFPROBE_TIMEOUT_S = 5.0
+
+
+async def _probe_audio_duration(path: str, *, allow_subprocess: bool = True) -> Optional[str]:
+    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure.
+
+    ``allow_subprocess=False`` keeps to the in-process header reads (wav/ogg)
+    and never spawns ffprobe.
+    """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".wav":
@@ -4053,17 +4060,28 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         except Exception:
             pass
 
+    if not allow_subprocess:
+        return None
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_FFPROBE_TIMEOUT_S)
         if proc.returncode == 0:
             return _format_duration(float(stdout.decode().strip()))
-    except Exception:
-        pass
+    except BaseException as exc:
+        # Timed out or cancelled (e.g. by a caller's wait_for): never leave
+        # ffprobe running behind us (FleetReview #115).
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not isinstance(exc, Exception):
+            raise
 
     return None
 
@@ -4109,9 +4127,12 @@ async def _inbound_log_preview(event) -> str:
         return text[:80].replace("\n", " ")
     duration = None
     if voice_paths:
+        # A log label must not cost the admitted turn an ffprobe spawn (up to
+        # the whole timeout): header reads only; anything else logs "?s"
+        # (FleetReview #115).
         try:
             duration = await asyncio.wait_for(
-                _probe_audio_duration(os.path.abspath(voice_paths[0])),
+                _probe_audio_duration(os.path.abspath(voice_paths[0]), allow_subprocess=False),
                 timeout=_VOICE_LOG_PROBE_TIMEOUT_S,
             )
         except Exception:
@@ -25318,21 +25339,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
+                # Through the once-helper (FleetReview #101): it records the
+                # echoed count on the event, so a pending/busy path that later
+                # echoes the same event's transcripts sends only the unsent tail.
                 if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                        await self._echo_pending_stt_transcripts_once(
+                            event,
+                            _echo_adapter,
+                            source,
+                            _successful_transcripts,
+                            metadata=self._thread_metadata_for_source(
+                                source, self._reply_anchor_for_event(event)
+                            ),
+                        )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the

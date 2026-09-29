@@ -289,6 +289,7 @@ def clear_cache() -> None:
     """Drop all cached PR states (tests; operator repair)."""
     _CACHE.clear()
     _REPO_EXISTS_CACHE.clear()
+    _DEPLOY_PROBE_STARVED.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +1249,14 @@ def _closed_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
 
 
 _PREFETCH_WORKERS = 6
+# Wall budget for one tick's deploy-ancestry probes (FleetReview #32). A probe
+# past it is not run; the locked pass reads the missing answer as
+# "unverified" and holds the card for the next tick.
+_PREFETCH_DEPLOY_BUDGET_S = 30.0
+# (tree, sha) pairs the last tick ran out of budget before probing. The next
+# tick probes them FIRST, so a slow early probe cannot starve later refs on
+# every tick: each tick answers at least one pair, oldest-starved first.
+_DEPLOY_PROBE_STARVED: list[tuple[str, str]] = []
 
 
 def _gate_candidates(
@@ -1414,7 +1423,7 @@ def _prefetch_deploys(
     every key the locked pass looks up is present here. Unmerged or
     SHA-less refs are skipped: they cannot be deployed yet.
     """
-    out: dict[tuple[str, str], bool] = {}
+    pending: list[tuple[str, str]] = []
     for ref, tree in checks:
         if tree is None:
             continue  # unmapped repo: no tree to probe; the locked pass holds it
@@ -1428,12 +1437,25 @@ def _prefetch_deploys(
             entry = _CACHE.get(key)
             if entry is not None and entry.state == "MERGED":
                 sha = entry.sha
-        if not sha or (tree, sha) in out:
-            continue
+        if sha and (tree, sha) not in pending:
+            pending.append((tree, sha))
+    # Last tick's starved pairs go first (still-wanted ones only), then the rest.
+    wanted = set(pending)
+    starved = [pair for pair in _DEPLOY_PROBE_STARVED if pair in wanted]
+    order = starved + [pair for pair in pending if pair not in set(starved)]
+    out: dict[tuple[str, str], bool] = {}
+    deadline = time.monotonic() + _PREFETCH_DEPLOY_BUDGET_S
+    for i, (tree, sha) in enumerate(order):
+        if out and time.monotonic() >= deadline:
+            # budget spent: the rest stay unanswered (unverified) this tick
+            # and are probed first next tick.
+            _DEPLOY_PROBE_STARVED[:] = order[i:]
+            return out
         try:
             out[(tree, sha)] = bool(deploy_fn(tree, sha))
         except Exception:  # defensive seam: unprovable deploy = not deployed
             out[(tree, sha)] = False
+    _DEPLOY_PROBE_STARVED.clear()
     return out
 
 

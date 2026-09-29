@@ -861,6 +861,12 @@ def _isolate_session_contextvars():
         yield
         if token is not None:
             rc._SESSION_CWD.reset(token)
+        # The test may have imported session_context and bound vars: put the
+        # whole family back to the fresh-process _UNSET state (no pre-test
+        # tokens exist to restore, and fresh IS the pre-test state).
+        sc = sys.modules.get("gateway.session_context")
+        if sc is not None:
+            sc.reset_session_vars()
         return
     tokens = sc.reset_session_vars()
     yield

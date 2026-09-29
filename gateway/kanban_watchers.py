@@ -719,6 +719,9 @@ def _guard_stuck_state_path() -> Path:
     return get_hermes_home() / "state" / "kanban-guard-stuck-pages.json"
 
 
+_GUARD_STUCK_PAGE_BUDGET_S = 30.0
+
+
 class _GuardStuckNotifier:
     """Page once per guard EPISODE, remind every 6h; retry failed sends.
 
@@ -767,6 +770,11 @@ class _GuardStuckNotifier:
             logger.warning("kanban dispatcher: guard-stuck page ledger not saved", exc_info=True)
 
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
+        """Page due episodes. Sends run serially (each up to 30 s) inside the
+        dispatcher tick, so one call spends at most ``_GUARD_STUCK_PAGE_BUDGET_S``
+        on them (FleetReview #79); an unsent page is not recorded and goes
+        out on a later tick."""
+        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
         if observed_boards is None:
@@ -785,6 +793,8 @@ class _GuardStuckNotifier:
             last = self._sent.get(key)
             if last is not None and now - last < self._remind:
                 continue
+            if time.monotonic() >= deadline:
+                break
             if send(board, item):
                 self._sent[key] = now
                 delivered += 1

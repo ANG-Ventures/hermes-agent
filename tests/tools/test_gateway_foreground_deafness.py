@@ -181,6 +181,7 @@ LOOPS_REFUSED = [
     "for i in {1..40}; do ls /tmp/x && break; sleep 1m; done",
     "watch -n 60 gh pr view 978",
     "cd /tmp && watch 'ls -la'",
+    "for i in 1 2; do for j in 1 2; do :; done; sleep 60; done",  # after a nested loop
 ]
 LOOPS_ALLOWED = [
     "for i in 1 2 3; do curl -s x; sleep 5; done",           # short sleeps
@@ -188,6 +189,10 @@ LOOPS_ALLOWED = [
     'git commit -m "for i in $(seq 1 9); do sleep 60; done"',  # quoted data
     "gh run watch 123 --exit-status",                         # bounded; cap covers it
     "for f in *.py; do ruff check $f; done",                  # loop, no sleep
+    # FleetReview #61: the sleep sits OUTSIDE the loop body (one wait, then
+    # a finite loop) -- not a poll.
+    "sleep 60; for f in *.py; do ruff check $f; done",
+    "for f in *.py; do ruff check $f; done; sleep 45",
 ]
 
 

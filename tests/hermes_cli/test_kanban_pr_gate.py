@@ -2468,3 +2468,53 @@ def test_t213f5d63_replay_through_dispatch_spawns_nothing(
         # "awaiting deploy" comment. Never more than one; never unblocked.
         assert len(held) <= 1, _comments(conn, tid)
     assert gh_calls  # the gate really evaluated the merged PR
+
+
+def test_prefetch_deploys_stops_at_its_wall_budget(monkeypatch):
+    """FleetReview #32: _prefetch_deploys ran deploy_fn sequentially for every
+    (tree, sha) with no wall budget. Past the budget the rest are skipped
+    (missing = unverified: the locked pass holds the card)."""
+    import time as _time
+
+    from hermes_cli import kanban_pr_gate as g
+
+    monkeypatch.setattr(g, "_PREFETCH_DEPLOY_BUDGET_S", 0.05, raising=False)
+    calls = []
+
+    def slow_deploy(tree, sha):
+        calls.append(sha)
+        _time.sleep(0.1)
+        return True
+
+    checks = [(g.PrRef("o/r", n), "/tree") for n in range(5)]
+    payloads = {("o/r", n): {"state": "MERGED", "mergeCommit": {"oid": f"sha{n}"}}
+                for n in range(5)}
+    out = g._prefetch_deploys(checks, payloads, slow_deploy)
+    assert calls == ["sha0"]
+    assert out == {("/tree", "sha0"): True}
+
+
+def test_prefetch_deploys_starved_refs_go_first_next_tick(monkeypatch):
+    """FleetReview on #1416: with the budget spent by the first probe on every
+    tick, later refs were never probed. Pairs a tick could not reach are
+    probed first on the next tick, so every ref is eventually answered."""
+    import time as _time
+
+    from hermes_cli import kanban_pr_gate as g
+
+    monkeypatch.setattr(g, "_PREFETCH_DEPLOY_BUDGET_S", 0.05, raising=False)
+    calls = []
+
+    def slow_deploy(tree, sha):
+        calls.append(sha)
+        _time.sleep(0.1)
+        return True
+
+    checks = [(g.PrRef("o/r", n), "/tree") for n in range(3)]
+    payloads = {("o/r", n): {"state": "MERGED", "mergeCommit": {"oid": f"sha{n}"}}
+                for n in range(3)}
+    answered = {}
+    for _tick in range(3):
+        answered.update(g._prefetch_deploys(checks, payloads, slow_deploy))
+    assert calls == ["sha0", "sha1", "sha2"]
+    assert set(answered) == {("/tree", f"sha{n}") for n in range(3)}

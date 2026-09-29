@@ -8461,6 +8461,27 @@ def _append_event(
         pass
 
 
+def _append_deferred_event_once(
+    conn: sqlite3.Connection, task_id: str, payload: dict,
+) -> None:
+    """Append a ``deferred`` event unless the card's newest event is already
+    the identical deferral. A steady-state backlog otherwise wrote one row per
+    backlogged card per dispatcher tick (FleetReview #83); a changed payload
+    (new counts, reason, provider) still records."""
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last[0] == "deferred":
+        try:
+            if json.loads(last[1] or "null") == payload:
+                return
+        except (TypeError, ValueError):
+            pass
+    _append_event(conn, task_id, "deferred", payload)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -22020,7 +22041,7 @@ def _dispatch_once_locked(
             )
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(conn, task_id, "deferred", payload)
+                    _append_deferred_event_once(conn, task_id, payload)
             return True, None
         skipped: list = []
         fallback = available_profile_fallback(
@@ -22056,7 +22077,7 @@ def _dispatch_once_locked(
             )
         if not dry_run:
             with write_txn(conn):
-                _append_event(conn, task_id, "deferred", payload)
+                _append_deferred_event_once(conn, task_id, payload)
         return True, None
 
     def note_lane_route(claimed, source):

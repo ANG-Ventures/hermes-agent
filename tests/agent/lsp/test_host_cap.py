@@ -79,7 +79,9 @@ def test_idle_server_is_stopped_and_frees_its_slot(repo):
         svc.snapshot_baseline(str(repo.path / "x.py"))
         assert svc.get_status()["clients"] and host_slots.held_count(6) == 1
         assert _wait_until(lambda: not svc.get_status()["clients"]), "idle server was never reaped"
-        assert host_slots.held_count(6) == 0
+        # The slot is released only after the reaped server's shutdown
+        # completes (#30), so it frees shortly after the client is gone.
+        assert _wait_until(lambda: host_slots.held_count(6) == 0), "slot never freed"
     finally:
         svc.shutdown()
 
@@ -158,3 +160,26 @@ def test_dead_server_gives_back_its_slot_to_a_replacement(repo):
     finally:
         svc.shutdown()
     assert host_slots.held_count(1) == 0
+
+
+def test_idle_reap_keeps_the_slot_until_the_server_is_shut_down(repo):
+    """FleetReview #30: the reaper released the host slot BEFORE awaiting
+    client.shutdown(), so a replacement could spawn while the old server was
+    still alive (cap + 1 live servers). The slot must be held during shutdown."""
+    svc = _service(max_servers_per_host=6, idle_timeout=0.5)
+    held_at_shutdown = []
+    try:
+        svc.snapshot_baseline(str(repo.path / "x.py"))
+        (client,) = list(svc._clients.values())
+        real = client.shutdown
+
+        async def watched():
+            held_at_shutdown.append(host_slots.held_count(6))
+            return await real()
+
+        client.shutdown = watched
+        assert _wait_until(lambda: held_at_shutdown), "idle server was never reaped"
+        assert held_at_shutdown == [1]
+        assert _wait_until(lambda: host_slots.held_count(6) == 0)
+    finally:
+        svc.shutdown()
