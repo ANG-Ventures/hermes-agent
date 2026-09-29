@@ -113,7 +113,11 @@ _MANDATORY_THINKING_CLAUDE_SUBSTRINGS = ("claude-fable",) + _OPUS_5_5_FAMILY_SUB
 # Families that 400 on ``tool_choice`` ``any``/``tool`` ("type "tool" and "any" are not supported
 # for this model") on Messages, Batches and token counting. Opt-IN, the opposite asymmetry: a
 # missing entry 400s loudly naming the field, a spurious one silently strips forced tool use.
-_NO_FORCED_TOOL_CHOICE_CLAUDE_SUBSTRINGS = _OPUS_5_5_FAMILY_SUBSTRINGS
+# Sonnet 5.5 rejects forced tool use too but is NOT mandatory-thinking: its "off" is
+# ``thinking: {"type": "between_tools"}``, so it joins this set only, not the family set above.
+_NO_FORCED_TOOL_CHOICE_CLAUDE_SUBSTRINGS = _OPUS_5_5_FAMILY_SUBSTRINGS + (
+    "claude-sonnet-5-5", "claude-sonnet-5.5",
+)
 # Models already reported for the forced-tool_choice downgrade (bounded by id set, not volume).
 _forced_tool_choice_downgrade_logged: set = set()
 
@@ -223,7 +227,7 @@ def _accepts_thinking_disable(model: str) -> bool:
 
 
 def _accepts_forced_tool_choice(model: str) -> bool:
-    """False when ``model`` rejects ``tool_choice`` ``any``/``tool`` (Opus 5.5, Fable/Mythos 5.1);
+    """False when ``model`` rejects ``tool_choice`` ``any``/``tool`` (Opus 5.5, Fable/Mythos 5.1, Sonnet 5.5);
     ``build_anthropic_kwargs`` then sends ``auto``. Scoped to Claude and opt-in within it:
     third-party Anthropic-Messages endpoints have their own tool contract, and an unknown future
     Claude keeps forced tool choice (a missing entry 400s loudly; a spurious one is silent)."""

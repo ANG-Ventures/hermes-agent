@@ -26,8 +26,10 @@ from __future__ import annotations
 import pytest
 
 from agent.anthropic_adapter import (
+    _MANDATORY_THINKING_CLAUDE_SUBSTRINGS,
     _accepts_forced_tool_choice,
     _accepts_thinking_disable,
+    _model_matches,
     build_anthropic_kwargs,
 )
 
@@ -59,6 +61,13 @@ NO_FORCED_TOOLS = [
     "anthropic/claude-opus-5.5",  # dot spelling normalizes onto the same family
     "claude-fable-5-1",
     "claude-mythos-5-1",
+]
+
+# Sonnet 5.5 rejects forced tool use but not via the family set: its thinking
+# "off" is ``between_tools``, so it must stay out of the mandatory-thinking set.
+NO_FORCED_TOOLS_ONLY = [
+    "claude-sonnet-5-5",
+    "anthropic/claude-sonnet-5.5",
 ]
 
 # Models that still accept a forced tool call.  Opus 5 is the control: the
@@ -217,3 +226,22 @@ class TestFamilyVerdictHelpers:
         this list is opt-IN, and an unrecognized release keeps forced tools."""
         assert _accepts_forced_tool_choice("claude-opus-6") is True
         assert _accepts_forced_tool_choice("anthropic/claude-sonnet-6") is True
+
+
+class TestSonnet55ForcedToolChoiceOnly:
+    """Sonnet 5.5 400s on ``any``/``tool`` like the 5.5 family, but its thinking
+    contract differs, so the two sets diverge for it (reported by @kshitijk4poor)."""
+
+    @pytest.mark.parametrize("model", NO_FORCED_TOOLS_ONLY)
+    def test_forced_shapes_downgrade_to_auto(self, model: str) -> None:
+        assert _accepts_forced_tool_choice(model) is False, model
+        for choice in ("required", "get_weather"):
+            kwargs = _kwargs(model, tools=TOOLS, tool_choice=choice)
+            assert kwargs["tool_choice"] == {"type": "auto"}, choice
+            assert all("strict" not in t for t in kwargs["tools"])
+
+    @pytest.mark.parametrize("model", NO_FORCED_TOOLS_ONLY)
+    def test_not_in_the_mandatory_thinking_set(self, model: str) -> None:
+        """Omitting the disable would leave Sonnet 5.5 thinking; its off is
+        ``between_tools``, a separate verdict."""
+        assert not _model_matches(model, _MANDATORY_THINKING_CLAUDE_SUBSTRINGS), model
