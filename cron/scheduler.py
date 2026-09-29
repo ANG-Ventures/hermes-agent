@@ -439,7 +439,10 @@ def _script_exit_page(job_name: str, error: str) -> str:
     if cause_src:
         cause = _LEAD_GLYPHS_RE.sub("", cause_src[0]).replace("**", "").strip() or cause_src[0]
         took = 1
-        if cause.endswith(":") and len(cause_src) > 1:  # "gbrain deploy parity (…):" + its content line
+        if cause.startswith("Traceback (most recent call last)"):
+            # the exception line is the cause, not the traceback banner
+            cause, took = cause_src[-1], len(cause_src)
+        elif cause.endswith(":") and len(cause_src) > 1:  # "gbrain deploy parity (…):" + its content line
             cause, took = f"{cause} {cause_src[1].replace('**', '').strip()}", 2
         lines.append(clip(cause))
     else:

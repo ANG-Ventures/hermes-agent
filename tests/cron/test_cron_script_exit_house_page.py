@@ -49,7 +49,7 @@ def test_long_cause_line_is_clipped_not_collapsed_into_one_blob():
 def test_stderr_only_uses_stderr_first_line():
     err = "Script exited with code 2\nstderr:\nTraceback (most recent call last):\n  x\nKeyError: 'a'"
     lines = _summarize_cron_failure_for_delivery(JOB, err).splitlines()
-    assert lines[:2] == ["⚠️ **fleet-model-drift-watch** · rc=2", "Traceback (most recent call last):"]
+    assert lines[:2] == ["⚠️ **fleet-model-drift-watch** · rc=2", "KeyError: 'a'"]
 
 
 def test_colon_header_joins_its_content_line_and_wrapped_ask_joins_its_tail():
