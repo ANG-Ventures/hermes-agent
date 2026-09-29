@@ -1730,6 +1730,33 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_api_max_retries(value: Any) -> Optional[int]:
+    """Per-job API retry budget, validated at the storage choke point.
+
+    Same semantics as the ``agent.api_max_retries`` config sibling (``agent/agent_init.py``): attempts
+    per model API call, clamped to ``>= 1`` (1 = a single attempt) here so the stored record reads
+    exactly as it behaves. Stricter than config on failure, like the reasoning pin: config falls
+    back to its default on garbage because a human watches the session start, a cron job is
+    fire-and-forget, so a non-integer raises and nothing invalid persists. Booleans (``int(True) ==
+    1``) and floats (``int(3.5) == 3``) are rejected, never coerced. None / empty string clears the
+    pin (job follows ``agent.api_max_retries``)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        if isinstance(value, (bool, float)):
+            raise ValueError(value)
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid api_max_retries {value!r}. Expected an integer >= 1 "
+            "(empty string clears the override).") from None
+    return max(parsed, 1)
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1745,6 +1772,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
+    "api_max_retries": _normalize_api_max_retries,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
@@ -1752,6 +1780,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "api_max_retries": _normalize_api_max_retries,
 }
 
 
@@ -1823,6 +1852,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    api_max_retries: Optional[Union[int, str]] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1833,7 +1863,10 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation)."""
+    (a venv can be rebuilt or moved after creation). api_max_retries: per-job API retry budget
+    overriding ``agent.api_max_retries`` for this job only (e.g. a job pinned to a flaky endpoint
+    stays on its model through a transient stretch instead of swapping); clamped ``>= 1``, inert
+    with ``no_agent``."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1919,6 +1952,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("api_max_retries", f["api_max_retries"]),
     ):
         if value is not None:
             job[key] = value
