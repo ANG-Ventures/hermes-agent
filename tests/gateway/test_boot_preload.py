@@ -232,6 +232,38 @@ def test_failed_import_is_logged_and_does_not_abort(tmp_path, monkeypatch, caplo
             sys.modules.pop(mod, None)
 
 
+
+def test_absent_optional_dependency_is_a_reasoned_skip_not_a_failure(tmp_path, monkeypatch, caplog):
+    """t_d07ad201: acp_adapter.* failed=4 on the live fleet because the optional ``acp`` extra is
+    not in the runtime venv. A third-party ModuleNotFoundError is skipped and named at INFO;
+    a missing FIRST-PARTY module is still real breakage and stays in ``failed``."""
+    pkg = "bootpre_fixture_optdep"
+    _write(tmp_path / pkg / "__init__.py", "")
+    _write(tmp_path / pkg / "needs_extra.py", "import bootpre_absent_extra_xyz\n")
+    _write(tmp_path / pkg / "also_extra.py", "from bootpre_absent_extra_xyz.sub import thing\n")
+    _write(tmp_path / pkg / "broken_inner.py", f"import {pkg}.deleted_module\n")
+    _write(tmp_path / pkg / "ok.py", "X = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(boot_preload, "PRELOAD_PACKAGES", (pkg,))
+    try:
+        with caplog.at_level(logging.INFO, logger="gateway.boot_preload"):
+            result = boot_preload.preload_first_party_modules(tmp_path)
+        assert result["skipped"] == {
+            f"{pkg}.also_extra": "bootpre_absent_extra_xyz",
+            f"{pkg}.needs_extra": "bootpre_absent_extra_xyz",
+        }
+        assert result["failed"] == 1 and f"{pkg}.broken_inner" in result["errors"]
+        skip_lines = [r for r in caplog.records if "skipped" in r.getMessage() and "optional" in r.getMessage()]
+        assert len(skip_lines) == 1 and skip_lines[0].levelno == logging.INFO
+        assert pkg in skip_lines[0].getMessage() and "bootpre_absent_extra_xyz" in skip_lines[0].getMessage()
+        warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not [m for m in warned if "extra" in m], warned
+        phase = [r.getMessage() for r in caplog.records if "PHASE=boot_preload" in r.getMessage()]
+        assert phase and "failed=1 skipped=2" in phase[0]
+    finally:
+        for mod in [m for m in sys.modules if m.startswith(pkg)]:
+            sys.modules.pop(mod, None)
+
 _SIDE_EFFECT_PROBE = r"""
 import json, os, signal, sys, threading
 sys.path.insert(0, sys.argv[1])
