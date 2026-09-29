@@ -314,3 +314,88 @@ def test_vanished_copy_after_route_does_not_fail_the_route(conn, armed, monkeypa
     assert _status(conn, tid)["status"] == "review"
     assert kb.list_attachments(conn, tid) == []
     assert "routed_artifact_missing" in _kinds(conn, tid)
+
+
+# --- FleetReview #1447 @aa9e59a3 (t_c48014d3) -------------------------------
+
+
+def test_reviewer_artifact_is_merged_with_routed_artifacts(conn, armed):
+    # Approval that brings its own artifact must not drop the implementer's.
+    tid, ws, artifact = _scratch_task(conn)
+    assert kb.complete_task(conn, tid, summary=STOP_FINDING,
+                            metadata={"artifacts": [str(artifact)]})
+    routed = kb.list_attachments(conn, tid)[0].stored_path
+    review_note = ws / "review.md"
+    review_note.write_bytes(b"review-bytes")
+    assert kb.complete_task(conn, tid, summary="approved",
+                            metadata={"artifacts": [str(review_note)]})
+    assert _status(conn, tid)["status"] == "done"
+    completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][-1]
+    arts = completed.payload["artifacts"]
+    assert arts[0] == routed and len(arts) == 2
+    assert Path(arts[1]).read_bytes() == b"review-bytes"
+    # One attachment row per file: the carried copy is not re-registered.
+    names = sorted(a.filename for a in kb.list_attachments(conn, tid))
+    assert names == ["readout.md", "review.md"]
+
+
+def test_reviewer_repeating_routed_artifact_is_not_duplicated(conn, armed):
+    tid, ws, artifact = _scratch_task(conn)
+    assert kb.complete_task(conn, tid, summary=STOP_FINDING,
+                            metadata={"artifacts": [str(artifact)]})
+    routed = kb.list_attachments(conn, tid)[0].stored_path
+    assert kb.complete_task(conn, tid, summary="approved",
+                            metadata={"artifacts": [routed]})
+    completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][-1]
+    assert completed.payload["artifacts"] == [routed]
+    assert len(kb.list_attachments(conn, tid)) == 1
+
+
+@pytest.mark.parametrize("text,trigger", [
+    ("no workaround for STOP finding: admission measures nothing", "STOP finding"),
+    ("no idea why; blocked on vendor creds", "blocked on"),
+    ("not sure, but could not reach the box", "could not"),
+    ("never mind the flake: NOT DEPLOYED", "NOT DEPLOYED"),
+])
+def test_negator_governing_another_word_does_not_suppress(text, trigger):
+    assert neg.match([text]) == trigger
+
+
+def test_negative_verdict_below_result_headline_is_scanned(conn, armed):
+    tid = _claimed(conn)
+    assert kb.complete_task(conn, tid, summary="Merged PR",
+                            result="Rollout status:\nNOT DEPLOYED; blocked on credentials")
+    assert _status(conn, tid)["status"] == "review"
+
+
+@pytest.mark.parametrize("result", [
+    "tests green\n```\nImportError: could not find module foo\n```",
+    "tests green\n    ImportError: could not find module foo",
+    "tests green\n> ERROR could not connect (retried, fixed)",
+    "tests green\nImportError: could not find module foo",
+    "tests green\nE   RuntimeError: could not bind port",
+    "tests green\n2026-09-28 13:00:01 WARNING could not reach cache",
+    "tests green\n[13:00:01] could not reach cache; retrying",
+    "tests green\n$ ssh box  # could not resolve host first try",
+    "tests green\nTraceback (most recent call last):",
+    # "<program>: message" tool output (FleetReview #1464 @03d1cc77).
+    "Deployment complete\nssh: Could not resolve hostname box\nRetried successfully",
+    "tests green\ncurl: (6) Could not resolve host: example.com",
+    "tests green\nfatal: could not read Username for 'https://github.com'",
+    "tests green\nerror: could not lock config file .git/config",
+    "tests green\n/usr/bin/ssh: Could not resolve hostname box",
+    "tests green\nbash: line 1: could not open /tmp/x",
+    "tests green\npython3.13: could not import site",
+    "tests green\nssh[4242]: Could not resolve hostname box",
+])
+def test_pasted_log_lines_in_result_body_are_not_scanned(result):
+    assert neg.match(neg.handoff_texts(GOOD, result)) is None
+
+
+@pytest.mark.parametrize("result, trigger", [
+    ("Rollout:\nstatus: blocked on credentials", "blocked on"),
+    ("Rollout:\nVerdict: could not deploy", "could not"),
+    ("Rollout:\nSsh access could not be granted", "could not"),
+])
+def test_prose_labels_are_still_scanned(result, trigger):
+    assert neg.match(neg.handoff_texts(GOOD, result)) == trigger

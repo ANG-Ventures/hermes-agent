@@ -62,6 +62,7 @@ from agent.fork_ext.relay_headers import (
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
+    stamp_bridge_lane,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -1907,6 +1908,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     stamp_call_id(agent, api_kwargs)
     # S7 D1: harness-minted route id (pinned lanes) + lane-src (bpr/pinned).
     stamp_correlation_headers(agent, api_kwargs)
+    stamp_bridge_lane(agent, api_kwargs)
     if should_use_direct_api_call(agent):
         try:
             response = direct_api_call(agent, api_kwargs)
@@ -6703,6 +6705,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Fresh correlation id per stream attempt (bridge lanes only).
                 stamp_call_id(agent, api_kwargs)
                 stamp_correlation_headers(agent, api_kwargs)
+                stamp_bridge_lane(agent, api_kwargs)
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),

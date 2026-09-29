@@ -158,6 +158,23 @@ PINNED_PROVIDER_FAILURE_REASON = "pinned_provider_unavailable"
 
 _RATE_LIMIT_REASONS = frozenset({"rate_limit", "billing", "upstream_rate_limit"})
 _card_pin_cache: dict = {}
+# JSON ``{"model", "provider"}`` the dispatcher sets from the card ROW at claim
+# time (t_a30417c3); seeds the pin snapshot so the worker never reads a row a
+# later ``set-model`` may already have changed. Absent = older dispatcher.
+CLAIMED_CARD_PIN_ENV = "KANBAN_CLAIMED_CARD_PIN"
+
+
+def _claimed_card_pin_from_env():
+    raw = os.environ.get(CLAIMED_CARD_PIN_ENV)
+    if not raw:
+        return None
+    try:
+        pin = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(pin, dict):
+        return None
+    return pin.get("model"), pin.get("provider")
 
 # The two Claude relay POOL faces. A card pinned to one means "this model on
 # the pool", not one wire, so failing over to the SIBLING pool for the SAME
@@ -181,7 +198,9 @@ def card_pinned_route() -> tuple:
     lane override and a capped-pool dispatch fallback rung ALSO reach the
     worker as ``--provider``, but the dispatcher applies them to the in-memory
     claim only and never writes them to the card, so reading the row is what
-    tells a card pin apart from a lane default. Fails open ``(None, None)``
+    tells a card pin apart from a lane default. The dispatcher hands the row
+    pin as claimed via ``CLAIMED_CARD_PIN_ENV`` (t_a30417c3); the row is read
+    only when that is absent (older dispatcher). Fails open ``(None, None)``
     when the board cannot be read: an unreadable pin must not strand a worker
     without its fallback chain.
     """
@@ -190,6 +209,13 @@ def card_pinned_route() -> tuple:
         return None, None
     if task_id in _card_pin_cache:
         return _card_pin_cache[task_id]
+    claimed = _claimed_card_pin_from_env()
+    if claimed is not None:
+        model, provider = claimed
+        provider = (str(provider or "")).strip().lower() or None
+        model = (str(model or "")).strip() or None
+        _card_pin_cache[task_id] = (model, provider)
+        return model, provider
     model = provider = None
     try:
         from hermes_cli import kanban_db as kb
@@ -619,6 +645,12 @@ def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None
     if gate_error:
         _refuse_live(task_id, run_id, event_id, gate_error, model_target)
         route_changes = False
+    elif touch_model and model and not route_changes:
+        # A live pin onto the route already serving switches nothing but
+        # still pins this run from here on.
+        _card_pin_cache[task_id] = (
+            model.strip() or None, (provider or "").strip().lower() or None,
+        )
     if not route_changes and not effort_changes:
         return active_system_prompt  # already on it (e.g. written before spawn)
 
