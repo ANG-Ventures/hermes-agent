@@ -29,4 +29,25 @@ def test_large_prefill_policy_not_shortened(tmp_path, monkeypatch, size):
         base_url="https://chatgpt.com/backend-api/codex",
         _compute_non_stream_stale_timeout=lambda _: 90)
     result = _resolve_nonstream_watchdogs(agent, {"input": "x" * size})
-    assert result.ttfb_timeout == 120
+    # Upstream's large-prefill policy may scale the cutoff UP (idle default); the fast-reconnect
+    # target (1s here) must never pull it below the 120s default.
+    assert result.ttfb_timeout >= 120
+
+
+@pytest.mark.parametrize("effort,floored", [("xhigh", True), ("low", False)])
+def test_high_effort_silence_floor_outranks_fast_reconnect(tmp_path, monkeypatch, effort, floored):
+    """Merge re-thread: a small high-effort request thinks before its first event, so the
+    implicit high-effort floor still wins over the fast-reconnect target."""
+    from agent.chat_completion_helpers import HIGH_EFFORT_SILENCE_FLOOR_SECONDS
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("agent:\n  codex:\n    ttfb_fast_reconnect_seconds: 7\n")
+    agent = SimpleNamespace(api_mode="codex_responses", provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        reasoning_config={"enabled": True, "effort": effort},
+        _compute_non_stream_stale_timeout=lambda _: float("inf"))
+    result = _resolve_nonstream_watchdogs(agent, {"input": "hi"})
+    if floored:
+        assert result.ttfb_timeout == HIGH_EFFORT_SILENCE_FLOOR_SECONDS
+    else:
+        assert result.ttfb_timeout == 7

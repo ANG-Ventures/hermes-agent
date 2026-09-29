@@ -13,7 +13,6 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
-    monkeypatch.setattr(jobs, "_compute_provider_model_snapshots", lambda **kw: (None, None))
     # No scheduler is launched; only registration is replaced, not persistence.
     monkeypatch.setattr("cron.scheduler.create_job_with_scheduler_registration", jobs.create_job)
     return registry.get_entry("cronjob_manage").handler
