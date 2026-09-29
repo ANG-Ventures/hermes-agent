@@ -61,6 +61,24 @@ def _callback_api():
     )
 
 
+def _current_session_id():
+    try:
+        from hermes_logging import _session_context
+
+        return getattr(_session_context, "session_id", None)
+    except Exception:
+        return None
+
+
+def _set_session_id(session_id) -> None:
+    try:
+        from hermes_logging import _session_context
+
+        _session_context.session_id = session_id
+    except Exception:
+        logger.debug("Could not set worker log session tag", exc_info=True)
+
+
 def propagate_context_to_thread(target: Callable) -> Callable:
     """Wrap *target* for execution on a worker thread with the *current*
     thread's ContextVars and approval/sudo callbacks propagated.
@@ -76,6 +94,11 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     absent.
     """
     ctx = contextvars.copy_context()
+    # The log session tag is thread-local (hermes_logging), not a ContextVar,
+    # so copy_context() does not carry it. Without this, lines logged by pool
+    # workers (e.g. the compaction worker's "LCM compaction #N") carry no
+    # [session_id] tag (t_35e2029a).
+    parent_session_id = _current_session_id()
     parent_approval_cb = parent_sudo_cb = None
     setters = None
     try:
@@ -88,6 +111,10 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
     def _runner(*args, **kwargs):
         def _inner():
+            # Restore (not clear) on exit: the runner may execute inline on
+            # the parent thread, whose own tag must survive.
+            prior_session_id = _current_session_id()
+            _set_session_id(parent_session_id)
             if setters is not None:
                 set_approval, set_sudo = setters
                 try:
@@ -104,6 +131,7 @@ def propagate_context_to_thread(target: Callable) -> Callable:
             try:
                 return target(*args, **kwargs)
             finally:
+                _set_session_id(prior_session_id)
                 if setters is not None:
                     set_approval, set_sudo = setters
                     try:
