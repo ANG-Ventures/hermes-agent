@@ -4761,6 +4761,13 @@ class MessageSender:
     @staticmethod
     def strip_cron_wrapper(content: str) -> str:
         """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output."""
+        # House-shape wrapper: content, then one "-# cron <name> · job <id> ·
+        # reply ..." footer line (cron/scheduler.py CRON_WRAPPER_FOOTER_PREFIX).
+        head, sep, last = content.rpartition("\n")
+        if sep and re.fullmatch(
+            r'-# cron (.+) · job \S* · reply "stop reminder \1" to manage', last
+        ):
+            return head.rstrip() or content
         if not content.startswith("Cronjob Response: "):
             return content
 

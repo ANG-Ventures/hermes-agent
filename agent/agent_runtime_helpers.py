@@ -5127,6 +5127,12 @@ _CLAUDE_CLI_CAP_SENTENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Any provider's "reached/hit/exceeded your <window> usage limit" sentence.
+_PROVIDER_QUOTA_SENTENCE_RE = re.compile(
+    r"\b(?:reached|hit|exceeded) your (?:[\w-]+ )?usage limit\b",
+    re.IGNORECASE,
+)
+
 _CLI_RESET_CLOCK_RE = re.compile(
     r"^(?:(?P<mon>[A-Za-z]{3,9})\s+(?P<day>\d{1,2}),?\s+)?"
     r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
@@ -5308,6 +5314,19 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                         context["quota_window_reset"] = _epoch
                         context.setdefault("reset_at", _epoch)
 
+    # Generic provider quota sentence ("You've reached your 5-hour usage limit.
+    # Your quota will reset when the current 5-hour window ends." -- kimi via
+    # cpa, 2026-09-29). No reset clock to parse, but the WINDOW is named, which
+    # lets the failover announce say "usage exhausted · 5h limit" instead of a
+    # bare class label.
+    if "quota_window" not in context:
+        _q_msg = context.get("message") or ""
+        if isinstance(_q_msg, str) and _PROVIDER_QUOTA_SENTENCE_RE.search(_q_msg):
+            if re.search(r"\b(?:weekly|7-day|7 day)\b", _q_msg, re.IGNORECASE):
+                context["quota_window"] = "7d"
+            elif re.search(r"\b(?:5-hour|5 hour|five-hour)\b", _q_msg, re.IGNORECASE):
+                context["quota_window"] = "5h"
+
     if "reset_at" not in context:
         message = context.get("message") or ""
         if isinstance(message, str):
@@ -5401,9 +5420,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     else:
         messages[target_idx]["content"] = existing_content + marker
     _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars): %s",
+        "Delivered /steer to agent after tool batch (%d chars)",
         len(steer_text),
-        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
 
 

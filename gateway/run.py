@@ -26066,6 +26066,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
 
+    def _live_prompt_tokens_for_session(self, session_key, session_id):
+        """Newest real last-call prompt tokens from the cached agent, or None.
+
+        None means no cached agent bound to ``session_id`` exists (fresh
+        process, evicted, or another session). A value <= 0 means the agent
+        is live but has no post-compaction real usage yet.
+        """
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        cache = getattr(self, "_agent_cache", None)
+        if cache_lock is None or cache is None or not session_key:
+            return None
+        try:
+            with cache_lock:
+                cached = cache.get(session_key)
+        except Exception:
+            return None
+        agent = cached[0] if isinstance(cached, tuple) else cached
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            return None
+        if getattr(agent, "session_id", None) != session_id:
+            return None
+        comp = getattr(agent, "context_compressor", None)
+        value = getattr(comp, "last_prompt_tokens", None) if comp is not None else None
+        return value if isinstance(value, int) else None
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         # Claim admission BEFORE the transcript lease. Pending sentinels remain
         # visible to inbound coalescing, but queued work cannot become a stale
@@ -26850,12 +26875,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 _msg_count = len(history)
 
-                # Prefer actual API-reported tokens from the last turn
-                # (stored in session entry) over the rough char-based estimate.
+                # Prefer actual API-reported tokens over the rough char-based
+                # estimate. The cached agent's compressor holds the newest real
+                # last-call figure (what /context shows); the stored figure can
+                # predate an in-turn compaction, so it only stands in when no
+                # live agent exists and it is plausible for the loaded transcript.
                 _stored_tokens = session_entry.last_prompt_tokens
-                if _stored_tokens > 0:
+                _live_tokens = self._live_prompt_tokens_for_session(
+                    session_key, session_entry.session_id
+                )
+                if _live_tokens is not None and _live_tokens > 0:
+                    if _stored_tokens > 0 and _stored_tokens != _live_tokens:
+                        logger.info(
+                            "Session hygiene: stored last_prompt_tokens ~%s for %s "
+                            "superseded by live ~%s from the cached agent",
+                            f"{_stored_tokens:,}", session_entry.session_id,
+                            f"{_live_tokens:,}",
+                        )
+                    _approx_tokens = _live_tokens
+                    _token_source = "actual (live)"
+                elif _live_tokens is None and _stored_tokens > 0:
                     _approx_tokens = _stored_tokens
                     _token_source = "actual"
+                    if _stored_tokens >= _compress_token_threshold:
+                        _rough_tokens = estimate_messages_tokens_rough(history)
+                        # Rough overestimates; a stored figure more than twice
+                        # it cannot describe this transcript -> it predates the
+                        # last compaction. Treat it as absent.
+                        if _rough_tokens * 2 < _stored_tokens:
+                            logger.info(
+                                "Session hygiene: stored last_prompt_tokens ~%s for %s "
+                                "predates the current transcript (rough ~%s); ignoring it",
+                                f"{_stored_tokens:,}", session_entry.session_id,
+                                f"{_rough_tokens:,}",
+                            )
+                            _approx_tokens = _rough_tokens
+                            _token_source = "estimated"
                 else:
                     _approx_tokens = estimate_messages_tokens_rough(history)
                     _token_source = "estimated"
@@ -27996,6 +28051,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                # The reply is discarded, but the API calls this turn made are
+                # real: persist their last prompt size so the next turn's
+                # hygiene valve does not read a figure from before an in-turn
+                # compaction (2026-09-29: /stop after a queued follow-up left a
+                # pre-compaction ~1.02M peak stored and hygiene compacted a 16%
+                # context). Conditional on the session not having been reset.
+                _stale_prompt_tokens = (
+                    agent_result.get("last_prompt_tokens")
+                    if isinstance(agent_result, dict) else None
+                )
+                if isinstance(_stale_prompt_tokens, int):
+                    try:
+                        await self.async_session_store.update_session(
+                            session_entry.session_key,
+                            last_prompt_tokens=_stale_prompt_tokens,
+                            touch_activity=False,
+                            expected_session_id=(
+                                agent_result.get("session_id") or session_entry.session_id
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to persist last_prompt_tokens for stale result %s",
+                            _quick_key or "?", exc_info=True,
+                        )
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -39000,6 +39080,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _leftover_steer:
                     pending = _leftover_steer
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+            elif result and result.get("pending_steer") and adapter and session_key:
+                # A follow-up already owns the next turn. Queue the leftover
+                # steer behind it instead of dropping it (2026-09-29). Use the
+                # overflow tail, never the head slot: the depth-cap branch
+                # below re-seats pending_event in the head slot and would
+                # overwrite it; the next drain promotes the overflow head.
+                # Apply the same slash-command guard as the pending text below:
+                # a leftover "/stop" or "/new" must never reach the agent.
+                _leftover_text = result["pending_steer"]
+                _leftover_is_cmd = False
+                _leftover_parts = _leftover_text.strip().split(None, 1)
+                if _leftover_parts and _leftover_parts[0].startswith("/"):
+                    _leftover_cmd_word = _leftover_parts[0][1:].lower()
+                    if _leftover_cmd_word:
+                        try:
+                            from hermes_cli.commands import resolve_command as _rc_leftover
+                            _leftover_is_cmd = bool(_rc_leftover(_leftover_cmd_word))
+                        except Exception:
+                            pass
+                if _leftover_is_cmd:
+                    logger.info(
+                        "Discarding command '/%s' from leftover /steer — "
+                        "commands must not be passed as agent input",
+                        _leftover_cmd_word,
+                    )
+                else:
+                    self._session_state(session_key).conversation.queued_events.append(
+                        MessageEvent(
+                            text=_leftover_text,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                        )
+                    )
+                    logger.info(
+                        "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
+                        session_key,
+                        len(_leftover_text),
+                    )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -39262,6 +39380,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
+
+                # The follow-up is a NEW turn on the parent's slot: re-stamp
+                # the turn clock and ack debounce so a busy/steer ack reports
+                # this turn's elapsed, not the parent's (2026-09-29). Only the
+                # key this run claimed (session_key): a different
+                # next_session_key with a live started_ts belongs to ANOTHER
+                # running turn, whose clock and ack debounce must not move.
+                _followup_state = self._peek_session_state(session_key) if session_key else None
+                if _followup_state is not None and _followup_state.turn.started_ts:
+                    _followup_state.turn.started_ts = time.time()
+                    _followup_state.turn.busy_ack_ts = 0.0
 
                 followup_result = await self._run_agent(
                     message=next_message,

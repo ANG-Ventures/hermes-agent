@@ -213,13 +213,11 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
 # of this module (fork raised 16 -> 30 on 2026-08-08 with loud exhaustion).
 
 # Default aggregate INPUT-token budget for one review fork (#93057). The
-# fork's first request replays the full snapshot — a warm prompt-cache read
-# that is cheap and intended (cache parity), which is why both compression
-# gates are deferred until the first provider response arrives
-# (_review_fork_first_request_pending in agent/turn_context.py). After that,
-# detached in-memory compaction bounds each request to roughly the
-# compression threshold, but nothing capped the SUM across the review's tool
-# loop: one production review made 8 requests replaying 1,487,951 input
+# fork's requests replay the snapshot — warm prompt-cache reads that are
+# cheap and intended (cache parity). The fork runs with compaction DISABLED
+# (t_35e2029a: it works on a throwaway copy), so this budget is what bounds
+# the review. Before it existed nothing capped the SUM across the review's
+# tool loop: one production review made 8 requests replaying 1,487,951 input
 # tokens total (four of them at 350k-384k). This budget caps the aggregate;
 # the review tool loop stops before the provider call that would cross it
 # (see ``_review_input_budget_exhausted`` in agent/conversation_loop.py).
@@ -1162,7 +1160,7 @@ def build_cache_parity_fork(
     credentials as the parent, byte-identical system prompt / tools[] /
     reasoning config on the same-model path, shared session_id for prefix
     warmth, and full persistence detachment (no state.db writes, no session
-    rotation, no external memory providers, in-place-only compaction).
+    rotation, no external memory providers, no compaction).
 
     Returns ``(fork_agent, runtime_dict, routed)`` where ``routed`` is True
     when auxiliary config redirected the fork to a different model (cache
@@ -1383,88 +1381,43 @@ def build_cache_parity_fork(
     # conversation (the review fires every ~10 turns). Leave session
     # finalization to the real owner (CLI close / gateway reset / cron).
     review_agent._end_session_on_close = False
-    # DETACHED IN-MEMORY COMPACTION (issue #93057). The fork shares
-    # the parent's session_id (pinned above for prefix-cache parity),
-    # so the historical guard here was ``compression_enabled = False``:
-    # if the fork ran the ordinary compression path it could rotate /
-    # archive the parent's live session — the sibling-session race
-    # behind #38727. But disabling compaction was a proxy for
-    # detachment, and it removed the ONLY bound on the review's
-    # private snapshot: as the review performs tool calls, every
-    # follow-up provider request replayed the snapshot plus the
-    # growing review tool loop (350k-384k input tokens per request in
-    # production, 1.49M total across one 8-request review).
+    # NO COMPACTION ON THE FORK (t_35e2029a, supersedes the #93057 in-memory
+    # compaction). The fork replays a THROWAWAY copy of the parent's
+    # transcript and never commits it, so any compaction it runs is discarded
+    # with the fork. Measured 2026-09-29: a 986-message review snapshot hit
+    # the pre-API threshold gate after the first response and spent 537 s of
+    # Opus (a ~1M-token cold summary prompt) compacting that copy. The
+    # review is already bounded without it: the aggregate input budget below
+    # stops the tool loop before the request that would exceed it, and
+    # _REVIEW_MAX_ITERATIONS caps iterations. Warm replays of the snapshot
+    # are cache reads; a summary pass is a cold full-price prompt, so
+    # compaction here costs more than it saves. A snapshot over the model
+    # window fails its first request (compression disabled -> the overflow
+    # path exits) instead of running the aux summary model.
     #
-    # The fix is detachment, not disablement:
-    #   • Persistence is already off above (_persist_disabled /
-    #     _session_db=None), so the commit site in compress_context
-    #     (``if agent._session_db:``) skips every durable write and
-    #     compaction can only ever rewrite the fork's private
-    #     in-memory transcript.
-    #   • The compressor's OWN session binding still needs severing:
-    #     AIAgent.__init__ bound it to the parent's SessionDB and
-    #     session_id before this function nulled the agent-level
-    #     binding, so durable cooldown/streak/ineffective-count
-    #     writes would otherwise land on the parent's row. Rebinding
-    #     with session_db=None / session_id="" makes every
-    #     compressor persist guard a no-op.
-    #   • Force in-place mode (never rotation) even if the parent's
-    #     config selected rotation, and re-enable compression ONLY
-    #     after the rebind succeeds (fail-closed — see below). While
-    #     enabled, both compression gates stay deferred until the
-    #     fork's first provider response so request #1 replays the
-    #     full snapshot as a warm cache read.
+    # The compressor's session binding is still severed: AIAgent.__init__
+    # bound it to the parent's SessionDB/session_id, and any engine-side
+    # durable write (cooldown/streak/ineffective-count) must never land on
+    # the parent's row (#38727). A failed rebind is logged and tolerated
+    # (plugin engines may not accept these kwargs); compression stays off
+    # either way.
     _review_compressor = getattr(review_agent, "context_compressor", None)
     _bind_review_compressor = getattr(
         _review_compressor, "bind_session_state", None
     )
-    _review_compression_detached = False
     if callable(_bind_review_compressor):
         try:
-            # Plugin/third-party context engines may not accept these
-            # kwargs; they own their own persistence policy, so a
-            # failed rebind leaves the pre-existing flags in place
-            # and must never abort the review (same tolerance as the
-            # init-time binding in agent_init.py).
             _bind_review_compressor(session_db=None, session_id="")
-            _review_compression_detached = True
         except Exception:
-            # FAIL-CLOSED (adversarial review, #93057): if the rebind
-            # could not sever the engine's session binding, the
-            # compressor may still point at the parent's
-            # SessionDB/session_id. Enabling compression in that
-            # state would let durable cooldown/streak/ineffective-
-            # count writes land on the parent's row and re-open the
-            # #38727 sibling race. Keep the historical
-            # compression_enabled=False behavior instead and warn;
-            # the review still runs, bounded by the iteration cap
-            # and the aggregate input budget below.
             logger.warning(
                 "background-review compressor detachment failed; "
-                "keeping compression DISABLED on this review fork "
-                "(fail-closed, issue #93057 / #38727)",
+                "compression stays DISABLED on this review fork "
+                "(issue #93057 / #38727)",
                 exc_info=True,
             )
-    # Force in-place mode (never rotation) even if the parent's
-    # config selected rotation. Re-enable compression ONLY after the
-    # compressor's session binding was successfully severed; an
-    # engine without a bind hook keeps the historical disabled
-    # behavior as well.
     review_agent.compression_in_place = True
-    review_agent.compression_enabled = _review_compression_detached
-    if _review_compression_detached:
-        # Warm-cache parity: the fork's FIRST provider request
-        # replays the parent's full snapshot as a warm prompt-cache
-        # read, so compaction must not rewrite the snapshot before
-        # that first request goes out. Defer both compression gates
-        # until the first provider response arrives (see
-        # _review_fork_first_request_pending in agent/turn_context.py
-        # and the pre-API gate in agent/conversation_loop.py); from
-        # the second request on, the fork's transcript is its own and
-        # compaction bounds it.
-        review_agent._review_defer_compaction_before_first_response = True
-    # Aggregate input budget: compaction bounds any single request;
-    # this bounds the WHOLE review. Iterations are already capped by
+    review_agent.compression_enabled = False
+    # Aggregate input budget: bounds the WHOLE review (compaction is off). Iterations are already capped by
     # _REVIEW_MAX_ITERATIONS. Checked in agent/conversation_loop.py
     # via _review_input_budget_exhausted (issue #93057).
     review_agent._review_input_token_budget = _review_input_token_budget(
@@ -1936,13 +1889,23 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(
-            agent,
-            messages_snapshot,
-            prompt,
-            task_cfg=task_cfg,
-            review_run=review_run,
-        )
+        # Tag every log line on the bg-review thread with the parent session
+        # id, including lines emitted before run_conversation() binds it and
+        # during teardown (t_35e2029a). Cleared on exit so a recycled thread
+        # never carries a stale tag.
+        from hermes_logging import clear_session_context, set_session_context
+
+        set_session_context(getattr(agent, "session_id", None) or "")
+        try:
+            _run_review_in_thread(
+                agent,
+                messages_snapshot,
+                prompt,
+                task_cfg=task_cfg,
+                review_run=review_run,
+            )
+        finally:
+            clear_session_context()
 
     return _target, prompt
 

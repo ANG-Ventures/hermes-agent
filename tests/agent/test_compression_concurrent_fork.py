@@ -1317,34 +1317,32 @@ def test_real_lock_api_internal_errors_fail_closed_skips_compression(
 
 
 
-def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> None:
-    """An oversized review snapshot replays warm on the first request, then
-    compacts in memory before further requests — without mutating the parent.
+def test_review_fork_never_compacts_oversized_snapshot(tmp_path: Path) -> None:
+    """The review fork must NOT run threshold compaction on its throwaway copy.
 
-    Regression for #93057: the fork historically pinned ``compression_enabled =
-    False`` because it shares the parent's session_id (issue #38727). That
-    left the review's private snapshot unbounded — every follow-up request in
-    the review tool loop replayed the whole snapshot (350k-384k input tokens
-    per request in production). The fix detaches the fork's compressor from
-    the parent's SessionDB/session_id and enables in-memory-only compaction.
+    Regression for t_35e2029a (measured 2026-09-29, session
+    20260927_183134_b6f8858a): a bg-review fork replaying a 986-message
+    snapshot hit the pre-API threshold gate after its first response and spent
+    537 s of Opus summarizing a transcript copy that is discarded with the
+    fork. The fork never commits anything, so compaction there is pure cost;
+    the aggregate input budget (``_review_input_token_budget``) and the
+    iteration cap already bound the review (#93057).
 
-    This test drives the REAL ``_run_review_in_thread`` + ``run_conversation``
-    with a threshold-crossing snapshot across two provider requests and
-    asserts:
-      • the FIRST request replays the full snapshot untouched (warm
-        prompt-cache parity) — no compaction summary, middle turns present;
-      • compression actually fired before the SECOND request (a real
-        threshold crossing, not just setup-time binding state), and that
-        request carries the compaction summary and none of the middle
-        snapshot turns;
-      • the fork keeps the parent's session_id (prompt-cache parity) but its
-        agent-level AND compressor-level session bindings are detached;
-      • the parent's durable transcript, session row, and child-session graph
-        are byte-for-byte unchanged after the compaction ran.
+    Drives the REAL ``_run_review_in_thread`` + ``run_conversation`` with the
+    REAL fork compressor forced over threshold across two provider requests
+    and asserts:
+      * the compressor's ``compress`` is never entered and the auxiliary
+        summary model (``call_llm``) is never called;
+      * both requests replay the full snapshot (no compaction summary);
+      * the fork keeps the parent's session_id (prompt-cache parity) with
+        agent-level and compressor-level session bindings detached;
+      * the parent's durable transcript, session row, and child-session graph
+        are unchanged.
     """
     import agent.background_review as br
+    import agent.context_compressor as cc_mod
 
-    parent_sid = "REVIEW_FORK_IN_MEMORY_COMPACTION_93057"
+    parent_sid = "REVIEW_FORK_NO_COMPACTION_T35E2029A"
 
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session(parent_sid, source="discord")
@@ -1368,6 +1366,11 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
     ]
 
     captured = {}
+    aux_calls = {"count": 0}
+
+    def _counting_call_llm(*_a, **_kw):
+        aux_calls["count"] += 1
+        raise AssertionError("review fork called the auxiliary summary model")
 
     def _tool_response(prompt_tokens: int) -> SimpleNamespace:
         message = SimpleNamespace(
@@ -1422,14 +1425,10 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
 
     def _run_threshold_crossing_review(self, *args, **kwargs):
         captured["compression_enabled"] = self.compression_enabled
-        captured["compression_in_place"] = self.compression_in_place
         captured["session_id"] = self.session_id
         captured["session_db"] = self._session_db
         captured["input_budget"] = getattr(
             self, "_review_input_token_budget", "missing"
-        )
-        captured["defer_first_request"] = getattr(
-            self, "_review_defer_compaction_before_first_response", "missing"
         )
         captured["compressor_session_db"] = getattr(
             self.context_compressor, "_session_db", "missing"
@@ -1437,41 +1436,15 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         captured["compressor_session_id"] = getattr(
             self.context_compressor, "_session_id", "missing"
         )
-        # Stub the fork's compressor so compaction output is deterministic
-        # and no aux-LLM call happens; the trigger/commit paths stay real.
-        self.context_compressor.threshold_tokens = 1
-        self.context_compressor.protect_first_n = 1
-        self.context_compressor.protect_last_n = 1
-        self.context_compressor.compress = MagicMock(
-            return_value=[
-                {"role": "user", "content": "[CONTEXT COMPACTION] review summary"},
-                {"role": "assistant", "content": "summary acknowledged"},
-            ]
-        )
-        # Compress on the first pressure check after the first response, then
-        # stand down so the compacted request proceeds instead of looping.
-        _should_compress_calls = {"count": 0}
-
-        def _should_compress(_tokens):
-            _should_compress_calls["count"] += 1
-            return _should_compress_calls["count"] == 1
-
-        self.context_compressor.should_compress = MagicMock(
-            side_effect=_should_compress
-        )
-        self.context_compressor.should_compress_info = MagicMock(
-            return_value=(True, "over threshold")
-        )
-        self.context_compressor.should_compress_preflight = MagicMock(
-            return_value=True
-        )
-        self.context_compressor.should_defer_preflight_to_real_usage = MagicMock(
-            return_value=False
-        )
-        self.context_compressor.get_active_compression_failure_cooldown = MagicMock(
-            return_value=None
-        )
-        self.context_compressor.select_context = MagicMock(return_value=None)
+        # Force the REAL fork compressor over threshold on every gate so any
+        # enabled compaction path would fire; spy on compress() without
+        # replacing it so a regression reaches the (counted) aux model.
+        compressor = self.context_compressor
+        compressor.threshold_tokens = 1
+        compressor.protect_first_n = 1
+        compressor.protect_last_n = 1
+        compress_spy = MagicMock(side_effect=compressor.compress)
+        compressor.compress = compress_spy
         self._compression_feasibility_checked = True
         self.client = MagicMock()
         self.client.chat.completions.create.side_effect = [
@@ -1495,7 +1468,7 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         self._execute_tool_calls = _fake_execute_tool_calls
 
         result = real_run_conversation(self, *args, **kwargs)
-        captured["compression_calls"] = self.context_compressor.compress.call_count
+        captured["compression_calls"] = compress_spy.call_count
         create = self.client.chat.completions.create
         captured["create_calls"] = create.call_count
         captured["outbound"] = [
@@ -1504,63 +1477,38 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         return result
 
     try:
-        with patch.object(AIAgent, "run_conversation", _run_threshold_crossing_review):
+        with (
+            patch.object(AIAgent, "run_conversation", _run_threshold_crossing_review),
+            patch.object(cc_mod, "call_llm", _counting_call_llm),
+            patch("agent.auxiliary_client.call_llm", _counting_call_llm),
+        ):
             br._run_review_in_thread(parent, snapshot, "review this conversation")
 
-        assert captured["compression_calls"] >= 1, (
-            "FIX REGRESSION: the review fork did not compact its oversized "
-            "snapshot. compression_enabled was historically set False on the "
-            "fork, which removed the only bound on the replayed snapshot "
-            "(issue #93057)."
+        assert captured["compression_enabled"] is False, (
+            "the review fork works on a throwaway transcript copy; threshold "
+            "compaction there is discarded work (t_35e2029a: 537 s of Opus)"
         )
+        assert captured["compression_calls"] == 0, (
+            f"review fork entered compress() {captured['compression_calls']}x"
+        )
+        assert aux_calls["count"] == 0, "review fork called the aux summary model"
         assert captured["create_calls"] == 2, (
             f"expected a 2-request review (tool call + final), "
             f"got {captured['create_calls']}"
         )
-        first_outbound, second_outbound = captured["outbound"]
-        first_contents = [str(m.get("content", "")) for m in first_outbound]
-        second_contents = [str(m.get("content", "")) for m in second_outbound]
-        # Warm-cache parity: the first request replays the full snapshot
-        # untouched — middle turns present, no compaction summary yet.
-        assert any("review turn 12" in text for text in first_contents), (
-            "the review fork's FIRST request must replay the full snapshot "
-            "(warm prompt-cache read) — compaction must not rewrite it before "
-            "the first provider call"
-        )
-        assert not any(
-            "[CONTEXT COMPACTION]" in text for text in first_contents
-        ), f"first request was compacted prematurely: {first_contents!r}"
-        # The SECOND request carries the compaction summary and none of the
-        # middle snapshot turns.
-        assert any(
-            "[CONTEXT COMPACTION] review summary" in text
-            for text in second_contents
-        ), f"outbound request did not contain the compaction summary: {second_contents!r}"
-        assert not any("review turn 12" in text for text in second_contents), (
-            "outbound request still replays the middle of the snapshot — "
-            "the review replayed an unbounded transcript despite compaction"
-        )
+        for outbound in captured["outbound"]:
+            contents = [str(m.get("content", "")) for m in outbound]
+            assert any("review turn 12" in text for text in contents)
+            assert not any("[CONTEXT COMPACTION]" in text for text in contents)
         assert captured["session_id"] == parent_sid, (
             "Review fork should inherit the parent's session_id for "
             "prompt-cache parity."
         )
-        assert captured["session_db"] is None, (
-            "Review fork must keep its agent-level SessionDB detached "
-            "(_session_db=None) so compaction can never persist."
-        )
-        assert captured["compressor_session_db"] is None, (
-            "Review fork's compressor must be detached from the parent "
-            "SessionDB, otherwise durable cooldown/streak writes land on "
-            "the parent's row (issue #93057)."
-        )
+        assert captured["session_db"] is None
+        assert captured["compressor_session_db"] is None
         assert captured["compressor_session_id"] == ""
-        assert captured["compression_enabled"] is True
-        assert captured["compression_in_place"] is True
-        assert captured["defer_first_request"] is True
         assert isinstance(captured["input_budget"], int) and captured["input_budget"] > 0
 
-        # Parent session must be byte-for-byte unchanged after the review
-        # compacted its private snapshot.
         assert parent.session_id == parent_sid
         assert db.get_messages(parent_sid) == durable_before
         session_row_after = tuple(

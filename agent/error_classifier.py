@@ -1661,6 +1661,16 @@ def _classify_by_status(
     """Classify based on HTTP status code with message-aware refinement."""
 
     if status_code == 401:
+        # Quota wall wearing a 401 mask: see the 403 branch below.
+        if _is_periodic_quota_wall(
+            error_msg, error_code, body, response_headers
+        ):
+            return result_fn(
+                FailoverReason.rate_limit,
+                retryable=True,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
         # Not retryable on its own — credential pool rotation and
         # provider-specific refresh (Codex, Anthropic, Nous) run before
         # the retryability check in run_agent.py.  If those succeed, the
@@ -1688,6 +1698,21 @@ def _classify_by_status(
             return result_fn(
                 FailoverReason.billing,
                 retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
+        # Periodic subscription quota wall wearing an AUTH status (2026-09-29, kimi
+        # via cpa): ``403 access_terminated_error "You've reached your 5-hour usage
+        # limit. Your quota will reset when the current 5-hour window ends."`` fell
+        # into the bare-403 ``auth`` bucket and announced "(auth refresh)", sending
+        # the operator to re-auth a valid token. A named usage limit plus a reset
+        # signal is a quota, never an auth fault. Same shape as a quota 429.
+        if _is_periodic_quota_wall(
+            error_msg, error_code, body, response_headers
+        ):
+            return result_fn(
+                FailoverReason.rate_limit,
+                retryable=True,
                 should_rotate_credential=True,
                 should_fallback=True,
             )
@@ -1943,6 +1968,35 @@ def _classify_by_status(
         return result_fn(FailoverReason.server_error, retryable=True)
 
     return None
+
+
+_QUOTA_WALL_RE = re.compile(
+    r"usage limit|usage_limit_reached|quota (?:will )?resets?\b|quota (?:has been )?exceeded"
+)
+
+
+def _is_periodic_quota_wall(
+    error_msg: str,
+    error_code: str,
+    body: dict,
+    response_headers,
+) -> bool:
+    """A named subscription usage limit that states a reset (401/403 bodies).
+
+    Kept NARROW: needs an explicit usage-limit phrase AND a reset signal, and
+    never fires on a billing phrase (credit/spend walls stay ``billing``). A
+    bare 401/403 or ``permission_error`` keeps the historical ``auth`` class.
+    """
+    if any(p in error_msg for p in _BILLING_PATTERNS):
+        return False
+    if "key limit exceeded" in error_msg or "spending limit" in error_msg:
+        return False
+    if not (
+        (error_code or "").lower() == "usage_limit_reached"
+        or _QUOTA_WALL_RE.search(error_msg)
+    ):
+        return False
+    return _has_usage_limit_transient_signal(error_msg, body, response_headers)
 
 
 def _has_usage_limit_transient_signal(

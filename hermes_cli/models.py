@@ -106,6 +106,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("openai/gpt-6-astra",                     ""),
     ("openai/gpt-6-astra-pro",                 ""),
     ("openai/gpt-6-sol",                       ""),
+    ("openai/gpt-6.1-sol",                     ""),
     ("openai/gpt-6-luna",                      ""),
     ("openai/gpt-5.6-sol",                     ""),
     ("openai/gpt-5.6-sol-pro",                 ""),
@@ -300,6 +301,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = GuardedDict(__name__, "_PROVIDER_MODELS
         "openai/gpt-6-astra",
         "openai/gpt-6-astra-pro",
         "openai/gpt-6-sol",
+        "openai/gpt-6.1-sol",
         "openai/gpt-6-luna",
         "openai/gpt-5.6-sol",
         "openai/gpt-5.6-sol-pro",
@@ -361,6 +363,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = GuardedDict(__name__, "_PROVIDER_MODELS
         "gpt-6-astra",
         "gpt-6-astra-pro",
         "gpt-6-sol",
+        "gpt-6.1-sol",
         "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-sol-pro",
@@ -7642,6 +7645,10 @@ def validate_requested_model(
             "accepted": False,
             "persist": False,
             "recognized": False,
+            # The live listing answered and omitted the id. Callers that hold
+            # independent evidence the id is real (a user-configured alias)
+            # use this to report "exists but unavailable" instead.
+            "not_listed": True,
             "message": (
                 f"Model `{requested}` was not found in this provider's model listing."
                 f"{suggestion_text}"
