@@ -688,10 +688,10 @@ hermes kanban pins --stale-hours 24   # exits 1 if a card pin is older (daily li
 
 A card can be worked by a coding harness other than Hermes. The assignee picks the harness: a thin Hermes shim profile claims the card like any worker, hands it to the harness in the card's worktree, then checks the result itself (it reruns the card's test command, reads the diff, and reads the served model from the harness's own log) and writes the board. The operator runbook is the fleet skill `kanban-foreign-lane`; this section is the short version.
 
-| Assignee | Harness | Brain | State (2026-09-28) |
+| Assignee | Harness | Brain | State (2026-09-28, 19:10 PT) |
 |---|---|---|---|
 | `cc-worker` | Claude Code, the interactive TUI (`claude-code-tui`) | `cpr-cli` (a pool-picked Claude sub) | Live. The TUI has been the default since 08:25 PT (t_ee57a556). |
-| `codex-worker` | `codex exec` | `bpr` | Not for production yet (t_8371a38c). |
+| `codex-worker` | `codex exec` | `bpr` (Claude Haiku through the bridge) | End-to-end green on `bpr` (t_8371a38c, 16:49 PT). The board-verb deny hook now runs inside Codex (t_603b76f3), and Codex can commit in a card-owned checkout (t_3165f60c). |
 | `opencode-worker` | OpenCode | `cliproxy:gpt-6-astra` | Live (t_e2f3590d). |
 | `pi-worker` | Pi | `cliproxy:gpt-6-astra` | Live (t_a1c6bc3d). |
 
@@ -701,7 +701,9 @@ A foreign-lane card must name one test command in its body, and its workspace mu
 
 - One model and one effort per card. The shim and the harness both run what the card says. The effort reaches Claude Code as its own `--effort` flag. With no card effort the harness runs `medium`.
 - `max` and `xhigh` run only when an operator profile (`default`, `apollo` or `aegis`) set that effort on the card. The receipt names who, in `effort_unlocked_by`. From anywhere else the card blocks `effort_not_allowed`.
-- The runner checks the model against the harness's allowlist (`harness-models.yaml` in the skill) when the card starts, not when you run `set-model`. A typo blocks the card within seconds with `model_not_servable`.
+- The runner checks the model against the harness's allowlist (`harness-models.yaml` in the skill) when the card starts, not when you run `set-model`. A typo blocks the card within seconds with `model_not_servable`. The Claude Code lists hold every Anthropic id that models.dev prices, and a test fails if models.dev adds one the list lacks (t_9a46fea5).
+- Each harness gets the effort its own way: Claude Code `--effort`, Codex `-c model_reasoning_effort=...`, and OpenCode or Pi on a `cliproxy:<model>` brain as the model suffix `<model>(<effort>)`. When a harness has no way to take it, the receipt says so in `brain_notes`.
+- The profile default is still Haiku 4.5, a test setting. The production model is ruled (`claude-opus-5-5`, effort medium, on `claude-bpr`) and switches in once the lanes are proven reliable (t_b9b19c02).
 
 ```bash
 hermes kanban set-model t_abcd claude-sonnet-5 --effort high     # harness and shim
@@ -709,9 +711,11 @@ hermes kanban set-model t_abcd --provider claude-bpx-6 --model claude-haiku-4-5 
     --pin-sub "benchmark on one sub"                              # one sub: brain cpx-cli:6
 ```
 
-The run's metadata (`hermes kanban show <id> --json`, `runs[-1].metadata`) carries the receipt: `model` and `model_source` (card, lane, profile or delegation), `effort` and `effort_source`, `served_model` (what the harness log says ran), and for the TUI `drive: tui` and `entrypoint: cli`.
+The run's metadata (`hermes kanban show <id> --json`, `runs[-1].metadata`) carries the receipt: `model` and `model_source` (card, lane, profile or delegation), `effort` and `effort_source`, `served_model` (what the harness log says ran), and for the TUI `drive: tui` and `entrypoint: cli`. If the post-run scan finds a secret-shaped string in the harness's session file, the file is moved to a private quarantine folder and the receipt's `session_quarantine` records where, with the byte offsets of each hit but never the text (t_f3462ef9). Every receipt is also collected into the `harness_receipts` table in `kanban.db`; `python3 scripts/harness-receipts.py stats` in the skill prints pass rate, median times and list-$ per harness and model (t_439ed2c3).
 
-**Billing.** On a Claude subscription the interactive TUI draws about half the headless rate. The measured figures are 0.50x against `claude -p` (t_da5d8919), and 0.52x in production with the shim's own turns counted, 0.42x with them subtracted (t_b54c8715). The cron job `cc-worker-receipt-watch` checks every new cc-worker receipt every 10 minutes and pages #alerts if one leaves the interactive class. It prints nothing while all receipts are green. On a ChatGPT subscription the Codex TUI and `codex exec` draw the same rate (0.97x to 1.02x, t_bf914621), so `codex-worker` stays on `codex exec`.
+**Billing.** On a Claude subscription the interactive TUI draws about half the headless rate. The measured figures are 0.50x against `claude -p` (t_da5d8919), and 0.52x in production with the shim's own turns counted, 0.42x with them subtracted (t_b54c8715). The cron job `cc-worker-receipt-watch` checks every new receipt every 10 minutes. It pages #alerts if a cc-worker receipt leaves the interactive class, and, for codex-worker, opencode-worker and pi-worker, if the served model is missing or wrong, the shim's test run disagrees with the harness, or the leak scan found anything (t_a8f139e0). It prints nothing while all receipts are green. On a ChatGPT subscription the Codex TUI and `codex exec` draw the same rate (0.97x to 1.02x, t_bf914621), so `codex-worker` stays on `codex exec`.
+
+**Coming in the next restart window.** Two fork changes are approved (Ace, 17:06 PT) and CI-green but not yet merged or running on 2026-09-28 19:10 PT. `foreign_lane.worker_command` lets the dispatcher run the lane runner directly with no LLM shim; the runner relays the receipt's own board call, and a lane that exits without one blocks the card (t_3a8e4e30). `foreign_lane.shim_model_cap` keeps the shim on a cheaper model, for example Sonnet, when a card is pinned to Opus, without changing the harness's model (t_ba8e22f6). Neither key does anything until the dispatcher restarts on that code.
 
 ### Cost strategy: frontier orchestrator, inexpensive workers
 

@@ -639,3 +639,70 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
     )
 
 
+# ------------------------------------------------------------------
+# Native commands must carry the args their gateway handler parses
+# (t_b4f07acf: native /undo dropped N, so Discord always undid 1).
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_native_undo_forwards_count(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["undo"]
+    interaction = SimpleNamespace()
+    await command(interaction, count=3)
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/undo 3")
+
+    adapter._run_simple_slash.reset_mock()
+    await command(interaction)
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/undo 1")
+
+
+@pytest.mark.asyncio
+async def test_native_commands_expose_args_their_registry_entry_declares(adapter):
+    """Invariant: a hand-registered native shadows the auto-registration, so
+    it must accept an argument whenever COMMAND_REGISTRY declares args_hint."""
+    import inspect
+
+    from hermes_cli.commands import COMMAND_REGISTRY
+
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+    tree = adapter._client.tree.commands
+
+    hinted = {}
+    for cmd in COMMAND_REGISTRY:
+        if cmd.args_hint:
+            for name in (cmd.name, *cmd.aliases):
+                hinted[name] = cmd.args_hint
+
+    missing = []
+    for name, fn in tree.items():
+        if name not in hinted or not callable(fn) or not inspect.iscoroutinefunction(fn):
+            continue
+        params = list(inspect.signature(fn).parameters)
+        if len(params) < 2:  # only ``interaction``
+            missing.append(name)
+    assert missing == [], f"native slash commands drop their args: {missing}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,kwargs,expected",
+    [
+        ("new", {"name": "plan"}, "/reset plan"),
+        ("reset", {"name": ""}, "/reset"),
+        ("compress", {"args": "here 2"}, "/compress here 2"),
+        ("usage", {"args": "reset"}, "/usage reset"),
+        ("help", {"filter": "skills"}, "/help skills"),
+    ],
+)
+async def test_native_args_reach_gateway_command_text(adapter, name, kwargs, expected):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands[name](interaction, **kwargs)
+    assert adapter._run_simple_slash.await_args.args[:2] == (interaction, expected)

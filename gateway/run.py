@@ -3429,6 +3429,8 @@ from gateway.turn_lease import (
     DEFAULT_STALE_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    bind_current_token,
+    current_token as current_turn_lease_token,
 )
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
@@ -4026,8 +4028,15 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-async def _probe_audio_duration(path: str) -> Optional[str]:
-    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
+_FFPROBE_TIMEOUT_S = 5.0
+
+
+async def _probe_audio_duration(path: str, *, allow_subprocess: bool = True) -> Optional[str]:
+    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure.
+
+    ``allow_subprocess=False`` keeps to the in-process header reads (wav/ogg)
+    and never spawns ffprobe.
+    """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".wav":
@@ -4053,17 +4062,28 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         except Exception:
             pass
 
+    if not allow_subprocess:
+        return None
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_FFPROBE_TIMEOUT_S)
         if proc.returncode == 0:
             return _format_duration(float(stdout.decode().strip()))
-    except Exception:
-        pass
+    except BaseException as exc:
+        # Timed out or cancelled (e.g. by a caller's wait_for): never leave
+        # ffprobe running behind us (FleetReview #115).
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not isinstance(exc, Exception):
+            raise
 
     return None
 
@@ -4109,9 +4129,12 @@ async def _inbound_log_preview(event) -> str:
         return text[:80].replace("\n", " ")
     duration = None
     if voice_paths:
+        # A log label must not cost the admitted turn an ffprobe spawn (up to
+        # the whole timeout): header reads only; anything else logs "?s"
+        # (FleetReview #115).
         try:
             duration = await asyncio.wait_for(
-                _probe_audio_duration(os.path.abspath(voice_paths[0])),
+                _probe_audio_duration(os.path.abspath(voice_paths[0]), allow_subprocess=False),
                 timeout=_VOICE_LOG_PROBE_TIMEOUT_S,
             )
         except Exception:
@@ -25101,8 +25124,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
                 # inside _run_agent returns False, and the old sentinel-only check here
                 # missed the leftover real agent — locking the session out forever (#28686).
+                # ...but only while the slot is still THIS turn's. The lease
+                # is released above, before the await, so a queued turn on
+                # the same key may already have claimed the slot and
+                # registered its agent; clearing it here would make /stop
+                # miss the live turn (FleetReview #1409).
                 try:
-                    self._release_running_agent_state(_quick_key)
+                    _slot_task = getattr(self, "_running_agent_tasks", {}).get(_quick_key)
+                    if (
+                        _slot_task is None
+                        or _slot_task is asyncio.current_task()
+                        or _slot_task.done()
+                    ):
+                        self._release_running_agent_state(_quick_key)
+                    else:
+                        logger.debug(
+                            "Skipping running-state release for %s: the slot "
+                            "belongs to a newer turn",
+                            _quick_key,
+                        )
                 finally:
                     if _checkout_ticket is not None:
                         _checkout_ticket.release()
@@ -25318,21 +25358,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
+                # Through the once-helper (FleetReview #101): it records the
+                # echoed count on the event, so a pending/busy path that later
+                # echoes the same event's transcripts sends only the unsent tail.
                 if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                        await self._echo_pending_stt_transcripts_once(
+                            event,
+                            _echo_adapter,
+                            source,
+                            _successful_transcripts,
+                            metadata=self._thread_metadata_for_source(
+                                source, self._reply_anchor_for_event(event)
+                            ),
+                        )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -26513,6 +26553,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # _handle_message releases the lease. If that task ends without
                 # releasing, a waiter may reclaim the lease (2026-09-27 leak).
                 _lease_token.owner_task = asyncio.current_task()
+                # Turn-pool work items submitted from this turn (run_sync)
+                # attach to the token; the lease is not freed while one runs.
+                bind_current_token(_lease_token)
                 # Diagnostic hint so a LATER waiter's PHASE=stale_lease_holder
                 # line can name the tool this turn is parked in.
                 try:
@@ -32771,7 +32814,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             return ctx.run(func, *call_args)
 
-        return await loop.run_in_executor(executor, _timed, *args)
+        if pool != "turn":
+            return await loop.run_in_executor(executor, _timed, *args)
+        # Track the concurrent future itself: the asyncio wrapper reports
+        # done() on cancel while the thread is still running.
+        cfut = executor.submit(_timed, *args)
+        token = current_turn_lease_token()
+        if token is not None:
+            token.add_worker(cfut)
+        return await asyncio.wrap_future(cfut, loop=loop)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work.
@@ -35598,7 +35649,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn.lease_token = None
         turn.lease_generation = None
         try:
-            return registry.release(token)
+            # Deferred while this turn's agent worker thread still runs: a
+            # cancelled handler does not stop it (FleetReview #1409).
+            return registry.release_when_idle(token)
         except Exception:
             logger.warning("Failed to release turn lease for %s", session_key, exc_info=True)
             return False
@@ -40681,6 +40734,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _loop.run_in_executor(None, discover_mcp_tools)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
+
+    # Pin one coherent code snapshot: import every first-party module now,
+    # while the tree still matches what booted, so a later fast-forward of the
+    # checkout can't feed a function-scoped import a newer module than its
+    # already-cached dependencies (see gateway/boot_preload.py).  Worker thread
+    # so the loop stays responsive; best-effort, never aborts boot.
+    try:
+        from gateway.boot_preload import preload_first_party_modules
+        await asyncio.get_running_loop().run_in_executor(None, preload_first_party_modules)
+    except Exception as e:
+        logger.warning("Boot preload failed: %s", e)
 
     # Start the gateway
     try:

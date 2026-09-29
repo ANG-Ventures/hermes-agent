@@ -4140,7 +4140,12 @@ def run_conversation(
                     )
                     if isinstance(_sent_model, str) and _sent_model:
                         _call_route["model"] = _sent_model
-                    agent._inflight_request_route = dict(_call_route)
+                    from agent.chat_completion_helpers import _dispatch_route_snapshot
+
+                    # The credential identity is pinned with the route: the
+                    # agent key may rotate while the call is in flight
+                    # (FleetReview 659603b36aec).
+                    agent._inflight_request_route = _dispatch_route_snapshot(agent, _call_route)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -6912,14 +6917,26 @@ def run_conversation(
                 )
                 _capacity_wait = None
                 if _is_pool_capacity:
-                    max_retries = max(max_retries, int(agent._capacity_retry_attempts))
+                    _cap_attempts = int(agent._capacity_retry_attempts)
+                    max_retries = max(max_retries, _cap_attempts)
+                    # The wall-clock budget counts time since the first pool
+                    # 503 of this block, request time included, not just our
+                    # own sleeps (FleetReview #84).
+                    _cap_now = time.monotonic()
+                    if _retry.capacity_started_at is None:
+                        _retry.capacity_started_at = _cap_now
+                    _retry.capacity_waited_s = max(
+                        _retry.capacity_waited_s, _cap_now - _retry.capacity_started_at
+                    )
                     _cap_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     _cap_ra_raw = None
                     if _cap_headers and hasattr(_cap_headers, "get"):
                         _cap_ra_raw = _cap_headers.get("retry-after") or _cap_headers.get("Retry-After")
                     _capacity_wait = capacity_retry_wait(
                         retry_count=retry_count,
-                        max_retries=max_retries,
+                        # The capacity path's OWN attempt budget: a larger
+                        # generic api_max_retries must not widen it (#29).
+                        max_retries=_cap_attempts,
                         raw_retry_after=_cap_ra_raw,
                         waited_s=_retry.capacity_waited_s,
                         max_wait_s=float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),

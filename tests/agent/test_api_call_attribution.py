@@ -155,6 +155,76 @@ def test_openai_codex_pool_uses_wire_attribution(recorded, monkeypatch):
     assert recorded[0]["attribution"] == "wire"
 
 
+def _codex_jwt(account_id: str) -> str:
+    import base64
+    import json
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    claims = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    return f"{seg({'alg': 'none'})}.{seg(claims)}.sig"
+
+
+class _FreshPool:
+    """A just-loaded pool (``load_pool()``): entries exist, no selection yet."""
+
+    def __init__(self, *tokens):
+        self.entries = [SimpleNamespace(access_token=t) for t in tokens]
+
+    def current(self):
+        return None
+
+
+def test_openai_codex_fallback_pool_without_cursor_stamps_wire_token(recorded):
+    # t_6144ccf0: fallback activation attaches load_pool(fb_provider) and sets
+    # agent.api_key from the fallback client; the pool cursor is never set, so
+    # current() is None. The call was sent with agent.api_key: stamp that.
+    agent = _agent("turn-fallback", "openai-codex")
+    agent._credential_pool = _FreshPool(_codex_jwt("d425ab44-aaaa"), _codex_jwt("97ff9716-bbbb"))
+    agent.api_key = _codex_jwt("50031da6-cccc")
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(1000, 50)))
+
+    assert recorded[0]["sub_key"] == "codex:50031da6"
+    assert recorded[0]["attribution"] == "wire"
+
+
+def test_openai_codex_without_pool_stamps_agent_key(recorded):
+    agent = _agent("turn-nopool", "openai-codex")
+    agent.api_key = _codex_jwt("97ff9716-bbbb")
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 5)))
+
+    assert recorded[0]["sub_key"] == "codex:97ff9716"
+
+
+def test_openai_codex_agent_key_wins_over_stale_pool_cursor(recorded):
+    # The client is built from agent.api_key; a pool cursor that disagrees is
+    # not the account the request was sent with.
+    agent = _agent("turn-disagree", "openai-codex")
+    agent._credential_pool = SimpleNamespace(
+        current=lambda: SimpleNamespace(access_token=_codex_jwt("d425ab44-aaaa"))
+    )
+    agent.api_key = _codex_jwt("97ff9716-bbbb")
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 5)))
+
+    assert recorded[0]["sub_key"] == "codex:97ff9716"
+
+
+def test_openai_codex_opaque_key_and_no_selection_records_null(recorded):
+    # Never guess: no account claim anywhere -> NULL, even with pool entries.
+    agent = _agent("turn-opaque", "openai-codex")
+    agent._credential_pool = _FreshPool(_codex_jwt("d425ab44-aaaa"))
+    agent.api_key = "opaque-test-token"
+
+    cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 5)))
+
+    assert recorded[0]["sub_key"] is None
+    assert recorded[0]["attribution"] == "wire"
+
+
 
 def test_delegated_subagent_stamps_own_turn_id(recorded):
     parent = _agent("turn-parent")

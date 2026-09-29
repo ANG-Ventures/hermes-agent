@@ -107,14 +107,37 @@ def _urls(apr_url=None, bpr_url=None) -> dict:
     return {"claude-apr": apr_url or "", "claude-bpr": bpr_url or ""}
 
 
+_DEAD_SOCKETS: list = []
+
+
 def _dead_url() -> str:
-    """A loopback URL nothing listens on (bind, read the port, close)."""
+    """A loopback URL that never answers HTTP: every connection is accepted
+    and closed at once, so a probe fails fast.
+
+    The port stays OWNED for the life of the module. Binding, reading the
+    port and closing the socket (the old shape) handed the port back to the
+    OS before the probe ran, so another process could take it and answer.
+    (A bound socket that never listen()s is no substitute: on Darwin the
+    connect hangs to the probe timeout instead of being refused.)
+    """
     import socket
+    import threading
 
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
+    s.listen(16)
+    _DEAD_SOCKETS.append(s)
+
+    def _slam() -> None:
+        while True:
+            try:
+                conn, _ = s.accept()
+            except OSError:
+                return
+            conn.close()
+
+    threading.Thread(target=_slam, daemon=True).start()
     port = s.getsockname()[1]
-    s.close()
     return f"http://127.0.0.1:{port}/health"
 
 
@@ -1467,3 +1490,47 @@ def test_circuit_charges_the_pool_recorded_at_spawn_not_the_current_pin(home):
         conn.execute("UPDATE tasks SET provider_override='claude-bpr' WHERE id=?", (tid,))
         conn.commit()
         assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": now - 50 + 600}
+
+
+def test_pool_budget_pinned_route_honours_an_explicit_probe(pool, bpr):
+    """FleetReview #9: an explicit provider probe takes precedence for a
+    PINNED route too (as in capped_provider). The pinned branch answered 1
+    from the relay's reachability and never read the explicit probe."""
+    pool.eligible = 0
+    bpr.eligible = 7
+    got = ph.pool_budget_eligible("claude-bpx-22", {"claude-bpx-22": pool.url}, {},
+                                  _urls(None, bpr.url))
+    assert got == 0
+    # No explicit probe: the pinned lane still spends one subscription.
+    assert ph.pool_budget_eligible("claude-bpx-22", {}, {}, _urls(None, bpr.url)) == 1
+    # An empty/malformed explicit probe is not a probe: the pinned lane keeps
+    # its relay health signal instead of failing open (FleetReview on #1416).
+    for bad in ("", "not-a-url"):
+        assert ph.pool_budget_eligible(
+            "claude-bpx-22", {"claude-bpx-22": bad}, {}, _urls(None, bpr.url)) == 1
+
+
+def test_steady_state_deferral_is_recorded_once(home, apr):
+    """FleetReview #83: an unchanged pool_budget deferral appended one event
+    per backlogged card per tick. Identical back-to-back deferrals collapse;
+    a changed one still records."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        for i in range(5):
+            _running_run(conn, kb.create_task(conn, title=f"r-{i}", assignee="argus"),
+                         {"pool": "claude-apr"})
+        tid = kb.create_task(conn, title="backlog", assignee="argus")
+        for _ in range(3):
+            kb.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100,
+                             max_in_progress=100)
+        assert len(_events(conn, tid, "deferred")) == 1
+        apr.eligible = 2  # the budget changed: a new deferral row
+        getattr(ph, "_PROBE_STATE", {}).clear()
+        _running_run(conn, kb.create_task(conn, title="r-5", assignee="argus"),
+                     {"pool": "claude-apr"})
+        kb.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100, max_in_progress=100)
+        deferred = _events(conn, tid, "deferred")
+        assert len(deferred) == 2 and deferred[-1]["eligible"] == 2

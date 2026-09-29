@@ -101,20 +101,14 @@ MIN_DERIVED_MODULES = 300
 # for burn-down on the follow-up card. The two /model coroutines this change
 # fixed (_finish_switch, _on_model_selected) and /reset are deliberately absent.
 REACHABLE_BASELINE = frozenset({
-    "gateway/kanban_watchers.py _run_kanban_dispatcher -> urlopen",
     "gateway/platforms/api_server.py _handle_browser_control_ws -> httpx.get",
-    "gateway/platforms/api_server.py _handle_model_options -> httpx.post",
     "gateway/platforms/api_server.py _handle_run_events -> httpx.get",
-    "gateway/platforms/api_server.py _handle_runs -> urlopen",
     "gateway/platforms/api_server.py _handle_session_chat_stream -> httpx.get",
     "gateway/platforms/api_server.py _handle_toolsets -> httpx.post",
-    "gateway/platforms/api_server.py _run_agent -> urlopen",
     "gateway/platforms/api_server.py _run_and_close -> urlopen",
     "gateway/platforms/api_server.py _write_sse_chat_completion -> httpx.get",
     "gateway/platforms/api_server.py _write_sse_responses -> httpx.get",
     "gateway/platforms/base.py _process_message_background -> httpx.get",
-    "gateway/relay/media.py download -> urlopen",
-    "gateway/relay/media.py upload -> urlopen",
     "gateway/run.py _handle_message_with_agent_admitted -> urlopen",
     "gateway/run.py _prepare_inbound_message_text -> urlopen",
     "gateway/run.py _run_agent_admitted -> open_credentialed_url",
@@ -123,19 +117,12 @@ REACHABLE_BASELINE = frozenset({
     # _handle_btw_command: gone -- its runtime resolve is offloaded (t_515b7fce).
     # _handle_compress_command_inner: gone -- _compress_context runs under
     # _run_in_executor_with_context, which the walker now counts (t_7189c691).
-    "gateway/slash_commands.py _handle_context_command -> requests.get",
-    "gateway/slash_commands.py _handle_debug_command -> urlopen",
     "gateway/slash_commands.py _handle_merge_command -> httpx.get",
-    "gateway/slash_commands.py _handle_refine_command -> httpx.get",
-    "gateway/slash_commands.py _handle_review_command -> urlopen",
     "plugins/platforms/matrix/adapter.py send_model_picker -> requests.get",
-    # Surfaced 2026-09-28 (t_cd88e043 #82) when requests.delete/patch and
-    # httpx.put/patch/delete joined the sink set: shutdown reaches the camofox
-    # browser close (_delete) synchronously. Pre-existing; burn-down item.
-    # The walker names ONE sink per coroutine, so these replace the old
-    # ``stop``/``_stop_impl -> requests.get`` entries (same coroutines).
-    "gateway/run.py _stop_impl -> requests.delete",
-    "gateway/run.py stop -> requests.delete",
+    # stop/_stop_impl -> requests.delete (camofox close) left 2026-09-28
+    # (t_e9ca7d13): false positive. It sits in the nested
+    # _kill_tool_subprocesses, which runs only via asyncio.to_thread; the
+    # walker no longer charges a nested def's body to its enclosing coroutine.
     # Pre-existing; surfaced (not introduced) when function-local imports
     # started shadowing same-file fallback defs (C5 #39): providers.get_label
     # defaults to allow_network=True. Same shape as the matrix entry above.
@@ -523,3 +510,36 @@ def test_index_is_populated():
     repo = _repo_root()
     index = build_index(repo, derive_scanned_modules(repo, SCAN_ROOTS), noqa_token=NOQA_TOKEN)
     assert len(index) >= 5000, f"indexed only {len(index)} functions"
+
+
+def test_nested_def_is_charged_only_where_it_runs(tmp_path):
+    """t_e9ca7d13 (#82 burn-down): a nested def's body was charged to the
+    enclosing coroutine even when the def only ran via asyncio.to_thread /
+    run_in_executor (stop -> requests.delete, relay download -> urlopen).
+    A nested def called directly, or scheduled onto the loop by reference,
+    still counts."""
+    pkg = tmp_path / "gateway"
+    pkg.mkdir()
+    (pkg / "x.py").write_text(
+        "import asyncio\n"
+        "import urllib.request\n"
+        "async def offloaded():\n"
+        "    def _inner():\n"
+        "        urllib.request.urlopen('u')\n"
+        "    await asyncio.to_thread(_inner)\n"
+        "async def direct():\n"
+        "    def _inner2():\n"
+        "        urllib.request.urlopen('u')\n"
+        "    _inner2()\n"
+        "async def scheduled():\n"
+        "    def _cb():\n"
+        "        urllib.request.urlopen('u')\n"
+        "    asyncio.get_running_loop().call_soon(_cb)\n",
+        encoding="utf-8",
+    )
+    sites = find_onloop_sink_sites(
+        tmp_path, ["gateway/x.py"], sink_names=NETWORK_SINK_NAMES,
+        sink_dotted=NETWORK_SINK_DOTTED, noqa_token=NOQA_TOKEN, start_roots=("gateway",),
+    )
+    starts = {s.split(" ")[1] for s in sites}
+    assert starts == {"direct", "scheduled"}, sites

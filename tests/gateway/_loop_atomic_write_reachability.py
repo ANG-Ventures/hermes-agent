@@ -89,6 +89,16 @@ _OFFLOAD_ATTRS = frozenset({
     "_submit_with_context",
 })
 
+# Loop-scheduling APIs: a function passed BY REFERENCE to one of these runs
+# on the event loop, so the reference counts as a call edge.
+_LOOP_CALLBACK_ATTRS = frozenset({
+    "call_soon",
+    "call_soon_threadsafe",
+    "call_later",
+    "call_at",
+    "add_done_callback",
+})
+
 _NOQA_TOKEN = "# noqa: atomic-write-on-loop"
 
 # Cap on call-graph depth.  The real incident chain was 5 frames deep; 8 gives
@@ -179,6 +189,13 @@ def _called_names(node: ast.AST) -> set[str]:
     stack: list[ast.AST] = list(ast.iter_child_nodes(node))
     while stack:
         current = stack.pop()
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A nested def is its own index entry; defining it runs nothing.
+            # It is reachable only through a call by name, which the
+            # enclosing body records (t_e9ca7d13: stop's nested
+            # _kill_tool_subprocesses runs only via asyncio.to_thread, but
+            # its body was charged to stop/_stop_impl).
+            continue
         if isinstance(current, ast.Call):
             func = current.func
             if isinstance(func, ast.Attribute) and func.attr in _OFFLOAD_ATTRS:
@@ -190,6 +207,10 @@ def _called_names(node: ast.AST) -> set[str]:
                     if not isinstance(child, ast.Lambda)
                 )
                 continue
+            if isinstance(func, ast.Attribute) and func.attr in _LOOP_CALLBACK_ATTRS:
+                for arg in current.args:
+                    if isinstance(arg, ast.Name):
+                        out.add(arg.id)
             if isinstance(func, ast.Name):
                 out.add(func.id)
             elif isinstance(func, ast.Attribute):

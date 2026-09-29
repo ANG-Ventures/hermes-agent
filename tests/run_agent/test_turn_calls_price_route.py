@@ -241,3 +241,53 @@ def test_switch_to_pooled_provider_mid_flight_keeps_the_ledger_row(monkeypatch):
     agent = _identity_agent(dispatched="openai", live="claude-bpr")
     _record_successful_api_call(agent, SimpleNamespace(usage=None))
     assert [r["provider"] for r in rows] == ["openai"]
+
+
+def _codex_jwt(account_id: str) -> str:
+    import base64
+    import json
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    claims = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    return f"{seg({'alg': 'none'})}.{seg(claims)}.sig"
+
+
+def test_codex_credential_change_during_the_call_does_not_restamp_its_account(
+    captured_turn_usage, monkeypatch,
+):
+    """FleetReview 659603b36aec: the Codex account a call is attributed to is
+    the credential it was DISPATCHED with. A credential rotation or a switch
+    from another thread while the request is on the wire must not stamp the
+    completed call's tokens to the NEW account (the route snapshot already
+    pins the provider; the account must be pinned with it).
+    """
+    import plugins.blackbox as blackbox
+
+    ledger = []
+    monkeypatch.setattr(
+        blackbox, "record_api_call",
+        lambda **kw: ledger.append((kw.get("provider"), kw.get("sub_key"))),
+    )
+    agent = _make_agent()
+    agent.provider = "openai-codex"
+    agent.api_key = _codex_jwt("aaaaaaaa-dispatch")
+    rotated = iter([_codex_jwt("bbbbbbbb-rotated"), _codex_jwt("cccccccc-rotated")])
+    responses = iter([_response(tool_calls=[_tool_call()], content=None), _response()])
+
+    def _create(*args, **kwargs):
+        # The request is already on the wire with the current key; another
+        # thread rotates the credential before the call returns.
+        agent.api_key = next(rotated)
+        return next(responses)
+
+    agent.client.chat.completions.create.side_effect = _create
+    agent.run_conversation("hello")
+
+    # Call 1 went out on account aaaaaaaa, call 2 on the key rotated in during
+    # call 1 (bbbbbbbb). Neither is stamped to the key live at completion.
+    assert ledger == [
+        ("openai-codex", "codex:aaaaaaaa"),
+        ("openai-codex", "codex:bbbbbbbb"),
+    ]

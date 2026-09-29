@@ -11142,7 +11142,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._reload_active_history_after_rewind(rewound=True)
         count = len(rewound_ids)
         prefill_text = result.get("prefill_text")
-        print(f"(^_^)b Undid {n} half-turn(s) ({count} message(s)).")
+        print(f"(^_^)b Undid {result.get('half_turns', n)} half-turn(s) ({count} message(s)).")
         print(f"  {len(self.conversation_history)} message(s) remaining in history.")
         if prefill and isinstance(prefill_text, str):
             self._prefill_input_buffer(prefill_text)
@@ -11169,7 +11169,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         self._reload_active_history_after_rewind(rewound=True)
-        print(f"(^_^)b Redid {n} undo operation(s) ({reactivated} message(s) restored).")
+        print(f"(^_^)b Redid {result.get('ops_redone', n)} undo operation(s) ({reactivated} message(s) restored).")
         tail = self.conversation_history[-1] if self.conversation_history else None
         if tail:
             role = tail.get("role", "message")

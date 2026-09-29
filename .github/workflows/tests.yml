@@ -302,6 +302,10 @@ jobs:
         uses: ./.github/actions/retry
         with:
           command: uv python install 3.11
+          # python-build-standalone release assets 500 for minutes at a time
+          # (merge group 36463111043, main push 36457723085; t_9081913e).
+          attempts: "5"
+          delay: "30"
 
       - name: Install dependencies
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
@@ -504,7 +508,13 @@ jobs:
             uv.lock
 
       - name: Set up Python 3.11
-        run: uv python install 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+          # python-build-standalone release assets 500 for minutes at a time
+          # (merge group 36463111043, main push 36457723085; t_9081913e).
+          attempts: "5"
+          delay: "30"
 
       - name: Install dependencies
         # `uv sync --locked` installs the exact pinned set from uv.lock (and

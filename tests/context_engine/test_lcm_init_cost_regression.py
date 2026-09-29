@@ -62,6 +62,11 @@ _GUARDED_TABLES = ("messages", "messages_fts", "summary_nodes", "nodes_fts")
 _SCAN_RE = re.compile(
     r"\bSCAN (?:TABLE )?(?:%s)(?:_\w+)?\b" % "|".join(_GUARDED_TABLES), re.IGNORECASE
 )
+# An aggregate read straight off a guarded table (not off a LIMITed subquery).
+_AGGREGATE_RE = re.compile(
+    r"\b(?:count|sum|total|avg|min|max|group_concat)\s*\([^)]*\)[^()]*?\bfrom\s+\"?(?:%s)\b"
+    % "|".join(_GUARDED_TABLES)
+)
 _LIFECYCLE_ROWS = 250  # > LCMConfig.empty_lifecycle_gc_threshold (200): GC fires
 
 
@@ -171,7 +176,10 @@ def _plans_that_scan_guarded_tables(db: Path, sqls: list[str]) -> list[str]:
         except sqlite3.Error as exc:
             bad.append(f"{sql[:100]}  ->  COULD NOT EXPLAIN ({exc})")
             continue
-        if _SCAN_RE.search(plan) and " limit " not in lowered:
+        # LIMIT bounds rows only without an aggregate: COUNT(*) ... LIMIT 1
+        # still reads every row before the one result row is limited (#27).
+        bounded = " limit " in lowered and not _AGGREGATE_RE.search(lowered)
+        if _SCAN_RE.search(plan) and not bounded:
             bad.append(f"{sql[:100]}  ->  {plan}")
     conn.close()
     return bad
@@ -337,3 +345,42 @@ def test_init_time_does_not_scale_with_row_count(tmp_path):
     ratio = tb / max(ts, 1e-4)
     # 100x rows; a full scan would be ~100x time. Healthy init is O(1) in rows.
     assert ratio < 5.0, f"init scales with row count: {ts:.4f}s @200 rows vs {tb:.4f}s @20000 rows (ratio {ratio:.1f}x)"
+
+
+def test_limit_does_not_exempt_an_aggregate_scan(tmp_path):
+    """FleetReview #27: any ' limit ' exempted a statement, but COUNT(*) ...
+    LIMIT 1 is still a full scan. Only a row-bounded probe is exempt."""
+    db = tmp_path / "lcm.db"
+    _fill(db, 5)
+    bad = _plans_that_scan_guarded_tables(db, [
+        "SELECT COUNT(*) FROM messages LIMIT 1",
+        "SELECT 1 FROM messages WHERE role = 'user' LIMIT 1",
+    ])
+    assert len(bad) == 1 and bad[0].startswith("SELECT COUNT(*)"), bad
+
+
+def test_negative_parity_interval_never_counts_on_startup(tmp_path, monkeypatch):
+    """FleetReview #45: with the parity interval < 0 ("never on startup") a
+    due DEEP check still dispatched the background scan, which ran the O(rows)
+    parity COUNTs anyway."""
+    db = tmp_path / "lcm.db"
+    _fill(db, 20)
+    db_bootstrap.join_background_integrity_scans(timeout=30.0)
+    monkeypatch.setenv(db_bootstrap.PARITY_CHECK_INTERVAL_ENV, "-1")
+    monkeypatch.setenv(db_bootstrap.INTEGRITY_CHECK_INTERVAL_ENV, "0")
+    calls = []
+    real = db_bootstrap._fts_count_parity_mismatch
+
+    def counting(conn, spec):
+        calls.append(spec.table_name)
+        return real(conn, spec)
+
+    monkeypatch.setattr(db_bootstrap, "_fts_count_parity_mismatch", counting)
+    # The deep FTS5 check is its own (due) lane; stub it so only the parity
+    # lane's COUNTs are counted.
+    monkeypatch.setattr(db_bootstrap, "check_external_content_fts_integrity",
+                        lambda conn, spec: {"status": "pass", "detail": ""})
+    st = MessageStore(db_path=str(db))
+    db_bootstrap.join_background_integrity_scans(timeout=30.0)
+    st.close()
+    assert calls == []

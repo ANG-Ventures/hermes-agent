@@ -205,13 +205,14 @@ class _FakeClock:
         return getattr(self._real, name)
 
 
-def _run(agent, outcomes, sleeps: list[float]):
+def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
     """Drive one turn. ``outcomes`` scripts ``_interruptible_api_call`` in
     order (exceptions raise, responses return); the last entry repeats.
     Returns ``(result, activate_mock, call_mock)``."""
     seq = list(outcomes)
 
     def _fake_call(*_a, **_k):
+        clock._offset += call_seconds  # the request itself takes time
         outcome = seq.pop(0) if len(seq) > 1 else seq[0]
         if isinstance(outcome, Exception):
             raise outcome
@@ -439,3 +440,45 @@ def test_config_knobs_are_read_from_the_agent_section():
     a = _build({})
     assert (a._capacity_retry_attempts, a._capacity_retry_max_wait_s) == (
         CAPACITY_RETRY_DEFAULT_ATTEMPTS, CAPACITY_RETRY_DEFAULT_MAX_WAIT_S)
+
+
+def test_generic_retry_ceiling_does_not_widen_the_capacity_budget():
+    """FleetReview #29: max_retries = max(generic, capacity) let a larger
+    api_max_retries (3) widen capacity_retry_attempts (2): 3 same-provider
+    tries instead of 2."""
+    statuses: list[tuple[str, str]] = []
+    agent = _make_agent(statuses)
+    agent._capacity_retry_attempts = 2
+    agent._capacity_retry_max_wait_s = 900.0
+    sleeps: list[float] = []
+
+    err = PoolCapacity503()
+    _, activate, call = _run(agent, [err, err, _response("via fallback")], sleeps)
+
+    assert agent._fallback_activated is True
+    activate.assert_called_once()
+    assert call.call_count == 3  # 2 primary attempts + the fallback call
+
+
+def test_wall_clock_budget_counts_request_time(caplog):
+    """FleetReview #84: capacity_waited_s summed sleeps only, so a slow 503
+    (5 s per request here) never counted against the 12 s budget."""
+    caplog.set_level("WARNING", logger="agent.conversation_loop")
+    statuses: list[tuple[str, str]] = []
+    agent = _make_agent(statuses)
+    agent._capacity_retry_attempts = 10
+    agent._capacity_retry_max_wait_s = 12.0
+    sleeps: list[float] = []
+
+    err = PoolCapacity503()
+    _, activate, call = _run(
+        agent, [err, err, err, _response("via fallback")], sleeps, call_seconds=5.0
+    )
+
+    assert agent._fallback_activated is True
+    activate.assert_called_once()
+    # 503 | wait 5 | 5 s request, 503 (10 s in) | wait 2 | 5 s request, 503
+    # (17 s in) -> budget spent -> fallback. Sleeps alone (5 + 5 + 2) would
+    # have allowed a fourth primary attempt.
+    assert call.call_count == 4
+    assert "retry 3/10 in 2.0s (waited 12s of 12s budget)" in caplog.text
