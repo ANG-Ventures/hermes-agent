@@ -23525,6 +23525,100 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
     return argv
 
 
+_SHIM_MODEL_FAMILY_RANK = (("haiku", 1), ("sonnet", 2), ("opus", 3))
+SHIM_MODEL_CAPPED_FROM_ENV = "HERMES_KANBAN_SHIM_MODEL_CAPPED_FROM"
+_SHIM_MODEL_ID_RE = re.compile(r"claude-(haiku|sonnet|opus)-\d[0-9a-z.-]*$")
+
+
+def _shim_model_rank(model: Optional[str]) -> Optional[int]:
+    """Rank a Claude model id by family (haiku < sonnet < opus); None = unknown.
+
+    Only the bare id after the last ``/`` is read, so ``provider/model`` forms
+    rank the same as the bare model. Unknown families never rank, so a cap
+    never fires on a model the dispatcher cannot place (fail-open to today).
+    """
+    name = str(model or "").rsplit("/", 1)[-1].lower()
+    # Only recognized Claude model-id shapes rank (``claude-<family>-<digit>``
+    # e.g. claude-opus-5, claude-sonnet-4-5, claude-haiku-4-5-20251001).
+    # A custom alias (``acme/opus-v1``, ``claude-custom-opus-v1``) never ranks,
+    # so it is never swapped for a Claude model on the card's provider.
+    m = _SHIM_MODEL_ID_RE.match(name)
+    if not m:
+        return None
+    return dict(_SHIM_MODEL_FAMILY_RANK)[m.group(1)]
+
+
+def _read_shim_model_cap(hermes_home: Optional[str]) -> Optional[str]:
+    """``foreign_lane.shim_model_cap`` from the assignee profile's config.yaml.
+
+    Only honoured on a foreign-lane shim profile, i.e. one whose
+    ``foreign_lane.harness`` is set; any other profile returns None.
+
+    Read raw at spawn time (no restart to flip). Unset, empty, unreadable or
+    malformed all return None = today's behaviour (the shim runs the card's
+    model). Fail-soft: a bad config must never block a spawn.
+    """
+    if not hermes_home:
+        return None
+    try:
+        # Presence-sensitive read of ANOTHER profile's file (unset = no cap),
+        # so the raw owner primitive + env expansion, not load_config() (which
+        # reads this process's home and merges defaults).
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+
+        path = Path(hermes_home) / "config.yaml"
+        if not path.is_file():
+            return None
+        cfg = _expand_env_vars(read_user_config_raw(path))
+        # Not a kanban.* key: a profile's foreign_lane section. The local name
+        # must not collide with a name test_kanban_config_keys binds to
+        # .get("kanban") (its scan is file-wide, not scope-aware).
+        foreign_lane_cfg = cfg.get("foreign_lane") if isinstance(cfg, dict) else None
+        if not isinstance(foreign_lane_cfg, dict):
+            return None
+        # Scope: only a real foreign-lane shim profile (one that names its
+        # harness) caps. Any other profile's tasks keep the card's model.
+        harness = foreign_lane_cfg.get("harness")
+        if not (isinstance(harness, str) and harness.strip()):
+            return None
+        cap = foreign_lane_cfg.get("shim_model_cap")
+        cap = str(cap).strip() if isinstance(cap, str) else ""
+        return cap or None
+    except Exception as exc:
+        _log.debug("kanban spawn: shim_model_cap unreadable at %r (%s)", hermes_home, exc)
+        return None
+
+
+def _apply_shim_model_cap(
+    model: str, cap: Optional[str], provider: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Return ``(model_to_spawn, capped_from)``.
+
+    ``capped_from`` is the card's model when the cap applied, else None. The
+    cap applies only when both ids rank and the card's model ranks strictly
+    above the cap; an equal or lower model, or an unrankable one, is untouched.
+    The spawn keeps the card's provider, so a provider-qualified cap
+    (``<provider>/<model>``) applies only when that provider IS the card's
+    effective provider; a different one is refused (logged, not capped)
+    rather than spawning a model the provider may not serve.
+    """
+    if not cap:
+        return model, None
+    cap_provider, sep, cap_model = cap.rpartition("/")
+    if sep:
+        if cap_provider != (provider or ""):
+            _log.warning(
+                "kanban spawn: shim_model_cap %r ignored: its provider is not "
+                "the card's provider %r", cap, provider,
+            )
+            return model, None
+        cap = cap_model
+    have, limit = _shim_model_rank(model), _shim_model_rank(cap)
+    if have is None or limit is None or have <= limit:
+        return model, None
+    return cap, model
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -23768,6 +23862,23 @@ def _default_spawn(
         # readable and the pairing greppable.
         from hermes_cli.kanban_provider_health import model_override
         model, provider = model_override(task)
+        # foreign_lane.shim_model_cap (model-switching spec 4.4 follow-up): a
+        # foreign-lane shim follows the card's model (Q-M1 = B), so an Opus
+        # card would run the shim on Opus too. When the profile sets a cap and
+        # the card's model ranks above it, spawn the shim at the cap. The
+        # harness still reads the card's model from the board, so only the
+        # shim moves. Unset = today's behaviour.
+        model, capped_from = _apply_shim_model_cap(
+            model, _read_shim_model_cap(env.get("HERMES_HOME")), provider,
+        )
+        if capped_from:
+            env[SHIM_MODEL_CAPPED_FROM_ENV] = capped_from
+            _log.info(
+                "kanban spawn task=%s assignee=%s shim_model=%s shim_model_capped_from=%s",
+                task.id, profile_arg, model, capped_from,
+            )
+        else:
+            env.pop(SHIM_MODEL_CAPPED_FROM_ENV, None)
         cmd.extend(["-m", model])
         if provider:
             cmd.extend(["--provider", provider])
