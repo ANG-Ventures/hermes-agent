@@ -917,6 +917,51 @@ def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
             (json.dumps({sub: count for sub, count in rows}), turn_id),
         )
 
+
+# Route stamp for a turn whose billed main-lane calls span more than one route
+# (t_a24c429c). ``provider``/``model`` keep naming the turn's PRIMARY route, but
+# the token columns sum every call, so a codex turn with claude-bpr fallback
+# calls must not claim ``lane_family='codex'`` for Claude cache writes.
+MIXED_ROUTE = "mixed"
+
+
+def _refresh_turn_route(conn: sqlite3.Connection, turn_id: str) -> None:
+    """Stamp lane_family/vendor/served_provider ``mixed`` when calls disagree.
+
+    Compared per column over the turn's own primary stamp plus every main-lane
+    (non-aux, non-composite-child) call that carried usage. A zero-usage failed
+    attempt adds no tokens, so it cannot make a turn mixed. Monotonic: once a
+    column is ``mixed`` a later call never un-mixes it until insert_turn
+    re-stamps the primary route and this runs again.
+    """
+    turn = conn.execute(
+        "SELECT lane_family, vendor, served_provider FROM turns WHERE turn_id = ?",
+        (turn_id,),
+    ).fetchone()
+    if turn is None:
+        return
+    calls = conn.execute(
+        f"""SELECT DISTINCT lane_family, vendor, served_provider FROM turn_api_calls
+            WHERE turn_id = ? AND {_NOT_AUX} AND {_NOT_COMPOSITE_CHILD}
+              AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+                  + COALESCE(cache_read, 0) + COALESCE(cache_write, 0) > 0""",
+        (turn_id,),
+    ).fetchall()
+    if not calls:
+        return
+    cols = ("lane_family", "vendor", "served_provider")
+    mixed = [
+        col for i, col in enumerate(cols)
+        if len({v for v in [turn[i], *(c[i] for c in calls)] if v}) > 1
+    ]
+    if mixed:
+        conn.execute(
+            "UPDATE turns SET " + ", ".join(f"{col} = ?" for col in mixed)
+            + " WHERE turn_id = ?",
+            (*([MIXED_ROUTE] * len(mixed)), turn_id),
+        )
+
+
 def insert_turn(
     record: TurnRecord, *, provisional: bool = False, move_last_turn: bool = True
 ) -> bool:
@@ -995,6 +1040,7 @@ def insert_turn(
                 ),
             )
             _refresh_served_subs(conn, record.turn_id)
+            _refresh_turn_route(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
             for seq, call in enumerate(record.tool_calls or []):
                 conn.execute(
@@ -1158,6 +1204,7 @@ def insert_api_call(
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
             _refresh_served_subs(conn, turn_id)
+            _refresh_turn_route(conn, turn_id)
         if http_status in (None, 200):
             _backfill_fallback_next_call(conn, turn_id, ts, usage)
 
@@ -1253,6 +1300,7 @@ def insert_composite_calls(
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
             _refresh_served_subs(conn, turn_id)
+            _refresh_turn_route(conn, turn_id)
 
 
 _FALLBACK_EVENT_COLUMNS = (
