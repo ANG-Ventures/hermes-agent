@@ -111,13 +111,19 @@ def _is_zero_default(node: ast.expr | None) -> bool:
     """
     if _is_zero_literal(node):
         return True
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "get"
-        and len(node.args) == 2
-        and _is_zero_literal(node.args[1])
-    )
+    # ``stamps.get(k) or 0.0``
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        return _is_zero_literal(node.values[-1])
+    if not isinstance(node, ast.Call):
+        return False
+    name = _call_name(node.func)
+    # ``stamps.get(k, 0.0)`` / ``stamps.setdefault(k, 0.0)``
+    if isinstance(node.func, ast.Attribute) and name in {"get", "setdefault"}:
+        return len(node.args) == 2 and _is_zero_literal(node.args[1])
+    # ``getattr(self, "_last", 0.0)``
+    if isinstance(node.func, ast.Name) and name == "getattr":
+        return len(node.args) == 3 and _is_zero_literal(node.args[2])
+    return False
 
 
 class _Scope:
@@ -184,6 +190,17 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
             is_function=isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)),
         )
         scopes.append(scope)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            # Parameters are local bindings that shadow module-level names.
+            # Their defaults are NOT treated as seeds: a zero parameter default
+            # is overwhelmingly a duration/offset (``ack_age=0.0``), not a
+            # boot-origin timestamp.
+            args = node.args
+            for arg in (
+                args.posonlyargs + args.args + args.kwonlyargs
+                + [a for a in (args.vararg, args.kwarg) if a is not None]
+            ):
+                scope.bindings.setdefault(arg.arg, []).append(None)
         for child in _own_nodes(node):
             if isinstance(child, ast.Global):
                 scope.globals.update(child.names)
@@ -236,8 +253,8 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
             if not left_is_mono:
                 continue
             if not isinstance(right, ast.Name):
-                # inline ``<monotonic> - stamps.get(key, 0.0)``
-                hits.append(f"{filename}:{node.lineno}: {ast.unparse(right.func.value)}.get")
+                # inline ``<monotonic> - stamps.get(key, 0.0)`` (or getattr/``or 0``)
+                hits.append(f"{filename}:{node.lineno}: {ast.unparse(right)}")
                 continue
             right_scope = scope.resolve(right.id)
             if right_scope is None:
@@ -337,7 +354,7 @@ def heartbeat_current_worker_from_env(progress_at=None):
         pytest.param(
             "import time\ndef f(stamps, k):\n    now = time.monotonic()\n"
             "    return now - stamps.get(k, 0.0) < 3600\n",
-            ["stamps.get"],
+            ["stamps.get(k, 0.0)"],
             id="dict-get-zero-default-inline",
         ),
         pytest.param(
@@ -345,6 +362,23 @@ def heartbeat_current_worker_from_env(progress_at=None):
             "    return now - stamps.get(k, 0.0) < 3600\n",
             [],
             id="dict-get-wall-clock-is-safe",
+        ),
+        pytest.param(
+            "import time\nlast = 0.0\ndef f(last):\n    return time.monotonic() - last\n",
+            [],
+            id="parameter-shadows-module-zero-seed",
+        ),
+        pytest.param(
+            "import time\ndef f(ack_age=0.0):\n    return time.perf_counter() - ack_age\n",
+            [],
+            id="parameter-default-is-an-offset-not-a-seed",
+        ),
+        pytest.param(
+            "import time\ndef f(self, stamps, k):\n    now = time.monotonic()\n"
+            "    a = getattr(self, '_last', 0.0)\n    b = stamps.setdefault(k, 0)\n"
+            "    c = stamps.get(k) or 0.0\n    return now - a, now - b, now - c\n",
+            ["a", "b", "c"],
+            id="getattr-setdefault-or-zero-defaults",
         ),
         pytest.param(
             "import time\ndef f(started):\n    last = 0\n"
@@ -363,4 +397,4 @@ def heartbeat_current_worker_from_env(progress_at=None):
 )
 def test_detector_shapes(source, expected):
     hits = find_zero_seeded_monotonic_diffs(source)
-    assert [h.rsplit(": ", 1)[1] for h in hits] == expected
+    assert sorted(h.split(": ", 1)[1] for h in hits) == sorted(expected)

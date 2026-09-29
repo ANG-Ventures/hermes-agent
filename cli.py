@@ -5816,7 +5816,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if getattr(self, "_resize_recovery_pending", False):
             return
         now = time.monotonic()
-        if hasattr(self, "_app") and self._app and (now - getattr(self, "_last_invalidate", 0.0)) >= min_interval:
+        if hasattr(self, "_app") and self._app and (now - getattr(self, "_last_invalidate", float("-inf"))) >= min_interval:
             self._last_invalidate = now
             try:
                 self._app.invalidate()
@@ -5909,7 +5909,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         per ``min_interval`` seconds.
         """
         now = time.monotonic()
-        last = getattr(self, "_last_focus_regain_redraw", 0.0)
+        last = getattr(self, "_last_focus_regain_redraw", float("-inf"))
         if now - last < min_interval:
             return
         self._last_focus_regain_redraw = now
@@ -6933,8 +6933,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not txt:
             return ""
         flow = self._spinner_token_flow()
-        t0 = getattr(self, "_tool_start_time", 0) or 0
-        if t0 > 0:
+        t0 = getattr(self, "_tool_start_time", None)
+        if t0:
             elapsed = time.monotonic() - t0
             if elapsed >= 60:
                 _m, _s = int(elapsed // 60), int(elapsed % 60)
@@ -7030,7 +7030,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if collector is None or not self._turn_summary_is_active():
             return
         try:
-            started = getattr(self, "_turn_summary_start", 0.0) or 0.0
+            started = getattr(self, "_turn_summary_start", None)
             elapsed = max(0.0, time.monotonic() - started) if started else 0.0
             line = collector.render(elapsed)
             if line:
