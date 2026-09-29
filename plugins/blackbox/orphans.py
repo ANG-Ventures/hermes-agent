@@ -151,8 +151,12 @@ def store_config(path: str) -> dict | None:
         from hermes_cli.managed_scope import apply_managed_overlay
 
         home = os.path.dirname(os.path.dirname(os.path.abspath(path)))
-        data = apply_managed_overlay(read_user_config_raw(os.path.join(home, "config.yaml")))
-        block = _expand_env_vars(data).get("blackbox")
+        raw = read_user_config_raw(os.path.join(home, "config.yaml"))
+        if not raw:
+            # Missing file, empty file and a non-mapping root all read as {}:
+            # a real profile config is never empty, so this is "unknown".
+            return None
+        block = _expand_env_vars(apply_managed_overlay(raw)).get("blackbox")
     except Exception:
         return None
     cfg = dict(blackbox._DEFAULTS)
@@ -203,10 +207,13 @@ def repair_record(path: str, turn_id: str):
         ).fetchone()
     finally:
         conn.close()
-    usage = store.ledger_turn_usage(turn_id, db_path=path)
+    try:
+        usage = store.ledger_turn_usage(turn_id, db_path=path, raise_on_error=True)
+    except Exception:
+        return None, None  # a failed read is not "no calls"
     if usage is None:
         if int(n_main or 0) > 0:
-            return None, None  # main-lane rows exist but the read failed
+            return None, None  # rows appeared/vanished between the two reads
         usage = {}  # verified aux-only: a flagged 0-call row still closes the orphan
     cfg = store_config(path)
     if cfg is None:
@@ -261,13 +268,17 @@ def repair(
     for path, rows in sorted(results.items()):
         ok, _why = repairable(path)
         done: list[tuple[str, bool]] = []
-        for turn_id, _last_ts, _errs in rows:
+        for turn_id, last_ts, _errs in rows:
             written = False
             if apply and ok:
                 record, fence = repair_record(path, turn_id)
-                written = record is not None and store.insert_turn(
-                    record, provisional=True, db_path=path, ledger_fence=fence
-                )
+                # The aggregate must describe the ledger the SCAN settled on:
+                # a call that landed since means the turn is live again, so
+                # it stays for a later scan instead of bypassing --settle-s.
+                if record is not None and fence[0] == float(last_ts):
+                    written = store.insert_turn(
+                        record, provisional=True, db_path=path, ledger_fence=fence
+                    )
             done.append((turn_id, bool(written)))
         out[path] = done
     return out

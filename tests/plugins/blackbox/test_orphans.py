@@ -18,6 +18,9 @@ def db(tmp_path, monkeypatch):
         "enabled": True, "alerts_enabled": False, "record_subagents": True,
         "retention_days": 3650, "store_text": True,
     })
+    # The profile's own config: --repair reads the TARGET store's config and
+    # fails closed without one.
+    (tmp_path / "config.yaml").write_text("blackbox:\n  enabled: true\n")
     store._connect().close()
     return store._db_path()
 
@@ -184,14 +187,71 @@ def test_repair_is_fenced_on_the_ledger_it_was_aggregated_from(db):
 
 
 def test_failed_ledger_read_never_becomes_a_zero_usage_repair(db, monkeypatch):
-    """Prism P1 on #1504: ledger_turn_usage() -> None on a DB error must not
-    be read as 'no main-lane calls'."""
+    """Prism P1 on #1504: a DB error inside ledger_turn_usage() must not be
+    read as 'no main-lane calls' -- neither by --repair nor by the signal path."""
     turn_id = "s:t:locked"
     _priced_call(turn_id, 1, inp=10, out=5)
-    monkeypatch.setattr(store, "ledger_turn_usage", lambda *_a, **_k: None)
+    real = store.ledger_turn_usage
+
+    def broken(*a, **k):
+        if k.get("raise_on_error"):
+            raise sqlite3.OperationalError("database is locked")
+        return None
+
+    monkeypatch.setattr(store, "ledger_turn_usage", broken)
     assert orphans.repair_record(str(db), turn_id) == (None, None)
     assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, False)]}
     assert _turn_row(db, turn_id, "turn_id") is None
+    # The signal path must still write (the process is exiting) but with
+    # every bucket UNKNOWN, never measured zeros.
+    blackbox._on_session_end(
+        session_id="s", turn_id=turn_id, completed=False, interrupted=True,
+        model="claude-opus-4-8", provider="claude-bpr", platform="cli",
+        terminal_error="signal_15",
+    )
+    assert _turn_row(
+        db, turn_id, "terminal_error, usage_unknown, input_tokens_unknown, "
+        "output_tokens_unknown, cache_read_tokens_unknown, cache_write_tokens_unknown, api_calls",
+    ) == ("signal_15", 1, 1, 1, 1, 1, 0)
+    monkeypatch.setattr(store, "ledger_turn_usage", real)
+
+
+def test_repair_leaves_a_turn_whose_ledger_moved_since_the_scan(db):
+    """Prism P1 on #1504 (stale eligibility): a call that landed after the scan
+    settled on the turn means the turn is live again -- not repaired this run."""
+    turn_id = "s:t:woke-up"
+    _priced_call(turn_id, 1, inp=10, out=5)
+    scanned = _orphans(db)
+    assert scanned == [(turn_id, 101.0, 0)]
+    _priced_call(turn_id, 2, inp=10, out=5)  # lands between scan() and repair()
+    assert orphans.repair({str(db): scanned}) == {str(db): [(turn_id, False)]}
+    assert _turn_row(db, turn_id, "turn_id") is None
+    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, True)]}
+    assert _turn_row(db, turn_id, "api_calls, input_tokens") == (2, 20)
+
+
+def test_repair_prices_a_composite_moa_orphan_from_its_physical_children(db):
+    """Prism P1 on #1504: the virtual 'moa' parent is unpriceable; its child
+    rows carry the real routes and travel as pricing_calls."""
+    turn_id = "s:t:moa"
+    blackbox.record_api_call(
+        turn_id=turn_id, seq=0, ts=100.0, provider="moa", model="default",
+        usage=CanonicalUsage(request_count=0), api_mode="anthropic_messages",
+        sub_key=None, attribution="wire", http_status=200, relay_synthetic=False,
+        route_id=None,
+    )
+    store.insert_composite_calls(turn_id, 0, sub_harness="moa", calls=[
+        {"seq": 1, "ts": 100.5, "provider": "claude-bpr", "model": "claude-opus-4-8",
+         "usage": CanonicalUsage(input_tokens=1000, output_tokens=100)},
+        {"seq": 2, "ts": 100.6, "provider": "claude-bpr", "model": "claude-opus-4-8",
+         "usage": CanonicalUsage(input_tokens=2000, output_tokens=100)},
+    ])
+    usage = store.ledger_turn_usage(turn_id)
+    assert usage["api_calls"] == 1 and len(usage["calls"][0]["pricing_calls"]) == 2
+    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, True)]}
+    row = _turn_row(db, turn_id, "provider, api_calls, input_tokens, output_tokens, cost_status, cost_usd")
+    assert row[:4] == ("moa", 1, 3000, 200)
+    assert row[4] not in ("unknown", "partial") and row[5] and row[5] > 0
 
 
 def test_losing_provisional_insert_leaves_the_real_rows_tool_calls_alone(db):
@@ -259,11 +319,15 @@ def test_repair_skips_a_store_whose_profile_drops_subagent_turns(tmp_path, db, c
     assert orphans.main([str(db), "--since", "0", "--settle-s", "0", "--repair"]) == 1
     assert "skipped 1 orphan turn(s)" in capsys.readouterr().out
     assert [t for t, _ts, _e in _orphans(db)] == [turn_id]
-    # An unreadable config fails closed too (Prism P1: unknown != permission).
-    (tmp_path / "config.yaml").write_text("blackbox: [unterminated\n")
-    assert orphans.store_config(str(db)) is None
-    assert orphans.repairable(str(db))[0] is False
-    assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, False)]}
+    # An unreadable, missing or empty config fails closed too (unknown != permission).
+    for bad in ("blackbox: [unterminated\n", "", "- not a mapping\n", None):
+        if bad is None:
+            (tmp_path / "config.yaml").unlink()
+        else:
+            (tmp_path / "config.yaml").write_text(bad)
+        assert orphans.store_config(str(db)) is None, repr(bad)
+        assert orphans.repairable(str(db))[0] is False, repr(bad)
+        assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, False)]}, repr(bad)
     (tmp_path / "config.yaml").write_text("blackbox:\n  enabled: true\n")
     assert orphans.repair({str(db): _orphans(db)}) == {str(db): [(turn_id, True)]}
     assert _orphans(db) == []

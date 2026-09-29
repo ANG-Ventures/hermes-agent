@@ -1114,13 +1114,48 @@ def insert_turn(
         return False
 
 
-def ledger_turn_usage(turn_id: str, db_path: Path | str | None = None) -> dict | None:
+#: Marks every token bucket unknown: for a row that must be written (the
+#: process is exiting) when the ledger could not be read. Never known zeros.
+LEDGER_USAGE_UNREADABLE: dict = {
+    "usage_unknown": True, "input_tokens_unknown": True, "output_tokens_unknown": True,
+    "cache_read_tokens_unknown": True, "cache_write_tokens_unknown": True,
+}
+
+
+def _ledger_call(inp, out, cr, cw, rs, prov, mdl) -> dict:
+    return {
+        "input_tokens": int(inp or 0),
+        "output_tokens": int(out or 0),
+        "cache_read_tokens": int(cr or 0),
+        "cache_write_tokens": int(cw or 0),
+        "reasoning_tokens": int(rs or 0),
+        "input_tokens_unknown": inp is None,
+        "output_tokens_unknown": out is None,
+        "cache_read_tokens_unknown": cr is None,
+        "cache_write_tokens_unknown": cw is None,
+        "usage_unknown": inp is None and out is None and cr is None and cw is None,
+        "provider": prov or "",
+        "model": mdl or "",
+        "base_url": "",
+    }
+
+
+def ledger_turn_usage(
+    turn_id: str, db_path: Path | str | None = None, *, raise_on_error: bool = False
+) -> dict | None:
     """Turn usage rebuilt from this turn's own ``turn_api_calls`` rows.
 
     Used for a turn the host abandoned mid-flight: the per-call ledger is
     written at the transport, so it holds every billed call even when the
     conversation loop never folded them into its accumulator. A NULL bucket
-    stays unknown, never a measured 0. None when the turn has no rows.
+    stays unknown, never a measured 0. None when the turn has no main-lane
+    rows. A composite (MoA) parent carries its physical children as
+    ``pricing_calls`` so ``compute_turn_cost`` prices the real routes, not
+    the virtual ``moa`` preset.
+
+    A failed read returns None too unless ``raise_on_error`` -- callers that
+    must not mistake "could not read" for "no calls" (the orphan repair, the
+    signal-path row) pass it and handle the exception.
     """
     try:
         # Positional only when targeting another store: tests stub _connect
@@ -1128,34 +1163,33 @@ def ledger_turn_usage(turn_id: str, db_path: Path | str | None = None) -> dict |
         with (_connect(db_path) if db_path else _connect()) as conn:
             rows = conn.execute(
                 "SELECT input_tokens, output_tokens, cache_read, cache_write, "
-                "reasoning, provider, model FROM turn_api_calls "
+                "reasoning, provider, model, seq FROM turn_api_calls "
                 f"WHERE turn_id = ? AND {_NOT_AUX} AND {_NOT_COMPOSITE_CHILD} "
                 "ORDER BY seq",
                 (turn_id,),
             ).fetchall()
+            children = conn.execute(
+                "SELECT input_tokens, output_tokens, cache_read, cache_write, "
+                "reasoning, provider, model, parent_call_id FROM turn_api_calls "
+                "WHERE turn_id = ? AND parent_call_id IS NOT NULL ORDER BY seq",
+                (turn_id,),
+            ).fetchall()
     except Exception:
+        if raise_on_error:
+            raise
         logger.warning("blackbox ledger usage read failed", exc_info=True)
         return None
     if not rows:
         return None
-    calls = [
-        {
-            "input_tokens": int(inp or 0),
-            "output_tokens": int(out or 0),
-            "cache_read_tokens": int(cr or 0),
-            "cache_write_tokens": int(cw or 0),
-            "reasoning_tokens": int(rs or 0),
-            "input_tokens_unknown": inp is None,
-            "output_tokens_unknown": out is None,
-            "cache_read_tokens_unknown": cr is None,
-            "cache_write_tokens_unknown": cw is None,
-            "usage_unknown": inp is None and out is None and cr is None and cw is None,
-            "provider": prov or "",
-            "model": mdl or "",
-            "base_url": "",
-        }
-        for inp, out, cr, cw, rs, prov, mdl in rows
-    ]
+    physical: dict = {}
+    for *cols, parent in children:
+        physical.setdefault(parent, []).append(_ledger_call(*cols))
+    calls = []
+    for *cols, seq in rows:
+        call = _ledger_call(*cols)
+        if seq in physical:
+            call["pricing_calls"] = physical[seq]
+        calls.append(call)
     usage: dict = {"api_calls": len(calls), "calls": calls}
     for key in ("input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "reasoning_tokens"):

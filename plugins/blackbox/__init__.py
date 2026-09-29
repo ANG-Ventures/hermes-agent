@@ -812,8 +812,16 @@ def _on_session_end(
             # A turn the process is abandoning (SIGTERM'd kanban worker,
             # Ctrl-C) never folded its accumulator, but every billed call is
             # already in turn_api_calls: price the row from the ledger rather
-            # than recording a 0-token turn under real spend.
-            turn_usage = store.ledger_turn_usage(str(kwargs["turn_id"]))
+            # than recording a 0-token turn under real spend. The row must be
+            # written regardless (the process is exiting), so a ledger that
+            # could not be read yields UNKNOWN buckets, never measured zeros.
+            try:
+                turn_usage = store.ledger_turn_usage(
+                    str(kwargs["turn_id"]), raise_on_error=True
+                )
+            except Exception:
+                logger.warning("blackbox ledger usage read failed", exc_info=True)
+                turn_usage = dict(store.LEDGER_USAGE_UNREADABLE)
         record = _build_record(
             session_id=session_id,
             interrupted=interrupted,
