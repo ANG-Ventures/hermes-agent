@@ -367,12 +367,20 @@ def _repeated_script_error_page(job: dict, error: str | None) -> str | None:
         "Fix the script, then verify with `hermes cron run {job_id}`; or "
         "pause it with `hermes cron pause {job_id}`.",
     ).format(job_id=job_id)
+    # House page shape (t_4bcf8c20): subject, one cause line, one fix line;
+    # the full cause and the alert-once note are folded.
+    page = _script_exit_page(job_name, str(error))
+    cause_line = page.splitlines()[1] if page and len(page.splitlines()) > 1 else re.sub(
+        r"\s+", " ", cause)[:300]
+    folded = re.sub(r"\s+", " ", cause)
+    if len(folded) > 600:
+        folded = folded[:599].rstrip() + "…"
     return (
-        f"🚨 Cron '{job_name}' ({job_id}) is stuck: its script has failed "
-        f"with the same error {streak} runs in a row.\n\n"
-        f"Cause: {cause}\n\n"
-        f"Fix: {hint}\n\n"
-        "Further identical failures are not paged; you will hear again "
+        f"🚨 **{job_name}** · stuck: same error {streak} runs in a row\n"
+        f"Cause: {cause_line}\n"
+        f"Fix: {hint}\n"
+        f"-# job {job_id} · error: {folded}\n"
+        "-# Further identical failures are not paged; you will hear again "
         "when the error changes."
     )
 
@@ -390,6 +398,76 @@ def _detect_gateway_code_skew() -> tuple[str, str] | None:
         return detect_code_skew()
     except Exception:
         return None
+
+
+_SCRIPT_EXIT_RE = re.compile(r"^Script exited with code (-?\d+)\b")
+_ASK_LINE_RE = re.compile(
+    r"^\s*(?:[-•·>*]\s*)?\**(?:next|fix|action|to fix|run|recheck|triage|remedy|→)\b",
+    re.IGNORECASE,
+)
+_PAGE_LINE_MAX = 300
+# Leading status glyphs a script stamps on its own first line; the page header
+# already carries one, so a second one only adds noise.
+_LEAD_GLYPHS_RE = re.compile(r"^(?:[\u2600-\u27bf\U0001f300-\U0001faff]\ufe0f?\s*)+")
+
+
+def _script_exit_page(job_name: str, error: str) -> str:
+    """House page for a no_agent script's nonzero exit, or "" when ERROR is not
+    the script runner's ``Script exited with code N`` contract."""
+    m = _SCRIPT_EXIT_RE.match(error or "")
+    if not m:
+        return ""
+    rc = m.group(1)
+    sections: dict[str, list[str]] = {"head": [], "stderr": [], "stdout": []}
+    cur = "head"
+    for ln in (error or "").splitlines()[1:]:
+        if ln in ("stdout:", "stderr:"):
+            cur = ln[:-1]
+            continue
+        sections[cur].append(ln)
+
+    def clip(line: str) -> str:
+        line = re.sub(r"\s+", " ", line).strip()
+        return line if len(line) <= _PAGE_LINE_MAX else line[: _PAGE_LINE_MAX - 1].rstrip() + "…"
+
+    def clean(lines):
+        return [x for x in (ln.strip() for ln in lines) if x and not set(x) <= set("-=_·•*`")]
+
+    out_lines, err_lines = clean(sections["stdout"]), clean(sections["stderr"])
+    cause_src = out_lines or err_lines or clean(sections["head"])
+    lines = [f"⚠️ **{job_name}** · rc={rc}"]
+    if cause_src:
+        lines.append(clip(_LEAD_GLYPHS_RE.sub("", cause_src[0]).lstrip("*").strip() or cause_src[0]))
+    ask = next((x for x in (out_lines + err_lines)[1:] if _ASK_LINE_RE.match(x)), None)
+    if ask:
+        lines.append(clip(ask))
+    extra = len(out_lines) + len(err_lines) - (1 if cause_src else 0) - (1 if ask else 0)
+    if extra > 0:
+        lines.append(f"-# +{extra} more output line(s) saved in the cron output")
+    return "\n".join(lines)
+
+
+def _findings_deliver_job(job: dict, error: Optional[str]) -> dict:
+    """Route a FINDINGS failure (no_agent script, exit 1, printed a report) per
+    ``cron.findings_deliver_map`` ({job deliver target: findings target}), e.g.
+    #alerts -> #logs: house exit contract (scripts/lib/cron_exit_contract.py in
+    hermes-home) -- exit 1 = findings delivered, exit >= 2 = monitor blind and
+    still pages the job's own target. Unset map (default) = unchanged routing."""
+    try:
+        if not job.get("no_agent"):
+            return job
+        text = str(error or "")
+        m = _SCRIPT_EXIT_RE.match(text)
+        if not m or m.group(1) != "1" or not re.search(r"(?m)^stdout:\n\s*\S", text):
+            return job
+        cfg = load_config() or {}
+        mapping = ((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get("findings_deliver_map") or {}
+        target = mapping.get(str(job.get("deliver") or "")) if isinstance(mapping, dict) else None
+        if not target:
+            return job
+        return dict(job, deliver=str(target))
+    except Exception:
+        return job  # routing must never break delivery
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -442,6 +520,16 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # Falling through leaves the generic cleaner below to report what actually
     # happened, naming the script. No new message text is needed.
     provider_reachable = not job.get("no_agent")
+
+    # A no_agent script that exited nonzero: render the house page shape
+    # (t_4bcf8c20) -- subject = job + rc, cause = the script's first stdout
+    # line, ask = the script's own next action if it printed one; the rest stays
+    # in the saved cron output. Was: "Cron 'X' failed: Script exited with code 1
+    # stdout: <first 177 chars, whitespace-collapsed>...".
+    if not provider_reachable:
+        shaped = _script_exit_page(job_name, text)
+        if shaped:
+            return shaped
 
     # Script execution happens outside the LLM/provider path (also for
     # agent-backed jobs that run a context script). Check the script runner's
@@ -3748,8 +3836,8 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
             f'reply "stop reminder {task_name}" to manage'
         )
         body = (content or "").strip("\n")
-        if success:
-            head = []
+        if success or body.startswith(f"⚠️ **{task_name}** · rc="):
+            head = []  # the page already names the job (house shape, t_4bcf8c20)
         else:
             head = [f"⚠️ **Cronjob Failed: {task_name}**"]
         delivery_content = "\n".join(head + ([body] if body else []) + [footer])
@@ -8219,7 +8307,7 @@ def _process_one_job(
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, success=success, adapters=adapters, loop=loop)
+                delivery_error = _deliver_result(job if success else _findings_deliver_job(job, error), deliver_content, success=success, adapters=adapters, loop=loop)
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -8738,7 +8826,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            job if success else _findings_deliver_job(job, error),
                             deliver_content,
                             # Without this a FAILED run wore the success header
                             # ("✅ Cronjob Response") over its own failure body.
@@ -8903,7 +8991,7 @@ def _run_one_job_body(
                 try:
                     delivery_attempted = True
                     delivery_error = _deliver_result(
-                        job,
+                        _findings_deliver_job(job, _err_text),
                         # Composed exactly like the normal failure delivery above.
                         # mark_job_run below records THIS run in failure_streak
                         # whichever layer failed, so a job that fails before the
