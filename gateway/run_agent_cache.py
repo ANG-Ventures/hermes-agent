@@ -460,6 +460,12 @@ class GatewayAgentCacheMixin:
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
                 request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+            # The generation is invalidated below, so this turn's continued CONTENT writes are
+            # unwanted: flag the live agent so the persist layer drops its post-stop rows while still
+            # writing the interrupt-close tail. Best-effort: a set failure must never break /stop.
+            with _log_suppressed(logging.DEBUG, "persist-superseded flag set skipped for %s", session_key,
+                                 exc_info=True):
+                running_agent._persist_superseded = True
             _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
             _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
         # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:

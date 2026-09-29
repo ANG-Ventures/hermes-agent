@@ -20,6 +20,7 @@ from agent.context_compressor import (
 )
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_manager import sanitize_context
+from agent.message_sanitization import _INTERRUPT_CLOSE_FINISH_REASON
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
@@ -246,6 +247,42 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     return row
 
 
+def _superseded_turn_drops(agent, msg: Dict) -> bool:
+    """True when a NEW row of a superseded turn (``agent._persist_superseded``: /stop, /new or
+    eviction invalidated its run generation) must not be written. Interruption is cooperative, so the
+    turn keeps producing assistant/tool rows until a checkpoint; those land after the user stopped it
+    and come back on the next /resume.
+
+    Carve-outs: the interrupt-close tail always persists (role-alternation repair). A ``tool`` result
+    is dropped only when its owning ``assistant(tool_calls)`` row was dropped too, tracked in an
+    AGENT-scoped set because the call and its result flush separately; an already-durable owner's
+    result passes, so no durable tool call is orphaned. Any other role fails open (a new user/system
+    row is never dropped), and an unreadable flag fails open.
+    """
+    try:
+        superseded = bool(getattr(agent, "_persist_superseded", False))
+    except Exception:
+        return False
+    if not superseded or msg.get("finish_reason") == _INTERRUPT_CLOSE_FINISH_REASON:
+        return False
+    dropped_ids = getattr(agent, "_superseded_suppressed_tool_call_ids", None)
+    if not isinstance(dropped_ids, set):
+        dropped_ids = set()
+        agent._superseded_suppressed_tool_call_ids = dropped_ids
+    role = msg.get("role")
+    if role == "tool":
+        return msg.get("tool_call_id") in dropped_ids
+    if role == "assistant":
+        for tc in msg.get("tool_calls") or ():
+            tc_id = (tc.get("id") or tc.get("tool_call_id")) if isinstance(tc, dict) else getattr(tc, "id", None)
+            if tc_id:
+                dropped_ids.add(tc_id)
+        return True
+    logger.debug("persist gate: superseded turn produced a new %r row for session %s; persisting (fail-open)",
+                 role, getattr(agent, "session_id", "?"))
+    return False
+
+
 def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optional[List[Dict]],
                       replay_history: bool = False):
     """Scan for un-flushed messages; returns ``(rows, msgs)`` to write in one transaction. ``replay_history``
@@ -259,6 +296,7 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
     batch_rows: List[Dict[str, Any]] = []
     batch_msgs: List[Dict] = []
     tool_uid_owners: dict = {}  # tool_call_uid_from_history memo; the scanned dicts outlive this loop
+    dropped = 0
     for msg_idx in range(_db_flush_scan_start(agent, messages), len(messages)):
         msg = messages[msg_idx]
         # Append-only flush: a mid-turn persist of scaffolding would commit a synthetic turn the end-of-turn
@@ -272,6 +310,10 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
         ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT):
             msg[_DB_PERSISTED_MARKER] = True
             continue
+        # Runs after every "already durable" skip, so it only sees genuinely new rows.
+        if _superseded_turn_drops(agent, msg):
+            dropped += 1
+            continue
         if getattr(agent, "_mute_notification_reply", False) and not is_history:
             # Only new rows, never the cached history prefix. Keep evidence/model
             # context intact while transcript pollers omit unsolicited presentation.
@@ -284,6 +326,9 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
                 msg[TOOL_CALL_UID] = tool_uid
         batch_rows.append(_db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message))
         batch_msgs.append(msg)
+    if dropped:
+        logger.info("persist: suppressed %d superseded-turn content row(s) for session %s (turn was "
+                    "/stop'd or /new'd; interrupt-close tail preserved)", dropped, getattr(agent, "session_id", "?"))
     return batch_rows, batch_msgs
 
 
