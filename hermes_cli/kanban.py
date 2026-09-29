@@ -2879,8 +2879,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"`hermes kanban boards list`)\n"
         )
     _print_triage_banner(triage_ids, stranded)
+    other_boards = (
+        _home_cards_on_other_boards(home_session_ids, args)
+        if home_session_ids is not None else None
+    )
     if not tasks:
         print("(no matching tasks)")
+        if other_boards:
+            print(other_boards)
         return 0
     caller = None
     if not (getattr(args, "flat_all", False) or args.session
@@ -2889,9 +2895,50 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not caller:
         for t in tasks:
             print(_fmt_task_line(t, refusals.get(t.id)))
+        if other_boards:
+            # --home spans every board (the cross-board index the
+            # kanban-home-cards block reads, C5 #32), so its hint is true.
+            print(other_boards)
         return 0
     print(_format_session_grouped(tasks, kb.home_ids(caller), refusals))
     return 0
+
+
+def _home_cards_on_other_boards(
+    session_ids: Any, args: argparse.Namespace,
+) -> Optional[str]:
+    """``list --home`` section: OPEN home cards on boards other than this one.
+
+    One read of the cross-board home index (``kanban_home_index``), the same
+    source the kanban-home-cards block renders from. Filters the index cannot
+    evaluate (assignee/tenant/workflow/archived) skip the section; an
+    unavailable index prints a one-line note instead of scanning boards.
+    """
+    if (args.assignee or getattr(args, "mine", False) or args.tenant
+            or args.archived or getattr(args, "workflow_template_id", None)
+            or getattr(args, "current_step_key", None)):
+        return None
+    from hermes_cli import kanban_home_index
+    try:
+        cards = kanban_home_index.open_cards(list(session_ids), timeout_s=1.0)
+    except kanban_home_index.IndexUnavailable as exc:
+        return f"(other boards: home index unavailable: {exc})"
+    except Exception as exc:  # listing must never fail on the extra section
+        return f"(other boards: home index read failed: {type(exc).__name__})"
+    current = kb.get_current_board()
+    rows = [
+        c for c in cards
+        if (c.get("board") or kb.DEFAULT_BOARD) != current
+        and (not args.status or c.get("status") == args.status)
+    ]
+    if not rows:
+        return None
+    rows.sort(key=lambda c: (str(c.get("board")), str(c.get("id"))))
+    lines = [f"\nOTHER BOARDS ({len(rows)} open home card{'s' if len(rows) != 1 else ''}):"]
+    for c in rows:
+        title = " ".join(str(c.get("title") or "").split())
+        lines.append(f"  {c.get('id')}  {c.get('status')}  {title}  [board {c.get('board')}]")
+    return "\n".join(lines)
 
 
 def _cmd_home_lint(args: argparse.Namespace) -> int:

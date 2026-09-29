@@ -123,6 +123,24 @@ def test_os_killpg_blocks_foreign_pgid():
         os.killpg(FOREIGN_PID, signal.SIGTERM)
 
 
+
+def test_os_kill_unverifiable_pid_fails_closed(monkeypatch):
+    """C5 #71: a pid psutil cannot inspect (AccessDenied) is not treated as ours."""
+    psutil = pytest.importorskip("psutil")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        def _denied(pid=None):
+            raise psutil.AccessDenied(pid)
+
+        with monkeypatch.context() as m:
+            m.setattr(psutil, "Process", _denied)
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.kill(proc.pid, signal.SIGTERM)
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
 # ──────────────────── subprocess regex bypasses ────────────────
 
 

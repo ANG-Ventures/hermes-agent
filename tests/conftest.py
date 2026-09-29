@@ -1761,8 +1761,14 @@ def _live_system_guard(request, monkeypatch):
             return False
         try:
             return _psutil.Process(pid).create_time() == created
-        except Exception:
+        except _psutil.NoSuchProcess:
             return True  # gone: the signal is a no-op
+        except _psutil.AccessDenied:
+            return False  # unverifiable identity: fail closed (C5 #71)
+        except Exception:
+            # Probe machinery broken (e.g. a test stubbed sys.modules["psutil"]),
+            # not evidence of a foreign process: trust the snapshot record.
+            return True
     _spawned_children = {}
 
     def _remember_spawned_child(pid: int) -> None:
@@ -1791,8 +1797,16 @@ def _live_system_guard(request, monkeypatch):
                 return True
             try:
                 walker = _psutil.Process(pid)
-            except Exception:
+            except _psutil.NoSuchProcess:
                 # The recorded child is gone, so the signal is a no-op.
+                return True
+            except _psutil.AccessDenied:
+                # Exists but unverifiable: fail closed (C5 #71).
+                return False
+            except Exception:
+                # Probe machinery broken (e.g. a test stubbed
+                # sys.modules["psutil"]), not evidence of a foreign process:
+                # the pid is on our spawn record, so trust it.
                 return True
             started_at = _spawned_children[pid]
             if started_at is not None:
@@ -1805,9 +1819,12 @@ def _live_system_guard(request, monkeypatch):
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
+        except _psutil.NoSuchProcess:
             # Stale PID — kill would be a no-op anyway, allow it.
             return True
+        except Exception:
+            # Exists but unverifiable (AccessDenied): fail closed (C5 #71).
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:

@@ -64,14 +64,14 @@ def schedule_interval_seconds(schedule, *, now=None):
             minutes = float(schedule.get("minutes"))
             return minutes * 60 if minutes > 0 else None
         if kind == "cron":
-            from datetime import datetime
-
             from cron import jobs as _jobs
 
             expr = schedule.get("expr")
             if not expr or not _jobs._ensure_croniter():
                 return None
-            base = now or datetime.now().astimezone()
+            # Configured Hermes tz, not host tz (C5 #50): for irregular
+            # expressions the slot containing now depends on the wall hour.
+            base = now or _jobs._hermes_now()
             prev_fire = _jobs.croniter(expr, base).get_prev(float)
             next_fire = _jobs.croniter(expr, base).get_next(float)
             gap = next_fire - prev_fire

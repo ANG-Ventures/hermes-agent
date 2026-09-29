@@ -51,6 +51,81 @@ def reset_pages_for_tests() -> None:
         _pages.clear()
 
 
+# C5 #46: page delivery (flock + a subprocess with a 5 s timeout) must not run
+# inline before the hook verdict. No notify spool/outbox exists in-tree, so
+# (per the ruling) each page runs on a NON-daemon thread: interpreter shutdown
+# waits for it instead of dropping it, and flush_pages() gives it a bounded
+# 5 s join at exit that logs any page still in flight. The thread's own work
+# is bounded too (flock wait <= _FLOCK_WAIT_SECONDS, notify timeout 5 s).
+PAGE_FLUSH_SECONDS = 5.0
+_FLOCK_WAIT_SECONDS = 5.0
+_page_threads: "set[threading.Thread]" = set()
+_page_threads_lock = threading.Lock()
+_flush_registered = False
+
+
+def flush_pages(timeout: float = PAGE_FLUSH_SECONDS) -> bool:
+    """Join in-flight page threads within ``timeout``. False (+ error log) if any remain."""
+    deadline = time.monotonic() + timeout
+    with _page_threads_lock:
+        pending = list(_page_threads)
+    for t in pending:
+        t.join(max(0.0, deadline - time.monotonic()))
+    alive = [t.name for t in pending if t.is_alive()]
+    if alive:
+        logger.error("missing shell hook page(s) still in flight after %.1fs: %s", timeout, ", ".join(alive))
+    return not alive
+
+
+def _register_flush() -> None:
+    global _flush_registered
+    if _flush_registered:
+        return
+    _flush_registered = True
+    # threading._register_atexit runs BEFORE the interpreter joins non-daemon
+    # threads, so the bounded join and its log line happen first.
+    register = getattr(threading, "_register_atexit", None)
+    try:
+        if register is not None:
+            register(flush_pages)
+            return
+    except RuntimeError:  # already shutting down
+        return
+    import atexit
+    atexit.register(flush_pages)
+
+
+def _dispatch_page(fn: Callable[[], None], name: str) -> threading.Thread:
+    """Run ``fn`` on a tracked non-daemon thread (never fire-and-forget daemon)."""
+    def run() -> None:
+        try:
+            fn()
+        except Exception:
+            logger.exception("missing shell hook page %s failed", name)
+        finally:
+            with _page_threads_lock:
+                _page_threads.discard(threading.current_thread())
+
+    t = threading.Thread(target=run, name=f"shell-hook-page:{name}", daemon=False)
+    with _page_threads_lock:
+        _page_threads.add(t)
+    _register_flush()
+    t.start()
+    return t
+
+
+def _flock_bounded(lock: Any, fcntl_mod: Any) -> None:
+    deadline = time.monotonic() + _FLOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl_mod.flock(lock, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise OSError("page dedup lock busy") from None
+            time.sleep(0.05)
+
+
 def _git(cwd: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(cwd), *args], stdin=subprocess.DEVNULL,
                           capture_output=True, text=text, timeout=_GIT_TIMEOUT_SECONDS)
@@ -262,10 +337,17 @@ def page_missing_hook(path: str, outcome: str = "files missing") -> bool:
 
 
 def page_once(path: str, outcome: str) -> None:
-    """Page at most once per hook per window, across processes (state file under the profile home)."""
+    """Page at most once per hook per window, off the verdict path (C5 #46)."""
     from agent import shell_hooks
 
     home = shell_hooks.get_hermes_home()
+    _dispatch_page(lambda: _page_once_sync(home, path, outcome), path)
+
+
+def _page_once_sync(home: Path, path: str, outcome: str) -> None:
+    """Page at most once per hook per window, across processes (state file under the profile home)."""
+    from agent import shell_hooks
+
     key = (str(home), path)
     with _page_lock:
         now = time.time()
@@ -274,7 +356,7 @@ def page_once(path: str, outcome: str) -> None:
             state_dir.mkdir(parents=True, exist_ok=True)
             with (state_dir / "missing-hook-pages.lock").open("a+") as lock:
                 if shell_hooks.fcntl is not None:
-                    shell_hooks.fcntl.flock(lock, shell_hooks.fcntl.LOCK_EX)
+                    _flock_bounded(lock, shell_hooks.fcntl)
                 state_file = state_dir / "missing-hook-pages.json"
                 try:
                     stamps = json.loads(state_file.read_text(encoding="utf-8"))
