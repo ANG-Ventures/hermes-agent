@@ -1046,6 +1046,12 @@ def insert_turn(
                     *_route_columns(record.provider, record.model),
                 ),
             )
+            if provisional and cur.rowcount == 0:
+                # The real row landed first: leave it, its tool calls and its
+                # route/served-subs stamps exactly as they are (Prism P1 on
+                # #1504 -- the side effects below used to run before this
+                # check and wiped the real turn's turn_tool_calls).
+                return False
             _refresh_served_subs(conn, record.turn_id)
             _refresh_turn_route(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
@@ -1064,8 +1070,6 @@ def insert_turn(
                         scrub_and_truncate(call.get("result_preview", "")),
                     ),
                 )
-            if provisional and cur.rowcount == 0:
-                return False
             if move_last_turn and not provisional:
                 conn.execute(
                     """

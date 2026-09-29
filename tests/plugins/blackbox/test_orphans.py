@@ -165,6 +165,41 @@ def test_repair_never_touches_an_existing_row(db):
     assert _turn_row(db, turn_id, "terminal_error, interrupted, final_text") == (None, 0, "done")
 
 
+def test_losing_provisional_insert_leaves_the_real_rows_tool_calls_alone(db):
+    """Prism P1 on #1504: the DO NOTHING loser must not run insert_turn's
+    side effects (turn_tool_calls wipe, route/served-subs re-stamp)."""
+    from plugins.blackbox.record import TurnRecord
+
+    turn_id = "s:t:with-tools"
+    _priced_call(turn_id, 1, inp=10, out=5)
+    real = TurnRecord(
+        turn_id=turn_id, profile="default", provider="claude-bpr", model="claude-opus-4-8",
+        platform="cli", chat_id="c1", api_calls=1, input_tokens=10, output_tokens=5,
+        tools=["terminal", "read_file"],
+        tool_calls=[{"name": "terminal", "args_preview": "ls", "result_preview": "ok"},
+                    {"name": "read_file", "args_preview": "x", "result_preview": "y"}],
+    )
+    assert store.insert_turn(real) is True
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    before = conn.execute(
+        "SELECT lane_family, vendor, served_provider, served_subs_json FROM turns WHERE turn_id=?",
+        (turn_id,)).fetchone()
+    conn.close()
+
+    assert store.insert_turn(orphans.repair_record(str(db), turn_id), provisional=True,
+                             db_path=str(db)) is False
+
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    assert conn.execute("SELECT name FROM turn_tool_calls WHERE turn_id=? ORDER BY seq",
+                        (turn_id,)).fetchall() == [("terminal",), ("read_file",)]
+    assert conn.execute(
+        "SELECT lane_family, vendor, served_provider, served_subs_json FROM turns WHERE turn_id=?",
+        (turn_id,)).fetchone() == before
+    assert conn.execute("SELECT terminal_error, tools FROM turns WHERE turn_id=?",
+                        (turn_id,)).fetchone() == (None, '["terminal", "read_file"]')
+    conn.close()
+
+
 def test_repair_marks_the_row_even_when_only_aux_calls_exist(db):
     turn_id = "s:t:auxonly"
     blackbox.record_api_call(
