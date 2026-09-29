@@ -964,12 +964,7 @@ _PRUNE_MIN_CHARS = 200
 # not be quoted as a user answer during compaction. Sources:
 #   cli.py timeout callback, gateway/run.py timeout + delivery-failure paths,
 #   hermes_cli/oneshot.py no-user callback.
-_CLARIFY_NON_RESPONSE_PREFIXES = (
-    "The user did not provide a response",
-    "[user did not respond",
-    "[clarify prompt could not be delivered",
-    "[oneshot mode:",
-)
+from tools.clarify_tool import NON_RESPONSE_PREFIXES as _CLARIFY_NON_RESPONSE_PREFIXES  # noqa: E402
 
 
 def _is_clarify_non_response_sentinel(response: Any) -> bool:

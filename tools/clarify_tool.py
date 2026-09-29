@@ -34,6 +34,26 @@ TIMEOUT_RESPONSE = (
     "Use your best judgement to make the choice and proceed."
 )
 
+# Every non-answer a clarify callback can return, by prefix. One source of
+# truth for the batch loop below and for context compaction (which must not
+# quote these as a user answer). Producers: cli.py timeout (TIMEOUT_RESPONSE),
+# gateway/run.py timeout + delivery failure, hermes_cli/oneshot.py no-user.
+NON_RESPONSE_PREFIXES = (
+    "The user did not provide a response",
+    "[user did not respond",
+    "[clarify prompt could not be delivered",
+    "[oneshot mode:",
+)
+
+
+def is_non_response(raw) -> bool:
+    """True when a callback reply means nobody answered (timeout / no user /
+    undeliverable), as opposed to an answer or a deliberate empty skip."""
+    if raw is None:
+        return True
+    return isinstance(raw, str) and raw.lstrip().startswith(NON_RESPONSE_PREFIXES)
+
+
 # Suffix appended to the first choice so the user can see, at a glance, which
 # option the agent actually recommends. Applied here rather than per-surface so
 # CLI, TUI, desktop, and messaging adapters all render the same label.
@@ -296,7 +316,7 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
 
         answers: dict = {}
         timed_out = False
-        if raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE):
+        if is_non_response(raw):
             timed_out = True
         elif isinstance(raw, dict):
             answers = dict(raw.get("answers") or {})
@@ -319,7 +339,10 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
         raw = _invoke_callback(
             callback, entry["question"], entry["choices"], entry["multi_select"],
         )
-        if raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE):
+        # Any non-answer (not just the CLI's TIMEOUT_RESPONSE): the gateway
+        # returns "[user did not respond within Nm]", and looping past it
+        # blocked a 5-question Telegram form for 5 x clarify_timeout.
+        if is_non_response(raw):
             timed_out = True
             break
         answers[entry["qid"]] = raw
