@@ -33,6 +33,9 @@ on:
       - "Deploy Site"
       - "Build Skills Index"
       - "Skills Index Freshness Check"
+      # Synthetic P4 bench probe (t_c58e7200). Bench waves stay silent here;
+      # see the PLACEMENT PROBE gate in the route step.
+      - "CI placement probe"
     types:
       - completed
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
@@ -246,6 +249,34 @@ jobs:
               fi
             else
               SIG=""; echo "::warning::cannot read the failing tests of run $WF_RUN_ID; paging"
+            fi
+          fi
+          # PLACEMENT PROBE (t_c58e7200). ci-placement-probe.yml is dispatched by
+          # p4_bench.py inside a bench window, and each wave is graded by
+          # p4_gates.py; the nightly bench cron pages #alerts + files a card on a
+          # red wave. The window file is local to the controller host, so GitHub
+          # cannot see it. The proxy is the dispatcher: every bench wave is
+          # dispatched with an ang-fleet-workers[bot] token (all 310 bot-dispatched
+          # probe runs were bench waves, measured 2026-09-28), so a bot red is silent.
+          # A red dispatched by anyone else (a hand `gh workflow run`) pages ONCE
+          # per wave: a later red of the same wave in the last 24h is silent.
+          # Any API error keeps the page (fail loud).
+          if [ "$ROUTE" = alerts ] && [ "$WF_NAME" = "CI placement probe" ]; then
+            WF_TITLE="$(f .display_title)"
+            WAVE="$(sed -nE 's/^placement probe (.+) #[^ #]+$/\1/p' <<< "$WF_TITLE")"
+            if [ "$WF_ACTOR" = "ang-fleet-workers[bot]" ]; then
+              ROUTE=none; echo "no page: bench-dispatched probe run; the bench grades and pages its wave"
+            elif [ -n "$WAVE" ]; then
+              SINCE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)"
+              PRIOR="$(api "actions/workflows/$WF_ID/runs?event=workflow_dispatch&status=failure&per_page=100" \
+                | jq -r --argjson id "$WF_RUN_ID" --arg p "placement probe $WAVE #" --arg since "$SINCE" \
+                  '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
+                    | select((.display_title // "") | startswith($p)) | .id][0] // ""')" || PRIOR=error
+              if [ "$PRIOR" = error ]; then
+                echo "::warning::prior probe run lookup failed; paging"
+              elif [ -n "$PRIOR" ]; then
+                ROUTE=none; echo "no page: probe wave '$WAVE' already paged (run $PRIOR)"
+              fi
             fi
           fi
           SUMMARY=""
