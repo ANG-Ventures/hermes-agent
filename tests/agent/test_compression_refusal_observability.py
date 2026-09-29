@@ -141,9 +141,12 @@ def test_refusal_metadata_is_bounded_and_success_clears_failure(category, as_dic
         assert "untrusted-category" not in caplog.text
         assert "private explanation" not in caplog.text
         success = {"choices": [{"finish_reason": "stop", "message": {"content": "Inventory checked; continue observations."}}]}
+        # The refused turns are latched on this route (t_0970eb0b), so the
+        # success control uses different content.
+        other_turns = [{"role": "user", "content": "Telescope calibrated."}]
         with patch("agent.context_compressor.call_llm", return_value=success):
             compressor._clear_compression_failure_cooldown()
-            assert compressor._generate_summary(turns)
+            assert compressor._generate_summary(other_turns)
         assert not compressor._last_summary_refusal_failure
         assert compressor._last_summary_error is None
 

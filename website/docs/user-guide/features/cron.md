@@ -351,6 +351,19 @@ cron:
   failure_nudge_threshold: 3   # default; 0 disables the nudge
 ```
 
+A script-only (`no_agent`) job that exits nonzero is reported as a short page:
+the job name and exit code, the script's first stdout line, and its own
+`fix:`/`next:` line if it printed one. The rest of the output stays in the
+saved cron output. By the exit contract, exit 1 with a printed report means
+"findings delivered" and exit 2 or higher means the monitor itself is broken.
+To send findings somewhere quieter than the job's own target, map the target:
+
+```yaml
+cron:
+  findings_deliver_map:        # default: unset (findings go to the job's target)
+    "discord:<alerts channel id>": "discord:<logs channel id>"
+```
+
 ### Failure incidents: acknowledge a known failure
 
 A recurring job that keeps failing with the *same* error pings you on every

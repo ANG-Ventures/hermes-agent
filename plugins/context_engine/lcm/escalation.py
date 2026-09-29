@@ -9,12 +9,15 @@ Each level checks if Tokens(summary) < Tokens(source). If not, escalates.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import logging
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -197,6 +200,132 @@ class SummarySpendGuard:
             self._backoff_until = 0.0
 
 
+class SummaryRefusedError(RuntimeError):
+    """The summary model's safeguards refused this prompt.
+
+    Deterministic for that segment on that model: re-sending it only buys
+    another cold prefill and another refusal (t_6c01fd8e).
+    """
+
+
+# claude-bpx#394 returns 400 invalid_request_error code=safeguard_refusal; the
+# pre-#394 bridge returned a 500 carrying Claude Code's refusal text.
+_SAFEGUARD_REFUSAL_MARKERS = ("safeguard_refusal", "safeguards flagged this")
+
+
+def _is_safeguard_refusal(exc: BaseException) -> bool:
+    if getattr(exc, "code", None) == "safeguard_refusal":
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _SAFEGUARD_REFUSAL_MARKERS)
+
+
+class SummaryRefusalLatch:
+    """Process-wide memory of (summary route, segment) pairs a model refused.
+
+    Keyed on a hash of the segment text, so L1/L2 prompts and later compaction
+    passes over the same segment all skip the refusing route, while other
+    segments and other routes are unaffected. Bounded LRU.
+
+    Entries expire after ``ttl_seconds``: safeguard classifiers are broad and
+    change over time, and a single misfire must not pin a segment to lossy L3
+    truncation for the life of the process. Callers key the route on its
+    *resolved* identity (``_summary_route_key``), not the configured alias, so
+    a /model switch or config change naturally stops matching the old entry.
+    """
+
+    def __init__(self, max_entries: int = 1024, ttl_seconds: float = 3600.0) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._ttl_seconds = max(0.0, float(ttl_seconds))
+        self._refused: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(model: str | None, segment_key: str) -> tuple[str, str]:
+        return ((model or "").strip() or _DEFAULT_ROUTE_KEY, segment_key)
+
+    def remaining(self, model: str | None, segment_key: str) -> float:
+        """Seconds until the latch for this pair expires; 0.0 when not latched."""
+        key = self._key(model, segment_key)
+        now = time.monotonic()
+        with self._lock:
+            expires_at = self._refused.get(key)
+            if expires_at is None:
+                return 0.0
+            if expires_at <= now:
+                del self._refused[key]
+                return 0.0
+            self._refused.move_to_end(key)
+            return expires_at - now
+
+    def is_refused(self, model: str | None, segment_key: str) -> bool:
+        return self.remaining(model, segment_key) > 0.0
+
+    def record(self, model: str | None, segment_key: str) -> None:
+        key = self._key(model, segment_key)
+        with self._lock:
+            self._refused[key] = time.monotonic() + self._ttl_seconds
+            self._refused.move_to_end(key)
+            while len(self._refused) > self._max_entries:
+                self._refused.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._refused.clear()
+
+
+def _summary_route_key(model: str | None) -> str:
+    """Resolved identity of the summary route ``model`` selects right now.
+
+    The configured value is an alias: an empty model means "the compression
+    task default", which ``call_llm`` resolves from ``auxiliary.compression``
+    config or, under ``auto``, from the live main runtime (it follows /model).
+    A model-only override likewise inherits the task provider. Latching on the
+    alias would keep a refusal pinned after the route is re-pointed at a model
+    that accepts the segment, so resolve provider/model/base_url the same way
+    ``call_llm`` does and key on that. Falls back to the alias on any error.
+    """
+    alias = (model or "").strip()
+    try:
+        from agent import auxiliary_client as aux
+
+        from .model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(alias)
+        provider, resolved_model, base_url, _key, _mode = aux._resolve_task_provider_model(
+            "compression",
+            provider=route.provider,
+            model=route.model or None,
+        )
+        provider = (provider or "").strip().lower()
+        resolved_model = (resolved_model or "").strip()
+        if provider in ("", "auto"):
+            main_provider = (aux._read_main_provider() or "").strip().lower()
+            provider = f"auto>{main_provider}" if main_provider else "auto"
+        if not resolved_model:
+            resolved_model = (aux._read_main_model_for_aux() or "").strip()
+        return f"{alias or _DEFAULT_ROUTE_KEY}=>{provider}|{resolved_model}|{(base_url or '').strip()}"
+    except Exception:
+        logger.debug("LCM summary route resolution failed for %r", alias, exc_info=True)
+        return alias or _DEFAULT_ROUTE_KEY
+
+
+_SUMMARY_REFUSALS = SummaryRefusalLatch()
+
+
+def _segment_key(text: str, focus_topic: str = "", custom_instructions: str = "") -> str:
+    """Refusal-latch identity of one summary request (t_bf18e600).
+
+    Every model-visible input, not just the segment: a corrected focus topic or
+    custom instructions is a different request and must be sent.
+    """
+    identity = json.dumps(
+        [text or "", focus_topic or "", custom_instructions or ""],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _strip_reasoning_blocks(text: str) -> str:
     """Remove <think>/<thinking>/<reasoning>/<thought>/<REASONING_SCRATCHPAD>
     blocks from ``text``. Idempotent and safe on text without any tags."""
@@ -242,6 +371,8 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
+        if getattr(response.choices[0], "finish_reason", None) == "content_filter":
+            raise SummaryRefusedError("summary finished with content_filter")
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
@@ -252,7 +383,11 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
                 model or "<default>",
             )
         return sanitized
+    except SummaryRefusedError:
+        raise
     except Exception as e:
+        if _is_safeguard_refusal(e):
+            raise SummaryRefusedError(str(e)[:300]) from e
         logger.warning("LLM summarization failed: %s", e)
         return None
 
@@ -372,10 +507,21 @@ def _invoke_summary_llm_chain(
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
+    segment_key: str | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        route_key = _summary_route_key(candidate_model) if segment_key else ""
+        latched_for = _SUMMARY_REFUSALS.remaining(route_key, segment_key) if segment_key else 0.0
+        if latched_for > 0.0:
+            logger.warning(
+                "LCM summary route %s skipped: it refused this segment; latch "
+                "expires in %.0fs",
+                route_key,
+                latched_for,
+            )
+            continue
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
             logger.warning(
@@ -398,6 +544,18 @@ def _invoke_summary_llm_chain(
                 model=candidate_model,
                 timeout=timeout,
             )
+        except SummaryRefusedError as exc:
+            # About the content, not the route: latch the pair instead of
+            # tripping the breaker, so other segments keep summarizing here.
+            logger.warning(
+                "LCM summary refused by safeguards on %s; never re-sending this "
+                "segment on that route: %s",
+                candidate_model or _DEFAULT_ROUTE_KEY,
+                exc,
+            )
+            if segment_key:
+                _SUMMARY_REFUSALS.record(route_key, segment_key)
+            continue
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
             result = None
@@ -599,6 +757,9 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    segment_key = _segment_key(
+        text, focus_topic=focus_topic, custom_instructions=custom_instructions
+    )
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
@@ -612,6 +773,7 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        segment_key=segment_key,
     )
 
     if l1_result:
@@ -632,6 +794,7 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        segment_key=segment_key,
     )
 
     if l2_result:
