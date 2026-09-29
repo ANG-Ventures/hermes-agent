@@ -3670,6 +3670,12 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict],
         return content, targets
 
 
+# Leading text of the one-line footer the cron delivery wrapper appends
+# (``-# cron <name> · job <id> · reply "stop reminder <name>" to manage``).
+# Consumers that strip the wrapper (gateway/platforms/yuanbao.py) key on it.
+CRON_WRAPPER_FOOTER_PREFIX = "-# cron "
+
+
 def _deliver_result(job: dict, content: str, success: bool = True, adapters=None, loop=None, *, wrap_override: Optional[bool] = None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -3679,8 +3685,9 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
-    ``success`` selects the framing of the wrapped delivery (clean ✅ header for
-    successful runs, ⚠️ failure header carrying the error as the body).
+    ``success`` selects the framing of the wrapped delivery (the content leads on
+    successful runs, a ⚠️ failure header carries the error as the body); both
+    end in one ``-# cron …`` footer line.
 
     Returns None on success, or an error string on failure.
     """
@@ -3730,30 +3737,22 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         wrap_response = wrap_override
 
     if wrap_response:
+        # House page shape (t_cb147820): the content's own header leads and the
+        # wrapper folds into ONE -# footer line.  A success run no longer stacks
+        # a ✅ header over a 🔴 finding; a failure keeps its single ⚠️ header
+        # (fork PR #16 semantics), only the id/rule/hint lines are folded.
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        manage_hint = (
-            f'To stop or manage this job, send me a new message '
-            f'(e.g. "stop reminder {task_name}").'
+        footer = (
+            f'{CRON_WRAPPER_FOOTER_PREFIX}{task_name} · job {job_id} · '
+            f'reply "stop reminder {task_name}" to manage'
         )
+        body = (content or "").strip("\n")
         if success:
-            delivery_content = (
-                f"✅ Cronjob Response: {task_name}\n"
-                f"🪪 Job ID: {job_id}\n"
-                f"-------------\n\n"
-                f"{content}\n\n"
-                f"{manage_hint}"
-            )
+            head = []
         else:
-            # Failure framing: a single ⚠️ header carrying the error as the body,
-            # instead of nesting a "Cron job failed" line inside the success header.
-            delivery_content = (
-                f"⚠️ Cronjob Failed: {task_name}\n"
-                f"🪪 Job ID: {job_id}\n"
-                f"-------------\n\n"
-                f"{content}\n\n"
-                f"{manage_hint}"
-            )
+            head = [f"⚠️ **Cronjob Failed: {task_name}**"]
+        delivery_content = "\n".join(head + ([body] if body else []) + [footer])
     else:
         delivery_content = content
 

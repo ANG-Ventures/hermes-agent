@@ -771,16 +771,50 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        # fork parity NOTE (2026-08-07): the merge kept the FORK's delivery
-        # wrapper ("🪪 Job ID: <id>" + a distinct ⚠️ failure header) over
-        # upstream's flat "(job_id: <id>)". The property under test is unchanged:
-        # the delivered message must carry the job id so a recipient can tell
-        # which job spoke. Only the spelling moved.
-        assert "Job ID: test-job" in sent_content
-        assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        # House page shape (t_cb147820): the content leads, the wrapper is ONE
+        # -# footer line that still names the job, its id and the manage hint.
+        assert sent_content == (
+            "Here is today's summary.\n"
+            '-# cron daily-report · job test-job · reply "stop reminder daily-report" to manage'
+        )
+
+    def test_delivery_success_wrapper_lets_content_header_lead(self):
+        """A 🔴 finding from a successful run is not buried under a ✅ header:
+        the content's own header is the first line, every content line survives,
+        and the id / rule / manage-hint lines fold into a single -# footer."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        content = (
+            "🔴 **arr config regression detected**\n"
+            "sonarr: quality profile 'HD-1080p' lost 2 formats\n"
+            "- see https://example.invalid/runbook#arr"
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "694506da4a5a",
+                "name": "arr-config-regression-lint",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, content + "\n\n")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        lines = sent_content.split("\n")
+        assert lines[0] == "🔴 **arr config regression detected**"
+        assert "\n".join(lines[:-1]) == content  # content preserved byte-for-byte
+        assert lines[-1] == (
+            "-# cron arr-config-regression-lint · job 694506da4a5a · "
+            'reply "stop reminder arr-config-regression-lint" to manage'
+        )
+        for gone in ("✅", "🪪", "-------------", "Cronjob Response", "To stop or manage"):
+            assert gone not in sent_content
+        assert "" not in lines  # no blank spacer lines
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -967,10 +1001,12 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "RuntimeError: [Errno 32] Broken pipe", success=False)
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "⚠️ Cronjob Failed: morning-digest" in sent_content
-        assert "🪪 Job ID: test-job" in sent_content
-        assert "RuntimeError: [Errno 32] Broken pipe" in sent_content
-        assert "To stop or manage this job" in sent_content
+        # House page shape (t_cb147820): one ⚠️ header, the error, one footer.
+        assert sent_content == (
+            "⚠️ **Cronjob Failed: morning-digest**\n"
+            "RuntimeError: [Errno 32] Broken pipe\n"
+            '-# cron morning-digest · job test-job · reply "stop reminder morning-digest" to manage'
+        )
         # No double-wrap: the success header must not appear on a failure.
         assert "Cronjob Response" not in sent_content
         # No nested "Cron job '...' failed" body from the old call-site framing.
@@ -1021,7 +1057,9 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert sent_content.endswith(
+            '-# cron abc-123 · job abc-123 · reply "stop reminder abc-123" to manage'
+        )
 
     def test_live_adapter_media_only_no_text(self, tmp_path, monkeypatch):
         """When content is ONLY a MEDIA tag with no text, media should still be sent."""
