@@ -279,7 +279,11 @@ def test_preload_on_real_tree_has_no_process_side_effects(tmp_path):
     # its gateway-aware config->env bridge at import, which only fills keys the
     # gateway's own bridge sets from the same config.yaml.
     assert not payload["env_changed"], payload["env_changed"]
-    assert payload["result"]["failed"] == 0, payload["result"]
+    # A module may legitimately fail on a host missing one of its optional
+    # dependencies (best-effort; logged at WARNING).  Anything other than an
+    # import failure means the module DOES something at import -> exclude it.
+    errors = payload["result"]["errors"]
+    assert all(e in ("ImportError", "ModuleNotFoundError") for e in errors.values()), errors
 
 
 class TestCodeSkewPreloadLine:

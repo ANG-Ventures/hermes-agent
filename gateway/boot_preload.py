@@ -154,11 +154,12 @@ def iter_preload_names(project_root: Path = _PROJECT_ROOT) -> Iterator[str]:
 def preload_first_party_modules(project_root: Path = _PROJECT_ROOT) -> dict:
     """Import every first-party module not yet in ``sys.modules``.
 
-    Returns ``{"modules": <newly imported first-party>, "failed": <count>, "elapsed_ms": <int>}``.
+    Returns ``{"modules": <newly imported first-party>, "failed": <count>,
+    "errors": {<module>: <exception type>}, "elapsed_ms": <int>}``.
     """
     started = time.perf_counter()
     before = set(sys.modules)
-    failed = 0
+    errors: dict[str, str] = {}
     for name in iter_preload_names(project_root):
         if name in sys.modules:
             continue
@@ -167,13 +168,13 @@ def preload_first_party_modules(project_root: Path = _PROJECT_ROOT) -> dict:
         except BaseException as exc:  # noqa: BLE001 - SystemExit from a stray CLI must not end boot
             if isinstance(exc, KeyboardInterrupt):
                 raise
-            failed += 1
+            errors[name] = type(exc).__name__
             logger.warning("boot preload: import of %s failed: %s: %s", name, type(exc).__name__, exc)
     root_names = set(PRELOAD_PACKAGES) | set(top_level_modules(project_root))
     loaded = [m for m in set(sys.modules) - before if m.split(".", 1)[0] in root_names]
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "PHASE=boot_preload modules=%d failed=%d elapsed_ms=%d", len(loaded), failed, elapsed_ms
+        "PHASE=boot_preload modules=%d failed=%d elapsed_ms=%d", len(loaded), len(errors), elapsed_ms
     )
     try:
         from gateway.code_skew import record_preload
@@ -181,4 +182,4 @@ def preload_first_party_modules(project_root: Path = _PROJECT_ROOT) -> dict:
         record_preload(len(loaded))
     except Exception:
         pass
-    return {"modules": len(loaded), "failed": failed, "elapsed_ms": elapsed_ms}
+    return {"modules": len(loaded), "failed": len(errors), "errors": errors, "elapsed_ms": elapsed_ms}
