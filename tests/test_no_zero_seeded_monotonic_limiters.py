@@ -70,10 +70,18 @@ def _call_name(func: ast.expr) -> str | None:
     return None
 
 
+_NUMERIC_WRAPPERS = {"int", "float", "round", "floor", "ceil", "trunc"}
+
+
 def _is_monotonic_call(node: ast.expr) -> bool:
     if not isinstance(node, ast.Call):
         return False
     func = node.func
+    # ``int(time.monotonic())`` is still an absolute boot-origin timestamp.
+    # Only a DIRECT monotonic argument counts: ``int(time.monotonic() - t0)``
+    # is a relative elapsed value and must not be treated as absolute.
+    if _call_name(func) in _NUMERIC_WRAPPERS and node.args:
+        return _is_monotonic_call(node.args[0])
     if _call_name(func) in _MONOTONIC_FUNCS:
         return True
     # asyncio: ``loop.time()`` / ``asyncio.get_running_loop().time()``
@@ -285,6 +293,19 @@ def heartbeat_current_worker_from_env(progress_at=None):
             "    if now - last >= 300:\n        last = now\n",
             [],
             id="wall-clock-is-safe",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    last = 0\n    now = int(time.monotonic())\n"
+            "    if now - last >= 30:\n        last = now\n",
+            ["last"],
+            id="int-wrapped-monotonic",
+        ),
+        pytest.param(
+            "import math, time\ndef f():\n    last = 0.0\n"
+            "    if round(time.monotonic(), 1) - last >= 30:\n        last = 1\n"
+            "    if math.floor(time.monotonic()) - last >= 30:\n        last = 1\n",
+            ["last", "last"],
+            id="round-and-floor-wrapped-monotonic",
         ),
         pytest.param(
             "import time\ndef f(started):\n    last = 0\n"
