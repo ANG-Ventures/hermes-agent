@@ -227,3 +227,63 @@ def test_lane_write_failure_does_not_escape_to_the_caller(
 
     asyncio.run(scenario())
     assert _spool_files(spool_home) == []
+
+
+def test_lane_write_lands_in_the_callers_profile_home(tmp_path, monkeypatch):
+    """The lane must resolve the home under the CALLER's context-local override.
+
+    A pool thread starts with a fresh context, so without propagation the write falls back to the
+    ambient home and a drain under the profile scope never sees it.
+    """
+    import hermes_constants
+    ambient, profile = tmp_path / "ambient", tmp_path / "profile"
+    ambient.mkdir()
+    profile.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    monkeypatch.setattr(hermes_constants, "assert_named_profile_home_live", lambda *_a, **_k: None, raising=False)
+
+    async def scenario():
+        token = hermes_constants.set_hermes_home_override(profile)
+        try:
+            result = shutdown_flush.spool_dropped_transcript_message(
+                "sess-profile", {"role": "user", "content": "mine"}
+            )
+            assert result is shutdown_flush.SPOOL_QUEUED
+            await asyncio.to_thread(shutdown_flush.fence_spool_lane)
+        finally:
+            hermes_constants.reset_hermes_home_override(token)
+
+    asyncio.run(scenario())
+    assert len(_spool_files(profile)) == 1
+    assert _spool_files(ambient) == []
+
+    seen = []
+    token = hermes_constants.set_hermes_home_override(profile)
+    try:
+        replayed, remaining = shutdown_flush.drain_transcript_spool(
+            "sess-profile", lambda m: seen.append(m["content"])
+        )
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+    assert (replayed, remaining, seen) == (1, 0, ["mine"])
+
+
+def test_lane_write_failure_is_logged_at_warning(spool_home, monkeypatch, caplog):
+    """The caller already reported the message as spooled; a lane failure must be visible."""
+    def _boom(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutdown_flush, "_write_payload", _boom, raising=True)
+
+    async def scenario():
+        shutdown_flush.spool_dropped_transcript_message(
+            "sess-warn", {"role": "user", "content": "doomed"}
+        )
+        await asyncio.to_thread(shutdown_flush.fence_spool_lane)
+
+    with caplog.at_level("WARNING", logger=shutdown_flush.logger.name):
+        asyncio.run(scenario())
+    assert any(
+        r.levelname == "WARNING" and "sess-warn" in r.getMessage() and "dropped" in r.getMessage()
+        for r in caplog.records
+    )

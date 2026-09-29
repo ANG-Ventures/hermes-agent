@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import contextvars
 import itertools
 import json
 import logging
@@ -130,8 +131,10 @@ def _run_on_spool_lane(payload: Dict[str, Any]) -> None:
     try:
         _write_payload(_get_flush_dir(), payload)
     except Exception as exc:
-        logger.debug(
-            "Off-loop spool write failed for %s: %s",
+        # WARNING, not DEBUG: the caller already got SPOOL_QUEUED and logged the message as spooled,
+        # so this line is the only record that the evicted message was actually lost.
+        logger.warning(
+            "Off-loop spool write failed for %s; cap-evicted transcript message dropped: %s",
             payload.get("session_key"), exc,
         )
     finally:
@@ -146,7 +149,11 @@ def _submit_spool_write(payload: Dict[str, Any]) -> None:
     global _SPOOL_SUBMITTED
     with _SPOOL_PROGRESS:
         _SPOOL_SUBMITTED += 1
-    _get_spool_lane().submit(_run_on_spool_lane, payload)
+    # Run under the caller's context: _get_flush_dir() resolves the home through a ContextVar
+    # override (multiplexed profiles), which a bare pool thread would not see -- the payload would
+    # land in the ambient home, where this profile's drain never looks.
+    ctx = contextvars.copy_context()
+    _get_spool_lane().submit(ctx.run, _run_on_spool_lane, payload)
 
 
 def fence_spool_lane(timeout: float = 30.0) -> bool:
