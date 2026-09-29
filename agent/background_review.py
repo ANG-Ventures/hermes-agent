@@ -38,6 +38,22 @@ logger = logging.getLogger(__name__)
 # tune here rather than guessing.
 _REVIEW_MAX_ITERATIONS = 30
 
+# Review forks whose turn is in flight, process-wide. A fork outlives its
+# parent's turn (it starts after the parent finalizes), so a host that walks
+# only RUNNING agents and their ``_active_children`` never sees it: the parent
+# is idle. Gateway shutdown reads this to record abandoned review turns
+# (the 2026-09-29 14:04 restart orphaned review turn ``...:c8656124``, whose
+# parent #apollo agent was idle; t_ab2f510b). Keyed by id(): test doubles are
+# not guaranteed hashable.
+_live_review_agents: Dict[int, Any] = {}
+_live_review_agents_lock = threading.Lock()
+
+
+def live_background_review_agents() -> list:
+    """Snapshot of the review forks whose ``run_conversation`` may be in flight."""
+    with _live_review_agents_lock:
+        return list(_live_review_agents.values())
+
 
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
 
@@ -1501,6 +1517,9 @@ def _run_review_in_thread(
         """
         if agent_ref is None:
             return
+        with _live_review_agents_lock:
+            if _live_review_agents.get(id(agent_ref)) is agent_ref:
+                del _live_review_agents[id(agent_ref)]
         if hasattr(agent, "_background_review_agent"):
             _br_lock = getattr(agent, "_background_review_lock", None)
             if _br_lock is not None:
@@ -1568,6 +1587,8 @@ def _run_review_in_thread(
             # separately fences startup and acknowledges request-phase exit.
             # The legacy pointer/list remain best-effort for direct test stubs;
             # a prepared run token is the live-turn cancellation authority.
+            with _live_review_agents_lock:
+                _live_review_agents[id(review_agent)] = review_agent
             if hasattr(agent, "_background_review_agent"):
                 _br_lock = getattr(agent, "_background_review_lock", None)
                 if _br_lock is not None:

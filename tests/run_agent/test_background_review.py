@@ -427,6 +427,9 @@ def test_background_review_registers_before_start_runs_and_cleans_up(monkeypatch
             seen["run"] = agent._background_review_run
             seen["active_children_during_run"] = list(agent._active_children)
             seen["background_review_agent_during_run"] = agent._background_review_agent
+            from agent.background_review import live_background_review_agents
+
+            seen["live_during_run"] = live_background_review_agents()
 
     monkeypatch.setattr(run_agent_module, "AIAgent", RecordingReviewAgent)
     CapturingThread.targets = []
@@ -453,6 +456,11 @@ def test_background_review_registers_before_start_runs_and_cleans_up(monkeypatch
     assert fork is not None
     assert seen["run"] is run
     assert seen["active_children_during_run"] == [fork]
+    # Process-wide registry gateway shutdown sweeps (idle parent, live fork).
+    from agent.background_review import live_background_review_agents
+
+    assert fork in seen["live_during_run"]
+    assert fork not in live_background_review_agents()
     assert observed_done.is_set()
     assert observed_done.set_calls == 1
     assert agent._background_review_run is None

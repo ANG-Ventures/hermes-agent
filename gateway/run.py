@@ -14056,6 +14056,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agents.extend(live_cron_agents())
         except Exception:
             pass
+        # Background review forks run on a daemon thread AFTER their parent's
+        # turn finalized, so an idle parent is in none of the maps above.
+        try:
+            from agent.background_review import live_background_review_agents
+
+            agents.extend(live_background_review_agents())
+        except Exception:
+            pass
         try:
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
             # /v1/runs agents AND the _run_agent() turns (session chat, chat

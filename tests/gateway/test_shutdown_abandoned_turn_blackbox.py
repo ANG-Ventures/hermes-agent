@@ -284,6 +284,24 @@ def test_in_flight_cron_agents_are_covered(ledger, monkeypatch):
     assert _orphan_ids(ledger) == []
 
 
+def test_in_flight_background_review_of_an_idle_parent_is_covered(ledger, monkeypatch):
+    """2026-09-29 14:04: review fork ``...:c8656124`` of the idle #apollo agent
+    was mid-turn at SIGTERM; its parent was in no running map, so the fork's
+    calls orphaned (t_ab2f510b)."""
+    from agent import background_review as br
+
+    tid = "20260927_135034_52aefa:1e881602-d57f-47b0-9ed1-5dc4e5ad213f:c8656124"
+    _in_flight_call(tid, http_status=200)
+    fork = _agent(tid)
+    monkeypatch.setitem(br._live_review_agents, id(fork), fork)
+
+    _shutdown(_runner(monkeypatch), {})
+
+    assert _orphan_ids(ledger) == []
+    assert _row(ledger, tid, "interrupted")[0] == 1
+    assert HOOKS == ["on_turn_abandoned"]
+
+
 def test_provisional_emit_waiting_on_a_real_finalize_stands_down(ledger, monkeypatch):
     """Real finalize holds the per-agent emit lock; the shutdown emit must
     block, then see the real marker and write nothing after the real row."""
