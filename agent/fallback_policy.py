@@ -1243,31 +1243,41 @@ def format_recovery_rider(row: Mapping[str, Any], *, seat_names: bool = True) ->
     """Recovery rider: return_branch, seat, dwell/turns and the cache
     EXPECTATION (never a claim; the outcome is back-filled, not announced)."""
     branch = row.get("return_branch")
-    seat = row.get("seat") or "sub ?"
-    if seat != "sub ?" and not seat_names:
+    # "sub" is relay-pool vocabulary. A primary with no seat concept (cpa/Kimi,
+    # openai-codex, openrouter, xai ...) gets NO seat clause at all; a relay
+    # primary whose seat is genuinely unknown says so in words (t_246ce7d6:
+    # never a bare "?"). Ace 2026-09-28: "sub ?" on a Kimi return was confusing.
+    seat = row.get("seat")
+    if seat and not seat_names:
         seat = "a sub"
+    if seat:
+        on_seat = f" on {seat}"
+    elif _plain_provider({"from_provider": row.get("to_provider")}):
+        on_seat = ""
+    else:
+        on_seat = " on sub unknown"
     dwell = f"after {_mins(row.get('dwell_s'))} / {int(row.get('dwell_turns') or 0)} turns on {_model_short(row.get('from_model'))}"
     since = row.get("since_primary_call_s")
     warm = row.get("expected_warm")
     expect = "expected warm" if warm else "expected cold"
     if branch == "warm_seat":
-        return f"primary eligible on {seat}, last call {_mins(since)} ago ({expect}), {dwell}"
+        return f"primary eligible{on_seat}, last call {_mins(since)} ago ({expect}), {dwell}"
     if branch == "fallback_cold":
         return (f"fallback idle {_mins(row.get('fallback_idle_s'))}; both caches cold, one full "
-                f"cache write ({expect}) on {seat}, {dwell}")
+                f"cache write ({expect}){on_seat}, {dwell}")
     if branch == "compaction":
         return (f"compaction rewrote the prefix; both caches cold, one full cache write "
-                f"({expect}) on {seat}, {dwell}")
+                f"({expect}){on_seat}, {dwell}")
     if branch == "cap_expiry":
-        return (f"primary warm copy expired; one full cache write ({expect}) on {seat}, {dwell}")
+        return (f"primary warm copy expired; one full cache write ({expect}){on_seat}, {dwell}")
     if branch == "fallback_failed":
-        return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible on "
-                f"{seat} ({expect}), {dwell}")
+        return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible"
+                f"{on_seat} ({expect}), {dwell}")
     if branch == TRANSIENT_BRANCH:
         return f"cause was transient (connection); retrying primary ({expect}), {dwell}"
     if branch == USER_ROUTE_BRANCH:
         return f"cleared by /model ({expect}), {dwell}"
-    return f"branch ? on {seat} ({expect}), {dwell}"
+    return f"branch ?{on_seat} ({expect}), {dwell}"
 
 
 def recovery_row(state: StickyState, decision: Decision, now: float, *,
