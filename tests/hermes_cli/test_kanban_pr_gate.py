@@ -2056,6 +2056,32 @@ def test_merged_but_not_deployed_holds_and_comments_once(kanban_home: Path) -> N
         assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_awaiting_deploy_names_what_triggered_the_gate(kanban_home: Path) -> None:
+    """C5 #47: every mapped ref stays gated (fail-safe), but the refusal says why."""
+    query = _stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)})
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            reason="needs ANG-Ventures/hermes-home#605, see /Users/ace/.hermes/x.md",
+        )
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=query, deploy_fn=_DeployOracle(),
+        )
+        assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        comment = _comments(conn, tid)[0]
+    assert (
+        "Deploy-gated because the block reason names deploy tree "
+        "/Users/ace/.hermes;" in comment
+    )
+    assert prg._deploy_trigger("merge first, then deploy", None) == (
+        "the block reason states a deploy gate"
+    )
+    assert prg._deploy_trigger("merge o/r#7", "lives in ~/.hermes") == (
+        "the card body names deploy tree ~/.hermes"
+    )
+    assert prg._deploy_trigger("merge o/r#7", None) is None
+
+
 def test_runtime_tree_is_checked_against_a_real_git_checkout(
     kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

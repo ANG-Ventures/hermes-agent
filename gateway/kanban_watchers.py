@@ -2790,6 +2790,18 @@ class GatewayKanbanWatchersMixin:
                 _review_on = _kb.review_dispatch_enabled()
                 for b in _kb.enumerating_each(boards):
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    # A board quarantined as corrupt (same fingerprint, inside
+                    # its retry window) is not opened by the demand pre-scan
+                    # either: the dispatch tick below skips it, so a probe
+                    # here would only re-hit the corrupt file every tick.
+                    _q = disabled_corrupt_boards.get(slug)
+                    if (
+                        _q is not None
+                        and _q[0] == _board_db_fingerprint(slug)
+                        and time.monotonic() - _q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                    ):
+                        _demand.append((slug, 0))
+                        continue
                     _dconn = None
                     try:
                         _dconn = _kb.connect(board=slug)

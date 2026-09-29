@@ -1064,15 +1064,10 @@ def build_turn_context(
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
                 if messages is not _idle_input:
-                    _comp = agent._blackbox_compaction
-                    _comp["idle_compaction_fired"] = True
-                    if _comp.get("compaction_tokens_before") is None:
-                        _comp["compaction_tokens_before"] = _idle_tokens
-                    if _comp.get("compaction_tokens_after") is None:
-                        _comp["compaction_tokens_after"] = estimate_request_tokens_rough(
-                            messages, system_prompt=active_system_prompt or "",
-                            tools=agent.tools or None,
-                        )
+                    # Re-derive turn state FIRST (C5 #42): ``messages`` is
+                    # already the compacted list, so a raise in the telemetry
+                    # below must not leave the flush baseline / user-message
+                    # index pointing at the pre-compaction list.
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -1083,6 +1078,20 @@ def build_turn_context(
                         messages, user_message
                     )
                     agent._persist_user_message_idx = current_turn_user_idx
+                    try:
+                        _comp = agent._blackbox_compaction
+                        _comp["idle_compaction_fired"] = True
+                        if _comp.get("compaction_tokens_before") is None:
+                            _comp["compaction_tokens_before"] = _idle_tokens
+                        if _comp.get("compaction_tokens_after") is None:
+                            _comp["compaction_tokens_after"] = estimate_request_tokens_rough(
+                                messages, system_prompt=active_system_prompt or "",
+                                tools=agent.tools or None,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Idle compaction blackbox bookkeeping failed", exc_info=True
+                        )
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.

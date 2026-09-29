@@ -116,6 +116,24 @@ class TestStoreSessionReadsHideSuperseded:
         ).fetchone()[0]
         assert n == 1
 
+    def test_index_build_is_logged_once_with_row_count(self, tmp_path, caplog):
+        """C5 #64: the one-time O(rows) build logs its row count + duration once."""
+        import logging
+
+        from plugins.context_engine.lcm.db_bootstrap import ensure_messages_dedup_columns
+
+        store = MessageStore(str(tmp_path / "lcm.db"))
+        _seed_with_hidden_block(store)
+        total = store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        store._conn.execute("DROP INDEX idx_msg_session_visible")
+        caplog.clear()  # store creation above may already have logged at INFO
+        with caplog.at_level(logging.INFO, logger="plugins.context_engine.lcm.db_bootstrap"):
+            ensure_messages_dedup_columns(store._conn)
+            ensure_messages_dedup_columns(store._conn)
+        hits = [r.getMessage() for r in caplog.records if "idx_msg_session_visible" in r.getMessage()]
+        assert len(hits) == 1, hits
+        assert f"over {total} messages in " in hits[0]
+
 
 class TestRebindReconcileIgnoresHiddenTail:
     def test_full_replay_over_hidden_block_ingests_only_the_new_turn(self, tmp_path):

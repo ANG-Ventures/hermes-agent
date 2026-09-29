@@ -284,21 +284,45 @@ def route_id_of(api_kwargs):
 
 
 class _AuxRoute:
-    """One auxiliary call's harness route id and the providers it was sent to."""
+    """One auxiliary call's harness route id and what the WIRE saw.
 
-    __slots__ = ("route_id", "sent_to")
+    ``offered_to`` is the fleet providers whose kwargs were built with the id.
+    That is intent, not evidence: an adapter can drop ``extra_headers`` (the
+    Anthropic Messages aux adapter did, t_d5f71d8e). ``wire`` is the evidence,
+    set from the served HTTP response by :func:`note_aux_http_response`:
+    ``(sent, relay_id)`` -- did the request carry our id, and did a pooled
+    relay answer with its own ``x-pool-route-id``.
+    """
+
+    __slots__ = ("route_id", "offered_to", "wire")
 
     def __init__(self):
         self.route_id = mint_harness_route_id()
-        self.sent_to = set()
+        self.offered_to = set()
+        self.wire = None
 
     def id_for(self, provider):
-        """The id iff it was actually sent to ``provider`` (the served route)."""
+        """The id the served route's boundary record carries, else None.
+
+        Pooled relays (claude-apr / claude-bpr) mint and forward their OWN id,
+        so their ``x-pool-route-id`` wins (same rule as the main path,
+        chat_completion_helpers). Otherwise the harness id, but only when the
+        served request actually carried it. No wire evidence -> None: an id
+        that never reached the box cannot be joined, and a wrong join is worse
+        than a NULL.
+        """
         p = provider.strip().lower() if isinstance(provider, str) else ""
-        return self.route_id if p and p in self.sent_to else None
+        if not p or p not in self.offered_to or not self.wire:
+            return None
+        sent, relay_id = self.wire
+        if relay_id:
+            return relay_id
+        return self.route_id if sent else None
 
 
 _AUX_ROUTE: "ContextVar[_AuxRoute | None]" = ContextVar("aux_route_id", default=None)
+_POOL_ROUTE_ID_HEADER = "x-pool-route-id"
+_RELAY_ROUTE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @contextmanager
@@ -315,16 +339,52 @@ def aux_route_scope():
 
 def aux_route_headers(provider) -> dict:
     """``{x-hermes-route-id: <id>}`` for an aux request to a fleet lane inside
-    an :func:`aux_route_scope`, else ``{}``. Never raises."""
+    an :func:`aux_route_scope`, else ``{}``. Never raises.
+
+    Called once per attempt as its kwargs are built, so it also clears the
+    previous attempt's wire evidence: a fallback attempt whose client reports
+    no response must not inherit the failed attempt's ids.
+    """
     try:
         route = _AUX_ROUTE.get()
-        p = provider.strip().lower() if isinstance(provider, str) else ""
-        if route is None or not _AUX_ROUTE_PROVIDER_RE.fullmatch(p):
+        if route is None:
             return {}
-        route.sent_to.add(p)
+        route.wire = None
+        p = provider.strip().lower() if isinstance(provider, str) else ""
+        if not _AUX_ROUTE_PROVIDER_RE.fullmatch(p):
+            return {}
+        route.offered_to.add(p)
         return {ROUTE_ID_HEADER: route.route_id}
     except Exception:
         return {}
+
+
+def note_aux_http_response(response) -> None:
+    """Record what the wire saw for the current aux attempt (httpx response).
+
+    Inert outside an :func:`aux_route_scope`. Reads the REQUEST's headers (was
+    our id actually sent?) and the response's ``x-pool-route-id`` (a pooled
+    relay's own id). The last response in the scope wins: SDK retries and
+    fallbacks end on the one that served. Never raises.
+    """
+    try:
+        route = _AUX_ROUTE.get()
+        if route is None or response is None:
+            return
+        request = getattr(response, "request", None)
+        req_headers = getattr(request, "headers", None) or {}
+        sent = req_headers.get(ROUTE_ID_HEADER) == route.route_id
+        relay_id = (getattr(response, "headers", None) or {}).get(_POOL_ROUTE_ID_HEADER)
+        if not (isinstance(relay_id, str) and _RELAY_ROUTE_ID_RE.fullmatch(relay_id)):
+            relay_id = None
+        route.wire = (sent, relay_id)
+    except Exception:
+        return
+
+
+async def anote_aux_http_response(response) -> None:
+    """Async httpx event-hook form of :func:`note_aux_http_response`."""
+    note_aux_http_response(response)
 
 
 def _pool_affinity_headers(agent, aux_task=None) -> dict:

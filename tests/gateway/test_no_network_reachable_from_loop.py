@@ -123,6 +123,11 @@ REACHABLE_BASELINE = frozenset({
     # (t_e9ca7d13): false positive. It sits in the nested
     # _kill_tool_subprocesses, which runs only via asyncio.to_thread; the
     # walker no longer charges a nested def's body to its enclosing coroutine.
+    # Pre-existing; surfaced (not introduced) when function-local imports
+    # started shadowing same-file fallback defs (C5 #39): providers.get_label
+    # defaults to allow_network=True. Same shape as the matrix entry above.
+    "plugins/platforms/telegram/adapter.py _handle_model_picker_callback -> requests.get",
+    "plugins/platforms/telegram/adapter.py send_model_picker -> requests.get",
 })
 
 # Coroutines this change took off the network path. They must stay off it.

@@ -1111,9 +1111,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert not any(record.exc_info for record in caplog.records)
     # Per tick: auto-decompose triage scan, load-gate demand probe, the
     # dispatch connect, and the ready-work probe (ready + review share one
-    # connection). The second tick skips only the dispatch connect because
-    # the corrupt board fingerprint is disabled: 4 + 3 = 7.
-    assert calls["connect"] == 7
+    # connection). The second tick skips the dispatch connect AND the demand
+    # probe because the corrupt board fingerprint is quarantined (#1468): the
+    # pre-scan must not re-open a board the dispatch tick skips. 4 + 2 = 6.
+    assert calls["connect"] == 6
 
 
 # ---------------------------------------------------------------------------

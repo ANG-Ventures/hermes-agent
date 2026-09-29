@@ -159,6 +159,17 @@ def test_comment_lookup_outage_is_retried_not_fatal(monkeypatch):
     assert sent == ["PATCH"]
 
 
+def test_every_urlopen_call_has_a_timeout():
+    """C5 #72 (PR #1229): an unbounded urlopen can hang the poller for the job's life."""
+    import ast
+    tree = ast.parse(_PATH.read_text())
+    bare = [n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "urlopen"
+            and not any(k.arg == "timeout" for k in n.keywords) and len(n.args) < 3]
+    assert bare == [], f"urlopen without timeout at lines {bare}"
+
+
 # ── stale re-run artifacts (k125, C7) ────────────────────────────────────
 
 
