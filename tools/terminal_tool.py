@@ -294,7 +294,7 @@ def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
 
 # Cache for disk usage warning to avoid full rglob scan on every call.
 # The check is advisory-only — staleness for up to 5 minutes is acceptable.
-_disk_usage_cache: dict = {"timestamp": 0.0, "result": False}
+_disk_usage_cache: dict = {"timestamp": float("-inf"), "result": False}  # monotonic: -inf, not 0.0
 _DISK_USAGE_CACHE_TTL = 300.0  # seconds
 
 

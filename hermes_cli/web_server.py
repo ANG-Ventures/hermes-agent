@@ -3617,7 +3617,7 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
 # remembers which collector produced the entry: tests monkeypatch
 # _collect_profile_gateway_topology per case, and the identity check keeps
 # them hermetic without needing a reset hook (a swapped collector is a miss).
-_TOPOLOGY_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None, "fn": None}
+_TOPOLOGY_CACHE: Dict[str, Any] = {"ts": float("-inf"), "data": None, "fn": None}
 _TOPOLOGY_CACHE_LOCK = threading.Lock()
 _TOPOLOGY_CACHE_TTL = 10.0
 

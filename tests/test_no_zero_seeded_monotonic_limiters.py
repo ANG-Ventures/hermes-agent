@@ -135,6 +135,7 @@ class _Scope:
         self.nonlocals: set[str] = set()
         self.bindings: dict[str, list[ast.expr | None]] = {}
         self.attrs: dict[str, list[ast.expr | None]] = {}  # ClassDef only
+        self.item_stores: list[tuple[str, object, ast.expr]] = []
 
     def class_attrs(self) -> dict[str, list[ast.expr | None]]:
         """Attribute seeds of the nearest enclosing class ({} if none)."""
@@ -226,6 +227,25 @@ def _self_attr(node: ast.expr) -> str | None:
     return None
 
 
+def _const_key(node: ast.Subscript) -> object:
+    key = node.slice
+    return key.value if isinstance(key, ast.Constant) else _NO_KEY
+
+
+_NO_KEY = object()
+
+
+def _key_seeds(values: list[ast.expr | None], key: object) -> list[ast.expr | None]:
+    """Values stored under ``key`` by dict literals in ``values``."""
+    out: list[ast.expr | None] = []
+    for v in values:
+        if isinstance(v, ast.Dict):
+            for k, item in zip(v.keys, v.values):
+                if isinstance(k, ast.Constant) and k.value == key:
+                    out.append(item)
+    return out
+
+
 def _assign_pairs(child: ast.AST):
     if isinstance(child, ast.Assign):
         for target in child.targets:
@@ -264,6 +284,15 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
                 for target, value in _assign_pairs(child):
                     if isinstance(target, ast.Name):
                         scope.bindings.setdefault(target.id, []).append(value)
+                    elif (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and _const_key(target) is not _NO_KEY
+                        and value is not None
+                    ):
+                        # ``cache["ts"] = 0.0`` seeds key "ts" of ``cache``
+                        # (resolved to its owning scope below, like a load).
+                        scope.item_stores.append((target.value.id, _const_key(target), value))
             if isinstance(child, _SCOPE_NODES):
                 visit(child, scope)
 
@@ -289,6 +318,12 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
                 target = scope.resolve(name)
                 if target is not None:
                     target.bindings.setdefault(name, []).extend(values)
+    for scope in scopes:
+        for name, key, value in scope.item_stores:
+            owner = scope.resolve(name) or scope
+            owner.bindings.setdefault(name, []).append(
+                ast.Dict(keys=[ast.Constant(key)], values=[value])
+            )
     return scopes
 
 
@@ -310,9 +345,15 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
                 continue
             right = node.right
             right_attr = _self_attr(right)
+            right_item = (
+                isinstance(right, ast.Subscript)
+                and _const_key(right) is not _NO_KEY
+                and (isinstance(right.value, ast.Name) or _self_attr(right.value) is not None)
+            )
             if (
                 not isinstance(right, ast.Name)
                 and right_attr is None
+                and not right_item
                 and not _is_zero_default(right)
             ):
                 continue
@@ -332,6 +373,18 @@ def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> li
             else:
                 left_is_mono = _is_monotonic_call(left)
             if not left_is_mono:
+                continue
+            if right_item:
+                # ``now - cache["ts"]`` where ``cache = {"ts": 0.0, ...}`` or
+                # ``cache["ts"] = 0.0`` (also ``self.cache[...]``).
+                base = right.value
+                if isinstance(base, ast.Name):
+                    owner = scope.resolve(base.id)
+                    values = owner.bindings.get(base.id, []) if owner else []
+                else:
+                    values = scope.class_attrs().get(_self_attr(base), [])
+                if any(_is_zero_default(v) for v in _key_seeds(values, _const_key(right))):
+                    hits.append(f"{filename}:{node.lineno}: {ast.unparse(right)}")
                 continue
             if right_attr is not None:
                 if any(_is_zero_default(v) for v in scope.class_attrs().get(right_attr, [])):
@@ -508,6 +561,31 @@ def heartbeat_current_worker_from_env(progress_at=None):
             "    elif now - start >= 1:  # zero-seed-ok: guarded sentinel\n        pass\n",
             [],
             id="pragma-guarded-sentinel",
+        ),
+        pytest.param(
+            "import time\n_cache = {'timestamp': 0.0, 'result': False}\n"
+            "def f():\n    now = time.monotonic()\n"
+            "    if now - _cache['timestamp'] < 300:\n        return _cache['result']\n",
+            ["_cache['timestamp']"],
+            id="dict-literal-key-seed",
+        ),
+        pytest.param(
+            "import time\n_cache = {}\n_cache['ts'] = 0\n"
+            "def f():\n    return time.monotonic() - _cache['ts']\n",
+            ["_cache['ts']"],
+            id="subscript-store-seed",
+        ),
+        pytest.param(
+            "import time\nclass C:\n    def __init__(self):\n        self.c = {'ts': 0.0}\n"
+            "    def f(self):\n        return time.monotonic() - self.c['ts']\n",
+            ["self.c['ts']"],
+            id="self-dict-literal-key-seed",
+        ),
+        pytest.param(
+            "import time\n_cache = {'timestamp': float('-inf'), 'n': 0}\n"
+            "def f():\n    return time.monotonic() - _cache['timestamp']\n",
+            [],
+            id="dict-literal-inf-and-other-key-zero-is-safe",
         ),
         pytest.param(
             "import time\ndef f(started):\n    last = 0\n"
