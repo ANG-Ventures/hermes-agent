@@ -4214,8 +4214,14 @@ class SessionStore:
         last_prompt_tokens: int = None,
         served_identity: Optional[Dict[str, Any]] = None,
         touch_activity: bool = True,
+        expected_session_id: Optional[str] = None,
     ) -> None:
         """Update lightweight session metadata after an interaction.
+
+        ``expected_session_id`` makes the write conditional: when the entry no
+        longer points at that session (a reset/rotation happened while the
+        writer's turn was running) nothing is written, so a late result can't
+        land its token count on a different conversation.
 
         ``served_identity`` (identity-only ``{"provider", "model"}``) records the
         route this session actually served the turn on, for the re-init recovery
@@ -4231,6 +4237,8 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
+                return
+            if expected_session_id is not None and entry.session_id != expected_session_id:
                 return
             if touch_activity:
                 entry.updated_at = _now()
