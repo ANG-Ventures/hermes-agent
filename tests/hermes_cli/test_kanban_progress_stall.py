@@ -14,11 +14,13 @@ startup CPU). Real-probe integration tests rotate the fault: fresh idle child,
 once-busy-now-blocked child, genuinely busy child.
 """
 import json
+import os
 import socket
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import psutil
 import pytest
@@ -383,16 +385,58 @@ def test_worker_bridge_stamps_progress_and_wait_tickers_do_not(board, monkeypatc
     monkeypatch.setattr(kanban_tools, "inject_new_comments_from_env", lambda agent: None)
     agent = object.__new__(run_agent.AIAgent)
     agent._last_progress_ts = 1000.0
+    # Pin a freshly-booted-host clock (Linux monotonic == uptime). A Blacksmith
+    # microVM reaches this test ~30-60 s after boot; seeding the limiter with 0.0
+    # then read as "attempted just now" and the write was skipped (None != 1000,
+    # merge_group runs 36522015097 / 04:42 on 2026-09-29).
+    real_monotonic = time.monotonic
+    boot = real_monotonic() - 5.0  # still advances, so deadline loops keep working
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() - boot)
 
-    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", 0.0)
+    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", float("-inf"))
     agent._emit_wait_notice("⏳ waiting on model — 60s with no response yet")
     assert agent._last_progress_ts == 1000.0
-    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", 0.0)
+    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", float("-inf"))
     agent._touch_activity("waiting for non-streaming API response", progress=False)
     assert agent._last_progress_ts == 1000.0
     assert kb._run_progress_at(board, tid, task.current_run_id) == 1000
 
-    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", 0.0)
+    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", float("-inf"))
     agent._touch_activity("tool completed: terminal (1.0s)")
     assert agent._last_progress_ts > 1000.0
     assert kb._run_progress_at(board, tid, task.current_run_id) == int(agent._last_progress_ts)
+
+
+def test_first_auto_heartbeat_is_not_dropped_on_a_freshly_booted_host(tmp_path):
+    """The limiter's MODULE DEFAULT must not swallow the first write when
+    time.monotonic() (uptime on Linux) is still below the 60 s interval.
+
+    Runs in a fresh interpreter so the real import-time default is exercised,
+    not a value some earlier test left behind.
+    """
+    code = (
+        "import os, time\n"
+        "_real = time.monotonic; _boot = _real() - 5.0\n"
+        "time.monotonic = lambda: _real() - _boot\n"
+        "os.environ['HERMES_KANBAN_TASK'] = 't_fresh'\n"
+        "from tools import kanban_tools as kt\n"
+        "calls = []\n"
+        "def _connect():\n"
+        "    calls.append('connect')\n"
+        "    raise RuntimeError('stop after the limiter')\n"
+        "kt._connect = _connect\n"
+        "kt.heartbeat_current_worker_from_env(progress_at=1000.0)\n"
+        "print('CALLS', len(calls))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "HERMES_KANBAN_TASK"}
+    env["HERMES_HOME"] = str(tmp_path / ".hermes")
+    repo = Path(__file__).resolve().parents[2]
+    out = subprocess.run(
+        [sys.executable, "-c", code], cwd=repo, env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert "CALLS 1" in out.stdout, (
+        "first auto-heartbeat was rate-limited away on a fresh-boot clock:\n"
+        + out.stdout[-500:]
+    )

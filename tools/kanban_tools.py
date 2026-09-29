@@ -327,7 +327,10 @@ def _goal_mode_handoff_rejection(task, evidence: str, *, conn=None, task_id=None
 #     explicit tool which carries a model-supplied note.
 
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
-_auto_heartbeat_last_attempt: float = 0.0
+# -inf, not 0.0: the limiter compares against time.monotonic(), whose origin is
+# host boot on Linux. On a freshly booted host/CI microVM (uptime < interval) a
+# 0.0 seed reads as "attempted just now" and silently drops the first write.
+_auto_heartbeat_last_attempt: float = float("-inf")
 
 
 def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bool:
@@ -398,7 +401,7 @@ def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bo
 # dance (or a restart). Rate-limited on its own (tighter than the 60s heartbeat
 # so notes land within a few seconds), watermarked per task id.
 _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
-_comment_poll_last_attempt: float = 0.0
+_comment_poll_last_attempt: float = float("-inf")  # see _auto_heartbeat_last_attempt
 # task_id -> highest comment id already seen (seeded on first poll so history
 # already present in build_worker_context isn't re-injected).
 _comment_watermark: dict[str, int] = {}

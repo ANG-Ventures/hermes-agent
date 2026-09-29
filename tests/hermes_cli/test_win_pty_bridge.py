@@ -102,13 +102,19 @@ class TestWinPtyBridgeSpawn:
 class TestWinPtyBridgeIO:
 
     def test_write_sends_to_child_stdin(self):
-        # python -c reads stdin, echoes a marker, exits.  More reliable than
-        # ``cat`` (not on Windows) and doesn't depend on a particular shell.
+        # python -c reads stdin, echoes a marker, then BLOCKS on a second line
+        # (close() terminates it).  More reliable than ``cat`` (not on
+        # Windows) and doesn't depend on a particular shell.  It must not exit
+        # right after writing: once the child is gone pywinpty's read() raises
+        # EOFError before ConPTY has drained the last write, so _read_until
+        # stopped on EOF with the input echo but no 'GOT:' (merge_group run
+        # 36549947480, 2026-09-29, Windows-only lane).
         script = (
             "import sys; "
             "line = sys.stdin.readline().strip(); "
             "sys.stdout.write('GOT:' + line + '\\n'); "
-            "sys.stdout.flush()"
+            "sys.stdout.flush(); "
+            "sys.stdin.readline()"
         )
         bridge = WinPtyBridge.spawn([sys.executable, "-c", script])
         try:
