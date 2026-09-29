@@ -226,7 +226,10 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
+    judged: list = []
+
     def mock_judge_goal(goal, last_response, **kwargs):
+        judged.append(last_response)
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         return "continue", "missing verification evidence", False, None, False
@@ -236,6 +239,8 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Attempt to complete should be rejected
     out = kt._handle_complete({"summary": "I did some stuff but not X"})
+    # FleetReview #124: the judge must be shown the handoff it is judging.
+    assert len(judged) == 1 and "I did some stuff but not X" in judged[0]
     d = json.loads(out)
     assert "error" in d
     assert "Goal completion rejected by judge" in d["error"]

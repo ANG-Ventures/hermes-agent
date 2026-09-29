@@ -1,5 +1,10 @@
 """k122: a completed Arm-B staging write survives a crash/retry across midnight."""
+import os
+import stat
 from pathlib import Path
+
+import pytest
+
 from plugins.memory.mem0.capture_router import CaptureRouter
 
 def test_retried_route_preserves_staged_facts_across_dates(tmp_path):
@@ -137,3 +142,15 @@ def test_staging_write_publishes_full_content(tmp_path):
     CaptureRouter._default_write(str(target), "full content\n")
     assert target.read_text(encoding="utf-8") == "full content\n"
     assert [p.name for p in target.parent.iterdir()] == ["turn-4.md"]
+
+
+@pytest.mark.parametrize("umask", [0o077, 0o022])
+def test_staging_write_mode_honours_umask(tmp_path, umask):
+    # the staged file must get exactly the mode open()+umask would give, never a fixed widened mode
+    target = tmp_path / "staged" / "d" / f"turn-{umask:o}.md"
+    old = os.umask(umask)
+    try:
+        CaptureRouter._default_write(str(target), "x\n")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o666 & ~umask

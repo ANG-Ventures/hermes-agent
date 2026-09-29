@@ -719,6 +719,9 @@ def _guard_stuck_state_path() -> Path:
     return get_hermes_home() / "state" / "kanban-guard-stuck-pages.json"
 
 
+_GUARD_STUCK_PAGE_BUDGET_S = 30.0
+
+
 class _GuardStuckNotifier:
     """Page once per guard EPISODE, remind every 6h; retry failed sends.
 
@@ -767,6 +770,11 @@ class _GuardStuckNotifier:
             logger.warning("kanban dispatcher: guard-stuck page ledger not saved", exc_info=True)
 
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
+        """Page due episodes. Sends run serially (each up to 30 s) inside the
+        dispatcher tick, so one call spends at most ``_GUARD_STUCK_PAGE_BUDGET_S``
+        on them (FleetReview #79); an unsent page is not recorded and goes
+        out on a later tick."""
+        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
         if observed_boards is None:
@@ -785,6 +793,8 @@ class _GuardStuckNotifier:
             last = self._sent.get(key)
             if last is not None and now - last < self._remind:
                 continue
+            if time.monotonic() >= deadline:
+                break
             if send(board, item):
                 self._sent[key] = now
                 delivered += 1
@@ -2780,6 +2790,18 @@ class GatewayKanbanWatchersMixin:
                 _review_on = _kb.review_dispatch_enabled()
                 for b in _kb.enumerating_each(boards):
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    # A board quarantined as corrupt (same fingerprint, inside
+                    # its retry window) is not opened by the demand pre-scan
+                    # either: the dispatch tick below skips it, so a probe
+                    # here would only re-hit the corrupt file every tick.
+                    _q = disabled_corrupt_boards.get(slug)
+                    if (
+                        _q is not None
+                        and _q[0] == _board_db_fingerprint(slug)
+                        and time.monotonic() - _q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                    ):
+                        _demand.append((slug, 0))
+                        continue
                     _dconn = None
                     try:
                         _dconn = _kb.connect(board=slug)

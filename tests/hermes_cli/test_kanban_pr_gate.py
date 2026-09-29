@@ -2056,6 +2056,32 @@ def test_merged_but_not_deployed_holds_and_comments_once(kanban_home: Path) -> N
         assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_awaiting_deploy_names_what_triggered_the_gate(kanban_home: Path) -> None:
+    """C5 #47: every mapped ref stays gated (fail-safe), but the refusal says why."""
+    query = _stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)})
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            reason="needs ANG-Ventures/hermes-home#605, see /Users/ace/.hermes/x.md",
+        )
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=query, deploy_fn=_DeployOracle(),
+        )
+        assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        comment = _comments(conn, tid)[0]
+    assert (
+        "Deploy-gated because the block reason names deploy tree "
+        "/Users/ace/.hermes;" in comment
+    )
+    assert prg._deploy_trigger("merge first, then deploy", None) == (
+        "the block reason states a deploy gate"
+    )
+    assert prg._deploy_trigger("merge o/r#7", "lives in ~/.hermes") == (
+        "the card body names deploy tree ~/.hermes"
+    )
+    assert prg._deploy_trigger("merge o/r#7", None) is None
+
+
 def test_runtime_tree_is_checked_against_a_real_git_checkout(
     kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2442,3 +2468,53 @@ def test_t213f5d63_replay_through_dispatch_spawns_nothing(
         # "awaiting deploy" comment. Never more than one; never unblocked.
         assert len(held) <= 1, _comments(conn, tid)
     assert gh_calls  # the gate really evaluated the merged PR
+
+
+def test_prefetch_deploys_stops_at_its_wall_budget(monkeypatch):
+    """FleetReview #32: _prefetch_deploys ran deploy_fn sequentially for every
+    (tree, sha) with no wall budget. Past the budget the rest are skipped
+    (missing = unverified: the locked pass holds the card)."""
+    import time as _time
+
+    from hermes_cli import kanban_pr_gate as g
+
+    monkeypatch.setattr(g, "_PREFETCH_DEPLOY_BUDGET_S", 0.05, raising=False)
+    calls = []
+
+    def slow_deploy(tree, sha):
+        calls.append(sha)
+        _time.sleep(0.1)
+        return True
+
+    checks = [(g.PrRef("o/r", n), "/tree") for n in range(5)]
+    payloads = {("o/r", n): {"state": "MERGED", "mergeCommit": {"oid": f"sha{n}"}}
+                for n in range(5)}
+    out = g._prefetch_deploys(checks, payloads, slow_deploy)
+    assert calls == ["sha0"]
+    assert out == {("/tree", "sha0"): True}
+
+
+def test_prefetch_deploys_starved_refs_go_first_next_tick(monkeypatch):
+    """FleetReview on #1416: with the budget spent by the first probe on every
+    tick, later refs were never probed. Pairs a tick could not reach are
+    probed first on the next tick, so every ref is eventually answered."""
+    import time as _time
+
+    from hermes_cli import kanban_pr_gate as g
+
+    monkeypatch.setattr(g, "_PREFETCH_DEPLOY_BUDGET_S", 0.05, raising=False)
+    calls = []
+
+    def slow_deploy(tree, sha):
+        calls.append(sha)
+        _time.sleep(0.1)
+        return True
+
+    checks = [(g.PrRef("o/r", n), "/tree") for n in range(3)]
+    payloads = {("o/r", n): {"state": "MERGED", "mergeCommit": {"oid": f"sha{n}"}}
+                for n in range(3)}
+    answered = {}
+    for _tick in range(3):
+        answered.update(g._prefetch_deploys(checks, payloads, slow_deploy))
+    assert calls == ["sha0", "sha1", "sha2"]
+    assert set(answered) == {("/tree", f"sha{n}") for n in range(3)}

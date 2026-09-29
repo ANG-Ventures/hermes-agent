@@ -478,3 +478,27 @@ def test_guard_stuck_notifier_pages_each_guard_reason_of_one_card():
     assert notifier.observe([("default", alive)], send) == 1
     assert notifier.observe([("default", active_pr)], send) == 1
     assert sent == ["prior_worker_still_alive", "active_pr"]
+
+
+def test_guard_stuck_pages_spend_a_bounded_time_per_tick(monkeypatch):
+    """FleetReview #79: each page is a subprocess.run(timeout=30), run serially
+    inside the dispatcher tick with no overall bound. Past the budget the rest
+    wait (unrecorded) for the next tick."""
+    import time as _time
+
+    from gateway import kanban_watchers as kw
+
+    monkeypatch.setattr(kw, "_GUARD_STUCK_PAGE_BUDGET_S", 0.05, raising=False)
+    items = [{"task_id": f"t_{i}", "clear_verb": "x"} for i in range(5)]
+    sent = []
+
+    def slow_send(board, row):
+        sent.append(row["task_id"])
+        _time.sleep(0.1)
+        return True
+
+    notifier = kw._GuardStuckNotifier()
+    assert notifier.observe([("default", it) for it in items], slow_send) == 1
+    assert sent == ["t_0"]
+    assert notifier.observe([("default", it) for it in items], slow_send) == 1
+    assert sent == ["t_0", "t_1"]  # the unsent ones go out on later ticks

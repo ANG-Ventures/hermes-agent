@@ -1635,9 +1635,15 @@ def test_gemini_31_pro_preview_alias_shares_tiered_pricing():
     assert result.amount_usd == Decimal("1.18")
 
 
-def test_gemini_38_flash_prices_at_google_list_rate():
+def test_gemini_38_flash_prices_at_google_list_rate(monkeypatch):
     """gemini-3.8-flash has a snapshot row (t_6ea3da6f): $0.75 in / $3.75 out /
-    $0.075 cache read per 1M, Google pricing page 2026-09-28."""
+    $0.075 cache read per 1M, Google pricing page 2026-09-28 (launch rates,
+    so the clock is pinned inside the launch window)."""
+    from datetime import datetime, timezone
+
+    import agent.usage_pricing as up
+
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2026, 9, 28, tzinfo=timezone.utc))
     result = estimate_usage_cost(
         "gemini-3.8-flash",
         CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
@@ -1645,6 +1651,49 @@ def test_gemini_38_flash_prices_at_google_list_rate():
         provider="google",
     )
     assert result.amount_usd == Decimal("4.575")
+
+
+def test_gemini_38_flash_switches_to_2027_rates_on_jan_1(monkeypatch):
+    """Google lists $1.50 / $7.50 / $0.15 from 2027-01-01 (t_08b04181): the
+    launch row must stop pricing at launch rates then, for the base id and
+    every effort-suffixed / bridge id that resolves to it."""
+    from datetime import datetime, timezone
+
+    import agent.usage_pricing as up
+
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000)
+    cases = [("gemini-3.8-flash", "google")] + [
+        (f"gemini-3.8-flash-{s}", p)
+        for s in ("low", "medium", "high")
+        for p in ("google", "gemini-bridge")
+    ]
+    for when, want in (
+        (datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc), Decimal("4.575")),
+        (datetime(2027, 1, 1, tzinfo=timezone.utc), Decimal("9.15")),
+        (datetime(2027, 6, 1, tzinfo=timezone.utc), Decimal("9.15")),
+    ):
+        monkeypatch.setattr(up, "_UTC_NOW", lambda when=when: when)
+        for model, provider in cases:
+            got = estimate_usage_cost(model, usage, provider=provider)
+            assert got.amount_usd == want, (when, model, provider, got.amount_usd)
+
+
+def test_scheduled_rate_changes_are_well_formed():
+    """Every announced rate change names both a tz-aware date and the successor
+    rates, and each successor is itself fully priced."""
+    from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
+
+    for key, entry in _OFFICIAL_DOCS_PRICING.items():
+        while entry.superseded_at is not None or entry.superseded_by is not None:
+            assert entry.superseded_at is not None and entry.superseded_by is not None, key
+            assert entry.superseded_at.tzinfo is not None, key
+            nxt = entry.superseded_by
+            assert nxt.input_cost_per_million is not None, key
+            assert nxt.output_cost_per_million is not None, key
+            if nxt.superseded_at is not None:
+                assert nxt.superseded_at > entry.superseded_at, key
+            entry = nxt
 
 
 def test_gemini_bridge_effort_suffix_prices_as_base_model():
@@ -1955,3 +2004,24 @@ def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
     result = estimate_usage_cost("moonshotai/kimi-k3", usage, provider="openrouter")
     # 3.00 + 15.00 + 0.30
     assert result.amount_usd is not None and float(result.amount_usd) == 18.30  # type: ignore[arg-type]
+
+
+# ── Anthropic Claude Sonnet 5.5 (launched 2026-09-28) ────────────────────────
+# Behaviour contracts from the announcement: 1M context, $2/$10 in/out, $0.20
+# cache read. The older claude-sonnet-5 row must keep pricing (ADD-KEEP).
+
+def test_sonnet_5_5_has_1m_context():
+    from agent.model_metadata import get_model_context_length
+
+    assert get_model_context_length("claude-sonnet-5-5") == 1_000_000
+
+
+def test_sonnet_5_5_prices_at_launch_rates_and_sonnet_5_still_prices():
+    usage = CanonicalUsage(
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000
+    )
+    new = estimate_usage_cost("claude-sonnet-5-5", usage, provider="anthropic")
+    # 2.00 + 10.00 + 0.20
+    assert new.amount_usd is not None and float(new.amount_usd) == 12.20  # type: ignore[arg-type]
+    old = estimate_usage_cost("claude-sonnet-5", usage, provider="anthropic")
+    assert old.amount_usd is not None and old.amount_usd > 0

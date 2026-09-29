@@ -4289,7 +4289,8 @@ class GatewaySlashCommandsMixin:
 
         return t(
             "gateway.undo.removed",
-            turns=n,
+            # What the core rewound (clamped to the history), not what was asked.
+            turns=result.get("half_turns", n),
             count=len(result.get("rewound_ids") or []),
         ) + self._undo_tail_suffix(session_entry.session_id)
 
@@ -4369,7 +4370,9 @@ class GatewaySlashCommandsMixin:
 
         base = t(
             "gateway.redo.restored",
-            ops=n,
+            # What the core redid (clamped to the undo-stack depth), not what
+            # was asked; fall back to n only for a core without the key.
+            ops=result.get("ops_redone", n),
             count=reactivated,
         )
         # If only SOME ops were redone (a transcript rewrite or a mid-loop

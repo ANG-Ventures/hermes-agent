@@ -6908,13 +6908,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
         tree = self._client.tree
 
+        # Every hand-registered native below must expose the options its
+        # gateway handler parses: a native registration shadows the
+        # COMMAND_REGISTRY auto-registration (which would add an ``args``
+        # field), so a missing option silently drops the user's argument.
         @tree.command(name="new", description="Start a new conversation")
-        async def slash_new(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/reset", "New conversation started~")
+        @discord.app_commands.describe(name="Optional title for the new session")
+        async def slash_new(interaction: discord.Interaction, name: str = ""):
+            await self._run_simple_slash(interaction, f"/reset {name}".strip(), "New conversation started~")
 
         @tree.command(name="reset", description="Reset your Hermes session")
-        async def slash_reset(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/reset", "Session reset~")
+        @discord.app_commands.describe(name="Optional title for the new session")
+        async def slash_reset(interaction: discord.Interaction, name: str = ""):
+            await self._run_simple_slash(interaction, f"/reset {name}".strip(), "Session reset~")
 
         @tree.command(name="model", description="Show or change the model")
         @discord.app_commands.describe(name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current.")
@@ -6955,8 +6961,12 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/retry", "Retrying~")
 
         @tree.command(name="undo", description="Remove the last exchange")
-        async def slash_undo(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/undo")
+        @discord.app_commands.describe(count="Half-turns to undo (default 1)")
+        async def slash_undo(
+            interaction: discord.Interaction,
+            count: discord.app_commands.Range[int, 1, 50] = 1,
+        ):
+            await self._run_simple_slash(interaction, f"/undo {count}")
 
         @tree.command(name="status", description="Show Hermes session status")
         async def slash_status(interaction: discord.Interaction):
@@ -6981,8 +6991,9 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, f"/plan {task}".strip())
 
         @tree.command(name="compress", description="Compress conversation context")
-        async def slash_compress(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/compress")
+        @discord.app_commands.describe(args="Optional: here [N] | focus topic | --preview | --dry-run")
+        async def slash_compress(interaction: discord.Interaction, args: str = ""):
+            await self._run_simple_slash(interaction, f"/compress {args}".strip())
 
         @tree.command(name="title", description="Set or show the session title")
         @discord.app_commands.describe(name="Session title. Leave empty to show current.")
@@ -6995,12 +7006,14 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, f"/resume {name}".strip())
 
         @tree.command(name="usage", description="Show token usage for this session")
-        async def slash_usage(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/usage")
+        @discord.app_commands.describe(args="Optional: reset [--force]")
+        async def slash_usage(interaction: discord.Interaction, args: str = ""):
+            await self._run_simple_slash(interaction, f"/usage {args}".strip())
 
         @tree.command(name="help", description="Show available commands")
-        async def slash_help(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/help")
+        @discord.app_commands.describe(filter="Optional: skills, or a filter term")
+        async def slash_help(interaction: discord.Interaction, filter: str = ""):
+            await self._run_simple_slash(interaction, f"/help {filter}".strip())
 
         @tree.command(name="insights", description="Show usage insights and analytics")
         @discord.app_commands.describe(days="Number of days to analyze (default: 7)")
