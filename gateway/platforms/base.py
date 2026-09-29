@@ -365,6 +365,80 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     return notify_metadata
 
 
+# Interim COMMENTARY (between-tool-call narration) is a narrower kind of
+# ``_interim_send``: heartbeats and approval fallbacks are interim too, but
+# only commentary may be shortened by an adapter, because the full text is
+# already durable in the session transcript (t_784a01bd).  Gateway-internal;
+# adapters that forward metadata strip it before the wire.
+INTERIM_KIND_KEY = "_interim_kind"
+INTERIM_KIND_COMMENTARY = "commentary"
+
+
+def mark_commentary_send(metadata: dict | None) -> dict:
+    """Clone metadata and mark the send as interim commentary."""
+    merged = dict(metadata) if metadata else {}
+    merged["_interim_send"] = True
+    merged[INTERIM_KIND_KEY] = INTERIM_KIND_COMMENTARY
+    return merged
+
+
+def is_commentary_send(metadata: dict | None) -> bool:
+    """True when ``metadata`` marks a send as interim commentary."""
+    return bool(metadata) and metadata.get(INTERIM_KIND_KEY) == INTERIM_KIND_COMMENTARY
+
+
+def _chunk_indicator(index: int, total: int) -> str:
+    """The ``(i/total)`` suffix ``truncate_message`` appends to split chunks."""
+    return f" ({index + 1}/{total})"
+
+
+def strip_chunk_indicators(chunks: list[str]) -> "tuple[list[str], bool]":
+    """Inverse of ``truncate_message``'s chunk tagging.
+
+    Returns ``(bodies, tagged)``.  ``tagged`` is True only when every chunk
+    carries exactly the indicator ``truncate_message`` would have given it;
+    otherwise the chunks are returned unchanged.
+    """
+    total = len(chunks)
+    if total < 2:
+        return list(chunks), False
+    tags = [_chunk_indicator(i, total) for i in range(total)]
+    if not all(c.endswith(t) for c, t in zip(chunks, tags)):
+        return list(chunks), False
+    return [c[: -len(t)] for c, t in zip(chunks, tags)], True
+
+
+def add_chunk_indicators(bodies: list[str]) -> list[str]:
+    """Tag ``bodies`` with ``(i/total)`` the way ``truncate_message`` does."""
+    total = len(bodies)
+    if total < 2:
+        return list(bodies)
+    return [f"{b}{_chunk_indicator(i, total)}" for i, b in enumerate(bodies)]
+
+
+def keep_head_and_tail_chunks(
+    chunks: list[str], keep: int
+) -> "tuple[list[str], list[str]]":
+    """Select ``keep`` chunks of an over-long split reply: the first chunk
+    (context) and the last ``keep - 1`` (the conclusion is at the end).
+
+    Returns ``(kept, elided)``.  When the input carries ``truncate_message``
+    indicators, ``kept`` is renumbered ``(1/keep)..(keep/keep)`` so the
+    delivered set never reads ``(1/12) (7/12) (12/12)``; ``elided`` is the
+    untagged middle.  Callers place their elision notice between
+    ``kept[0]`` and ``kept[1:]`` (t_784a01bd).
+    """
+    if keep < 2:
+        raise ValueError("keep must be >= 2 (head + at least one tail chunk)")
+    if len(chunks) <= keep:
+        return list(chunks), []
+    bodies, tagged = strip_chunk_indicators(chunks)
+    tail_start = len(bodies) - (keep - 1)
+    kept = [bodies[0], *bodies[tail_start:]]
+    elided = bodies[1:tail_start]
+    return (add_chunk_indicators(kept) if tagged else kept), elided
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
@@ -8456,9 +8530,6 @@ class BasePlatformAdapter(ABC):
 
         # Append chunk indicators when the response spans multiple messages
         if len(chunks) > 1:
-            total = len(chunks)
-            chunks = [
-                f"{chunk} ({i + 1}/{total})" for i, chunk in enumerate(chunks)
-            ]
+            chunks = add_chunk_indicators(chunks)
 
         return chunks

@@ -213,6 +213,9 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
+    is_commentary_send,
+    keep_head_and_tail_chunks,
+    strip_chunk_indicators,
     utf16_len,
     validate_inbound_media_size,
 )
@@ -4204,23 +4207,42 @@ class DiscordAdapter(BasePlatformAdapter):
 
         A degenerate turn can produce tens of thousands of characters; the
         #86581 incident delivered 60,698 chars as 31 back-to-back Discord
-        messages.  When ``chunks`` exceeds ``MAX_SPLIT_MESSAGES``, keep the
-        first ``N-1`` chunks and replace the rest with a short notice so the
-        user sees a clear signal instead of a flood.  The full response
-        remains available in the gateway session history / logs.
+        messages.  When ``chunks`` exceeds ``MAX_SPLIT_MESSAGES``, deliver
+        the first chunk (context), a short elision notice, and the LAST
+        ``N-2`` chunks.  A real reply's conclusion is at its end, so the
+        cap must never drop the tail (t_784a01bd: a head-preserving cap
+        delivered 7 chunks of narration and discarded the answer).  The
+        full response remains available in the gateway session history.
         """
         if len(chunks) <= self.MAX_SPLIT_MESSAGES:
             return chunks
-        kept = chunks[: self.MAX_SPLIT_MESSAGES - 1]
-        dropped_chars = sum(len(c) for c in chunks[self.MAX_SPLIT_MESSAGES - 1 :])
+        kept, elided = keep_head_and_tail_chunks(chunks, self.MAX_SPLIT_MESSAGES - 1)
+        elided_chars = sum(len(c) for c in elided)
         notice = (
-            f"\n\n⚠️ **Response truncated** — this reply exceeded the "
-            f"delivery limit ({self.MAX_SPLIT_MESSAGES} messages). "
-            f"{dropped_chars} characters were not delivered; the full "
-            f"response is in the session logs."
+            f"⚠️ **Response truncated** — {len(elided)} messages "
+            f"({elided_chars} characters) from the middle of this reply were "
+            f"not delivered (delivery limit: {self.MAX_SPLIT_MESSAGES} "
+            f"messages). The start and the end are shown; the full response "
+            f"is in the session logs."
         )
-        kept.append(notice)
-        return kept
+        return [kept[0], notice, *kept[1:]]
+
+    _COMMENTARY_CONTINUED_MARKER = "\n\n… (continued in session log)"
+
+    def _commentary_chunks(self, formatted: str) -> List[str]:
+        """Interim commentary is delivered as ONE message (t_784a01bd).
+
+        Between-tool-call narration is already durable in the transcript; a
+        long block must not flood the channel or trip the split cap.  Keep
+        the first chunk's worth of text and mark the rest as elided.
+        """
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        if len(chunks) <= 1:
+            return chunks
+        marker = self._COMMENTARY_CONTINUED_MARKER
+        first = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH - len(marker))
+        bodies, _tagged = strip_chunk_indicators(first)
+        return [bodies[0] + marker]
 
     async def send(
         self,
@@ -4316,9 +4338,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self._cap_split_chunks(
-                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-            )
+            if is_commentary_send(metadata):
+                chunks = self._commentary_chunks(formatted)
+            else:
+                chunks = self._cap_split_chunks(
+                    self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                )
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.

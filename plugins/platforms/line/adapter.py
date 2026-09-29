@@ -121,6 +121,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    keep_head_and_tail_chunks,
 )
 from gateway.config import Platform
 
@@ -263,9 +264,10 @@ def strip_markdown_preserving_urls(text: str) -> str:
 def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[str]:
     """Split ``text`` into LINE-sized bubbles, preferring paragraph/line breaks.
 
-    Returns at most ``LINE_MAX_MESSAGES_PER_CALL`` chunks; longer text is
-    truncated with an ellipsis on the final chunk to keep the response
-    deliverable in a single Reply/Push call.
+    Returns at most ``LINE_MAX_MESSAGES_PER_CALL`` chunks.  Longer text keeps
+    its first bubble and its LAST ones — a reply's conclusion is at the end
+    (t_784a01bd) — with an omission marker on the first bubble, so the
+    response stays deliverable in a single Reply/Push call.
     """
     if not text:
         return []
@@ -274,10 +276,9 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
 
     chunks: List[str] = []
     remaining = text
-    while remaining and len(chunks) < LINE_MAX_MESSAGES_PER_CALL:
+    while remaining:
         if len(remaining) <= max_chars:
             chunks.append(remaining)
-            remaining = ""
             break
         # Try to break on the latest paragraph or newline within budget.
         cut = remaining.rfind("\n\n", 0, max_chars)
@@ -290,15 +291,10 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
         chunks.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip()
 
-    if remaining:
-        # Truncate gracefully — caller already burned its 5-bubble budget.
-        if chunks:
-            tail = chunks[-1]
-            if len(tail) > max_chars - 1:
-                tail = tail[: max_chars - 1]
-            chunks[-1] = tail.rstrip() + "…"
-        else:
-            chunks.append(remaining[: max_chars - 1] + "…")
+    if len(chunks) > LINE_MAX_MESSAGES_PER_CALL:
+        chunks, elided = keep_head_and_tail_chunks(chunks, LINE_MAX_MESSAGES_PER_CALL)
+        marker = f"\n\n[… {len(elided)} part(s) omitted; the end follows]"
+        chunks[0] = chunks[0][: max(0, max_chars - len(marker))].rstrip() + marker
     return chunks
 
 

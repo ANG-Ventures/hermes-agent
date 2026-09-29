@@ -1821,6 +1821,7 @@ class RelayAdapter(BasePlatformAdapter):
         # Gateway-internal interim marker (see send()): strip before the
         # wire; an interim send through this door also skips interception.
         _interim = bool(_sfp_metadata.pop("_interim_send", False))
+        _sfp_metadata.pop("_interim_kind", None)  # t_784a01bd, gateway-internal
         # Finding #7 (live canary): the delivery resolver calls THIS method
         # directly (gateway/delivery.py), bypassing send() — an open native
         # stream must absorb the turn-final here too, or the stream is left
@@ -1984,6 +1985,7 @@ class RelayAdapter(BasePlatformAdapter):
         # plain-send duplicate (live finding, 2026-08-16 canary). The
         # marker is gateway-internal; strip before the wire.
         _interim = bool(send_metadata.pop("_interim_send", False))
+        send_metadata.pop("_interim_kind", None)  # t_784a01bd, gateway-internal
         # NS-658 seal-interception — checked BEFORE the explicit-platform
         # branch (finding #7, live canary): the delivery-resolver lane
         # (follow-up queue, media-accompanied finals, scheduled sends) routes

@@ -4131,6 +4131,42 @@ class TestSlashEphemeralAck:
         )
         assert total_text.count("A") == len(long_content)
 
+    @pytest.mark.asyncio
+    async def test_send_slash_ephemeral_over_post_cap_keeps_the_end(self, adapter):
+        """Over Slack's 5-POST response_url budget the reply keeps its first
+        and LAST parts; the elided middle is announced (t_784a01bd — the old
+        cap dropped the tail, where a reply's conclusion lives)."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        part = adapter.MAX_MESSAGE_LENGTH - 200
+        long_content = " ".join(
+            f"PART{i}-" + "b" * part for i in range(8)
+        ) + " FINAL-CONCLUSION-SENTINEL"
+        assert len(adapter.truncate_message(long_content, adapter.MAX_MESSAGE_LENGTH)) > 5
+
+        with patch(
+            "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
+        ):
+            result = await adapter._send_slash_ephemeral(
+                {"response_url": "https://hooks.slack.com/commands/long"},
+                long_content,
+            )
+
+        assert result.success is True
+        texts = [c[1]["json"]["text"] for c in mock_session.post.call_args_list]
+        assert len(texts) == 5
+        assert texts[0].startswith("PART0-")
+        assert "FINAL-CONCLUSION-SENTINEL" in texts[-1]
+        assert "truncated" in texts[0].lower()
+        assert "Reply truncated" not in texts[-1]
+
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_limits_error_body(self, adapter):
