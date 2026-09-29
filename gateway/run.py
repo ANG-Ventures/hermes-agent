@@ -40703,6 +40703,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Pin one coherent code snapshot: import every first-party module now,
+    # while the tree still matches what booted, so a later fast-forward of the
+    # checkout can't feed a function-scoped import a newer module than its
+    # already-cached dependencies (see gateway/boot_preload.py).  Worker thread
+    # so the loop stays responsive; best-effort, never aborts boot.
+    try:
+        from gateway.boot_preload import preload_first_party_modules
+        await asyncio.get_running_loop().run_in_executor(None, preload_first_party_modules)
+    except Exception as e:
+        logger.warning("Boot preload failed: %s", e)
+
     # Start the gateway
     try:
         success = await runner.start()
