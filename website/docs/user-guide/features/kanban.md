@@ -686,27 +686,27 @@ hermes kanban pins --stale-hours 24   # exits 1 if a card pin is older (daily li
 
 ### Cards worked by another coding harness (foreign lanes)
 
-A card can be worked by a coding harness other than Hermes. The assignee picks the harness: a thin Hermes shim profile claims the card like any worker, hands it to the harness in the card's worktree, then checks the result itself (it reruns the card's test command, reads the diff, and reads the served model from the harness's own log) and writes the board. The operator runbook is the fleet skill `kanban-foreign-lane`; this section is the short version.
+A card can be worked by a coding harness other than Hermes. The assignee picks the harness. A lane runner script hands the card to the harness in the card's worktree, then checks the result itself (it reruns the card's test command, reads the diff, and reads the served model from the harness's own log) and writes the board. On a profile that sets `foreign_lane.worker_command` the dispatcher runs that script directly, with no LLM in between; on a profile without it, a thin Hermes shim profile claims the card like any worker and calls the script. The operator runbook is the fleet skill `kanban-foreign-lane`; this section is the short version.
 
-| Assignee | Harness | Brain | State (2026-09-28, 19:10 PT) |
-|---|---|---|---|
-| `cc-worker` | Claude Code, the interactive TUI (`claude-code-tui`) | `cpr-cli` (a pool-picked Claude sub) | Live. The TUI has been the default since 08:25 PT (t_ee57a556). |
-| `codex-worker` | `codex exec` | `bpr` (Claude Haiku through the bridge) | End-to-end green on `bpr` (t_8371a38c, 16:49 PT). The board-verb deny hook now runs inside Codex (t_603b76f3), and Codex can commit in a card-owned checkout (t_3165f60c). |
-| `opencode-worker` | OpenCode | `cliproxy:gpt-6-astra` | Live (t_e2f3590d). |
-| `pi-worker` | Pi | `cliproxy:gpt-6-astra` | Live (t_a1c6bc3d). |
+| Assignee | Harness | Runner | Brain | State (2026-09-29, 03:50 PT) |
+|---|---|---|---|---|
+| `cc-worker` | Claude Code, the interactive TUI (`claude-code-tui`) | native `worker_command`, no shim | `cpr-cli` (a pool-picked Claude sub) | Live. The TUI has been the default since 08:25 PT on 09-28 (t_ee57a556); the native runner since 23:54 PT (t_ff056214). |
+| `codex-worker` | `codex exec` | native `worker_command`, no shim | `bpr` (Claude through the bridge) | End-to-end green on `bpr` (t_8371a38c). Native smoke card t_202cadb6 passed on Haiku. The board-verb deny hook runs inside Codex (t_603b76f3), and Codex can commit in a card-owned checkout (t_3165f60c). |
+| `opencode-worker` | OpenCode | LLM shim | `cliproxy:gpt-6-luna` | Live (t_e2f3590d). |
+| `pi-worker` | Pi | LLM shim | `cliproxy:gpt-6-luna` | Live (t_a1c6bc3d). |
 
-A foreign-lane card must name one test command in its body, and its workspace must be a git worktree on the card's branch. Otherwise the shim blocks it.
+A foreign-lane card must name one test command in its body, as a single line ``Test command: `<cmd>` ``, and its workspace must be a git worktree on the card's branch. Otherwise the card blocks at once, for example `native worker: card names no test command` or `lane exited rc=2 without reporting ... is not a git worktree` (both seen on live runs on 2026-09-29).
 
 **Model and effort.** `set-model` works on these cards the same way, with three differences:
 
-- One model and one effort per card. The shim and the harness both run what the card says. The effort reaches Claude Code as its own `--effort` flag. With no card effort the harness runs `medium`.
+- One model and one effort per card. The harness runs what the card says, and so does the shim on a profile that still has one. The effort reaches Claude Code as its own `--effort` flag. With no card effort the harness runs `medium`.
 - `max` and `xhigh` run only when an operator profile (`default`, `apollo` or `aegis`) set that effort on the card. The receipt names who, in `effort_unlocked_by`. From anywhere else the card blocks `effort_not_allowed`.
 - The runner checks the model against the harness's allowlist (`harness-models.yaml` in the skill) when the card starts, not when you run `set-model`. A typo blocks the card within seconds with `model_not_servable`. The Claude Code lists hold every Anthropic id that models.dev prices, and a test fails if models.dev adds one the list lacks (t_9a46fea5).
 - Each harness gets the effort its own way: Claude Code `--effort`, Codex `-c model_reasoning_effort=...`, and OpenCode or Pi on a `cliproxy:<model>` brain as the model suffix `<model>(<effort>)`. When a harness has no way to take it, the receipt says so in `brain_notes`.
-- The profile default is still Haiku 4.5, a test setting. The production model is ruled (`claude-opus-5-5`, effort medium, on `claude-bpr`) and switches in once the lanes are proven reliable (t_b9b19c02).
+- The profile default on `cc-worker` and `codex-worker` is `claude-sonnet-5-5`, a test setting (Ace, 00:20 PT on 2026-09-29). It replaced Haiku 4.5 because Haiku cost more per card on the Q14 matrix: 18 requests against 5, $0.187 against $0.097 median list-$, 99.5 s against 31.5 s (t_b9b19c02). Price per token is not cost per task. The production model is ruled (`claude-opus-5-5`, effort medium, on `claude-bpr`) and switches in once the lanes are proven reliable.
 
 ```bash
-hermes kanban set-model t_abcd claude-sonnet-5 --effort high     # harness and shim
+hermes kanban set-model t_abcd claude-sonnet-5 --effort high     # the harness (and the shim, if any)
 hermes kanban set-model t_abcd --provider claude-bpx-6 --model claude-haiku-4-5 \
     --pin-sub "benchmark on one sub"                              # one sub: brain cpx-cli:6
 ```
@@ -715,7 +715,19 @@ The run's metadata (`hermes kanban show <id> --json`, `runs[-1].metadata`) carri
 
 **Billing.** On a Claude subscription the interactive TUI draws about half the headless rate. The measured figures are 0.50x against `claude -p` (t_da5d8919), and 0.52x in production with the shim's own turns counted, 0.42x with them subtracted (t_b54c8715). The cron job `cc-worker-receipt-watch` checks every new receipt every 10 minutes. It pages #alerts if a cc-worker receipt leaves the interactive class, and, for codex-worker, opencode-worker and pi-worker, if the served model is missing or wrong, the shim's test run disagrees with the harness, or the leak scan found anything (t_a8f139e0). It prints nothing while all receipts are green. On a ChatGPT subscription the Codex TUI and `codex exec` draw the same rate (0.97x to 1.02x, t_bf914621), so `codex-worker` stays on `codex exec`.
 
-**Coming in the next restart window.** Two fork changes are approved (Ace, 17:06 PT) and CI-green but not yet merged or running on 2026-09-28 19:10 PT. `foreign_lane.worker_command` lets the dispatcher run the lane runner directly with no LLM shim; the runner relays the receipt's own board call, and a lane that exits without one blocks the card (t_3a8e4e30). `foreign_lane.shim_model_cap` keeps the shim on a cheaper model, for example Sonnet, when a card is pinned to Opus, without changing the harness's model (t_ba8e22f6). Neither key does anything until the dispatcher restarts on that code.
+**The native runner (`worker_command`), live.** Deployed in the restart window at 23:34 PT on 2026-09-28 (t_62c56e2a) and set on `cc-worker` and `codex-worker` at 23:54 PT (t_ff056214). With the key set, the dispatcher spawns `kanban_native_worker`, which runs the lane script with the card's `{task_id}`, `{workspace}` and `{tests_cmd}`, heartbeats every 120 s, and makes the receipt's own board call. A lane that exits without a receipt blocks the card. The key is read per spawn, so deleting it is the rollback and needs no restart. Measured on three real cards: median card $0.254 with no shim cost, against $0.369 for the last 18 shim-era cards, where the shim was 61.5 percent of the dollars (t_ff056214).
+
+```yaml
+foreign_lane:
+  worker_command: [/usr/bin/python3, <skill>/scripts/run_lane_tui.py,
+                   --task-id, "{task_id}", --workspace, "{workspace}", --tests-cmd, "{tests_cmd}"]
+```
+
+`foreign_lane.shim_model_cap` (t_ba8e22f6, also deployed) keeps a shim on a cheaper model when a card is pinned to Opus. It matters only on profiles that still run a shim.
+
+**Board status audit (Q15 = B).** Since the same restart window, `kanban.db` records every task status change in `task_status_audit`, stamped with the writing process (`kanban_db:<pid>`; a raw sqlite3 write shows as `unknown`). The lane runner reads the rows for its card, and any change it did not make blocks the card, even one restored before the run ended. That closed the last board-write arm on OpenCode and Pi: both rerun cards blocked (t_8ee219f5).
+
+**TUI slots per sub.** At most `TUI_SLOTS_PER_SUB` (default 6) interactive Claude Code sessions run on one sub at a time; the 7th waits for a free slot. The cap lives in the shared genuine-local CLI script, not in the dispatcher (t_fbd51223).
 
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
