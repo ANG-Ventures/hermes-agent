@@ -227,14 +227,9 @@ def test_compress_wait_budget_follows_config_ceiling(monkeypatch):
     # The aux compression request budget floors the idle window and, with it, the ceiling (#114594): the
     # RPC waiter must outlast a compaction the host is still allowed to run.
     monkeypatch.setattr(aux, "_effective_aux_timeout", lambda task, timeout: 300.0)
-    from agent.conversation_compression import resolve_context_compression_timeouts
-    _idle, _ceiling = resolve_context_compression_timeouts({"context_total_ceiling_seconds": 200})
-    wait = server._compute_host_compress_wait_seconds(
+    assert server._compute_host_compress_wait_seconds(
         {"compression": {"context_total_ceiling_seconds": 200}}
-    )
-    # Waiter = resolved ceiling + slack, and never shorter than the aux request budget + slack.
-    assert wait == _ceiling + 30.0
-    assert wait >= 330.0
+    ) == 330.0
     # Legacy clamps, judged with the aux floor pinned off.
     monkeypatch.setattr(aux, "_effective_aux_timeout", lambda task, timeout: 0.0)
     assert server._compute_host_compress_wait_seconds({"compression": {}}) == 630.0
