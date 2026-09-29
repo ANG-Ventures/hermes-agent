@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Bridge admission classification is opt-in per profile. With this off,
+        # bpr/bpx-N requests keep their previous header bytes.
+        "bridge_background_lane": False,
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —

@@ -11081,6 +11081,7 @@ def _persist_scratch_completion_artifacts(
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     used_destinations: set[Path] = set()
+    copied_paths: list[str] = []
     changed = False
 
     def _discard_copies() -> None:
@@ -11154,13 +11155,14 @@ def _persist_scratch_completion_artifacts(
 
         used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
+        copied_paths.append(str(dest.resolve()))
         changed = True
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        # Only copies made HERE need an attachment row: an already-stored
+        # path in the list (a routed copy carried onto an approval) has one.
+        metadata["_staged_artifacts"] = copied_paths
 
 
 def _stage_routed_scratch_artifacts(
@@ -11239,13 +11241,14 @@ def _carry_routed_artifacts(
     task_id: str,
     metadata: Optional[dict],
 ) -> Optional[dict]:
-    """An approval without its own artifacts inherits the routed run's copies.
+    """The approving completion carries the routed run's copies.
 
     The gateway uploads files from the ``completed`` event only, so a bare
-    approval of a routed card would otherwise deliver nothing.
+    approval of a routed card would otherwise deliver nothing. An approval
+    that declares artifacts of its own gets the routed copies FIRST, then its
+    own (deduped) -- replacing one list with the other dropped the
+    implementer's files (FleetReview #1447 @aa9e59a3).
     """
-    if isinstance(metadata, dict) and metadata.get("artifacts"):
-        return metadata
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? "
         "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
@@ -11258,7 +11261,14 @@ def _carry_routed_artifacts(
     carried = routed.get("routed_artifacts") if isinstance(routed, dict) else None
     if not isinstance(carried, list) or not carried:
         return metadata
-    return dict(metadata or {}, artifacts=[str(a) for a in carried])
+    own = metadata.get("artifacts") if isinstance(metadata, dict) else None
+    if isinstance(own, str):
+        own = [own]
+    merged: list[str] = []
+    for item in [*carried, *(own if isinstance(own, (list, tuple)) else [])]:
+        if str(item) not in merged:
+            merged.append(str(item))
+    return dict(metadata or {}, artifacts=merged)
 
 
 def _insert_completion_attachment(
