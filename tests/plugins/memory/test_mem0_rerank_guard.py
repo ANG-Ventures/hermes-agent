@@ -587,6 +587,11 @@ def test_default_page_uses_required_discord_alert_destination(monkeypatch):
         "message": "incident",
     }]
 
+    # a recovery line is not a page: it goes to #logs, the incident still pages #alerts
+    calls.clear()
+    _send_page("MEM0 RERANK RECOVERED: arm=builtin; detector healthy; configured arm unchanged.")
+    assert [c["target"] for c in calls] == ["discord:1480525090331561984"]
+
 
 @pytest.mark.parametrize("response", [{}, {"success": False}, "not-json"])
 def test_default_page_requires_positive_delivery_ack(monkeypatch, response):

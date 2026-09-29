@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 RERANK_OFF = "off"
 RERANK_BUILTIN = "builtin"
 _ALERT_TARGET = "discord:1480528231286181948"
+# A recovery is not a page: once, to #logs (fleet alerts rule: recovery posts once, to #logs,
+# only after a paged failure).
+_RECOVERY_TARGET = "discord:1480525090331561984"
+_RECOVERY_PREFIX = "MEM0 RERANK RECOVERED"
 _ROLLBACK = "set mem0.json rerank=off, then Apollo safe-restarts the gateway"
 _STATE_LOCKS: Dict[str, threading.Lock] = {}
 _STATE_LOCKS_GUARD = threading.Lock()
@@ -55,7 +59,7 @@ def _send_page(message: str) -> None:
     _load_hermes_env()
     raw = send_message_tool({
         "action": "send",
-        "target": _ALERT_TARGET,
+        "target": _RECOVERY_TARGET if message.startswith(_RECOVERY_PREFIX) else _ALERT_TARGET,
         "message": message,
     })
     try:
@@ -246,7 +250,7 @@ class RerankIncidentManager:
         p95: Optional[float] = None,
     ) -> str:
         if page_kind == "recovery":
-            return "MEM0 RERANK RECOVERED: arm=builtin; detector healthy; configured arm unchanged."
+            return f"{_RECOVERY_PREFIX}: arm=builtin; detector healthy; configured arm unchanged."
         detail = (
             f" p95_ms={p95:.2f} budget_ms={self._latency_budget_ms:.2f}"
             if failure_class == "LATENCY-BREACH" and p95 is not None else ""
