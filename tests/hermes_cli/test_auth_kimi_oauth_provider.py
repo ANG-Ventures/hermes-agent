@@ -331,3 +331,278 @@ def test_membership_model_context_lengths():
 
     assert _endpoint_scoped_context_length("k3", KIMI_OAUTH_INFERENCE_BASE_URL) == 1_048_576
     assert _endpoint_scoped_context_length("k3-256k", KIMI_OAUTH_INFERENCE_BASE_URL) == 262_144
+
+
+# ---------------------------------------------------------------------------
+# FleetReview #1392 follow-ups (t_ca39d148)
+# ---------------------------------------------------------------------------
+
+
+def _account_jwt(exp: int, *, user_id: str, tag: str, client_id: str = KIMI_OAUTH_CLIENT_ID) -> str:
+    def enc(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    claims = {"exp": exp, "client_id": client_id, "jti": tag, "user_id": user_id, "sub": user_id}
+    return f"{enc({'alg': 'HS256'})}.{enc(claims)}.sig"
+
+
+def test_login_label_rides_in_the_single_login_write(home, monkeypatch):
+    (home / "auth.json").write_text(json.dumps({"version": 1, "active_provider": "anthropic", "providers": {}}))
+    monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
+        (200, {"device_code": "dc", "user_code": "X", "verification_uri": "u", "interval": 1}),
+        (200, {"access_token": _jwt(int(time.time()) + 900), "refresh_token": "r-1", "expires_in": 900}),
+    ]))
+    writes = []
+    real_write = auth_mod._kimi_oauth_write_state
+
+    def _spy(state, **kw):
+        writes.append(dict(state))
+        return real_write(state, **kw)
+
+    monkeypatch.setattr(auth_mod, "_kimi_oauth_write_state", _spy)
+    auth_mod._kimi_oauth_login(open_browser=False, sleep=lambda _s: None, label="work")
+    assert len(writes) == 1 and writes[0]["label"] == "work"
+    assert get_provider_auth_state("kimi-oauth")["label"] == "work"
+
+
+def test_auth_add_label_does_not_restore_a_rotated_refresh_token(home, monkeypatch):
+    import hermes_cli.auth_commands as auth_commands
+
+    rotated = _logged_in_state(access_ttl=900, refresh="r-rotated", access_tag="gen2")
+
+    def _fake_login(*, open_browser, timeout_seconds, label=None):
+        written = _logged_in_state(access_ttl=900, refresh="r-spent", access_tag="gen1")
+        if label:
+            written["label"] = label
+        # The login persisted `written`; another process then rotated the pair.
+        _write_store(home, dict(rotated, label=written.get("label")))
+        return written
+
+    monkeypatch.setattr(auth_mod, "_kimi_oauth_login", _fake_login)
+    monkeypatch.setattr(auth_commands, "load_pool", lambda provider: None, raising=False)
+
+    class _Args:
+        provider = "kimi-oauth"
+        auth_type = "oauth"
+        label = "work"
+        no_browser = True
+        timeout = None
+
+    auth_commands.auth_add_command(_Args())
+    stored = get_provider_auth_state("kimi-oauth")
+    assert stored["refresh_token"] == "r-rotated"
+    assert stored["label"] == "work"
+
+
+def test_foreign_account_kimi_jwt_is_not_swapped_for_the_stored_login(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for, build_anthropic_client
+
+    exp = int(time.time()) + 900
+    state = _logged_in_state(access_ttl=800)
+    state["access_token"] = _account_jwt(exp, user_id="acct-local", tag="mine")
+    _write_store(home, state)
+    foreign = _account_jwt(exp, user_id="acct-other", tag="theirs")
+
+    assert _kimi_oauth_token_provider_for(foreign) is None
+    client = build_anthropic_client(foreign, KIMI_OAUTH_INFERENCE_BASE_URL)
+    assert client.auth_token != "entra-id-bearer-via-http-hook"
+    assert _kimi_oauth_token_provider_for(state["access_token"]) is not None
+
+
+def test_forged_jwt_with_matching_account_claims_is_not_swapped(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    exp = int(time.time()) + 900
+    state = _logged_in_state(access_ttl=800)
+    state["access_token"] = _account_jwt(exp, user_id="acct-local", tag="mine")
+    _write_store(home, state)
+    # Unsigned payload copying the public client_id and the local user_id/sub.
+    forged = _account_jwt(exp, user_id="acct-local", tag="forged")
+    assert _kimi_oauth_token_provider_for(forged) is None
+
+
+def test_earlier_rotation_of_the_stored_login_is_still_swapped(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    old = _logged_in_state(access_ttl=30, refresh="r-1", access_tag="gen1")
+    _write_store(home, old)
+    monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
+        (200, {"access_token": _jwt(int(time.time()) + 900, tag="gen2"),
+               "refresh_token": "r-2", "expires_in": 900}),
+    ]))
+    auth_mod.refresh_kimi_oauth_state()
+    stored = get_provider_auth_state("kimi-oauth")
+    assert stored["access_token"] != old["access_token"]
+    assert _kimi_oauth_token_provider_for(old["access_token"]) is not None
+    assert old["access_token"] not in json.dumps(stored["issued_access_sha256"])
+
+
+def test_kimi_jwt_without_a_stored_login_keeps_the_static_path(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for, build_anthropic_client
+
+    token = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    assert _kimi_oauth_token_provider_for(token) is None
+    client = build_anthropic_client(token, KIMI_OAUTH_INFERENCE_BASE_URL)
+    assert client.auth_token != "entra-id-bearer-via-http-hook"
+
+
+def test_auxiliary_resolver_builds_a_kimi_oauth_client(home):
+    from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
+
+    _write_store(home, _logged_in_state(access_ttl=800))
+    client, model = resolve_provider_client("kimi-oauth", "k3")
+    assert isinstance(client, AnthropicAuxiliaryClient)
+    assert model == "k3"
+    assert client._real_client.auth_token == "entra-id-bearer-via-http-hook"
+    assert client.base_url.rstrip("/") == KIMI_OAUTH_INFERENCE_BASE_URL
+
+
+def test_auxiliary_resolver_without_kimi_login_returns_none(home):
+    from agent.auxiliary_client import resolve_provider_client
+
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    assert resolve_provider_client("kimi-oauth", "k3") == (None, None)
+
+
+def test_auxiliary_resolver_uses_explicit_key_without_a_stored_login(home):
+    from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
+
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    key = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    client, model = resolve_provider_client("kimi-oauth", "k3", explicit_api_key=key)
+    assert isinstance(client, AnthropicAuxiliaryClient)
+    assert model == "k3"
+    assert client._real_client.auth_token != "entra-id-bearer-via-http-hook"
+    assert client.base_url.rstrip("/") == KIMI_OAUTH_INFERENCE_BASE_URL
+
+
+def _capture_messages_headers(client):
+    import httpx
+
+    seen = {}
+
+    def _handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "k3",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+            "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    # Swap the transport in place: with_options() would rebuild the client
+    # and re-read ANTHROPIC_API_KEY from the env.
+    client._client = httpx.Client(transport=httpx.MockTransport(_handler))
+    client.messages.create(model="k3", max_tokens=8, messages=[{"role": "user", "content": "hi"}])
+    return seen
+
+
+def test_unmanaged_kimi_jwt_is_sent_as_bearer_not_x_api_key(home, monkeypatch):
+    from agent.auxiliary_client import resolve_provider_client
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-leak")
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    key = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    client, _model = resolve_provider_client("kimi-oauth", "k3", explicit_api_key=key)
+    seen = _capture_messages_headers(client._real_client)
+    assert seen["authorization"] == f"Bearer {key}"
+    assert "x-api-key" not in seen
+
+
+def test_static_sk_kimi_key_still_sent_as_x_api_key():
+    from agent.anthropic_adapter import build_anthropic_client
+
+    key = "sk-kimi-" + "x" * 40
+    seen = _capture_messages_headers(build_anthropic_client(key, KIMI_OAUTH_INFERENCE_BASE_URL))
+    assert seen["x-api-key"] == key
+    assert "authorization" not in seen
+
+
+def _device_jwt(exp: int, *, device_id: str, tag: str) -> str:
+    def enc(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    claims = {"exp": exp, "client_id": KIMI_OAUTH_CLIENT_ID, "jti": tag, "device_id": device_id}
+    return f"{enc({'alg': 'HS256'})}.{enc(claims)}.sig"
+
+
+def test_device_id_claim_alone_is_not_trusted(home):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    state = _logged_in_state(access_ttl=800)
+    _write_store(home, state)
+    forged = _device_jwt(int(time.time()) - 3600, device_id=state["device_id"], tag="forged")
+    assert _kimi_oauth_token_provider_for(forged) is None
+
+
+def _relogin(monkeypatch, new_access):
+    monkeypatch.setattr(auth_mod, "_kimi_post_form", _FakeForm([
+        (200, {"device_code": "dc", "user_code": "X", "verification_uri": "u", "interval": 1}),
+        (200, {"access_token": new_access, "refresh_token": "r-2", "expires_in": 900}),
+    ]))
+    auth_mod._kimi_oauth_login(open_browser=False, sleep=lambda _s: None)
+
+
+def test_same_account_relogin_keeps_issued_token_history(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    exp = int(time.time()) + 900
+    old = _logged_in_state(access_ttl=800, refresh="r-1")
+    old["access_token"] = _account_jwt(exp, user_id="acct-a", tag="pre-login")
+    old["issued_access_sha256"] = ["f" * 64]
+    _write_store(home, old)
+    _relogin(monkeypatch, _account_jwt(exp, user_id="acct-a", tag="post-login"))
+    history = get_provider_auth_state("kimi-oauth")["issued_access_sha256"]
+    assert "f" * 64 in history
+    assert _kimi_oauth_token_provider_for(old["access_token"]) is not None
+
+
+def test_other_account_relogin_drops_issued_token_history(home, monkeypatch):
+    from agent.anthropic_adapter import _kimi_oauth_token_provider_for
+
+    exp = int(time.time()) + 900
+    old = _logged_in_state(access_ttl=800, refresh="r-1")
+    old["access_token"] = _account_jwt(exp, user_id="acct-a", tag="pre-login")
+    old["issued_access_sha256"] = ["f" * 64]
+    _write_store(home, old)
+    _relogin(monkeypatch, _account_jwt(exp, user_id="acct-b", tag="post-login"))
+    assert get_provider_auth_state("kimi-oauth")["issued_access_sha256"] == []
+    assert _kimi_oauth_token_provider_for(old["access_token"]) is None
+
+
+def test_aux_with_options_copy_stays_bearer_only(home, monkeypatch):
+    import httpx
+
+    from agent.auxiliary_client import resolve_provider_client
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-leak")
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    key = _account_jwt(int(time.time()) + 900, user_id="acct-x", tag="t")
+    client, _model = resolve_provider_client("kimi-oauth", "k3", explicit_api_key=key)
+    seen = {}
+
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "k3", "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "ok"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"output_tokens": 1}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    sse = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
+
+    def _handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse.encode())
+
+    client._real_client._client = httpx.Client(transport=httpx.MockTransport(_handler))
+    # timeout forces the adapter's with_options() copy.
+    client.chat.completions.create(
+        model="k3", messages=[{"role": "user", "content": "hi"}], max_tokens=8, timeout=5,
+    )
+    assert seen["authorization"] == f"Bearer {key}"
+    assert "x-api-key" not in seen

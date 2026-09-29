@@ -115,6 +115,9 @@ def query_pr_state(repo: str, number: int) -> Optional[dict]:
     out = {"state": "MERGED" if payload.get("merged_at") else str(payload["state"]).upper()}
     if out["state"] == "MERGED" and payload.get("merge_commit_sha"):
         out["merge_commit_sha"] = str(payload["merge_commit_sha"])
+    head = payload.get("head")
+    if out["state"] == "MERGED" and isinstance(head, dict) and head.get("sha"):
+        out["head_sha"] = str(head["sha"])
     return out
 
 

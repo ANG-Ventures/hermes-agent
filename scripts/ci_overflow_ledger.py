@@ -296,6 +296,8 @@ class Ledger:
             summary = dict(plan.summary)
             summary.update(remaining_allowance=remaining, reserved_minutes=sum(j.reserved_minutes for j in jobs),
                            budget_overrides_cloud_only=any(j.reason == "budget-overrides-cloud-only" for j in jobs))
+            if "blacksmith" in summary:   # recount after demotions: the paid share actually admitted
+                summary["blacksmith"] = sum(1 for j in jobs if j.labels == BLACKSMITH)
             if estimating:
                 summary.update(admission_estimate=dict(cost, headroom=self.headroom, samples={
                     k: len(state.get(SAMPLES, {}).get(k, [])) for k in CEILING}))

@@ -51,8 +51,10 @@ def _fresh_card_pin_cache():
     from hermes_cli import kanban_worker_route
 
     kanban_worker_route._card_pin_cache.clear()
+    kanban_worker_route._live_state.update(agent=None, cursor=0)
     yield
     kanban_worker_route._card_pin_cache.clear()
+    kanban_worker_route._live_state.update(agent=None, cursor=0)
 
 
 def _runtime_agent(provider, chain):
@@ -148,17 +150,19 @@ def test_card_pinned_worker_keeps_quota_reason_and_nonretryable_failures(board):
     assert WorkerExit(broken).code == 1
 
 
-def test_card_pinned_worker_allows_same_provider_fallback(board):
+def test_card_pinned_worker_refuses_same_provider_other_model(board):
+    """t_1d2ba891: a model pin pins the MODEL; another model on the lane is refused."""
     from agent.error_classifier import FailoverReason
 
     tid, _ = board
-    agent = _runtime_agent("openai-codex", [
-        {"provider": "claude-bpr", "model": "claude-opus-5-5"},
-        {"provider": "openai-codex", "model": "gpt-6-astra"},
-    ])
-    assert _failover(agent, FailoverReason.server_error) is True
-    assert agent.provider == "openai-codex"
-    assert agent.model == "gpt-6-astra"
+    agent = _runtime_agent("openai-codex",
+                           [{"provider": "openai-codex", "model": "gpt-6-astra"}])
+    assert _failover(agent, FailoverReason.server_error) is False
+    assert agent.model == "gpt-6-sol-900k"
+    refused = _events(tid, "worker_route_pin_refused")
+    assert refused[0][1]["to_provider"] == "openai-codex"
+    assert refused[0][1]["to_model"] == "gpt-6-astra"
+    assert _events(tid, "worker_route_substituted") == []
 
 
 def test_lane_override_is_not_a_card_pin(board, monkeypatch):
@@ -289,3 +293,183 @@ def test_single_sub_pin_refuses_pool_failover(board, pin, target):
     assert refused[0][1]["provider"] == pin
     assert refused[0][1]["to_provider"] == target
     assert _events(tid, "worker_route_substituted") == []
+
+
+# --- t_1d2ba891: a card pin with a model pins the MODEL on the same provider
+
+def test_fable_pin_refuses_opus_on_same_provider_and_requeues(board):
+    """subs-ace:t_cc62f8dd: claude-bpr/claude-fable-5-1 pin -> claude-bpr/claude-opus-5-5
+    failover (timeout/rate_limit/overloaded) must be refused, not substituted."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.kanban_worker_exit import EXIT_CLASS_PINNED_PROVIDER, WorkerExit
+    from hermes_cli.kanban_worker_route import apply_pin_refusal_to_result
+
+    tid, run_id = board
+    _pin_card(tid, "claude-bpr", "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert (agent.provider, agent.model) == ("claude-bpr", "claude-fable-5-1")
+    assert _events(tid, "worker_route_substituted") == []
+    refused = _events(tid, "worker_route_pin_refused")
+    assert [r for r, _ in refused] == [run_id]
+    payload = refused[0][1]
+    assert (payload["stage"], payload["provider"], payload["model"]) == (
+        "runtime", "claude-bpr", "claude-fable-5-1")
+    assert (payload["to_provider"], payload["to_model"]) == ("claude-bpr", "claude-opus-5-5")
+
+    # The three reasons seen on runs 293/300/308 all end as a requeue, never
+    # a counted failure; a reason without its own class gets the pin class.
+    for reason, error in (("timeout", "request timed out"),
+                          ("rate_limit", "HTTP 429"),
+                          ("overloaded", "HTTP 529 overloaded")):
+        result = apply_pin_refusal_to_result(agent, {
+            "failed": True, "failure_reason": reason,
+            "failure_retryable": True, "error": error})
+        exc = WorkerExit(result)
+        assert exc.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE, reason
+        assert exc.exit_class is not None, reason
+    timeout = apply_pin_refusal_to_result(agent, {
+        "failed": True, "failure_reason": "timeout", "failure_retryable": True,
+        "error": "request timed out"})
+    assert timeout["failure_reason"] == "pinned_provider_unavailable"
+    assert WorkerExit(timeout).exit_class == EXIT_CLASS_PINNED_PROVIDER
+
+
+def test_fable_pin_allows_sibling_pool_same_model(board):
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-apr", "model": "claude-fable-5-1"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is True
+    assert (agent.provider, agent.model) == ("claude-apr", "claude-fable-5-1")
+    assert _events(tid, "worker_route_pin_refused") == []
+
+
+def test_fable_pin_refuses_sibling_pool_opus(board):
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-apr", "model": "claude-opus-5-5"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert agent.provider == "claude-bpr"
+
+
+def test_no_pin_same_provider_model_failover_unchanged(board):
+    from agent.error_classifier import FailoverReason
+
+    tid, run_id = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET provider_override=NULL, model_override=NULL WHERE id=?",
+                     (tid,))
+        conn.commit()
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is True
+    assert agent.model == "claude-opus-5-5"
+    assert _events(tid, "worker_route_pin_refused") == []
+    assert [r for r, _ in _events(tid, "worker_route_substituted")] == [run_id]
+
+
+def test_unreadable_board_fails_open(board, monkeypatch):
+    from agent.error_classifier import FailoverReason
+    from hermes_cli import kanban_db
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-fable-5-1")
+
+    def _boom(*a, **k):
+        raise RuntimeError("board unreadable")
+
+    monkeypatch.setattr(kanban_db, "get_task", _boom)
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is True
+    assert agent.model == "claude-opus-5-5"
+
+
+def test_model_only_pin_refuses_another_model(board):
+    """``set-model --model X`` without a provider still pins the model."""
+    from agent.error_classifier import FailoverReason
+
+    tid, run_id = board
+    _pin_card(tid, None, "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"},
+                         {"provider": "openai-codex", "model": "gpt-6-sol-900k"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert (agent.provider, agent.model) == ("claude-bpr", "claude-fable-5-1")
+    refused = _events(tid, "worker_route_pin_refused")
+    assert [r for r, _ in refused] == [run_id]
+    assert refused[0][1]["provider"] == "claude-bpr"
+    assert refused[0][1]["to_model"] == "claude-opus-5-5"
+    assert _events(tid, "worker_route_substituted") == []
+
+
+def test_model_only_pin_allows_same_model_elsewhere(board):
+    from agent.error_classifier import FailoverReason
+
+    tid, _ = board
+    _pin_card(tid, None, "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-apx-1", "model": "claude-fable-5-1"}],
+                        model="claude-fable-5-1")
+    assert _failover(agent, FailoverReason.overloaded) is True
+    assert (agent.provider, agent.model) == ("claude-apx-1", "claude-fable-5-1")
+    assert _events(tid, "worker_route_pin_refused") == []
+
+
+def test_next_dispatch_write_does_not_change_running_policy(board):
+    """A non-live set-model after the run's first loop boundary applies to the
+    NEXT dispatch only: the running worker keeps the pin it spawned on."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+    tid, _ = board
+    _pin_card(tid, "claude-bpr", "claude-fable-5-1")
+    agent = _pool_agent("claude-bpr",
+                        [{"provider": "claude-bpr", "model": "claude-opus-5-5"}],
+                        model="claude-fable-5-1")
+    agent._delegate_depth = 0
+    apply_pending_live_route(agent, iteration=0)  # first loop boundary
+    _pin_card(tid, "claude-bpr", "claude-opus-5-5")  # next-dispatch write
+    assert _failover(agent, FailoverReason.overloaded) is False
+    assert agent.model == "claude-fable-5-1"
+    assert _events(tid, "worker_route_substituted") == []
+
+
+def test_live_pin_on_the_serving_route_refreshes_the_snapshot(board):
+    """``set-model --live`` onto the route already serving switches nothing but
+    still pins the run: a later failover to another model is refused."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+    tid, run_id = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET provider_override=NULL, model_override=NULL, "
+                     "current_run_id=? WHERE id=?", (run_id, tid))
+        conn.commit()
+    agent = _runtime_agent("openai-codex",
+                           [{"provider": "openai-codex", "model": "gpt-6-astra"}])
+    agent._delegate_depth = 0
+    apply_pending_live_route(agent, iteration=0)  # snapshot: no pin
+    _pin_card(tid, "openai-codex", "gpt-6-sol-900k")
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kb.ROUTE_CHANGED_EVENT, {
+                "touch_model": True, "touch_effort": False,
+                "model": "gpt-6-sol-900k", "provider": "openai-codex"}, run_id=run_id)
+    apply_pending_live_route(agent, iteration=1)
+    assert agent.model == "gpt-6-sol-900k"
+    assert _failover(agent, FailoverReason.server_error) is False
+    assert agent.model == "gpt-6-sol-900k"

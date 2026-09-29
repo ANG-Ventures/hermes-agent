@@ -146,3 +146,44 @@ def test_stuck_page_item_carries_pr(kanban_home):
         conn.commit()
         stuck = [x for x in kb.respawn_guard_stuck_tasks(conn, now=now) if x["task_id"] == tid]
     assert stuck and stuck[0]["pr"] == "https://github.com/o/r/pull/9"
+
+
+@pytest.mark.parametrize(
+    "head",
+    ["alice/fix-t_11111111", "alice/topic_t_11111111", "t_22222222-x/fix-t_11111111"],
+)
+def test_card_id_outside_owner_position_stays_guarded(kanban_home, fake_gh, head):
+    """t_84471ec4: an id in the branch TOPIC is a mention, not an owner."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="lane work", assignee="alice")
+        fake_gh[5] = _open(head)
+        kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/5")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("head", ["wt/t_11111111", "proj/t_11111111", "bob/t_11111111-x"])
+def test_other_card_id_in_owner_position_skips(kanban_home, fake_gh, head):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="lane work", assignee="alice")
+        fake_gh[6] = _open(head)
+        kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/6")
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_show_drops_ready_hold_after_review_requested(kanban_home):
+    """t_84471ec4: ready -> review handoff must not keep showing the old active_pr."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr", "pr": "u"})
+        kb._append_event(conn, tid, "review_requested", {})
+    assert "guard:" not in kc.run_slash(f"show {tid}")
+
+
+def test_show_hides_active_pr_hold_on_review_card(kanban_home):
+    """The review lane never records active_pr; a stale one must not display."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr", "pr": "u"})
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+    assert "guard:" not in kc.run_slash(f"show {tid}")

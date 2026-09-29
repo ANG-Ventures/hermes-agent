@@ -2808,6 +2808,7 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
+        _log_turn_error(sid, message, source="compute_host")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
     _apply_compute_host_metadata_mirror(session, frame)
     try:
@@ -10447,6 +10448,29 @@ def _fail_inflight_turn(
     turn["streaming"] = False
     turn["updated_at"] = now
     session["inflight_turn"] = turn
+    _log_turn_error(session.get("session_key"), turn["error"], source="turn")
+
+
+def _log_turn_error(session_ref: Any, message: str, *, source: str) -> None:
+    """Record a failed turn in the process log AND on stderr (journald).
+
+    Every terminal turn failure (returned error, dispatcher exception, agent
+    build failure, compute-host ``turn.error``) otherwise lives only in the
+    client-bound ``message.complete`` frame. A long-lived ``hermes serve``
+    that failed every turn for ~4 h (stale in-memory modules after a checkout
+    fast-forward: ``ImportError ... SESSION_ACTIVITY_PERSIST_NEVER``) left no
+    line in journald or errors.log (t_e8118410). Never raises.
+    """
+    try:
+        text = " ".join(str(message or "turn failed").split())[:500]
+        logger.warning("turn failed (%s) session=%s: %s", source, session_ref or "?", text)
+        print(
+            f"[gateway-turn-error] source={source} session={session_ref or '?'} error={text}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 # ── Auto-continue: resume a turn killed by a process/machine death ────

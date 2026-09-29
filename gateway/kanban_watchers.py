@@ -719,6 +719,9 @@ def _guard_stuck_state_path() -> Path:
     return get_hermes_home() / "state" / "kanban-guard-stuck-pages.json"
 
 
+_GUARD_STUCK_PAGE_BUDGET_S = 30.0
+
+
 class _GuardStuckNotifier:
     """Page once per guard EPISODE, remind every 6h; retry failed sends.
 
@@ -767,6 +770,11 @@ class _GuardStuckNotifier:
             logger.warning("kanban dispatcher: guard-stuck page ledger not saved", exc_info=True)
 
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
+        """Page due episodes. Sends run serially (each up to 30 s) inside the
+        dispatcher tick, so one call spends at most ``_GUARD_STUCK_PAGE_BUDGET_S``
+        on them (FleetReview #79); an unsent page is not recorded and goes
+        out on a later tick."""
+        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
         if observed_boards is None:
@@ -785,6 +793,8 @@ class _GuardStuckNotifier:
             last = self._sent.get(key)
             if last is not None and now - last < self._remind:
                 continue
+            if time.monotonic() >= deadline:
+                break
             if send(board, item):
                 self._sent[key] = now
                 delivered += 1
@@ -2597,6 +2607,13 @@ class GatewayKanbanWatchersMixin:
         def _finish_gate_tick(spawned: int) -> None:
             load_gate.finish_tick(spawned, logger=logger)
 
+        # Round-robin cursor for the per-board allowance split and the
+        # wall-clock start of each board's current zero-spawn streak while
+        # the gate had allowance (published to `hermes kanban diagnostics`).
+        from hermes_cli import kanban_load_gate as _klg
+        _board_rr = {"tick": 0}
+        _board_starved_since: dict[str, float] = {}
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -2762,10 +2779,59 @@ class GatewayKanbanWatchersMixin:
             budget_cache: dict = {}
             # Load gate: ONE allowance per tick, shared across every board —
             # the host's run queue is one resource no matter which board the
-            # worker came from.
+            # worker came from. It is SPLIT round-robin across the boards
+            # that have spawnable work, rotating the first pick every tick
+            # (t_f78d1938: consumed in fixed board order, default first, the
+            # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
             _allowance, _spawn_paused = _sample_spawn_pause()
-            _remaining = _allowance
             _tick_spawned = 0
+            _demand: list[tuple[str, int]] = []
+            if _allowance is not None and not _spawn_paused:
+                _review_on = _kb.review_dispatch_enabled()
+                for b in _kb.enumerating_each(boards):
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    # A board quarantined as corrupt (same fingerprint, inside
+                    # its retry window) is not opened by the demand pre-scan
+                    # either: the dispatch tick below skips it, so a probe
+                    # here would only re-hit the corrupt file every tick.
+                    _q = disabled_corrupt_boards.get(slug)
+                    if (
+                        _q is not None
+                        and _q[0] == _board_db_fingerprint(slug)
+                        and time.monotonic() - _q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                    ):
+                        _demand.append((slug, 0))
+                        continue
+                    _dconn = None
+                    try:
+                        _dconn = _kb.connect(board=slug)
+                        _n = _kb.count_spawnable_demand(
+                            _dconn,
+                            default_assignee=default_assignee,
+                            include_review=_review_on,
+                        )
+                    except Exception:
+                        _n = 0
+                    finally:
+                        if _dconn is not None:
+                            try:
+                                _dconn.close()
+                            except Exception:
+                                pass
+                    _demand.append((slug, _n))
+            _quotas = _klg.split_allowance(
+                _allowance, _demand, start=_board_rr["tick"],
+            )
+            _board_rr["tick"] += 1
+            _demand_by = dict(_demand)
+            # Allowance no board claimed by demand (total demand < allowance)
+            # stays available to any board — the demand count must never be
+            # the reason a board spawns less than it did before the split.
+            _spare = (
+                None if _allowance is None
+                else max(0, _allowance - sum(q or 0 for q in _quotas.values()))
+            )
+            _board_stats: dict = {}
             # Enumeration extent spans the whole per-board tick body, not just
             # the fingerprint's path resolve: `_tick_once_for_board` also calls
             # `connect(board=slug)`, which re-resolves internally. Scoping only
@@ -2773,21 +2839,55 @@ class GatewayKanbanWatchersMixin:
             # warnings that then silenced later single-board misreadings.
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                _quota = _quotas.get(slug, 0) or 0
+                _limit = None if _allowance is None else _quota + (_spare or 0)
                 _paused = _spawn_paused
-                if _paused is None and _remaining is not None and _remaining <= 0:
+                if _paused is None and _limit is not None and _limit <= 0:
                     _paused = (
                         f"load gate: this tick's allowance of {_allowance} "
-                        f"spawn(s) is used"
+                        f"spawn(s) is used by other boards"
                     )
                 res = _tick_once_for_board(
                     slug, budget_cache, _paused,
-                    None if _paused else _remaining,
+                    None if _paused else _limit,
                 )
                 out.append((slug, res))
                 _n = len(getattr(res, "spawned", None) or []) if res is not None else 0
                 _tick_spawned += _n
-                if _remaining is not None:
-                    _remaining -= _n
+                if _spare is not None:
+                    # Quota this board did not use (concurrency cap, demand
+                    # over-count) goes back to the pool for the boards after
+                    # it; spawns past its quota came out of the pool.
+                    _spare = max(0, _spare + _quota - _n)
+                _ready = _demand_by.get(slug, 0)
+                if not _demand:
+                    # Gate paused/disabled: no split happened, so no board
+                    # was starved BY the split — leave the streaks alone.
+                    pass
+                elif _ready > 0:
+                    logger.info(
+                        "kanban dispatcher [%s]: ready=%d quota=%d spawned=%d "
+                        "starved=%d allowance=%s",
+                        slug, _ready, _quota, _n,
+                        _ready if _n == 0 else 0, _allowance,
+                    )
+                    _prev = _board_starved_since.get(slug)
+                    if _n > 0:
+                        _board_starved_since.pop(slug, None)
+                    elif _prev is None:
+                        _board_starved_since[slug] = time.time()
+                else:
+                    _board_starved_since.pop(slug, None)
+                _board_stats[slug] = {
+                    "ready": _ready,
+                    "quota": _quota,
+                    "spawned": _n,
+                    "starved_since": _board_starved_since.get(slug),
+                }
+            if _allowance is not None and not _spawn_paused:
+                load_gate.boards = {
+                    k: v for k, v in _board_stats.items() if v["ready"] > 0
+                }
             _finish_gate_tick(_tick_spawned)
             return out
 

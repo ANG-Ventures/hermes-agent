@@ -137,6 +137,16 @@ def compute_half_turn_target(
     if n < 1:
         n = 1
 
+    group_starts = _half_turn_group_starts(active_messages)
+    if not group_starts:
+        return None
+
+    target_index = max(0, len(group_starts) - n)
+    return group_starts[target_index]
+
+
+def _half_turn_group_starts(active_messages: List[Dict[str, Any]]) -> List[int]:
+    """Return the first-row id of every countable half-turn group, in order."""
     group_starts: List[int] = []
     current_party: Optional[str] = None
     current_start: Optional[int] = None
@@ -152,11 +162,7 @@ def compute_half_turn_target(
     if current_party != "other" and current_start is not None:
         group_starts.append(current_start)
 
-    if not group_starts:
-        return None
-
-    target_index = max(0, len(group_starts) - n)
-    return group_starts[target_index]
+    return group_starts
 
 
 def _new_tail(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -387,6 +393,10 @@ def undo(session_id: str, n: int) -> Dict[str, Any]:
     return {
         "rewound_ids": rewound_ids,
         "prefill_text": prefill,
+        # Half-turns actually rewound: compute_half_turn_target clamps a
+        # request larger than the history to "rewind everything", so report
+        # the clamped count, never the requested one.
+        "half_turns": min(max(n, 1), len(_half_turn_group_starts(msgs))),
     }
 
 
@@ -398,6 +408,7 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
             "reactivated_count": 0,
             "new_tail_id": None,
             "prefill_text": None,
+            "ops_redone": 0,
             "message": "nothing to redo",
         }
 
@@ -411,6 +422,7 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
             "reactivated_count": 0,
             "new_tail_id": None,
             "prefill_text": None,
+            "ops_redone": 0,
             "message": message,
         }
 
@@ -490,6 +502,7 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
                 "reactivated_count": 0,
                 "new_tail_id": None,
                 "prefill_text": None,
+                "ops_redone": 0,
                 "message": "nothing to redo (transcript changed since undo)",
             }
         # else: earlier ops did real work — fall through to commit + report it.
@@ -523,6 +536,9 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
         "reactivated_count": reactivated_total,
         "new_tail_id": new_tail_id,
         "prefill_text": None,
+        # Undo ops actually redone (<= the requested M: clamped to the undo
+        # stack depth and cut short by a partial). Callers render THIS count.
+        "ops_redone": ops_redone,
     }
     if transcript_changed:
         result["partial"] = True

@@ -230,10 +230,20 @@ def _openai_http_client_kwargs(
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
     try:
         from agent.process_bootstrap import build_keepalive_http_client
+        # S7 D1 (t_ebbae2c8 / t_d5f71d8e): the aux route id is recorded from
+        # what the WIRE saw (request header sent? relay x-pool-route-id?), not
+        # from kwargs intent. Inert outside an aux_route_scope.
+        from agent.fork_ext.relay_headers import (
+            anote_aux_http_response,
+            note_aux_http_response,
+        )
         client = build_keepalive_http_client(
             str(base_url or ""),
             async_mode=async_mode,
             verify=_resolve_aux_verify(base_url),
+            event_hooks={"response": [
+                anote_aux_http_response if async_mode else note_aux_http_response
+            ]},
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves
@@ -2518,6 +2528,11 @@ class _AnthropicCompletionsAdapter:
         if _opts and hasattr(_client, "with_options"):
             try:
                 _client = _client.with_options(**_opts)
+                # The SDK copy re-reads ANTHROPIC_API_KEY when api_key is
+                # None; a bearer-only client must stay bearer-only or the
+                # Anthropic key is sent to a non-Anthropic endpoint.
+                if getattr(self._client, "api_key", "") is None:
+                    _client.api_key = None
             except Exception:
                 _client = self._client  # never break the call over an options quirk
 
@@ -2566,9 +2581,23 @@ class _AnthropicCompletionsAdapter:
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
 
+        # S7 D1 (t_d5f71d8e): the kwargs allow-list above used to drop the
+        # caller's extra_headers, so x-hermes-route-id (and the gemini-bridge
+        # claims) never reached claude-apr / claude-apx-N while the ledger
+        # recorded the id as sent. Forward them; the Anthropic SDK takes
+        # ``extra_headers`` per request.
+        caller_extra_headers = kwargs.get("extra_headers")
+        if isinstance(caller_extra_headers, dict) and caller_extra_headers:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **caller_extra_headers,
+            }
+        from agent.fork_ext.relay_headers import note_aux_http_response
+
         response = create_anthropic_message(
             _client,
             anthropic_kwargs,
+            on_response=note_aux_http_response,
             # Per streamed event: record provider-response timing always, but
             # tick the forward-progress hook (hosts watching liveness —
             # gateway session hygiene / the compression commit fence) only
@@ -7650,6 +7679,49 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: bedrock converse (%s, %s)",
                          final_model, region)
 
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
+    elif pconfig.auth_type == "oauth_kimi":
+        # kimi-oauth (Kimi Code membership): the managed login's rotating
+        # JWT is served per request by the auth.json token provider, on the
+        # Anthropic Messages wire at api.kimi.com/coding.
+        from agent.anthropic_adapter import build_anthropic_client
+        from hermes_cli.auth import (
+            KIMI_OAUTH_INFERENCE_BASE_URL,
+            resolve_kimi_oauth_runtime_credentials,
+        )
+
+        if explicit_api_key:
+            # No stored login needed. build_anthropic_client swaps the key
+            # for the token provider only when this login issued it.
+            api_key = explicit_api_key
+            base_url = explicit_base_url or KIMI_OAUTH_INFERENCE_BASE_URL
+        else:
+            try:
+                creds = resolve_kimi_oauth_runtime_credentials(as_token_provider=True)
+            except Exception as exc:
+                logger.debug("resolve_provider_client: kimi-oauth unavailable: %s", exc)
+                return None, None
+            api_key = creds["api_key"]
+            base_url = explicit_base_url or creds["base_url"]
+        base_url = base_url.strip().rstrip("/")
+        default_model = _get_aux_model_for_provider(provider)
+        final_model = _normalize_resolved_model(model or default_model, provider)
+        if not final_model:
+            logger.debug("resolve_provider_client: kimi-oauth has no model to use")
+            return None, None
+        try:
+            real_client = build_anthropic_client(api_key, base_url)
+        except Exception as exc:
+            logger.warning("resolve_provider_client: cannot create kimi-oauth client: %s", exc)
+            return None, None
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model,
+            api_key=explicit_api_key or "kimi-oauth-bearer-via-http-hook",
+            base_url=base_url,
+        )
+        logger.debug("resolve_provider_client: kimi-oauth (%s)", final_model)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 

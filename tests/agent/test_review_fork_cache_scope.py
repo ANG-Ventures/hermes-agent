@@ -219,3 +219,45 @@ def test_build_cache_parity_fork_tags_the_fork(write_origin, tag):
     assert fork.session_id == "parent-sess"  # transcript identity unchanged
     assert fork._prompt_cache_fork_tag == tag
     assert resolve_prompt_cache_scope(fork) == f"parent-sess::{tag}"
+
+
+def test_concurrent_forks_of_one_parent_get_distinct_cache_tags():
+    """FleetReview #91: the tag was fixed per write_origin, so two forks alive
+    at once shared one slot-keyed scope and evicted each other. A fork that
+    starts after the first closed reuses the base tag (warm slot)."""
+    from agent.background_review import build_cache_parity_fork
+
+    parent = SimpleNamespace(
+        model="grok-4.3", provider="xai-oauth", platform="cli", session_id="parent-91",
+        tools=[], valid_tool_names=set(), _cached_system_prompt="sys",
+        session_start=object(), _memory_store=None, _memory_enabled=False,
+        _user_profile_enabled=False, enabled_toolsets=None, disabled_toolsets=None,
+        request_overrides={},
+    )
+
+    class Fork:
+        def __init__(self, **kwargs):
+            self.provider = kwargs.get("provider")
+            self.model = kwargs.get("model")
+            self.base_url = kwargs.get("base_url") or ""
+            self.tools = []
+            self.valid_tool_names = set()
+            self._memory_manager = None
+            self.context_compressor = None
+
+        def close(self):
+            pass
+
+    runtime = {"model": "grok-4.3", "provider": "xai-oauth", "routed": False}
+    with patch("run_agent.AIAgent", Fork), patch(
+        "agent.background_review._resolve_review_runtime", return_value=runtime
+    ):
+        a, _, _ = build_cache_parity_fork(parent, max_iterations=3)
+        b, _, _ = build_cache_parity_fork(parent, max_iterations=3)
+        assert resolve_prompt_cache_scope(a) != resolve_prompt_cache_scope(b)
+        assert a._prompt_cache_fork_tag == "review"
+        a.close()
+        c, _, _ = build_cache_parity_fork(parent, max_iterations=3)
+        assert c._prompt_cache_fork_tag == "review"
+        b.close()
+        c.close()

@@ -239,7 +239,10 @@ def test_in_process_gateway_still_borrows_no_env_session(monkeypatch):
     import types
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
     monkeypatch.setenv("HERMES_SESSION_ID", OTHER_SESSION)
-    monkeypatch.setitem(sys.modules, "gateway.run", types.ModuleType("gateway.run"))
+    fake_run = types.ModuleType("gateway.run")
+    runner = object()
+    fake_run._gateway_runner_ref = lambda: runner  # the gateway PROCESS
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
     assert contextvars.Context().run(cli._caller_session_id) is None
     monkeypatch.delitem(sys.modules, "gateway.run")
     assert contextvars.Context().run(cli._caller_session_id) == OTHER_SESSION
