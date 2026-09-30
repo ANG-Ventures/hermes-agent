@@ -741,9 +741,25 @@ class _GuardStuckNotifier:
 
     @staticmethod
     def _key(board: str, item: dict) -> str:
-        return "|".join((str(board), str(item["task_id"]),
-                         str(item.get("reason") or "active_pr"),
-                         str(item.get("guarded_since") or "")))
+        reason = str(item.get("reason") or "active_pr")
+        # An active_pr hold is ONE episode per (card, PR): a requeue/respawn
+        # that restarts the streak on the same open PR is not a new episode
+        # (r19, t_f1af5dcd). Other guards keep the streak-start episode.
+        episode = (f"pr={item['pr']}" if reason == "active_pr" and item.get("pr")
+                   else str(item.get("guarded_since") or ""))
+        return "|".join((str(board), str(item["task_id"]), reason, episode))
+
+    def _last_sent(self, key: str) -> Optional[float]:
+        """Last page time for ``key``; an active_pr key also honours a pre-r19
+        ledger entry of the same card (``…|active_pr|<guarded_since>``) so the
+        deploy does not re-page every open episode once."""
+        last = self._sent.get(key)
+        if last is not None or "|active_pr|pr=" not in key:
+            return last
+        prefix = key.split("|pr=", 1)[0] + "|"
+        legacy = [at for k, at in self._sent.items()
+                  if k.startswith(prefix) and k[len(prefix):].isdigit()]
+        return max(legacy) if legacy else None
 
     def _load(self) -> dict[str, float]:
         if self._state_path is None:
@@ -790,7 +806,7 @@ class _GuardStuckNotifier:
         delivered = 0
         for board, item in cards:
             key = self._key(board, item)
-            last = self._sent.get(key)
+            last = self._last_sent(key)
             if last is not None and now - last < self._remind:
                 continue
             if time.monotonic() >= deadline:
@@ -801,6 +817,47 @@ class _GuardStuckNotifier:
         if self._sent != before:
             self._save()
         return delivered
+
+
+# Run outcomes that end a worker mid-task: its open PR is probably unfinished.
+_UNFINISHED_RUN_OUTCOMES = frozenset({
+    "timed_out", "crashed", "rate_limited", "reclaimed", "gave_up", "spawn_failed",
+})
+
+
+def _land_verb(pr_url: str) -> Optional[str]:
+    """``fleet-merge.sh <owner/repo> <n> …`` for a GitHub PR URL, else None."""
+    import re
+
+    m = re.match(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", str(pr_url or ""))
+    if not m:
+        return None
+    return f"~/.hermes/scripts/fleet-merge.sh {m.group(1)} {m.group(2)} --by <you> --reason '<why safe>'"
+
+
+def _active_pr_detail(board: str, item: dict) -> str:
+    """Name the ONE verb the operator should run for an active_pr hold.
+
+    The hold is correct: the card's PR is open, so a respawn would duplicate
+    it. What the operator must decide is whether that PR is the finished
+    deliverable (LAND it, then complete the card) or a worker's unfinished
+    branch (REQUEUE so the worker resumes on it). The last run's outcome
+    decides the recommendation; both commands are given (r19, t_f1af5dcd).
+    """
+    outcome = item.get("last_outcome")
+    land = _land_verb(item.get("pr"))
+    unfinished = outcome in _UNFINISHED_RUN_OUTCOMES or land is None
+    lines = ["READY card held behind its open PR (active_pr >30 min)"]
+    if item.get("pr"):
+        lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")
+    if unfinished:
+        lines.append(f"Wanted: **REQUEUE** (worker resumes on its PR): `{item['clear_verb']}`")
+        if land:
+            lines.append(f"Or, if the PR is complete + CI-green, LAND it: `{land}`")
+    else:
+        lines.append(f"Wanted: **LAND** the PR if CI is green, then complete the card: `{land}`")
+        lines.append(f"Or, if it needs more work, REQUEUE: `{item['clear_verb']}`")
+    return "\n".join(lines)
 
 
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
@@ -818,15 +875,11 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
             "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
         )
     else:
-        detail = (
-            "READY card stuck behind active_pr (>30 min)\n"
-            + (f"Holding PR: {item['pr']}\n" if item.get("pr") else "")
-            + f"Operator recovery: `{item['clear_verb']}`"
-        )
+        detail = _active_pr_detail(board, item)
     message = (
         f"🛑 **Kanban dispatcher** · {detail}\n"
         f"Board: `{board}` · Card: `{item['task_id']}`\n"
-        "-# Pages once per stuck episode; reminder every 6h while it stays stuck."
+        "-# Pages once per stuck episode (active_pr: per card + PR); reminder every 6h while it stays stuck."
     )
     try:
         proc = subprocess.run(

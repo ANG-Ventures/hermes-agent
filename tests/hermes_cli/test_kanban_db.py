@@ -3899,6 +3899,34 @@ def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
         assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
 
 
+
+def test_respawn_guard_stuck_carries_last_run_outcome(kanban_home):
+    """r19 (t_f1af5dcd): the active_pr page picks REQUEUE vs LAND from the
+    card's last ended run, so the probe must report it."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="timed out mid-PR", assignee="alice")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute("UPDATE task_runs SET outcome='timed_out', status='timed_out', ended_at=? "
+                     "WHERE id=?", (now - 4000, run_id))
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, current_run_id=NULL "
+                     "WHERE id=?", (tid,))
+        conn.commit()
+        fresh = kb.create_task(conn, title="never ran", assignee="alice")
+        for t in (tid, fresh):
+            kb._append_event(conn, t, "respawn_guarded", {"reason": "active_pr",
+                                                          "pr": "https://github.com/o/r/pull/9"})
+            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND "
+                         "kind='respawn_guarded'", (now - 1861, t))
+            kb._append_event(conn, t, "respawn_guarded", {"reason": "active_pr",
+                                                          "pr": "https://github.com/o/r/pull/9"})
+        conn.commit()
+        got = {x["task_id"]: x for x in kb.respawn_guard_stuck_tasks(conn, now=now)}
+        assert got[tid]["last_outcome"] == "timed_out"
+        assert got[tid]["pr"] == "https://github.com/o/r/pull/9"
+        assert got[fresh]["last_outcome"] is None
+
 def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     """Every kind in the override set is actually emitted by kanban_db (no dead entries),
     and every operator requeue verb's event kind is in the set (no missing entries)."""

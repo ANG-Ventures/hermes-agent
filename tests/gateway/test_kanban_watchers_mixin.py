@@ -480,6 +480,55 @@ def test_guard_stuck_notifier_pages_each_guard_reason_of_one_card():
     assert sent == ["prior_worker_still_alive", "active_pr"]
 
 
+
+def test_active_pr_is_one_episode_per_card_and_pr(tmp_path):
+    """r19 (t_f1af5dcd): a restarted streak on the SAME open PR is the same
+    episode (6h reminder only); a different PR is a new one."""
+    from gateway.kanban_watchers import _GUARD_STUCK_REMIND_SECONDS, _GuardStuckNotifier
+    pr = "https://github.com/o/r/pull/9"
+    item = {"task_id": "t_x", "reason": "active_pr", "pr": pr, "guarded_since": 100, "clear_verb": "x"}
+    notifier = _GuardStuckNotifier(tmp_path / "g.json")
+    sent = []
+    send = lambda board, row: sent.append(row.get("pr")) or True
+    t0 = 10_000.0
+    assert notifier.observe([("default", item)], send, now=t0) == 1
+    assert notifier.observe([("default", {**item, "guarded_since": 5_000})], send, now=t0 + 60) == 0
+    assert notifier.observe([("default", {**item, "pr": pr + "0"})], send, now=t0 + 120) == 1
+    assert notifier.observe([("default", {**item, "guarded_since": 9})], send,
+                            now=t0 + _GUARD_STUCK_REMIND_SECONDS) == 1  # the 6h reminder
+    assert sent == [pr, pr + "0", pr]
+
+
+def test_active_pr_key_honours_pre_r19_ledger_entry(tmp_path):
+    """The deploy must not re-page every open episode once: a legacy
+    ``board|card|active_pr|<guarded_since>`` entry counts as the last page."""
+    import json
+    from gateway.kanban_watchers import _GUARD_STUCK_REMIND_SECONDS, _GuardStuckNotifier
+    state = tmp_path / "g.json"
+    state.write_text(json.dumps({"default|t_x|active_pr|1790739715": 10_000.0}))
+    item = {"task_id": "t_x", "reason": "active_pr", "pr": "https://github.com/o/r/pull/9",
+            "guarded_since": 1790739715, "clear_verb": "x"}
+    notifier = _GuardStuckNotifier(state)
+    send = lambda board, row: True
+    assert notifier.observe([("default", item)], send, now=10_000.0 + 600) == 0
+    assert notifier.observe([("default", item)], send,
+                            now=10_000.0 + _GUARD_STUCK_REMIND_SECONDS) == 1
+
+
+def test_active_pr_page_names_the_wanted_verb():
+    from gateway.kanban_watchers import _active_pr_detail
+    requeue = "hermes kanban --board default requeue t_x '<reason>'"
+    base = {"task_id": "t_x", "reason": "active_pr", "clear_verb": requeue,
+            "pr": "https://github.com/ANG-Ventures/hermes-home/pull/1838"}
+    timed_out = _active_pr_detail("default", {**base, "last_outcome": "timed_out"})
+    assert f"Wanted: **REQUEUE** (worker resumes on its PR): `{requeue}`" in timed_out
+    assert "fleet-merge.sh ANG-Ventures/hermes-home 1838 --by" in timed_out  # the alternative
+    finished = _active_pr_detail("default", {**base, "last_outcome": "completed"})
+    assert finished.index("Wanted: **LAND**") < finished.index(requeue)
+    assert "fleet-merge.sh ANG-Ventures/hermes-home 1838" in finished
+    no_pr = _active_pr_detail("default", {**base, "pr": None, "last_outcome": None})
+    assert "Wanted: **REQUEUE**" in no_pr and "fleet-merge" not in no_pr
+
 def test_guard_stuck_pages_spend_a_bounded_time_per_tick(monkeypatch):
     """FleetReview #79: each page is a subprocess.run(timeout=30), run serially
     inside the dispatcher tick with no overall bound. Past the budget the rest
