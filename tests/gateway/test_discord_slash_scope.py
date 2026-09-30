@@ -101,7 +101,7 @@ def test_prefix_fallback_is_restricted_and_command_only(tmp_path, monkeypatch):
 
 
 def test_yaml_scope_roundtrip(tmp_path, monkeypatch):
-    (tmp_path / "config.yaml").write_text("discord:\n  slash_commands:\n    - status\n    - stop\n")
+    (tmp_path / "config.yaml").write_text("platforms:\n  discord:\n    enabled: true\ndiscord:\n  slash_commands:\n    - status\n    - stop\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config = load_gateway_config()
     from gateway.config import Platform
