@@ -747,6 +747,27 @@ def _deterministic_truncate(text: str, max_tokens: int) -> str:
     return best
 
 
+def _redact_summary_input(text: str) -> str:
+    """Strip secrets and request-signing values before the summarizer sees them.
+
+    Ingest redaction (``sensitive_patterns``) is opt-in, so serialized chunks
+    reach here raw. Dense signing material (billing-header ``cch=``,
+    ``*signature`` values) trips model safeguards (``[cyber]``) and costs a
+    failed attempt per chunk; credentials in summaries persist in lcm.db
+    (t_c2107577). Values are masked, keys and narrative are kept. The L3
+    truncation below uses the same redacted text.
+    """
+    if not text:
+        return text
+    try:
+        from agent.redact import redact_signing_material, redact_sensitive_text
+    except Exception:  # vendored plugin running outside the fork
+        return text
+    return redact_signing_material(
+        redact_sensitive_text(text, force=True, redact_url_credentials=True)
+    )
+
+
 def summarize_with_escalation(
     text: str,
     source_tokens: int,
@@ -767,6 +788,7 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    text = _redact_summary_input(text)
     segment_key = _segment_key(
         text, focus_topic=focus_topic, custom_instructions=custom_instructions
     )

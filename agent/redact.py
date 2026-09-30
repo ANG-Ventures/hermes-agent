@@ -1277,6 +1277,59 @@ def redact_terminal_output(
     return redact_sensitive_text(output, force=force, code_file=code_file)
 
 
+# Request-signing material: Claude Code billing-header integrity values
+# (``cch=``, ``cc_prompt_id=``, the ``cc_version`` fingerprint suffix) and
+# ``*signature`` / ``*hmac`` values. Not credentials, so
+# ``redact_sensitive_text`` leaves them alone and live tool output keeps them
+# (relay/debug work needs the real values). At the compaction boundary they
+# only cost: a summarizer chunk dense with signing headers trips model
+# safeguards (``[cyber]``, t_c2107577) and summaries persist them.
+#
+# Left boundary: not preceded by a word char OR preceded by a JSON escape
+# (``\n``/``\t``/...), whose letter is alphanumeric and would otherwise block
+# the match in serialized bodies (serialized-payload-leak-classes §1).
+_SIGNING_LEFT = r"(?:(?<![A-Za-z0-9_])|(?<=\\[ntrbf]))"
+_SIGNING_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(_SIGNING_LEFT + r"(cch=)(?:0x)?[0-9a-fA-F]{4,16}(?![0-9A-Za-z])"),
+        r"\1***",
+    ),
+    (
+        re.compile(_SIGNING_LEFT + r"(cc_prompt_id=)[0-9a-fA-F][0-9a-fA-F-]{5,}(?![0-9A-Za-z])"),
+        r"\1***",
+    ),
+    (
+        re.compile(_SIGNING_LEFT + r"(cc_version=\d+\.\d+\.\d+)\.[0-9a-fA-F]{3}(?![0-9A-Za-z])"),
+        r"\1.***",
+    ),
+    (
+        # key (``signature``, ``x-apx-signature``, ``thinking signature``,
+        # ``hmac``), optional (escaped) quote, ``:``/``=``, optional (escaped)
+        # quote, then an opaque value containing a digit. Values without a
+        # digit (``inspect.signature``, ``${sig}``) are code, not material.
+        re.compile(
+            r"(?i)([A-Za-z0-9_-]*(?:signature|hmac)(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])?)"
+            r"(?=[A-Za-z+/=_-]*[0-9])[A-Za-z0-9+/=_-]{8,}(?![A-Za-z0-9+/=_(-])"
+        ),
+        r"\1***",
+    ),
+)
+
+
+def redact_signing_material(text: str) -> str:
+    """Mask request-signing / integrity VALUES, keeping the key and narrative.
+
+    Scoped to summarizer input and persisted summaries (the compaction
+    boundary), not live tool output. Plain digests (``sha256:...``, git SHAs)
+    are deliberately kept: they are identifiers a summary must carry.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    for pattern, replacement in _SIGNING_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in
 # the input string, the prefix regex cannot match anything, so we skip it.
 # False positives are fine (they just run the regex, which then matches
