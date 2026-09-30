@@ -22,6 +22,14 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 @pytest.fixture(autouse=True)
+def _agent_notify_on(monkeypatch):
+    """These tests pin the completion-injection mechanics, which only run when
+    display.background_process_agent_notify is on (default off since t_ec17f15f)."""
+    from gateway.run import GatewayRunner as _GR
+    monkeypatch.setattr(_GR, "_load_background_agent_notify_mode", staticmethod(lambda: "on"))
+
+
+@pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
     """Any current/future durable compatibility path must stay in tmp state."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -2504,13 +2504,14 @@ class ProcessRegistry:
             base_note += f" Uptime: {int(uptime)}s."
         if session.notify_on_complete:
             base_note += (
-                " notify_on_complete is set: you will be notified on exit — "
-                "do more work instead of waiting again."
+                " notify_on_complete is set, but exit notifications may be "
+                "off (display.background_process_agent_notify) — call "
+                "process(action='wait') again to collect the result."
             )
         else:
             base_note += (
-                " Poll again later or use terminal(background=true, "
-                "notify_on_complete=true) next time for automatic notification."
+                " Call process(action='wait', timeout=...) again to collect "
+                "the result."
             )
         if timeout_note:
             result["timeout_note"] = f"{timeout_note}. {base_note}"

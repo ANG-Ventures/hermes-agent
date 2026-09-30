@@ -12520,6 +12520,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return mode
 
     @staticmethod
+    def _load_background_agent_notify_mode() -> str:
+        """Whether a ``notify=true`` background exit injects an agent turn.
+
+        ``display.background_process_agent_notify`` (default ``off``):
+          - ``off``           — no synthetic agent turn on exit; the exit stays in
+            the process table for ``process(poll|wait|log)``. Watch patterns
+            (``notify=[...]``) are unaffected.
+          - ``empty-success`` — inject only when exit code != 0 or output is
+            non-empty.
+          - ``on``            — inject every completion (pre-2026-09-30 behavior).
+
+        Why ``off``: the injected turn invites a chat reply; the NO_REPLY hint
+        in that turn was ignored 3x (09-27, 09-29, 09-30). Bounded jobs use
+        ``process(action=wait)`` instead (Ace, 2026-09-30).
+        """
+        cfg = _load_gateway_runtime_config()
+        raw = cfg_get(cfg, "display", "background_process_agent_notify")
+        if raw is False:
+            return "off"
+        if raw is True:
+            return "on"
+        mode = str(raw).strip().lower().replace("_", "-") if raw not in {None, ""} else "off"
+        if mode not in {"off", "empty-success", "on"}:
+            logger.warning(
+                "Unknown background_process_agent_notify '%s', defaulting to 'off'", raw,
+            )
+            return "off"
+        return mode
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -34857,6 +34887,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         _out = _raw
                     _out = _redact_gateway_user_facing_secrets(_out)
+                    _agent_mode = self._load_background_agent_notify_mode()
+                    _healthy_silent = (
+                        session.exit_code == 0
+                        and (getattr(session, "completion_reason", None) or "exited") == "exited"
+                        and not _out.strip()
+                    )
+                    if _agent_mode == "off" or (_agent_mode == "empty-success" and _healthy_silent):
+                        # No synthetic agent turn, and no fall-through to a chat
+                        # send. The session stays in the registry's finished
+                        # table, so process(poll|wait|log) still reports it.
+                        logger.info(
+                            "Process watcher: %s exited (code %s); agent completion "
+                            "turn suppressed (display.background_process_agent_notify=%s)",
+                            session_id, session.exit_code, _agent_mode,
+                        )
+                        break
                     completion_evt = {
                         "type": "completion",
                         "session_id": session_id,
