@@ -600,16 +600,16 @@ def sample_cpu_busy(prev=None, block: float = 0.0):
 
 
 def count_running_workers() -> "Optional[int]":
-    """Running tasks across every board on this host (``None`` on error)."""
+    """Running tasks across every board on this host.
+
+    Each board is counted in isolation (t_ebbea874): one unreadable board,
+    the current one included, no longer hides the healthy boards' count.
+    ``None`` only when no board could be read at all.
+    """
     try:
         from hermes_cli import kanban_db as _kb
 
-        conn = _kb.connect()
-        try:
-            here = _kb.count_running_tasks(conn)
-        finally:
-            conn.close()
-        return here + _kb.count_running_tasks_other_boards(None)
+        return _kb.count_running_tasks_host()
     except Exception:
         return None
 

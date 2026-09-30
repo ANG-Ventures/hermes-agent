@@ -1177,6 +1177,7 @@ def test_no_board_enumerator_trips_the_refusal(_pin_contradiction_env):
         "kanban_db.count_running_tasks_other_boards": (
             lambda: kb.count_running_tasks_other_boards(board="pinned-board")
         ),
+        "kanban_db.count_running_tasks_host": kb.count_running_tasks_host,
         "kanban.boards_list/_board_task_counts": (
             lambda: [kc._board_task_counts(s) for s in _slugs()]
         ),

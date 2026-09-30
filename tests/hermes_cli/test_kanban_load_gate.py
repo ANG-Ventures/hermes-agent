@@ -413,6 +413,54 @@ def test_count_running_workers(kanban_home, monkeypatch):
     assert klg.count_running_workers() is None
 
 
+# -- one unreadable board must not hide the healthy ones (Prism P1 72ab3045) --
+def _corrupt_current_board_with_healthy_second(kanban_home, running_on_second):
+    kb.create_board("second")
+    with kb.connect(board="second") as conn:
+        for i in range(running_on_second):
+            tid = kb.create_task(conn, title=f"busy{i}", assignee="alpha")
+            assert kb.claim_task(conn, tid) is not None
+    # A real corrupt file, not a mocked connect(): the default board's DB.
+    kb.kanban_db_path(board=None).write_bytes(b"not a sqlite database" * 64)
+    with pytest.raises(Exception):
+        kb.connect().close()
+
+
+@pytest.mark.parametrize("running_on_second", [0, 2])
+def test_count_running_workers_isolates_unreadable_current_board(
+    kanban_home, running_on_second,
+):
+    """Red on eb4963e8: the current board's connect() raised and the whole
+    host count came back None, hiding the healthy board."""
+    _corrupt_current_board_with_healthy_second(kanban_home, running_on_second)
+    assert klg.count_running_workers() == running_on_second
+
+
+def test_unreadable_current_board_keeps_small_host_dispatching(kanban_home):
+    """The finding's scenario end to end: idle 1-core host, prior cost 2.0,
+    corrupt current board, healthy idle board -> the empty-host floor admits."""
+    _corrupt_current_board_with_healthy_second(kanban_home, 0)
+    g = LoadGate({}, ncpu=1)
+    allowance, reason = g.admit(0.1, now=0.0, running=klg.count_running_workers())
+    assert (allowance, reason) == (1, None)
+
+
+def test_count_running_workers_none_only_when_no_board_readable(
+    kanban_home, monkeypatch,
+):
+    _corrupt_current_board_with_healthy_second(kanban_home, 1)
+    monkeypatch.setattr(kb, "list_boards", lambda **k: 1 / 0)
+    assert klg.count_running_workers() is None
+
+
+def test_host_count_counts_each_db_file_once(kanban_home):
+    """Current board also appears in list_boards(): count it once."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="busy", assignee="alpha")
+        assert kb.claim_task(conn, tid) is not None
+    assert kb.count_running_tasks_host() == 1
+
+
 # -- small hosts: floor() must not starve an empty host (Prism P1 c966b642) --
 @pytest.mark.parametrize("ncpu,load1", [(1, 0.1), (2, 0.1), (2, 1.5)])
 def test_empty_small_host_admits_one_worker(ncpu, load1):

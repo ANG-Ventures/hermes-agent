@@ -22046,11 +22046,69 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
     except Exception:
         current_path = None
+    return _scan_running_tasks({current_path} if current_path else set())[0]
+
+
+def count_running_tasks_host() -> Optional[int]:
+    """Total ``running`` tasks across EVERY board on this host.
+
+    The load gate's host-wide worker count (t_ebbea874). The current board
+    is counted in its own isolation domain, like every other board: an
+    unreadable current board used to abort the whole count (``None``), so
+    an idle small host with one corrupt board never got its empty-host
+    admission floor and stopped dispatching the healthy boards too.
+
+    Each DB file is counted once (``HERMES_KANBAN_DB`` pins every slug to one
+    file). Returns ``None`` only when NO board could be read, so a caller
+    that needs a KNOWN count (the empty-host floor) never guesses.
+    """
+    total, readable = 0, 0
+    try:
+        current_path: Optional[str] = str(
+            kanban_db_path(board=None).expanduser().resolve()
+        )
+    except Exception:
+        current_path = None
+    try:
+        conn = connect()
+        try:
+            total += _count_running_strict(conn)
+            readable += 1
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    other, other_readable = _scan_running_tasks(
+        {current_path} if current_path else set()
+    )
+    total += other
+    readable += other_readable
+    return total if readable else None
+
+
+def _count_running_strict(conn: sqlite3.Connection) -> int:
+    """``count_running_tasks`` that RAISES on a broken board (no fail-open)."""
+    return int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+
+
+def _scan_running_tasks(skip_paths: "set[str]") -> "tuple[int, int]":
+    """``(running_total, boards_read)`` over every non-archived board.
+
+    Per-board failure isolation: a board that cannot be opened or queried
+    contributes nothing and is not counted as read. Boards whose resolved DB
+    path is in ``skip_paths``, or was already counted, are skipped.
+    """
     try:
         boards = list_boards(include_archived=False)
     except Exception:
-        return 0
-    total = 0
+        return 0, 0
+    seen = set(skip_paths)
+    total, readable = 0, 0
     # Extent spans each loop body (belt and braces with the inner
     # ``enumerating_boards()`` below, which stays so a direct call to this
     # helper is covered too).
@@ -22063,13 +22121,15 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
             with enumerating_boards():
                 path = kanban_db_path(board=slug).expanduser()
                 resolved = str(path.resolve())
-                if current_path is not None and resolved == current_path:
+                if resolved in seen:
                     continue
+                seen.add(resolved)
                 if not path.exists():
                     continue
                 other = connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                total += _count_running_strict(other)
+                readable += 1
             finally:
                 try:
                     other.close()
@@ -22077,7 +22137,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                     pass
         except Exception:
             continue
-    return total
+    return total, readable
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
