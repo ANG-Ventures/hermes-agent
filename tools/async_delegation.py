@@ -1679,6 +1679,16 @@ def dispatch_async_delegation_batch(
                         _child_status(child) for child in child_results
                     ) if status is not None
                 ]
+                # delegate_task's batch runner joins every timed_out_running
+                # child (join_late) before returning, so a unit must never
+                # reach here with one still live. If one does, name it: its
+                # result lands only in the durable late-result record.
+                if "timed_out_running" in votes:
+                    logger.warning(
+                        "async_delegation_batch_open_children delegation_id=%s "
+                        "live=%d (late results: delegate_task action='list')",
+                        delegation_id, votes.count("timed_out_running"),
+                    )
                 all_failed = bool(votes) and all(
                     # timed_out_running = still working, never a failure.
                     status not in ("completed", "success", "timed_out_running")

@@ -581,6 +581,15 @@ def _handle_control_action(
             "count": len(entries),
             "subagents": entries,
         }
+        # Durable results of children that finished after a
+        # timed_out_running wait (the parent steer is only a nudge).
+        try:
+            _late = _owned_late_results(parent_agent)
+        except Exception:
+            logger.debug("late result listing failed", exc_info=True)
+            _late = []
+        if _late:
+            payload["late_results"] = _late
         if not entries:
             payload["note"] = (
                 "No live subagents right now. Children that already finished "
@@ -2843,6 +2852,193 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
 
 _LATE_RESULT_MAX_CHARS = 8000
 
+# Durable record of every TIMED_OUT_RUNNING child's late result. A steer into
+# the parent is only a nudge: it is lost when the parent is idle, finished or
+# interrupted (steer() refuses or raises). The record is written to
+# cache/delegation/late/<late_result_id>.json and mirrored in memory, and
+# delegate_task(action='list') returns it as ``late_results`` so the owning
+# conversation can always read the result.
+_late_results: Dict[str, Dict[str, Any]] = {}
+_late_handles: Dict[str, "_LateCompletion"] = {}
+_late_results_lock = threading.Lock()
+_LATE_RESULTS_CAP = 64
+_LATE_RESULT_RETENTION_SECONDS = 7 * 86400
+_LATE_LIST_LIMIT = 20
+
+
+class _LateCompletion:
+    """Handle for one TIMED_OUT_RUNNING child's late-completion thread."""
+
+    def __init__(self, late_result_id: str, *, absorbed: bool = False) -> None:
+        self.late_result_id = late_result_id
+        # True when an async batch/recovery unit joins this child and carries
+        # its result in the unit's own completion event (no parent steer).
+        self.absorbed = absorbed
+        self.done = threading.Event()
+        self.entry: Optional[Dict[str, Any]] = None
+        self.result_path: Optional[str] = None
+
+
+def _late_results_dir():
+    from hermes_constants import get_hermes_dir
+
+    return get_hermes_dir("cache/delegation", "delegation_cache") / "late"
+
+
+def _public_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-safe copy of a result entry without private ``_`` keys."""
+    out = {k: v for k, v in entry.items() if not str(k).startswith("_")}
+    try:
+        json.dumps(out, ensure_ascii=False)
+        return out
+    except (TypeError, ValueError):
+        return json.loads(json.dumps(out, ensure_ascii=False, default=str))
+
+
+def _record_late_result(
+    handle: "_LateCompletion",
+    entry: Dict[str, Any],
+    *,
+    child: Any,
+    parent_agent: Any,
+) -> Optional[str]:
+    """Persist a late result (file + in-memory mirror). Returns the file path."""
+    owner_sid = str(getattr(child, "_parent_session_id", "") or "") or str(
+        getattr(parent_agent, "session_id", "") or ""
+    )
+    record: Dict[str, Any] = {
+        "late_result_id": handle.late_result_id,
+        "owner_agent_session_id": owner_sid or None,
+        "finished_at": time.time(),
+        "absorbed_by_batch": handle.absorbed,
+        "entry": _public_entry(entry),
+    }
+    path_str: Optional[str] = None
+    try:
+        d = _late_results_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{handle.late_result_id}.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        path_str = str(path)
+        cutoff = time.time() - _LATE_RESULT_RETENTION_SECONDS
+        for old in d.glob("*.json"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+    except Exception:
+        logger.warning(
+            "delegate_task late result %s could not be written to disk; "
+            "in-memory record only",
+            handle.late_result_id,
+            exc_info=True,
+        )
+    with _late_results_lock:
+        _late_results[handle.late_result_id] = {
+            **record,
+            "result_path": path_str,
+            "agent": child,
+        }
+        while len(_late_results) > _LATE_RESULTS_CAP:
+            _late_results.pop(next(iter(_late_results)), None)
+    handle.result_path = path_str
+    return path_str
+
+
+def _owned_late_results(parent_agent: Any) -> List[Dict[str, Any]]:
+    """Late results owned by *parent_agent*'s conversation (memory + disk)."""
+    with _late_results_lock:
+        records = {k: dict(v) for k, v in _late_results.items()}
+    try:
+        files = sorted(
+            _late_results_dir().glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:200]
+    except Exception:
+        files = []
+    for p in files:
+        rid = p.stem
+        if rid in records:
+            continue
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("entry"), dict):
+            rec["result_path"] = str(p)
+            records[rid] = rec
+    out: List[Dict[str, Any]] = []
+    for rid, rec in records.items():
+        probe = {
+            "agent": rec.get("agent"),
+            "owner_agent_session_id": rec.get("owner_agent_session_id"),
+        }
+        if not _owns_subagent_record(probe, parent_agent):
+            continue
+        entry = rec.get("entry") or {}
+        summary = entry.get("summary")
+        if isinstance(summary, str) and len(summary) > _LATE_RESULT_MAX_CHARS:
+            summary = summary[:_LATE_RESULT_MAX_CHARS] + " …[truncated; see result_path]"
+        item: Dict[str, Any] = {
+            "late_result_id": rid,
+            "subagent_id": entry.get("subagent_id"),
+            "task_index": entry.get("task_index"),
+            "status": entry.get("status"),
+            "summary": summary,
+            "finished_at": rec.get("finished_at"),
+            "result_path": rec.get("result_path"),
+        }
+        for k in ("error", "missed_steer", "schema_valid", "schema_retries", "schema_errors"):
+            if k in entry:
+                item[k] = entry[k]
+        out.append(item)
+    out.sort(key=lambda r: r.get("finished_at") or 0, reverse=True)
+    return out[:_LATE_LIST_LIMIT]
+
+
+def _activity_agents(child: Any) -> List[Any]:
+    return [child] + [
+        r.get("agent") for r in _live_subtree_records(child) if r.get("agent") is not None
+    ]
+
+
+def _progress_signature(child: Any) -> Tuple[Any, ...]:
+    """(api calls, current tool, activity ts) of the child and its live subtree."""
+    sig = []
+    for a in _activity_agents(child):
+        try:
+            s = a.get_activity_summary()
+            sig.append(
+                (id(a), s.get("api_call_count"), s.get("current_tool"), s.get("last_activity_ts"))
+            )
+        except Exception:
+            sig.append((id(a), None, None, None))
+    return tuple(sig)
+
+
+def _subtree_idle_seconds(child: Any) -> float:
+    """Seconds since the most recent activity anywhere in the child's subtree.
+
+    0.0 when no agent reports a numeric ``last_activity_ts`` (unknown is
+    treated as active, never as hung).
+    """
+    idles = []
+    now = time.time()
+    for a in _activity_agents(child):
+        try:
+            ts = a.get_activity_summary().get("last_activity_ts")
+        except Exception:
+            ts = None
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            idles.append(max(0.0, now - float(ts)))
+        else:
+            return 0.0
+    return min(idles) if idles else 0.0
+
 
 def _timed_out_running_entry(
     *,
@@ -2854,9 +3050,11 @@ def _timed_out_running_entry(
 ) -> Optional[Dict[str, Any]]:
     """Result entry for a wait that timed out while the child still works.
 
-    Returns None for a child that never reached its first LLM call and has
-    no live descendants: that is a wedge, handled by the timeout+diagnostic
-    failure path (#14726), not live work.
+    Returns None (the timeout+diagnostic failure path) for a child that is
+    not working: one that never reached its first LLM call and has no live
+    descendants (#14726 wedge), or one whose whole subtree has shown no
+    activity for child_timeout seconds (hung, e.g. blocked after its first
+    API call). Only a child with recent activity is TIMED_OUT_RUNNING.
     """
     api_calls = 0
     try:
@@ -2865,6 +3063,13 @@ def _timed_out_running_entry(
         pass
     below = _live_subtree_records(child)
     if api_calls == 0 and not below:
+        return None
+    if child_timeout and _subtree_idle_seconds(child) >= float(child_timeout):
+        logger.info(
+            "delegate_task hung at timeout: subagent=%s idle>=%ss",
+            subagent_id,
+            child_timeout,
+        )
         return None
     live = [
         {
@@ -2910,12 +3115,90 @@ def _timed_out_running_entry(
         "note": (
             f"Timed out ≠ dead: the wait hit {child_timeout}s but the subagent "
             "and the listed descendants are STILL RUNNING. Do NOT re-delegate "
-            "the same task (that runs a second tree concurrently). Its result "
-            "is delivered to you when it finishes; meanwhile use "
-            "delegate_task(action='list'|'steer'|'stop') with the ids above."
+            "the same task (that runs a second tree concurrently). When it "
+            "finishes its result is recorded durably (late_result_path, and "
+            "delegate_task(action='list') under late_results) and you are "
+            "nudged; meanwhile use delegate_task(action='list'|'steer'|'stop') "
+            "with the ids above. A subagent that stops making progress for "
+            f"{child_timeout}s is stopped and reported as timeout."
         ),
         "_child_role": getattr(child, "_delegate_role", None),
     }
+
+
+def _apply_output_schema(
+    child: Any,
+    result: Dict[str, Any],
+    *,
+    task_index: int,
+    child_task_id: Optional[str],
+    stream_callback: Any,
+) -> Tuple[Optional[bool], List[str], int]:
+    """T1-24 structured-output validation + ONE bounded correction retry.
+
+    Shared by the normal completion path and the late (timed_out_running)
+    path so both enforce the same contract. Mutates *result* in place with
+    the retry turn's answer/api_calls/messages. Returns
+    ``(schema_valid, schema_errors, schema_retries)``; ``(None, [], 0)``
+    when no schema was attached at dispatch.
+    """
+    output_schema = getattr(child, "_delegate_output_schema", None)
+    if not isinstance(output_schema, dict):
+        return None, [], 0
+    from tools.delegation_output_schema import (
+        build_retry_message,
+        validate_output,
+    )
+
+    first_text = result.get("final_response") or ""
+    schema_valid, schema_errors = validate_output(first_text, output_schema)
+    retries = 0
+    if (
+        not schema_valid
+        and first_text.strip()
+        and not result.get("interrupted", False)
+    ):
+        # Exactly one retry turn, carrying the validation errors verbatim
+        # (no schema re-paste — the child already holds the contract).
+        retries = 1
+        retry_result = None
+        try:
+            retry_result = child.run_conversation(
+                user_message=build_retry_message(schema_errors),
+                task_id=child_task_id,
+                stream_callback=stream_callback,
+            )
+        except Exception as retry_exc:
+            logger.warning(
+                "Subagent %d schema-retry turn failed: %s",
+                task_index,
+                retry_exc,
+            )
+        if isinstance(retry_result, dict):
+            retry_text = retry_result.get("final_response") or ""
+            if retry_text.strip():
+                result["final_response"] = retry_text
+            try:
+                result["api_calls"] = int(result.get("api_calls", 0) or 0) + int(
+                    retry_result.get("api_calls", 0) or 0
+                )
+            except (TypeError, ValueError):
+                pass
+            retry_messages = retry_result.get("messages")
+            if isinstance(retry_messages, list) and isinstance(
+                result.get("messages"), list
+            ):
+                result["messages"] = result["messages"] + retry_messages
+            retry_pending = retry_result.get("pending_steer")
+            if isinstance(retry_pending, str) and retry_pending.strip():
+                prior = result.get("pending_steer")
+                result["pending_steer"] = (
+                    f"{prior}\n{retry_pending}"
+                    if isinstance(prior, str) and prior
+                    else retry_pending
+                )
+            schema_valid, schema_errors = validate_output(retry_text, output_schema)
+    return schema_valid, schema_errors, retries
 
 
 def _start_late_completion(
@@ -2929,33 +3212,149 @@ def _start_late_completion(
     child_progress_cb: Any,
     child_pool: Any,
     leased_cred_id: Any,
-) -> threading.Thread:
-    """Own a TIMED_OUT_RUNNING child until it ends, then deliver its result.
+    child_timeout: Optional[float] = None,
+    child_task_id: Optional[str] = None,
+    stream_callback: Any = None,
+) -> "_LateCompletion":
+    """Own a TIMED_OUT_RUNNING child until it ends (or hangs), then deliver.
 
-    Delivery uses the normal completion surfaces: the subagent.complete
-    progress event, the live transcript terminal marker + manifest, and a
-    steer into the parent agent (appended to its next tool result, so no
-    message is spliced and the prompt cache holds). Then the per-child
-    teardown the owner skipped runs here.
+    - Hang ceiling: the child and its live subtree must keep making progress
+      (api calls / current tool / activity timestamp). No progress for
+      child_timeout seconds → stop it, reap its subtree, report ``timeout``,
+      release its lease.
+    - Same contract as the normal path: output_schema validation with one
+      bounded retry, and any steer the child accepted but never consumed is
+      reported as ``missed_steer``.
+    - Durable delivery: the result is recorded on disk + in memory (read via
+      action='list' → late_results) BEFORE the parent steer, which is only a
+      nudge. An async unit that joins this child (``absorbed``) carries the
+      result in its own completion event instead of the steer.
     """
+    import uuid as _uuid
+
+    late_id = f"late-{subagent_id or task_index}-{_uuid.uuid4().hex[:8]}"
+    handle = _LateCompletion(
+        late_id, absorbed=getattr(child, "_delegate_join_late", False) is True
+    )
+    with _late_results_lock:
+        _late_handles[late_id] = handle
+    ceiling = float(child_timeout) if child_timeout else None
 
     def _late() -> None:
         error: Optional[str] = None
         result: Dict[str, Any] = {}
+        hung = False
         try:
-            raw = child_future.result()
+            if ceiling is None:
+                raw = child_future.result()
+            else:
+                poll = max(0.05, min(5.0, ceiling / 4.0))
+                last_sig = _progress_signature(child)
+                last_progress = time.monotonic() - min(
+                    _subtree_idle_seconds(child), ceiling
+                )
+                while True:
+                    try:
+                        raw = child_future.result(timeout=poll)
+                        break
+                    except (FuturesTimeoutError, TimeoutError):
+                        if child_future.done():
+                            continue
+                        now = time.monotonic()
+                        sig = _progress_signature(child)
+                        if sig != last_sig:
+                            last_sig, last_progress = sig, now
+                        elif now - last_progress >= ceiling:
+                            hung = True
+                            raw = None
+                            break
             result = raw if isinstance(raw, dict) else {}
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-        summary = str(result.get("final_response") or "").strip()
-        if error:
+
+        if hung:
+            # Alive but stuck: bound it exactly like the wait-time failure.
+            pending_steer = (
+                _close_subagent_steering(subagent_id, child) if subagent_id else None
+            )
+            try:
+                if not request_hard_interrupt(
+                    child, f"Subagent hung (no progress for {ceiling}s)"
+                ) and hasattr(child, "_interrupt_requested"):
+                    child._interrupt_requested = True
+            except Exception:
+                pass
+            _reap_subtree(child, "hung")
+            try:
+                child_future.result(timeout=min(ceiling, 5.0))
+            except Exception:
+                pass
+            api_calls = 0
+            try:
+                api_calls = int(child.get_activity_summary().get("api_call_count", 0) or 0)
+            except Exception:
+                pass
+            error = (
+                f"Subagent hung: no progress for {ceiling}s after it was "
+                f"reported {TIMED_OUT_RUNNING}; it was stopped and its "
+                "credential lease released."
+            )
+            result = {"api_calls": api_calls}
+            logger.warning(
+                "delegate_task hung child reaped: subagent=%s ceiling=%ss",
+                subagent_id,
+                ceiling,
+            )
+        else:
+            schema_valid: Optional[bool] = None
+            schema_errors: List[str] = []
+            schema_retries = 0
+            if error is None:
+                try:
+                    schema_valid, schema_errors, schema_retries = _apply_output_schema(
+                        child,
+                        result,
+                        task_index=task_index,
+                        child_task_id=child_task_id,
+                        stream_callback=stream_callback,
+                    )
+                except Exception:
+                    logger.warning("late schema validation failed", exc_info=True)
+            # Same linearization boundary as the normal path: close steering
+            # and keep any accepted-but-unconsumed text.
+            pending_steer = (
+                _close_subagent_steering(subagent_id, child) if subagent_id else None
+            )
+            finalizer_pending = result.get("pending_steer")
+            if isinstance(finalizer_pending, str) and finalizer_pending.strip():
+                pending_steer = (
+                    f"{finalizer_pending}\n{pending_steer}"
+                    if pending_steer
+                    else finalizer_pending
+                )
+
+        summary = str(result.get("final_response") or "")
+        if hung:
+            status = "timeout"
+        elif error:
             status = "error"
         elif result.get("interrupted"):
             status = "interrupted"
-        elif summary and result.get("completed", True) is not False:
+        elif summary and summary.strip() != "(empty)":
             status = "completed"
         else:
             status = "failed"
+        if hung or error:
+            exit_reason = "timeout" if hung else "error"
+        elif result.get("interrupted"):
+            exit_reason = "interrupted"
+        elif result.get("completed", False):
+            exit_reason = "completed"
+        else:
+            exit_reason = "max_iterations"
+        _model = getattr(child, "model", None)
+        _cost = getattr(child, "session_estimated_cost_usd", 0.0)
+        _cost = float(_cost) if isinstance(_cost, (int, float)) else 0.0
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "subagent_id": subagent_id,
@@ -2963,12 +3362,39 @@ def _start_late_completion(
             "summary": summary or None,
             "api_calls": result.get("api_calls", 0),
             "duration_seconds": round(time.monotonic() - child_start, 2),
+            "model": _model if isinstance(_model, str) else None,
+            "exit_reason": exit_reason,
+            "truncated": exit_reason == "max_iterations",
             "after": TIMED_OUT_RUNNING,
+            "late_result_id": late_id,
+            "cost_usd": round(_cost, 6),
+            "_child_role": getattr(child, "_delegate_role", None),
+            "_child_cost_usd": _cost,
         }
+        if hung:
+            entry["timeout_seconds"] = ceiling
+            entry["timeout_phase"] = "hung_after_timed_out_running"
         if error:
             entry["error"] = error
-            # A genuine failure of this child: reap whatever it spawned.
-            _reap_subtree(child, "error")
+            if not hung:
+                # A genuine failure of this child: reap whatever it spawned.
+                _reap_subtree(child, "error")
+        elif status == "failed":
+            entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if not hung and isinstance(getattr(child, "_delegate_output_schema", None), dict):
+            entry["schema_valid"] = bool(schema_valid)
+            if schema_retries:
+                entry["schema_retries"] = schema_retries
+            if not schema_valid and schema_errors:
+                entry["schema_errors"] = schema_errors
+        if isinstance(pending_steer, str) and pending_steer.strip():
+            entry["missed_steer"] = pending_steer
+            note = (
+                "[steer did not land — the subagent finished before it could "
+                f"be delivered: {pending_steer}]"
+            )
+            entry["summary"] = f"{summary}\n\n{note}" if summary else note
+
         if child_progress_cb:
             try:
                 child_progress_cb(
@@ -2980,56 +3406,96 @@ def _start_late_completion(
                 )
             except Exception as exc:
                 logger.debug("late subagent.complete relay failed: %s", exc)
-        writer = getattr(child, "_live_writer", None)
-        if writer is not None:
+        if not handle.absorbed:
+            # An absorbing async unit finalizes transcript + manifest itself.
+            writer = getattr(child, "_live_writer", None)
+            if writer is not None:
+                try:
+                    writer.finalize(entry)
+                except Exception:
+                    logger.debug("late live transcript finalize failed", exc_info=True)
             try:
-                writer.finalize(entry)
-            except Exception:
-                logger.debug("late live transcript finalize failed", exc_info=True)
-        try:
-            from tools.delegation_live_log import update_manifest_statuses
+                from tools.delegation_live_log import update_manifest_statuses
 
-            deleg_id = getattr(child, "_delegation_id", None)
-            if isinstance(deleg_id, str):
-                update_manifest_statuses(deleg_id, [entry])
-        except Exception:
-            logger.debug("late manifest update failed", exc_info=True)
+                deleg_id = getattr(child, "_delegation_id", None)
+                if isinstance(deleg_id, str):
+                    update_manifest_statuses(deleg_id, [entry])
+            except Exception:
+                logger.debug("late manifest update failed", exc_info=True)
         try:
             _release_child_resources(
                 child, parent_agent, subagent_id, child_pool, leased_cred_id
             )
         except Exception:
             logger.debug("late child teardown failed", exc_info=True)
-        body = summary or error or "(no final response)"
-        if len(body) > _LATE_RESULT_MAX_CHARS:
-            body = body[:_LATE_RESULT_MAX_CHARS] + " …[truncated; see live transcript]"
-        transcript = getattr(child, "_live_transcript_path", None)
-        text = (
-            f"[delegate_task late result] subagent {subagent_id} (task "
-            f"{task_index}), earlier reported {TIMED_OUT_RUNNING}, has "
-            f"finished: status={status}."
-            + (f" Transcript: {transcript}." if transcript else "")
-            + f"\n{body}"
-        )
+
+        # Durable first: the steer below is only a nudge and can be lost.
+        path = _record_late_result(handle, entry, child=child, parent_agent=parent_agent)
+        handle.entry = entry
+        handle.done.set()
+        if not handle.absorbed:
+            with _late_results_lock:
+                _late_handles.pop(late_id, None)
+
         delivered = False
-        steer = getattr(parent_agent, "steer", None)
-        if callable(steer):
-            try:
-                delivered = bool(steer(text))
-            except Exception as exc:
-                logger.debug("late result steer into parent failed: %s", exc)
+        if not handle.absorbed:
+            body = entry.get("summary") or error or "(no final response)"
+            if len(body) > _LATE_RESULT_MAX_CHARS:
+                body = body[:_LATE_RESULT_MAX_CHARS] + " …[truncated; see result file]"
+            transcript = getattr(child, "_live_transcript_path", None)
+            text = (
+                f"[delegate_task late result] subagent {subagent_id} (task "
+                f"{task_index}), earlier reported {TIMED_OUT_RUNNING}, has "
+                f"finished: status={status}."
+                + (f" Result: {path}." if path else "")
+                + (f" Transcript: {transcript}." if transcript else "")
+                + f"\n{body}"
+            )
+            steer = getattr(parent_agent, "steer", None)
+            if callable(steer):
+                try:
+                    delivered = bool(steer(text))
+                except Exception as exc:
+                    logger.debug("late result steer into parent failed: %s", exc)
         logger.info(
-            "delegate_task late completion: subagent=%s status=%s delivered=%s",
+            "delegate_task late completion: subagent=%s status=%s recorded=%s "
+            "nudged=%s absorbed=%s",
             subagent_id,
             status,
+            path or "memory-only",
             delivered,
+            handle.absorbed,
         )
 
     t = threading.Thread(
         target=_late, name=f"delegate-late-{subagent_id or task_index}", daemon=True
     )
     t.start()
-    return t
+    return handle
+
+
+def _join_late_result(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace a TIMED_OUT_RUNNING entry with the child's real late result.
+
+    Used by async/recovery units, which must not finalize while a child is
+    still live. Bounded: the late thread's hang ceiling ends a stuck child.
+    """
+    if entry.get("status") != TIMED_OUT_RUNNING:
+        return entry
+    with _late_results_lock:
+        handle = _late_handles.get(str(entry.get("late_result_id") or ""))
+    if handle is None:
+        logger.warning(
+            "delegate_task: no late-completion handle for %s; unit carries "
+            "timed_out_running", entry.get("subagent_id"),
+        )
+        return entry
+    handle.done.wait()
+    with _late_results_lock:
+        _late_handles.pop(handle.late_result_id, None)
+    late = dict(handle.entry or {})
+    late["task_index"] = entry.get("task_index", late.get("task_index"))
+    return late
 
 
 def _run_single_child(
@@ -3461,7 +3927,7 @@ def _run_single_child(
                 )
                 if _tor_entry is not None:
                     _detached[0] = True
-                    _start_late_completion(
+                    _late_handle = _start_late_completion(
                         _child_future,
                         child=child,
                         parent_agent=parent_agent,
@@ -3471,7 +3937,17 @@ def _run_single_child(
                         child_progress_cb=child_progress_cb,
                         child_pool=child_pool,
                         leased_cred_id=leased_cred_id,
+                        child_timeout=child_timeout,
+                        child_task_id=child_task_id,
+                        stream_callback=_relay_child_text,
                     )
+                    _tor_entry["late_result_id"] = _late_handle.late_result_id
+                    try:
+                        _tor_entry["late_result_path"] = str(
+                            _late_results_dir() / f"{_late_handle.late_result_id}.json"
+                        )
+                    except Exception:
+                        pass
                     return _tor_entry
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
@@ -3602,59 +4078,13 @@ def _run_single_child(
         # Pattern from: github/copilot-cli ctx.agent(prompt, {schema}) —
         # PATTERN ONLY, no code copied.
         _output_schema = getattr(child, "_delegate_output_schema", None)
-        _schema_valid: Optional[bool] = None
-        _schema_errors: List[str] = []
-        _schema_retries = 0
-        if isinstance(_output_schema, dict):
-            from tools.delegation_output_schema import (
-                build_retry_message,
-                validate_output,
-            )
-
-            _first_text = result.get("final_response") or ""
-            _schema_valid, _schema_errors = validate_output(
-                _first_text, _output_schema
-            )
-            if (
-                not _schema_valid
-                and _first_text.strip()
-                and not result.get("interrupted", False)
-            ):
-                # Exactly one retry turn, carrying the validation errors
-                # verbatim (no schema re-paste — the child already holds
-                # the contract in its context).
-                _schema_retries = 1
-                _retry_result = None
-                try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
-                except Exception as _retry_exc:
-                    logger.warning(
-                        "Subagent %d schema-retry turn failed: %s",
-                        task_index,
-                        _retry_exc,
-                    )
-                if isinstance(_retry_result, dict):
-                    _retry_text = _retry_result.get("final_response") or ""
-                    if _retry_text.strip():
-                        result["final_response"] = _retry_text
-                    try:
-                        result["api_calls"] = int(
-                            result.get("api_calls", 0) or 0
-                        ) + int(_retry_result.get("api_calls", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
-                    _retry_messages = _retry_result.get("messages")
-                    if isinstance(_retry_messages, list) and isinstance(
-                        result.get("messages"), list
-                    ):
-                        result["messages"] = result["messages"] + _retry_messages
-                    _schema_valid, _schema_errors = validate_output(
-                        _retry_text, _output_schema
-                    )
+        _schema_valid, _schema_errors, _schema_retries = _apply_output_schema(
+            child,
+            result,
+            task_index=task_index,
+            child_task_id=child_task_id,
+            stream_callback=_relay_child_text,
+        )
 
         # Linearization boundary for registry steering. From this point on the
         # child cannot consume another steer. Closing under the registry lock
@@ -4929,7 +5359,9 @@ def delegate_task(
     if audit_reason:
         logger.info("flagship override: delegate_task model=%s provider=%s reason=%s", model, provider, audit_reason)
 
-    def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
+    def _execute_and_aggregate(
+        *, honor_parent_interrupt: bool = True, join_late: bool = False
+    ) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
         dict. Used by BOTH the synchronous path and the background runner. In
@@ -4938,7 +5370,18 @@ def delegate_task(
         here (all children must finish) before producing ONE consolidated
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
+
+        ``join_late``: the caller is an async/recovery unit whose completion
+        event is the only delivery. It must not finalize while a
+        timed_out_running child is still live, so each such entry is replaced
+        by that child's real late result (bounded by the hang ceiling).
         """
+        if join_late:
+            for _ji, _jt, _jc in children:
+                try:
+                    _jc._delegate_join_late = True
+                except Exception:
+                    pass
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
@@ -5090,6 +5533,9 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        if join_late:
+            results[:] = [_join_late_result(_e) for _e in results]
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's
@@ -5247,7 +5693,9 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(honor_parent_interrupt=False)
+            return _execute_and_aggregate(
+                honor_parent_interrupt=False, join_late=True
+            )
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -5431,7 +5879,11 @@ def delegate_task(
         return json.dumps(_cap_result, ensure_ascii=False)
 
     # ----- Synchronous path -----
-    return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+    # A recovered async unit (_recovery_spec) delivers only via its own
+    # completion event, so it joins timed_out_running children too.
+    return json.dumps(
+        _execute_and_aggregate(join_late=bool(_recovery_spec)), ensure_ascii=False
+    )
 
 
 def _resolve_child_credential_pool(
