@@ -5425,7 +5425,10 @@ class TurnRunner:
         from agent.chat_completion_helpers import format_chat_pin_notice
         from gateway.response_filters import is_intentional_silence_agent_result
 
-        if not final_response or is_intentional_silence_agent_result(result, final_response):
+        if not final_response or is_intentional_silence_agent_result(
+            result, final_response,
+            internal=self._ctx.persist_user_display_kind == "internal_notification",
+        ):
             return
         store = getattr(self._runner, "session_store", None)
         if getattr(type(store), "lookup_chat_model_pin", None) is None:
@@ -6777,6 +6780,13 @@ class TurnRunner:
                             ctx.source, _scfg, _adapter,
                             on_missing_cursor="raise",
                         )
+                    )
+                    # Internal-event turns (bg-process completions) resolve
+                    # silence with the autonomous rule; hold their preview
+                    # until the final text is known so a "note + NO_REPLY"
+                    # never flashes on screen.
+                    _consumer_cfg.internal_event = (
+                        ctx.persist_user_display_kind == "internal_notification"
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -28097,8 +28107,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = ""
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
+                # Internal events (bg-process completions, restore replays)
+                # have no human waiting: autonomous rule, so a short note +
+                # NO_REPLY on its own line is suppressed.  Human turns stay
+                # exact-marker.
                 _intentional_silence = is_intentional_silence_agent_result(
                     agent_result, response,
+                    internal=bool(getattr(event, "internal", False)),
                 )
             except Exception:
                 _intentional_silence = False
@@ -39220,6 +39235,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         from gateway.response_filters import is_intentional_silence_agent_result
                         _intentional_silence = is_intentional_silence_agent_result(
                             _delivery_result, first_response,
+                            internal=persist_user_display_kind == "internal_notification",
                         )
                     except Exception:
                         _intentional_silence = False

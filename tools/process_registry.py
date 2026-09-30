@@ -3417,13 +3417,15 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
     return line
 
 
-# Appended to every agent-facing background-completion turn. The gateway drops a
-# reply that is exactly NO_REPLY (gateway/response_filters.SILENT_REPLY_TOKEN), but
-# the model only uses it if the injected turn says so — without this line agents
-# answer their own completions with "already handled" posts (Ace, 2026-09-27).
+# Appended to every agent-facing background-completion turn. These arrive as
+# internal events, whose replies the gateway drops when NO_REPLY
+# (gateway/response_filters.SILENT_REPLY_TOKEN) is the whole reply or sits on its
+# own first/last line (is_autonomous_silence_response), but the model only uses it
+# if the injected turn says so — without this line agents answer their own
+# completions with "already handled" posts (Ace, 2026-09-27).
 COMPLETION_SILENCE_HINT = (
     "If this result is already reported or changes nothing for the user, "
-    "reply with exactly NO_REPLY — nothing will be posted."
+    "end your reply with NO_REPLY on its own line — nothing will be posted."
 )
 
 

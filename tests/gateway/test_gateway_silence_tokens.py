@@ -165,6 +165,108 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     assert response == text
 
 
+# --------------------------------------------------------------------------
+# Internal-event turns (bg-process completions, restore replays) resolve
+# silence with the autonomous rule; human turns stay exact-marker.
+# --------------------------------------------------------------------------
+
+_NOTE_THEN_MARKER = (
+    "That's the #176 CI watch confirming green — already merged on that "
+    "result. No new information.\n\nNO_REPLY"
+)
+
+
+def _internal_event():
+    return MessageEvent(
+        text="[Background process proc_1 finished with exit code 0]",
+        source=_source(),
+        internal=True,
+    )
+
+
+def _agent_result(text, *, failed=False):
+    return {
+        "final_response": text,
+        "messages": [
+            {"role": "user", "content": "completion"},
+            {"role": "assistant", "content": text},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": failed,
+    }
+
+
+def test_internal_flag_selects_autonomous_rule_and_failure_still_wins():
+    ok = {"failed": False}
+    assert is_intentional_silence_agent_result(ok, _NOTE_THEN_MARKER, internal=True)
+    assert not is_intentional_silence_agent_result(ok, _NOTE_THEN_MARKER)
+    assert not is_intentional_silence_agent_result(
+        {"failed": True}, _NOTE_THEN_MARKER, internal=True,
+    )
+    # Exact markers are silence under both rules.
+    assert is_intentional_silence_agent_result(ok, "NO_REPLY", internal=True)
+
+
+@pytest.mark.asyncio
+async def test_internal_event_note_plus_marker_is_suppressed(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_agent_result(_NOTE_THEN_MARKER))
+
+    response = await runner._handle_message_with_agent(
+        _internal_event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+    # Transcript still records the assistant turn (delivery-only decision).
+    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    assert appended[-1].get("content") == _NOTE_THEN_MARKER
+
+
+@pytest.mark.asyncio
+async def test_human_turn_note_plus_marker_is_delivered(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_agent_result(_NOTE_THEN_MARKER))
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == _NOTE_THEN_MARKER
+
+
+@pytest.mark.asyncio
+async def test_internal_event_failed_turn_with_marker_is_delivered(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value=_agent_result(_NOTE_THEN_MARKER, failed=True),
+    )
+
+    response = await runner._handle_message_with_agent(
+        _internal_event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response and "confirming green" in response
+
+
+@pytest.mark.asyncio
+async def test_internal_event_marker_buried_mid_sentence_is_delivered(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    text = (
+        "CI for #176 failed on slice 4: the NO_REPLY filter test regressed, "
+        "see run 123 for the traceback."
+    )
+    runner._run_agent = AsyncMock(return_value=_agent_result(text))
+
+    response = await runner._handle_message_with_agent(
+        _internal_event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == text
+
+
 @pytest.mark.asyncio
 async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path):
     """Gateway hooks receive the actual model/provider for post-turn routing."""
