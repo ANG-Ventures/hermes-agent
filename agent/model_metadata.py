@@ -3282,6 +3282,28 @@ def _resolve_codex_oauth_context_length_with_source(
     return None, ""
 
 
+def provider_serves_codex_subscription(provider: Optional[str]) -> bool:
+    """True when *provider* serves Codex-family slugs from a Codex subscription.
+
+    ``openai-codex`` always does. Any other provider opts in through its
+    profile's ``codex_subscription_backend`` capability flag (e.g. the ``cpa``
+    CLIProxyAPI lane, which fronts the SAME ChatGPT/Codex tokens): the backend
+    enforces the Codex window, not the API platform's 1.05M (t_c1403b02).
+    """
+    p = (provider or "").strip().lower()
+    if not p:
+        return False
+    if p == "openai-codex":
+        return True
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(p)
+    except Exception:
+        return False
+    return bool(getattr(profile, "codex_subscription_backend", False))
+
+
 def _resolve_codex_oauth_context_length(
     model: str, access_token: str = ""
 ) -> Optional[int]:
@@ -3506,6 +3528,25 @@ def get_model_context_length(
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
+
+    # 0d. Codex-subscription proxy lanes (a provider profile with
+    # ``codex_subscription_backend``, e.g. cpa -> CLIProxyAPI). Codex-family
+    # slugs there hit the SAME Codex backend as openai-codex, which enforces
+    # the Codex window (gpt-6.1-sol: 922K input) — not the API-platform 1.05M
+    # the endpoint probe / catalog / persistent cache would report. Resolve
+    # through the openai-codex tables (policy knob, verified caps, ``-900k``
+    # alias). Runs before the persistent cache so a stale API value already
+    # persisted for the proxy URL cannot win. No access token is passed: the
+    # proxy bearer is not a ChatGPT OAuth token and must never be sent to
+    # chatgpt.com. Non-Codex ids (kimi-*, grok-*) miss the table and fall
+    # through unchanged.
+    if (
+        (provider or "").strip().lower() != "openai-codex"
+        and provider_serves_codex_subscription(provider)
+    ):
+        codex_ctx, _codex_source = _resolve_codex_oauth_context_length_with_source(model)
+        if codex_ctx:
+            return codex_ctx
 
     # Endpoint-scoped provider metadata. Keep this ahead of the persistent
     # cache so a value learned for a multiplexed provider's other endpoint
