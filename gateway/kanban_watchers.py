@@ -758,7 +758,13 @@ class _GuardStuckNotifier:
         if last is not None or "|active_pr|pr=" not in key or not item.get("guarded_since"):
             return last
         legacy = key.split("|pr=", 1)[0] + f"|{item['guarded_since']}"
-        return self._sent.get(legacy)
+        last = self._sent.get(legacy)
+        if last is not None:
+            # Migrate: the canonical per-PR key now carries the page time, so a
+            # later streak reset on the same PR still finds it (Prism #1530 r2).
+            # observe() persists it (the ledger differs from its snapshot).
+            self._sent[key] = last
+        return last
 
     def _load(self) -> dict[str, float]:
         if self._state_path is None:
@@ -818,10 +824,11 @@ class _GuardStuckNotifier:
         return delivered
 
 
-# Run outcomes that end a worker mid-task: its open PR is probably unfinished.
-_UNFINISHED_RUN_OUTCOMES = frozenset({
-    "timed_out", "crashed", "rate_limited", "reclaimed", "gave_up", "spawn_failed",
-})
+# Run outcomes after which the worker had FINISHED its deliverable. Any other
+# last outcome (timed_out, crashed, rate_limited, reclaimed, stale, stalled,
+# changes_requested, cohort_death, gave_up, ... or one added later) means it was
+# interrupted or sent back, so the safe default is REQUEUE (Prism #1530 r2).
+_FINISHED_RUN_OUTCOMES = frozenset({"completed", "review_requested"})
 
 
 def _land_verb(pr_url: str) -> Optional[str]:
@@ -853,7 +860,7 @@ def _active_pr_detail(board: str, item: dict) -> str:
     """
     outcome = item.get("last_outcome")
     land = _land_verb(item.get("pr"))
-    unfinished = outcome in _UNFINISHED_RUN_OUTCOMES or land is None
+    unfinished = outcome not in _FINISHED_RUN_OUTCOMES or land is None
     lines = ["READY card held behind its open PR (active_pr >30 min)"]
     if item.get("pr"):
         lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")

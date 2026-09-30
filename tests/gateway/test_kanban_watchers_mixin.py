@@ -511,6 +511,11 @@ def test_active_pr_key_honours_pre_r19_ledger_entry(tmp_path):
     notifier = _GuardStuckNotifier(state)
     send = lambda board, row: True
     assert notifier.observe([("default", item)], send, now=10_000.0 + 600) == 0
+    # Prism #1530 r2: the legacy time was migrated to the per-PR key and
+    # persisted, so a streak reset on the SAME PR (new guarded_since) stays silent,
+    # also across a restart.
+    reset = {**item, "guarded_since": 1790750000}
+    assert _GuardStuckNotifier(state).observe([("default", reset)], send, now=10_000.0 + 650) == 0
     # Prism #1530: a DIFFERENT streak/PR of the same card is not covered by it.
     other = {**item, "pr": "https://github.com/o/r/pull/10", "guarded_since": 1790745000}
     assert notifier.observe([("default", other)], send, now=10_000.0 + 700) == 1
@@ -526,6 +531,9 @@ def test_active_pr_page_names_the_wanted_verb():
     timed_out = _active_pr_detail("default", {**base, "last_outcome": "timed_out"})
     assert f"Wanted: **REQUEUE** (worker resumes on its PR): `{requeue}`" in timed_out
     assert "fleet-merge.sh ANG-Ventures/hermes-home 1838 --by" in timed_out  # the alternative
+    for interrupted in ("stale", "stalled", "changes_requested", "cohort_death", None, "future_kind"):
+        page = _active_pr_detail("default", {**base, "last_outcome": interrupted})
+        assert "Wanted: **REQUEUE**" in page, interrupted
     finished = _active_pr_detail("default", {**base, "last_outcome": "completed"})
     assert finished.index("Wanted: **LAND**") < finished.index(requeue)
     assert "fleet-merge.sh ANG-Ventures/hermes-home 1838" in finished
