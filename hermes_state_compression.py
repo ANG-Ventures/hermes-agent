@@ -597,7 +597,8 @@ class SessionCompressionMixin:
         ``wait_notice_interval_seconds``, then at gaps growing by ``wait_notice_backoff`` x (capped at
         ``wait_notice_max_interval_seconds``). Messaging surfaces post each notice as a new message, so a
         fixed 15s cadence floods a long wait; the defaults give 0, 15, 45, 105, 225, 465s...
-        ``wait_notice_backoff <= 1`` keeps the fixed cadence. A busy database is not a holder: the
+        ``wait_notice_backoff <= 1`` keeps the fixed cadence; ``wait_notice_max_interval_seconds <= 0``
+        means no ceiling. A busy database is not a holder: the
         attempt is retried at once with a longer write patience, and ``on_contended()`` is called
         instead, since the busy writer may be the holder's last flush. ``should_abort()`` True (e.g.
         ``/stop``) returns False at once."""
@@ -656,7 +657,9 @@ class SessionCompressionMixin:
                 # Grow the gap only after an interval notice (not the immediate first one):
                 # 0, +I, +I*b, +I*b^2 ... capped.
                 if last_notice_at is not None and notice_every > 0.0:
-                    notice_every = min(notice_cap, notice_every * notice_backoff)
+                    notice_every *= notice_backoff
+                    if notice_cap > 0.0:  # cap <= 0 means no ceiling, never "every poll"
+                        notice_every = min(notice_cap, notice_every)
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 

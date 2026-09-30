@@ -788,3 +788,15 @@ def test_turn_lease_wait_notice_cap_below_interval_is_honored(monkeypatch):
         monkeypatch, wait_seconds=60.0, backoff=2.0, cap=10.0, interval=15.0
     )
     assert notices == [0, 10, 20, 30, 40, 50]
+
+
+def test_turn_lease_wait_notice_zero_cap_means_no_ceiling(monkeypatch):
+    """cap=0 reads as "no ceiling"; it must not collapse the gap to every poll.
+
+    Reported by @Enough1122 and @uttkarsh-26: min(0, gap*backoff) was 0, which
+    hit the notice_every == 0.0 "notify on every poll" arm (286 notices in 300s).
+    """
+    notices = _notice_times(monkeypatch, wait_seconds=300.0, backoff=2.0, cap=0.0)
+    assert notices == [0, 15, 45, 105, 225]
+    unbounded = _notice_times(monkeypatch, wait_seconds=1000.0, backoff=2.0, cap=0.0)
+    assert unbounded == [0, 15, 45, 105, 225, 465, 945]
