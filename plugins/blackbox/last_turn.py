@@ -375,23 +375,34 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
         from plugins.blackbox.record import effective_context_used
 
         used, raw_used = effective_context_used(rec)
-        # Clamp at 100%: last_prompt tokens can transiently overshoot the model
-        # max during streaming or before compression fires — users must never
-        # see >100% "of model max" (mirrors the clamp in agent/display.py,
-        # cli.py /stats, gateway status, and tools/memory_tool.py; see
-        # tests/run_agent/test_percentage_clamp.py).
-        pct = min(100, used / length * 100)
-        lines.append(
-            f"• Context window (last call): {_humanize_tok(used)}/{_humanize_tok(length)} "
-            f"{_ctx_health(pct)} ({pct:.0f}% of model max)"
-        )
-        if raw_used is not None:
+        if used < 0:
+            lines.append(f"• Context window (last call): {_humanize_tok(0, unknown=True)}/{_humanize_tok(length)}")
+            lines.append("  ⚠ relay usage invariant: reported prompt is not a context size")
+        else:
+            # Clamp at 100%: last_prompt tokens can transiently overshoot the model
+            # max during streaming or before compression fires — users must never
+            # see >100% "of model max" (mirrors the clamp in agent/display.py,
+            # cli.py /stats, gateway status, and tools/memory_tool.py; see
+            # tests/run_agent/test_percentage_clamp.py).
+            pct = min(100, used / length * 100)
             lines.append(
-                f"  ⚠ reported prompt {_humanize_tok(raw_used)} exceeds the window: "
-                f"relay usage invariant, counted as billed, not as context"
+                f"• Context window (last call): {_humanize_tok(used)}/{_humanize_tok(length)} "
+                f"{_ctx_health(pct)} ({pct:.0f}% of model max)"
             )
+            if raw_used is not None:
+                lines.append(
+                    f"  ⚠ reported prompt {_humanize_tok(raw_used)} exceeds the window: "
+                    f"relay usage invariant, counted as billed, not as context"
+                )
     elif used:
-        lines.append(f"• Context window (last call): {_humanize_tok(used)}")
+        from plugins.blackbox.record import effective_context_used
+
+        corrected, _raw = effective_context_used(rec)
+        if corrected < 0:
+            lines.append(f"• Context window (last call): {_humanize_tok(0, unknown=True)}")
+            lines.append("  ⚠ relay usage invariant: reported prompt is not a context size")
+        else:
+            lines.append(f"• Context window (last call): {_humanize_tok(corrected)}")
 
     try:
         _comp = int(compressions or 0)

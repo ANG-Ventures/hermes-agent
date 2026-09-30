@@ -968,7 +968,6 @@ def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> int | 
     ).fetchone()
     if row is None:
         return
-    length = int(row[1] or 0)
     last = conn.execute(
         "SELECT usage_invariant_violation, corrected_prompt_tokens "
         "FROM turn_api_calls WHERE turn_id = ? AND parent_call_id IS NULL "
@@ -982,7 +981,10 @@ def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> int | 
     violation, call_corrected = (last[0], last[1]) if last else (None, None)
     corrected = None
     if violation:
-        corrected = call_corrected if call_corrected is not None else (length or None)
+        # The relay omitted a usable model window: context_length may be the
+        # harness's configured limit (272k on a 1M model), so it cannot be a
+        # fallback. -1 is the display-only unknown marker, not a token count.
+        corrected = call_corrected if call_corrected is not None else -1
     conn.execute(
         "UPDATE turns SET corrected_context_used = ? WHERE turn_id = ?",
         (corrected, turn_id),

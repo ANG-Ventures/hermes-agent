@@ -183,6 +183,23 @@ def test_card_hydration_and_just_finalized_record_receive_correction(db, monkeyp
     assert "180%" not in card._context_line(rec2)
 
 
+def test_flagged_relay_without_window_is_unknown_not_configured_length(db):
+    from plugins.blackbox import card
+
+    flagged = _bridge_usage(1_795_696, usage_invariant_violation="prompt_exceeds_context_window",
+                            relay_synthetic=True, upstream_requests=2)
+    # context_length here is merely the harness's configured limit, NOT the
+    # model window: falling back to 272k would fabricate 100% occupancy.
+    _run_turn("t-no-window", flagged, context_used=1_795_696, context_length=272_000)
+    row = dict(_row(db, "SELECT * FROM turns WHERE turn_id='t-no-window'"))
+    assert row["corrected_context_used"] == -1
+    assert row["context_used"] == 1_795_696
+    lines = render_last_turn_record(row)
+    assert any("unknown" in ln.lower() for ln in lines if "Context window" in ln), lines
+    assert "unknown" in card._context_line(card._record_from_row(row)).lower()
+    assert "100%" not in card._context_line(card._record_from_row(row))
+
+
 def test_context_line_renders_corrected_and_names_raw():
     rec = {"context_used": 1_795_696, "context_length": 1_000_000,
            "corrected_context_used": 897_883, "input_tokens": 1_795_696,
