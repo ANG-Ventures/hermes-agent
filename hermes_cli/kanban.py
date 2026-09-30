@@ -1797,13 +1797,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 help="Act on a card whose home session is another session "
                      "(or an unhomed card); records a takeover event and "
                      "posts REASON as a comment the home session sees. On "
-                     "assign/unblock/promote/reclaim/triage-resolve "
-                     "it also RE-HOMES the card to your session (children "
-                     "and pings follow; prev_session_id kept in the event); "
-                     "never on complete, and never for cron/sweep actors. "
+                     "assign/unblock/promote/triage-resolve it also "
+                     "RE-HOMES the card to your session (an OWNERSHIP "
+                     "TRANSFER: children and pings follow; the event keeps "
+                     "previous_session + previous_home); reclaim KEEPS the "
+                     "home unless --transfer-home. Never on complete, and "
+                     "never for cron/sweep actors. "
                      "Re-home without a status change: "
                      "hermes kanban edit <id> --session <sid> --takeover R.",
             )
+            if _name in kb.REHOME_ON_TAKEOVER_ACTIONS:
+                _home = _p.add_mutually_exclusive_group()
+                _home.add_argument(
+                    "--keep-home",
+                    dest="takeover_home", action="store_const", const="keep",
+                    default=None,
+                    help="With --takeover: act on the card but leave its home "
+                         "session and home chat as they are (the default "
+                         "for reclaim).",
+                )
+                _home.add_argument(
+                    "--transfer-home",
+                    dest="takeover_home", action="store_const",
+                    const="transfer",
+                    help="With --takeover: move the card's home to your "
+                         "session and chat -- an ownership transfer (the "
+                         "default for assign/unblock/promote/triage-resolve).",
+                )
             _p.add_argument(
                 "--operator",
                 dest="operator",
@@ -2015,6 +2035,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 foreign_ok=getattr(args, "foreign_ok", None),
                 surface="cli",
                 operator=getattr(args, "operator", None),
+                home=getattr(args, "takeover_home", None),
             )
         try:
             # The preflight above ran on its own connection; the scope re-runs

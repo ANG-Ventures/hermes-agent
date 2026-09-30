@@ -1430,3 +1430,121 @@ def test_refused_guarded_mutation_with_side_write_records_no_takeover(kanban_hom
         kinds = [e.kind for e in kb.list_events(conn, tid)]
         assert "reclaim_refused" in kinds and "takeover" not in kinds
         assert _comments(conn, tid) == []
+
+
+# --- t_0b3b0667: reclaim --takeover keeps the home; --transfer-home moves it ---
+
+
+def _running_card(conn, *, session_id=HOME, chat="home-chat"):
+    tid = kb.create_task(conn, title="card", assignee="worker-a",
+                         session_id=session_id)
+    kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat)
+    # A claim held by another host: no local worker to signal.
+    assert kb.claim_task(conn, tid, claimer="otherhost:4242")
+    return tid
+
+
+def _takeover_events(conn, tid):
+    return [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+
+
+def test_reclaim_takeover_keeps_home_by_default(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _running_card(conn)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="load shedding"):
+            assert kb.reclaim_task(conn, tid, reason="load")
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.session_id == HOME
+        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
+        (ev,) = _takeover_events(conn, tid)
+        assert ev.payload["previous_session"] == HOME
+        assert ev.payload["previous_home"] == [
+            {"platform": "discord", "chat_id": "home-chat", "thread_id": ""}]
+        assert ev.payload["home_transfer"] is False
+        assert "prev_session_id" not in ev.payload
+        assert any("home kept" in c for c in _comments(conn, tid))
+
+
+def test_reclaim_transfer_home_moves_session_and_records_previous(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _running_card(conn)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="home chat abandoned 3d",
+                               home="transfer"):
+            assert kb.reclaim_task(conn, tid, reason="adopt")
+        assert kb.get_task(conn, tid).session_id == OTHER
+        (ev,) = _takeover_events(conn, tid)
+        assert ev.payload["home_transfer"] is True
+        assert ev.payload["previous_session"] == HOME
+        assert ev.payload["prev_session_id"] == HOME
+        assert ev.payload["session_id"] == OTHER
+        assert ev.payload["previous_home"][0]["chat_id"] == "home-chat"
+
+
+def test_keep_home_overrides_adopting_verb_default(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="one-off unblock", home="keep"):
+            assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).session_id == HOME
+        (ev,) = _takeover_events(conn, tid)
+        assert ev.payload["home_transfer"] is False
+
+
+def test_mutation_actor_rejects_unknown_home_mode():
+    with pytest.raises(ValueError):
+        with kb.mutation_actor(session_ids=(OTHER,), home="steal"):
+            pass
+
+
+def test_cli_reclaim_keep_default_and_transfer_flag(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        kept = _running_card(conn)
+        moved = _running_card(conn)
+    kc.run_slash(f"reclaim {kept} --takeover 'load shedding'")
+    kc.run_slash(f"reclaim {moved} --takeover 'abandoned' --transfer-home")
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, kept).status == "ready"
+        assert kb.get_task(conn, kept).session_id == HOME
+        assert kb.get_task(conn, moved).session_id == OTHER
+    out = kc.run_slash(f"reclaim {kept} --keep-home --transfer-home --takeover x")
+    assert "not allowed with" in out
+
+
+def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
+    import importlib.util
+    import time
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "taker-chat")
+    with kb.connect_closing() as conn:
+        tid = _running_card(conn)
+        # Pre-fix behaviour: a reclaim takeover that moved the home.
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="load", home="transfer"):
+            assert kb.reclaim_task(conn, tid, reason="load")
+        assert kb.get_task(conn, tid).session_id == OTHER
+        assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
+            "home-chat", "taker-chat"}
+    spec = importlib.util.spec_from_file_location(
+        "restore", Path(__file__).resolve().parents[2]
+        / "scripts" / "kanban_restore_reclaim_homes.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        rows = mod.plan(conn, since=now - 60, until=now + 60,
+                        by_session=None, sub_window=30)
+        assert [(r["task_id"], r["restore_to"], r["skip"]) for r in rows] == [
+            (tid, HOME, None)]
+        assert mod.apply(conn, rows) == 1
+        assert kb.get_task(conn, tid).session_id == HOME
+        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
+        # Idempotent: the second pass skips (home no longer the taker's).
+        again = mod.plan(conn, since=now - 60, until=now + 60,
+                         by_session=None, sub_window=30)
+        assert again[0]["skip"] and mod.apply(conn, again) == 0
