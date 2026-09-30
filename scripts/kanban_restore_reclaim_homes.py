@@ -10,7 +10,8 @@ For every ``takeover`` event with ``action == "reclaim"`` that re-homed the card
 
 * sets ``tasks.session_id`` back to ``prev_session_id``;
 * deletes the subscription the takeover added for the TAKER's chat only:
-  the chat named by the event (``taker_chat``) or by ``--taker-chat``,
+  the exact (platform, chat_id, thread_id) named by the event
+  (``taker_chat``) or by ``--taker-chat``,
   created within ``--sub-window`` seconds after the event and not in the
   event's ``previous_home``. When the taker's chat is unknown, no sub is
   deleted;
@@ -84,7 +85,7 @@ def _evaluate(conn, ev, *, taker_chats: set, sub_window: int) -> dict:
     chats = set(taker_chats)
     tc = p.get("taker_chat")
     if isinstance(tc, dict) and tc.get("platform") and tc.get("chat_id"):
-        chats.add((tc["platform"], tc["chat_id"]))
+        chats.add((tc["platform"], tc["chat_id"], tc.get("thread_id") or ""))
     if not chats:
         row["note"] = "taker chat unknown: subs kept (pass --taker-chat)"
     keep = {
@@ -97,7 +98,9 @@ def _evaluate(conn, ev, *, taker_chats: set, sub_window: int) -> dict:
         (tid, ev["created_at"], ev["created_at"] + sub_window),
     ).fetchall():
         key = (s["platform"], s["chat_id"], s["thread_id"] or "")
-        if key[:2] in chats and key not in keep:
+        # Full key: another conversation in a different thread of the same
+        # chat is never the taker's.
+        if key in chats and key not in keep:
             row["remove_subs"].append(
                 {"platform": key[0], "chat_id": key[1], "thread_id": key[2]})
     return row
@@ -173,19 +176,20 @@ def main(argv=None) -> int:
     ap.add_argument("--sub-window", type=int, default=30,
                     help="seconds after the event in which the taker's sub was written")
     ap.add_argument("--taker-chat", action="append", default=[],
-                    metavar="PLATFORM:CHAT_ID",
+                    metavar="PLATFORM:CHAT_ID[:THREAD_ID]",
                     help="the taker's chat, for events that do not record it; "
-                         "only its subs are removed (repeatable)")
+                         "only a sub with exactly this key is removed "
+                         "(no THREAD_ID = the unthreaded sub; repeatable)")
     ap.add_argument("--board", default=None)
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     chats = set()
     for spec in args.taker_chat:
-        platform, sep, chat_id = spec.partition(":")
-        if not (sep and platform and chat_id):
-            ap.error(f"--taker-chat wants PLATFORM:CHAT_ID, got {spec!r}")
-        chats.add((platform, chat_id))
+        parts = spec.split(":", 2)
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            ap.error(f"--taker-chat wants PLATFORM:CHAT_ID[:THREAD_ID], got {spec!r}")
+        chats.add((parts[0], parts[1], parts[2] if len(parts) == 3 else ""))
     with kb.connect_closing(board=args.board) as conn:
         rows = plan(conn, since=_ts(args.since), until=_ts(args.until),
                     by_session=args.by_session, sub_window=args.sub_window,

@@ -6325,6 +6325,7 @@ def record_foreign_action(
         if taker_platform and taker_chat_id:
             payload["taker_chat"] = {
                 "platform": taker_platform, "chat_id": taker_chat_id,
+                "thread_id": _ambient_session_env("HERMES_SESSION_THREAD_ID"),
             }
     with write_txn(conn, allow_nested=True):
         if new_home:

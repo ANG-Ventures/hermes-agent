@@ -1560,10 +1560,10 @@ def test_restore_without_taker_chat_keeps_every_sub(kanban_home, monkeypatch):
         tid2 = _historical_rehome(conn, monkeypatch)
         rows = [r for r in mod.plan(conn, since=now - 60, until=now + 60,
                                     by_session=None, sub_window=30,
-                                    taker_chats={("discord", "taker-chat")})
+                                    taker_chats={("discord", "taker-chat", "")})
                 if r["task_id"] == tid2]
         assert mod.apply(conn, rows, sub_window=30,
-                         taker_chats={("discord", "taker-chat")}) == 1
+                         taker_chats={("discord", "taker-chat", "")}) == 1
         assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid2)] == ["home-chat"]
 
 
@@ -1612,3 +1612,32 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
         again = mod.plan(conn, since=now - 60, until=now + 60,
                          by_session=None, sub_window=30)
         assert again[0]["skip"] and mod.apply(conn, again, sub_window=30) == 0
+
+
+def test_restore_never_removes_another_thread_of_the_taker_chat(kanban_home, monkeypatch):
+    import time
+    mod = _restore_mod()
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        tid = _running_card(conn)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "slack")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "C1")
+        monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-A")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopt", home="transfer"):
+            assert kb.reclaim_task(conn, tid, reason="adopt")
+        (ev,) = _takeover_events(conn, tid)
+        assert ev.payload["taker_chat"] == {
+            "platform": "slack", "chat_id": "C1", "thread_id": "thread-A"}
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
+                          thread_id="thread-A")
+        # Another conversation, same chat, different thread, same window.
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
+                          thread_id="thread-B")
+        rows = mod.plan(conn, since=now - 60, until=now + 60,
+                        by_session=None, sub_window=30)
+        assert rows[0]["remove_subs"] == [
+            {"platform": "slack", "chat_id": "C1", "thread_id": "thread-A"}]
+        assert mod.apply(conn, rows, sub_window=30) == 1
+        left = {(s["chat_id"], s["thread_id"] or "") for s in kb.list_notify_subs(conn, tid)}
+        assert ("C1", "thread-B") in left and ("C1", "thread-A") not in left
