@@ -2601,8 +2601,17 @@ class GatewayKanbanWatchersMixin:
                 load_gate.max_spawn_per_tick, load_gate.load5_floor,
             )
         def _sample_spawn_pause() -> "tuple[Optional[int], Optional[str]]":
-            """(allowance, reason) for this tick; (None, None) = no limit."""
-            return load_gate.admit_now()
+            """(allowance, reason) for this tick; (None, None) = no limit.
+
+            Host-wide running count feeds the gate's load-per-worker slope
+            (t_bf26e8f1); CPU busy is sampled inside ``admit_now``.
+            """
+            running = None
+            if load_gate.enabled:
+                from hermes_cli import kanban_load_gate as _klg_mod
+
+                running = _klg_mod.count_running_workers()
+            return load_gate.admit_now(running=running)
 
         def _finish_gate_tick(spawned: int) -> None:
             load_gate.finish_tick(spawned, logger=logger)

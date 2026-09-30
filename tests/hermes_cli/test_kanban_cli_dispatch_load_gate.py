@@ -51,9 +51,12 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return home
 
 
-def _load(monkeypatch, load1, load5=None):
+def _load(monkeypatch, load1, load5=None, cpu_busy=None):
     monkeypatch.setattr(klg, "sample_loadavg",
                         lambda: (load1, load1 if load5 is None else load5))
+    # The live CPU sample would make these tests depend on the runner.
+    monkeypatch.setattr(klg, "sample_cpu_busy",
+                        lambda prev=None, block=0.0: (cpu_busy, None))
 
 
 def _run(**kw) -> int:

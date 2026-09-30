@@ -64,7 +64,7 @@ def boards(tmp_path, monkeypatch):
 
     monkeypatch.setattr(kb, "dispatch_once", fake_dispatch)
     # Host has room for exactly 4 new workers every tick.
-    monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self: (4, None))
+    monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self, **kw: (4, None))
     clock = Clock()
     monkeypatch.setattr(watchers, "asyncio", SimpleNamespace(
         sleep=clock.sleep, to_thread=asyncio.to_thread, CancelledError=asyncio.CancelledError,
@@ -108,7 +108,7 @@ async def test_second_board_gets_a_spawn_every_tick(boards, caplog):
 async def test_quota_a_board_cannot_use_passes_to_the_next_board(boards, monkeypatch):
     """Allowance 1; default gets the quota but its concurrency cap lets it
     spawn nothing. The unused quota must reach subs-ace this same tick."""
-    monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self: (1, None))
+    monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self, **kw: (1, None))
     inner = kb.dispatch_once
 
     def capped(conn, *, board=None, spawn_paused=None, spawn_limit=None, **kw):

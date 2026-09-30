@@ -3159,10 +3159,11 @@ DEFAULT_CONFIG = {
         # resume once it drops below `resume_below` (default: 0.75 × CPU
         # count). Hysteresis so a load that hovers at the bar doesn't flap
         # spawns every tick. Set enabled: false to disable.
-        # Projected-load admission (load1 lags a spawn burst by 60-90 s):
-        # each worker spawned in the last `ramp_seconds` counts as
-        # `worker_load_cost` of not-yet-visible load; a tick admits at most
-        # ceil((pause_above - load1 - pending) / worker_load_cost) and never
+        # Projected-load admission (a worker's load lands over 5-10 min):
+        # each worker spawned in the last `ramp_seconds` counts as the
+        # per-worker load cost x the share of the ramp not yet elapsed; a
+        # tick admits at most floor((pause_above - load1 - pending) / cost)
+        # and never
         # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
         # pause also needs load5 < pause_above. See kanban_load_gate.py.
         # Worker hosts (t_5981ff03): while dispatch_load_gate holds this host,
@@ -3176,9 +3177,21 @@ DEFAULT_CONFIG = {
             "pause_above": None,
             "resume_below": None,
             "worker_load_cost": 2.0,
-            "ramp_seconds": 120,
+            "ramp_seconds": 600,
             "max_spawn_per_tick": 4,
             "load5_floor": True,
+            # t_bf26e8f1: load-per-worker is measured (least squares of load1
+            # on running workers over slope_window_seconds), clamped to
+            # [worker_load_cost_min, worker_load_cost_max]; worker_load_cost
+            # is the prior. A load1 pause needs the CPU at least
+            # cpu_busy_pause busy (cpu_corroborate); below that the gate
+            # admits on CPU headroom at worker_cpu_cost cores per worker.
+            "worker_load_cost_min": 0.5,
+            "worker_load_cost_max": 4.0,
+            "slope_window_seconds": 600,
+            "cpu_corroborate": True,
+            "cpu_busy_pause": 0.70,
+            "worker_cpu_cost": 1.0,
         },
         # Reviewer↔implementer round cap. A "round" is one changes_requested
         # verdict; once a card has collected this many, the next request for

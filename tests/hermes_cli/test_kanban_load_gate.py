@@ -87,28 +87,30 @@ def test_new_gate_first_tick_is_burst_capped_and_second_sees_ramp(
     _board_with_ready(kanban_home, monkeypatch, 30)
     gate = LoadGate({}, ncpu=32)
     assert len(_tick(gate, 20.0, 0.0).spawned) == 4        # max_spawn_per_tick
-    # load1 unchanged (lag) but 4 x 2.0 pending: ceil((32-20-8)/2) = 2
+    # load1 unchanged (lag); 4 x 2.0 x (1 - 30/600) = 7.6 pending:
+    # floor((32-20-7.6)/2) = 2
     assert len(_tick(gate, 20.0, 30.0).spawned) == 2
-    # 6 x 2.0 = 12 pending: headroom 0 -> saturated, nothing spawned
+    # 4 x 0.9 + 2 x 0.95 = 5.5 invisible workers x 2.0 = 11.0 pending:
+    # floor(1.0/2) = 0 -> saturated, nothing spawned
     res = _tick(gate, 20.0, 60.0)
-    assert res.spawned == [] and "pending_ramp=12.0" in (res.spawn_paused or "")
+    assert res.spawned == [] and "pending_ramp=11.0" in (res.spawn_paused or "")
     assert gate.state == "saturated"
-    # ramp window (120 s) expires -> admits again, still capped
-    assert len(_tick(gate, 20.0, 200.0).spawned) == 4
+    # the ramp (600 s) runs out -> admits again, still capped
+    assert len(_tick(gate, 20.0, 700.0).spawned) == 4
 
 
 # ── pure gate arithmetic ────────────────────────────────────────────────────
 
 def test_allowance_formula_and_caps():
     g = LoadGate({"max_spawn_per_tick": 100}, ncpu=32)
-    assert g.admit(20.0, now=0) == (6, None)                 # ceil(12/2)
-    assert g.admit(31.0, now=0) == (1, None)                 # ceil(0.5)
-    a, reason = g.admit(32.0, now=0)
+    assert g.admit(20.0, now=0) == (6, None)                 # floor(12/2)
+    a, reason = g.admit(31.0, now=0)                         # floor(0.5): stop short
     assert a == 0 and reason.startswith("projected")
     g.record_spawns(3, now=0)
-    assert g.pending(now=10) == 6.0
-    assert g.admit(20.0, now=10) == (3, None)                # ceil((12-6)/2)
-    assert g.pending(now=121) == 0.0                         # window expired
+    assert g.pending(now=0) == 6.0
+    assert g.pending(now=300) == 3.0                         # half visible by now
+    assert g.admit(20.0, now=300) == (4, None)               # floor((12-3)/2)
+    assert g.pending(now=601) == 0.0                         # window expired
     g4 = LoadGate({}, ncpu=32)
     assert g4.admit(0.0, now=0) == (4, None)                 # default burst cap
     g5 = LoadGate({"worker_load_cost": 4, "max_spawn_per_tick": 50}, ncpu=32)
@@ -147,7 +149,7 @@ def test_disabled_gate_is_inert():
 def test_bad_config_values_fall_back_to_defaults():
     g = LoadGate({"worker_load_cost": "x", "ramp_seconds": -1,
                   "max_spawn_per_tick": 0}, ncpu=8)
-    assert (g.worker_load_cost, g.ramp_seconds, g.max_spawn_per_tick) == (2.0, 120.0, 4)
+    assert (g.worker_load_cost, g.ramp_seconds, g.max_spawn_per_tick) == (2.0, 600.0, 4)
 
 
 def test_dispatch_once_spawn_limit_intersects_budget(kanban_home, monkeypatch):
@@ -300,3 +302,112 @@ def test_count_spawnable_demand(kanban_home, monkeypatch):
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: False, raising=False)
     with kb.connect_closing() as conn:
         assert kb.count_spawnable_demand(conn) == 0
+
+
+# --- forecast-aware + CPU-corroborated admission (t_bf26e8f1) --------------
+
+
+def _drive(gate, minutes, *, base=10.0, per_worker=2.0, ramp=600.0):
+    """Unlimited backlog on a host where each worker's load arrives linearly
+    over ``ramp`` s (measured 5-10 min on the Studio, 2026-09-29). Returns
+    the peak load1 and the final worker count."""
+    spawns, peak = [], 0.0
+    for m in range(minutes):
+        now = m * 60.0
+        load = base + sum(per_worker * min(1.0, (now - t) / ramp) for t in spawns)
+        peak = max(peak, load)
+        allowance, _ = gate.admit(load, load5=load, now=now, running=len(spawns))
+        spawns += [now] * (allowance or 0)
+        gate.record_spawns(allowance or 0, now=now)
+    return peak, len(spawns)
+
+
+def test_forecast_plateaus_under_pause_above_with_lagging_load():
+    peak, workers = _drive(LoadGate({"pause_above": 64, "resume_below": 48}, 32), 60)
+    assert peak <= 64.0
+    assert workers >= 20  # still fills the host, it does not just refuse
+
+
+def test_short_ramp_mutant_overshoots():
+    """The pre-fix ramp (120 s) forgets a spawn before its load lands."""
+    peak, _ = _drive(LoadGate({"pause_above": 64, "resume_below": 48,
+                               "ramp_seconds": 120}, 32), 60)
+    assert peak > 64.0
+
+
+def test_measured_slope_replaces_prior_and_prior_holds_without_signal():
+    g = LoadGate({}, ncpu=32)
+    for i in range(11):                       # 10 min, load = 3 + 1.0/worker
+        g.admit(3.0 + 10 + i, now=i * 60.0, running=10 + i)
+    assert g.cost_source == "measured" and abs(g.cost - 1.0) < 1e-6
+    flat = LoadGate({}, ncpu=32)
+    for i in range(11):                       # workers never move: no slope
+        flat.admit(5.0 + i, now=i * 60.0, running=20)
+    assert (flat.cost_source, flat.cost) == ("prior", 2.0)
+    noise = LoadGate({}, ncpu=32)
+    loads = [30, 5, 28, 6, 31, 4, 29, 7, 30, 5, 28]
+    for i in range(11):                       # load unrelated to workers
+        noise.admit(float(loads[i]), now=i * 60.0, running=10 + (i % 3))
+    assert noise.cost_source == "prior"
+
+
+def test_measured_slope_is_clamped():
+    g = LoadGate({}, ncpu=32)
+    for i in range(11):                       # load falls as workers rise
+        g.admit(60.0 - 3 * i, now=i * 60.0, running=10 + i)
+    assert g.cost == g.worker_load_cost_min
+    g2 = LoadGate({}, ncpu=32)
+    for i in range(11):
+        g2.admit(10.0 + 20 * i, now=i * 60.0, running=10 + i)
+    assert g2.cost == g2.worker_load_cost_max
+
+
+def test_load1_pause_needs_cpu_corroboration():
+    """2026-09-29 19:10: load1 250 with the CPU 64% idle paused the gate 2 h."""
+    idle = LoadGate({"pause_above": 64, "resume_below": 48}, ncpu=32)
+    a, reason = idle.admit(250.0, load5=200.0, now=0, cpu_busy=0.36)
+    assert idle.state == "cpu_headroom" and reason is None and a == 4
+    busy = LoadGate({"pause_above": 64, "resume_below": 48}, ncpu=32)
+    a, reason = busy.admit(250.0, load5=200.0, now=0, cpu_busy=0.95)
+    assert (a, busy.state) == (0, "paused") and "load1=250.0" in reason
+    blind = LoadGate({"pause_above": 64, "resume_below": 48}, ncpu=32)
+    assert blind.admit(250.0, load5=200.0, now=0)[0] == 0      # no CPU sample
+    off = LoadGate({"pause_above": 64, "resume_below": 48,
+                    "cpu_corroborate": False}, ncpu=32)
+    assert off.admit(250.0, load5=200.0, now=0, cpu_busy=0.36)[0] == 0
+
+
+def test_cpu_headroom_is_consumed_by_pending_workers():
+    g = LoadGate({"pause_above": 64, "resume_below": 48,
+                  "max_spawn_per_tick": 100}, ncpu=32)
+    # (0.70 - 0.50) x 32 = 6.4 cores / 1.0 per worker -> 6
+    assert g.admit(250.0, now=0, cpu_busy=0.50)[0] == 6
+    g.record_spawns(6, now=0)
+    a, reason = g.admit(250.0, now=30, cpu_busy=0.50)   # 5.7 cores pending
+    assert a == 0 and "pending cpu" in reason and g.state == "cpu_headroom"
+
+
+def test_sample_cpu_busy_delta(monkeypatch):
+    import collections
+    import sys
+    import types
+
+    T = collections.namedtuple("T", "user system idle")
+    seq = iter([T(10, 10, 80), T(40, 20, 90)])
+    fake = types.SimpleNamespace(cpu_times=lambda: next(seq))
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    busy, snap = klg.sample_cpu_busy(None)
+    assert busy is None and snap == T(10, 10, 80)
+    busy, _ = klg.sample_cpu_busy(snap)
+    assert abs(busy - 0.8) < 1e-9          # 40 of 50 ticks not idle
+
+
+def test_count_running_workers(kanban_home, monkeypatch):
+    _board_with_ready(kanban_home, monkeypatch, 2)
+    assert klg.count_running_workers() == 0
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='running'")
+        conn.commit()
+    assert klg.count_running_workers() == 2
+    monkeypatch.setattr(kb, "connect", lambda *a, **k: 1 / 0)
+    assert klg.count_running_workers() is None
