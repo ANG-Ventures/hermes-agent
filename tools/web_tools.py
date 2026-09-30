@@ -1215,6 +1215,15 @@ async def web_extract_tool(
                 safe_urls.append(url)
                 safe_indices.append(index)
 
+        # ── Local PDF read (tools/web_pdf_local.py) ──────────────────────────
+        # Paid extract vendors bill PDFs per page (Firecrawl: 45–263 credits
+        # per manual). Read PDFs locally instead and never send them to a
+        # vendor. ``web.local_pdf: false`` restores vendor dispatch.
+        from tools.web_pdf_local import split_local_pdfs as _split_local_pdfs
+        local_pdf_done, safe_urls, safe_indices = await _split_local_pdfs(
+            safe_urls, safe_indices, _load_web_config()
+        )
+
         # Dispatch only safe URLs to the configured backend
         backend = ""
         if not safe_urls:
@@ -1476,7 +1485,7 @@ async def web_extract_tool(
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
         # order of the safe URL list they receive.
-        if invalid_urls or ssrf_blocked:
+        if invalid_urls or ssrf_blocked or local_pdf_done:
             safe_results = {
                 index: (
                     results[position]
@@ -1490,7 +1499,7 @@ async def web_extract_tool(
                 )
                 for position, index in enumerate(safe_indices)
             }
-            by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
+            by_index = {**safe_results, **ssrf_blocked, **invalid_urls, **local_pdf_done}
             results = [by_index[index] for index in range(len(urls))]
 
         response = {"results": results}
@@ -1544,6 +1553,9 @@ async def web_extract_tool(
                                 if k in r["metadata"]}} if isinstance(r.get("metadata"), dict)
                    and any(k in r["metadata"] for k in ("served_by", "fallback_from")) else {}),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
+                **({"metadata": r["metadata"]}
+                   if isinstance(r.get("metadata"), dict)
+                   and r["metadata"].get("served_by") == "local-pdf" else {}),
             }
             for r in response.get("results", [])
         ]
