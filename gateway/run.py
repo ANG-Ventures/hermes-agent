@@ -12520,6 +12520,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return mode
 
     @staticmethod
+    def _load_background_agent_notify_mode() -> str:
+        """Whether a ``notify=true`` background exit injects an agent turn.
+
+        ``display.background_process_agent_notify`` (default ``off``):
+          - ``off``           — no synthetic agent turn on exit; the exit stays in
+            the process table for ``process(poll|wait|log)``. Watch patterns
+            (``notify=[...]``) are unaffected.
+          - ``empty-success`` — inject only when exit code != 0 or output is
+            non-empty.
+          - ``on``            — inject every completion (pre-2026-09-30 behavior).
+
+        Why ``off``: the injected turn invites a chat reply; the NO_REPLY hint
+        in that turn was ignored 3x (09-27, 09-29, 09-30). Bounded jobs use
+        ``process(action=wait)`` instead (Ace, 2026-09-30).
+        """
+        from tools.process_registry import AGENT_NOTIFY_MODES, normalize_agent_notify_mode
+        cfg = _load_gateway_runtime_config()
+        raw = cfg_get(cfg, "display", "background_process_agent_notify")
+        mode = normalize_agent_notify_mode(raw)
+        if raw not in (None, "", True, False) and str(raw).strip().lower().replace("_", "-") not in AGENT_NOTIFY_MODES:
+            logger.warning(
+                "Unknown background_process_agent_notify '%s', defaulting to 'off'", raw,
+            )
+        return mode
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -34887,6 +34913,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
+                    # display.background_process_agent_notify, resolved in the
+                    # SPAWNING profile when known (the draining turn may belong
+                    # to another profile), else in this scope.
+                    _agent_mode = (
+                        watcher.get("agent_notify_mode")
+                        or getattr(session, "agent_notify_mode", "")
+                        or self._load_background_agent_notify_mode()
+                    )
+                    _healthy_silent = (
+                        session.exit_code == 0
+                        and (getattr(session, "completion_reason", None) or "exited") == "exited"
+                        and not _out.strip()
+                    )
+                    if _agent_mode == "off" or (_agent_mode == "empty-success" and _healthy_silent):
+                        # Suppress: no synthetic agent turn and no fall-through
+                        # to a chat post; process(poll|wait|log) still see the
+                        # exit. completion_required (goal wait barrier, code-
+                        # spawned bot delivery, promoted watch_patterns) always
+                        # delivers — decided atomically against
+                        # require_completion(), which replays the stashed turn
+                        # if a goal parks after this exit.
+                        _loop = asyncio.get_running_loop()
+
+                        def _replay(_t=synth_text, _e=completion_evt, _l=_loop):
+                            asyncio.run_coroutine_threadsafe(
+                                self._enqueue_process_completion_notification(_t, _e), _l,
+                            )
+
+                        if _pr_check.suppress_completion(session, _replay):
+                            logger.info(
+                                "Process watcher: %s exited (code %s); agent completion "
+                                "turn suppressed (display.background_process_agent_notify=%s)",
+                                session_id, session.exit_code, _agent_mode,
+                            )
+                            break
                     delivered = await self._enqueue_process_completion_notification(
                         synth_text, completion_evt,
                     )

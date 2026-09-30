@@ -669,6 +669,8 @@ def _spawn_delivery(
             command,
             background=True,
             notify_on_complete=True,
+            # The peer's reply arrives only via the completion turn.
+            _completion_required=True,
             task_id=task_id,
             workdir=str(Path(__file__).resolve().parent.parent),
             _host_local=True,

@@ -1232,7 +1232,7 @@ Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), se
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Background: set background=true (returns a session_id). For a bounded job (tests, builds, deploys), collect the result with process(action="wait", timeout=...) or process(action="log") — do not use notify=true (exit notifications are off by default in messaging gateways, and an injected completion turn invites a duplicate chat reply). notify=[pattern] is only for a readiness line on a server/daemon that never exits. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops).
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
 PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
@@ -2892,15 +2892,17 @@ def _foreground_background_guidance(command: str) -> str | None:
         return (
             "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
             "Re-send WITHOUT the wrapper as terminal(command=\"<cmd>\", background=true, "
-            "notify_on_complete=true) so Hermes tracks the process, then run readiness "
-            "checks and tests in separate commands."
+            ") so Hermes tracks the process, then collect a bounded job's result with "
+            "process(action=\"wait\", timeout=...) and run readiness checks and tests "
+            "in separate commands."
         )
 
     if _INLINE_BACKGROUND_AMP_RE.search(unquoted) or _TRAILING_BACKGROUND_AMP_RE.search(unquoted):
         return (
             "Foreground command uses '&' backgrounding. Re-send WITHOUT the '&' as "
-            "terminal(command=\"<cmd>\", background=true) — add notify_on_complete=true "
-            "for bounded jobs — then run health checks and tests in follow-up terminal calls."
+            "terminal(command=\"<cmd>\", background=true) — for bounded jobs collect the "
+            "result with process(action=\"wait\", timeout=...) — then run health checks "
+            "and tests in follow-up terminal calls."
         )
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
@@ -2978,9 +2980,9 @@ def _gateway_polling_loop_guidance(command: str) -> str | None:
         f"Refused: foreground polling loop ({literal}) in a messaging-gateway "
         f"session. While a foreground tool call runs, this chat cannot answer "
         f"new messages — a 60-minute poll leaves the user unanswered for 60 "
-        f"minutes. Do this instead: (1) re-send it with background=true and "
-        f"notify_on_complete=true (or watch_patterns for the line you are "
-        f"waiting for), then END THE TURN — you will be notified; (2) for "
+        f"minutes. Do this instead: (1) re-send it with background=true (or "
+        f"watch_patterns for the line you are waiting for) and collect it with "
+        f"process(action='wait', timeout=...) in slices of a few minutes; (2) for "
         f"waits longer than ~10 minutes, hand the work to a kanban card or a "
         f"cron job; (3) for a one-shot status check, run the check once "
         f"without the loop."
@@ -3066,6 +3068,7 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    _completion_required: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -3197,14 +3200,14 @@ def terminal_tool(
                     f"Foreground timeout {timeout}s exceeds the maximum of "
                     f"{_fg_max}s for messaging-gateway sessions: while a "
                     f"foreground call runs, this chat cannot answer new "
-                    f"messages. Use background=true with "
-                    f"notify_on_complete=true and end the turn, or hand work "
+                    f"messages. Use background=true and collect the result "
+                    f"with process(action='wait', timeout=...), or hand work "
                     f"longer than ~10 min to a kanban card or cron job."
                 )
             return tool_error(
                 f"Foreground timeout {timeout}s exceeds the maximum of "
-                f"{_fg_max}s. Use background=true with "
-                f"notify_on_complete=true for long-running commands."
+                f"{_fg_max}s. Use background=true and collect the result "
+                f"with process(action='wait', timeout=...) for long-running commands."
             )
         # A long configured default (terminal.timeout) must not smuggle an
         # over-cap wait into a messaging turn when the model omits timeout.
@@ -3638,16 +3641,14 @@ def terminal_tool(
                 # blindness for bounded-task cases (false negative).
                 if background and not notify_on_complete and not watch_patterns:
                     result_data["hint"] = (
-                        "background=true without notify_on_complete=true means "
-                        "this process runs SILENTLY — you will not be told when "
-                        "it exits. If this is a bounded task (test suite, build, "
-                        "CI poller, deploy, anything with a defined end), you "
-                        "almost certainly wanted notify_on_complete=true so the "
-                        "system pings you on exit. Re-launch with "
-                        "notify_on_complete=true, or call process(action='poll') "
-                        "/ process(action='wait') yourself to learn the outcome. "
-                        "Only ignore this hint for genuine long-lived processes "
-                        "that never exit (servers, watchers, daemons)."
+                        "background=true: this process runs SILENTLY — you will "
+                        "not be told when it exits. If this is a bounded task "
+                        "(test suite, build, CI poller, deploy, anything with a "
+                        "defined end), collect the outcome yourself with "
+                        "process(action='wait', timeout=...) or "
+                        "process(action='log'). Only ignore this hint for "
+                        "genuine long-lived processes that never exit (servers, "
+                        "watchers, daemons)."
                     )
 
                 # Nudge: homebrewed CI watcher built from `gh pr view`
@@ -3803,6 +3804,14 @@ def terminal_tool(
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
+                    # Internal (code-level) spawners whose flow depends on the
+                    # completion turn, e.g. bot DM delivery. Not model-settable.
+                    if _completion_required:
+                        proc_session.completion_required = True
+                    # Resolve the agent-notify knob in THIS (producing) profile;
+                    # the watcher may be drained by another profile's turn.
+                    from tools.process_registry import resolve_agent_notify_mode
+                    proc_session.agent_notify_mode = resolve_agent_notify_mode()
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
@@ -3821,6 +3830,7 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "agent_notify_mode": proc_session.agent_notify_mode,
                             "parent_session_id": proc_session.parent_session_id,
                         })
 
@@ -4396,7 +4406,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "Run in the background, returning a session_id. For anything with a defined end (tests, builds, deploys), get the result with process(action=wait, timeout=...) or process(action=log). Short commands: prefer foreground with a generous timeout.",
                 "default": False
             },
             "timeout": {
@@ -4414,7 +4424,7 @@ TERMINAL_SCHEMA = {
                 "default": False
             },
             "notify": {
-                "description": "With background=true: notify=true fires exactly one notification when the process exits (the right choice for nearly every bounded task — builds, tests, deploys). notify=['pattern', ...] instead notifies when a line matches a pattern — ONLY for one-shot readiness signals on processes that never exit (e.g. ['Application startup complete']); rate-limited and auto-disabled if it over-fires. Omit for silent daemons.",
+                "description": "With background=true: notify=['pattern', ...] notifies when a line matches — ONLY for one-shot readiness signals on processes that never exit (e.g. ['Application startup complete']); rate-limited and auto-disabled if it over-fires. Do NOT use notify=true for bounded jobs (builds, tests, deploys): use process(action=wait, timeout=...) or process(action=log) instead. Exit notifications are off by default in messaging gateways (display.background_process_agent_notify), and when on they re-enter as a turn that invites a duplicate reply. Omit for silent daemons.",
                 "anyOf": [
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}

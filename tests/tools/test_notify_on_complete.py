@@ -279,7 +279,8 @@ class TestCompletionConsumed:
 # the process silently — the agent has no way to learn it finished short
 # of calling process(action="poll") explicitly. The tool result must
 # include a "hint" field that nudges the agent toward
-# notify_on_complete=True for bounded tasks. May 2026 PR #31231 incident:
+# process(action="wait") for bounded tasks (was notify_on_complete=True
+# until t_ec17f15f). May 2026 PR #31231 incident:
 # bg CI poller exited green, agent never noticed, user had to surface it.
 # ---------------------------------------------------------------------------
 
@@ -347,8 +348,9 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
     assert result["session_id"] == "proc_silent_test"
     hint = result.get("hint", "")
     assert hint, "Silent background process must include a hint field"
-    assert "notify_on_complete" in hint, (
-        "Hint must name the corrective flag so the agent can self-correct"
+    assert "process(action='wait'" in hint, (
+        "Hint must name the corrective call so the agent can self-correct "
+        "(bounded jobs use process(wait), not notify — t_ec17f15f)"
     )
     assert "silent" in hint.lower() or "no way to learn" in hint.lower(), (
         "Hint must explain the failure mode, not just suggest the fix"

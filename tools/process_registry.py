@@ -59,7 +59,7 @@ from tools.environments.local import (
 )
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -433,6 +433,18 @@ class ProcessSession:
     # boundary (/new), instead of injecting them into the chat's NEW session.
     parent_session_id: str = ""
     notify_on_complete: bool = False             # Queue agent notification on exit
+    # Something structural depends on the completion turn (a goal parked on this
+    # process, a code-spawned bot delivery, a watch_patterns session promoted to
+    # notify_on_complete). The gateway delivers the turn even when
+    # display.background_process_agent_notify suppresses model-requested ones.
+    completion_required: bool = False
+    # display.background_process_agent_notify resolved in the SPAWNING profile
+    # ("" = unresolved; the watcher then falls back to its own scope).
+    agent_notify_mode: str = ""
+    # Set by the gateway watcher when it suppressed this session's completion
+    # turn: a zero-arg callable that re-delivers it. require_completion() fires
+    # it, so a goal that parks AFTER the exit still gets its wakeup.
+    _replay_completion: Optional[Callable[[], Any]] = field(default=None, repr=False)
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -615,6 +627,7 @@ class ProcessRegistry:
                         # Promote to notify_on_complete so the agent still gets
                         # exactly one notification when the process actually ends.
                         session.notify_on_complete = True
+                        session.completion_required = True
                         should_disable = True
                 return_early = True
             else:
@@ -644,6 +657,7 @@ class ProcessRegistry:
                 if lifetime_exhausted:
                     session._watch_disabled = True
                     session.notify_on_complete = True
+                    session.completion_required = True
 
         if return_early:
             if should_disable:
@@ -2173,6 +2187,47 @@ class ProcessRegistry:
     # Short prefixes ("p", "pr", "proc_1") are too collision-prone to act on.
     _MIN_PREFIX_CHARS = 4
 
+    def require_completion(self, session_id: Optional[str] = None, pid: Optional[int] = None) -> int:
+        """Mark matching sessions ``completion_required`` (by id or OS pid).
+
+        Used by goal wait barriers: a parked goal resumes on the completion
+        turn, so that turn must be delivered even when the gateway suppresses
+        model-requested completion turns. If the watcher already suppressed the
+        completion (the process exited before the goal parked), the stashed
+        turn is replayed. Returns the number of sessions marked.
+        """
+        replays = []
+        with self._lock:
+            sessions = list(self._running.values()) + list(self._finished.values())
+            marked = 0
+            for s in sessions:
+                if (session_id and s.id == session_id) or (pid and s.pid == pid):
+                    s.completion_required = True
+                    marked += 1
+                    if s._replay_completion is not None:
+                        replays.append(s._replay_completion)
+                        s._replay_completion = None
+        if marked:
+            self._write_checkpoint()
+        for fn in replays:
+            try:
+                fn()
+            except Exception as e:
+                logger.warning("Replaying a suppressed completion failed: %s", e)
+        return marked
+
+    def suppress_completion(self, session: "ProcessSession", replay: Callable[[], Any]) -> bool:
+        """Atomically decide suppression against ``require_completion``.
+
+        Returns False (caller must deliver) if the session is already
+        completion_required; otherwise stashes ``replay`` and returns True.
+        """
+        with self._lock:
+            if session.completion_required:
+                return False
+            session._replay_completion = replay
+            return True
+
     def get(self, session_id: str) -> Optional[ProcessSession]:
         """Get a session by ID (running or finished).
 
@@ -2504,13 +2559,14 @@ class ProcessRegistry:
             base_note += f" Uptime: {int(uptime)}s."
         if session.notify_on_complete:
             base_note += (
-                " notify_on_complete is set: you will be notified on exit — "
-                "do more work instead of waiting again."
+                " notify_on_complete is set, but exit notifications may be "
+                "off (display.background_process_agent_notify) — call "
+                "process(action='wait') again to collect the result."
             )
         else:
             base_note += (
-                " Poll again later or use terminal(background=true, "
-                "notify_on_complete=true) next time for automatic notification."
+                " Call process(action='wait', timeout=...) again to collect "
+                "the result."
             )
         if timeout_note:
             result["timeout_note"] = f"{timeout_note}. {base_note}"
@@ -3069,6 +3125,8 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "parent_session_id": s.parent_session_id,
                             "notify_on_complete": s.notify_on_complete,
+                            "completion_required": s.completion_required,
+                            "agent_notify_mode": s.agent_notify_mode,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -3173,6 +3231,8 @@ class ProcessRegistry:
                 watcher_interval=entry.get("watcher_interval", 0),
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                completion_required=bool(entry.get("completion_required", False)),
+                agent_notify_mode=str(entry.get("agent_notify_mode") or ""),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
@@ -3193,6 +3253,7 @@ class ProcessRegistry:
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
+                    "agent_notify_mode": session.agent_notify_mode,
                     "parent_session_id": session.parent_session_id,
                 })
             if not still_ours:
@@ -3423,6 +3484,35 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
 # own first/last line (is_autonomous_silence_response), but the model only uses it
 # if the injected turn says so — without this line agents answer their own
 # completions with "already handled" posts (Ace, 2026-09-27).
+AGENT_NOTIFY_MODES = ("off", "empty-success", "on")
+
+
+def normalize_agent_notify_mode(raw: Any) -> str:
+    """Normalize ``display.background_process_agent_notify`` (default ``off``).
+
+    YAML ``false``/unset -> ``off``; ``true`` -> ``on``; ``empty_success`` ->
+    ``empty-success``; anything unknown -> ``off``.
+    """
+    if raw is True:
+        return "on"
+    if raw is False or raw in (None, ""):
+        return "off"
+    mode = str(raw).strip().lower().replace("_", "-")
+    return mode if mode in AGENT_NOTIFY_MODES else "off"
+
+
+def resolve_agent_notify_mode() -> str:
+    """Resolve the knob in the CURRENT profile scope (call at spawn time, in the
+    producing profile). Returns "" when config cannot be read."""
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        return normalize_agent_notify_mode(
+            cfg_get(read_raw_config(), "display", "background_process_agent_notify")
+        )
+    except Exception:
+        return ""
+
+
 COMPLETION_SILENCE_HINT = (
     "If this result is already reported or changes nothing for the user, "
     "end your reply with NO_REPLY on its own line — nothing will be posted."

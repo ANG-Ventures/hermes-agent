@@ -86,8 +86,8 @@ terminal(
 ### Background for long tasks
 
 ```
-terminal(command="<same as above>", workdir="/path/to/project", background=true, notify_on_complete=true)
-process(action="poll", session_id="<id>")
+terminal(command="<same as above>", workdir="/path/to/project", background=true)
+process(action="wait", session_id="<id>", timeout=600)
 process(action="log", session_id="<id>")
 ```
 

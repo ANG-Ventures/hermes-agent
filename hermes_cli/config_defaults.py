@@ -1603,6 +1603,14 @@ DEFAULT_CONFIG = {
         #   "error"   — final raw-output message only on non-zero exit
         #   "off"     — no watcher messages at all
         "background_process_notifications": "concise",
+        # Agent-side terminal(background=true, notify=true) completions:
+        #   "off"           — no synthetic agent turn on exit (default); the
+        #                     exit stays visible to process(poll|wait|log);
+        #                     notify=[pattern] watch matches are unaffected
+        #   "empty-success" — inject only on exit != 0 or non-empty output
+        #   "on"            — inject every completion
+        # Read by gateway/run.py::_load_background_agent_notify_mode.
+        "background_process_agent_notify": "off",
         "streaming": False,
         "timestamps": False,      # Show message timestamps (CLI labels, TUI rows, desktop transcript)
         "timestamp_format": "%H:%M",  # strftime format for timestamps (e.g. "%b-%d %H:%M")

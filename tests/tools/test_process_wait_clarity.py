@@ -29,11 +29,12 @@ class TestWaitTimeoutClarity:
         finally:
             registry.kill_process(sid)
 
-    def test_wait_timeout_suggests_notify_when_unset(self, registry):
+    def test_wait_timeout_steers_to_wait_not_notify_when_unset(self, registry):
         sid = _spawn_sleeper(registry, notify=False)
         try:
             r = registry.wait(sid, timeout=1)
-            assert "notify_on_complete=true" in r["timeout_note"]
+            assert "process(action='wait'" in r["timeout_note"]
+            assert "notify_on_complete=true" not in r["timeout_note"]
         finally:
             registry.kill_process(sid)
 
@@ -41,7 +42,8 @@ class TestWaitTimeoutClarity:
         sid = _spawn_sleeper(registry, notify=True)
         try:
             r = registry.wait(sid, timeout=1)
-            assert "you will be notified on exit" in r["timeout_note"]
+            assert "process(action='wait')" in r["timeout_note"]
+            assert "you will be notified" not in r["timeout_note"]
         finally:
             registry.kill_process(sid)
 
