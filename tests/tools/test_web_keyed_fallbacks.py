@@ -77,6 +77,7 @@ async def test_extract_partial_failure_does_not_fallback(setup, monkeypatch):
     out = json.loads(await web_tools.web_extract_tool(urls))
     assert calls == ["firecrawl"]
     assert out["results"][1]["error"] == "404"
+    assert out["results"][0]["metadata"] == {"served_by": "firecrawl"}
 
 
 @pytest.mark.asyncio

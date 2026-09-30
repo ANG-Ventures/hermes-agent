@@ -457,8 +457,11 @@ def _keyed_fallbacks(capability: str, primary: str):
             continue
         # Ring vendors without a key invoke their anonymous endpoint and can
         # walk the ring themselves. They belong to the later rescue, not here.
-        if name in key_vars and not get_provider_env(key_vars[name]):
-            continue
+        if name in key_vars:
+            api_key = get_provider_env(key_vars[name])
+            from plugins.web.keyless_mcp import use_keyless
+            if not api_key or use_keyless(name, api_key):
+                continue
         try:
             if provider.is_available():
                 yield provider
@@ -1051,6 +1054,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                         _resp.setdefault("data", {}).setdefault("metadata", {}).update(
                             served_by=current.name, fallback_from=provider.name
                         )
+                if _resp.get("success") and _load_web_config().get("search_fallbacks"):
+                    _resp.setdefault("data", {}).setdefault("metadata", {}).setdefault(
+                        "served_by", current.name
+                    )
                 if not _resp.get("success") and _rescue_eligible(current):
                     _rescued = True
                     _resp = _rescue_search(
@@ -1209,6 +1216,7 @@ async def web_extract_tool(
                 safe_indices.append(index)
 
         # Dispatch only safe URLs to the configured backend
+        backend = ""
         if not safe_urls:
             results = []
         else:
@@ -1403,7 +1411,10 @@ async def web_extract_tool(
                                 meta = {}
                                 r["metadata"] = meta
                             meta.update(served_by=current.name, fallback_from=provider.name)
-                if _failed_extract_batch(results, fetch_urls) and _rescue_eligible(current):
+                if ((results and all(r.get("error") for r in results)
+                     and (_failed_extract_batch(results, fetch_urls)
+                          or not _load_web_config().get("extract_fallbacks")))
+                    and _rescue_eligible(current)):
                     _extract_rescued = True
                     results = await asyncio.to_thread(
                         _rescue_extract, current.name, fetch_urls, results
@@ -1451,6 +1462,16 @@ async def web_extract_tool(
                             }
                         )
                     results = merged
+
+        if safe_urls and _load_web_config().get("extract_fallbacks"):
+            from typing import cast
+            for r in cast(List[Dict[str, Any]], results):
+                if not r.get("error") and not _policy_blocked_result(r):
+                    meta = r.get("metadata")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                        r["metadata"] = meta
+                    meta.setdefault("served_by", backend)
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
