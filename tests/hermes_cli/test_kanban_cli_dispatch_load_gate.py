@@ -111,7 +111,12 @@ def test_one_shot_counts_recent_spawns_as_pending_ramp(board, monkeypatch, capsy
     _run(max=4)
     out = capsys.readouterr().out
     assert _running() == 16
-    assert "SATURATED load1=40.0" in out and "pending_ramp=32.0" in out
+    assert "SATURATED load1=40.0" in out
+    # Pending fades linearly over the 600 s ramp (t_bf26e8f1), so the
+    # seconds this test takes shave a little off the 16 x 2.0 = 32.0.
+    import re
+    m = re.search(r"pending_ramp=([\d.]+)", out)
+    assert m and 31.0 <= float(m.group(1)) <= 32.0, out
 
 
 def test_ignore_load_gate_spawns_prints_and_records_event(board, monkeypatch, capsys):
