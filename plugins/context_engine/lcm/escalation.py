@@ -386,7 +386,7 @@ def _sanitize_reasoning_summary(text: str) -> str:
 # by BOTH first-person refusal/classifier phrasing near the start AND a reply
 # far below the requested budget: a real summary that merely mentions a
 # classifier or quotes a refusal is long and third-person.
-_META_REFUSAL_SCAN_CHARS = 800
+_META_REFUSAL_SCAN_CHARS = 300
 _META_REFUSAL_MAX_TOKENS_FLOOR = 256
 _META_REFUSAL_BUDGET_FRACTION = 0.05
 _META_REFUSAL_RE = re.compile(
