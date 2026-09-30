@@ -106,6 +106,7 @@ from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     capacity_retry_wait,
     is_local_relay_restart_candidate,
+    relay_drain_wait,
     is_zai_coding_overload_error,
     jittered_backoff,
     resolve_retry_after,
@@ -7052,6 +7053,58 @@ def run_conversation(
                         )
                         # Hand off to the retries-exhausted → fallback branch.
                         retry_count = max_retries
+                # ── Relay draining for a deploy: wait, retry the SAME model ──
+                # 503 {"error":"draining-for-deploy"} is provider-wide and
+                # self-clearing (claude-pool deploy-drain, t_826861ab). Budget
+                # shape is the loopback-restart wait's (wall clock, same model,
+                # attempt NOT consumed), not the capacity block's: that one is
+                # attempt-bounded (3 x Retry-After 15 = 45 s), shorter than
+                # the relay's own 120 s drain TTL. Bound spent -> the existing
+                # "max retries -> fallback" branch below (single-sourced
+                # announce), where the chain walk skips same-provider entries.
+                if classified.reason == FailoverReason.relay_draining:
+                    from agent.fallback_wiring import relay_drain_wait_s
+
+                    _drain_max = relay_drain_wait_s()
+                    _drain_now = time.monotonic()
+                    if _retry.relay_drain_started_at is None:
+                        _retry.relay_drain_started_at = _drain_now
+                    _drain_waited = _drain_now - _retry.relay_drain_started_at
+                    _drain_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    _drain_ra = None
+                    if _drain_headers is not None and hasattr(_drain_headers, "get"):
+                        _drain_ra = _drain_headers.get("retry-after") or _drain_headers.get("Retry-After")
+                    _drain_wait = relay_drain_wait(
+                        raw_retry_after=_drain_ra,
+                        waited_s=_drain_waited,
+                        max_wait_s=_drain_max,
+                    )
+                    if _drain_wait is not None:
+                        if _drain_waited == 0:
+                            agent._vprint(
+                                f"{agent.log_prefix}⏳ relay draining for deploy, waiting "
+                                f"(up to {_drain_max:.0f}s) to retry {_model}…",
+                                force=True,
+                            )
+                        agent._touch_activity("waiting for relay deploy drain")
+                        logger.warning(
+                            "relay draining for deploy: retry %s in %.1fs (waited %.0fs of %.0fs, "
+                            "retry_after=%s) %s",
+                            _model, _drain_wait, _drain_waited, _drain_max, _drain_ra,
+                            agent._client_log_context(),
+                        )
+                        _drain_end = time.monotonic() + _drain_wait
+                        while time.monotonic() < _drain_end and not agent._interrupt_requested:
+                            time.sleep(min(0.2, max(_drain_end - time.monotonic(), 0.0)))
+                        # Not an attempt: the relay refused before serving. An
+                        # interrupt is handled by the checkpoint at loop top.
+                        retry_count = max(retry_count - 1, 0)
+                        continue
+                    logger.warning(
+                        "relay drain outlived the %.0fs wait (waited %.0fs) → fallback %s",
+                        _drain_max, _drain_waited, agent._client_log_context(),
+                    )
+                    retry_count = max_retries
                 # ── Loopback relay restarting: wait, retry the SAME model ──
                 # A connection error on a 127.0.0.1/localhost base_url is a
                 # local relay restart (relay-autodeploy: ~5 s listener gap).
