@@ -95,6 +95,32 @@ async def test_extract_402_to_keyed_tavily_real_dispatch(setup, monkeypatch):
     assert out["results"][0]["metadata"] == {"served_by": "tavily", "fallback_from": "firecrawl"}
 
 
+
+
+def test_search_missing_key_skips_candidate(setup, monkeypatch):
+    calls, providers = setup
+    monkeypatch.setattr("agent.web_search_provider.get_provider_env", lambda key: "")
+    providers.update(firecrawl=Provider("firecrawl", calls, search={"success": False, "error": "402"}),
+                     tavily=Provider("tavily", calls, search={"success": True, "data": {"web": []}}))
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda provider: False)
+    out = json.loads(web_tools.web_search_tool("missing-key-skip"))
+    assert calls == ["firecrawl"]
+    assert out["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_policy_refusal_never_sent_to_keyed_fallback(setup, monkeypatch):
+    calls, providers = setup
+    url = "https://a.example"
+    providers.update(firecrawl=Provider("firecrawl", calls, extract=[
+        {"url": url, "error": "blocked by website policy", "blocked_by_policy": True}]),
+        tavily=Provider("tavily", calls, extract=[{"url": url, "content": "bypass"}]))
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda provider: False)
+    out = json.loads(await web_tools.web_extract_tool([url]))
+    assert calls == ["firecrawl"]
+    assert out["results"][0]["blocked_by_policy"] is True
+
+
 @pytest.mark.asyncio
 async def test_exhausted_chain_reaches_ring(setup, monkeypatch):
     calls, providers = setup
