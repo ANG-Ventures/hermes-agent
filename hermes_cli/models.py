@@ -4015,12 +4015,22 @@ def resolve_fast_mode_capability(
     base = _fast_model_base(model)
     route = f"{normalized_provider}/{base or '<unset>'}"
 
-    if str(tier or "").strip().lower() == "ultrafast":
+    normalized_tier = str(tier or "").strip().lower()
+    if normalized_tier == "ultrafast":
         return _resolve_ultrafast_capability(
             provider=normalized_provider,
             api_mode=normalized_mode,
             model=model,
             route=route,
+        )
+    if normalized_tier not in {"", "priority", "fast"}:
+        # Never substitute a paid Priority tier for some other requested
+        # tier (flex, default, ...): these contracts only cover fast tiers.
+        return FastModeCapability(
+            supported=False,
+            family="unsupported",
+            request_overrides={},
+            reason=f"service tier `{normalized_tier}` has no fast-mode contract.",
         )
 
     openai_contract = FAST_MODE_CAPABILITY_CATALOG["openai_priority"]

@@ -5609,7 +5609,11 @@ class GatewaySlashCommandsMixin:
             status_capability = (
                 ultrafast_capability
                 if self._service_tier == "ultrafast"
-                or (not capability.supported and ultrafast_capability.supported)
+                or (
+                    self._service_tier is None
+                    and not capability.supported
+                    and ultrafast_capability.supported
+                )
                 else capability
             )
             if not status_capability.supported:

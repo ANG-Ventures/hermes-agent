@@ -17419,13 +17419,29 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             )
             return "\n".join(_lines)
         elif name == "fast" and agent:
-            mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode == "ultrafast":
-                agent.service_tier = "ultrafast"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
+            from hermes_cli.fast_mode_contracts import parse_service_tier
+
+            mode = arg.lower().strip()
+            if mode in {"fast", "on", "ultrafast", "normal", "off"}:
+                tier = parse_service_tier(mode)
+                # service_tier alone is inert; mirror the tier into
+                # request_overrides, route-gated, and leave the session
+                # untouched when the worker's /fast refused this route.
+                overrides = _service_tier_request_overrides(
+                    getattr(agent, "model", None),
+                    {
+                        "provider": getattr(agent, "provider", None),
+                        "api_mode": getattr(agent, "api_mode", None),
+                    },
+                    tier,
+                )
+                if tier is None or overrides:
+                    agent.service_tier = tier
+                    current = dict(getattr(agent, "request_overrides", {}) or {})
+                    current.pop("service_tier", None)
+                    current.pop("speed", None)
+                    current.update(overrides)
+                    agent.request_overrides = current
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()

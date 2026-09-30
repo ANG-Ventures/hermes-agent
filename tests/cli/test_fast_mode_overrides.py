@@ -359,3 +359,82 @@ def test_codex_stream_keeps_served_tier(monkeypatch):
         agent._build_api_kwargs([{"role": "user", "content": "hi"}])
     )
     assert response.service_tier == "default"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (Prism on #1511)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tier", ["flex", "default", "auto", "turbo"])
+def test_non_fast_tier_is_never_upgraded_to_priority(tier):
+    from hermes_cli.models import resolve_fast_mode_capability, service_tier_request_overrides
+
+    capability = resolve_fast_mode_capability(
+        model="gpt-5.5", provider="openai-api", api_mode="codex_responses", tier=tier
+    )
+    assert capability.supported is False
+    assert capability.request_overrides == {}
+    assert service_tier_request_overrides(
+        model="gpt-5.5", provider="openai-api", api_mode="codex_responses", tier=tier
+    ) == {}
+
+
+def test_served_tier_is_per_call_not_sticky():
+    from agent.conversation_loop import _record_served_service_tier
+
+    agent = SimpleNamespace(request_overrides={}, provider="openai-api", _served_service_tier=None)
+    _record_served_service_tier(agent, SimpleNamespace(service_tier="ultrafast"))
+    assert agent._served_service_tier == "ultrafast"
+    _record_served_service_tier(agent, SimpleNamespace())
+    assert agent._served_service_tier is None
+
+
+def test_cli_fast_fast_refused_on_ultrafast_only_route():
+    import cli
+
+    stub = SimpleNamespace(
+        service_tier=None,
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        api_mode="codex_responses",
+        model="gpt-6-astra",
+        agent=None,
+    )
+    stub._fast_command_available = lambda: cli.HermesCLI._fast_command_available(stub)
+    with patch.object(cli, "_cprint") as cprint:
+        cli.HermesCLI._handle_fast_command(stub, "/fast fast")
+    assert stub.service_tier is None
+    assert any("ultrafast" in str(c) for c in cprint.call_args_list)
+
+    with patch.object(cli, "_cprint"), patch.object(cli, "save_config_value"):
+        cli.HermesCLI._handle_fast_command(stub, "/fast ultrafast")
+    assert stub.service_tier == "ultrafast"
+
+
+def test_slash_mirror_routes_tier_into_request_overrides():
+    import tui_gateway.server as server
+
+    agent = SimpleNamespace(
+        model="gpt-6-astra",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        service_tier="priority",
+        request_overrides={"service_tier": "priority", "extra_body": {"x": 1}},
+    )
+    session = {"agent": agent}
+    with patch.object(server, "_emit"), patch.object(server, "_session_info", return_value={}):
+        server._mirror_slash_side_effects("sid", session, "/fast ultrafast")
+    assert agent.service_tier == "ultrafast"
+    assert agent.request_overrides == {"service_tier": "ultrafast", "extra_body": {"x": 1}}
+
+    # Unsupported route: mirror leaves the session as it was.
+    agent.model = "gpt-5.5"
+    with patch.object(server, "_emit"), patch.object(server, "_session_info", return_value={}):
+        server._mirror_slash_side_effects("sid", session, "/fast ultrafast")
+    assert agent.service_tier == "ultrafast"
+    assert agent.request_overrides["service_tier"] == "ultrafast"
+
+    with patch.object(server, "_emit"), patch.object(server, "_session_info", return_value={}):
+        server._mirror_slash_side_effects("sid", session, "/fast normal")
+    assert agent.service_tier is None
+    assert agent.request_overrides == {"extra_body": {"x": 1}}

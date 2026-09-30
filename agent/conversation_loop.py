@@ -142,6 +142,9 @@ def _record_served_service_tier(agent: Any, response: Any) -> None:
     was silently rate-limited to Standard; surface it instead of letting the
     turn look like it ran at the requested tier.
     """
+    # Per call: a response without a tier leaves the latest call's served
+    # tier unknown instead of inheriting an earlier call's value.
+    agent._served_service_tier = None
     served = getattr(response, "service_tier", None)
     if not isinstance(served, str) or not served.strip():
         return

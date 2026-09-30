@@ -3975,6 +3975,17 @@ class CLICommandsMixin:
         )
 
         if arg in {"fast", "on"}:
+            from cli import HermesCLI
+
+            try:
+                capability = HermesCLI._fast_capability(self)
+            except Exception:
+                capability = None
+            # /fast is also offered on ultrafast-only routes (gpt-6-astra);
+            # refuse a priority tier the turn route could never attach.
+            if capability is not None and not capability.supported:
+                _cprint(f"  {_DIM}(._.) {capability.reason} Try /fast ultrafast.{_RST}")
+                return
             self.service_tier = "priority"
             saved_value = "fast"
             label = "FAST"
