@@ -12570,6 +12570,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             safe_remove_workspace_dir(
                 wp, task_id=task_id, reason="complete_task", conn=conn,
             )
+        _kwh.cleanup_remote_workspaces(conn, task_id, path)
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
@@ -21349,10 +21350,11 @@ def _default_spillover_plan(conn):
     """Spillover capacity from ``kanban.worker_hosts`` (None when unset)."""
     try:
         from hermes_cli.config import load_config
-        cfg = (load_config() or {}).get("kanban", {}).get("worker_hosts")
+        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
+        hosts_cfg = kanban_cfg.get("worker_hosts")
     except Exception:
         return None
-    hosts = _kwh.parse_worker_hosts(cfg)
+    hosts = _kwh.parse_worker_hosts(hosts_cfg)
     if not hosts:
         return None
     return _kwh.plan_spillover(conn, hosts)
@@ -22059,16 +22061,23 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, body, workspace_kind FROM tasks "
+        "SELECT id, assignee, body, workspace_kind, workspace_path FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     if spillover is not None:
         # Only cards a worker host can take: scratch workspace + allowlisted
         # assignee. Everything else waits for this host's gate to reopen.
+        # Also: no linked child (children read the parent's scratch dir
+        # locally; a spilled card's files live on the worker host) and no
+        # pre-existing local workspace content (it is not on the host).
         ready_rows = [
             r for r in ready_rows
             if spillover.eligible(r["assignee"], r["workspace_kind"])
+            and not _kwh.local_workspace_has_content(r["workspace_path"])
+            and conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (r["id"],),
+            ).fetchone() is None
         ]
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
@@ -22674,8 +22683,15 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        placed_host = None
+        if spillover is not None:
+            placed_host = spillover.take(row_assignee)
+            if placed_host is None:
+                continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            if placed_host is not None:
+                spillover.release(placed_host)
             continue
         # Route precedence at spawn (both lanes): card pin > active lane
         # override > profile default gives the INTENDED route; then main's
@@ -22754,14 +22770,6 @@ def _dispatch_once_locked(
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
             import inspect
-            placed_host = None
-            if spillover is not None:
-                placed_host = spillover.take(claimed.assignee)
-                if placed_host is None:
-                    raise RuntimeError(
-                        "worker-host spillover: no slot left for "
-                        f"{claimed.assignee}"
-                    )
             spawn_kwargs: dict = {}
             try:
                 sig = inspect.signature(_spawn)
@@ -22784,6 +22792,7 @@ def _dispatch_once_locked(
                 _append_event(
                     conn, claimed.id, _kwh.PLACED_EVENT,
                     {"host": placed_host.name, "target": placed_host.target,
+                     "workspace": str(workspace),
                      "reason": str(spawn_paused), "pid": pid},
                     run_id=claimed.current_run_id,
                 )
