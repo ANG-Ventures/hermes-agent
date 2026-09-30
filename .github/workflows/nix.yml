@@ -131,4 +131,22 @@ jobs:
       - name: nix flake check
         # --print-build-logs: a check that fails then prints the assertion
         # that failed, and not only the derivation that failed to build.
-        run: nix flake check --print-build-logs
+        #
+        # One retry, only for a FETCH failure (t_d43e73aa). 2026-09-30 01:00Z
+        # main went red at 7c57ca748 because cache.nixos.org answered a resumed
+        # NAR download with HTTP 416, nix then disabled the substituter for the
+        # run, and the fallback source fetch from ftpmirror.gnu.org timed out.
+        # The next push 10 min later was green; 1 red in the last 100 main
+        # runs, and that one. A real check failure never matches these lines,
+        # so it still fails on the first attempt.
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/nix-flake-check.log"
+          nix flake check --print-build-logs 2>&1 | tee "$log" && exit 0
+          if grep -Eq "unable to download '[^']+': (HTTP error [0-9]+|Timeout was reached|Couldn't resolve host|Failure when receiving data)|substituter '[^']+' is disabled|is required, but there is no substituter that can build it" "$log"; then
+            echo "::warning::nix flake check hit a transient fetch failure; retrying once"
+            sleep 30
+            nix flake check --print-build-logs
+          else
+            exit 1
+          fi
