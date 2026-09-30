@@ -573,6 +573,17 @@ def _invoke_summary_llm_chain(
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        # t_5e0ae3b8: gemini-bridge currently drops the tail of prompts over
+        # ~200k chars. Never accept a partial-transcript "summary" from that
+        # route; try luna/another configured route, then deterministic fallback.
+        if len(prompt) > 200_000 and any(
+            tag in candidate_model.lower() for tag in ("flash", "gemini")
+        ):
+            logger.warning(
+                "LCM summary skipping %s for >200k-char prompt: bridge may "
+                "truncate its tail (t_5e0ae3b8)", candidate_model,
+            )
+            continue
         route_key = _summary_route_key(candidate_model) if segment_key else ""
         latched_for = _SUMMARY_REFUSALS.remaining(route_key, segment_key) if segment_key else 0.0
         if latched_for > 0.0:

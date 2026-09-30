@@ -422,3 +422,26 @@ def test_refusal_finish_reason_is_rejected(monkeypatch):
     assert _run(model="claude-sonnet-5-5", fallback_models=["luna"]) == (
         "decision summary", 1)
     assert calls == ["claude-sonnet-5-5", "luna"]
+
+
+def test_huge_prompt_skips_flash_bridge_with_truncated_tail(monkeypatch):
+    seen = []
+
+    def route(**kw):
+        seen.append(kw.get("model"))
+        if kw.get("model") == "sonnet":
+            return _ok(NODE_946_REPLY)
+        return _ok("A summary from luna")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = summarize_with_escalation(
+        text="user: " + ("long history " * 20_000), source_tokens=100_000,
+        token_budget=12_000, model="sonnet",
+        fallback_models=["gemini-3.8-flash-medium", "gpt-6-luna-900k"],
+    )
+    # The luna output itself is too small for the large-input ratio gate, so
+    # it is correctly not committed either. What matters here: flash saw no
+    # truncated prompt and the next route was attempted.
+    assert seen[:2] == ["sonnet", "gpt-6-luna-900k"]
+    assert "gemini-3.8-flash-medium" not in seen
+    assert summary != NODE_946_REPLY
