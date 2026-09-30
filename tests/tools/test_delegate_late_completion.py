@@ -244,6 +244,9 @@ def test_working_child_is_not_reaped_by_the_hang_ceiling(fleet_home, monkeypatch
     from tools import delegate_tool
 
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.2)
+    # Isolate the HANG ceiling: the absolute wall ceiling (default 4x
+    # child_timeout, #1542 round 2) is covered in test_delegate_late_round2.
+    monkeypatch.setattr(delegate_tool, "_get_child_max_wall_seconds", lambda ct: 60.0)
     release = threading.Event()
 
     def _slow(self):
@@ -315,6 +318,9 @@ def test_async_batch_waits_for_timed_out_running_child(fleet_home, monkeypatch):
         process_registry.completion_queue.get_nowait()
 
     monkeypatch.setattr(dt, "_get_child_timeout", lambda: 0.3)
+    # The 1.0 s "still open" window must not race the default wall ceiling
+    # (4x child_timeout = 1.2 s from child start).
+    monkeypatch.setattr(dt, "_get_child_max_wall_seconds", lambda ct: 60.0)
     release = threading.Event()
 
     def _slow(self):

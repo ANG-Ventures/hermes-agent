@@ -2291,6 +2291,13 @@ DEFAULT_CONFIG = {
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
                                      # (floor 30s) to enforce a hard cap.
+        "child_max_wall_seconds": 0,  # absolute ceiling for a child whose wait hit
+                                      # child_timeout_seconds while it was still working
+                                      # (timed_out_running). The late owner stops such a
+                                      # child after this many seconds from its start even
+                                      # if it keeps making progress. 0 = 4x
+                                      # child_timeout_seconds; positive = seconds (floor
+                                      # child_timeout_seconds). Cannot be disabled.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch
