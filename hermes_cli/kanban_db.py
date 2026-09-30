@@ -18234,9 +18234,11 @@ def _reap_worker_session(
     Call only once the worker is gone. Signals nothing unless the session is
     proved to be the recorded run's (:func:`_session_owned_by_run`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
-    worker was known alive); unknown bounds mean no reap. Groups that appear
-    DURING the reap (a member that forks into a new group on SIGTERM) are
-    signalled too. Never targets sid <= 1, the caller's own session, or the
+    worker was known alive); unknown bounds mean no reap. Every later scan
+    must share a ``(pid, create_time)`` member with the scan before it, so a
+    session that empties and has its sid reused mid-reap is never signalled.
+    Groups that appear DURING the reap (a member forking into a new group on
+    SIGTERM) are signalled while that continuity holds. Never targets sid <= 1, the caller's own session, or the
     caller's own process group. POSIX only; a no-op elsewhere.
     """
     import signal
@@ -18271,12 +18273,30 @@ def _reap_worker_session(
                 pass
             signalled.add(pgid)
 
+    def _identities(found: list[tuple[int, int]]) -> set[tuple[int, float]]:
+        out = set()
+        for pid, _ in found:
+            created = _member_birth(pid)
+            if created is not None:
+                out.add((pid, created))
+        return out
+
+    known = _identities(members)
+
     def _left() -> set[int]:
-        # Ownership was proved above. Inside the few-second grace window the
-        # sid cannot change hands: reusing the pid needs the (sequential) pid
-        # space to wrap, so every group now in the session is the worker's,
-        # including ones a member created in answer to SIGTERM.
-        return {pgid for _, pgid in _worker_session_members(sid)}
+        # Ownership is re-established on EVERY snapshot, never assumed: a
+        # snapshot is the same session only if it still holds a member
+        # (same pid AND create time) of the previous one. A session holding
+        # any original member has not emptied, so its sid cannot have been
+        # reused; groups a member created in answer to SIGTERM ride along.
+        # No overlap -> the session emptied (or is unprovable): stop.
+        nonlocal known
+        current = _worker_session_members(sid)
+        ids = _identities(current)
+        if not current or not (ids & known):
+            return set()
+        known = ids
+        return {pgid for _, pgid in current}
 
     _term({pgid for _, pgid in members})
     deadline = time.monotonic() + grace

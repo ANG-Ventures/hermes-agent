@@ -164,6 +164,7 @@ _FORK_ON_TERM = (
     "def h(*_):\n"
     "    p = subprocess.Popen(['/bin/sleep', '120'], preexec_fn=os.setpgrp)\n"
     "    print(p.pid, flush=True)\n"
+    "    time.sleep(1)\n"  # still a member when the reaper rescans
     "    os._exit(0)\n"
     "signal.signal(signal.SIGTERM, h)\n"
     "os.setpgrp()\n"
@@ -199,6 +200,21 @@ def test_group_born_during_reap_is_reaped():
             os.kill(escaped, 9)
         except OSError:
             pass
+
+
+def test_reap_stops_when_session_continuity_breaks(monkeypatch):
+    """Prism: ownership must hold for every rescan, not just the first. A
+    rescan sharing no (pid, create_time) with the previous one is a reused
+    sid; nothing in it may be signalled."""
+    signalled: list = []
+    scans = iter([[(111, 111)], [(222, 222)]])
+    monkeypatch.setattr(kb, "_worker_session_members", lambda sid: next(scans, []))
+    births = {111: 100.0, 222: 10_000.0}
+    monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: signalled.append(pg))
+    assert kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0,
+                                   grace=0.5) == 1
+    assert signalled == [111], "signalled a group from a non-continuous rescan"
 
 
 def test_reap_refuses_init_and_own_session():
