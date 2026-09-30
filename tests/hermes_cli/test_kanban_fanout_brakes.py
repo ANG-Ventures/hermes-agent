@@ -640,3 +640,182 @@ def test_cli_budget_subcommand_is_read_only(kanban_home, monkeypatch):
     assert "10.00" in out, out
     # Read-only: no pause marker written by a report.
     assert not (kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json").exists()
+
+
+
+# ---------------------------------------------------------------------------
+# r16 K -- children of an already-ruled parent mint in todo, not triage
+# ---------------------------------------------------------------------------
+
+
+def _r16_worker(monkeypatch, worker_tid, *, default_assignee=""):
+    from hermes_cli import kanban_worker_policy as kwp
+
+    monkeypatch.setattr(kwp, "_load_config", lambda: {"kanban": {
+        "worker_created_status": "triage", "default_assignee": default_assignee,
+    }})
+    monkeypatch.setenv(kwp.WORKER_ENV_MARKER, worker_tid)
+    return kwp
+
+
+def _r16_mint(conn, kwp, **kw):
+    kw.setdefault("assignee", "daedalus")
+    return kb.create_task(
+        conn,
+        forced_status=kwp.resolve_park_status(initial_status="running"),
+        **kw,
+    )
+
+
+def _r16_kinds(conn, tid):
+    return [r[0] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+
+
+def _r16_parent(conn, *, status="running", assignee="daedalus"):
+    pid = kb.create_task(conn, title="ruled parent", assignee=assignee)
+    if status == "running":
+        kb.claim_task(conn, pid)
+    elif status == "todo":
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (pid,))
+        conn.commit()
+    return pid
+
+
+def test_r16_child_of_running_parent_mints_todo_on_parent_lane(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn, assignee="daedalus-opus")
+        kwp = _r16_worker(monkeypatch, parent)
+        cid = _r16_mint(conn, kwp, title="W4a split", assignee="apollo",
+                        parents=(parent,), parents_kind="derived-from")
+        child = kb.get_task(conn, cid)
+        # todo (derived-from => recompute may already have promoted to ready);
+        # the point is: NOT triage, and on the parent's lane, not 'apollo'.
+        assert child.status in {"todo", "ready"}
+        assert child.assignee == "daedalus-opus"
+        kinds = _r16_kinds(conn, cid)
+        assert kwp.RULED_MINT_EVENT in kinds
+        assert "assignee_remapped" in kinds
+        assert "parked_by_policy" not in kinds
+    finally:
+        conn.close()
+
+
+def test_r16_needs_ruling_line_still_parks_in_triage(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn)
+        kwp = _r16_worker(monkeypatch, parent)
+        cid = _r16_mint(conn, kwp, title="scope question",
+                        body="context\n\nNEEDS RULING: ship A or B?",
+                        parents=(parent,))
+        assert kb.get_task(conn, cid).status == "triage"
+        kinds = _r16_kinds(conn, cid)
+        assert "parked_by_policy" in kinds
+        assert kwp.RULED_MINT_EVENT not in kinds
+    finally:
+        conn.close()
+
+
+def test_r16_unruled_parent_keeps_the_park(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn, status="todo")
+        kwp = _r16_worker(monkeypatch, "t_someworker")
+        cid = _r16_mint(conn, kwp, title="orphan split", parents=(parent,))
+        assert kb.get_task(conn, cid).status == "triage"
+        # Parentless worker cards park too.
+        lone = _r16_mint(conn, kwp, title="no parent")
+        assert kb.get_task(conn, lone).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_r16_operator_ruling_comment_rules_a_waiting_parent(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn, status="todo")
+        kb.add_comment(conn, parent, "default", "Apollo ruling: split it, go.")
+        kwp = _r16_worker(monkeypatch, "t_someworker")
+        cid = _r16_mint(conn, kwp, title="split after ruling", parents=(parent,))
+        assert kb.get_task(conn, cid).status == "todo"
+        # A worker's own comment is not a ruling.
+        other = _r16_parent(conn, status="todo")
+        kb.add_comment(conn, other, "daedalus", "I think we should split")
+        cid2 = _r16_mint(conn, kwp, title="split w/o ruling", parents=(other,))
+        assert kb.get_task(conn, cid2).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_r16_sibling_chain_inherits_one_worker_ruling(kanban_home, monkeypatch):
+    """W4a -> W4b minted by the same worker run: both skip triage."""
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn)
+        kwp = _r16_worker(monkeypatch, parent)
+        w4a = _r16_mint(conn, kwp, title="W4a", parents=(parent,),
+                        parents_kind="derived-from")
+        w4b = _r16_mint(conn, kwp, title="W4b", parents=(w4a,))
+        assert kb.get_task(conn, w4b).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_r16_bypass_born_card_children_park_again(kanban_home, monkeypatch):
+    """Recursion bound: a card minted by this rule does not confer it on ITS
+    own worker's children -- one auto-dispatched generation per ruling."""
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn)
+        kwp = _r16_worker(monkeypatch, parent)
+        child = _r16_mint(conn, kwp, title="gen1", parents=(parent,),
+                          parents_kind="derived-from")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+        conn.commit()
+        monkeypatch.setenv(kwp.WORKER_ENV_MARKER, child)  # gen1's worker runs
+        grand = _r16_mint(conn, kwp, title="gen2", parents=(child,))
+        assert kb.get_task(conn, grand).status == "triage"
+        # ...unless Apollo/Ace records a ruling on gen1.
+        kb.add_comment(conn, child, "apollo", "ruling: gen2 approved")
+        grand2 = _r16_mint(conn, kwp, title="gen2 ruled", parents=(child,))
+        assert kb.get_task(conn, grand2).status == "todo"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("placeholder", ["apollo", "human:apollo", "human", "default", "aegis"])
+def test_r16_worker_placeholder_assignee_lint(kanban_home, monkeypatch, placeholder):
+    conn = kb.connect()
+    try:
+        kwp = _r16_worker(monkeypatch, "t_someworker", default_assignee="")
+        with pytest.raises(ValueError, match="kanban.default_assignee"):
+            _r16_mint(conn, kwp, title=f"to {placeholder}", assignee=placeholder)
+        kwp = _r16_worker(monkeypatch, "t_someworker", default_assignee="daedalus")
+        tid = _r16_mint(conn, kwp, title=f"to {placeholder} 2", assignee=placeholder)
+        assert kb.get_task(conn, tid).assignee == "daedalus"
+        assert "assignee_remapped" in _r16_kinds(conn, tid)
+    finally:
+        conn.close()
+
+
+def test_r16_operator_creates_untouched(kanban_home, monkeypatch):
+    """No worker marker: 'apollo' assignee + running parent behave as before."""
+    from hermes_cli import kanban_worker_policy as kwp
+
+    monkeypatch.delenv(kwp.WORKER_ENV_MARKER, raising=False)
+    conn = kb.connect()
+    try:
+        parent = _r16_parent(conn)
+        tid = kb.create_task(conn, title="mine", assignee="apollo",
+                             parents=(parent,),
+                             forced_status=kwp.resolve_park_status(initial_status="running"))
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "apollo"
+        assert task.status == "todo"
+        kinds = _r16_kinds(conn, tid)
+        assert kwp.RULED_MINT_EVENT not in kinds
+        assert "assignee_remapped" not in kinds
+    finally:
+        conn.close()

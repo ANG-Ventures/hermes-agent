@@ -511,8 +511,10 @@ def test_create_happy_path(worker_env):
     # in kanban.worker_created_status (default "triage") rather than following
     # normal parent gating — a human promotes it. The pre-brake expectation
     # here was "todo" (parent isn't done yet); that path is now only reachable
-    # for a non-worker creator.
-    assert d["status"] == "triage"
+    # for a non-worker creator. r16 K (2026-09-29): the parent here is the
+    # worker's own RUNNING card -- an already-ruled parent -- so the child
+    # mints in todo on the normal gating path instead of a triage park.
+    assert d["status"] == "todo"
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -981,14 +983,14 @@ def test_worker_lifecycle_through_tools(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.metadata == {"child_task": child_out["task_id"]}
-        # Child parked in triage by the fan-out brake (2026-09-22): a card the
-        # WORKER created does not auto-promote to ready when the parent
-        # finishes — a human promotes it. Pre-brake this asserted "ready"
-        # (recompute_ready promoted it inside complete_task); the brake's whole
-        # point is that recompute never touches a triage card.
+        # Fan-out brake (2026-09-22) + r16 K (2026-09-29): the child was minted
+        # under the worker's own RUNNING card -- an already-ruled parent -- so
+        # it lands in todo (not triage) and recompute_ready promotes it to
+        # ready when the parent completes. Only a NEEDS RULING: body line or an
+        # unruled parent parks it in triage (see test_kanban_fanout_brakes).
         child = kb.get_task(conn, child_out["task_id"])
-        assert child.status == "triage", (
-            f"worker-created child should park in triage, got {child.status}"
+        assert child.status == "ready", (
+            f"ruled-parent child should promote after parent done, got {child.status}"
         )
         # Comment is visible
         assert len(kb.list_comments(conn, worker_env)) == 1

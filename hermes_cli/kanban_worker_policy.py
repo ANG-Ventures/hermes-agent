@@ -21,7 +21,9 @@ worker profile can legitimately be driven interactively by a human.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from typing import Optional
 
 # Statuses whose creation intent is "queue this for work". Only these are
@@ -128,7 +130,9 @@ def configured_default_assignee() -> str:
     return value.strip()
 
 
-def resolve_worker_assignee(assignee: str) -> tuple[str, Optional[dict], Optional[str]]:
+def resolve_worker_assignee(
+    assignee: str, *, parent_lane: Optional[str] = None,
+) -> tuple[str, Optional[dict], Optional[str]]:
     """Rewrite a worker's placeholder assignee to ``kanban.default_assignee``.
 
     Returns ``(assignee, remap_payload, error)``:
@@ -140,12 +144,26 @@ def resolve_worker_assignee(assignee: str) -> tuple[str, Optional[dict], Optiona
       ``(assignee, None, error)``, and the caller refuses the create.
     """
     requested = str(assignee).strip()
-    if not is_dispatched_worker() or requested.lower() not in RESERVED_WORKER_ASSIGNEES:
+    if not is_dispatched_worker() or not is_placeholder_assignee(requested):
         return str(assignee), None, None
+    lane = (parent_lane or "").strip()
+    if lane and not is_placeholder_assignee(lane):
+        # Minted under an already-ruled parent: the child rides the parent's
+        # assignee lane, never a human/operator placeholder (r16 K).
+        return lane, {
+            "from": requested,
+            "to": lane,
+            "knob": "ruled_parent_lane",
+            "reason": (
+                f"worker-created card asked for placeholder assignee="
+                f"{requested!r}; remapped to the ruled parent's lane {lane!r}"
+            ),
+            "worker_task_id": (os.environ.get(WORKER_ENV_MARKER) or "").strip() or None,
+        }, None
     configured = configured_default_assignee()
-    if not configured or configured.lower() in RESERVED_WORKER_ASSIGNEES:
+    if not configured or is_placeholder_assignee(configured):
         return str(assignee), None, (
-            f"assignee={requested!r} is reserved for the operator profile and "
+            f"assignee={requested!r} is a placeholder/operator lane and "
             "cannot be used by a dispatched worker, and kanban.default_assignee "
             "is not set to another profile. Name the specialist profile that "
             "should run this card."
@@ -160,3 +178,123 @@ def resolve_worker_assignee(assignee: str) -> tuple[str, Optional[dict], Optiona
         ),
         "worker_task_id": (os.environ.get(WORKER_ENV_MARKER) or "").strip() or None,
     }, None
+
+
+# ---------------------------------------------------------------------------
+# r16 K: children minted under an already-ruled parent skip the triage park.
+#
+# Incident 2026-09-29: every card a worker split off a card Apollo had already
+# ruled on (Prism W4a-d, t_99d05f73, t_a88d7ab0 with assignee 'apollo') landed
+# in ``triage`` with no run and nothing to rule, and Apollo hand-resolved each
+# one to ``todo`` every sweep. The rule: a worker-created child whose parent's
+# ruling is recorded lands in ``todo`` on the parent's assignee lane. Only a
+# body carrying an explicit ``NEEDS RULING:`` line still parks in triage.
+# ---------------------------------------------------------------------------
+
+# Profiles that are a human/operator lane or a model's filler, never a worker
+# that the dispatcher can usefully spawn for a worker-created card.
+PLACEHOLDER_ASSIGNEES = RESERVED_WORKER_ASSIGNEES | frozenset({
+    "apollo", "aegis", "human", "operator", "reviewer", "worker",
+    "assignee", "tbd", "none", "null", "unassigned",
+})
+
+# Comment authors whose comment on a parent IS a recorded ruling (Apollo runs
+# as the ``default`` profile; Ace's own comments are authored ``user``/``ace``).
+RULING_AUTHORS = frozenset({"default", "apollo", "ace", "user"})
+
+# A parent that is itself queued or being worked was put there by a ruling.
+RULED_PARENT_STATUSES = frozenset({"ready", "running"})
+
+RULED_MINT_EVENT = "minted_under_ruled_parent"
+
+_NEEDS_RULING_RE = re.compile(r"^[ \t>*_-]*NEEDS RULING:", re.MULTILINE)
+
+
+def is_placeholder_assignee(name: Optional[str]) -> bool:
+    """True for a human/operator/placeholder lane (``apollo``, ``human:x``...)."""
+    value = (name or "").strip().lower()
+    if not value:
+        return True
+    return value in PLACEHOLDER_ASSIGNEES or value.startswith("human:")
+
+
+def body_needs_ruling(body: Optional[str]) -> bool:
+    """True when the card body carries an explicit ``NEEDS RULING:`` line."""
+    return bool(body) and bool(_NEEDS_RULING_RE.search(body))
+
+
+def find_ruled_parent(conn, parents) -> Optional[dict]:
+    """Return the first parent whose ruling is recorded, else None.
+
+    A parent is ruled when (in order):
+
+    1. it carries a comment by an operator/Ace author (:data:`RULING_AUTHORS`);
+    2. it was itself minted under a ruled parent by THIS SAME worker run
+       (sibling chains such as W4a -> W4b inherit the one ruling);
+    3. it is ``ready``/``running`` -- unless it was minted by this rule, so a
+       bypass-born card's own children park again. That bounds automatic
+       dispatch to one generation per human ruling (the 2026-09-22 fan-out
+       brake stays intact for recursive worker trees).
+    """
+    worker = (os.environ.get(WORKER_ENV_MARKER) or "").strip()
+    authors = sorted(RULING_AUTHORS)
+    for pid in parents or ():
+        row = conn.execute(
+            "SELECT id, status, assignee FROM tasks WHERE id = ?", (pid,),
+        ).fetchone()
+        if row is None:
+            continue
+        ruling = conn.execute(
+            "SELECT id, author FROM task_comments WHERE task_id = ? AND "
+            "lower(author) IN (" + ",".join("?" * len(authors)) + ") "
+            "ORDER BY id LIMIT 1",
+            (pid, *authors),
+        ).fetchone()
+        base = {"parent": row["id"], "parent_status": row["status"],
+                "parent_assignee": row["assignee"]}
+        if ruling is not None:
+            return {**base, "why": "ruling_comment",
+                    "comment_id": ruling["id"], "ruled_by": ruling["author"]}
+        bypass = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id LIMIT 1",
+            (pid, RULED_MINT_EVENT),
+        ).fetchone()
+        if bypass is not None:
+            try:
+                minted_by = (json.loads(bypass["payload"] or "{}") or {}).get(
+                    "worker_task_id"
+                )
+            except (TypeError, ValueError):
+                minted_by = None
+            if worker and minted_by == worker:
+                return {**base, "why": "sibling_of_ruled_mint"}
+            continue
+        if row["status"] in RULED_PARENT_STATUSES:
+            return {**base, "why": "parent_status"}
+    return None
+
+
+def resolve_ruled_mint(conn, *, parents, body: Optional[str]) -> Optional[dict]:
+    """Decide whether a worker-created, policy-parked card should be ``todo``.
+
+    Returns the ruled-parent record (see :func:`find_ruled_parent`) when the
+    card skips triage, or None to keep the park. Never overrides an explicit
+    ``NEEDS RULING:`` line, and never applies to a parentless card.
+    """
+    if not is_dispatched_worker() or not parents:
+        return None
+    if body_needs_ruling(body):
+        return None
+    return find_ruled_parent(conn, parents)
+
+
+def ruled_mint_event_payload(ruled: dict) -> dict:
+    """Audit payload for the ``minted_under_ruled_parent`` task_event."""
+    return {
+        **ruled,
+        "status": "todo",
+        "rule": "r16 K: child of a ruled parent -> todo on the parent lane; "
+                "only an explicit 'NEEDS RULING:' line parks in triage",
+        "worker_task_id": (os.environ.get(WORKER_ENV_MARKER) or "").strip() or None,
+    }
