@@ -821,6 +821,9 @@ class _GuardStuckNotifier:
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
+        # A land-request is tracked apart from the page (``<key>|land``) so an
+        # enqueue does not spend the (card, PR) page slot (Prism #1545).
+        current |= {f"{key}|land" for key in current}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -839,9 +842,19 @@ class _GuardStuckNotifier:
                 continue
             if time.monotonic() >= deadline:
                 break
-            if send(board, item):
-                self._sent[key] = now
-                delivered += 1
+            land_key = f"{key}|land"
+            land_at = self._sent.get(land_key)
+            probe = dict(item)
+            if land_at is not None and now - land_at < self._remind:
+                probe["land_enqueued_at"] = land_at
+            if send(board, probe):
+                if probe.get("land_request") == "enqueued":
+                    # Enqueued, nobody paged: a later non-merged queue outcome
+                    # still pages once on the next tick (Prism #1545).
+                    self._sent[land_key] = now
+                elif probe.get("land_request") != "pending":
+                    self._sent[key] = now
+                    delivered += 1
         if self._sent != before:
             self._save()
         return delivered
@@ -942,7 +955,9 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
     """Enqueue a land-request for a finished card's mergeable holding PR.
 
     None: not landable here (page the operator). True: enqueued (or already
-    queued). False: the enqueue failed (page instead). Landable means the
+    queued); ``item["land_request"]`` says which (``enqueued`` /
+    ``pending``) so the page slot stays free for a later queue failure
+    (Prism #1545). False: the enqueue failed (page instead). Landable means the
     guard held on ``RESPAWN_GUARD_HOLD_MERGEABLE`` (OPEN, mergeable, no red
     check), the last run FINISHED its deliverable, the URL is a legal GitHub
     PR, and the land queue has not already given up on this PR. The queue
@@ -976,6 +991,11 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
     if prior is not None and prior != "merged":
         item["land_queue"] = prior
         return None
+    if item.get("land_enqueued_at") is not None:
+        # Already enqueued in this reminder window and the queue has not
+        # stopped on the PR: wait silently, no second enqueue (Prism #1545).
+        item["land_request"] = "pending"
+        return True
     argv = [sys.executable, str(script), "enqueue", "--card", str(item["task_id"]),
             "--repo", repo, "--pr", str(number), "--board", str(board),
             "--item", f"{item['task_id']}: active_pr hold, PR mergeable, "
@@ -992,6 +1012,7 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
         return False
     logger.info("kanban dispatcher [%s]: active_pr hold %s -> land-request enqueued for %s#%s (%s)",
                 board, item["task_id"], repo, number, (proc.stdout or "").strip()[:160])
+    item["land_request"] = "enqueued"
     return True
 
 

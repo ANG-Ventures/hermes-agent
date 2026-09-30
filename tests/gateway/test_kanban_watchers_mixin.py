@@ -721,7 +721,40 @@ def test_active_pr_land_request_is_once_per_card_and_pr(tmp_path, monkeypatch):
     _root, calls = _land_rig(tmp_path, monkeypatch)
     notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
     item = _mergeable_hold(guarded_since=100)
-    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1000) == 1
+    # An enqueue is an action, not a page: not counted (Prism #1545).
+    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1000) == 0
     assert notifier.observe([("default", {**item, "guarded_since": 900})],
                             _send_guard_stuck_alert, now=2000) == 0
     assert [a for a in calls if "enqueue" in a] == [calls[0]] and len(calls) == 1
+
+
+def test_active_pr_failed_land_request_pages_once_without_re_enqueue(tmp_path, monkeypatch):
+    """Prism #1545 52766705e3e6: the enqueue must not spend the (card, PR) page
+    slot. When the queue later stops on the PR (FAILED/DIRTY/GAVE UP), the next
+    tick pages once; the PR is never re-enqueued inside the reminder window."""
+    import json
+
+    from gateway.kanban_watchers import _GuardStuckNotifier, _send_guard_stuck_alert
+
+    root, calls = _land_rig(tmp_path, monkeypatch)
+    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
+    item = _mergeable_hold(guarded_since=100)
+    # Enqueue is an action, not a page: no "#alerts paged" count.
+    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1000) == 0
+    assert len(calls) == 1 and "enqueue" in calls[0]
+    # Still pending: silent, and no second enqueue subprocess.
+    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1060) == 0
+    assert len(calls) == 1
+    done = root / "state" / "apollo-land-queue.done"
+    done.mkdir(parents=True)
+    (done / "1-x.json").write_text(json.dumps(
+        {"repo": "ANG-Ventures/prism-router", "pr": 281, "status": "failed"}), encoding="utf-8")
+    # A restarted gateway reloads the ledger and still escalates.
+    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
+    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=2000) == 1
+    assert len(calls) == 2 and str(calls[1][1]).endswith("notify.py")
+    assert "Land queue already stopped on this PR: `failed`" in calls[1][calls[1].index("--send") + 1]
+    # Paged once: silent until the 6h reminder, never re-enqueued.
+    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=3000) == 0
+    assert len(calls) == 2
+    assert not [a for a in calls[1:] if "enqueue" in a]
