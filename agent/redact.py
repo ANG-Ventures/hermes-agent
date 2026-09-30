@@ -1306,13 +1306,15 @@ _SIGNING_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
         # key (``signature``, ``x-apx-signature``, ``thinking signature``,
         # ``hmac``), optional (escaped) quote, ``:``/``=``, optional (escaped)
         # quote, then an opaque value: pure hex (>=8), or a base64-ish blob
-        # (>=20, no ``_``, mixes digits, upper and lower). Code identifiers
-        # and algorithm names (``protocol_v2``, ``HmacSHA256``,
-        # ``inspect.signature``) match neither and are kept.
+        # (>=32, no ``_``, upper and lower, and either ``+``/``/`` or 3+
+        # separate digit runs). Code identifiers and algorithm names
+        # (``protocol_v2``, ``HmacSHA256``, ``RequestSignatureV2Payload``,
+        # ``inspect.signature``) have at most a digit run or two and are kept.
         re.compile(
             r"(?i:([A-Za-z0-9_-]*(?:signature|hmac)(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])?))"
             r"(?:[0-9a-fA-F]{8,}"
-            r"|(?=[A-Za-z+/=-]*[0-9])(?=[0-9+/=a-z-]*[A-Z])(?=[0-9+/=A-Z-]*[a-z])[A-Za-z0-9+/=-]{20,})"
+            r"|(?=[0-9+/=a-z-]*[A-Z])(?=[0-9+/=A-Z-]*[a-z])"
+            r"(?=[A-Za-z0-9=-]*[+/]|(?:[A-Za-z+/=-]*[0-9]+(?![0-9])){3})[A-Za-z0-9+/=-]{32,})"
             r"(?![A-Za-z0-9+/=_(.-])"
         ),
         r"\1***",

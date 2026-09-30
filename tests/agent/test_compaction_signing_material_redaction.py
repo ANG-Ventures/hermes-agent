@@ -22,7 +22,7 @@ PROMPT_ID = "9c1e77ab02"
 FINGERPRINT = "ef3"
 SIG = "3f9a0c1d2e4b5a6978"
 APX_SIG = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
-THINKING_SIG = "EqQBCkYIBxgCKkBxyz123456789abcdef"
+THINKING_SIG = "EqQBCkYIBxgCKkB4Zm9vYmFy3Q1pL7vX9aK2mN0c"
 BEARER = "sk-" + "ant-oat01-" + "abcdefghijklmnopqrstuvwxyz" + "0123456789"
 VALUES = (CCH, PROMPT_ID, f"283.{FINGERPRINT}", SIG, APX_SIG, THINKING_SIG, BEARER)
 
@@ -53,6 +53,8 @@ def _assert_scrubbed(text: str) -> None:
         (f"cc_version=2.1.283.{FINGERPRINT};", "cc_version=2.1.283.***;"),
         (f"cc_prompt_id={PROMPT_ID}", "cc_prompt_id=***"),
         (f"x-apx-signature: {APX_SIG}", "x-apx-signature: ***"),
+        (f'"signature":"{THINKING_SIG}"', '"signature":"***"'),
+        ('signature: "EqQBCkYIBxgCKkB+Zm9vYmFyQ/pLvXaKmNc="', 'signature: "***"'),
         (f"a\\ncch={CCH}", "a\\ncch=***"),
         (f"a\\tsignature={SIG}", "a\\tsignature=***"),
     ],
@@ -71,6 +73,10 @@ def test_values_masked_keys_kept(raw, expected):
         # Prism P1 (#1554 r1): identifiers / algorithm names are not material.
         "signature = protocol_v2; hmac=HmacSHA256; signature: sign_request_v2",
         "signature=RequestSignerV2.compute(body)",
+        # Prism P1 (#1554 r2): long CamelCase names with a version digit.
+        "def verify(signature: RequestSignatureV2Payload):",
+        "signature = SignatureAlgorithmV2",
+        "signature = HmacSha256SignatureVerifierForRelayV2Payload",
     ],
 )
 def test_code_and_identifiers_survive(keep):
