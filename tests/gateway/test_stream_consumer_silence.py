@@ -213,3 +213,94 @@ class TestInternalEventStreamSilence:
         await consumer.run()
 
         assert any("run 123" in t for t in _sent_and_edited(adapter))
+
+
+class TestInternalEventHoldAcrossBoundaries:
+    """The internal-event hold spans segment breaks and commentary (t_4f0e196a).
+
+    Prism P1 on #1514: the hold required ``not got_segment_break`` and
+    ``commentary_text is None``, so a preamble before a tool boundary (or an
+    interim commentary) was delivered even when the turn ended in NO_REPLY.
+    """
+
+    @staticmethod
+    def _consumer(adapter):
+        return GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(
+                edit_interval=0.0, buffer_threshold=1, internal_event=True,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_segment_break_before_marker_never_reaches_platform(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Checking the build log first.")
+        await asyncio.sleep(0.1)
+        consumer.on_segment_break()  # tool call boundary
+        await asyncio.sleep(0.1)
+        consumer.on_delta("NO_REPLY")
+        await asyncio.sleep(0.1)
+        consumer.finish("NO_REPLY")
+        await asyncio.wait_for(task, timeout=5)
+
+        assert _sent_and_edited(adapter) == []
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_commentary_before_marker_never_reaches_platform(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_commentary("Let me check whether this is new.")
+        await asyncio.sleep(0.1)
+        consumer.finish("NO_REPLY")
+        await asyncio.wait_for(task, timeout=5)
+
+        assert _sent_and_edited(adapter) == []
+
+    @pytest.mark.asyncio
+    async def test_held_preamble_is_delivered_when_final_is_not_silent(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Checking the build log first.")
+        await asyncio.sleep(0.1)
+        consumer.on_segment_break()
+        consumer.on_commentary("Log fetched.")
+        await asyncio.sleep(0.1)
+        consumer.on_delta("CI is red: test_foo failed in run 123.")
+        await asyncio.sleep(0.1)
+        consumer.finish("CI is red: test_foo failed in run 123.")
+        await asyncio.wait_for(task, timeout=5)
+
+        texts = _sent_and_edited(adapter)
+        joined = "\n".join(texts)
+        assert "Checking the build log first." in joined
+        assert "Log fetched." in joined
+        assert "run 123" in joined
+        # Held interim content lands before the final answer.
+        first_final = next(i for i, t in enumerate(texts) if "run 123" in t)
+        assert any("Checking the build log" in t for t in texts[:first_final])
+        assert consumer.has_delivered_text("Checking the build log first.")
+
+    @pytest.mark.asyncio
+    async def test_flush_barrier_releases_held_content_in_order(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Preamble before the tool.")
+        consumer.on_segment_break()
+        consumer.on_delta("Question context.")
+        flushed = await asyncio.to_thread(consumer.flush_pending_sync, 5.0)
+        consumer.finish("Which branch?")
+        await asyncio.wait_for(task, timeout=5)
+
+        assert flushed is True
+        sends = [c.kwargs.get("content", "") for c in adapter.send.call_args_list]
+        pre = next(i for i, t in enumerate(sends) if "Preamble" in t)
+        ctx = next(i for i, t in enumerate(sends) if "Question context" in t)
+        assert pre < ctx
