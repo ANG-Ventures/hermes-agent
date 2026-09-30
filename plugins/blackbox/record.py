@@ -67,6 +67,11 @@ class TurnRecord:
     # returned no usage sets them even when the final call is fully measured.
     # Renderers of last-call data must gate on THIS flag (r6 finding 9).
     last_call_prompt_unknown: bool = False
+    # Context-size correction (t_5918f6f7): NULL unless the final call carries
+    # the relay's usage_invariant_violation. Written by the store's
+    # _refresh_context_invariant (never by the turn upsert); insert_turn copies
+    # it back onto the record so the spend card renders the corrected size.
+    corrected_context_used: Optional[int] = None
     # Request composition of the FINAL call (char/4 fixed vs non-fixed buckets).
     # Distinct from the cache split above: this decomposes the request PAYLOAD
     # by source (system / tool schemas / history / tool results / tool args),
@@ -177,3 +182,20 @@ def tools_summary(tools: List[str]) -> str:
     for t in order:
         out.append(f"{t}×{counts[t]}" if counts[t] > 1 else t)
     return ", ".join(out)
+
+
+def effective_context_used(rec: Any) -> tuple[int, int | None]:
+    """(context size to display, raw context_used when it was corrected else None).
+
+    One callable for every context-occupancy reader (``/context``, the spend
+    card): a stored ``corrected_context_used`` (set only when the final call
+    carries the relay's usage_invariant_violation, claude-bpx#397) wins. A raw
+    value over ``context_length`` alone is left as is: context_length can be
+    the harness's configured length rather than the model window (t_5918f6f7).
+    """
+    get = rec.get if isinstance(rec, dict) else (lambda k, d=None: getattr(rec, k, d))
+    raw = int(get("context_used", 0) or 0)
+    corrected = get("corrected_context_used", None)
+    if corrected is not None:
+        return int(corrected), raw
+    return raw, None

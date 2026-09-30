@@ -90,6 +90,51 @@ def _cache_creation_tiers(usage: Any) -> tuple[int | None, int | None]:
     return value("ephemeral_5m_input_tokens"), value("ephemeral_1h_input_tokens")
 
 
+def _usage_extra(usage: Any, key: str) -> Any:
+    """Read a relay-added usage field from a dict, attribute or pydantic extra."""
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage.get(key)
+    value = getattr(usage, key, None)
+    if value is None:
+        extra = getattr(usage, "model_extra", None)
+        if isinstance(extra, dict):
+            value = extra.get(key)
+    return value
+
+
+def _positive_int(raw: Any) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if not math.isfinite(raw) or raw <= 0:
+        return None
+    return int(raw)
+
+
+def _relay_usage_invariant(usage: Any) -> tuple[str | None, int | None, int | None]:
+    """(usage_invariant_violation, corrected_prompt_tokens, upstream_requests).
+
+    claude-bpx#397 marks egress usage whose prompt exceeds the model's context
+    window with ``usage_invariant_violation`` (a reason string),
+    ``relay_synthetic`` and ``context_window``, and reports
+    ``upstream_requests`` for multi-request relay turns. The violation's
+    corrected prompt is the context window (the last-request figure is already
+    the reported prompt after #397, so a violation means it is unrecoverable).
+    Unknown shapes yield NULLs, never a guess.
+    """
+    raw_violation = _usage_extra(usage, "usage_invariant_violation")
+    if raw_violation is True:
+        violation = "prompt_exceeds_context_window"
+    elif isinstance(raw_violation, str) and raw_violation.strip():
+        violation = raw_violation.strip()[:80]
+    else:
+        violation = None
+    corrected = _positive_int(_usage_extra(usage, "context_window")) if violation else None
+    upstream = _positive_int(_usage_extra(usage, "upstream_requests"))
+    return violation, corrected, upstream
+
+
 def record_api_call(
     *,
     turn_id: str,
@@ -135,6 +180,7 @@ def record_api_call(
         else CanonicalUsage(request_count=0)
     )
     tier_5m, tier_1h = _cache_creation_tiers(usage)
+    violation, corrected_prompt, upstream = _relay_usage_invariant(usage)
     store.insert_api_call(
         turn_id,
         seq,
@@ -151,6 +197,9 @@ def record_api_call(
         cache_write_1h=tier_1h,
         cache_ttl_requested=cache_ttl_requested,
         call_id=call_id,
+        usage_invariant_violation=violation,
+        corrected_prompt_tokens=corrected_prompt,
+        upstream_requests=upstream,
     )
     if turn_id in _provisional_turns:
         _refresh_provisional_turn(turn_id)
