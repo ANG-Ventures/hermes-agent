@@ -18147,6 +18147,201 @@ def _dead_claimer_release_at(
     )
 
 
+def _worker_session_members(sid: int) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of every process still in session ``sid``.
+
+    Workers are spawned with ``start_new_session=True``, so worker pid ==
+    sid == pgid. Anything the worker started in ANOTHER process group of that
+    session (pytest children, helper-launched headless Chromes, background
+    shells) is not reached by signalling the worker pid and outlives it with
+    ppid 1 (t_ca0233d7: 54 leaked Chromes, Studio load1 250). ``ps`` lists
+    pid+pgid; ``os.getsid`` maps each PID (not each pgid, since a group whose
+    leader exited still has live members). Same algorithm as hermes-home
+    ``scripts/test-gate`` ``_session_groups``.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,pgid="], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    members: list[tuple[int, int]] = []
+    me = os.getpid()
+    my_pgid = os.getpgid(0)
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        pid, pgid = int(parts[0]), int(parts[1])
+        if pid == me or pgid <= 1 or pgid == my_pgid:
+            continue
+        try:
+            if os.getsid(pid) == sid:
+                members.append((pid, pgid))
+        except OSError:
+            pass
+    return members
+
+
+def _member_birth(pid: int) -> Optional[float]:
+    """Create time of ``pid``, or None when it is gone/unreadable."""
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.Error, OSError):
+        return None
+
+
+def _session_owned_by_run(
+    members: list[tuple[int, int]], born_after: float, born_before: float,
+) -> bool:
+    """True when some member of the session was created inside the recorded
+    run, i.e. between its claim and its last liveness evidence.
+
+    A worker pid can be recycled once its whole session is gone; a new
+    session leader on that pid, exited with children left behind, looks
+    exactly like a dead worker's leftovers. Its members were all created
+    after the recorded worker died, which is after the run's last evidence,
+    so they fail this check. While any member of the ORIGINAL session lives,
+    the session is continuous and every group in it is the worker's.
+
+    Known residual (deliberate, safety over completeness): on the crash path
+    a child the worker started after its last heartbeat is indistinguishable
+    from a recycled session's child and is left alone. Paths that verified
+    the worker alive before signalling it bound on that moment instead.
+    """
+    for pid, _ in members:
+        created = _member_birth(pid)
+        # No upper slack: a recycled leader (and every child of it) is
+        # created after the worker died, i.e. strictly after its last
+        # evidence, and event times are floored, so ``<= born_before`` can
+        # never admit one. The lower bound only needs claim-time slack.
+        if created is not None and born_after - 1.0 <= created <= born_before:
+            return True
+    return False
+
+
+def _reap_worker_session(
+    sid: Optional[int],
+    *,
+    born_after: Optional[float],
+    born_before: Optional[float],
+    grace: float = 3.0,
+) -> int:
+    """SIGTERM every process group left in worker session ``sid``, wait up to
+    ``grace`` seconds, then SIGKILL the survivors. Returns the groups signalled.
+
+    Call only once the worker is gone. Signals nothing unless the session is
+    proved to be the recorded run's (:func:`_session_owned_by_run`, with
+    ``born_after`` = claim time and ``born_before`` = the last moment the
+    worker was known alive); unknown bounds mean no reap. Every later scan
+    must share a ``(pid, create_time)`` member with the scan before it, so a
+    session that empties and has its sid reused mid-reap is never signalled.
+    Groups that appear DURING the reap (a member forking into a new group on
+    SIGTERM) are signalled while that continuity holds. Never targets sid <= 1, the caller's own session, or the
+    caller's own process group. POSIX only; a no-op elsewhere.
+    """
+    import signal
+
+    if not sid or int(sid) <= 1 or born_after is None or born_before is None:
+        return 0
+    if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
+        return 0
+    sid = int(sid)
+    try:
+        if sid in (os.getsid(0), os.getpid()):
+            return 0
+    except OSError:
+        return 0
+    members = _worker_session_members(sid)
+    if not members:
+        return 0
+    if not _session_owned_by_run(members, float(born_after), float(born_before)):
+        _log.info(
+            "kanban: session %d has %d member(s) but none from the recorded run; not reaped",
+            sid, len(members),
+        )
+        return 0
+
+    signalled: set[int] = set()
+
+    def _term(groups: set[int]) -> None:
+        for pgid in sorted(groups - signalled):
+            try:
+                os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
+            except OSError:
+                pass
+            signalled.add(pgid)
+
+    def _identities(found: list[tuple[int, int]]) -> set[tuple[int, float]]:
+        out = set()
+        for pid, _ in found:
+            created = _member_birth(pid)
+            if created is not None:
+                out.add((pid, created))
+        return out
+
+    known = _identities(members)
+
+    def _left() -> set[int]:
+        # Ownership is re-established on EVERY snapshot, never assumed: a
+        # snapshot is the same session only if it still holds a member
+        # (same pid AND create time) of the previous one. A session holding
+        # any original member has not emptied, so its sid cannot have been
+        # reused; groups a member created in answer to SIGTERM ride along.
+        # No overlap -> the session emptied (or is unprovable): stop.
+        nonlocal known
+        current = _worker_session_members(sid)
+        ids = _identities(current)
+        if not current or not (ids & known):
+            return set()
+        known = ids
+        return {pgid for _, pgid in current}
+
+    _term({pgid for _, pgid in members})
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        left = _left()
+        if not left:
+            break
+        _term(left)  # groups born during the reap get their SIGTERM too
+        time.sleep(0.1)
+    for pgid in sorted(_left()):
+        try:
+            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
+        except OSError:
+            pass
+        signalled.add(pgid)
+    _log.warning(
+        "kanban: reaped %d leftover process group(s) of worker session %d",
+        len(signalled), sid,
+    )
+    return len(signalled)
+
+
+def _run_last_evidence_at(
+    conn: Optional[sqlite3.Connection], task_id: Optional[str],
+    run_id: Optional[int] = None,
+) -> Optional[float]:
+    """Newest ``heartbeat``/``spawned`` event time of the run (current run
+    when ``run_id`` is None): the last moment its worker is known alive."""
+    if conn is None or task_id is None:
+        return None
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = row[0] if row else None
+    if run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('heartbeat', 'spawned')",
+        (task_id, int(run_id)),
+    ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -18240,7 +18435,9 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
 
+    verified_alive_at: Optional[float] = None
     if _pid_alive(pid):
+        verified_alive_at = time.time()
         identity = _owner_identity(int(pid), *owner_window)
         info["owner_identity"] = identity
         if identity == "recycled":
@@ -18271,6 +18468,9 @@ def _terminate_reclaimed_worker(
         # survival. Leaving terminated=False here would make the reclaim guard
         # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
+        _reap_terminated_worker_session(
+            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+        )
         return info
     except PermissionError:
         # Identity was verified above (or the pid was not visibly alive), so
@@ -18285,6 +18485,9 @@ def _terminate_reclaimed_worker(
     for _ in range(10):
         if not _pid_alive(pid):
             info["terminated"] = True
+            _reap_terminated_worker_session(
+                pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+            )
             return info
         time.sleep(0.5)
 
@@ -18299,7 +18502,34 @@ def _terminate_reclaimed_worker(
             return info
 
     info["terminated"] = not _pid_alive(pid)
+    if info["terminated"]:
+        _reap_terminated_worker_session(
+            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+        )
     return info
+
+
+def _reap_terminated_worker_session(
+    pid, info: dict, signal_fn, owner_window: tuple,
+    verified_alive_at: Optional[float], conn, task_id,
+) -> None:
+    """Reap the leftovers of a worker ``_terminate_reclaimed_worker`` just
+    proved gone. Session members must date from the recorded run: claimed
+    at/after the claim and no later than the moment the worker was verified
+    alive (or, if it was already dead, its last heartbeat/spawn event).
+    Skipped when a test ``signal_fn`` stands in for real signals (those runs
+    use fake or borrowed pids)."""
+    if signal_fn is not None:
+        return
+    born_before = verified_alive_at
+    if born_before is None:
+        born_before = _run_last_evidence_at(conn, task_id)
+    reaped = _reap_worker_session(
+        pid, born_after=owner_window[0] if owner_window else None,
+        born_before=born_before,
+    )
+    if reaped:
+        info["session_groups_reaped"] = reaped
 
 
 def _dead_claimer_hold_only(worker_pid: Optional[int], termination: dict) -> bool:
@@ -19527,6 +19757,20 @@ def detect_crashed_workers(
             pid = int(row["worker_pid"])
             kind, code = _classify_run_exit(conn, row["id"], row["current_run_id"], pid)
             dead.append((row, pid, kind, code))
+            if not _pid_alive(pid):
+                # The worker died on its own; whatever it left in other
+                # process groups of its session would outlive it (a live pid
+                # here is a recycled one and is never used as a sid). Only a
+                # session with a member from THIS run is signalled.
+                _reap_worker_session(
+                    pid,
+                    born_after=_worker_owner_window(
+                        conn, row["id"], pid, row["current_run_id"],
+                    )[0],
+                    born_before=_run_last_evidence_at(
+                        conn, row["id"], row["current_run_id"],
+                    ),
+                )
         # N workers ending externally in the same tick while all were still
         # heartbeating is ONE event (something outside killed them), not N
         # independent task failures. Decided over the whole tick before any
