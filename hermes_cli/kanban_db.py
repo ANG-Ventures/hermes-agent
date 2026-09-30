@@ -18211,7 +18211,7 @@ def _reap_worker_session(sid: Optional[int], grace: float = 3.0) -> int:
         return 0
     for pgid in groups:
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
         except OSError:
             pass
     deadline = time.monotonic() + grace
@@ -18219,7 +18219,7 @@ def _reap_worker_session(sid: Optional[int], grace: float = 3.0) -> int:
         time.sleep(0.1)
     for pgid in _worker_session_groups(sid):
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
         except OSError:
             pass
     _log.warning(

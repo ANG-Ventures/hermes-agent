@@ -85,7 +85,7 @@ def _worker_card(conn, mode: str, max_runtime=None):
     assert kb.claim_task(conn, tid) is not None
     worker = subprocess.Popen(
         [sys.executable, "-c", _WORKER, mode],
-        stdout=subprocess.PIPE, text=True, start_new_session=True,
+        stdout=subprocess.PIPE, text=True, encoding="utf-8", start_new_session=True,
     )
     assert worker.stdout is not None
     sleep_pid = int(worker.stdout.readline())
