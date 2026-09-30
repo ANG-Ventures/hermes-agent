@@ -1837,11 +1837,11 @@ def _build_child_agent(
     import uuid as _uuid
 
     # ── Role resolution ─────────────────────────────────────────────────
-    # Depth-derived, not caller-declared: a child may delegate iff the
-    # kill switch is on and depth budget remains below max_spawn_depth.
-    # The legacy `role` arg no longer participates (it asked the caller
-    # to guess a fact the config already knows); it is still accepted and
-    # normalised for wire compat, but capability comes from depth alone.
+    # Orchestrator is explicit opt-in: a child is a LEAF unless the caller
+    # passed role='orchestrator'. max_spawn_depth is only the ceiling and
+    # orchestrator_enabled the kill switch. (Depth-derived promotion made
+    # every child below the ceiling an orchestrator whether or not anyone
+    # asked — the 2026-09-08 max_spawn_depth=5 fan-out burst.)
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = recovery_max_spawn_depth or _get_max_spawn_depth()
     orchestrator_enabled = (
@@ -1849,8 +1849,22 @@ def _build_child_agent(
         if recovery_orchestrator_enabled is not None
         else _get_orchestrator_enabled()
     )
-    orchestrator_ok = orchestrator_enabled and child_depth < max_spawn
-    effective_role = "orchestrator" if orchestrator_ok else "leaf"
+    requested_role = _normalize_role(role)
+    effective_role = "leaf"
+    if requested_role == "orchestrator":
+        if not orchestrator_enabled:
+            logger.info(
+                "delegate_task: role='orchestrator' forced to leaf "
+                "(delegation.orchestrator_enabled=false)"
+            )
+        elif child_depth >= max_spawn:
+            logger.warning(
+                "delegate_task: role='orchestrator' requested at depth=%d, "
+                "the max_spawn_depth=%d floor; downgraded to leaf",
+                child_depth, max_spawn,
+            )
+        else:
+            effective_role = "orchestrator"
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -1860,6 +1874,10 @@ def _build_child_agent(
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
+    logger.info(
+        "delegate_task spawn id=%s depth=%d role=%s (requested=%s, max_spawn_depth=%d)",
+        subagent_id, child_depth, effective_role, requested_role, max_spawn,
+    )
 
     delegation_cfg = _load_config()
 
@@ -6384,14 +6402,13 @@ def _build_top_level_description() -> str:
     # vocabulary most sessions never see. The list below is the fail-safe
     # superset; model_tools session-filters it to the tools the session
     # actually has, dropping the whole line when none apply.
-    # Delegation capability is depth-derived (no role param): mention
+    # Delegation is opt-in per child via role='orchestrator': mention
     # recursion only where it's actually available.
     if orchestration_available:
         restrictions_rule = (
             "- Children cannot call clarify, memory, or cronjob.\n"
-            "- Children can themselves delegate while depth remains "
-            f"(max_spawn_depth={_get_max_spawn_depth()}); the runtime "
-            "derives this from depth automatically.\n"
+            "- Children cannot delegate unless you pass role='orchestrator' "
+            f"(tree capped at max_spawn_depth={_get_max_spawn_depth()}).\n"
         )
     else:
         restrictions_rule = (
@@ -6450,25 +6467,23 @@ def _build_tasks_param_description() -> str:
     )
 
 
-def _build_role_param_description() -> str:
-    """Legacy helper — the `role` param is no longer advertised.
+_ROLE_PARAM_DESCRIPTION = (
+    "leaf (default): does the work itself, cannot delegate. orchestrator: "
+    "may fan out; use only for a lead that must decompose. "
+    "Gathering/research/coding workers are leaves."
+)
 
-    Delegation capability is depth-derived (see the role-resolution block in
-    _build_child_agent): a child may itself delegate iff
-    delegation.orchestrator_enabled and its depth < max_spawn_depth. The
-    handler still accepts role for wire compat (old transcripts, kanban
-    dispatcher) but ignores it. Kept because external callers import this
-    symbol; returns the depth story for any such use.
+
+def _build_role_param_description() -> str:
+    """Description of the `role` parameter (top-level and per-task).
+
+    Orchestrator is explicit opt-in: a child is a leaf unless its parent
+    passes role='orchestrator'; delegation.max_spawn_depth is the ceiling
+    and delegation.orchestrator_enabled the kill switch (see the
+    role-resolution block in _build_child_agent). Kept as a function
+    because external callers import this symbol.
     """
-    try:
-        max_depth = _get_max_spawn_depth()
-    except Exception:
-        max_depth = MAX_DEPTH
-    return (
-        "Legacy parameter, ignored: whether a child can delegate is derived "
-        f"from delegation config (max_spawn_depth={max_depth}), not declared "
-        "by the caller."
-    )
+    return _ROLE_PARAM_DESCRIPTION
 
 
 def _build_dynamic_schema_overrides() -> dict:
@@ -6495,7 +6510,7 @@ def _build_dynamic_schema_overrides() -> dict:
 
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
-    # NOTE: description / tasks.description / role.description are placeholder
+    # NOTE: description / tasks.description are placeholder
     # values. The real text is generated per get_definitions() call by
     # _build_dynamic_schema_overrides() (registered via
     # dynamic_schema_overrides below) so the model sees the user's actual
@@ -6560,15 +6575,17 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task skill promotion override. See top-level 'skills'.",
                         },
+                        "role": {
+                            "type": "string",
+                            "enum": ["leaf", "orchestrator"],
+                            "description": "Per-task role; overrides the top-level 'role'.",
+                        },
                     },
                     "required": ["goal"],
                 },
                 # No maxItems — the runtime limit is configurable via
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
-                # NOTE: the handler also accepts a per-task `role` — legacy,
-                # ignored: delegation capability is depth-derived, not
-                # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
             # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
@@ -6623,6 +6640,11 @@ DELEGATE_TASK_SCHEMA = {
                     "domain needs (e.g. ['systematic-debugging']). The child "
                     "can still browse/load ANY skill via skills_list/skill_view."
                 ),
+            },
+            "role": {
+                "type": "string",
+                "enum": ["leaf", "orchestrator"],
+                "description": _ROLE_PARAM_DESCRIPTION,
             },
             "model": {"type": "string", "description": "Optional per-call model override. Flagship models require allow_flagship_reason."},
             "provider": {"type": "string", "description": "Provider for per-call model override; requires model."},

@@ -107,7 +107,7 @@ class TestDelegateRequirements(unittest.TestCase):
     def test_dynamic_limits_moved_to_param_descriptions(self):
         """Concurrency reaches the model through the tasks parameter
         description; the depth ceiling lives in the top-level description's
-        depth-derived recursion rule (role param is gone)."""
+        recursion rule (role='orchestrator' is explicit opt-in)."""
         from tools.delegate_tool import _build_dynamic_schema_overrides
         from tools.registry import registry
 
@@ -121,9 +121,9 @@ class TestDelegateRequirements(unittest.TestCase):
 
         for parameters in (overrides["parameters"], definition["parameters"]):
             self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
-            self.assertNotIn("role", parameters["properties"])
-        # Depth ceiling now rides the depth-derived recursion rule in the
-        # top-level text (only rendered when nesting is available).
+            self.assertNotIn("up to 7", parameters["properties"]["role"]["description"])
+        # Depth ceiling rides the recursion rule in the top-level text
+        # (only rendered when nesting is available).
         self.assertIn("max_spawn_depth=4", overrides["description"])
         self.assertNotIn("up to 7", overrides["description"])
 
@@ -3331,23 +3331,27 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
             delegate_task(**kwargs)
             return mock_child
 
-    def test_role_is_depth_derived_not_caller_declared(self):
-        """With max_spawn_depth=2 (mocked), a depth-1 child has depth budget
-        left, so it becomes an orchestrator automatically — no role arg
-        needed, and a passed legacy role arg is ignored either way."""
+    def test_role_is_caller_declared_default_leaf(self):
+        """With max_spawn_depth=2 (mocked) a depth-1 child has depth budget
+        left, but depth alone never promotes it: no role arg -> leaf, an
+        explicit role='leaf' -> leaf. Orchestrator is opt-in (t_b7237e76;
+        depth-derived promotion caused the 2026-09-08 fan-out burst)."""
         child = self._run_with_mock_child(_SENTINEL)
-        self.assertEqual(child._delegate_role, "orchestrator")
-        # Legacy explicit role='leaf' does not override the depth derivation.
+        self.assertEqual(child._delegate_role, "leaf")
         child = self._run_with_mock_child("leaf")
-        self.assertEqual(child._delegate_role, "orchestrator")
+        self.assertEqual(child._delegate_role, "leaf")
 
-    def test_schema_no_longer_advertises_role(self):
-        """`role` left the advertised schema (capability is depth-derived);
-        the handler still accepts it for wire compat."""
+    def test_schema_advertises_role_top_level_and_per_task(self):
+        """`role` is advertised at both levels so the model can opt a lead
+        into orchestration; leaf is the documented default."""
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertNotIn("role", props)
-        self.assertNotIn("role", props["tasks"]["items"]["properties"])
+        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["role"]["enum"],
+            ["leaf", "orchestrator"],
+        )
+        self.assertIn("leaf (default)", props["role"]["description"])
 
     def test_schema_omits_acp_transport_fields(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
@@ -3366,13 +3370,9 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         child = self._run_with_mock_child("orchestrator")
         self.assertEqual(child._delegate_role, "orchestrator")
 
-    # parity 2026-08-29: fork's test_schema_has_role_top_level_and_per_task
-    # and test_unknown_role_coerces_to_leaf asserted the pre-9dfbde19db
-    # contract (role advertised in schema; explicit role honored). Upstream's
-    # tasks-only redesign made capability depth-derived and removed `role`
-    # from the schema — the replacement contract is locked above by
-    # test_schema_no_longer_advertises_role and
-    # test_role_is_depth_derived_not_caller_declared.
+    def test_unknown_role_coerces_to_leaf(self):
+        child = self._run_with_mock_child("supervisor")
+        self.assertEqual(child._delegate_role, "leaf")
 
 
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".
@@ -3462,12 +3462,8 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         self.assertIn("depth 1", prompt)
         self.assertIn("max_spawn_depth=2", prompt)
 
-    # parity 2026-08-29: fork's test_batch_mode_per_task_role_override
-    # asserted per-task role='leaf' suppresses delegation. Superseded by
-    # upstream 9dfbde19db: capability is depth-derived, so with
-    # max_spawn_depth=2 every depth-1 child is an orchestrator regardless of
-    # a legacy per-task role value. Depth-derivation is locked by
-    # test_role_is_depth_derived_not_caller_declared.
+    # Per-task role overrides (per-task leaf beats top-level orchestrator)
+    # are locked in tests/tools/test_delegate_leaf_default_role.py.
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
