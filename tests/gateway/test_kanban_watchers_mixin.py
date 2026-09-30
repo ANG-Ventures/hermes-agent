@@ -650,7 +650,7 @@ def _mergeable_hold(**over):
 
     item = {"task_id": "t_0000abcd", "reason": "active_pr", "last_outcome": "completed",
             "pr": "https://github.com/ANG-Ventures/prism-router/pull/281",
-            "hold": kb.RESPAWN_GUARD_HOLD_MERGEABLE, "merge_state": "CLEAN",
+            "hold": kb.RESPAWN_GUARD_HOLD_MERGEABLE, "merge_state": "CLEAN", "pr_owned": True,
             "clear_verb": "hermes kanban --board default requeue t_0000abcd '<reason>'"}
     item.update(over)
     return item
@@ -679,6 +679,8 @@ def test_active_pr_mergeable_hold_enqueues_land_request_not_a_page(tmp_path, mon
     {"hold": "worker alive"},               # red/dirty PR with a live worker
     {"hold": None},                         # pre-#1538 guard event
     {"pr": "https://github.com/o/$(id)/pull/1"},
+    {"pr_owned": False},                    # PR only MENTIONED by the card (Prism #1545)
+    {"pr_owned": None},                     # pre-fix guard event: ownership unknown
 ])
 def test_active_pr_hold_that_is_not_landable_pages_the_operator(tmp_path, monkeypatch, over):
     from gateway.kanban_watchers import _send_guard_stuck_alert

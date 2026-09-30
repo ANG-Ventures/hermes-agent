@@ -959,7 +959,8 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
     ``pending``) so the page slot stays free for a later queue failure
     (Prism #1545). False: the enqueue failed (page instead). Landable means the
     guard held on ``RESPAWN_GUARD_HOLD_MERGEABLE`` (OPEN, mergeable, no red
-    check), the last run FINISHED its deliverable, the URL is a legal GitHub
+    check), the last run FINISHED its deliverable, the PR's head branch names
+    this card (``pr_owned``), the URL is a legal GitHub
     PR, and the land queue has not already given up on this PR. The queue
     waits for CI green and lands through fleet-merge.sh, so fleet policy
     still decides; a refusal comments the card. r19 spec (t_f1af5dcd), wired
@@ -972,6 +973,10 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
     if item.get("hold") != kb.RESPAWN_GUARD_HOLD_MERGEABLE:
         return None
     if item.get("last_outcome") not in _FINISHED_RUN_OUTCOMES:
+        return None
+    if item.get("pr_owned") is not True:
+        # A card comment may name any PR: land only a PR whose head branch
+        # names this card; unknown ownership pages (Prism #1545 cd0457757028).
         return None
     parsed = _github_pr(item.get("pr"))
     if parsed is None:
