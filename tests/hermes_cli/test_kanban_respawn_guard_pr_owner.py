@@ -275,3 +275,29 @@ def test_deferred_tick_line_names_pr_and_hold_reason():
     assert line == (
         " — https://github.com/o/r/pull/9 (OPEN/CLEAN), PR mergeable, closer will land it"
     )
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED", "OPEN"])
+def test_state_survives_when_check_rollup_is_not_readable(monkeypatch, state):
+    """Prism P1 (#1538): a PR-only token cannot read checks; the enriched query
+    fails, the state-only retry must still resolve the authoritative state and
+    leave merge health unknown (a stale DIRTY reading must not release)."""
+    calls: list[str] = []
+
+    def run(cmd, *args, **kwargs):
+        fields = cmd[cmd.index("--json") + 1]
+        calls.append(fields)
+        if "statusCheckRollup" in fields:
+            return types.SimpleNamespace(returncode=1, stdout="")
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps({
+            "state": "CLOSED" if state == "MERGED" else state,
+            "mergedAt": "2026-09-30T00:00:00Z" if state == "MERGED" else None,
+            "headRefName": "alice/t_00000001-x",
+        }))
+
+    monkeypatch.setattr(kb, "_PR_MERGE_HEALTH_CACHE",
+                        {("o/r", 5): {"merge_state": "DIRTY", "ci_red": False}})
+    monkeypatch.setattr(kb.subprocess, "run", run)
+    assert kb._query_github_pr_state("o/r", 5) == state
+    assert len(calls) == 2 and "statusCheckRollup" not in calls[1]
+    assert kb._pr_needs_its_worker("o/r", 5) is None

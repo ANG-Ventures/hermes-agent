@@ -17805,24 +17805,32 @@ def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
 
 
 def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
-    """Resolve a PR state via ``gh``; return None on any query failure."""
-    try:
-        proc = subprocess.run(
-            [
-                "gh", "pr", "view", str(number), "-R", repo,
-                "--json",
-                "state,mergedAt,headRefName,mergeStateStatus,statusCheckRollup",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=_RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError, TimeoutError):
+    """Resolve a PR state via ``gh``; return None on any query failure.
+
+    The health fields (``mergeStateStatus``, ``statusCheckRollup``) need
+    check/status read access a PR-only token may lack. When that enriched
+    query fails, retry with the state-only fields: the authoritative state
+    must survive, and merge health is left unknown (the guard keeps holding).
+    """
+    key = (repo.lower(), int(number))
+    base_fields = "state,mergedAt,headRefName"
+    for fields in (f"{base_fields},mergeStateStatus,statusCheckRollup", base_fields):
+        try:
+            proc = subprocess.run(
+                ["gh", "pr", "view", str(number), "-R", repo, "--json", fields],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=_RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return None
+        if proc.returncode == 0:
+            break
+    else:
         return None
-    if proc.returncode != 0:
-        return None
+    with_health = fields != base_fields
     try:
         payload = json.loads(proc.stdout or "{}")
     except (TypeError, ValueError):
@@ -17834,10 +17842,14 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
         _PR_HEAD_REF_CACHE[(repo.lower(), int(number))] = head
         while len(_PR_HEAD_REF_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
             _PR_HEAD_REF_CACHE.pop(next(iter(_PR_HEAD_REF_CACHE)))
-    _PR_MERGE_HEALTH_CACHE[(repo.lower(), int(number))] = {
-        "merge_state": str(payload.get("mergeStateStatus") or "").upper() or None,
-        "ci_red": _pr_rollup_is_red(payload.get("statusCheckRollup")),
-    }
+    if not with_health:
+        # Never act on an older reading when this one could not see health.
+        _PR_MERGE_HEALTH_CACHE.pop(key, None)
+    else:
+        _PR_MERGE_HEALTH_CACHE[key] = {
+            "merge_state": str(payload.get("mergeStateStatus") or "").upper() or None,
+            "ci_red": _pr_rollup_is_red(payload.get("statusCheckRollup")),
+        }
     while len(_PR_MERGE_HEALTH_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
         _PR_MERGE_HEALTH_CACHE.pop(next(iter(_PR_MERGE_HEALTH_CACHE)))
     if payload.get("mergedAt"):
