@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_video_from_bytes,
     keep_head_and_tail_chunks,
+    keep_head_and_tail_text,
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
@@ -3221,8 +3222,13 @@ class SlackAdapter(BasePlatformAdapter):
             # Unlike send() we can't split into multiple messages (we're
             # editing an existing one), so truncate to fit — an oversized
             # payload fails the whole edit with ``msg_too_long``.
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-            formatted = chunks[0] if chunks else formatted
+            if finalize:
+                # The final edit is what stays on screen: keep the start AND
+                # the end (the conclusion) within the cap (t_11223645).
+                formatted = keep_head_and_tail_text(formatted, self.MAX_MESSAGE_LENGTH)
+            else:
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                formatted = chunks[0] if chunks else formatted
             update_kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "ts": message_id,
