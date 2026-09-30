@@ -157,7 +157,7 @@ is logged at WARNING together with a process-wide count of deferred
 teardowns (`_deferred_teardowns`), so accumulation is observable. Closing
 its SessionDB under it would lose transcript writes, and that is the bug
 being fixed. The drain bound is `min(ceiling, 5)`, which is 5 s at every
-configurable `child_timeout` (floor 30 s); the constant says so where it is
+configurable `child_timeout` (floor 60 s); the constant says so where it is
 defined.
 
 **I3: every terminal child has exactly one durable record under its owning

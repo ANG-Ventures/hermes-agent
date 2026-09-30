@@ -261,7 +261,7 @@ If you want a hard cap anyway (e.g. cost control on unattended cron-driven deleg
 ```yaml
 delegation:
   child_timeout_seconds: 0     # default: 0 = no timeout
-  # child_timeout_seconds: 1800  # opt-in hard cap (floor 30s)
+  # child_timeout_seconds: 1800  # opt-in hard cap (floor 60s)
 ```
 
 A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.

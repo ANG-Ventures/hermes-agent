@@ -1013,6 +1013,15 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
+# Floor for delegation.child_timeout_seconds. A leaf inside one silent tool
+# call only refreshes last_activity_ts on the tool-activity heartbeat
+# (agent/tool_executor.py::_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S, 30 s) plus
+# scheduling overhead. A cap at or below that interval expires before the
+# first tick and hard-stops a live leaf mid-tool, so the floor must clear
+# the heartbeat with margin: 2x the interval.
+_CHILD_TIMEOUT_FLOOR_S = 60.0
+
+
 def _get_child_timeout() -> Optional[float]:
     """Read delegation.child_timeout_seconds from config.
 
@@ -1029,7 +1038,8 @@ def _get_child_timeout() -> Optional[float]:
     parent activity so the gateway inactivity timeout can fire.
 
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
-    in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
+    in to a hard cap (floor ``_CHILD_TIMEOUT_FLOOR_S``, 60 s); ``0`` or a
+    negative value means disabled.
     """
     cfg = _load_config()
     val = cfg.get("child_timeout_seconds")
@@ -1043,7 +1053,7 @@ def _get_child_timeout() -> Optional[float]:
                 val,
             )
         else:
-            return None if parsed <= 0 else max(30.0, parsed)
+            return None if parsed <= 0 else max(_CHILD_TIMEOUT_FLOOR_S, parsed)
     env_val = os.getenv("DELEGATION_CHILD_TIMEOUT_SECONDS")
     if env_val:
         try:
@@ -1051,7 +1061,7 @@ def _get_child_timeout() -> Optional[float]:
         except (TypeError, ValueError):
             pass
         else:
-            return None if parsed <= 0 else max(30.0, parsed)
+            return None if parsed <= 0 else max(_CHILD_TIMEOUT_FLOOR_S, parsed)
     return DEFAULT_CHILD_TIMEOUT
 
 
@@ -1066,8 +1076,9 @@ def _get_child_max_wall_seconds(child_timeout: Optional[float]) -> Optional[floa
     that keeps making progress is stopped once it has run this long since
     its start. Config ``delegation.child_max_wall_seconds``: 0/unset (and any
     invalid or negative value) = DEFAULT_CHILD_MAX_WALL_MULTIPLIER x
-    child_timeout, never below that multiple of child_timeout's own 30 s
-    floor (120 s; identical for every configurable child_timeout); a
+    child_timeout, never below that multiple of child_timeout's own floor
+    (``_CHILD_TIMEOUT_FLOOR_S``; identical for every configurable
+    child_timeout); a
     positive value is used as-is, floored at child_timeout. It cannot be
     disabled. None when there is no child_timeout (then no wait ever
     returns TIMED_OUT_RUNNING, so there is nothing to bound).
@@ -1075,7 +1086,7 @@ def _get_child_max_wall_seconds(child_timeout: Optional[float]) -> Optional[floa
     if not child_timeout:
         return None
     floor = float(child_timeout)
-    default = max(floor, 30.0) * DEFAULT_CHILD_MAX_WALL_MULTIPLIER
+    default = max(floor, _CHILD_TIMEOUT_FLOOR_S) * DEFAULT_CHILD_MAX_WALL_MULTIPLIER
     val = _load_config().get("child_max_wall_seconds")
     if val is None:
         return default
@@ -2967,7 +2978,7 @@ class _LateCompletion:
 
 # Bounded wait for the live turn after a stop decision, before the result is
 # persisted. Equals min(ceiling, 5) for every configurable child_timeout
-# (floor 30 s). Only delivery is bounded by it: persistence teardown waits
+# (floor _CHILD_TIMEOUT_FLOOR_S). Only delivery is bounded by it: persistence teardown waits
 # for the turn to exit (docs/dev/delegate-child-lifecycle.md, I2).
 _LATE_STOP_DRAIN_SECONDS = 5.0
 # Children whose persistence teardown is waiting on a still-live turn.
