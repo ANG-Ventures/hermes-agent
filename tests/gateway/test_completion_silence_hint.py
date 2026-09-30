@@ -192,6 +192,7 @@ def test_require_completion_marks_by_session_id_and_pid():
 
 def test_goal_wait_barriers_mark_the_process(monkeypatch):
     import hermes_cli.goals as goals
+    import tools.process_registry as pr_module
 
     calls = []
 
@@ -200,18 +201,30 @@ def test_goal_wait_barriers_mark_the_process(monkeypatch):
             calls.append((session_id, pid))
             return 1
 
-    import tools.process_registry as pr_module
     monkeypatch.setattr(pr_module, "process_registry", _Reg())
-    goals._require_completion_turn(session_id="proc_ci")
-    goals._require_completion_turn(pid=77)
-    assert calls == [("proc_ci", None), (None, 77)]
-    import inspect
-    assert "_require_completion_turn(pid=pid)" in inspect.getsource(goals.GoalManager.wait_on)
-    assert "_require_completion_turn(session_id=session_id)" in inspect.getsource(goals.GoalManager.wait_on_session)
+    goals._DB_CACHE.clear()
+    try:
+        mgr = goals.GoalManager(session_id="t-ec17-goal")
+        mgr.set("ship it", max_turns=5)
+        mgr.wait_on_session("proc_ci", reason="CI")
+        mgr.wait_on(4242, reason="CI pid")
+    finally:
+        goals._DB_CACHE.clear()
+    assert calls == [("proc_ci", None), (None, 4242)]
 
 
-def test_bot_dm_delivery_spawn_requires_completion():
-    import inspect
+def test_bot_dm_delivery_spawn_requires_completion(monkeypatch):
+    import json
     import tools.bot_mode_dm as bot_mode_dm
+    import tools.terminal_tool as terminal_tool_module
 
-    assert "_completion_required=True" in inspect.getsource(bot_mode_dm)
+    calls = []
+
+    def fake_terminal_tool(command, **kwargs):
+        calls.append(kwargs)
+        return json.dumps({"output": "started", "session_id": "proc_dm1"})
+
+    monkeypatch.setattr(terminal_tool_module, "terminal_tool", fake_terminal_tool)
+    bot_mode_dm._spawn_delivery("true", "@peer", dm_file=None, task_id=None, agent=None)
+    assert calls and calls[0]["notify_on_complete"] is True
+    assert calls[0]["_completion_required"] is True
