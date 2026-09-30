@@ -41,6 +41,16 @@ def safe_boundaries(messages: Sequence[Dict[str, Any]]) -> List[bool]:
     """
     n = len(messages)
     out = [True] * (n + 1)
+    # Only a call with a result LATER in this batch can be split from it. A
+    # call with no later result (interrupted turn, superseded row, an id
+    # reused by a replayed row) never closes, and tracking it would mark
+    # every later boundary unsafe.
+    last_result: Dict[str, int] = {}
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "tool":
+            result_id = str(msg.get("tool_call_id") or "").strip()
+            if result_id:
+                last_result[result_id] = i
     pending: set[str] = set()
     for i, msg in enumerate(messages):
         if i > 0:
@@ -49,7 +59,7 @@ def safe_boundaries(messages: Sequence[Dict[str, Any]]) -> List[bool]:
         if role == "assistant":
             for tool_call in msg.get("tool_calls") or []:
                 call_id = _tool_call_id(tool_call)
-                if call_id:
+                if call_id and last_result.get(call_id, -1) > i:
                     pending.add(call_id)
         elif role == "tool":
             pending.discard(str(msg.get("tool_call_id") or "").strip())

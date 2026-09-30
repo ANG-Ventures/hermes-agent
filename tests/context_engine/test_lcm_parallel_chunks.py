@@ -126,6 +126,32 @@ def test_safe_boundaries_marks_interior_of_open_pair_unsafe():
     assert safe_boundaries(messages) == [True, True, False, True, True]
 
 
+def test_orphan_tool_call_does_not_freeze_later_boundaries():
+    """A call whose result never arrives must not make the rest unsplittable."""
+    messages = [
+        {"role": "user", "content": _text(200, "a")},
+        {"role": "assistant", "content": "x", "tool_calls": [{"id": "lost", "function": {}}]},
+        {"role": "user", "content": _text(200, "b")},
+        {"role": "assistant", "content": _text(200, "c")},
+        {"role": "user", "content": _text(200, "d")},
+    ]
+    ok = safe_boundaries(messages)
+    assert ok[2] and ok[3] and ok[4]
+    assert len(split_pair_safe(messages, count_message_tokens(messages[0]) * 2)) >= 2
+
+
+def test_reused_call_id_whose_result_came_earlier_does_not_freeze_boundaries():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "dup", "function": {}}]},
+        {"role": "tool", "tool_call_id": "dup", "content": "r"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "dup", "function": {}}]},
+        {"role": "user", "content": "q2"},
+        {"role": "user", "content": "q3"},
+    ]
+    assert safe_boundaries(messages)[4:] == [True, True, True]
+
+
 def test_small_trailing_chunk_merges_into_previous():
     messages = [{"role": "user", "content": _text(300, f"m{i}_")} for i in range(4)]
     per = count_message_tokens(messages[0])
