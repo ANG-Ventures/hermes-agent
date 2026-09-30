@@ -3041,6 +3041,15 @@ def has_codex_context_variant(model_bare: str) -> bool:
 # ``-900k`` alias is stripped). Read from the ACTIVE config.yaml (root, or
 # the profile's own config under a profile home) so one agent can be flipped
 # back alone:  hermes config set model.codex_context_policy advertised
+# The read goes through the merged ``load_config_readonly()`` view, so an
+# administrator's managed-scope config.yaml wins over the user file and
+# ``${VAR}`` references expand (t_27a85d2c). WHEN AN EDIT TAKES EFFECT: every
+# fresh resolve sees it (new sessions, new agents, the /model picker), but an
+# agent that is already running keeps the window it resolved at agent init
+# (compressor threshold, 85% autoraise, LCM cap) until a new session or a
+# restart; a /model switch re-resolves the window for the new route.
+# Deliberate: those values are derived together once per agent, so a
+# mid-session re-read would leave them disagreeing.
 CODEX_CONTEXT_POLICY_LARGE = "large"
 CODEX_CONTEXT_POLICY_ADVERTISED = "advertised"
 _CODEX_CONTEXT_POLICIES = frozenset(
@@ -3050,16 +3059,21 @@ CODEX_CONTEXT_POLICY_DEFAULT = CODEX_CONTEXT_POLICY_LARGE
 
 
 def _codex_context_policy_from_config() -> str:
-    """Read ``model.codex_context_policy`` from the active config.yaml.
+    """Read ``model.codex_context_policy`` from the active merged config.
+
+    Uses ``load_config_readonly()`` (cached on the user AND managed-scope
+    file signatures, no deepcopy), NOT the raw user file: a managed-scope
+    value must override the user's, and ``${VAR}`` values must expand, exactly
+    as for every other behavioural config read.
 
     Absent, unreadable, or unrecognised values fall back to the default
     (``large``). A legacy string-shaped ``model:`` key has no sub-keys and
     therefore also resolves to the default.
     """
     try:
-        from hermes_cli.config import read_raw_config_readonly
+        from hermes_cli.config import load_config_readonly
 
-        cfg = read_raw_config_readonly()
+        cfg = load_config_readonly()
     except Exception:
         return CODEX_CONTEXT_POLICY_DEFAULT
     model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
