@@ -1716,6 +1716,10 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
+    # Tier keys (service_tier/speed) the user set explicitly in
+    # delegation.request_overrides; kept verbatim through the inherit-branch
+    # tier re-gate below.
+    explicit_tier_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
@@ -2188,6 +2192,8 @@ def _build_child_agent(
                     pass
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if not override_provider:
+        _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides)
     # Per-task skill promotion (see agent/system_prompt.py): names the brief
     # wants re-promoted to full descriptions in the child's compact index.
     # Set BEFORE the first request — the system prompt is built lazily.
@@ -3735,6 +3741,50 @@ _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
 
 
+def _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides) -> None:
+    """Re-gate the inherited tier override when the child's route differs.
+
+    The inherit branch copies the parent's request_overrides verbatim, but
+    those tier keys were gated against the PARENT's route. When
+    delegation.model (or api_mode) moves the child elsewhere, e.g.
+    gpt-6-astra ultrafast -> gpt-5.4-mini, re-derive the tier for the child's
+    route from the parent's session tier. Tier keys the user set explicitly
+    in delegation.request_overrides are a deliberate override and are kept.
+    """
+    same_route = all(
+        getattr(child, attr, None) == getattr(parent_agent, attr, None)
+        for attr in ("model", "provider", "api_mode")
+    )
+    if same_route:
+        return
+    from agent.agent_init import (
+        _SERVICE_TIER_OVERRIDE_KEYS,
+        _regate_service_tier_overrides,
+    )
+
+    if not getattr(child, "service_tier", None):
+        child.service_tier = getattr(parent_agent, "service_tier", None)
+    try:
+        _regate_service_tier_overrides(child)
+    except Exception:
+        # Fail closed: an unresolvable route gets no tier override.
+        logger.debug("subagent tier re-gate failed; dropping tier keys", exc_info=True)
+        overrides = dict(getattr(child, "request_overrides", {}) or {})
+        for key in _SERVICE_TIER_OVERRIDE_KEYS:
+            overrides.pop(key, None)
+        child.request_overrides = overrides
+    explicit = {
+        k: v
+        for k, v in (explicit_tier_overrides or {}).items()
+        if k in _SERVICE_TIER_OVERRIDE_KEYS
+    }
+    if explicit:
+        child.request_overrides = {
+            **dict(getattr(child, "request_overrides", {}) or {}),
+            **explicit,
+        }
+
+
 def _build_child_preserving_parent_tools(**kwargs):
     """Build a child without leaking its resolved toolset into the parent."""
     import model_tools
@@ -4502,6 +4552,7 @@ def delegate_task(
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
                 override_request_overrides=creds.get("request_overrides"),
+                explicit_tier_overrides=creds.get("explicit_tier_overrides"),
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
@@ -5415,6 +5466,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
                 getattr(parent_agent, "request_overrides", None),
                 explicit_request_overrides,
             ),
+            # Explicit tier keys survive _build_child_agent's re-gate of the
+            # parent-inherited tier onto a different delegation.model.
+            "explicit_tier_overrides": {
+                k: v
+                for k, v in (explicit_request_overrides or {}).items()
+                if k in ("service_tier", "speed")
+            }
+            or None,
             "max_output_tokens": None,
         }
 
