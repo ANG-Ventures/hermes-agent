@@ -473,7 +473,12 @@ def _findings_deliver_job(job: dict, error: Optional[str]) -> dict:
             return job
         text = str(error or "")
         m = _SCRIPT_EXIT_RE.match(text)
-        if not m or m.group(1) != "1" or not re.search(r"(?m)^stdout:\n\s*\S", text):
+        if not m or m.group(1) != "1":
+            return job
+        # the stdout section must hold a report: stop at the next section marker so an
+        # empty "stdout:" followed by "stderr:" is not read as findings.
+        so = re.search(r"(?ms)^stdout:\n(.*?)(?=^(?:stdout|stderr):$|\Z)", text)
+        if not so or not so.group(1).strip():
             return job
         cfg = load_config() or {}
         mapping = ((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get("findings_deliver_map") or {}

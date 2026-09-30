@@ -122,6 +122,8 @@ def test_findings_reroute_only_exit1_with_report_when_mapped():
         assert _findings_deliver_job(JOB, blind)["deliver"] == JOB["deliver"]  # exit 2 still pages
         no_report = "Script exited with code 1\nstderr:\nboom"
         assert _findings_deliver_job(JOB, no_report)["deliver"] == JOB["deliver"]  # exit 1, no report = down
+        empty_then_err = "Script exited with code 1\nstdout:\n  \nstderr:\nboom"
+        assert _findings_deliver_job(JOB, empty_then_err)["deliver"] == JOB["deliver"]  # blank stdout section
         other = dict(JOB, deliver="discord:1552284606907023370")
         assert _findings_deliver_job(other, ERR)["deliver"] == other["deliver"]  # unmapped target
         assert _findings_deliver_job(dict(JOB, no_agent=False), ERR) is not None
