@@ -177,3 +177,20 @@ def tools_summary(tools: List[str]) -> str:
     for t in order:
         out.append(f"{t}×{counts[t]}" if counts[t] > 1 else t)
     return ", ".join(out)
+
+
+def effective_context_used(rec: Any) -> tuple[int, int | None]:
+    """(context size to display, raw context_used when it was corrected else None).
+
+    One callable for every context-occupancy reader (``/context``, the spend
+    card): a stored ``corrected_context_used`` (set only when the final call
+    carries the relay's usage_invariant_violation, claude-bpx#397) wins. A raw
+    value over ``context_length`` alone is left as is: context_length can be
+    the harness's configured length rather than the model window (t_5918f6f7).
+    """
+    get = rec.get if isinstance(rec, dict) else (lambda k, d=None: getattr(rec, k, d))
+    raw = int(get("context_used", 0) or 0)
+    corrected = get("corrected_context_used", None)
+    if corrected is not None:
+        return int(corrected), raw
+    return raw, None

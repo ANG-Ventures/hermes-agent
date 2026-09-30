@@ -114,6 +114,10 @@ def _context_line(record: TurnRecord) -> str:
         return f"{humanize_tokens(0, unknown=True)}{suffix}"
     if length <= 0:
         return humanize_tokens(used)
+    # Relay-summed prompt over the window is not a context size (t_5918f6f7).
+    from plugins.blackbox.record import effective_context_used
+
+    used, _raw = effective_context_used(record)
     pct = used / length * 100
     return (
         f"{humanize_tokens(used)}/{humanize_tokens(length)} "

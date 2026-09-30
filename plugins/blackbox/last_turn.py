@@ -370,6 +370,11 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
             f"• Context window (last call): {_humanize_tok(0, unknown=True)}{suffix}"
         )
     elif length > 0:
+        # A relay-summed prompt (claude-bpx#397) is not a context size: show
+        # the corrected figure and name the raw one (t_5918f6f7).
+        from plugins.blackbox.record import effective_context_used
+
+        used, raw_used = effective_context_used(rec)
         # Clamp at 100%: last_prompt tokens can transiently overshoot the model
         # max during streaming or before compression fires — users must never
         # see >100% "of model max" (mirrors the clamp in agent/display.py,
@@ -380,6 +385,11 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
             f"• Context window (last call): {_humanize_tok(used)}/{_humanize_tok(length)} "
             f"{_ctx_health(pct)} ({pct:.0f}% of model max)"
         )
+        if raw_used is not None:
+            lines.append(
+                f"  ⚠ reported prompt {_humanize_tok(raw_used)} exceeds the window: "
+                f"relay usage invariant, counted as billed, not as context"
+            )
     elif used:
         lines.append(f"• Context window (last call): {_humanize_tok(used)}")
 
