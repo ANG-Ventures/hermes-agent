@@ -69,6 +69,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    keep_head_and_tail_text,
 )
 from utils import env_float
 
@@ -2340,7 +2341,7 @@ class WeComAdapter(BasePlatformAdapter):
             reply_req_id,
             {
                 "msgtype": "markdown",
-                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                "markdown": {"content": keep_head_and_tail_text(content, self.MAX_MESSAGE_LENGTH)},
             },
         )
         self._raise_for_wecom_error(response, "send reply markdown")
@@ -2382,9 +2383,17 @@ class WeComAdapter(BasePlatformAdapter):
         Raises :class:`WeComStreamExpiredError` on errcode 846608 so the
         caller can fall back to a proactive markdown send.
         """
-        truncated = self._truncate_stream_content(
-            content or "", self.MAX_STREAM_CONTENT_LENGTH,
-        )
+        if finish:
+            # The final frame is what stays on screen: keep the start AND the
+            # end (the conclusion) within the byte cap (t_11223645).
+            # Intermediate frames stay a head preview; the final replaces them.
+            truncated = keep_head_and_tail_text(
+                content or "", self.MAX_STREAM_CONTENT_LENGTH, utf8_bytes=True,
+            )
+        else:
+            truncated = self._truncate_stream_content(
+                content or "", self.MAX_STREAM_CONTENT_LENGTH,
+            )
         if len(content or "") != len(truncated):
             logger.warning(
                 "[%s] Stream content truncated for stream_id=%s",
@@ -2660,7 +2669,7 @@ class WeComAdapter(BasePlatformAdapter):
                         {
                             "chatid": chat_id,
                             "msgtype": "markdown",
-                            "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                            "markdown": {"content": keep_head_and_tail_text(content, self.MAX_MESSAGE_LENGTH)},
                         },
                     )
             else:
@@ -2683,7 +2692,7 @@ class WeComAdapter(BasePlatformAdapter):
                     {
                         "chatid": chat_id,
                         "msgtype": "markdown",
-                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                        "markdown": {"content": keep_head_and_tail_text(content, self.MAX_MESSAGE_LENGTH)},
                     },
                 )
         except asyncio.TimeoutError:

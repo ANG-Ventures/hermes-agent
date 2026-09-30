@@ -236,6 +236,8 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    is_commentary_send,
+    strip_chunk_indicators,
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
@@ -5508,6 +5510,16 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
+            if len(chunks) > 1 and is_commentary_send(metadata):
+                # Interim commentary is delivered as ONE message (t_784a01bd,
+                # t_11223645): the full text is durable in the transcript, and
+                # a long narration block must not flood the chat.
+                marker = "\n\n… \\(continued in session log\\)"
+                first = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH - utf16_len(marker), len_fn=utf16_len,
+                )
+                bodies, _tagged = strip_chunk_indicators(first)
+                chunks = [bodies[0] + marker]
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the

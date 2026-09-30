@@ -439,6 +439,46 @@ def keep_head_and_tail_chunks(
     return (add_chunk_indicators(kept) if tagged else kept), elided
 
 
+def keep_head_and_tail_text(text: str, limit: int, *, utf8_bytes: bool = False) -> str:
+    """Single-message twin of ``keep_head_and_tail_chunks``.
+
+    For a transport that takes exactly ONE message with a hard size cap
+    (ntfy body, WeCom markdown/stream frame, a Slack ``chat.update``), keep
+    the start (a quarter of the budget) and the END (the rest) with an
+    omission marker between them.  A head-only slice drops the conclusion
+    (t_784a01bd, t_11223645).  ``limit`` is in characters, or in UTF-8 bytes
+    when ``utf8_bytes`` is set.  Text within the limit is returned unchanged.
+    """
+    def size(s: str) -> int:
+        return len(s.encode("utf-8")) if utf8_bytes else len(s)
+
+    if size(text) <= limit:
+        return text
+
+    def marker(omitted: int) -> str:
+        return f"\n\n[… {omitted} characters omitted; the end follows]\n\n"
+
+    budget = limit - size(marker(len(text)))
+    if budget < 4:
+        # Pathological limit: nothing sensible fits beside the marker.
+        if limit <= 0:
+            return ""
+        if utf8_bytes:
+            return text.encode("utf-8")[-limit:].decode("utf-8", errors="ignore")
+        return text[-limit:]
+    head_budget = budget // 4
+    tail_budget = budget - head_budget
+    if utf8_bytes:
+        encoded = text.encode("utf-8")
+        head = encoded[:head_budget].decode("utf-8", errors="ignore")
+        tail = encoded[len(encoded) - tail_budget:].decode("utf-8", errors="ignore")
+    else:
+        head = text[:head_budget]
+        tail = text[len(text) - tail_budget:]
+    omitted = len(text) - len(head) - len(tail)
+    return head.rstrip() + marker(omitted) + tail.lstrip()
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 

@@ -2742,6 +2742,21 @@ class TestEditMessage:
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
 
+    @pytest.mark.asyncio
+    async def test_final_edit_over_cap_keeps_the_end(self, adapter):
+        """The FINAL oversized edit keeps its start and its END (t_11223645:
+        a head-only cut dropped the conclusion of a >39k reply)."""
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        content = "HEADSTART " + "y" * 45000 + " FINALCONCLUSIONSENTINEL"
+        result = await adapter.edit_message(
+            "C123", "1234.5678", content, finalize=True
+        )
+        assert result.success
+        text = adapter._app.client.chat_update.call_args.kwargs["text"]
+        assert len(text) <= adapter.MAX_MESSAGE_LENGTH
+        assert text.startswith("HEADSTART")
+        assert text.endswith("FINALCONCLUSIONSENTINEL")
+
 
 # ---------------------------------------------------------------------------
 # TestDeleteMessage

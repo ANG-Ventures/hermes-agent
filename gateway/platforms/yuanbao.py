@@ -59,6 +59,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    keep_head_and_tail_text,
 )
 from gateway.platforms import helpers as _mdchunk
 from gateway.platforms.helpers import MessageDeduplicator
@@ -5202,8 +5203,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         """
         if not self._access_policy.is_dm_allowed(user_id):
             return SendResult(success=False, error="DM access denied for this user")
-        if len(text) > self.DM_MAX_CHARS:
-            text = text[:self.DM_MAX_CHARS] + "\n...(truncated)"
+        # Keep the start AND the end: the conclusion is at the end (t_11223645).
+        text = keep_head_and_tail_text(text, self.DM_MAX_CHARS)
         chat_id = f"direct:{user_id}"
         return await self.send(chat_id, text, group_code=group_code)
 
