@@ -194,6 +194,7 @@ def _pin_default_route(monkeypatch, main: dict) -> None:
     )
     monkeypatch.setattr(aux, "_read_main_provider", lambda: main["provider"])
     monkeypatch.setattr(aux, "_read_main_model_for_aux", lambda: main["model"])
+    monkeypatch.setattr(aux, "_read_main_base_url", lambda: main.get("base_url", ""))
 
 
 def test_default_route_latch_follows_a_model_switch(monkeypatch):
@@ -263,3 +264,33 @@ def test_changed_request_inputs_are_resent(monkeypatch, field, first, second):
     assert len(calls) == 1  # same request: latched
     _run(model="claude-sonnet-5-5", circuit_breaker=breaker, **{field: second})
     assert len(calls) == 2  # different request: sent
+
+
+# --- t_f03a8117: an auto route inherits the live endpoint; key on it too ---
+
+
+def test_default_route_latch_keys_on_the_inherited_endpoint(monkeypatch):
+    """Same provider=custom + model name, different runtime base_url: a refusal
+    on one endpoint must not suppress (or stay latched after a switch to) the
+    other. ``_resolve_task_provider_model`` returns ``base_url=None`` under
+    auto; ``call_llm`` then sends to the main runtime endpoint."""
+    main = {"provider": "custom", "model": "llama-4",
+            "base_url": "http://endpoint-a:8000/v1"}
+    _pin_default_route(monkeypatch, main)
+    served: list[str] = []
+
+    def route(**kw):
+        served.append(main["base_url"])
+        if main["base_url"].startswith("http://endpoint-a"):
+            raise _bpx_safeguard_400()
+        return _ok("short summary of the segment")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    assert _run()[1] == 3
+    assert _run()[1] == 3  # latched on endpoint A
+    assert served == ["http://endpoint-a:8000/v1"]
+
+    # Only the runtime base_url changes (other session / endpoint switch).
+    main["base_url"] = "http://endpoint-b:8000/v1"
+    assert _run() == ("short summary of the segment", 1)
+    assert served == ["http://endpoint-a:8000/v1", "http://endpoint-b:8000/v1"]
