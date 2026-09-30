@@ -425,6 +425,8 @@ If no backend has **ever** been selected (no `web.backend` / per-capability key 
 
 **One-shot keyless rescue for keyed backends:** when your chosen/keyed backend fails a call (bad key, outage, upstream 5xx), that single call automatically retries on the keyless free-tier ring instead of erroring — the result notes which vendor served it and why (`rescued_from` / `backend_error`). The failover is never sticky: the very next `web_search`/`web_extract` call attempts your chosen backend again. Disable with `web.keyless_rescue: false` (also off whenever `keyless_fallback` is off).
 
+**Dead-backend circuit breaker:** a keyed backend that answers HTTP 402 (out of credits) or 401 (bad key) is skipped for `web.dead_backend_cooldown_seconds` (default 3600) instead of being retried on every call, and logs one WARNING per episode rather than one per call. After the cooldown the next call probes it once; a success closes the episode. Set `web.dead_backend_alert_command` to run a pager command once per episode (env `WEB_BACKEND`, `WEB_BACKEND_STATUS`, `WEB_BACKEND_ERROR`). State lives in `$HERMES_HOME/state/web_backend_breaker.json`, shared by every process of the profile.
+
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
 
 ---

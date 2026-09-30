@@ -2409,6 +2409,14 @@ web:
   # call attempts the chosen backend again (never sticky).
   keyless_rescue: true
 
+  # Dead-backend circuit breaker (default 3600 s). A backend answering
+  # HTTP 402 (out of credits) or 401 (bad key) is skipped for this long;
+  # the fallback chain serves meanwhile. One WARNING per episode. 0 = off.
+  dead_backend_cooldown_seconds: 3600
+  # Optional command run once per dead-backend episode (e.g. a pager).
+  # Env: WEB_BACKEND, WEB_BACKEND_STATUS, WEB_BACKEND_ERROR.
+  dead_backend_alert_command: ""
+
   # Pin Exa/Parallel to a tier (set by the hermes tools Free/Paid rows).
   # free = always the anonymous endpoint; paid = always the keyed SDK path;
   # unset = auto (key present -> paid, otherwise free).
