@@ -168,10 +168,21 @@ def ultrafast_contract_accepts(model_id: Optional[str]) -> bool:
     return normalize_fast_model_id(model_id) in ULTRAFAST_CAPABILITY_CONTRACT["models"]
 
 
+_FAST_MODEL_ID_PREFIXES: tuple[str, ...] = (
+    "anthropic/",
+    "openai/",
+    "openai-codex/",
+    "openai-api/",
+)
+
+
 def normalize_fast_model_id(model_id: Optional[str]) -> str:
     """Normalize only documented spelling aliases; retain all other suffixes."""
     normalized = str(model_id or "").strip().lower()
-    if normalized.startswith(("anthropic/", "openai/")):
+    # Vendor prefixes (OpenRouter spelling) and Hermes provider-id prefixes
+    # (``-m openai-codex/gpt-6-astra``): the provider route is gated
+    # separately, so the contract lookup keys on the bare model id.
+    if normalized.startswith(_FAST_MODEL_ID_PREFIXES):
         normalized = normalized.split("/", 1)[1]
     if normalized == "claude-opus-4.8":
         return "claude-opus-4-8"
