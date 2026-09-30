@@ -7897,15 +7897,11 @@ def _get_usage(agent) -> dict:
     except Exception:
         # A status-bar readout must never break usage reporting.
         pass
-    # Served service_tier of the latest call + the per-call ledger (bounded), so
-    # a client can attribute cache hits, tier and latency per call.
+    # Served service_tier of the latest call (per-call history is Blackbox's).
     try:
         _served = getattr(agent, "_served_service_tier", None)
         if isinstance(_served, str) and _served:
             usage["service_tier"] = _served
-        _ledger = getattr(agent, "_api_call_ledger", None)
-        if _ledger is not None:
-            usage["call_ledger"] = [dict(c) for c in list(_ledger)]
     except Exception:
         pass
     # Live count of background/async subagents still running (delegate_task

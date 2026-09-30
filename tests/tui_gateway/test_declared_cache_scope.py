@@ -6,7 +6,7 @@ first model call of every new session was cache-cold even though instructions
 and tools were byte-identical (live 2026-09-30: every single-call turn read
 0 cached tokens; calls 2+ in the same session read 71-95%). A declared scope
 lets those sessions share one cache bucket; the usage payload carries exact
-cache reads, the served tier, and a per-call ledger so the client can prove it.
+cache reads and the served tier (per-call rows are Blackbox's turn_api_calls).
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class TestDeclaredScope:
         assert not hasattr(bare, "_declared_cache_scope")
 
 
-class TestUsageLedger:
+class TestUsageFields:
     def _agent(self, **extra):
         base = dict(model="gpt-6-astra", session_input_tokens=10799, session_prompt_tokens=27695,
                     session_output_tokens=123, session_api_calls=3,
@@ -67,16 +67,11 @@ class TestUsageLedger:
         base.update(extra)
         return types.SimpleNamespace(**base)
 
-    def test_exact_cache_read_tier_and_ledger(self):
-        ledger = collections.deque([
-            {"prompt": 7215, "cached": 0, "output": 37, "latency_ms": 2100, "service_tier": "ultrafast"},
-            {"prompt": 9955, "cached": 7040, "output": 21, "latency_ms": 2600, "service_tier": "ultrafast"},
-        ], maxlen=64)
-        usage = server._get_usage(self._agent(_served_service_tier="ultrafast", _api_call_ledger=ledger))
+    def test_exact_cache_read_and_served_tier(self):
+        usage = server._get_usage(self._agent(_served_service_tier="ultrafast"))
         assert usage["cache_read"] == 16896
         assert usage["service_tier"] == "ultrafast"
-        assert usage["call_ledger"][1]["cached"] == 7040
-        assert usage["call_ledger"] is not ledger  # a copy, never the live deque
+        assert "call_ledger" not in usage  # per-call history is Blackbox's, not re-logged
 
     def test_zero_cache_reads_are_reported_as_zero_not_omitted(self):
         usage = server._get_usage(self._agent(session_cache_read_tokens=0))

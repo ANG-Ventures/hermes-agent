@@ -5574,18 +5574,6 @@ def run_conversation(
                     except Exception:
                         pass
 
-                    try:
-                        _ledger = getattr(agent, "_api_call_ledger", None)
-                        if _ledger is not None:
-                            _ledger.append({
-                                "prompt": None if prompt_tokens_unknown(canonical_usage) else int(prompt_tokens or 0),
-                                "cached": None if prompt_tokens_unknown(canonical_usage) else int(canonical_usage.cache_read_tokens or 0),
-                                "output": None if output_unknown else int(completion_tokens or 0),
-                                "latency_ms": round(float(api_duration) * 1000),
-                                "service_tier": getattr(agent, "_served_service_tier", None),
-                            })
-                    except Exception:
-                        pass
                     # Log API call details for debugging/observability
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens and not prompt_tokens_unknown(canonical_usage):
