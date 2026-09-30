@@ -103,6 +103,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kanban_worker_hosts as _kwh
 from toolsets import get_toolset_names
 from utils import env_var_enabled
 
@@ -17687,6 +17688,12 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    spillover: Optional[str] = None
+    """Worker-host spillover state for a gate-paused tick (kanban.worker_hosts):
+    per-host load1 / running / slots. None when the tick was not paused or no
+    worker host is configured."""
+    placements: dict = field(default_factory=dict)
+    """task id -> worker host name for workers spawned onto a worker host."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -21582,6 +21589,20 @@ def _check_dispatch_file_collisions(
         _record_dispatch_collision_warning(conn, task_id, collisions)
 
 
+def _default_spillover_plan(conn):
+    """Spillover capacity from ``kanban.worker_hosts`` (None when unset)."""
+    try:
+        from hermes_cli.config import load_config
+        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
+        hosts_cfg = kanban_cfg.get("worker_hosts")
+    except Exception:
+        return None
+    hosts = _kwh.parse_worker_hosts(hosts_cfg)
+    if not hosts:
+        return None
+    return _kwh.plan_spillover(conn, hosts)
+
+
 def review_dispatch_enabled() -> bool:
     """Return whether first-class review tasks should dispatch automatically.
 
@@ -21838,6 +21859,7 @@ def dispatch_once(
     spawn_limit: Optional[int] = None,
     reconcile_orphans: bool = True,
     budget_cache: Optional[dict] = None,
+    spillover_fn=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -21878,6 +21900,7 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
             pr_gate_prefetch=pr_gate_prefetch,
             budget_cache=budget_cache,
+            spillover_fn=spillover_fn,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -21905,6 +21928,7 @@ def dispatch_once(
                 reconcile_orphans=reconcile_orphans,
                 pr_gate_prefetch=pr_gate_prefetch,
                 budget_cache=budget_cache,
+                spillover_fn=spillover_fn,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -21977,6 +22001,7 @@ def _dispatch_once_locked(
     reconcile_orphans: bool = True,
     pr_gate_prefetch=None,
     budget_cache: Optional[dict] = None,
+    spillover_fn=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -22189,9 +22214,19 @@ def _dispatch_once_locked(
     # above already ran, so a paused tick keeps the board honest but adds
     # NO new workers to an overloaded host. Measured 2026-09-24: load1 80-110
     # on 32 cores while the dispatcher kept spawning 9-14 workers a tick.
+    # Worker-host spillover (kanban.worker_hosts, t_5981ff03): while the gate
+    # holds THIS host, eligible cards may still spawn with their tools placed
+    # on a worker host. No configured host (the default) keeps the old return.
+    spillover = None
     if spawn_paused:
         result.spawn_paused = str(spawn_paused)
-        return result
+        spillover = (spillover_fn or _default_spillover_plan)(conn)
+        if spillover is None or spillover.budget <= 0:
+            if spillover is not None:
+                result.spillover = f"no worker-host capacity: {spillover.summary()}"
+            return result
+        result.spillover = spillover.summary()
+        spawn_limit = spillover.budget
 
     running_count = 0
     spawn_budget: Optional[int] = None
@@ -22269,14 +22304,29 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, body FROM tasks "
+        "SELECT id, assignee, body, workspace_kind, workspace_path FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    if spillover is not None:
+        # Only cards a worker host can take: scratch workspace + allowlisted
+        # assignee. Everything else waits for this host's gate to reopen.
+        # Also: no task link in either direction (children read the
+        # parent's scratch dir locally; a spilled card's files live on the
+        # worker host) and no local workspace content (it is not on the host).
+        ready_rows = [
+            r for r in ready_rows
+            if spillover.eligible(r["assignee"], r["workspace_kind"])
+            and not _kwh.local_workspace_has_content(r["workspace_path"])
+            and conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? "
+                "LIMIT 1", (r["id"], r["id"]),
+            ).fetchone() is None
+        ]
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
-    if review_dispatch_enabled():
+    if spillover is None and review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
@@ -22877,8 +22927,15 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        placed_host = None
+        if spillover is not None:
+            placed_host = spillover.take(row_assignee)
+            if placed_host is None:
+                continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            if placed_host is not None:
+                spillover.release(placed_host)
             continue
         # Route precedence at spawn (both lanes): card pin > active lane
         # override > profile default gives the INTENDED route; then main's
@@ -22957,14 +23014,39 @@ def _dispatch_once_locked(
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
             import inspect
+            spawn_kwargs: dict = {}
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if placed_host is not None:
+                    if "placement" not in sig.parameters and not any(
+                        p.kind is inspect.Parameter.VAR_KEYWORD
+                        for p in sig.parameters.values()
+                    ):
+                        raise RuntimeError(
+                            "worker-host spillover: spawn_fn takes no placement"
+                        )
+                    spawn_kwargs["placement"] = placed_host
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+                if placed_host is not None:
+                    raise
+            pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+            if placed_host is not None:
+                _append_event(
+                    conn, claimed.id, _kwh.PLACED_EVENT,
+                    {"host": placed_host.name, "target": placed_host.target,
+                     "workspace": str(workspace),
+                     "reason": str(spawn_paused), "pid": pid},
+                    run_id=claimed.current_run_id,
+                )
+                result.placements[claimed.id] = placed_host.name
+                _log.info(
+                    "kanban dispatch: placed %s (%s) on worker host %s pid=%s; "
+                    "local gate: %s",
+                    claimed.id, claimed.assignee, placed_host.name, pid,
+                    spawn_paused,
+                )
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
@@ -24088,6 +24170,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    placement=None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -24286,6 +24369,13 @@ def _default_spawn(
     # highest-precedence interface override; dropping the env var covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
+
+    # Worker-host placement (kanban.worker_hosts): same process, same grant,
+    # tools on the worker host. Never inherit a placement from our own env.
+    env.pop(_kwh.PLACEMENT_ENV, None)
+    if placement is not None:
+        _kwh.prepare_remote_workspace(placement, workspace)
+        _kwh.apply_placement(env, placement, workspace)
 
     cmd = [
         *_resolve_hermes_argv(),

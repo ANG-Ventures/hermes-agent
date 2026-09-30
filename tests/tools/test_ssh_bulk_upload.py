@@ -83,11 +83,43 @@ class TestSSHBulkUpload:
         # Exactly one subprocess.run call for mkdir
         assert mock_run.call_count == 1
         mkdir_cmd = mock_run.call_args[0][0]
-        # Should contain mkdir -p with both parent dirs
+        # mkdir -p runs once; both parent dirs arrive NUL-separated on stdin
         mkdir_str = " ".join(mkdir_cmd)
         assert "mkdir -p" in mkdir_str
-        assert "/home/testuser/.hermes/skills" in mkdir_str
-        assert "/home/testuser/.hermes/credentials" in mkdir_str
+        sent = mock_run.call_args.kwargs["input"].split("\0")
+        assert "/home/testuser/.hermes/skills" in sent
+        assert "/home/testuser/.hermes/credentials" in sent
+
+    def test_mkdir_dir_list_never_rides_argv(self, mock_env, tmp_path):
+        """Thousands of dirs must not grow the remote command (ARG_MAX).
+
+        A real skills tree failed with "/bin/bash: Argument list too long"
+        when the dirs were joined into the ssh command (t_5981ff03).
+        """
+        f1 = tmp_path / "a.txt"
+        f1.write_text("a")
+        files = [
+            (str(f1), f"/home/testuser/.hermes/skills/d{i:05d}/x{'y' * 60}/f.md")
+            for i in range(5000)
+        ]
+        mock_run = MagicMock(return_value=subprocess.CompletedProcess([], 0))
+
+        def make_proc(cmd, **kwargs):
+            m = MagicMock()
+            m.returncode = 0
+            m.poll.return_value = 0
+            m.communicate.return_value = (b"", b"")
+            m.stderr = MagicMock()
+            m.stderr.read.return_value = b""
+            return m
+
+        with patch.object(subprocess, "run", mock_run), \
+             patch.object(subprocess, "Popen", side_effect=make_proc):
+            mock_env._ssh_bulk_upload(files)
+
+        remote_cmd = mock_run.call_args[0][0][-1]
+        assert len(remote_cmd) < 100
+        assert mock_run.call_args.kwargs["input"].count("\0") == 5000
 
     def test_staging_symlinks_mirror_remote_layout(self, mock_env, tmp_path):
         """Staged file in staging dir should mirror the remote path structure.

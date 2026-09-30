@@ -234,14 +234,18 @@ class SSHEnvironment(BaseEnvironment):
         base = f"{self._remote_home}/.hermes"
         parents = unique_parent_dirs(files)
         if parents:
+            # Directory list goes over stdin, not argv: a real skills tree
+            # (thousands of dirs) overflows the remote shell's single-argument
+            # limit ("/bin/bash: Argument list too long") and the whole sync
+            # then fails and retries on every tool call.
             cmd = self._build_ssh_command()
-            cmd.append(quoted_mkdir_command(parents))
+            cmd.append("xargs -0 mkdir -p --")
             result = subprocess.run(
                 cmd,
+                input="\0".join(parents) + "\0",
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 timeout=30,
-                stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
                 raise EnvironmentConnectionError(

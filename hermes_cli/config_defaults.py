@@ -3165,6 +3165,12 @@ DEFAULT_CONFIG = {
         # ceil((pause_above - load1 - pending) / worker_load_cost) and never
         # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
         # pause also needs load5 < pause_above. See kanban_load_gate.py.
+        # Worker hosts (t_5981ff03): while dispatch_load_gate holds this host,
+        # eligible scratch cards may spawn with their terminal + file tools on
+        # a second machine over the ssh backend. List of {name, ssh_host,
+        # ssh_user, max_workers, pause_above, profiles}. Empty = off.
+        # See kanban_worker_hosts.py.
+        "worker_hosts": [],
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,
