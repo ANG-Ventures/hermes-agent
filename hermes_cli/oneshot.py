@@ -482,18 +482,21 @@ def _run_agent(
         # agent.service_tier (fast / ultrafast) — route-gated, same contract
         # as the interactive CLI; only request_overrides reach the wire.
         from hermes_cli.fast_mode_contracts import parse_service_tier
-        from hermes_cli.models import service_tier_request_overrides
 
         _agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
         _service_tier = parse_service_tier(
             (_agent_cfg or {}).get("service_tier") if isinstance(_agent_cfg, dict) else None
         )
-        _tier_overrides = service_tier_request_overrides(
-            model=effective_model,
-            provider=runtime.get("provider"),
-            api_mode=runtime.get("api_mode"),
-            tier=_service_tier,
-        )
+        _tier_overrides = {}
+        if _service_tier:
+            from hermes_cli.models import service_tier_request_overrides
+
+            _tier_overrides = service_tier_request_overrides(
+                model=effective_model,
+                provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                tier=_service_tier,
+            )
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),
