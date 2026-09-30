@@ -28,7 +28,9 @@ def _fetch_block() -> str:
 
 
 def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+    # Identity via -c: CI runners have no git user, and `tag -a` / `commit` need one.
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
+                   check=True, capture_output=True)
 
 
 def _run(tmp_path: Path, url: str, ref: str) -> subprocess.CompletedProcess:
@@ -50,8 +52,7 @@ def _run(tmp_path: Path, url: str, ref: str) -> subprocess.CompletedProcess:
 def _make_upstream(path: Path) -> str:
     path.mkdir()
     _git(path, "init", "-q", "-b", "main")
-    _git(path, "-c", "user.email=t@t", "-c", "user.name=t",
-         "commit", "-q", "--allow-empty", "-m", "c1")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "c1")
     _git(path, "tag", "-a", "v2026.3.12", "-m", "t")
     return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
                           capture_output=True, text=True, check=True).stdout.strip()
