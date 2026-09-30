@@ -1806,6 +1806,22 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
 _terminal_config_bridge_attempted = False
 
 
+def _reapply_kanban_placement() -> None:
+    """Keep a dispatcher worker-host placement over config-bridged values.
+
+    A kanban worker spilled onto a worker host (``kanban.worker_hosts``) gets
+    its ``TERMINAL_*`` values in ``KANBAN_WORKER_PLACEMENT``. The config.yaml
+    bridge above overrides env with the profile's ``terminal`` section (e.g.
+    ``backend: local``), which would silently run the tools on the dispatcher
+    host again. Re-asserting after every bridge keeps the placement.
+    """
+    try:
+        from hermes_cli.kanban_worker_hosts import reapply_placement_env
+        reapply_placement_env()
+    except Exception:
+        logger.debug("kanban worker placement re-apply failed", exc_info=True)
+
+
 def _ensure_terminal_env_bridged() -> None:
     """Backfill TERMINAL_* env vars from config.yaml when no launcher did.
 
@@ -1852,6 +1868,7 @@ def _ensure_terminal_env_bridged() -> None:
         # historical local default still applies.
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
     finally:
+        _reapply_kanban_placement()
         # Re-render cap-dependent schema text now that the bridge has run.
         # In `finally` so a partial/failed bridge still leaves the schema
         # agreeing with whatever the enforcement path will actually apply —
@@ -1909,6 +1926,7 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
+    _reapply_kanban_placement()
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
