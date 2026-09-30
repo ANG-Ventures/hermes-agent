@@ -119,8 +119,30 @@ def test_crashed_worker_session_leftovers_reaped(conn, monkeypatch):
     assert _gone(sleep_pid), "setpgrp'd sleep outlived its crashed worker"
 
 
+def test_recycled_session_is_not_reaped(conn, monkeypatch):
+    """Prism P1: a dead worker's pid reused by a NEW session leader that exited
+    and left children. Those children postdate the recorded run's last
+    evidence, so they are not the worker's and must survive."""
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    tid, worker, sleep_pid = _worker_card(conn, "exit")
+    with kb.write_txn(conn):  # the recorded run ended 2 h ago
+        conn.execute(
+            "UPDATE task_events SET created_at = created_at - 7200 "
+            "WHERE task_id = ? AND kind IN ('claimed', 'spawned', 'heartbeat')", (tid,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - 7200 "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)", (tid,),
+        )
+    assert _gone(worker.pid)
+    kb.detect_crashed_workers(conn)
+    time.sleep(0.5)
+    assert kb._pid_alive(sleep_pid), "reaped a session that is not the recorded worker's"
+
+
 def test_reap_refuses_init_and_own_session():
-    assert kb._reap_worker_session(0) == 0
-    assert kb._reap_worker_session(1) == 0
-    assert kb._reap_worker_session(os.getsid(0)) == 0
-    assert kb._reap_worker_session(os.getpid()) == 0
+    window = {"born_after": 0.0, "born_before": time.time()}
+    assert kb._reap_worker_session(0, **window) == 0
+    assert kb._reap_worker_session(1, **window) == 0
+    assert kb._reap_worker_session(os.getsid(0), **window) == 0
+    assert kb._reap_worker_session(os.getpid(), **window) == 0
