@@ -1696,6 +1696,23 @@ def test_scheduled_rate_changes_are_well_formed():
             entry = nxt
 
 
+def test_gemini_4_argon_prices_at_introductory_rate_bare_and_bridge():
+    """gemini-4-argon launch pricing (blog.google 2026-09-30, introductory):
+    $2 in / $10 out / $0.10 cached input per 1M. Bridge ids carry agy's effort
+    tier (-low/-medium/-high) and must price as the base id, status estimated."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000)
+    cases = [("gemini-4-argon", "google")] + [
+        (f"gemini-4-argon-{s}", p)
+        for s in ("low", "medium", "high")
+        for p in ("google", "gemini-bridge")
+    ]
+    for model, provider in cases:
+        got = estimate_usage_cost(model, usage, provider=provider)
+        assert got.status == "estimated", (model, provider, got.status)
+        assert got.amount_usd == Decimal("12.10"), (model, provider, got.amount_usd)
+
+
 def test_gemini_bridge_effort_suffix_prices_as_base_model():
     """The gemini-bridge appends agy's effort tier (-low/-medium/-high). Effort is
     not a SKU, so each suffixed id prices exactly like its base id, and via the
