@@ -223,3 +223,60 @@ def test_reap_refuses_init_and_own_session():
     assert kb._reap_worker_session(1, **window) == 0
     assert kb._reap_worker_session(os.getsid(0), **window) == 0
     assert kb._reap_worker_session(os.getpid(), **window) == 0
+
+
+# --- run-identity sweep: children that setsid() OUT of the worker session -------------
+
+def _spawn_escapee(task_id: str, run_id: str) -> subprocess.Popen:
+    """A child in its OWN session (as browser_harness.daemon does) carrying the run identity."""
+    env = {**os.environ, "HERMES_KANBAN_TASK": task_id, "HERMES_KANBAN_RUN_ID": run_id}
+    p = subprocess.Popen([sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(120)"],
+                         stdout=subprocess.PIPE, text=True, encoding="utf-8", env=env, start_new_session=True)
+    assert p.stdout is not None and p.stdout.readline().strip() == "ready"
+    return p
+
+
+def test_env_identity_reap_kills_a_daemon_that_left_the_session():
+    """The browser-use harness daemon setsid()s, so the session reap never sees it;
+    its environment still names the run. Born inside the window => reaped."""
+    born_after = time.time() - 5
+    victim = _spawn_escapee("t_envreap1", "4242")
+    bystander = _spawn_escapee("t_envreap1", "4243")   # same task, a NEWER run: not ours
+    try:
+        # the session reap of the WORKER (a fake sid here: the victim is in its own session) sees nothing
+        assert kb._reap_worker_session(99_999_9, born_after=born_after, born_before=time.time()) == 0
+        assert not _gone(victim.pid)
+        n = kb._reap_run_env_escapees("t_envreap1", 4242, born_after=born_after,
+                                      born_before=time.time(), grace=2.0)
+        assert n == 1
+        assert _gone(victim.pid), "run-identified escapee survived the reap"
+        assert not _gone(bystander.pid), "a different run's process was signalled"
+    finally:
+        for p in (victim, bystander):
+            try:
+                p.kill(); p.wait(timeout=5)
+            except Exception:
+                pass
+
+
+def test_env_identity_reap_respects_birth_window_and_unknown_bounds():
+    victim = _spawn_escapee("t_envreap2", "7")
+    try:
+        # born AFTER the window closed -> a recycled/unrelated process; untouched
+        assert kb._reap_run_env_escapees("t_envreap2", 7, born_after=1.0, born_before=2.0) == 0
+        assert not _gone(victim.pid)
+        # unknown bounds -> no reap, ever
+        assert kb._reap_run_env_escapees("t_envreap2", 7, born_after=None, born_before=time.time()) == 0
+        assert kb._reap_run_env_escapees("t_envreap2", 7, born_after=0.0, born_before=None) == 0
+        assert kb._reap_run_env_escapees(None, 7, born_after=0.0, born_before=time.time()) == 0
+        assert not _gone(victim.pid)
+    finally:
+        victim.kill(); victim.wait(timeout=5)
+
+
+def test_env_identity_scan_never_lists_self_or_own_session(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_envreap3")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "99")
+    # this very process carries the identity and must be invisible to the sweep
+    assert all(pid != os.getpid() for pid, _ in kb._run_env_escapees("t_envreap3", 99))
+    assert kb._reap_run_env_escapees("t_envreap3", 99, born_after=0.0, born_before=time.time() + 10) == 0
