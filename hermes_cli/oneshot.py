@@ -498,6 +498,13 @@ def _run_agent(
                 tier=_service_tier,
             )
 
+        # agent.reasoning_effort / reasoning_overrides — same chokepoint as
+        # the CLI, gateway and serve builders; without it the provider
+        # default effort goes on the wire.
+        from hermes_constants import resolve_reasoning_config
+
+        _reasoning_config = resolve_reasoning_config(cfg, effective_model)
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -513,6 +520,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            reasoning_config=_reasoning_config,
             service_tier=_service_tier,
             request_overrides=_tier_overrides or None,
             ephemeral_system_prompt=skills_prompt,
