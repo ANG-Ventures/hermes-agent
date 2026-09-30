@@ -1156,6 +1156,35 @@ async def web_extract_tool(
                 safe_urls.append(url)
                 safe_indices.append(index)
 
+        # ── Local PDF read (tools/web_pdf_local.py) ──────────────────────────
+        # Paid extract vendors bill PDFs per page (Firecrawl: 45–263 credits
+        # per manual). Read PDFs locally instead and never send them to a
+        # vendor. ``web.local_pdf: false`` restores vendor dispatch.
+        local_pdf_done: Dict[int, Dict[str, Any]] = {}
+        from tools.web_pdf_local import (
+            classify_pdf_urls as _classify_pdf_urls,
+            local_pdf_settings as _local_pdf_settings,
+            read_pdf_locally as _read_pdf_locally,
+        )
+        _pdf_enabled, _pdf_max_bytes = _local_pdf_settings(_load_web_config())
+        if _pdf_enabled and safe_urls:
+            _is_pdf = await _classify_pdf_urls(safe_urls)
+            _pdf_reads = await asyncio.gather(*(
+                _read_pdf_locally(url, _pdf_max_bytes)
+                for url, flag in zip(safe_urls, _is_pdf) if flag
+            ))
+            _pdf_iter = iter(_pdf_reads)
+            _vendor_urls: List[str] = []
+            _vendor_indices: List[int] = []
+            for url, index, flag in zip(safe_urls, safe_indices, _is_pdf):
+                _local = next(_pdf_iter) if flag else None
+                if _local is not None:
+                    local_pdf_done[index] = _local
+                else:
+                    _vendor_urls.append(url)
+                    _vendor_indices.append(index)
+            safe_urls, safe_indices = _vendor_urls, _vendor_indices
+
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
             results = []
@@ -1388,7 +1417,7 @@ async def web_extract_tool(
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
         # order of the safe URL list they receive.
-        if invalid_urls or ssrf_blocked:
+        if invalid_urls or ssrf_blocked or local_pdf_done:
             safe_results = {
                 index: (
                     results[position]
@@ -1402,7 +1431,7 @@ async def web_extract_tool(
                 )
                 for position, index in enumerate(safe_indices)
             }
-            by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
+            by_index = {**safe_results, **ssrf_blocked, **invalid_urls, **local_pdf_done}
             results = [by_index[index] for index in range(len(urls))]
 
         response = {"results": results}
@@ -1453,6 +1482,9 @@ async def web_extract_tool(
                 "content": r.get("content", ""),
                 "error": r.get("error"),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
+                **({"metadata": r["metadata"]}
+                   if isinstance(r.get("metadata"), dict)
+                   and r["metadata"].get("served_by") == "local-pdf" else {}),
             }
             for r in response.get("results", [])
         ]

@@ -62,6 +62,19 @@ If you specifically need the live DOM rather than extracted markdown — for exa
 
 ---
 
+## PDFs are read locally
+
+Some extract vendors bill a PDF per page (a 200-page manual can cost ~200 credits). `web_extract` therefore reads PDFs itself: a URL whose path ends in `.pdf` (query string ignored), or whose HEAD response is `Content-Type: application/pdf` (5 s timeout, up to 3 redirects), is downloaded locally and its text layer extracted with pymupdf, or `pdftotext` when pymupdf is not installed. PDFs are never sent to Firecrawl, Tavily, Exa or Parallel.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `web.local_pdf` | `true` | `false` sends PDFs to the extract backend as before |
+| `web.pdf_max_bytes` | `52428800` (50 MB) | Larger PDFs are refused with a clear error |
+
+A locally read result carries `metadata.served_by: local-pdf`, the page count and byte size. A scanned PDF with no text layer returns `metadata.warning: "no text layer — run OCR"` instead of falling back to a paid vendor. A `.pdf` link that actually serves an HTML page goes to the extract backend normally.
+
+---
+
 ## Result caching
 
 Repeat web calls within a short window are served from cache instead of the paid backend — this saves credits and latency in the two patterns where duplicates are common: subagent fan-outs (several delegated agents researching the same topic) and the agent re-checking a page it read minutes ago.
