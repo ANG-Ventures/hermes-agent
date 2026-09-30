@@ -109,16 +109,27 @@ def _add_context_variants(model_ids: List[str]) -> List[str]:
     """Insert ``-900k`` large-context picker variants after eligible base slugs.
 
     The ChatGPT Codex backend advertises 272K for the gpt-5.4 / gpt-5.6
-    families but accepts ~911K (live-verified Aug 2026). The base slugs keep
-    the cheaper advertised 272K limit by default; each verified slug gets an
-    explicit ``<slug>-900k`` picker entry that opts into the large window.
+    families but accepts ~911K (live-verified Aug 2026). Under
+    ``model.codex_context_policy: advertised`` the base slugs keep the
+    cheaper advertised 272K limit; each verified slug gets an explicit
+    ``<slug>-900k`` picker entry that opts into the large window.
+    Under the default ``large`` policy the BARE slug already IS the
+    large-window entry, so the legacy ``-900k`` entries are HIDDEN from the
+    picker (not minted). They stay resolvable: ``validate_requested_model``
+    accepts any valid variant that is absent from the catalog, and the
+    context resolver maps it to the same window as the bare slug.
     The suffix is Hermes-side only — it is stripped before the model id hits
     the wire (agent/transports/codex.py, agent/auxiliary_client.py).
     """
     from agent.model_metadata import (
+        CODEX_CONTEXT_POLICY_LARGE,
         CODEX_CONTEXT_VARIANT_SUFFIX,
+        codex_context_policy,
         has_codex_context_variant,
     )
+
+    if codex_context_policy() == CODEX_CONTEXT_POLICY_LARGE:
+        return list(model_ids)
 
     out: List[str] = []
     present = set(model_ids)

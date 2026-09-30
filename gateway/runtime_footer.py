@@ -46,10 +46,48 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("provider_model", "context_full", "reasoning", "cwd")
 _SEP = " \u00b7 "
+
+
+class ContextReading(NamedTuple):
+    """Current-context figure read from a live compressor.
+
+    ``tokens`` is None when the compressor has no figure. ``post_compaction``
+    is True when a compaction committed and no real usage has arrived since
+    (``last_prompt_tokens == -1``): any stored figure predates that compaction,
+    so callers must NOT fall back to it. ``estimated`` marks a rough figure.
+    """
+
+    tokens: Optional[int]
+    estimated: bool
+    post_compaction: bool
+
+
+def live_context_tokens(compressor: Any) -> ContextReading:
+    """Resolve the current-context figure a display surface should show.
+
+    * ``last_prompt_tokens > 0`` -> the provider-measured last call.
+    * ``last_prompt_tokens < 0`` (compaction committed, awaiting real usage) ->
+      the post-compaction rough estimate the compaction recorded, flagged
+      estimated; ``None`` when there is none. Never the pre-compaction figure.
+    * ``0`` / missing / non-int -> no figure (caller may use a stored one).
+    """
+    if compressor is None:
+        return ContextReading(None, False, False)
+    value = getattr(compressor, "last_prompt_tokens", None)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return ContextReading(None, False, False)
+    if value > 0:
+        return ContextReading(value, False, False)
+    if value < 0:
+        rough = getattr(compressor, "last_compression_rough_tokens", None)
+        if isinstance(rough, int) and not isinstance(rough, bool) and rough > 0:
+            return ContextReading(rough, True, True)
+        return ContextReading(None, False, True)
+    return ContextReading(None, False, False)
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -167,6 +205,7 @@ def format_runtime_footer(
     message_limit: Optional[int] = None,
     turn_seconds: Optional[float] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    context_estimated: bool = False,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
@@ -174,6 +213,8 @@ def format_runtime_footer(
     partially-populated footer is better than a line with ``?%`` or empty slots.
     """
     parts: list[str] = []
+    # A rough (post-compaction, pre-usage) figure is marked ``~``.
+    _est = "~" if context_estimated else ""
     for field in fields:
         if field == "model":
             m = _model_short(model)
@@ -188,16 +229,16 @@ def format_runtime_footer(
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(f"{pct}%")
+                parts.append(f"{_est}{pct}%")
         elif field == "context_full":
             # Both used and window humanized (50.2k/1M); pct from raw values.
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(
-                    f"{_humanize_tok(context_tokens)}/{_humanize_tok(context_length)} ({pct}%)"
+                    f"{_est}{_humanize_tok(context_tokens)}/{_humanize_tok(context_length)} ({pct}%)"
                 )
             elif context_tokens and context_tokens > 0:
-                parts.append(_humanize_tok(context_tokens))
+                parts.append(f"{_est}{_humanize_tok(context_tokens)}")
         elif field == "reasoning":
             # Model reasoning-effort level (none/minimal/low/medium/high/xhigh/max).
             r = (reasoning or "").strip()
@@ -282,6 +323,7 @@ def build_footer_line(
     message_count: Optional[int] = None,
     message_limit: Optional[int] = None,
     turn_seconds: Optional[float] = None,
+    context_estimated: bool = False,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -311,4 +353,5 @@ def build_footer_line(
         message_limit=message_limit,
         turn_seconds=turn_seconds,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        context_estimated=context_estimated,
     )

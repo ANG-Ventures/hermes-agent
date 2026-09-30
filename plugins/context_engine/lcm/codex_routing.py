@@ -40,17 +40,24 @@ def _is_openai_codex_route(provider: str | None) -> bool:
 
 
 def _is_host_codex_context_variant(bare_model: str) -> bool:
-    """Return True when the host marks ``bare_model`` as a context-window variant.
+    """Return True when the host resolves ``bare_model`` to its large window.
 
+    Prefers the host's ``codex_uses_large_window`` (valid ``-900k`` variants,
+    plus bare eligible slugs under the host's default
+    ``model.codex_context_policy: large``); falls back to the older
+    ``is_codex_context_variant`` on hosts without it.
     Best-effort: LCM may run against a stub ``agent`` package (upstream CI),
     in which case no variant is recognised and the conservative table applies.
     """
     try:
-        from agent.model_metadata import is_codex_context_variant
-    except Exception:  # pragma: no cover - host without the helper
-        return False
+        from agent.model_metadata import codex_uses_large_window as predicate
+    except Exception:
+        try:
+            from agent.model_metadata import is_codex_context_variant as predicate
+        except Exception:  # pragma: no cover - host without the helper
+            return False
     try:
-        return bool(is_codex_context_variant(bare_model))
+        return bool(predicate(bare_model))
     except Exception:  # pragma: no cover - defensive
         return False
 
@@ -69,9 +76,10 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
     if not bare_model:
         return None
     if _is_host_codex_context_variant(bare_model):
-        # Explicit opt-in picker variants (``gpt-5.6-sol-900k``) are a
-        # host-side alias whose window the host has ALREADY resolved from its
-        # live-verified table (the alias is stripped before it hits the wire).
+        # Large-window slugs (``gpt-5.6-sol-900k``, and bare eligible slugs
+        # under the host's ``large`` policy) have a window the host has
+        # ALREADY resolved from its live-verified table (any alias is
+        # stripped before it hits the wire).
         # Re-clamping them here to the advertised base-slug window would
         # silently discard the user's opt-in, so trust the host value.
         return None

@@ -1087,6 +1087,12 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        # Codex window policy lives at model.codex_context_policy (large |
+        # advertised; default large when absent — code default in
+        # agent/model_metadata.py, not DEFAULT_CONFIG, because ``model`` may be
+        # a bare string). Slugs resolving to the large verified window are
+        # never autoraised below. Flip back: `hermes config set
+        # model.codex_context_policy advertised` (2026-09-30, t_73689428).
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction

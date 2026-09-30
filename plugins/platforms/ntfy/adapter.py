@@ -66,6 +66,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    keep_head_and_tail_text,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -143,7 +144,11 @@ def _truncate_body(message: str, *, context: str) -> bytes:
             "%s: truncating message from %d to %d chars (ntfy limit)",
             context, len(message), MAX_MESSAGE_LENGTH,
         )
-    return message[:MAX_MESSAGE_LENGTH].encode("utf-8")
+    # Keep the start AND the end: the conclusion is at the end (t_11223645).
+    # ntfy's limit is in BYTES; over it the body becomes an attachment.
+    return keep_head_and_tail_text(
+        message, MAX_MESSAGE_LENGTH, utf8_bytes=True,
+    ).encode("utf-8")
 
 
 def check_requirements() -> bool:
@@ -433,7 +438,11 @@ class NtfyAdapter(BasePlatformAdapter):
                 "[%s] Message truncated from %d to %d chars (ntfy limit)",
                 self.name, len(content), self.MAX_MESSAGE_LENGTH,
             )
-        body = content[:self.MAX_MESSAGE_LENGTH]
+        # Keep the start AND the end: the conclusion is at the end (t_11223645).
+        # ntfy's limit is in BYTES; over it the body becomes an attachment.
+        body = keep_head_and_tail_text(
+            content, self.MAX_MESSAGE_LENGTH, utf8_bytes=True,
+        )
 
         try:
             resp = await self._http_client.post(

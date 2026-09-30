@@ -5264,6 +5264,21 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _footer_context_tokens(agent_result: dict) -> int:
+    """Context figure for the runtime footer from a turn result.
+
+    Prefers ``context_tokens_display`` (resolved by ``live_context_tokens``:
+    the post-compaction estimate when the compressor holds the -1 sentinel, or
+    -1 when there is none so the footer omits the field instead of showing a
+    pre-compaction value). Results without it (proxy path, no agent) keep the
+    raw ``last_prompt_tokens``.
+    """
+    value = agent_result.get("context_tokens_display")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return agent_result.get("last_prompt_tokens", 0) or 0
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -8070,8 +8085,24 @@ class TurnRunner:
         _output_toks = 0
         _context_length = 0
         _agent = ctx.agent_holder[0]
+        _ctx_display_toks = None
+        _ctx_display_estimated = False
         if _agent and hasattr(_agent, "context_compressor"):
             _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
+            # Footer figure: the raw value is -1 right after a compaction that
+            # no API call followed; show the post-compaction estimate then,
+            # never an older figure (t_64728f32).
+            try:
+                from gateway.runtime_footer import live_context_tokens as _lct
+
+                _ctx_reading = _lct(_agent.context_compressor)
+                if _ctx_reading.tokens is not None:
+                    _ctx_display_toks = _ctx_reading.tokens
+                elif _ctx_reading.post_compaction:
+                    _ctx_display_toks = -1  # no figure: footer omits the field
+                _ctx_display_estimated = _ctx_reading.estimated
+            except Exception:
+                _ctx_display_toks = None
             _input_toks = getattr(_agent, "session_prompt_tokens", 0)
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
@@ -8241,6 +8272,8 @@ class TurnRunner:
                 "compacted_in_place": _compacted_in_place,
                 "session_id": effective_session_id,
                 "last_prompt_tokens": _last_prompt_toks,
+                "context_tokens_display": _ctx_display_toks,
+                "context_tokens_estimated": _ctx_display_estimated,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
@@ -8324,6 +8357,8 @@ class TurnRunner:
             "history_offset": _effective_history_offset,
             "compacted_in_place": _compacted_in_place,
             "last_prompt_tokens": _last_prompt_toks,
+            "context_tokens_display": _ctx_display_toks,
+            "context_tokens_estimated": _ctx_display_estimated,
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
             "model": _resolved_model,
@@ -28307,7 +28342,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
                     provider=agent_result.get("provider"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                    context_tokens=_footer_context_tokens(agent_result),
+                    context_estimated=bool(agent_result.get("context_tokens_estimated")),
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     reasoning=(
