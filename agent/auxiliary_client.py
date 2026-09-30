@@ -4810,6 +4810,20 @@ def _is_connection_error(exc: Exception) -> bool:
     return False
 
 
+def _is_context_length_error(exc: Exception) -> bool:
+    """A request too large for this model is a capability miss, even on HTTP 500."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None and (not isinstance(status, int) or status < 400):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "prompt is too long", "context length exceeded", "context_length_exceeded",
+        "maximum context length", "input is too long", "request too large",
+    ))
+
+
 def _is_transient_transport_error(exc: Exception) -> bool:
     """Return True for a one-off transport blip worth retrying ON the
     same provider before any provider/model fallback.
@@ -4821,6 +4835,8 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     ``_is_auth_error`` / ``_is_rate_limit_error`` which the except-chain
     handles by switching provider, refreshing creds, or rotating the pool.
     """
+    if _is_context_length_error(exc):
+        return False
     if _is_connection_error(exc):
         return True
     status = getattr(exc, "status_code", None) or getattr(
@@ -11039,6 +11055,7 @@ def _call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_context_length_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
@@ -11062,6 +11079,7 @@ def _call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_context_length_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
@@ -11078,6 +11096,8 @@ def _call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_context_length_error(first_err):
+                reason = "context length exceeded"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -11767,6 +11787,7 @@ async def _async_call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_context_length_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
@@ -11782,6 +11803,7 @@ async def _async_call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_context_length_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
@@ -11794,6 +11816,8 @@ async def _async_call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_context_length_error(first_err):
+                reason = "context length exceeded"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
