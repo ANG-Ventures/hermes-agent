@@ -428,6 +428,50 @@ def _ddgs_package_importable() -> bool:
         return False
 
 
+# ─── Configured keyed fallbacks, then one-shot keyless rescue ─────────────────
+
+def _keyed_fallbacks(capability: str, primary: str):
+    """Yield distinct configured providers with credentials, never anonymous ring paths."""
+    from agent.web_search_registry import get_provider
+    from agent.web_search_provider import get_provider_env
+
+    key_vars = {
+        "firecrawl": "FIRECRAWL_API_KEY", "tavily": "TAVILY_API_KEY",
+        "exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY",
+        "keenable": "KEENABLE_API_KEY", "brave-free": "BRAVE_SEARCH_API_KEY",
+        "searxng": "SEARXNG_URL",
+    }
+    configured = _load_web_config().get(f"{capability}_fallbacks", [])
+    if not isinstance(configured, list):
+        return
+    seen = {primary}
+    for item in configured:
+        if not isinstance(item, str):
+            continue
+        name = item.lower().strip()
+        if name in seen:
+            continue
+        seen.add(name)
+        provider = get_provider(name)
+        if provider is None or not getattr(provider, f"supports_{capability}")():
+            continue
+        # Ring vendors without a key invoke their anonymous endpoint and can
+        # walk the ring themselves. They belong to the later rescue, not here.
+        if name in key_vars and not get_provider_env(key_vars[name]):
+            continue
+        try:
+            if provider.is_available():
+                yield provider
+        except Exception as exc:  # noqa: BLE001 — skip broken fallback
+            logger.debug("keyed web fallback %r unavailable: %s", name, exc)
+
+
+def _failed_extract_batch(results: list, urls: list) -> bool:
+    return (bool(results) and len(results) == len(urls)
+            and all(r.get("error") for r in results)
+            and not all(_policy_blocked_result(r) for r in results))
+
+
 # ─── One-shot keyless rescue (keyed/configured backend failed) ───────────────
 
 def _keyless_rescue_enabled() -> bool:
@@ -982,28 +1026,36 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             def _paid_search() -> tuple[dict, bool]:
                 _fetch_limit = _bucket_limit(limit)
                 _rescued = False
+                current = provider
                 try:
-                    _resp = provider.search(query, _fetch_limit)
-                except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                    if _rescue_eligible(provider):
-                        _rescued = True
-                        _resp = _rescue_search(
-                            provider.name, str(exc), query, _fetch_limit
-                        )
-                    else:
+                    _resp = current.search(query, _fetch_limit)
+                except Exception as exc:  # noqa: BLE001 — candidate for fallback
+                    _resp = {"success": False, "error": str(exc)}
+                    if not _load_web_config().get("search_fallbacks") and not _rescue_eligible(current):
                         raise
-                else:
-                    if not _resp.get("success") and _rescue_eligible(provider):
-                        # One-shot keyless rescue: THIS call rides the
-                        # free-tier ring; the next call attempts the chosen
-                        # backend again.
-                        _rescued = True
-                        _resp = _rescue_search(
-                            provider.name,
-                            str(_resp.get("error", "")),
-                            query,
-                            _fetch_limit,
+                for candidate in _keyed_fallbacks("search", provider.name):
+                    if _resp.get("success"):
+                        break
+                    logger.info(
+                        "web_search backend '%s' failed (%s); trying keyed fallback '%s'",
+                        current.name, str(_resp.get("error", ""))[:200], candidate.name,
+                    )
+                    current = candidate
+                    try:
+                        _resp = candidate.search(query, _fetch_limit)
+                    except Exception as exc:  # noqa: BLE001 — next keyed candidate
+                        _resp = {"success": False, "error": str(exc)}
+                if current is not provider:
+                    _rescued = True  # never cache under the primary vendor's key
+                    if _resp.get("success"):
+                        _resp.setdefault("data", {}).setdefault("metadata", {}).update(
+                            served_by=current.name, fallback_from=provider.name
                         )
+                if not _resp.get("success") and _rescue_eligible(current):
+                    _rescued = True
+                    _resp = _rescue_search(
+                        current.name, str(_resp.get("error", "")), query, _fetch_limit
+                    )
                 return _resp, _rescued
 
             response_data = _search_memo.lookup(provider.name, query, limit)
@@ -1307,40 +1359,55 @@ async def web_extract_tool(
                 # extract(); exa + tavily are sync.
                 import inspect
                 _extract_rescued = False
+                current = provider
                 try:
-                    if inspect.iscoroutinefunction(provider.extract):
-                        results = await provider.extract(fetch_urls, format=format)
+                    if inspect.iscoroutinefunction(current.extract):
+                        results = await current.extract(fetch_urls, format=format)
                     else:
-                        # Run sync extract() in a thread so we don't block the
-                        # event loop on network I/O.
                         results = await asyncio.to_thread(
-                            provider.extract, fetch_urls, format=format
+                            current.extract, fetch_urls, format=format
                         )
-                except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                    if _rescue_eligible(provider):
-                        _extract_rescued = True
-                        failed = [
-                            {"url": u, "title": "", "content": "", "error": str(exc)}
-                            for u in fetch_urls
-                        ]
-                        results = await asyncio.to_thread(
-                            _rescue_extract, provider.name, fetch_urls, failed
-                        )
-                    else:
+                except Exception as exc:  # noqa: BLE001 — candidate for fallback
+                    if not _load_web_config().get("extract_fallbacks") and not _rescue_eligible(current):
                         raise
-                else:
-                    # One-shot keyless rescue when the WHOLE batch failed
-                    # (backend-level outage, not per-page problems). Stateless:
-                    # the next web_extract call uses the chosen backend again.
-                    if (
-                        results
-                        and all(r.get("error") for r in results)
-                        and _rescue_eligible(provider)
-                    ):
-                        _extract_rescued = True
-                        results = await asyncio.to_thread(
-                            _rescue_extract, provider.name, fetch_urls, results
-                        )
+                    results = [{"url": u, "title": "", "content": "", "error": str(exc)}
+                               for u in fetch_urls]
+                for candidate in _keyed_fallbacks("extract", provider.name):
+                    if not _failed_extract_batch(results, fetch_urls):
+                        break
+                    # Never route policy-blocked pages through another vendor.
+                    if any(_policy_blocked_result(r) for r in results):
+                        break
+                    logger.info(
+                        "web_extract backend '%s' failed all %d URL(s) (%s); trying keyed fallback '%s'",
+                        current.name, len(fetch_urls), str(results[0].get("error", ""))[:200],
+                        candidate.name,
+                    )
+                    current = candidate
+                    try:
+                        if inspect.iscoroutinefunction(current.extract):
+                            results = await current.extract(fetch_urls, format=format)
+                        else:
+                            results = await asyncio.to_thread(
+                                current.extract, fetch_urls, format=format
+                            )
+                    except Exception as exc:  # noqa: BLE001 — next keyed candidate
+                        results = [{"url": u, "title": "", "content": "", "error": str(exc)}
+                                   for u in fetch_urls]
+                if current is not provider:
+                    _extract_rescued = True  # do not cache under the primary name
+                    for r in results:
+                        if not r.get("error"):
+                            meta = r.get("metadata")
+                            if not isinstance(meta, dict):
+                                meta = {}
+                                r["metadata"] = meta
+                            meta.update(served_by=current.name, fallback_from=provider.name)
+                if _failed_extract_batch(results, fetch_urls) and _rescue_eligible(current):
+                    _extract_rescued = True
+                    results = await asyncio.to_thread(
+                        _rescue_extract, current.name, fetch_urls, results
+                    )
 
                 # Cache each successful fetch's full clean text for TTL reuse
                 # (best-effort; oversized pages are skipped by the cache).
@@ -1452,6 +1519,9 @@ async def web_extract_tool(
                 "title": r.get("title", ""),
                 "content": r.get("content", ""),
                 "error": r.get("error"),
+                **({"metadata": {k: r["metadata"][k] for k in ("served_by", "fallback_from")
+                                if k in r["metadata"]}} if isinstance(r.get("metadata"), dict)
+                   and any(k in r["metadata"] for k in ("served_by", "fallback_from")) else {}),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
             }
             for r in response.get("results", [])
