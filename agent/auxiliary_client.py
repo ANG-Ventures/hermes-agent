@@ -6217,6 +6217,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    skip_indices: Optional[set[int]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -6276,6 +6277,8 @@ def _try_configured_fallback_chain(
     min_ctx = _task_minimum_context_length(task)
 
     for i, entry in enumerate(chain):
+        if i in (skip_indices or ()):
+            continue
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -11145,13 +11148,46 @@ def _call_llm_impl(
                 _record_route_info(
                     route_info, _fallback_provider_from_label(fb_label), fb_model
                 )
-                fb_resp = _call_fallback_candidate_sync(
-                    fb_client, fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                try:
+                    fb_resp = _call_fallback_candidate_sync(
+                        fb_client, fb_model, fb_label,
+                        task=task, messages=messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config)
+                except Exception as fb_err:
+                    if not (_is_context_length_error(fb_err) and fb_label.startswith("fallback_chain[")):
+                        raise
+                    # A configured seat can have a smaller real window than
+                    # its nominal metadata. Walk the remaining configured
+                    # seats without re-sending to the rejected model.
+                    skipped_indices = {int(fb_label.split("[", 1)[1].split("]", 1)[0])}
+                    fb_resp = None
+                    while True:
+                        next_client, next_model, next_label = _try_configured_fallback_chain(
+                            task, resolved_provider or "auto", reason="context length exceeded",
+                            failed_model=_chain_failed_model, skip_indices=skipped_indices)
+                        if next_client is None:
+                            break
+                        skipped_indices.add(int(next_label.split("[", 1)[1].split("]", 1)[0]))
+                        try:
+                            fb_resp = _call_fallback_candidate_sync(
+                                next_client, next_model, next_label,
+                                task=task, messages=messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools,
+                                effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config)
+                        except Exception as next_err:
+                            if _is_context_length_error(next_err):
+                                continue
+                            raise
+                        if fb_resp is not None:
+                            _record_route_info(route_info, _fallback_provider_from_label(next_label), next_model)
+                            break
+                    if fb_resp is None:
+                        raise first_err
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
