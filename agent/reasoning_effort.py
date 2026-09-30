@@ -81,8 +81,13 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
 #: which is exactly CODEX_GPT56_EFFORTS. A bare ``gpt-6`` prefix is
 #: deliberately NOT used: Astra's vocabulary differs (no wire-level
 #: none/minimal), so each gpt-6 slug is listed on its own evidence.
+#: gpt-6.1-sol: live-probed 2026-09-30 (t_ec67290c) against
+#: chatgpt.com/backend-api/codex/responses — effort=max returns HTTP 200 and
+#: response.created/completed echo effort "max"; an invalid value 400s with
+#: "Supported values are: 'none', 'minimal', 'low', 'medium', 'high',
+#: 'xhigh', and 'max'", so the echo is validated, not passthrough.
 _CODEX_MAX_EFFORT_SLUGS: tuple[str, ...] = (
-    "gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol",
 )
 
 

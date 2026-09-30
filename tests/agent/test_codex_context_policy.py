@@ -32,6 +32,7 @@ def _use_config(monkeypatch, tmp_path, text):
         path.write_text(text, encoding="utf-8")
     monkeypatch.setattr(_config_mod, "get_config_path", lambda: path)
     _config_mod._RAW_CONFIG_CACHE.clear()
+    _config_mod._LOAD_CONFIG_CACHE.clear()
     return path
 
 
@@ -345,3 +346,53 @@ def test_wire_model_id_unchanged(request, policy_fixture, model, wire):
         params={"is_codex_backend": True},
     )
     assert kw["model"] == wire
+
+
+# -- merged-config read: managed scope + ${VAR} (t_27a85d2c, Prism P1 on #1557) --
+
+def _use_managed(monkeypatch, tmp_path, text):
+    """Point the managed-scope dir at a fresh dir holding config.yaml = *text*."""
+    from hermes_cli import managed_scope
+
+    managed = tmp_path / "managed"
+    managed.mkdir(exist_ok=True)
+    path = managed / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _config_mod._LOAD_CONFIG_CACHE.clear()
+    return path
+
+
+def test_managed_scope_policy_overrides_user_file(monkeypatch, tmp_path):
+    """An administrator-pinned policy wins over the user's config.yaml."""
+    _use_config(monkeypatch, tmp_path, "model:\n  codex_context_policy: large\n")
+    _use_managed(monkeypatch, tmp_path, "model:\n  codex_context_policy: advertised\n")
+    assert mm.codex_context_policy() == "advertised"
+    assert mm._verified_codex_ctx_for_slug("gpt-6-sol") is None
+    assert _codex_ctx("gpt-6-sol") == 272_000
+
+
+def test_managed_scope_policy_edit_is_picked_up_without_restart(monkeypatch, tmp_path):
+    """The read cache is keyed on the managed file too, so a managed edit lands."""
+    import os
+
+    _use_config(monkeypatch, tmp_path, "model:\n  codex_context_policy: advertised\n")
+    managed = _use_managed(monkeypatch, tmp_path, "model:\n  codex_context_policy: advertised\n")
+    assert mm.codex_context_policy() == "advertised"
+    # Same size on purpose: only the mtime moves, the size signature does not.
+    managed.write_text("model:\n  codex_context_policy: large     \n", encoding="utf-8")
+    st = managed.stat()
+    os.utime(managed, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert mm.codex_context_policy() == "large"
+    assert mm._verified_codex_ctx_for_slug("gpt-6-sol") == 872_000
+
+
+def test_policy_env_reference_is_expanded(monkeypatch, tmp_path):
+    """``${VAR}`` in the knob expands like every other behavioural config value."""
+    monkeypatch.setenv("CODEX_POLICY_T27A85D2C", "advertised")
+    _use_config(
+        monkeypatch, tmp_path,
+        "model:\n  codex_context_policy: ${CODEX_POLICY_T27A85D2C}\n",
+    )
+    assert mm.codex_context_policy() == "advertised"

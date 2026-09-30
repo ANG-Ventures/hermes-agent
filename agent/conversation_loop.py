@@ -5341,6 +5341,13 @@ def run_conversation(
                             if aggregator_usage is canonical_usage
                             else _compressor_usage_dict(aggregator_usage)
                         )
+                        # Display-only, once per session: first large-window
+                        # Codex prompt above the 272K price tier (t_a56d83c1).
+                        from agent.codex_tier_notice import maybe_emit_codex_tier_notice
+                        maybe_emit_codex_tier_notice(
+                            agent,
+                            getattr(agent.context_compressor, "last_prompt_tokens", 0),
+                        )
                     elif getattr(
                         agent.context_compressor,
                         "awaiting_real_usage_after_compression",

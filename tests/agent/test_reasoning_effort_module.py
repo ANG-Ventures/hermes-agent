@@ -160,6 +160,17 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"
 
+    def test_gpt_61_sol_accepts_max(self):
+        """Live-probed 2026-09-30 (t_ec67290c): chatgpt.com codex/responses
+        with model=gpt-6.1-sol, reasoning.effort=max -> HTTP 200, and both
+        response.created and response.completed echo effort 'max'. 'max' must
+        not clamp to xhigh on 6.1, including the -900k window alias."""
+        from agent.reasoning_effort import CODEX_GPT56_EFFORTS, codex_supported_efforts
+
+        for slug in ("gpt-6.1-sol", "gpt-6.1-sol-900k", "openai/gpt-6.1-sol"):
+            assert codex_supported_efforts(slug) is CODEX_GPT56_EFFORTS, slug
+            assert clamp_effort("max", codex_supported_efforts(slug)) == "max"
+
 
 class TestRequestedEffort:
     def test_extracts_effort(self):

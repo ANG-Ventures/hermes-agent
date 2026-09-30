@@ -1055,6 +1055,53 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+DEFAULT_CHILD_MAX_WALL_MULTIPLIER = 4.0
+
+
+def _get_child_max_wall_seconds(child_timeout: Optional[float]) -> Optional[float]:
+    """Absolute wall-clock ceiling for a child that went TIMED_OUT_RUNNING.
+
+    The late-completion owner is progress-aware (no progress for
+    child_timeout -> stopped), but progress-aware is not unbounded: a child
+    that keeps making progress is stopped once it has run this long since
+    its start. Config ``delegation.child_max_wall_seconds``: 0/unset (and any
+    invalid or negative value) = DEFAULT_CHILD_MAX_WALL_MULTIPLIER x
+    child_timeout, never below that multiple of child_timeout's own 30 s
+    floor (120 s; identical for every configurable child_timeout); a
+    positive value is used as-is, floored at child_timeout. It cannot be
+    disabled. None when there is no child_timeout (then no wait ever
+    returns TIMED_OUT_RUNNING, so there is nothing to bound).
+    """
+    if not child_timeout:
+        return None
+    floor = float(child_timeout)
+    default = max(floor, 30.0) * DEFAULT_CHILD_MAX_WALL_MULTIPLIER
+    val = _load_config().get("child_max_wall_seconds")
+    if val is None:
+        return default
+    try:
+        parsed = float(val)
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.child_max_wall_seconds=%r is not a valid number; "
+            "using %sx child_timeout",
+            val,
+            DEFAULT_CHILD_MAX_WALL_MULTIPLIER,
+        )
+        return default
+    if parsed < 0:
+        logger.warning(
+            "delegation.child_max_wall_seconds=%r cannot disable the ceiling; "
+            "using %sx child_timeout",
+            val,
+            DEFAULT_CHILD_MAX_WALL_MULTIPLIER,
+        )
+        return default
+    if parsed == 0:
+        return default
+    return max(floor, parsed)
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -2887,8 +2934,19 @@ _LATE_LIST_LIMIT = 20
 class _LateCompletion:
     """Handle for one TIMED_OUT_RUNNING child's late-completion thread."""
 
-    def __init__(self, late_result_id: str, *, absorbed: bool = False) -> None:
+    def __init__(
+        self,
+        late_result_id: str,
+        *,
+        absorbed: bool = False,
+        late_dir: Any = None,
+    ) -> None:
         self.late_result_id = late_result_id
+        # Late-results dir of the OWNING profile, captured on the spawning
+        # thread. The late thread persists here, never via a fresh
+        # get_hermes_home() lookup (a secondary profile's home is a
+        # context-local override, not the process env).
+        self.late_dir = late_dir
         # True when an async batch/recovery unit joins this child and carries
         # its result in the unit's own completion event (no parent steer).
         self.absorbed = absorbed
@@ -2933,7 +2991,7 @@ def _record_late_result(
     }
     path_str: Optional[str] = None
     try:
-        d = _late_results_dir()
+        d = handle.late_dir if handle.late_dir is not None else _late_results_dir()
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{handle.late_result_id}.json"
         tmp = path.with_suffix(".json.tmp")
@@ -2961,42 +3019,55 @@ def _record_late_result(
             "agent": child,
         }
         while len(_late_results) > _LATE_RESULTS_CAP:
-            _late_results.pop(next(iter(_late_results)), None)
+            evicted = _late_results.pop(next(iter(_late_results)), None) or {}
+            if not evicted.get("result_path"):
+                # Memory was its only copy (the disk write failed): say so
+                # loudly instead of dropping it silently.
+                logger.error(
+                    "delegate_task late result %s evicted with no durable "
+                    "copy; entry=%s",
+                    evicted.get("late_result_id"),
+                    json.dumps(evicted.get("entry"), ensure_ascii=False, default=str)[:2000],
+                )
     handle.result_path = path_str
     return path_str
 
 
 def _owned_late_results(parent_agent: Any) -> List[Dict[str, Any]]:
     """Late results owned by *parent_agent*'s conversation (memory + disk)."""
+    def _owned(rec: Dict[str, Any]) -> bool:
+        probe = {
+            "agent": rec.get("agent"),
+            "owner_agent_session_id": rec.get("owner_agent_session_id"),
+        }
+        return _owns_subagent_record(probe, parent_agent)
+
     with _late_results_lock:
-        records = {k: dict(v) for k, v in _late_results.items()}
+        snapshot = {k: dict(v) for k, v in _late_results.items()}
+    # Ownership is decided BEFORE any limit: a global newest-N cut would hide
+    # an owned result behind newer results of other conversations. The dir
+    # is bounded by _LATE_RESULT_RETENTION_SECONDS pruning.
+    records = {k: v for k, v in snapshot.items() if _owned(v)}
     try:
-        files = sorted(
-            _late_results_dir().glob("*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )[:200]
+        files = list(_late_results_dir().glob("*.json"))
     except Exception:
         files = []
     for p in files:
         rid = p.stem
-        if rid in records:
+        if rid in snapshot:
             continue
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if isinstance(rec, dict) and isinstance(rec.get("entry"), dict):
-            rec["result_path"] = str(p)
-            records[rid] = rec
+        if not (isinstance(rec, dict) and isinstance(rec.get("entry"), dict)):
+            continue
+        if not _owned(rec):
+            continue
+        rec["result_path"] = str(p)
+        records[rid] = rec
     out: List[Dict[str, Any]] = []
     for rid, rec in records.items():
-        probe = {
-            "agent": rec.get("agent"),
-            "owner_agent_session_id": rec.get("owner_agent_session_id"),
-        }
-        if not _owns_subagent_record(probe, parent_agent):
-            continue
         entry = rec.get("entry") or {}
         summary = entry.get("summary")
         if isinstance(summary, str) and len(summary) > _LATE_RESULT_MAX_CHARS:
@@ -3144,6 +3215,55 @@ def _timed_out_running_entry(
     }
 
 
+class _LateTurnStalled(Exception):
+    """A supervised late-path turn hit the hang or wall ceiling."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason  # "hung" | "wall"
+
+
+def _supervise_child_future(
+    future: Any,
+    child: Any,
+    ceiling: float,
+    wall_deadline: Optional[float],
+) -> Tuple[str, Any]:
+    """Wait for a child turn's future under progress + absolute-wall bounds.
+
+    Returns ``("done", raw)``, ``("hung", None)`` (no progress anywhere in
+    the child's subtree for *ceiling* seconds) or ``("wall", None)``
+    (``time.monotonic()`` passed *wall_deadline*, progress or not). An
+    exception the turn itself raised -- including a ``TimeoutError`` --
+    re-raises here: a finished future is never polled again.
+    """
+    poll = max(0.05, min(5.0, ceiling / 4.0))
+    last_sig = _progress_signature(child)
+    last_progress = time.monotonic() - min(_subtree_idle_seconds(child), ceiling)
+    while True:
+        wait = poll
+        if wall_deadline is not None:
+            remaining = wall_deadline - time.monotonic()
+            if remaining <= 0 and not future.done():
+                return "wall", None
+            wait = max(0.01, min(poll, remaining))
+        try:
+            return "done", future.result(timeout=wait)
+        except (FuturesTimeoutError, TimeoutError):
+            if future.done():
+                # Finished meanwhile, or finished by RAISING TimeoutError:
+                # result() returns the value or re-raises the turn's own
+                # exception for the caller's error path (a `continue` here
+                # spun forever on a raised TimeoutError).
+                return "done", future.result()
+        now = time.monotonic()
+        sig = _progress_signature(child)
+        if sig != last_sig:
+            last_sig, last_progress = sig, now
+        elif now - last_progress >= ceiling:
+            return "hung", None
+
+
 def _apply_output_schema(
     child: Any,
     result: Dict[str, Any],
@@ -3151,6 +3271,7 @@ def _apply_output_schema(
     task_index: int,
     child_task_id: Optional[str],
     stream_callback: Any,
+    run_turn: Any = None,
 ) -> Tuple[Optional[bool], List[str], int]:
     """T1-24 structured-output validation + ONE bounded correction retry.
 
@@ -3159,6 +3280,10 @@ def _apply_output_schema(
     the retry turn's answer/api_calls/messages. Returns
     ``(schema_valid, schema_errors, schema_retries)``; ``(None, [], 0)``
     when no schema was attached at dispatch.
+
+    *run_turn(message)*, when given, runs the correction turn instead of a
+    bare ``child.run_conversation`` (the late path supervises it); a
+    ``_LateTurnStalled`` it raises propagates to the caller.
     """
     output_schema = getattr(child, "_delegate_output_schema", None)
     if not isinstance(output_schema, dict):
@@ -3181,11 +3306,16 @@ def _apply_output_schema(
         retries = 1
         retry_result = None
         try:
-            retry_result = child.run_conversation(
-                user_message=build_retry_message(schema_errors),
-                task_id=child_task_id,
-                stream_callback=stream_callback,
-            )
+            if run_turn is not None:
+                retry_result = run_turn(build_retry_message(schema_errors))
+            else:
+                retry_result = child.run_conversation(
+                    user_message=build_retry_message(schema_errors),
+                    task_id=child_task_id,
+                    stream_callback=stream_callback,
+                )
+        except _LateTurnStalled:
+            raise
         except Exception as retry_exc:
             logger.warning(
                 "Subagent %d schema-retry turn failed: %s",
@@ -3233,16 +3363,24 @@ def _start_late_completion(
     child_timeout: Optional[float] = None,
     child_task_id: Optional[str] = None,
     stream_callback: Any = None,
+    child_turn: Any = None,
 ) -> "_LateCompletion":
-    """Own a TIMED_OUT_RUNNING child until it ends (or hangs), then deliver.
+    """Own a TIMED_OUT_RUNNING child until it ends (or is stopped), then deliver.
 
     - Hang ceiling: the child and its live subtree must keep making progress
       (api calls / current tool / activity timestamp). No progress for
       child_timeout seconds → stop it, reap its subtree, report ``timeout``,
       release its lease.
+    - Wall ceiling: progress-aware is not unbounded. Once the child has run
+      ``delegation.child_max_wall_seconds`` (default 4x child_timeout) since
+      its start it is stopped the same way, progress or not.
     - Same contract as the normal path: output_schema validation with one
       bounded retry, and any steer the child accepted but never consumed is
-      reported as ``missed_steer``.
+      reported as ``missed_steer``. The retry turn runs through *child_turn*
+      (the spawn-time bindings) on a supervised worker under both ceilings.
+    - Owning profile: the thread runs in a copy of the spawning thread's
+      context and persists into the late dir captured here, so a secondary
+      profile (context-local home override) keeps its own results.
     - Durable delivery: the result is recorded on disk + in memory (read via
       action='list' → late_results) BEFORE the parent steer, which is only a
       nudge. An async unit that joins this child (``absorbed``) carries the
@@ -3251,60 +3389,124 @@ def _start_late_completion(
     import uuid as _uuid
 
     late_id = f"late-{subagent_id or task_index}-{_uuid.uuid4().hex[:8]}"
+    try:
+        late_dir = _late_results_dir()
+    except Exception:
+        logger.warning("delegate_task: late results dir unresolved", exc_info=True)
+        late_dir = None
     handle = _LateCompletion(
-        late_id, absorbed=getattr(child, "_delegate_join_late", False) is True
+        late_id,
+        absorbed=getattr(child, "_delegate_join_late", False) is True,
+        late_dir=late_dir,
     )
     with _late_results_lock:
         _late_handles[late_id] = handle
     ceiling = float(child_timeout) if child_timeout else None
+    max_wall = _get_child_max_wall_seconds(ceiling)
+    wall_deadline = child_start + max_wall if max_wall else None
+    approval_cb = _get_subagent_approval_callback()
+    # The turn currently running on the child: the original future, or the
+    # supervised correction turn once it starts. Stop paths drain THIS one
+    # before teardown closes the child's resources.
+    active_turn: Dict[str, Any] = {"future": child_future}
+
+    def _supervised_turn(message: str) -> Any:
+        """One follow-up child turn under the late path's hang/wall bounds."""
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        executor = DaemonThreadPoolExecutor(
+            max_workers=1,
+            initializer=_set_subagent_approval_cb,
+            initargs=(approval_cb,),
+        )
+        try:
+            if child_turn is not None:
+                call, args = child_turn, (message,)
+            else:
+                def call(msg: str) -> Any:
+                    return child.run_conversation(
+                        user_message=msg,
+                        task_id=child_task_id,
+                        stream_callback=stream_callback,
+                    )
+                args = (message,)
+            fut = executor.submit(contextvars.copy_context().run, call, *args)
+            active_turn["future"] = fut
+            outcome, raw = _supervise_child_future(
+                fut, child, float(ceiling or 0.0), wall_deadline
+            )
+            if outcome != "done":
+                raise _LateTurnStalled(outcome)
+            return raw
+        finally:
+            executor.shutdown(wait=False)
 
     def _late() -> None:
         error: Optional[str] = None
         result: Dict[str, Any] = {}
-        hung = False
+        stop: Optional[str] = None  # "hung" | "wall" | "retry_hung" | "retry_wall"
         try:
             if ceiling is None:
                 raw = child_future.result()
             else:
-                poll = max(0.05, min(5.0, ceiling / 4.0))
-                last_sig = _progress_signature(child)
-                last_progress = time.monotonic() - min(
-                    _subtree_idle_seconds(child), ceiling
+                outcome, raw = _supervise_child_future(
+                    child_future, child, ceiling, wall_deadline
                 )
-                while True:
-                    try:
-                        raw = child_future.result(timeout=poll)
-                        break
-                    except (FuturesTimeoutError, TimeoutError):
-                        if child_future.done():
-                            continue
-                        now = time.monotonic()
-                        sig = _progress_signature(child)
-                        if sig != last_sig:
-                            last_sig, last_progress = sig, now
-                        elif now - last_progress >= ceiling:
-                            hung = True
-                            raw = None
-                            break
+                if outcome != "done":
+                    stop = outcome
             result = raw if isinstance(raw, dict) else {}
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 
+        schema_valid: Optional[bool] = None
+        schema_errors: List[str] = []
+        schema_retries = 0
+        if stop is None and error is None:
+            try:
+                schema_valid, schema_errors, schema_retries = _apply_output_schema(
+                    child,
+                    result,
+                    task_index=task_index,
+                    child_task_id=child_task_id,
+                    stream_callback=stream_callback,
+                    run_turn=_supervised_turn if ceiling else None,
+                )
+            except _LateTurnStalled as stalled:
+                stop = f"retry_{stalled.reason}"
+                schema_retries = 1
+            except Exception:
+                logger.warning("late schema validation failed", exc_info=True)
+        hung = stop is not None
+        finalizer_pending = result.get("pending_steer")
+
         if hung:
-            # Alive but stuck: bound it exactly like the wait-time failure.
+            # Alive but stuck, or past the wall ceiling: bound it exactly like
+            # the wait-time failure.
+            if stop and stop.endswith("wall"):
+                why = (
+                    f"past the {max_wall}s wall ceiling "
+                    "(delegation.child_max_wall_seconds)"
+                )
+            else:
+                why = f"no progress for {ceiling}s"
             pending_steer = (
                 _close_subagent_steering(subagent_id, child) if subagent_id else None
             )
             try:
                 if not request_hard_interrupt(
-                    child, f"Subagent hung (no progress for {ceiling}s)"
+                    child, f"Subagent stopped: {why}"
                 ) and hasattr(child, "_interrupt_requested"):
                     child._interrupt_requested = True
             except Exception:
                 pass
             _reap_subtree(child, "hung")
             try:
-                child_future.result(timeout=min(ceiling, 5.0))
+                # Bounded drain of the turn that is actually running (the
+                # correction turn after a retry stall), so teardown does not
+                # close the child's session/tools under a still-unwinding turn.
+                # Flat 5 s: equals min(ceiling, 5) for every configurable
+                # child_timeout (floor 30 s).
+                active_turn["future"].result(timeout=5.0)
             except Exception:
                 pass
             api_calls = 0
@@ -3312,44 +3514,49 @@ def _start_late_completion(
                 api_calls = int(child.get_activity_summary().get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            error = (
-                f"Subagent hung: no progress for {ceiling}s after it was "
-                f"reported {TIMED_OUT_RUNNING}; it was stopped and its "
-                "credential lease released."
-            )
-            result = {"api_calls": api_calls}
+            if stop and stop.startswith("retry_"):
+                error = (
+                    f"Subagent schema-correction turn stalled ({why}) after it "
+                    f"was reported {TIMED_OUT_RUNNING}; it was stopped and its "
+                    "credential lease released. The first answer is kept."
+                )
+                # Keep the answer the child did produce; only the correction
+                # turn is lost.
+                result = {
+                    "api_calls": api_calls,
+                    "final_response": result.get("final_response"),
+                }
+            else:
+                error = (
+                    f"Subagent {'hung' if stop == 'hung' else 'stopped'}: {why} "
+                    f"after it was reported {TIMED_OUT_RUNNING}; it was stopped "
+                    "and its credential lease released."
+                )
+                result = {"api_calls": api_calls}
             logger.warning(
-                "delegate_task hung child reaped: subagent=%s ceiling=%ss",
+                "delegate_task late child stopped: subagent=%s reason=%s "
+                "ceiling=%ss wall=%ss",
                 subagent_id,
+                stop,
                 ceiling,
+                max_wall,
             )
         else:
-            schema_valid: Optional[bool] = None
-            schema_errors: List[str] = []
-            schema_retries = 0
-            if error is None:
-                try:
-                    schema_valid, schema_errors, schema_retries = _apply_output_schema(
-                        child,
-                        result,
-                        task_index=task_index,
-                        child_task_id=child_task_id,
-                        stream_callback=stream_callback,
-                    )
-                except Exception:
-                    logger.warning("late schema validation failed", exc_info=True)
             # Same linearization boundary as the normal path: close steering
             # and keep any accepted-but-unconsumed text.
             pending_steer = (
                 _close_subagent_steering(subagent_id, child) if subagent_id else None
             )
-            finalizer_pending = result.get("pending_steer")
-            if isinstance(finalizer_pending, str) and finalizer_pending.strip():
-                pending_steer = (
-                    f"{finalizer_pending}\n{pending_steer}"
-                    if pending_steer
-                    else finalizer_pending
-                )
+        # Steer the child accepted but never consumed, drained by a finished
+        # turn's finalizer into result["pending_steer"]. Captured before the
+        # stop branch rebuilds `result`, so a stalled correction turn cannot
+        # drop the first turn's accepted steer.
+        if isinstance(finalizer_pending, str) and finalizer_pending.strip():
+            pending_steer = (
+                f"{finalizer_pending}\n{pending_steer}"
+                if pending_steer
+                else finalizer_pending
+            )
 
         summary = str(result.get("final_response") or "")
         if hung:
@@ -3391,7 +3598,13 @@ def _start_late_completion(
         }
         if hung:
             entry["timeout_seconds"] = ceiling
-            entry["timeout_phase"] = "hung_after_timed_out_running"
+            entry["timeout_phase"] = {
+                "wall": "wall_ceiling_after_timed_out_running",
+                "retry_hung": "schema_retry_hung_after_timed_out_running",
+                "retry_wall": "wall_ceiling_after_timed_out_running",
+            }.get(stop or "", "hung_after_timed_out_running")
+            if stop and stop.endswith("wall"):
+                entry["max_wall_seconds"] = max_wall
         if error:
             entry["error"] = error
             if not hung:
@@ -3485,8 +3698,16 @@ def _start_late_completion(
             handle.absorbed,
         )
 
+    # A bare Thread starts with an EMPTY context: run _late in a copy of the
+    # spawning thread's context so profile-scoped state (the context-local
+    # home override of a secondary profile, session vars) is the owner's for
+    # teardown, manifest updates and the correction turn.
+    owner_context = contextvars.copy_context()
     t = threading.Thread(
-        target=_late, name=f"delegate-late-{subagent_id or task_index}", daemon=True
+        target=owner_context.run,
+        args=(_late,),
+        name=f"delegate-late-{subagent_id or task_index}",
+        daemon=True,
     )
     t.start()
     return handle
@@ -3898,6 +4119,11 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            return _child_turn(goal)
+
+        def _child_turn(user_message):
+            # One child turn with the spawn-time bindings. Also the late
+            # path's schema-correction turn (it must not run bare).
             # Bind the routing-only send-origin so the child's bare send_message/
             # react calls resolve to the PARENT's channel, not the global home
             # (PRD v2 RC#1). Uses dedicated contextvars read ONLY by the send
@@ -3913,7 +4139,7 @@ def _run_single_child(
             try:
                 with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                     return child.run_conversation(
-                        user_message=goal,
+                        user_message=user_message,
                         task_id=child_task_id,
                         stream_callback=_relay_child_text,
                     )
@@ -3958,14 +4184,14 @@ def _run_single_child(
                         child_timeout=child_timeout,
                         child_task_id=child_task_id,
                         stream_callback=_relay_child_text,
+                        child_turn=_child_turn,
                     )
                     _tor_entry["late_result_id"] = _late_handle.late_result_id
-                    try:
+                    if _late_handle.late_dir is not None:
+                        # The same captured dir the late thread writes to.
                         _tor_entry["late_result_path"] = str(
-                            _late_results_dir() / f"{_late_handle.late_result_id}.json"
+                            _late_handle.late_dir / f"{_late_handle.late_result_id}.json"
                         )
-                    except Exception:
-                        pass
                     return _tor_entry
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and

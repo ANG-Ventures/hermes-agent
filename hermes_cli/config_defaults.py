@@ -1096,6 +1096,8 @@ DEFAULT_CONFIG = {
         # a bare string). Slugs resolving to the large verified window are
         # never autoraised below. Flip back: `hermes config set
         # model.codex_context_policy advertised` (2026-09-30, t_73689428).
+        # Managed-scope overrides apply; running agents keep their resolved
+        # window until a new session or restart (t_27a85d2c).
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
@@ -1112,6 +1114,11 @@ DEFAULT_CONFIG = {
                                       # autoraise banner. Set False to keep the
                                       # 85% threshold autoraise but suppress the
                                       # user-facing notice in CLI/gateway output.
+        "codex_tier_notice": True,    # One-time per-session notice the first time a
+                                      # large-window Codex prompt (model.codex_context_policy:
+                                      # large) passes 272K tokens: turns above 272K price at
+                                      # the higher tier (2x input). Display-only; set False
+                                      # to silence it. Never shown under `advertised`.
         "codex_app_server_auto": "native",  # Codex app-server (codex CLI runtime) thread
                                       # compaction mode. The codex agent owns the real
                                       # thread context, so Hermes' summarizer cannot
@@ -2310,6 +2317,13 @@ DEFAULT_CONFIG = {
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
                                      # (floor 30s) to enforce a hard cap.
+        "child_max_wall_seconds": 0,  # absolute ceiling for a child whose wait hit
+                                      # child_timeout_seconds while it was still working
+                                      # (timed_out_running). The late owner stops such a
+                                      # child after this many seconds from its start even
+                                      # if it keeps making progress. 0 = 4x
+                                      # child_timeout_seconds; positive = seconds (floor
+                                      # child_timeout_seconds). Cannot be disabled.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch
