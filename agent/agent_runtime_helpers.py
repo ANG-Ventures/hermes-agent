@@ -5385,15 +5385,20 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
-    # Find the last tool-role message in the recent tail. Skipping
-    # non-tool messages defends against future code appending
-    # something else at the boundary.
-    target_idx = None
-    for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
-        msg = messages[j]
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            target_idx = j
-            break
+    # Target: the newest tool result that is BOTH in this batch's tail
+    # window AND in the current turn.  The window alone is a count, not a
+    # turn bound: when it is wider than the tool rows this batch appended it
+    # reaches back past the current user message into the previous turn's
+    # tool result, where the steer is buried before the previous final reply
+    # (the model ignores it) and the cached prefix is mutated.  Same bound as
+    # the pre-API drain (#1496).
+    from agent.conversation_loop import _current_turn_tail_tool_index
+
+    target_idx = _current_turn_tail_tool_index(
+        messages, getattr(agent, "_persist_user_message_idx", None)
+    )
+    if target_idx is not None and target_idx < len(messages) - num_tool_msgs:
+        target_idx = None
     if target_idx is None:
         # No tool result in this batch (e.g. all skipped by interrupt);
         # put the steer back so the caller's fallback path can deliver
