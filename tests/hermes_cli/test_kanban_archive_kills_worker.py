@@ -105,3 +105,71 @@ def test_archive_without_worker_signals_nothing(board, monkeypatch):
         tid = kb.create_task(conn, title="idle", assignee="builder")
         assert kb.archive_task(conn, tid) is True
     assert sent == []
+
+
+# --- t_b9d9bcbc (Prism post-merge review of #1513) -------------------------
+
+
+def _stub_cleanup(monkeypatch):
+    reaped = []
+    monkeypatch.setattr(kb, "_cleanup_workspace", lambda *a: reaped.append(a))
+    return reaped
+
+
+@pytest.mark.parametrize("claimer", ["remote", "cleared"])
+def test_archive_keeps_workspace_when_liveness_is_not_provable(board, monkeypatch, claimer):
+    """Prism 6383a983f818: a stamped worker whose claim is held on ANOTHER host,
+    or whose claim_lock is already NULL, cannot be signalled or checked from
+    here (_terminate_reclaimed_worker returns host_local=False untouched). That
+    is unknown liveness, so the workspace must be kept, not reaped."""
+    reaped = _stub_cleanup(monkeypatch)
+    pid = os.getpid() + 1000000
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="remote worker", assignee="builder")
+        lock = "some-other-host:4242" if claimer == "remote" else None
+        task = kb.claim_task(conn, tid, claimer="some-other-host:4242")
+        assert task is not None
+        assert kb._set_worker_pid(conn, tid, pid, run_id=task.current_run_id)
+        if lock is None:
+            conn.execute("UPDATE tasks SET claim_lock = NULL WHERE id = ?", (tid,))
+        assert kb.archive_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "archived"
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "archive_worker_terminated"]
+    assert reaped == []
+    assert ev and ev[-1].payload.get("workspace_kept") is True
+    assert ev[-1].payload.get("host_local") is False
+
+
+def test_archive_snapshot_sees_pid_stamped_just_before_archive_txn(board, monkeypatch):
+    """Prism 82f34e87302a: the worker snapshot must be read inside the archive's
+    write txn. A pid stamped after a pre-txn SELECT but before the UPDATE was
+    cleared unseen: never signalled, workspace reaped under it."""
+    reaped = _stub_cleanup(monkeypatch)
+    sent = []
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
+                        lambda pid, lock, **k: sent.append(pid) or
+                        {"host_local": True, "termination_attempted": True,
+                         "terminated": False})
+    pid = os.getpid() + 1000000
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="racing spawn", assignee="builder")
+        host = kb._claimer_id().split(":", 1)[0]
+        task = kb.claim_task(conn, tid, claimer=f"{host}:{os.getpid()}")
+        assert task is not None
+        real_txn = kb.write_txn
+        stamped = []
+
+        def racing_txn(c, **kw):
+            # The worker registers its pid (another connection) right before
+            # archive's first write txn opens.
+            if not stamped:
+                stamped.append(True)
+                with kb.connect_closing() as other:
+                    assert kb._set_worker_pid(other, tid, pid, run_id=task.current_run_id)
+            return real_txn(c, **kw)
+
+        monkeypatch.setattr(kb, "write_txn", racing_txn)
+        assert kb.archive_task(conn, tid) is True
+        monkeypatch.setattr(kb, "write_txn", real_txn)
+    assert sent == [pid]  # the stamped worker was seen and signalled
+    assert reaped == []   # and its workspace kept while it survives
