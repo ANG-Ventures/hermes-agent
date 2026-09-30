@@ -3928,6 +3928,24 @@ def test_respawn_guard_stuck_carries_last_run_outcome(kanban_home):
         assert got[tid]["pr"] == "https://github.com/o/r/pull/9"
         assert got[fresh]["last_outcome"] is None
 
+
+def test_respawn_guard_stuck_carries_newest_hold(kanban_home):
+    """t_5a9deed5: the gateway lands a mergeable hold instead of paging, so the
+    probe reports the NEWEST guard event's hold + merge_state."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="green PR", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr", "hold": "PR merge state unknown"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {
+            "reason": "active_pr", "pr": "https://github.com/o/r/pull/9",
+            "hold": kb.RESPAWN_GUARD_HOLD_MERGEABLE, "merge_state": "CLEAN"})
+        conn.commit()
+        (item,) = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert item["hold"] == kb.RESPAWN_GUARD_HOLD_MERGEABLE
+        assert item["merge_state"] == "CLEAN"
+
+
 def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     """Every kind in the override set is actually emitted by kanban_db (no dead entries),
     and every operator requeue verb's event kind is in the set (no missing entries)."""
