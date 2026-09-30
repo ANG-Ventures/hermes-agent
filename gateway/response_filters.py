@@ -140,12 +140,23 @@ def is_autonomous_silence_response(response: Any) -> bool:
     return False
 
 
-def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
-    """Silence markers suppress delivery only for successful agent turns."""
+def is_intentional_silence_agent_result(
+    agent_result: dict | None, response: Any, *, internal: bool = False,
+) -> bool:
+    """Silence markers suppress delivery only for successful agent turns.
+
+    ``internal`` marks a turn triggered by a system-generated gateway event
+    (background-process completion, delegation batch, restore replay).  No
+    human is waiting on those, so they get the autonomous-lane rule
+    (:func:`is_autonomous_silence_response`: marker on its own first/last
+    line); human turns keep the exact-marker rule.
+    """
     if not isinstance(agent_result, dict):
         return False
     if agent_result.get("failed"):
         return False
+    if internal:
+        return is_autonomous_silence_response(response)
     return is_intentional_silence_response(response)
 
 

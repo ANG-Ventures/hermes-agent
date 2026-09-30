@@ -36,6 +36,7 @@ from gateway.config import (
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
 )
 from gateway.response_filters import (
+    is_autonomous_silence_response as _is_autonomous_silence_response,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
 )
@@ -183,6 +184,12 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+    # True when the turn was triggered by an internal gateway event
+    # (background-process completion, restore replay) rather than a human.
+    # Such turns resolve silence with the autonomous rule
+    # (is_autonomous_silence_response) and hold mid-stream previews until
+    # the final text is known.  Human turns are unaffected.
+    internal_event: bool = False
 
 
 class GatewayStreamConsumer:
@@ -1467,7 +1474,14 @@ class GatewayStreamConsumer:
                     # preview instead of finalizing it, so the marker never
                     # reaches the chat.  Substantive prose that merely mentions
                     # a marker is NOT suppressed (see is_intentional_silence_response).
-                    if _is_intentional_silence_response(
+                    # Internal-event turns use the autonomous rule (marker on
+                    # its own first/last line), human turns the exact rule.
+                    _silence_fn = (
+                        _is_autonomous_silence_response
+                        if self.cfg.internal_event
+                        else _is_intentional_silence_response
+                    )
+                    if _silence_fn(
                         self._clean_for_display(self._accumulated)
                     ):
                         await self._suppress_silence_marker()
@@ -1521,8 +1535,14 @@ class GatewayStreamConsumer:
                     and not got_done
                     and not got_segment_break
                     and commentary_text is None
-                    and _is_partial_silence_marker(
-                        self._clean_for_display(self._accumulated)
+                    and (
+                        # Internal-event replies are short and may end in a
+                        # silence marker on its own line: hold every interval
+                        # tick until got_done decides.
+                        self.cfg.internal_event
+                        or _is_partial_silence_marker(
+                            self._clean_for_display(self._accumulated)
+                        )
                     )
                 ):
                     should_edit = False

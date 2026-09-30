@@ -19,6 +19,7 @@ These tests pin the two halves of the fix:
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -154,3 +155,61 @@ class TestStreamedSilenceSuppression:
         assert consumer.already_sent is False
 
 
+
+
+class TestInternalEventStreamSilence:
+    """Internal-event turns (bg-process completions) use the autonomous rule."""
+
+    NOTE = "Already merged on that result. No new information.\n\nNO_REPLY"
+
+    @pytest.mark.asyncio
+    async def test_internal_note_plus_marker_never_reaches_platform(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(
+                edit_interval=0.0, buffer_threshold=1, internal_event=True,
+            ),
+        )
+        # Feed deltas while run() is live so interval ticks actually fire:
+        # without the internal-event hold the note would be edited on screen.
+        task = asyncio.create_task(consumer.run())
+        for chunk in ("Already merged on that result. ", "No new information.",
+                      "\n\n", "NO_REPLY"):
+            consumer.on_delta(chunk)
+            await asyncio.sleep(0.1)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=5)
+
+        assert _sent_and_edited(adapter) == []
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_human_turn_note_plus_marker_is_delivered(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta(self.NOTE)
+        consumer.finish()
+        await consumer.run()
+
+        assert any("No new information" in t for t in _sent_and_edited(adapter))
+
+    @pytest.mark.asyncio
+    async def test_internal_real_report_mentioning_marker_is_delivered(self):
+        adapter = _make_adapter()
+        text = "CI failed: the NO_REPLY filter test regressed, see run 123."
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(
+                edit_interval=0.01, buffer_threshold=1, internal_event=True,
+            ),
+        )
+        consumer.on_delta(text)
+        consumer.finish()
+        await consumer.run()
+
+        assert any("run 123" in t for t in _sent_and_edited(adapter))
