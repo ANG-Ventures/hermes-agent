@@ -154,6 +154,69 @@ async def test_async_configured_chain_continues_after_context_rejection(monkeypa
     assert large.chat.completions.create.await_count == 1
 
 
+def test_context_error_mentioning_max_tokens_skips_parameter_retry(monkeypatch):
+    rejected = PromptTooLong("prompt is too long: 250000 tokens > 200000 max_tokens window")
+    primary, fallback = MagicMock(), MagicMock()
+    primary.base_url = "https://bpr.invalid/v1"
+    fallback.base_url = "https://luna.invalid/v1"
+    primary.chat.completions.create.side_effect = rejected
+    served = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="Summary"), finish_reason="stop")])
+    fallback.chat.completions.create.return_value = served
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *a, **k: ("claude-bpr", "claude-sonnet-5-5", None, None, None))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *a, **k: (primary, "claude-sonnet-5-5"))
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {
+        "provider": "claude-bpr", "model": "claude-sonnet-5-5", "fallback_chain": [
+            {"provider": "openai-codex", "model": "gpt-6-luna-900k"}]})
+    monkeypatch.setattr(aux, "_resolve_fallback_entry", lambda entry: (fallback, entry["model"]))
+    monkeypatch.setattr(aux, "_task_minimum_context_length", lambda task: None)
+    monkeypatch.setattr(aux, "_transient_retry_count", lambda: 0)
+    monkeypatch.setattr(aux, "_record_aux_call_cost", lambda *a, **k: None)
+    monkeypatch.setattr("agent.aux_accounting.record_aux_api_call", lambda *a, **k: None)
+    response = aux.call_llm(task="compression", messages=[{"role": "user", "content": "long request"}], max_tokens=4000)
+    assert response is served
+    assert primary.chat.completions.create.call_count == 1
+    assert fallback.chat.completions.create.call_count == 1
+
+
+def test_auto_main_fallback_chain_continues_after_first_context_rejection(monkeypatch):
+    rejected = PromptTooLong("500 Claude Code returned an error result: Prompt is too long")
+    primary, configured, small, large = (MagicMock() for _ in range(4))
+    for client, name in ((primary, "primary"), (configured, "configured"),
+                         (small, "small"), (large, "large")):
+        client.base_url = f"https://{name}.invalid/v1"
+    for client in (primary, configured, small):
+        client.chat.completions.create.side_effect = rejected
+    served = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="900K summary"), finish_reason="stop")])
+    large.chat.completions.create.return_value = served
+    task_config = {"provider": "auto", "fallback_chain": [
+        {"provider": "gemini-bridge", "model": "configured-small"}]}
+    main_chain = [
+        {"provider": "small-bridge", "model": "main-128k"},
+        {"provider": "openai-codex", "model": "gpt-6-luna-900k"},
+    ]
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *a, **k: ("auto", "primary", None, None, None))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *a, **k: (primary, "primary"))
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: task_config)
+    monkeypatch.setattr(aux, "_resolve_fallback_entry", lambda entry: ({
+        "configured-small": configured, "main-128k": small, "gpt-6-luna-900k": large,
+    }[entry["model"]], entry["model"]))
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+    monkeypatch.setattr("hermes_cli.fallback_config.get_fallback_chain", lambda config: main_chain)
+    monkeypatch.setattr(aux, "_read_main_provider", lambda: "primary")
+    monkeypatch.setattr(aux, "_task_minimum_context_length", lambda task: None)
+    monkeypatch.setattr(aux, "_try_payment_fallback", lambda *a, **k: (None, None, ""))
+    monkeypatch.setattr(aux, "_transient_retry_count", lambda: 0)
+    monkeypatch.setattr(aux, "_record_aux_call_cost", lambda *a, **k: None)
+    monkeypatch.setattr("agent.aux_accounting.record_aux_api_call", lambda *a, **k: None)
+    response = aux.call_llm(task="compression", messages=[{"role": "user", "content": "long request"}])
+    assert response is served
+    assert configured.chat.completions.create.call_count == 1
+    assert small.chat.completions.create.call_count == 1
+    assert large.chat.completions.create.call_count == 1
+
+
 def test_non_context_failure_does_not_fall_back_as_a_window_miss():
     for status, text in ((500, "upstream timeout"), (413, "request too large"),
                          (200, "Prompt is too long")):

@@ -6398,9 +6398,10 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    skip_routes: Optional[set[tuple[str, str]]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     client, model, provider, _entry = _select_main_fallback_entry(
-        task, failed_provider, reason
+        task, failed_provider, reason, skip_routes=skip_routes
     )
     return client, model, provider
 
@@ -6409,6 +6410,7 @@ def _select_main_fallback_entry(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    skip_routes: Optional[set[tuple[str, str]]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str, Optional[Dict[str, Any]]]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -6445,6 +6447,8 @@ def _select_main_fallback_entry(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if (fb_norm, fb_model.lower()) in (skip_routes or ()):
+            continue
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
             continue
@@ -6458,6 +6462,8 @@ def _select_main_fallback_entry(
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
+            if (fb_norm, (resolved_model or fb_model).lower()) in (skip_routes or ()):
+                continue
             if min_ctx is not None:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -10809,7 +10815,7 @@ def _call_llm_impl(
             "1210" in err_str
             and "bigmodel" in str(getattr(client, "base_url", ""))
         )
-        if max_tokens is not None and (
+        if max_tokens is not None and not _is_context_length_error(first_err) and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
@@ -11187,26 +11193,48 @@ def _call_llm_impl(
                             _record_route_info(route_info, _fallback_provider_from_label(next_label), next_model)
                             break
                     if fb_resp is None:
+                        from_discovery = False
                         if is_auto:
                             next_client, next_model, next_label = _try_main_fallback_chain(
                                 task, resolved_provider or "auto", reason="context length exceeded")
                             if next_client is None:
                                 next_client, next_model, next_label = _try_payment_fallback(
                                     resolved_provider, task, reason="context length exceeded")
+                                from_discovery = True
                         else:
                             next_client, next_model, next_label = _try_main_agent_model_fallback(
                                 resolved_provider, task, reason="context length exceeded",
                                 failed_model=_chain_failed_model)
                         if next_client is not None:
-                            fb_resp = _call_fallback_candidate_sync(
-                                next_client, next_model, next_label,
-                                task=task, messages=messages, temperature=temperature,
-                                max_tokens=max_tokens, tools=tools,
-                                effective_timeout=effective_timeout,
-                                effective_extra_body=effective_extra_body,
-                                reasoning_config=reasoning_config)
-                            if fb_resp is not None:
-                                _record_route_info(route_info, _fallback_provider_from_label(next_label), next_model)
+                            skipped_main: set[tuple[str, str]] = set()
+                            while next_client is not None:
+                                try:
+                                    fb_resp = _call_fallback_candidate_sync(
+                                        next_client, next_model, next_label,
+                                        task=task, messages=messages, temperature=temperature,
+                                        max_tokens=max_tokens, tools=tools,
+                                        effective_timeout=effective_timeout,
+                                        effective_extra_body=effective_extra_body,
+                                        reasoning_config=reasoning_config)
+                                except Exception as main_err:
+                                    if not (is_auto and _is_context_length_error(main_err)):
+                                        raise
+                                    if from_discovery:
+                                        break
+                                    skipped_main.add((next_label.lower(), (next_model or "").lower()))
+                                    next_client, next_model, next_label = _try_main_fallback_chain(
+                                        task, resolved_provider or "auto", reason="context length exceeded",
+                                        skip_routes=skipped_main)
+                                    if next_client is None:
+                                        next_client, next_model, next_label = _try_payment_fallback(
+                                            resolved_provider, task, reason="context length exceeded")
+                                        from_discovery = True
+                                        if next_client is None:
+                                            break
+                                    continue
+                                if fb_resp is not None:
+                                    _record_route_info(route_info, _fallback_provider_from_label(next_label), next_model)
+                                break
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
@@ -11629,7 +11657,7 @@ async def _async_call_llm_impl(
             "1210" in err_str
             and "bigmodel" in str(getattr(client, "base_url", ""))
         )
-        if max_tokens is not None and (
+        if max_tokens is not None and not _is_context_length_error(first_err) and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
@@ -11964,28 +11992,47 @@ async def _async_call_llm_impl(
                             _record_route_info(route_info, _fallback_provider_from_label(next_label), async_model or next_model)
                             break
                     if fb_resp is None:
+                        from_discovery = False
                         if is_auto:
                             next_client, next_model, next_label = _try_main_fallback_chain(
                                 task, resolved_provider or "auto", reason="context length exceeded")
                             if next_client is None:
                                 next_client, next_model, next_label = _try_payment_fallback(
                                     resolved_provider, task, reason="context length exceeded")
+                                from_discovery = True
                         else:
                             next_client, next_model, next_label = _try_main_agent_model_fallback(
                                 resolved_provider, task, reason="context length exceeded",
                                 failed_model=_chain_failed_model)
-                        if next_client is not None:
+                        skipped_main: set[tuple[str, str]] = set()
+                        while next_client is not None:
                             async_next, async_model = _to_async_client(
                                 next_client, next_model or "", is_vision=(task == "vision"))
-                            fb_resp = await _call_fallback_candidate_async(
-                                async_next, async_model or next_model, next_label,
-                                task=task, messages=messages, temperature=temperature,
-                                max_tokens=max_tokens, tools=tools,
-                                effective_timeout=effective_timeout,
-                                effective_extra_body=effective_extra_body,
-                                reasoning_config=reasoning_config)
+                            try:
+                                fb_resp = await _call_fallback_candidate_async(
+                                    async_next, async_model or next_model, next_label,
+                                    task=task, messages=messages, temperature=temperature,
+                                    max_tokens=max_tokens, tools=tools,
+                                    effective_timeout=effective_timeout,
+                                    effective_extra_body=effective_extra_body,
+                                    reasoning_config=reasoning_config)
+                            except Exception as main_err:
+                                if not (is_auto and _is_context_length_error(main_err)):
+                                    raise
+                                if from_discovery:
+                                    break
+                                skipped_main.add((next_label.lower(), (next_model or "").lower()))
+                                next_client, next_model, next_label = _try_main_fallback_chain(
+                                    task, resolved_provider or "auto", reason="context length exceeded",
+                                    skip_routes=skipped_main)
+                                if next_client is None:
+                                    next_client, next_model, next_label = _try_payment_fallback(
+                                        resolved_provider, task, reason="context length exceeded")
+                                    from_discovery = True
+                                continue
                             if fb_resp is not None:
                                 _record_route_info(route_info, _fallback_provider_from_label(next_label), async_model or next_model)
+                            break
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
