@@ -749,17 +749,16 @@ class _GuardStuckNotifier:
                    else str(item.get("guarded_since") or ""))
         return "|".join((str(board), str(item["task_id"]), reason, episode))
 
-    def _last_sent(self, key: str) -> Optional[float]:
-        """Last page time for ``key``; an active_pr key also honours a pre-r19
-        ledger entry of the same card (``…|active_pr|<guarded_since>``) so the
-        deploy does not re-page every open episode once."""
+    def _last_sent(self, key: str, item: dict) -> Optional[float]:
+        """Last page time for ``key``. An active_pr key also honours the pre-r19
+        ledger entry of the SAME streak (``…|active_pr|<guarded_since>``) so the
+        deploy does not re-page every open episode once; only that exact legacy
+        key counts, so a card's different PR still pages (Prism #1530)."""
         last = self._sent.get(key)
-        if last is not None or "|active_pr|pr=" not in key:
+        if last is not None or "|active_pr|pr=" not in key or not item.get("guarded_since"):
             return last
-        prefix = key.split("|pr=", 1)[0] + "|"
-        legacy = [at for k, at in self._sent.items()
-                  if k.startswith(prefix) and k[len(prefix):].isdigit()]
-        return max(legacy) if legacy else None
+        legacy = key.split("|pr=", 1)[0] + f"|{item['guarded_since']}"
+        return self._sent.get(legacy)
 
     def _load(self) -> dict[str, float]:
         if self._state_path is None:
@@ -806,7 +805,7 @@ class _GuardStuckNotifier:
         delivered = 0
         for board, item in cards:
             key = self._key(board, item)
-            last = self._last_sent(key)
+            last = self._last_sent(key, item)
             if last is not None and now - last < self._remind:
                 continue
             if time.monotonic() >= deadline:
@@ -826,13 +825,21 @@ _UNFINISHED_RUN_OUTCOMES = frozenset({
 
 
 def _land_verb(pr_url: str) -> Optional[str]:
-    """``fleet-merge.sh <owner/repo> <n> …`` for a GitHub PR URL, else None."""
-    import re
+    """``fleet-merge.sh <owner/repo> <n> …`` for a GitHub PR URL, else None.
 
-    m = re.match(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", str(pr_url or ""))
-    if not m:
+    The URL comes from card text, so owner/repo must be GitHub-legal names
+    (no shell metacharacters) and every argument is shell-quoted; anything
+    else renders no LAND command at all (Prism #1530).
+    """
+    import re
+    import shlex
+
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/"
+                     r"([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})/?", str(pr_url or ""))
+    if not m or m.group(2) in (".", ".."):
         return None
-    return f"~/.hermes/scripts/fleet-merge.sh {m.group(1)} {m.group(2)} --by <you> --reason '<why safe>'"
+    return "~/.hermes/scripts/fleet-merge.sh " + shlex.join(
+        [f"{m.group(1)}/{m.group(2)}", m.group(3), "--by", "<you>", "--reason", "<why safe>"])
 
 
 def _active_pr_detail(board: str, item: dict) -> str:

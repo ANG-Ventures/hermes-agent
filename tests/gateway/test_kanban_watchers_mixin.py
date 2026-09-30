@@ -511,6 +511,9 @@ def test_active_pr_key_honours_pre_r19_ledger_entry(tmp_path):
     notifier = _GuardStuckNotifier(state)
     send = lambda board, row: True
     assert notifier.observe([("default", item)], send, now=10_000.0 + 600) == 0
+    # Prism #1530: a DIFFERENT streak/PR of the same card is not covered by it.
+    other = {**item, "pr": "https://github.com/o/r/pull/10", "guarded_since": 1790745000}
+    assert notifier.observe([("default", other)], send, now=10_000.0 + 700) == 1
     assert notifier.observe([("default", item)], send,
                             now=10_000.0 + _GUARD_STUCK_REMIND_SECONDS) == 1
 
@@ -528,6 +531,18 @@ def test_active_pr_page_names_the_wanted_verb():
     assert "fleet-merge.sh ANG-Ventures/hermes-home 1838" in finished
     no_pr = _active_pr_detail("default", {**base, "pr": None, "last_outcome": None})
     assert "Wanted: **REQUEUE**" in no_pr and "fleet-merge" not in no_pr
+
+
+def test_land_verb_rejects_shell_metacharacters_and_quotes_args():
+    """Prism #1530: the PR URL is card text; it must never reach a shell command raw."""
+    import shlex
+    from gateway.kanban_watchers import _land_verb
+    verb = _land_verb("https://github.com/ANG-Ventures/hermes-home/pull/1838")
+    assert shlex.split(verb)[1:4] == ["ANG-Ventures/hermes-home", "1838", "--by"]
+    for bad in ("https://github.com/$(id)/repo/pull/9", "https://github.com/o/r;rm -rf ~/pull/9",
+                "https://github.com/o/`x`/pull/9", "https://github.com/o/../pull/9",
+                "http://github.com/o/r/pull/9x", "https://evil.example/github.com/o/r/pull/9"):
+        assert _land_verb(bad) is None, bad
 
 def test_guard_stuck_pages_spend_a_bounded_time_per_tick(monkeypatch):
     """FleetReview #79: each page is a subprocess.run(timeout=30), run serially
