@@ -155,6 +155,9 @@ def vendor(monkeypatch):
         registry, "get_provider", lambda name: provider if name == "fakevendor" else None
     )
     monkeypatch.setattr(web_tools, "_rescue_eligible", lambda p: False)
+    # Routing tests (size cap, 404, blocked redirect) never reach extraction;
+    # pin the extractor gate so they hold on hosts without pymupdf/pdftotext.
+    monkeypatch.setattr(web_pdf_local, "local_extractor_available", lambda: True)
     url_safety._reset_allow_private_cache()
     yield provider
     url_safety._reset_allow_private_cache()
