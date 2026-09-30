@@ -15,6 +15,7 @@ a thin dispatcher that delegates to a platform-provided callback.
 """
 
 import json
+import re
 from typing import Dict, List, Optional, Callable
 
 
@@ -34,24 +35,24 @@ TIMEOUT_RESPONSE = (
     "Use your best judgement to make the choice and proceed."
 )
 
-# Every non-answer a clarify callback can return, by prefix. One source of
-# truth for the batch loop below and for context compaction (which must not
-# quote these as a user answer). Producers: cli.py timeout (TIMEOUT_RESPONSE),
-# gateway/run.py timeout + delivery failure, hermes_cli/oneshot.py no-user.
-NON_RESPONSE_PREFIXES = (
-    "The user did not provide a response",
-    "[user did not respond",
-    "[clarify prompt could not be delivered",
-    "[oneshot mode:",
+# Non-answers a clarify callback returns when nobody answered, matched as the
+# WHOLE reply (never a prefix: a user may legitimately type an answer that
+# starts with the same words). Producers: cli.py timeout (TIMEOUT_RESPONSE),
+# gateway/run.py _clarify_send_then_wait timeout + delivery failure.
+_GATEWAY_NON_ANSWER = re.compile(
+    r"\[user did not respond within \d+m\]|\[clarify prompt could not be delivered\]"
 )
 
 
 def is_non_response(raw) -> bool:
-    """True when a callback reply means nobody answered (timeout / no user /
-    undeliverable), as opposed to an answer or a deliberate empty skip."""
+    """True when a callback reply is a runtime sentinel meaning nobody answered
+    (timeout / undeliverable), as opposed to an answer or a deliberate skip."""
     if raw is None:
         return True
-    return isinstance(raw, str) and raw.lstrip().startswith(NON_RESPONSE_PREFIXES)
+    if not isinstance(raw, str):
+        return False
+    text = raw.strip()
+    return text == TIMEOUT_RESPONSE or bool(_GATEWAY_NON_ANSWER.fullmatch(text))
 
 
 # Suffix appended to the first choice so the user can see, at a glance, which

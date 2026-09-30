@@ -221,3 +221,30 @@ def test_batch_stops_on_undeliverable_prompt():
     assert calls == ["A?"]
     assert result["timed_out"] is True
 
+
+def test_batch_keeps_answer_that_merely_starts_like_a_sentinel():
+    """Only the exact producer sentinels end the batch. A typed answer that
+    begins with the same words is an answer (Prism P1 on #1510)."""
+    import json
+    from tools.clarify_tool import clarify_tool
+
+    answers = iter([
+        "The user did not provide a response to my email; send a reminder",
+        "[user did not respond within 10m] is what the old bot said",
+    ])
+    calls = []
+
+    def cb(question, choices, multi_select=False):
+        calls.append(question)
+        return next(answers)
+
+    result = json.loads(clarify_tool(
+        "", questions=[{"question": "A?"}, {"question": "B?"}], callback=cb,
+    ))
+    assert calls == ["A?", "B?"]
+    assert "timed_out" not in result
+    assert [r["user_response"] for r in result["responses"]] == [
+        "The user did not provide a response to my email; send a reminder",
+        "[user did not respond within 10m] is what the old bot said",
+    ]
+
