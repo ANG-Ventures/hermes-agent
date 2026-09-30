@@ -225,8 +225,9 @@ def test_cli_create_stamps_env_session_by_default(kanban_home, monkeypatch):
     assert unstamped["session_id"] is None
 
 
-def test_cli_create_without_env_is_refused_unless_homed(kanban_home):
+def test_cli_create_without_env_is_refused_unless_homed(kanban_home, monkeypatch):
     # t_09fea045: an implicit unhomed card is undrivable -> refused.
+    monkeypatch.delenv(kb.ALLOW_UNHOMED_CREATE_ENV, raising=False)  # arm the refusal
     assert "refused create" in kc.run_slash("create 'x' --json")
     created = json.loads(kc.run_slash("create 'x' --home operator --json"))
     assert created["session_id"] == kb.OPERATOR_HOME_SESSION

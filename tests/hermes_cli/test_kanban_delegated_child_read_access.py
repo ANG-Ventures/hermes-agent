@@ -40,7 +40,7 @@ def _run(home: Path, *args: str, child: bool) -> subprocess.CompletedProcess[str
 @pytest.fixture(scope="module")
 def board(tmp_path_factory):
     home = tmp_path_factory.mktemp("hermes")
-    created = _run(home, "create", "child access probe", "--json", child=False)
+    created = _run(home, "create", "child access probe", "--json", "--session", "none", child=False)
     assert created.returncode == 0, created.stderr
     return home, json.loads(created.stdout)["id"]
 
