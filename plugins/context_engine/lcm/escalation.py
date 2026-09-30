@@ -377,6 +377,38 @@ def _sanitize_reasoning_summary(text: str) -> str:
     return stripped
 
 
+# t_cdf67f57: a safeguard interruption can also come back as an ordinary
+# finish_reason=stop reply in which the model talks ABOUT the interruption
+# instead of summarizing (LCM node 946 on claude-sonnet-5-5, 2/2 replays, ~140
+# tokens against a 12,000 budget): "Understood. I won't redo that summary, even
+# in a different wording. I can't tell which part tripped the classifier...".
+# It is shorter than the source, so the length gate alone accepts it. Detect it
+# by BOTH first-person refusal/classifier phrasing near the start AND a reply
+# far below the requested budget: a real summary that merely mentions a
+# classifier or quotes a refusal is long and third-person.
+_META_REFUSAL_SCAN_CHARS = 800
+_META_REFUSAL_MAX_TOKENS_FLOOR = 256
+_META_REFUSAL_BUDGET_FRACTION = 0.05
+_META_REFUSAL_RE = re.compile(
+    r"\bI\s*(?:won't|will\s+not|can't|cannot|can\s+not|am\s+unable\s+to|'m\s+unable\s+to"
+    r"|am\s+not\s+able\s+to|'m\s+not\s+able\s+to|shouldn't|must\s+decline\s+to)\s+"
+    r"(?:\w+\s+){0,6}?(?:redo|re-?summari[sz]e|summari[sz]e|continue|reproduce|rewrite|"
+    r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_meta_refusal_reply(content: str, max_tokens: int) -> bool:
+    """True when a finish_reason=stop reply is a safeguard meta-refusal, not a summary."""
+    text = (content or "").strip()
+    if not text:
+        return False
+    ceiling = max(_META_REFUSAL_MAX_TOKENS_FLOOR, int(max_tokens * _META_REFUSAL_BUDGET_FRACTION))
+    if count_tokens(text) > ceiling:
+        return False
+    return bool(_META_REFUSAL_RE.search(text[:_META_REFUSAL_SCAN_CHARS]))
+
+
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -392,8 +424,9 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
-        if getattr(response.choices[0], "finish_reason", None) == "content_filter":
-            raise SummaryRefusedError("summary finished with content_filter")
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        if finish_reason in ("content_filter", "refusal"):
+            raise SummaryRefusedError(f"summary finished with {finish_reason}")
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
@@ -402,6 +435,11 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
             logger.warning(
                 "LCM summary discarded reasoning-only output (model=%s); escalating",
                 model or "<default>",
+            )
+        if sanitized and _is_meta_refusal_reply(sanitized, max_tokens):
+            raise SummaryRefusedError(
+                "summary reply is a safeguard meta-refusal, not a summary: "
+                + sanitized[:200]
             )
         return sanitized
     except SummaryRefusedError:
@@ -529,6 +567,8 @@ def _invoke_summary_llm_chain(
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
     segment_key: str | None = None,
+    source_tokens: int | None = None,
+    target_tokens: int | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -580,6 +620,19 @@ def _invoke_summary_llm_chain(
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
             result = None
+        if result and source_tokens and target_tokens and source_tokens >= 50_000:
+            # A 140-token "summary" of ~400k input is not a compression
+            # success, even if it avoids the known refusal words. Keep this
+            # gate off small inputs whose genuine summaries may be tiny.
+            if count_tokens(result) < max(128, int(target_tokens * 0.02)):
+                logger.warning(
+                    "LCM summary outcome=refusal model=%s: output far below "
+                    "target (%d vs %d tokens)",
+                    candidate_model or "<default>", count_tokens(result), target_tokens,
+                )
+                if segment_key:
+                    _SUMMARY_REFUSALS.record(route_key, segment_key)
+                continue
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
@@ -821,6 +874,8 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
+        source_tokens=source_tokens,
+        target_tokens=token_budget,
     )
 
     if l1_result:
@@ -842,6 +897,8 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
+        source_tokens=source_tokens,
+        target_tokens=l2_budget,
     )
 
     if l2_result:

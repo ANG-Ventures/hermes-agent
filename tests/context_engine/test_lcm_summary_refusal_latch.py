@@ -294,3 +294,131 @@ def test_default_route_latch_keys_on_the_inherited_endpoint(monkeypatch):
     main["base_url"] = "http://endpoint-b:8000/v1"
     assert _run() == ("short summary of the segment", 1)
     assert served == ["http://endpoint-a:8000/v1", "http://endpoint-b:8000/v1"]
+
+
+# --- t_cdf67f57: a finish_reason=stop meta-refusal is a refusal, not a summary ---
+
+# Reply shape from LCM node 946 (session 20260924_123749_d91a4b7d) replayed on
+# claude-bpr / claude-sonnet-5-5: finish_reason=stop, ~140 tokens, 12,000 budget.
+NODE_946_REPLY = (
+    "Understood. I won't redo that summary, even in a different wording. I "
+    "can't tell which part tripped the classifier, so any rephrasing of the "
+    "same material is likely to be interrupted again. If you want, point me at "
+    "a narrower slice of the conversation and I'll summarize just that part, "
+    "or tell me which topics to leave out and I'll work around them."
+)
+
+
+def test_node_946_meta_refusal_falls_through_to_fallback_and_latches(monkeypatch):
+    seen: list[str] = []
+
+    def route(**kw):
+        model = kw.get("model") or ""
+        seen.append(model)
+        if model == "claude-sonnet-5-5":
+            return _ok(NODE_946_REPLY)
+        return _ok("short summary of the segment")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = _run(model="claude-sonnet-5-5", fallback_models=["flash"])
+    assert (summary, level) == ("short summary of the segment", 1)
+    assert NODE_946_REPLY not in summary
+    # Deterministic like the raised refusal: the next pass skips sonnet outright.
+    seen.clear()
+    _run(model="claude-sonnet-5-5", fallback_models=["flash"])
+    assert seen == ["flash"]
+
+
+def test_node_946_meta_refusal_with_no_fallback_is_never_persisted(monkeypatch):
+    calls: list[int] = []
+
+    def route(**kw):
+        calls.append(1)
+        return _ok(NODE_946_REPLY)
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = _run(model="claude-sonnet-5-5")
+    assert level == 3
+    assert "classifier" not in summary
+    assert len(calls) == 1  # L2 on the same segment is latched too
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        NODE_946_REPLY,
+        "I'm unable to summarize this segment because it was flagged by the safety filter.",
+        "Sorry, I can't continue with that summary; it triggered the safeguards again.",
+        "I cannot provide a summary of this content under the usage policy.",
+    ],
+)
+def test_meta_refusal_detector_hits(reply):
+    assert escalation._is_meta_refusal_reply(reply, 24000)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "short summary of the segment",
+        # Third-person summary of a conversation ABOUT the classifier.
+        "The user investigated why the relay tripped the classifier on node 946 "
+        "and decided to add a meta-refusal detector.\nExpand for details about: "
+        "relay debugging",
+        "Assistant renamed config.yaml keys; user approved. Expand for details about: rename",
+    ],
+)
+def test_meta_refusal_detector_misses_real_summaries(reply):
+    # A short third-person summary about a classifier must not be thrown away.
+    assert not escalation._is_meta_refusal_reply(reply, 24000)
+
+
+def test_long_reply_with_refusal_quote_is_accepted(monkeypatch):
+    """A real summary that quotes an in-conversation refusal is long: keep it."""
+    body = (
+        "- User asked the assistant to redo a summary; assistant said "
+        "\"I won't redo that summary\".\n" + ("- kept decision detail\n" * 400)
+    )
+    assert not escalation._is_meta_refusal_reply(body, 1200)
+
+
+def test_tiny_output_for_huge_input_falls_through_without_refusal_words(monkeypatch):
+    seen = []
+
+    def route(**kw):
+        seen.append(kw.get("model"))
+        if kw.get("model") == "claude-sonnet-5-5":
+            return _ok("Understood. Please give me a narrower topic.")
+        return _ok("- Decision one\n" * 400)
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = summarize_with_escalation(
+        text=SEGMENT, source_tokens=100_000, token_budget=12_000,
+        model="claude-sonnet-5-5", fallback_models=["luna"],
+    )
+    assert level == 1
+    assert summary.startswith("- Decision one")
+    assert seen == ["claude-sonnet-5-5", "luna"]
+
+
+def test_short_summary_of_short_input_remains_valid(monkeypatch):
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", lambda **kw: _ok("Decision: ship it."))
+    assert summarize_with_escalation(
+        text="User approved shipping after test passed.", source_tokens=20,
+        token_budget=200, model="claude-sonnet-5-5",
+    ) == ("Decision: ship it.", 1)
+
+
+def test_refusal_finish_reason_is_rejected(monkeypatch):
+    calls = []
+
+    def route(**kw):
+        calls.append(kw.get("model"))
+        if kw.get("model") == "claude-sonnet-5-5":
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="refused"), finish_reason="refusal")])
+        return _ok("decision summary")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    assert _run(model="claude-sonnet-5-5", fallback_models=["luna"]) == (
+        "decision summary", 1)
+    assert calls == ["claude-sonnet-5-5", "luna"]
