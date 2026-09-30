@@ -741,9 +741,30 @@ class _GuardStuckNotifier:
 
     @staticmethod
     def _key(board: str, item: dict) -> str:
-        return "|".join((str(board), str(item["task_id"]),
-                         str(item.get("reason") or "active_pr"),
-                         str(item.get("guarded_since") or "")))
+        reason = str(item.get("reason") or "active_pr")
+        # An active_pr hold is ONE episode per (card, PR): a requeue/respawn
+        # that restarts the streak on the same open PR is not a new episode
+        # (r19, t_f1af5dcd). Other guards keep the streak-start episode.
+        episode = (f"pr={item['pr']}" if reason == "active_pr" and item.get("pr")
+                   else str(item.get("guarded_since") or ""))
+        return "|".join((str(board), str(item["task_id"]), reason, episode))
+
+    def _last_sent(self, key: str, item: dict) -> Optional[float]:
+        """Last page time for ``key``. An active_pr key also honours the pre-r19
+        ledger entry of the SAME streak (``…|active_pr|<guarded_since>``) so the
+        deploy does not re-page every open episode once; only that exact legacy
+        key counts, so a card's different PR still pages (Prism #1530)."""
+        last = self._sent.get(key)
+        if last is not None or "|active_pr|pr=" not in key or not item.get("guarded_since"):
+            return last
+        legacy = key.split("|pr=", 1)[0] + f"|{item['guarded_since']}"
+        last = self._sent.get(legacy)
+        if last is not None:
+            # Migrate: the canonical per-PR key now carries the page time, so a
+            # later streak reset on the same PR still finds it (Prism #1530 r2).
+            # observe() persists it (the ledger differs from its snapshot).
+            self._sent[key] = last
+        return last
 
     def _load(self) -> dict[str, float]:
         if self._state_path is None:
@@ -790,7 +811,7 @@ class _GuardStuckNotifier:
         delivered = 0
         for board, item in cards:
             key = self._key(board, item)
-            last = self._sent.get(key)
+            last = self._last_sent(key, item)
             if last is not None and now - last < self._remind:
                 continue
             if time.monotonic() >= deadline:
@@ -801,6 +822,56 @@ class _GuardStuckNotifier:
         if self._sent != before:
             self._save()
         return delivered
+
+
+# Run outcomes after which the worker had FINISHED its deliverable. Any other
+# last outcome (timed_out, crashed, rate_limited, reclaimed, stale, stalled,
+# changes_requested, cohort_death, gave_up, ... or one added later) means it was
+# interrupted or sent back, so the safe default is REQUEUE (Prism #1530 r2).
+_FINISHED_RUN_OUTCOMES = frozenset({"completed", "review_requested"})
+
+
+def _land_verb(pr_url: str) -> Optional[str]:
+    """``fleet-merge.sh <owner/repo> <n> …`` for a GitHub PR URL, else None.
+
+    The URL comes from card text, so owner/repo must be GitHub-legal names
+    (no shell metacharacters) and every argument is shell-quoted; anything
+    else renders no LAND command at all (Prism #1530).
+    """
+    import re
+    import shlex
+
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/"
+                     r"([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})/?", str(pr_url or ""))
+    if not m or m.group(2) in (".", ".."):
+        return None
+    return "~/.hermes/scripts/fleet-merge.sh " + shlex.join(
+        [f"{m.group(1)}/{m.group(2)}", m.group(3), "--by", "<you>", "--reason", "<why safe>"])
+
+
+def _active_pr_detail(board: str, item: dict) -> str:
+    """Name the ONE verb the operator should run for an active_pr hold.
+
+    The hold is correct: the card's PR is open, so a respawn would duplicate
+    it. What the operator must decide is whether that PR is the finished
+    deliverable (LAND it, then complete the card) or a worker's unfinished
+    branch (REQUEUE so the worker resumes on it). The last run's outcome
+    decides the recommendation; both commands are given (r19, t_f1af5dcd).
+    """
+    outcome = item.get("last_outcome")
+    land = _land_verb(item.get("pr"))
+    unfinished = outcome not in _FINISHED_RUN_OUTCOMES or land is None
+    lines = ["READY card held behind its open PR (active_pr >30 min)"]
+    if item.get("pr"):
+        lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")
+    if unfinished:
+        lines.append(f"Wanted: **REQUEUE** (worker resumes on its PR): `{item['clear_verb']}`")
+        if land:
+            lines.append(f"Or, if the PR is complete + CI-green, LAND it: `{land}`")
+    else:
+        lines.append(f"Wanted: **LAND** the PR if CI is green, then complete the card: `{land}`")
+        lines.append(f"Or, if it needs more work, REQUEUE: `{item['clear_verb']}`")
+    return "\n".join(lines)
 
 
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
@@ -818,15 +889,11 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
             "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
         )
     else:
-        detail = (
-            "READY card stuck behind active_pr (>30 min)\n"
-            + (f"Holding PR: {item['pr']}\n" if item.get("pr") else "")
-            + f"Operator recovery: `{item['clear_verb']}`"
-        )
+        detail = _active_pr_detail(board, item)
     message = (
         f"🛑 **Kanban dispatcher** · {detail}\n"
         f"Board: `{board}` · Card: `{item['task_id']}`\n"
-        "-# Pages once per stuck episode; reminder every 6h while it stays stuck."
+        "-# Pages once per stuck episode (active_pr: per card + PR); reminder every 6h while it stays stuck."
     )
     try:
         proc = subprocess.run(

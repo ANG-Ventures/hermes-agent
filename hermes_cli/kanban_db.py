@@ -21200,6 +21200,11 @@ def respawn_guard_stuck_tasks(
             "ORDER BY id DESC LIMIT 1",
             (task_id, int(last_other)),
         ).fetchone()
+        last_run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
         out.append({
             "task_id": task_id,
             "assignee": row["assignee"],
@@ -21208,6 +21213,7 @@ def respawn_guard_stuck_tasks(
             "guarded_since": first_at,
             "guarded_seconds": now - first_at,
             "guard_events": int(streak["n"]),
+            "last_outcome": last_run["outcome"] if last_run else None,
             "clear_verb": render_operator_command(board, "requeue", task_id, "<reason>"),
         })
     return out
