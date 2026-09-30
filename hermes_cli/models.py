@@ -4250,8 +4250,13 @@ def resolve_fast_mode_overrides(
     API request kwargs by ``_build_api_kwargs`` in run_agent.py — each API path
     handles its own keys (service_tier for OpenAI/Codex, speed for Anthropic).
     """
-    if str(tier or "").strip().lower() == "ultrafast":
+    normalized_tier = str(tier or "").strip().lower()
+    if normalized_tier == "ultrafast":
         return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
+    if normalized_tier not in {"", "priority", "fast"}:
+        # Same guard as resolve_fast_mode_capability: never substitute a paid
+        # Priority/Fast override for some other requested tier (flex, ...).
+        return None
     if not model_supports_fast_mode(model_id):
         return None
     if _is_anthropic_fast_model(model_id):

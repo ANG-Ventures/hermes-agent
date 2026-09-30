@@ -3164,8 +3164,8 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     matcher. Matching by name alone would let a *different* model selected at the
     same named endpoint inherit an ``extra_body`` configured for another model.
     A stale ``extra_body`` is always cleared when the switched-to provider/model
-    resolves none; non-provider overrides (``service_tier`` / ``speed`` from
-    ``/fast``) are preserved.
+    resolves none. The ``service_tier`` / ``speed`` override from ``/fast`` is
+    re-gated against the switched-to route (``agent.service_tier`` is kept).
     """
     from agent.agent_init import _custom_provider_extra_body_for_agent
 
@@ -3192,6 +3192,10 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     if new_extra_body:
         overrides["extra_body"] = dict(new_extra_body)
     agent.request_overrides = overrides
+
+    from agent.agent_init import _regate_service_tier_overrides
+
+    _regate_service_tier_overrides(agent)
 
 
 # Sentinel for switch_model's ``session_reasoning_config`` parameter.  A

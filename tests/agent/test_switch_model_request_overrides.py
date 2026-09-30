@@ -49,8 +49,9 @@ def _agent(*, model, base_url, request_overrides, custom_providers=CUSTOM_PROVID
 
 
 def test_switch_applies_matched_provider_extra_body():
-    """Switching to the matching provider+model applies its extra_body and
-    preserves non-provider overrides (service_tier/speed from /fast)."""
+    """Switching to the matching provider+model applies its extra_body; the
+    /fast tier override is re-gated for the new route (t_62b562f6): a custom
+    local endpoint has no service_tier contract, so it is not carried over."""
     a = _agent(
         model="think-model",
         base_url="http://10.0.0.1:8000/v1",
@@ -58,7 +59,7 @@ def test_switch_applies_matched_provider_extra_body():
     )
     arh._apply_switched_provider_request_overrides(a, "custom:main-think")
     assert a.request_overrides["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
-    assert a.request_overrides["service_tier"] == "priority"  # preserved
+    assert "service_tier" not in a.request_overrides  # re-gated: no contract
 
 
 def test_switch_to_noncustom_clears_stale_extra_body():
@@ -73,7 +74,8 @@ def test_switch_to_noncustom_clears_stale_extra_body():
     )
     arh._apply_switched_provider_request_overrides(a, "anthropic")
     assert "extra_body" not in a.request_overrides  # stale extra_body cleared
-    assert a.request_overrides["service_tier"] == "priority"  # preserved
+    # OpenAI's service_tier is not an Anthropic field: re-gated away.
+    assert "service_tier" not in a.request_overrides
 
 
 def test_switch_from_none_overrides():

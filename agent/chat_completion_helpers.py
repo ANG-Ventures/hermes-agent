@@ -4576,6 +4576,22 @@ def try_activate_fallback(
                 agent.model, _eb_err,
             )
 
+        # Re-gate the service_tier / speed override against the FALLBACK
+        # route; it was gated against the primary only. Fail closed: if the
+        # re-gate itself fails, drop the tier keys rather than carry them.
+        try:
+            from agent.agent_init import _regate_service_tier_overrides
+            _regate_service_tier_overrides(agent)
+        except Exception:
+            logger.warning(
+                "Fallback %s: service_tier re-gate failed; dropping tier overrides",
+                agent.model, exc_info=True,
+            )
+            _ro = dict(getattr(agent, "request_overrides", {}) or {})
+            _ro.pop("service_tier", None)
+            _ro.pop("speed", None)
+            agent.request_overrides = _ro
+
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)

@@ -9957,22 +9957,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._console_print("\n".join(lines), highlight=False, markup=False)
     
     def _fast_capability(self, tier=None):
-        """Route capability for *tier* on this session's model/provider/api_mode."""
-        from hermes_cli.models import resolve_fast_mode_capability
-        from hermes_cli.providers import infer_api_mode_from_provider
+        """Route capability for *tier* on this session's model/provider/api_mode.
 
-        agent = getattr(self, "agent", None)
-        model = getattr(agent, "model", None) or getattr(self, "model", None)
-        provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
-        api_mode = getattr(agent, "api_mode", None) or getattr(self, "api_mode", None)
-        if not api_mode:
-            api_mode = infer_api_mode_from_provider(provider)
-        return resolve_fast_mode_capability(
-            model=model,
-            provider=provider,
-            api_mode=api_mode,
-            tier=tier,
-        )
+        Fails closed: a resolution error reports an unsupported route instead
+        of raising into a /fast handler.
+        """
+        from hermes_cli.models import FastModeCapability
+
+        try:
+            from hermes_cli.models import resolve_fast_mode_capability
+            from hermes_cli.providers import infer_api_mode_from_provider
+
+            agent = getattr(self, "agent", None)
+            model = getattr(agent, "model", None) or getattr(self, "model", None)
+            provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
+            api_mode = getattr(agent, "api_mode", None) or getattr(self, "api_mode", None)
+            if not api_mode:
+                api_mode = infer_api_mode_from_provider(provider)
+            return resolve_fast_mode_capability(
+                model=model,
+                provider=provider,
+                api_mode=api_mode,
+                tier=tier,
+            )
+        except Exception:
+            logger.warning("fast-mode capability resolution failed", exc_info=True)
+            return FastModeCapability(
+                supported=False,
+                family="unsupported",
+                request_overrides={},
+                reason="fast-mode capability could not be resolved for this route.",
+            )
 
     def _fast_command_available(self) -> bool:
         """True when the route supports ANY static tier (fast/priority or ultrafast)."""

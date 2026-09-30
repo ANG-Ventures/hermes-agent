@@ -547,6 +547,42 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+# Every key a static agent.service_tier can put into request_overrides
+# (OpenAI/Codex ``service_tier``, Anthropic ``speed``).
+_SERVICE_TIER_OVERRIDE_KEYS = ("service_tier", "speed")
+
+
+def _regate_service_tier_overrides(agent) -> None:
+    """Re-derive the tier override for the agent's CURRENT route.
+
+    A tier override is gated against the route it was attached on. Any
+    in-place route change (fallback activation, ``switch_model``) must drop
+    it and re-attach only what the new route documents; otherwise e.g.
+    ``service_tier: "ultrafast"`` rides onto OpenRouter or a custom endpoint.
+    ``agent.service_tier`` (the session's request) is left untouched, so a
+    later hop back onto a supporting route re-attaches the tier.
+    """
+    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    tier_raw = getattr(agent, "service_tier", None)
+    if not tier_raw and not any(k in overrides for k in _SERVICE_TIER_OVERRIDE_KEYS):
+        return
+    for key in _SERVICE_TIER_OVERRIDE_KEYS:
+        overrides.pop(key, None)
+    if tier_raw:
+        from hermes_cli.fast_mode_contracts import parse_service_tier
+        from hermes_cli.models import service_tier_request_overrides
+
+        overrides.update(
+            service_tier_request_overrides(
+                model=getattr(agent, "model", None),
+                provider=getattr(agent, "provider", None),
+                api_mode=getattr(agent, "api_mode", None),
+                tier=parse_service_tier(tier_raw),
+            )
+        )
+    agent.request_overrides = overrides
+
+
 def _normalize_run_budget_seconds(value) -> Optional[float]:
     """Normalize a wall-clock run budget value to a positive float or None.
 
