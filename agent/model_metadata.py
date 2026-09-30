@@ -2918,7 +2918,15 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     # unprobed future gpt-6 descendant can never inherit this cap.
     "gpt-6-sol": 872_000,
     "gpt-6-luna": 872_000,
-    # gpt-6.1-sol: add once the codex lane serves it and max_context_window is measured (2026-09-29)
+    # GPT-6.1 Sol: the codex-sub catalog did NOT list the slug at measurement
+    # time, so there is no catalog max_context_window. Measured instead by
+    # request bisection against chatgpt.com/backend-api/codex/responses on
+    # 2026-09-30: 921,028 input tokens accepted, 921,998 rejected with
+    # context_length_exceeded -> 922,000 hard input ceiling (models.dev:
+    # 1,050,000 = 922,000 input + 128,000 output). 900K keeps the >=11K
+    # margin rule used for gpt-5.6. EXACT: no prefix, so -pro/-fast/other
+    # 6.1 descendants never inherit it.
+    "gpt-6.1-sol": 900_000,
 }
 
 # The advertised value the verified-above table is allowed to override.
@@ -2938,7 +2946,7 @@ _CODEX_900K_ELIGIBLE_BASES = frozenset({
     "gpt-6-astra",                # measured max_context_window 872,000
     "gpt-6-sol",                  # measured max_context_window 872,000
     "gpt-6-luna",                 # measured max_context_window 872,000
-    # gpt-6.1-sol: add once the codex lane serves it and max_context_window is measured (2026-09-29)
+    "gpt-6.1-sol",                # measured ceiling 922,000 (2026-09-30 bisection)
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",

@@ -247,6 +247,41 @@ def test_known_red_and_fallback_both_failing_turns_the_step_red(tmp_path):
     assert proc.returncode != 0
 
 
+_FAKE_CURL_BODY = r"""#!/bin/bash
+body=""; prev=""
+for a in "$@"; do [ "$prev" = "--data" ] && body="$a"; prev="$a"; done
+printf '%s\n' "$body" >> "$FAKE_CURL_LOG"
+printf '200'
+"""
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+@pytest.mark.parametrize("event,trigger,actor", [
+    ("schedule", "scheduled run, not a merge", "cron"),
+    ("merge_group", "merge queue", "github-merge-queue[bot]"),
+    ("push", "merge/push to main", "github-merge-queue[bot]"),
+])
+def test_page_names_scheduled_vs_merge(tmp_path, event, trigger, actor):
+    """t_b4265523: a scheduled red paged 'by github-merge-queue[bot] (schedule)' and read as a merge."""
+    steps = _workflow()["jobs"]["notify-on-failure"]["steps"]
+    post = next(s for s in steps if s.get("name", "").startswith("Sign and POST"))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(_FAKE_CURL_BODY)
+    (bindir / "curl").chmod(0o755)
+    log = tmp_path / "bodies.log"
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "FAKE_CURL_LOG": str(log),
+           "CI_FAIL_WEBHOOK_SECRET": "s", "WEBHOOK_URL": "https://hooks.example/webhooks/ci-fail",
+           "WF_NAME": "Install & Update E2E", "WF_BRANCH": "main", "WF_SHA": "abc", "WF_RUN_ID": "42",
+           "WF_URL": "https://x/42", "WF_ACTOR": "github-merge-queue[bot]", "REPO": "o/r",
+           "WF_EVENT": event, "EVENT_NAME": "workflow_run", "GITHUB_RUN_ID": "7"}
+    proc = subprocess.run(["bash", "-c", post["run"]], env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    body = json.loads(log.read_text().splitlines()[0])
+    assert body["trigger"] == trigger
+    assert body["actor"] == actor
+
+
 # --- merge-queue dedupe (t_70f92e0b) -------------------------------------------
 # Fake GitHub API: every URL is looked up by suffix in FAKE_API (a JSON file of
 # {url-substring: response-json}); a miss exits 22 like `curl -f` on a 404.

@@ -18711,6 +18711,97 @@ def _reap_worker_session(
     return len(signalled)
 
 
+def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of every live process whose ENVIRONMENT carries exactly
+    this task+run identity, wherever it sits in the session tree.
+
+    A worker's children inherit its environment. One class of child
+    ``setsid()``s into a NEW session on purpose (the browser-use harness
+    daemon, ``browser_harness.daemon``, spawns with ``start_new_session``), so
+    :func:`_worker_session_members` cannot see it and it outlives the run with
+    ppid 1 (2026-09-30, Mac Studio: 26 daemons of done/archived cards, 1.2 GB
+    RSS, +4/day). The run identity still travels with it in the environment.
+    Same-uid only (``environ()`` raises otherwise); never self or our session.
+    """
+    me = os.getpid()
+    try:
+        my_sid = os.getsid(0) if hasattr(os, "getsid") else None
+    except OSError:
+        my_sid = None
+    want_task, want_run = str(task_id), str(run_id)
+    found: list[tuple[int, int]] = []
+    for proc in psutil.process_iter(["pid"]):
+        pid = proc.info["pid"]
+        if pid == me or pid <= 1:
+            continue
+        try:
+            env = proc.environ()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            continue
+        if env.get("HERMES_KANBAN_TASK") != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
+            continue
+        try:
+            if my_sid is not None and os.getsid(pid) == my_sid:
+                continue
+            pgid = os.getpgid(pid)
+        except OSError:
+            continue
+        if pgid <= 1 or pgid == os.getpgid(0):
+            continue
+        found.append((pid, pgid))
+    return found
+
+
+def _reap_run_env_escapees(
+    task_id: Optional[str],
+    run_id: Optional[int],
+    *,
+    born_after: Optional[float],
+    born_before: Optional[float],
+    grace: float = 3.0,
+) -> int:
+    """Second sweep after :func:`_reap_worker_session`: SIGTERM (then SIGKILL)
+    the process groups of run-identified processes that escaped the worker's
+    session (see :func:`_run_env_escapees`). Same proof as the session reap:
+    only members born inside ``[born_after, born_before]`` — the recorded
+    run's window — are signalled; unknown bounds mean no reap. Call only once
+    the worker is gone. POSIX only; a no-op elsewhere."""
+    import signal
+
+    if not task_id or run_id is None or born_after is None or born_before is None:
+        return 0
+    if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
+        return 0
+    lo, hi = float(born_after), float(born_before)
+    targets: dict[int, int] = {}
+    for pid, pgid in _run_env_escapees(task_id, run_id):
+        born = _member_birth(pid)
+        if born is None or not (lo <= born <= hi):
+            continue
+        targets[pgid] = pid
+    if not targets:
+        return 0
+    for pgid in sorted(targets):
+        try:
+            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
+        except OSError:
+            pass
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(_pid_alive(p) for p in targets.values()):
+        time.sleep(0.1)
+    for pgid, pid in targets.items():
+        if _pid_alive(pid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
+            except OSError:
+                pass
+    _log.warning(
+        "kanban: reaped %d run-identified process group(s) that escaped worker session of %s run %s",
+        len(targets), task_id, run_id,
+    )
+    return len(targets)
+
+
 def _run_last_evidence_at(
     conn: Optional[sqlite3.Connection], task_id: Optional[str],
     run_id: Optional[int] = None,
@@ -18922,6 +19013,16 @@ def _reap_terminated_worker_session(
     )
     if reaped:
         info["session_groups_reaped"] = reaped
+    run_row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone() if conn is not None else None
+    escaped = _reap_run_env_escapees(
+        task_id, run_row[0] if run_row else None,
+        born_after=owner_window[0] if owner_window else None,
+        born_before=born_before,
+    )
+    if escaped:
+        info["env_escapees_reaped"] = escaped
 
 
 def _dead_claimer_hold_only(worker_pid: Optional[int], termination: dict) -> bool:
@@ -20154,14 +20255,20 @@ def detect_crashed_workers(
                 # process groups of its session would outlive it (a live pid
                 # here is a recycled one and is never used as a sid). Only a
                 # session with a member from THIS run is signalled.
+                _born_after = _worker_owner_window(
+                    conn, row["id"], pid, row["current_run_id"],
+                )[0]
+                _born_before = _run_last_evidence_at(
+                    conn, row["id"], row["current_run_id"],
+                )
                 _reap_worker_session(
-                    pid,
-                    born_after=_worker_owner_window(
-                        conn, row["id"], pid, row["current_run_id"],
-                    )[0],
-                    born_before=_run_last_evidence_at(
-                        conn, row["id"], row["current_run_id"],
-                    ),
+                    pid, born_after=_born_after, born_before=_born_before,
+                )
+                # ...and whatever setsid()'d OUT of that session but still
+                # carries the run's identity (browser harness daemons).
+                _reap_run_env_escapees(
+                    row["id"], row["current_run_id"],
+                    born_after=_born_after, born_before=_born_before,
                 )
         # N workers ending externally in the same tick while all were still
         # heartbeating is ONE event (something outside killed them), not N

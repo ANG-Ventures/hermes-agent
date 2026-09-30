@@ -1833,7 +1833,7 @@ del _base_56
 # GPT-6 Sol/Luna have no "-pro" variant (the 2026-09-22 launch shipped the
 # base slugs only), so alias ONLY the Hermes-side "-900k" Codex picker
 # variant — the suffix is stripped on the wire, so it is the same model.
-for _base_6 in ("gpt-6-sol", "gpt-6-luna"):
+for _base_6 in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"):
     _OFFICIAL_DOCS_PRICING[("openai", f"{_base_6}-900k")] = _OFFICIAL_DOCS_PRICING[
         ("openai", _base_6)
     ]
