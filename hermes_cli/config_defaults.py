@@ -1083,6 +1083,8 @@ DEFAULT_CONFIG = {
         # a bare string). Slugs resolving to the large verified window are
         # never autoraised below. Flip back: `hermes config set
         # model.codex_context_policy advertised` (2026-09-30, t_73689428).
+        # Managed-scope overrides apply; running agents keep their resolved
+        # window until a new session or restart (t_27a85d2c).
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
