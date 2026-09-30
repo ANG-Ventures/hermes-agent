@@ -2356,6 +2356,16 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    # Lineage line: lets log consumers (web-call-tripwire) rebuild the
+    # delegation tree from agent.log without reading state.db. Field order and
+    # key=value spelling are a parsing contract; values must carry no spaces.
+    logger.info(
+        "delegate_task child id=%s session=%s parent_session=%s depth=%d",
+        str(subagent_id).replace(" ", "_") or "-",
+        str(child_session_ref["session_id"]).replace(" ", "_") or "-",
+        str(getattr(parent_agent, "session_id", "") or "").replace(" ", "_") or "-",
+        child_depth,
+    )
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
