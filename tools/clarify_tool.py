@@ -15,6 +15,7 @@ a thin dispatcher that delegates to a platform-provided callback.
 """
 
 import json
+import re
 from typing import Dict, List, Optional, Callable
 
 
@@ -33,6 +34,26 @@ TIMEOUT_RESPONSE = (
     "The user did not provide a response within the time limit. "
     "Use your best judgement to make the choice and proceed."
 )
+
+# Non-answers a clarify callback returns when nobody answered, matched as the
+# WHOLE reply (never a prefix: a user may legitimately type an answer that
+# starts with the same words). Producers: cli.py timeout (TIMEOUT_RESPONSE),
+# gateway/run.py _clarify_send_then_wait timeout + delivery failure.
+_GATEWAY_NON_ANSWER = re.compile(
+    r"\[user did not respond within \d+m\]|\[clarify prompt could not be delivered\]"
+)
+
+
+def is_non_response(raw) -> bool:
+    """True when a callback reply is a runtime sentinel meaning nobody answered
+    (timeout / undeliverable), as opposed to an answer or a deliberate skip."""
+    if raw is None:
+        return True
+    if not isinstance(raw, str):
+        return False
+    text = raw.strip()
+    return text == TIMEOUT_RESPONSE or bool(_GATEWAY_NON_ANSWER.fullmatch(text))
+
 
 # Suffix appended to the first choice so the user can see, at a glance, which
 # option the agent actually recommends. Applied here rather than per-surface so
@@ -296,7 +317,7 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
 
         answers: dict = {}
         timed_out = False
-        if raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE):
+        if is_non_response(raw):
             timed_out = True
         elif isinstance(raw, dict):
             answers = dict(raw.get("answers") or {})
@@ -319,7 +340,10 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
         raw = _invoke_callback(
             callback, entry["question"], entry["choices"], entry["multi_select"],
         )
-        if raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE):
+        # Any non-answer (not just the CLI's TIMEOUT_RESPONSE): the gateway
+        # returns "[user did not respond within Nm]", and looping past it
+        # blocked a 5-question Telegram form for 5 x clarify_timeout.
+        if is_non_response(raw):
             timed_out = True
             break
         answers[entry["qid"]] = raw
