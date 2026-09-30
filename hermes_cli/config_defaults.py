@@ -399,6 +399,11 @@ DEFAULT_CONFIG = {
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         # per-page char budget for web_extract; larger pages truncate, full text kept in cache/web
         "extract_char_limit": 15000,
+        # PDFs (.pdf path or HEAD Content-Type: application/pdf) are downloaded and read locally
+        # (pymupdf, else pdftotext), never sent to an extract vendor that bills per page. false =
+        # vendor dispatch as before. pdf_max_bytes caps the local download.
+        "local_pdf": True,
+        "pdf_max_bytes": 50 * 1024 * 1024,
         # Keyless free-tier ring: with NO web backend configured or keyed, web_search/web_extract
         # rotate round-robin across exa, parallel, firecrawl, keenable public free tiers, failing
         # over on rate limits. Never pre-empts a configured/keyed backend. false = disable.
