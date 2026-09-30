@@ -24,6 +24,26 @@ def _error(message, code="codex_refresh_uncertain"):
     return auth.AuthError(message, provider=PROVIDER, code=code, relogin_required=True)
 
 
+def _snapshot(entry):
+    """Owner-store view of ``entry``: ``to_dict()`` plus its raw token fields.
+
+    ``to_dict()`` strips secrets for sources that are borrowed in general
+    (any openai-codex source other than ``device_code``/``manual:*``, e.g. a
+    ``mirror:*`` row pushed by an external keeper). Rows in the owner store
+    carry their tokens on disk regardless, so generation checks must compare
+    the real token fields. With the sanitized view a borrowed row never
+    matched its disk generation: status deltas (exhaustion) were never
+    persisted, and ``sync()`` reset every in-memory exhaustion from disk, so
+    an all-401 pool rotated to the same dead entry forever (t_f343f944).
+    """
+    snap = entry.to_dict()
+    for key in TOKEN_FIELDS:
+        value = getattr(entry, key, None)
+        if value is not None:
+            snap[key] = value
+    return snap
+
+
 def _rows(store):
     return store.get("credential_pool", {}).get(PROVIDER, [])
 
@@ -256,7 +276,7 @@ def load():
             PROVIDER, [PooledCredential.from_dict(PROVIDER, r) for r in raw]
         )
         pool._auth_owner = owner
-        pool._owner_baseline = {e.id: e.to_dict() for e in pool._entries}
+        pool._owner_baseline = {e.id: _snapshot(e) for e in pool._entries}
         # A killed writer leaves the original row but its receipt fences it.
         pool._entries = [
             replace(e, last_status="dead", last_error_reason="codex_refresh_uncertain")
@@ -306,7 +326,7 @@ def persist(pool, removed_ids=None):
         auth._save_auth_store(store, target_path=owner)
         # Keep the baseline paired with the actual in-memory snapshot. Do not
         # advance it to an unseen peer generation (that would allow clobbering).
-        pool._owner_baseline = deepcopy(incoming)
+        pool._owner_baseline = {e.id: _snapshot(e) for e in pool._entries}
 
 
 def _current(pool, entry):
@@ -330,10 +350,10 @@ def _current(pool, entry):
 def sync(pool, entry):
     with pool._lock, auth._auth_store_lock(target_path=pool._auth_owner):
         _, current = _current(pool, entry)
-        if current.to_dict() == entry.to_dict():
+        if _snapshot(current) == _snapshot(entry):
             return entry
         pool._replace_entry(entry, current)
-        pool._owner_baseline[current.id] = current.to_dict()
+        pool._owner_baseline[current.id] = _snapshot(current)
         return current
 
 
@@ -350,7 +370,7 @@ def refresh(pool, entry, force):
         if any(getattr(current, k) != getattr(entry, k) for k in TOKEN_FIELDS):
             _require_usable(current)
             pool._replace_entry(entry, current)
-            pool._owner_baseline[current.id] = current.to_dict()
+            pool._owner_baseline[current.id] = _snapshot(current)
             return current  # peer committed; even forced waiters must not POST again
         _require_usable(current)
         receipt = _reserve(pool._auth_owner, current)  # durable BEFORE any POST
@@ -366,7 +386,7 @@ def refresh(pool, entry, force):
                 # Commit cooldown before releasing the reservation, so peers
                 # cannot retry immediately if this writer dies after release.
                 pool._replace_entry(entry, current)
-                pool._owner_baseline[current.id] = current.to_dict()
+                pool._owner_baseline[current.id] = _snapshot(current)
                 pool._mark_exhausted(current, 429)
                 receipt.unlink()
                 _sync_dir(receipt.parent)
@@ -386,7 +406,7 @@ def refresh(pool, entry, force):
         for r in _rows(store):
             if r.get("id") == current.id:
                 r.update({
-                    k: updated.to_dict().get(k)
+                    k: _snapshot(updated).get(k)
                     for k in (*TOKEN_FIELDS, *auth._POOL_STATUS_FIELDS)
                 })
         if current.source == "device_code":
@@ -400,5 +420,5 @@ def refresh(pool, entry, force):
         # a different generation and recover without deleting the receipt.
         auth._save_auth_store(store, target_path=pool._auth_owner)
         pool._replace_entry(entry, updated)
-        pool._owner_baseline[updated.id] = updated.to_dict()
+        pool._owner_baseline[updated.id] = _snapshot(updated)
         return updated
