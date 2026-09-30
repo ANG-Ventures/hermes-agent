@@ -3967,6 +3967,12 @@ def _configure_tool_category(
         # Use custom title if provided (e.g. "Select Search Provider")
         title = cat.get("setup_title", "Choose a provider")
         print(color(f"  --- {icon} {name} - {title} ---", Colors.CYAN))
+        if ts_key == "web":
+            web_cfg = config.get("web") or {}
+            for capability in ("search", "extract"):
+                chain = web_cfg.get(f"{capability}_fallbacks") if isinstance(web_cfg, dict) else None
+                if isinstance(chain, list) and chain:
+                    _print_info(f"  {capability} keyed fallbacks: {' → '.join(str(v) for v in chain)}")
         if cat.get("setup_note"):
             _print_info(f"  {cat['setup_note']}")
         if hidden_nous_message:
