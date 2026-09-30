@@ -24938,7 +24938,12 @@ def run_daemon(
             )
             gate_kwargs: dict = {}
             if load_gate is not None:
-                allowance, reason = load_gate.admit_now()
+                from hermes_cli import kanban_load_gate as _klg_mod
+
+                allowance, reason = load_gate.admit_now(
+                    running=_klg_mod.count_running_workers()
+                    if load_gate.enabled else None
+                )
                 gate_kwargs = {"spawn_paused": reason, "spawn_limit": allowance}
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(

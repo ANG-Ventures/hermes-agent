@@ -1067,6 +1067,9 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     import hermes_cli.kanban_load_gate as _klg
 
     monkeypatch.setattr(_klg, "sample_loadavg", lambda: (0.0, 0.0))
+    # The host-wide running count (t_bf26e8f1) opens every board; keep it
+    # out of the connect count this test pins.
+    monkeypatch.setattr(_klg, "count_running_workers", lambda: None)
 
     calls = {"connect": 0, "to_thread": 0}
 
