@@ -336,6 +336,83 @@ def test_compress_writes_one_leaf_node_from_the_reduce(tmp_path, monkeypatch):
     assert len(rec.chunk_calls) >= 2 and len(rec.reduce_calls) == 1
 
 
+def test_workers_never_serialize_engine_state(tmp_path, monkeypatch):
+    """Prism P1: serialization (session id, profile home, externalization) runs on the owner."""
+    msgs = _transcript(40, seed=8)
+    total = count_messages_tokens(msgs)
+    engine = _engine(tmp_path, parallel_chunks_enabled=True, parallel_chunk_tokens=total // 3)
+    threads = []
+    real = engine._serialize_messages
+
+    def spy(messages):
+        threads.append(threading.current_thread().name)
+        return real(messages)
+
+    monkeypatch.setattr(engine, "_serialize_messages", spy)
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", _Recorder())
+    engine._summarize_leaf_chunk_with_rescue(msgs)
+    assert threads and all(not name.startswith("lcm-parallel-leaf") for name in threads)
+
+
+def test_reduce_input_is_bounded_by_chunk_tokens(tmp_path, monkeypatch):
+    """Prism P1: many parts must not build one reducer prompt past a chunk's size."""
+    msgs = _transcript(120, seed=9)
+    total = count_messages_tokens(msgs)
+    cap = total // 16
+    engine = _engine(
+        tmp_path, parallel_chunks_enabled=True, parallel_chunk_tokens=cap,
+        summary_spend_max_calls=0,
+    )
+    from plugins.context_engine.lcm.tokens import count_tokens
+
+    # Each map summary returns exactly its budget in tokens (worst case).
+    def chunk_fn_factory():
+        def chunk_fn(text):
+            return "w " * 3000, 1
+        return chunk_fn
+
+    rec = _Recorder(chunk_fn=chunk_fn_factory(), reduce_fn=lambda text: ("R " * 200, 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", rec)
+    engine._summarize_leaf_chunk_with_rescue(msgs)
+    assert len(rec.chunk_calls) >= 12
+    per_part = max(1000, cap // len(rec.chunk_calls))
+    assert all(budget <= per_part for _t, _s, budget in rec.chunk_calls)
+    assert len(rec.reduce_calls) >= 2, "oversized part set must reduce in groups"
+    for text, _src, _budget in rec.reduce_calls:
+        # header + part markers are small; the parts themselves respect the cap
+        assert count_tokens(text) <= cap + 3000 * 2 + 500
+
+
+def test_spend_guard_without_room_for_fanout_stays_serial(tmp_path, monkeypatch):
+    """Prism P1: never let the guard trip mid-map and push the reduce to L3."""
+    msgs = _transcript(60, seed=10)
+    total = count_messages_tokens(msgs)
+    engine = _engine(
+        tmp_path, parallel_chunks_enabled=True, parallel_chunk_tokens=total // 4,
+        summary_spend_max_calls=24,
+    )
+    for _ in range(22):
+        engine._summary_spend_guard.record_call()
+    rec = _Recorder()
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", rec)
+    engine._summarize_leaf_chunk_with_rescue(msgs)
+    assert len(rec.chunk_calls) == 1 and rec.reduce_calls == []
+
+
+def test_reduce_truncation_keeps_the_part_summaries(tmp_path, monkeypatch):
+    msgs = _transcript(60, seed=11)
+    total = count_messages_tokens(msgs)
+    engine = _engine(tmp_path, parallel_chunks_enabled=True, parallel_chunk_tokens=total // 3)
+    rec = _Recorder(
+        chunk_fn=lambda text: (f"PART<{text[:12]}>", 1),
+        reduce_fn=lambda text: ("truncated head...tail", 3),
+    )
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", rec)
+    _chunk, _src, summary, level, _a = engine._summarize_leaf_chunk_with_rescue(msgs)
+    assert summary.count("PART<") == len(rec.chunk_calls) >= 2
+    assert level == 2
+
+
 # ── cancellation (extends #1492) ─────────────────────────────────────────
 
 

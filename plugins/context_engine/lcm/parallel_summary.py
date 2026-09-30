@@ -102,14 +102,17 @@ def split_pair_safe(
 
 
 def run_map_reduce(
-    chunks: Sequence[List[Dict[str, Any]]],
+    chunks: Sequence[Any],
     *,
-    summarize_chunk: Callable[[List[Dict[str, Any]], int], Tuple[str, int]],
+    summarize_chunk: Callable[[Any, int], Tuple[str, int]],
     reduce: Callable[[List[str]], Tuple[str, int]],
     max_concurrency: int,
 ) -> Tuple[str, int]:
     """Summarize ``chunks`` concurrently, then reduce. Returns (text, level).
 
+    ``chunks`` are opaque payloads: the engine passes text it serialized on
+    the owning thread, so a worker never reads mutable engine state (session
+    id, profile home) that a detached, aborted worker could observe changing.
     ``summarize_chunk(chunk, index)`` and ``reduce(parts)`` run the normal
     escalation ladder; any exception they raise propagates unchanged so the
     caller's rescue path sees it exactly as it would from a serial summary.
@@ -127,7 +130,7 @@ def run_map_reduce(
     abort = threading.Event()
     install = capture_aux_thread_state(extra_cancel_event=abort)
 
-    def _worker(chunk: List[Dict[str, Any]], index: int) -> Tuple[str, int]:
+    def _worker(chunk: Any, index: int) -> Tuple[str, int]:
         with install():
             raise_if_aux_cancel_requested()
             return summarize_chunk(chunk, index)
@@ -192,3 +195,24 @@ def format_reduce_input(parts: Sequence[str]) -> str:
         "between parts.\n\n"
     )
     return header + "\n\n".join(blocks)
+
+
+def plan_reduce_groups(part_tokens: Sequence[int], input_cap: int) -> List[List[int]]:
+    """Group consecutive part indices so each group's tokens fit ``input_cap``.
+
+    A single part larger than the cap forms its own group. One group means a
+    single reduce call is enough.
+    """
+    cap = max(1, int(input_cap))
+    groups: List[List[int]] = []
+    current: List[int] = []
+    used = 0
+    for index, tokens in enumerate(part_tokens):
+        if current and used + tokens > cap:
+            groups.append(current)
+            current, used = [], 0
+        current.append(index)
+        used += tokens
+    if current:
+        groups.append(current)
+    return groups

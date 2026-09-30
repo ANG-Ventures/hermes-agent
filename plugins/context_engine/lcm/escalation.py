@@ -157,6 +157,17 @@ class SummarySpendGuard:
             self._prune(current_time)
             return len(self._calls) < self.max_calls
 
+    def remaining(self, *, now: float | None = None) -> int | None:
+        """Calls left in the current window; None when the guard is disabled."""
+        if self.max_calls <= 0:
+            return None
+        current_time = time.monotonic() if now is None else now
+        with self._lock:
+            if current_time < self._backoff_until:
+                return 0
+            self._prune(current_time)
+            return max(0, self.max_calls - len(self._calls))
+
     def try_record_call(self, *, now: float | None = None) -> bool:
         """Atomically reserve one provider call if the budget allows it."""
         if self.max_calls <= 0:
