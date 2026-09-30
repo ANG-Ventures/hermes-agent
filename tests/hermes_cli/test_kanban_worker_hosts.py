@@ -148,3 +148,64 @@ def test_terminal_tool_config_bridge_keeps_placement(monkeypatch):
     assert cfg["env_type"] == "ssh"
     assert cfg["ssh_user"] == "kanbanw"
 
+
+
+def test_cards_no_host_can_take_are_never_claimed(kanban_home):
+    """Budget is summed across hosts; per-assignee capacity is not.
+
+    Host A takes alpha (2 slots), host B takes beta (2 slots): 4 ready alpha
+    cards must spawn 2 and leave 2 ready, unclaimed, with no spawn failure.
+    """
+    cfg = [dict(HOST_CFG[0]), dict(HOST_CFG[0], name="host-b", ssh_host="b", profiles=["beta"])]
+    ids = _make(4)
+    spawned = []
+    res = _tick(_plan(cfg=cfg), spawned)
+    assert [h for _, h in spawned] == ["ace-ai", "ace-ai"]
+    assert res.spawn_failed == [] and res.auto_blocked == []
+    marks = ",".join("?" * len(ids))
+    with kb.connect_closing() as conn:
+        statuses = sorted(r[0] for r in conn.execute(
+            f"SELECT status FROM tasks WHERE id IN ({marks})", ids,
+        ).fetchall())
+        assert statuses == ["ready", "ready", "running", "running"]
+        claimed = conn.execute(
+            f"SELECT COUNT(DISTINCT task_id) FROM task_events WHERE kind = 'claimed' "
+            f"AND task_id IN ({marks})", ids,
+        ).fetchone()[0]
+        assert claimed == 2
+
+
+def test_parent_cards_and_prefilled_workspaces_stay_local(kanban_home, tmp_path):
+    parent, prefilled = _make(2)
+    (child,) = _make(1, assignee="beta")
+    ws = tmp_path / "legacy-ws"
+    ws.mkdir()
+    (ws / "handoff.md").write_text("x")
+    with kb.connect_closing() as conn:
+        conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, child))
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), prefilled))
+        conn.commit()
+    spawned = []
+    _tick(_plan(), spawned)
+    assert spawned == []
+
+
+def test_remote_cleanup_removes_only_the_placed_card_dir(kanban_home):
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alpha")
+        ws = f"/Volumes/fleet-scratch/workspaces/default/{tid}"
+        kb._append_event(conn, tid, kwh.PLACED_EVENT,
+                         {"host": "ace-ai", "target": "kanbanw@ace-ai", "workspace": ws})
+        conn.commit()
+        assert kwh.cleanup_remote_workspaces(conn, tid, ws, runner=runner) == ["ace-ai"]
+        assert calls[-1][-2:] == ["kanbanw@ace-ai", f"rm -rf -- {ws}"]
+        # A path that is not this card's own dir is never removed.
+        calls.clear()
+        assert kwh.cleanup_remote_workspaces(conn, tid, "/Volumes/fleet-scratch", runner=runner) == []
+        assert calls == []
