@@ -68,6 +68,9 @@ def test_values_masked_keys_kept(raw, expected):
         "sig = inspect.signature(fn); signature = compute_sig2(body)",
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "commit 636aed70fd; cc_version=2.1.283; xcch=4f2a9",
+        # Prism P1 (#1554 r1): identifiers / algorithm names are not material.
+        "signature = protocol_v2; hmac=HmacSHA256; signature: sign_request_v2",
+        "signature=RequestSignerV2.compute(body)",
     ],
 )
 def test_code_and_identifiers_survive(keep):
@@ -144,6 +147,31 @@ def test_lcm_prompt_and_l3_have_no_signing_material(monkeypatch):
     # L3 deterministic truncation persists as the summary: scrubbed too.
     assert level == 3
     _assert_scrubbed(summary)
+
+
+def test_lcm_focus_and_custom_instructions_are_redacted(monkeypatch):
+    """Prism P1 (#1554 r1): the prompts interpolate focus_topic and
+    custom_instructions too; neither may carry secrets or signing values."""
+    from plugins.context_engine.lcm import escalation
+
+    escalation._SUMMARY_REFUSALS.clear()
+    prompts: list[str] = []
+
+    def ok(**kw):
+        prompts.append(json.dumps(kw["messages"]))
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(content="short"))])
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", ok)
+    escalation.summarize_with_escalation(
+        text="probe the relay " * 200, source_tokens=5000, token_budget=600,
+        focus_topic=f"retry with Authorization: Bearer {BEARER} and cch={CCH}",
+        custom_instructions=f"keep signature={SIG} out",
+    )
+    assert prompts
+    for prompt in prompts:
+        _assert_scrubbed(prompt)
+        assert "Authorization" in prompt and "cch=***" in prompt
 
 
 def test_lcm_refusal_shaped_200_walks_the_chain(monkeypatch):

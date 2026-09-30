@@ -789,6 +789,10 @@ def summarize_with_escalation(
     output shorter than the source.
     """
     text = _redact_summary_input(text)
+    # Both prompts interpolate these too; the auto focus topic is built from
+    # recent user messages that ingest redaction (opt-in) leaves raw.
+    focus_topic = _redact_summary_input(focus_topic)
+    custom_instructions = _redact_summary_input(custom_instructions)
     segment_key = _segment_key(
         text, focus_topic=focus_topic, custom_instructions=custom_instructions
     )
