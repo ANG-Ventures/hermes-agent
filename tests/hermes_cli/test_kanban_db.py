@@ -3928,6 +3928,24 @@ def test_respawn_guard_stuck_carries_last_run_outcome(kanban_home):
         assert got[tid]["pr"] == "https://github.com/o/r/pull/9"
         assert got[fresh]["last_outcome"] is None
 
+
+def test_respawn_guard_stuck_carries_newest_hold(kanban_home):
+    """t_5a9deed5: the gateway lands a mergeable hold instead of paging, so the
+    probe reports the NEWEST guard event's hold + merge_state."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="green PR", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr", "hold": "PR merge state unknown"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {
+            "reason": "active_pr", "pr": "https://github.com/o/r/pull/9",
+            "hold": kb.RESPAWN_GUARD_HOLD_MERGEABLE, "merge_state": "CLEAN"})
+        conn.commit()
+        (item,) = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert item["hold"] == kb.RESPAWN_GUARD_HOLD_MERGEABLE
+        assert item["merge_state"] == "CLEAN"
+
+
 def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     """Every kind in the override set is actually emitted by kanban_db (no dead entries),
     and every operator requeue verb's event kind is in the set (no missing entries)."""
@@ -4168,3 +4186,36 @@ def test_prior_worker_page_names_the_latest_rejections_pid(kanban_home):
         stuck = [x for x in kb.respawn_guard_stuck_tasks(conn, now=now)
                  if x["reason"] == "prior_worker_still_alive"]
         assert [x["prev_pid"] for x in stuck] == [42]
+
+
+@pytest.mark.parametrize("head,owned", [
+    ("daedalus/t_0000abcd-fix", True),       # owner position names this card
+    ("wt/t_0000abcd", True),
+    ("feature/foo", False),                  # no card id: mention, not ownership
+    ("alice/fix-t_0000abcd", False),         # id in the topic only
+    ("daedalus/t_11111111-fix", False),      # another card's branch
+    (None, False),                           # head unknown
+])
+def test_pr_owned_by_card_requires_positive_owner(head, owned, monkeypatch):
+    """Prism #1545 cd0457757028: an automatic land-request needs the PR's head
+    branch to name THIS card; a mentioned or unknown PR is not ownership."""
+    monkeypatch.setattr(kb, "_PR_HEAD_REF_CACHE", {} if head is None else {("o/r", 7): head})
+    assert kb._pr_owned_by_card("O/R", 7, "t_0000abcd") is owned
+
+
+def test_respawn_guard_stuck_reports_pr_owned_only_when_recorded(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        owned = kb.create_task(conn, title="own PR", assignee="alice")
+        legacy = kb.create_task(conn, title="pre-fix event", assignee="alice")
+        for tid, extra in ((owned, {"pr_owned": True}), (legacy, {})):
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'",
+                         (now - 1860, tid))
+            kb._append_event(conn, tid, "respawn_guarded", {
+                "reason": "active_pr", "pr": "https://github.com/o/r/pull/9",
+                "hold": kb.RESPAWN_GUARD_HOLD_MERGEABLE, **extra})
+        conn.commit()
+        got = {i["task_id"]: i for i in kb.respawn_guard_stuck_tasks(conn, now=now)}
+        assert got[owned]["pr_owned"] is True
+        assert got[legacy]["pr_owned"] is False

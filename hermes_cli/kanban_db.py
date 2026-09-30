@@ -17848,6 +17848,21 @@ def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
     return owner is not None and owner.group(0) != task_id.lower()
 
 
+def _pr_owned_by_card(repo: str, number: int, task_id: str) -> bool:
+    """True only on POSITIVE evidence the PR is ``task_id``'s own work.
+
+    The head branch carries ``task_id`` in the OWNER position (start of the
+    last path segment, ``<assignee>/<card_id>-<topic>``). An unknown head ref
+    or a branch with no card id there is NOT ownership: a card comment may
+    mention any PR. Gates automatic land-requests (Prism #1545 cd0457757028).
+    """
+    head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
+    if not head:
+        return False
+    owner = _CARD_ID_OWNER_RE.match(head.lower().rsplit("/", 1)[-1])
+    return owner is not None and owner.group(0) == task_id.lower()
+
+
 def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
     """Resolve a PR state via ``gh``; return None on any query failure.
 
@@ -21510,7 +21525,7 @@ def check_respawn_guard(
                     continue
                 hold = "worker alive"
             elif merge_state in _PR_MERGEABLE_STATES:
-                hold = "PR mergeable, closer will land it"
+                hold = RESPAWN_GUARD_HOLD_MERGEABLE
             else:
                 hold = "PR merge state unknown"
             if detail is not None:
@@ -21518,6 +21533,9 @@ def check_respawn_guard(
                     pr=f"https://github.com/{repo}/pull/{number}",
                     pr_state=state or "unknown",
                     hold=hold,
+                    # Only a PR whose head branch names THIS card may be
+                    # landed automatically (Prism #1545 cd0457757028).
+                    pr_owned=_pr_owned_by_card(repo, number, task_id),
                 )
                 if merge_state:
                     detail["merge_state"] = merge_state
@@ -21526,6 +21544,11 @@ def check_respawn_guard(
             return "active_pr"
 
     return None
+
+
+# ``hold`` of an active_pr decline whose OPEN own-PR is mergeable. The gateway
+# watcher enqueues that PR on the land queue instead of paging (t_5a9deed5).
+RESPAWN_GUARD_HOLD_MERGEABLE = "PR mergeable, closer will land it"
 
 
 # A READY+assigned card continuously deferred as ``respawn_guarded:active_pr``
@@ -21651,7 +21674,10 @@ def respawn_guard_stuck_tasks(
         if now - last_at > _RESPAWN_GUARD_STUCK_FRESH_SECONDS:
             continue
         newest = conn.execute(
-            "SELECT json_extract(payload, '$.pr') AS pr FROM task_events "
+            "SELECT json_extract(payload, '$.pr') AS pr, "
+            "json_extract(payload, '$.hold') AS hold, "
+            "json_extract(payload, '$.merge_state') AS merge_state, "
+            "json_extract(payload, '$.pr_owned') AS pr_owned FROM task_events "
             "WHERE task_id = ? AND id > ? AND kind = 'respawn_guarded' "
             "ORDER BY id DESC LIMIT 1",
             (task_id, int(last_other)),
@@ -21666,6 +21692,14 @@ def respawn_guard_stuck_tasks(
             "assignee": row["assignee"],
             "reason": "active_pr",
             "pr": newest["pr"] if newest else None,
+            # Why the newest guard decline held (``check_respawn_guard``
+            # ``hold``): the gateway enqueues a land-request instead of
+            # paging when it is the mergeable hold (t_5a9deed5).
+            "hold": newest["hold"] if newest else None,
+            "merge_state": newest["merge_state"] if newest else None,
+            # True only when the guard saw the PR's head branch name this
+            # card (``_pr_owned_by_card``); absent/false = page, never land.
+            "pr_owned": bool(newest["pr_owned"]) if newest else False,
             "guarded_since": first_at,
             "guarded_seconds": now - first_at,
             "guard_events": int(streak["n"]),

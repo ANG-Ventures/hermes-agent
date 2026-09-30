@@ -71,7 +71,7 @@ def test_cards_own_open_pr_still_guards_and_names_the_pr(kanban_home, fake_gh):
         assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
         assert detail == {
             "pr": "https://github.com/o/home/pull/1271", "pr_state": "OPEN",
-            "hold": "PR merge state unknown",
+            "hold": "PR merge state unknown", "pr_owned": True,
         }
 
 
@@ -84,7 +84,10 @@ def test_unattributable_open_pr_stays_guarded(kanban_home, fake_gh, head):
         tid = kb.create_task(conn, title="lane work", assignee="alice")
         fake_gh[7] = {"state": "OPEN", "mergedAt": None, **({"headRefName": head} if head else {})}
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/7")
-        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+        # Guarded, but NOT this card's PR: never landed automatically (Prism #1545).
+        assert detail["pr_owned"] is False
 
 
 def test_other_cards_pr_skipped_but_own_pr_in_same_card_still_guards(kanban_home, fake_gh):
@@ -113,7 +116,7 @@ def test_dispatch_event_and_show_name_the_holding_pr(
         payloads = [e.payload for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
         assert payloads[-1] == {
             "reason": "active_pr", "pr": "https://github.com/o/home/pull/1271", "pr_state": "OPEN",
-            "hold": "PR merge state unknown",
+            "hold": "PR merge state unknown", "pr_owned": True,
         }
     out = kc.run_slash(f"show {tid}")
     guard = [ln for ln in out.splitlines() if ln.strip().startswith("guard:")]
@@ -237,6 +240,7 @@ def test_unmergeable_pr_holds_while_its_worker_is_alive(kanban_home, fake_gh, mo
     assert detail == {
         "pr": "https://github.com/o/r/pull/1871", "pr_state": "OPEN",
         "merge_state": "DIRTY", "pr_needs": "DIRTY", "hold": "worker alive",
+        "pr_owned": True,
     }
 
 
@@ -252,6 +256,7 @@ def test_mergeable_pr_still_holds_and_says_the_closer_lands_it(
         assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
     assert detail["hold"] == "PR mergeable, closer will land it"
     assert detail["merge_state"] == merge_state
+    assert detail["pr_owned"] is True
 
 
 def test_dispatch_spawns_workerless_card_behind_planted_dirty_pr(

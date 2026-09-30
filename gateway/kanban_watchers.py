@@ -821,6 +821,9 @@ class _GuardStuckNotifier:
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
+        # A land-request is tracked apart from the page (``<key>|land``) so an
+        # enqueue does not spend the (card, PR) page slot (Prism #1545).
+        current |= {f"{key}|land" for key in current}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -839,9 +842,19 @@ class _GuardStuckNotifier:
                 continue
             if time.monotonic() >= deadline:
                 break
-            if send(board, item):
-                self._sent[key] = now
-                delivered += 1
+            land_key = f"{key}|land"
+            land_at = self._sent.get(land_key)
+            probe = dict(item)
+            if land_at is not None and now - land_at < self._remind:
+                probe["land_enqueued_at"] = land_at
+            if send(board, probe):
+                if probe.get("land_request") == "enqueued":
+                    # Enqueued, nobody paged: a later non-merged queue outcome
+                    # still pages once on the next tick (Prism #1545).
+                    self._sent[land_key] = now
+                elif probe.get("land_request") != "pending":
+                    self._sent[key] = now
+                    delivered += 1
         if self._sent != before:
             self._save()
         return delivered
@@ -854,6 +867,21 @@ class _GuardStuckNotifier:
 _FINISHED_RUN_OUTCOMES = frozenset({"completed", "review_requested"})
 
 
+def _github_pr(pr_url) -> Optional[tuple[str, int]]:
+    """``(owner/repo, number)`` for a GitHub-legal PR URL, else None.
+
+    The URL comes from card text, so owner/repo must be GitHub-legal names
+    (no shell metacharacters); anything else is not a PR (Prism #1530).
+    """
+    import re
+
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/"
+                     r"([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})/?", str(pr_url or ""))
+    if not m or m.group(2) in (".", ".."):
+        return None
+    return f"{m.group(1)}/{m.group(2)}", int(m.group(3))
+
+
 def _land_verb(pr_url: str) -> Optional[str]:
     """``fleet-merge.sh <owner/repo> <n> …`` for a GitHub PR URL, else None.
 
@@ -861,15 +889,13 @@ def _land_verb(pr_url: str) -> Optional[str]:
     (no shell metacharacters) and every argument is shell-quoted; anything
     else renders no LAND command at all (Prism #1530).
     """
-    import re
     import shlex
 
-    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/"
-                     r"([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})/?", str(pr_url or ""))
-    if not m or m.group(2) in (".", ".."):
+    parsed = _github_pr(pr_url)
+    if parsed is None:
         return None
     return "~/.hermes/scripts/fleet-merge.sh " + shlex.join(
-        [f"{m.group(1)}/{m.group(2)}", m.group(3), "--by", "<you>", "--reason", "<why safe>"])
+        [parsed[0], str(parsed[1]), "--by", "<you>", "--reason", "<why safe>"])
 
 
 def _active_pr_detail(board: str, item: dict) -> str:
@@ -887,6 +913,8 @@ def _active_pr_detail(board: str, item: dict) -> str:
     lines = ["READY card held behind its open PR (active_pr >30 min)"]
     if item.get("pr"):
         lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")
+    if item.get("land_queue"):
+        lines.append(f"Land queue already stopped on this PR: `{item['land_queue']}` (see the card comment)")
     if unfinished:
         lines.append(f"Wanted: **REQUEUE** (worker resumes on its PR): `{item['clear_verb']}`")
         if land:
@@ -897,8 +925,108 @@ def _active_pr_detail(board: str, item: dict) -> str:
     return "\n".join(lines)
 
 
+def _land_queue_prior_outcome(root: Path, repo: str, number: int) -> Optional[str]:
+    """Status of a FINISHED land-queue row for ``repo#number``, else None.
+
+    A finished row that is not ``merged`` means the queue already tried and
+    stopped (FAILED / DIRTY / GAVE UP, card commented): a human is needed, so
+    the hold pages instead of enqueueing the same PR again.
+    """
+    import json
+
+    done = root / "state" / "apollo-land-queue.done"
+    found = None
+    try:
+        paths = sorted(done.glob("*.json"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(row, dict) and str(row.get("repo", "")).lower() == repo.lower()
+                and str(row.get("pr")) == str(number)):
+            found = str(row.get("status") or "finished")
+    return found
+
+
+def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
+    """Enqueue a land-request for a finished card's mergeable holding PR.
+
+    None: not landable here (page the operator). True: enqueued (or already
+    queued); ``item["land_request"]`` says which (``enqueued`` /
+    ``pending``) so the page slot stays free for a later queue failure
+    (Prism #1545). False: the enqueue failed (page instead). Landable means the
+    guard held on ``RESPAWN_GUARD_HOLD_MERGEABLE`` (OPEN, mergeable, no red
+    check), the last run FINISHED its deliverable, the PR's head branch names
+    this card (``pr_owned``), the URL is a legal GitHub
+    PR, and the land queue has not already given up on this PR. The queue
+    waits for CI green and lands through fleet-merge.sh, so fleet policy
+    still decides; a refusal comments the card. r19 spec (t_f1af5dcd), wired
+    t_5a9deed5: a green holding PR needs a land-request, not a human.
+    """
+    from hermes_cli import kanban_db as kb
+
+    if item.get("reason") not in (None, "active_pr"):
+        return None
+    if item.get("hold") != kb.RESPAWN_GUARD_HOLD_MERGEABLE:
+        return None
+    if item.get("last_outcome") not in _FINISHED_RUN_OUTCOMES:
+        return None
+    if item.get("pr_owned") is not True:
+        # A card comment may name any PR: land only a PR whose head branch
+        # names this card; unknown ownership pages (Prism #1545 cd0457757028).
+        return None
+    parsed = _github_pr(item.get("pr"))
+    if parsed is None:
+        return None
+    repo, number = parsed
+    try:
+        from hermes_constants import get_hermes_home
+
+        root = Path(get_hermes_home())
+    except Exception:
+        logger.debug("kanban dispatcher: hermes home unresolved; no land-request", exc_info=True)
+        return None
+    script = root / "scripts" / "apollo_land_queue.py"
+    if not script.is_file():
+        return None
+    prior = _land_queue_prior_outcome(root, repo, number)
+    if prior is not None and prior != "merged":
+        item["land_queue"] = prior
+        return None
+    if item.get("land_enqueued_at") is not None:
+        # Already enqueued in this reminder window and the queue has not
+        # stopped on the PR: wait silently, no second enqueue (Prism #1545).
+        item["land_request"] = "pending"
+        return True
+    argv = [sys.executable, str(script), "enqueue", "--card", str(item["task_id"]),
+            "--repo", repo, "--pr", str(number), "--board", str(board),
+            "--item", f"{item['task_id']}: active_pr hold, PR mergeable, "
+                      f"last run {item.get('last_outcome')} (dispatcher land-request)"]
+    try:
+        proc = subprocess.run(argv, check=False, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    except Exception:
+        logger.exception("kanban dispatcher: active_pr land-request enqueue failed")
+        return False
+    if proc.returncode != 0:
+        logger.error("kanban dispatcher: active_pr land-request enqueue rc=%s for %s#%s: %s",
+                     proc.returncode, repo, number, (proc.stderr or proc.stdout or "").strip()[:200])
+        return False
+    logger.info("kanban dispatcher [%s]: active_pr hold %s -> land-request enqueued for %s#%s (%s)",
+                board, item["task_id"], repo, number, (proc.stdout or "").strip()[:160])
+    item["land_request"] = "enqueued"
+    return True
+
+
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
-    """Best-effort #alerts page with the exact recovery verb."""
+    """Land a finished card's mergeable PR, else page #alerts with the verb."""
+    if item.get("reason") != "prior_worker_still_alive":
+        enqueued = _enqueue_active_pr_land(board, item)
+        if enqueued:
+            return True
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
