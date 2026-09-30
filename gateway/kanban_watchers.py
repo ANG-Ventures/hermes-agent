@@ -758,7 +758,10 @@ class _GuardStuckNotifier:
         if last is not None or "|active_pr|pr=" not in key or not item.get("guarded_since"):
             return last
         legacy = key.split("|pr=", 1)[0] + f"|{item['guarded_since']}"
-        last = self._sent.get(legacy)
+        # Consume it: the legacy key names no PR, so it may silence only the
+        # first PR observed for this streak; a PR the card acquires later in
+        # the SAME streak (same guarded_since) still pages (Prism #1530).
+        last = self._sent.pop(legacy, None)
         if last is not None:
             # Migrate: the canonical per-PR key now carries the page time, so a
             # later streak reset on the same PR still finds it (Prism #1530 r2).
