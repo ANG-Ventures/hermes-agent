@@ -244,60 +244,21 @@ def prepare_remote_workspace(host: WorkerHost, workspace: str,
 
 
 def local_workspace_has_content(path: Optional[str]) -> bool:
-    """True when a card's LOCAL workspace already holds files.
+    """True when a card's LOCAL workspace may hold files.
 
     Those files would not exist on the worker host, so such a card is not
-    spilled. An unset or missing path is empty.
+    spilled. Only an unset or missing path counts as empty; any other scan
+    failure (permissions, I/O) fails closed.
     """
     if not path:
         return False
     try:
         with os.scandir(path) as it:
             return any(True for _ in it)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
-
-
-def cleanup_remote_workspaces(conn, task_id: str, local_path: Optional[str],
-                              runner: Callable = subprocess.run) -> List[str]:
-    """Remove the card's scratch dir on every worker host it was placed on.
-
-    Only the exact path recorded on the ``worker_placed`` event is removed,
-    only when it equals the card's local workspace path and ends in the card
-    id (containment). Best-effort: returns the hosts it cleaned.
-    """
-    if not local_path or os.path.basename(local_path.rstrip("/")) != task_id:
-        return []
-    rows = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
-        (task_id, PLACED_EVENT),
-    ).fetchall()
-    done: List[str] = []
-    seen = set()
-    for row in rows:
-        try:
-            data = json.loads(row[0] or "{}")
-        except (TypeError, ValueError):
-            continue
-        target, ws = data.get("target"), data.get("workspace")
-        if not target or ws != local_path or (target, ws) in seen:
-            continue
-        seen.add((target, ws))
-        user, _, host = str(target).partition("@")
-        if not user or not host:
-            continue
-        spec = WorkerHost(str(data.get("host") or host), host, user, 1, 1.0, ("-",))
-        try:
-            proc = runner(
-                _ssh_argv(spec, f"rm -rf -- {shlex.quote(ws)}"),
-                capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
-                stdin=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if getattr(proc, "returncode", 1) == 0:
-            done.append(spec.name)
-    return done
+    except OSError:
+        return True
 
 
 def reapply_placement_env(environ: Optional[MutableMapping[str, str]] = None) -> Optional[str]:

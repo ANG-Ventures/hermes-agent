@@ -190,22 +190,25 @@ def test_parent_cards_and_prefilled_workspaces_stay_local(kanban_home, tmp_path)
     assert spawned == []
 
 
-def test_remote_cleanup_removes_only_the_placed_card_dir(kanban_home):
-    calls = []
 
-    def runner(argv, **kw):
-        calls.append(argv)
-        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
+def test_linked_children_stay_local_too(kanban_home):
+    (parent,) = _make(1, assignee="beta")
+    (child,) = _make(1)
     with kb.connect_closing() as conn:
-        tid = kb.create_task(conn, title="t", assignee="alpha")
-        ws = f"/Volumes/fleet-scratch/workspaces/default/{tid}"
-        kb._append_event(conn, tid, kwh.PLACED_EVENT,
-                         {"host": "ace-ai", "target": "kanbanw@ace-ai", "workspace": ws})
+        conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, child))
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
         conn.commit()
-        assert kwh.cleanup_remote_workspaces(conn, tid, ws, runner=runner) == ["ace-ai"]
-        assert calls[-1][-2:] == ["kanbanw@ace-ai", f"rm -rf -- {ws}"]
-        # A path that is not this card's own dir is never removed.
-        calls.clear()
-        assert kwh.cleanup_remote_workspaces(conn, tid, "/Volumes/fleet-scratch", runner=runner) == []
-        assert calls == []
+    spawned = []
+    _tick(_plan(), spawned)
+    assert spawned == []
+
+
+def test_unreadable_local_workspace_fails_closed(tmp_path, monkeypatch):
+    assert kwh.local_workspace_has_content(None) is False
+    assert kwh.local_workspace_has_content(str(tmp_path / "missing")) is False
+
+    def boom(path):
+        raise PermissionError(13, "denied", path)
+
+    monkeypatch.setattr(kwh.os, "scandir", boom)
+    assert kwh.local_workspace_has_content(str(tmp_path)) is True
