@@ -65,6 +65,14 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
         return ""
     now = int(time.time())
     parts = []
+    pr = detail.get("pr")
+    if pr:
+        states = "/".join(
+            str(detail[k]) for k in ("pr_state", "merge_state") if detail.get(k)
+        )
+        parts.append(f"{pr} ({states})" if states else str(pr))
+    if detail.get("hold"):
+        parts.append(str(detail["hold"]))
     err = detail.get("error")
     if err:
         err = " ".join(str(err).split())
@@ -120,6 +128,8 @@ def _fmt_current_respawn_guard(status: str, events) -> str:
         line += f" — {pr}"
         if payload.get("pr_state"):
             line += f" ({payload['pr_state']})"
+        if payload.get("hold"):
+            line += f": {payload['hold']}"
     else:
         line += _fmt_respawn_guard_detail(
             {k: payload.get(k) for k in ("error", "recorded_at", "eligible_at")
