@@ -3859,7 +3859,9 @@ def _start_late_completion(
 
         def _after_live_exit(fut: Any) -> None:
             try:
-                if lc.harvest(fut):
+                new_steer = lc.harvest(fut)
+                if new_steer or entry.get("steer_fate_unknown"):
+                    # The turn exited: its steer fate is now known either way.
                     lc.fire("amend")
                     pending = lc.missed_steer
                     entry.pop("steer_fate_unknown", None)
@@ -3868,6 +3870,7 @@ def _start_late_completion(
                         handle, entry, child=child, parent_agent=parent_agent
                     )
                     handle.entry = entry
+                if new_steer:
                     logger.warning(
                         "delegate_task late result %s amended: steer returned "
                         "by a turn that exited after the result was recorded",

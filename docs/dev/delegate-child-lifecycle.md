@@ -54,7 +54,7 @@ change state; any other `(state, event)` pair raises `IllegalTransition`.
 | `correcting` | `stall` | `reaped` | late thread | same |
 | `late_completed` | `persist` | `persisted` | late thread | write the record (once) |
 | `reaped` | `persist` | `persisted` | late thread | write the record (once) |
-| `persisted` | `amend` | `persisted` | the live turn's exit callback | rewrite the one record with steer text found after `persist` (ledger source 4); re-nudge the parent |
+| `persisted` | `amend` | `persisted` | the live turn's exit callback | rewrite the one record with steer text found after `persist` (ledger source 4), or clear `steer_fate_unknown`; re-nudge the parent only for new text |
 | `persisted` | `teardown` | `torn_down` | the live turn's exit callback, or the late thread when no turn ran off-thread | `child.close()` and relay unregister; refused while any turn is live |
 
 `running` has no exit edge for a child that finishes inside the wait. That
@@ -142,7 +142,9 @@ completes, source 4 is never read, and source 1 found an empty queue. The
 child's record is already `timeout`, so the parent knows the work failed. The
 record carries `steer_fate_unknown: true` whenever the live turn outlived the
 stop drain, meaning a steer may be pending that the record does not show
-yet. An `amend` clears the flag.
+yet. When that turn exits, the exit callback fires `amend` whether or not it
+found new text, because the fate is now known either way. The amendment
+clears the flag. The parent is re-nudged only when there is new text.
 
 **I2: no teardown while any turn of that child is live.** `teardown` checks
 the live-turn future. If the future is not done, `teardown` is not fired

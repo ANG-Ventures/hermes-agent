@@ -376,6 +376,8 @@ def test_exit_callback_runs_in_the_owner_context(fleet_home, fast_late, exit_pat
         assert _wait_until(lambda: _late_results(parent), timeout=10.0)
         if exit_path == "worker_thread":
             assert not seen
+            (late,) = _late_results(parent)
+            assert late.get("steer_fate_unknown") is True
             unblock.set()
         assert _wait_until(lambda: seen, timeout=5.0), exit_path
     finally:
@@ -387,8 +389,12 @@ def test_exit_callback_runs_in_the_owner_context(fleet_home, fast_late, exit_pat
         assert thread_name.startswith("delegate-late-")
     else:
         assert not thread_name.startswith("delegate-late-")
+    # Momus r3 RC-9: a clean exit resolves the fate; no second nudge.
     (late,) = _late_results(parent)
-    assert bool(late.get("steer_fate_unknown")) is (exit_path == "worker_thread")
+    assert "steer_fate_unknown" not in late, late
+    on_disk = json.loads(open(late["result_path"], encoding="utf-8").read())
+    assert "steer_fate_unknown" not in on_disk["entry"]
+    assert not any("amended" in s for s in parent.steered), parent.steered
 
 
 # Edge table ------------------------------------------------------------------
