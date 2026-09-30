@@ -10,12 +10,12 @@ from hermes_cli.codex_models import _add_context_variants
 
 @pytest.mark.parametrize("policy, bare_window, bare_autoraise, picker_variant", [
     ("advertised", None, True, True),
-    ("large", 872_000, False, False),
+    ("large", 900_000, False, False),
 ])
 def test_policy_agrees_across_resolver_picker_and_autoraise(policy, bare_window, bare_autoraise, picker_variant):
     with patch("hermes_cli.config.read_raw_config_readonly", return_value={"model": {"codex_context_policy": policy}}):
         assert mm._verified_codex_ctx_for_slug("gpt-6-sol") == bare_window
-        assert mm._verified_codex_ctx_for_slug("gpt-6-sol-900k") == 872_000
+        assert mm._verified_codex_ctx_for_slug("gpt-6-sol-900k") == 900_000
         assert _is_codex_gpt54_or_gpt55("gpt-6-sol", "openai-codex") is bare_autoraise
         assert ("gpt-6-sol-900k" in _add_context_variants(["gpt-6-sol"])) is picker_variant
         assert mm.strip_codex_context_variant_suffix("gpt-6-sol-900k") == "gpt-6-sol"
