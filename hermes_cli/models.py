@@ -4158,7 +4158,11 @@ def service_tier_request_overrides(
             model=model, provider=provider, api_mode=api_mode, tier=tier
         )
     except Exception:
-        logger.debug("service_tier capability resolution failed", exc_info=True)
+        logger.warning(
+            "agent.service_tier=%s not sent: capability resolution failed",
+            tier,
+            exc_info=True,
+        )
         return {}
     if not capability.supported:
         logger.warning(
