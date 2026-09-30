@@ -36,6 +36,11 @@ HEAD_TIMEOUT_SECONDS = 5.0
 HEAD_MAX_REDIRECTS = 3
 GET_MAX_REDIRECTS = 5
 GET_TIMEOUT_SECONDS = 60.0
+# httpx timeouts bound each network operation, not the whole transfer: a
+# server trickling a byte just under the read timeout would otherwise hold
+# the batch forever. These cap the WHOLE probe / download, redirects included.
+HEAD_DEADLINE_SECONDS = 10.0
+GET_DEADLINE_SECONDS = 120.0
 PDFTOTEXT_TIMEOUT_SECONDS = 60.0
 # A whole document with fewer extracted non-whitespace characters than this
 # is treated as having no text layer (a scan).
@@ -121,22 +126,29 @@ async def _check_hop(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def head_is_pdf(url: str) -> bool:
-    """Bounded HEAD probe: 5 s timeout, <=3 redirects. Any failure => False."""
+    """Bounded HEAD probe: 5 s per op, 10 s overall, <=3 redirects. Any failure => False."""
     try:
-        async with _client(HEAD_TIMEOUT_SECONDS) as client:
-            current = url
-            for _ in range(HEAD_MAX_REDIRECTS + 1):
-                if await _check_hop(current) is not None:
-                    return False
-                resp = await client.head(current)
-                if resp.is_redirect and resp.headers.get("location"):
-                    current = urljoin(str(resp.url), resp.headers["location"])
-                    continue
-                return resp.status_code < 400 and _is_pdf_content_type(
-                    resp.headers.get("content-type")
-                )
+        return await asyncio.wait_for(_head_is_pdf(url), HEAD_DEADLINE_SECONDS)
+    except asyncio.TimeoutError:
+        logger.debug("web_extract: HEAD probe for %s exceeded %ss", url, HEAD_DEADLINE_SECONDS)
     except Exception as exc:  # noqa: BLE001 — a failed probe means "not known PDF"
         logger.debug("web_extract: HEAD probe failed for %s: %s", url, exc)
+    return False
+
+
+async def _head_is_pdf(url: str) -> bool:
+    async with _client(HEAD_TIMEOUT_SECONDS) as client:
+        current = url
+        for _ in range(HEAD_MAX_REDIRECTS + 1):
+            if await _check_hop(current) is not None:
+                return False
+            resp = await client.head(current)
+            if resp.is_redirect and resp.headers.get("location"):
+                current = urljoin(str(resp.url), resp.headers["location"])
+                continue
+            return resp.status_code < 400 and _is_pdf_content_type(
+                resp.headers.get("content-type")
+            )
     return False
 
 
@@ -289,7 +301,13 @@ async def read_pdf_locally(url: str, max_bytes: int) -> Optional[Dict[str, Any]]
     dispatches that URL normally, since HTML is not billed per page.
     """
     try:
-        final_url, data, error = await _download(url, max_bytes)
+        final_url, data, error = await asyncio.wait_for(
+            _download(url, max_bytes), GET_DEADLINE_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return {"url": url, "title": "", "content": "",
+                "error": (f"Timed out fetching PDF locally: download exceeded "
+                          f"{GET_DEADLINE_SECONDS:g}s")}
     except NotAPdf as exc:
         logger.info("web_extract: %s is not a PDF after fetch (%s); using backend", url, exc)
         return None
