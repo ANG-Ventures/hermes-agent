@@ -18147,6 +18147,88 @@ def _dead_claimer_release_at(
     )
 
 
+def _worker_session_groups(sid: int) -> list[int]:
+    """Process groups that still hold a member of session ``sid``.
+
+    Workers are spawned with ``start_new_session=True``, so worker pid ==
+    sid == pgid. Anything the worker started in ANOTHER process group of that
+    session (pytest children, helper-launched headless Chromes, background
+    shells) is not reached by signalling the worker pid and outlives it with
+    ppid 1 (t_ca0233d7: 54 leaked Chromes, Studio load1 250). ``ps`` lists
+    pid+pgid; ``os.getsid`` maps each PID (not each pgid, since a group whose
+    leader exited still has live members). Same algorithm as hermes-home
+    ``scripts/test-gate`` ``_session_groups``.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,pgid="], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    groups: set[int] = set()
+    me = os.getpid()
+    my_pgid = os.getpgid(0)
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        pid, pgid = int(parts[0]), int(parts[1])
+        if pid == me or pgid <= 1 or pgid == my_pgid:
+            continue
+        try:
+            if os.getsid(pid) == sid:
+                groups.add(pgid)
+        except OSError:
+            pass
+    return sorted(groups)
+
+
+def _reap_worker_session(sid: Optional[int], grace: float = 3.0) -> int:
+    """SIGTERM every process group left in worker session ``sid``, wait up to
+    ``grace`` seconds, then SIGKILL the survivors. Returns the groups found.
+
+    Call only once the worker is gone (terminated, or found dead) and its pid
+    is NOT a recycled one: while any member of the session lives, the kernel
+    will not hand the pid out again, so a dead leader's sid can only name the
+    worker's own leftovers. Never targets sid <= 1, the caller's own session,
+    or the caller's own process group. POSIX only; a no-op elsewhere.
+    """
+    import signal
+
+    if not sid or int(sid) <= 1:
+        return 0
+    if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
+        return 0
+    sid = int(sid)
+    try:
+        if sid in (os.getsid(0), os.getpid()):
+            return 0
+    except OSError:
+        return 0
+    groups = _worker_session_groups(sid)
+    if not groups:
+        return 0
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and _worker_session_groups(sid):
+        time.sleep(0.1)
+    for pgid in _worker_session_groups(sid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    _log.warning(
+        "kanban: reaped %d leftover process group(s) of worker session %d",
+        len(groups), sid,
+    )
+    return len(groups)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -18271,6 +18353,7 @@ def _terminate_reclaimed_worker(
         # survival. Leaving terminated=False here would make the reclaim guard
         # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
+        _reap_terminated_worker_session(pid, info, signal_fn)
         return info
     except PermissionError:
         # Identity was verified above (or the pid was not visibly alive), so
@@ -18285,6 +18368,7 @@ def _terminate_reclaimed_worker(
     for _ in range(10):
         if not _pid_alive(pid):
             info["terminated"] = True
+            _reap_terminated_worker_session(pid, info, signal_fn)
             return info
         time.sleep(0.5)
 
@@ -18299,7 +18383,20 @@ def _terminate_reclaimed_worker(
             return info
 
     info["terminated"] = not _pid_alive(pid)
+    if info["terminated"]:
+        _reap_terminated_worker_session(pid, info, signal_fn)
     return info
+
+
+def _reap_terminated_worker_session(pid, info: dict, signal_fn) -> None:
+    """Reap the leftovers of a worker ``_terminate_reclaimed_worker`` just
+    proved gone. Skipped when a test ``signal_fn`` stands in for real signals
+    (those runs use fake or borrowed pids)."""
+    if signal_fn is not None:
+        return
+    reaped = _reap_worker_session(pid)
+    if reaped:
+        info["session_groups_reaped"] = reaped
 
 
 def _dead_claimer_hold_only(worker_pid: Optional[int], termination: dict) -> bool:
@@ -19527,6 +19624,11 @@ def detect_crashed_workers(
             pid = int(row["worker_pid"])
             kind, code = _classify_run_exit(conn, row["id"], row["current_run_id"], pid)
             dead.append((row, pid, kind, code))
+            if not _pid_alive(pid):
+                # The worker died on its own; whatever it left in other
+                # process groups of its session would outlive it (a live pid
+                # here is a recycled one and is never used as a sid).
+                _reap_worker_session(pid)
         # N workers ending externally in the same tick while all were still
         # heartbeating is ONE event (something outside killed them), not N
         # independent task failures. Decided over the whole tick before any
