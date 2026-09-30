@@ -145,7 +145,10 @@ def _truncate_body(message: str, *, context: str) -> bytes:
             context, len(message), MAX_MESSAGE_LENGTH,
         )
     # Keep the start AND the end: the conclusion is at the end (t_11223645).
-    return keep_head_and_tail_text(message, MAX_MESSAGE_LENGTH).encode("utf-8")
+    # ntfy's limit is in BYTES; over it the body becomes an attachment.
+    return keep_head_and_tail_text(
+        message, MAX_MESSAGE_LENGTH, utf8_bytes=True,
+    ).encode("utf-8")
 
 
 def check_requirements() -> bool:
@@ -436,7 +439,10 @@ class NtfyAdapter(BasePlatformAdapter):
                 self.name, len(content), self.MAX_MESSAGE_LENGTH,
             )
         # Keep the start AND the end: the conclusion is at the end (t_11223645).
-        body = keep_head_and_tail_text(content, self.MAX_MESSAGE_LENGTH)
+        # ntfy's limit is in BYTES; over it the body becomes an attachment.
+        body = keep_head_and_tail_text(
+            content, self.MAX_MESSAGE_LENGTH, utf8_bytes=True,
+        )
 
         try:
             resp = await self._http_client.post(

@@ -122,16 +122,23 @@ class TestNtfy:
     async def test_send_over_limit_keeps_the_end(self):
         adapter = self._adapter()
         await adapter.send("t", "HEAD-START " + _long(20_000))
-        body = adapter._http_client.post.call_args.kwargs["content"].decode("utf-8")
-        assert len(body) <= _ntfy.MAX_MESSAGE_LENGTH
+        raw = adapter._http_client.post.call_args.kwargs["content"]
+        assert len(raw) <= _ntfy.MAX_MESSAGE_LENGTH  # ntfy's cap is BYTES
+        body = raw.decode("utf-8")
         assert body.startswith("HEAD-START")
         assert body.endswith(TAIL)
 
     def test_standalone_body_keeps_the_end(self):
-        body = _ntfy._truncate_body("HEAD-START " + _long(20_000), context="t").decode("utf-8")
-        assert len(body) <= _ntfy.MAX_MESSAGE_LENGTH
+        raw = _ntfy._truncate_body("HEAD-START " + _long(20_000), context="t")
+        assert len(raw) <= _ntfy.MAX_MESSAGE_LENGTH  # ntfy's cap is BYTES
+        body = raw.decode("utf-8")
         assert body.startswith("HEAD-START")
         assert body.endswith(TAIL)
+
+    def test_multibyte_body_within_byte_cap(self):
+        raw = _ntfy._truncate_body("开始" + "汉字" * 5_000 + TAIL, context="t")
+        assert len(raw) <= _ntfy.MAX_MESSAGE_LENGTH
+        assert raw.decode("utf-8").endswith(TAIL)
 
     def test_standalone_short_body_unchanged(self):
         assert _ntfy._truncate_body("hi", context="t") == b"hi"
