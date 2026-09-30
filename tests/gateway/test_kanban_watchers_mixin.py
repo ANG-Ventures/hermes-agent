@@ -523,6 +523,53 @@ def test_active_pr_key_honours_pre_r19_ledger_entry(tmp_path):
                             now=10_000.0 + _GUARD_STUCK_REMIND_SECONDS) == 1
 
 
+def test_legacy_entry_is_consumed_by_one_pr_of_the_streak(tmp_path):
+    """Prism #1530 (6782f1a4e186): the legacy ``…|active_pr|<guarded_since>``
+    entry names no PR, so it may silence only ONE PR of that streak. A card
+    that acquires PR B inside the same streak (same guarded_since, within 6h
+    of PR A's page) must page for B, also across a restart."""
+    import json
+    from gateway.kanban_watchers import _GuardStuckNotifier
+    state = tmp_path / "g.json"
+    state.write_text(json.dumps({"default|t_x|active_pr|1790739715": 10_000.0}))
+    a = {"task_id": "t_x", "reason": "active_pr", "pr": "https://github.com/o/r/pull/9",
+         "guarded_since": 1790739715, "clear_verb": "x"}
+    b = {**a, "pr": "https://github.com/o/r/pull/10"}
+    sent = []
+    send = lambda board, row: sent.append(row["pr"]) or True
+    assert _GuardStuckNotifier(state).observe([("default", a)], send, now=10_600.0) == 0
+    assert _GuardStuckNotifier(state).observe([("default", b)], send, now=10_700.0) == 1
+    assert sent == [b["pr"]]
+    assert "default|t_x|active_pr|1790739715" not in json.loads(state.read_text())
+    # A itself stays covered by its migrated per-PR key.
+    assert _GuardStuckNotifier(state).observe([("default", a)], send, now=10_800.0) == 0
+
+
+def test_legacy_entry_left_by_a_prior_migration_is_consumed(tmp_path):
+    """Prism #1534 (a52a75cf4895): a ledger migrated by the pre-consume code holds
+    BOTH the per-PR key and the legacy key. Observing PR A (canonical hit) must
+    still drop the legacy key, so PR B of the same streak pages."""
+    import json
+    from gateway.kanban_watchers import _GuardStuckNotifier
+    pr_a = "https://github.com/o/r/pull/9"
+    state = tmp_path / "g.json"
+    state.write_text(json.dumps({"default|t_x|active_pr|1790739715": 10_000.0,
+                                 f"default|t_x|active_pr|pr={pr_a}": 10_000.0}))
+    a = {"task_id": "t_x", "reason": "active_pr", "pr": pr_a,
+         "guarded_since": 1790739715, "clear_verb": "x"}
+    b = {**a, "pr": "https://github.com/o/r/pull/10"}
+    send = lambda board, row: True
+    assert _GuardStuckNotifier(state).observe([("default", a)], send, now=10_600.0) == 0
+    assert "default|t_x|active_pr|1790739715" not in json.loads(state.read_text())
+    assert _GuardStuckNotifier(state).observe([("default", b)], send, now=10_700.0) == 1
+    # Prism #1534 (886ea41b20e6): restart straight onto PR B from the two-entry
+    # ledger; the legacy time already belongs to A, so B pages.
+    state.write_text(json.dumps({"default|t_x|active_pr|1790739715": 10_000.0,
+                                 f"default|t_x|active_pr|pr={pr_a}": 10_000.0}))
+    assert _GuardStuckNotifier(state).observe([("default", b)], send, now=10_700.0) == 1
+    assert "default|t_x|active_pr|1790739715" not in json.loads(state.read_text())
+
+
 def test_active_pr_page_names_the_wanted_verb():
     from gateway.kanban_watchers import _active_pr_detail
     requeue = "hermes kanban --board default requeue t_x '<reason>'"

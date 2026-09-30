@@ -755,10 +755,33 @@ class _GuardStuckNotifier:
         deploy does not re-page every open episode once; only that exact legacy
         key counts, so a card's different PR still pages (Prism #1530)."""
         last = self._sent.get(key)
-        if last is not None or "|active_pr|pr=" not in key or not item.get("guarded_since"):
+        if "|active_pr|pr=" not in key or not item.get("guarded_since"):
             return last
         legacy = key.split("|pr=", 1)[0] + f"|{item['guarded_since']}"
-        last = self._sent.get(legacy)
+        # Consume it: the legacy key names no PR, so it may silence only the
+        # first PR observed for this streak; a PR the card acquires later in
+        # the SAME streak (same guarded_since) still pages (Prism #1530). Popped
+        # on a canonical hit too: a ledger migrated by the pre-consume code
+        # holds both keys (Prism #1534 a52a75cf4895).
+        legacy_at = self._sent.pop(legacy, None)
+        pr_prefix = key.split("|pr=", 1)[0] + "|pr="
+        if legacy_at is not None and any(
+                k != key and k.startswith(pr_prefix) and at == legacy_at
+                for k, at in self._sent.items()):
+            # Already migrated to another PR of this card: that PR owns the page
+            # time; this one was never paged (Prism #1534 886ea41b20e6).
+            legacy_at = None
+        if last is None and legacy_at is not None:
+            # Migrate: the canonical per-PR key now carries the page time, so a
+            # later streak reset on the same PR still finds it (Prism #1530 r2).
+            # observe() persists it (the ledger differs from its snapshot).
+            last = self._sent[key] = legacy_at
+        return last
+        legacy = key.split("|pr=", 1)[0] + f"|{item['guarded_since']}"
+        # Consume it: the legacy key names no PR, so it may silence only the
+        # first PR observed for this streak; a PR the card acquires later in
+        # the SAME streak (same guarded_since) still pages (Prism #1530).
+        last = self._sent.pop(legacy, None)
         if last is not None:
             # Migrate: the canonical per-PR key now carries the page time, so a
             # later streak reset on the same PR still finds it (Prism #1530 r2).
