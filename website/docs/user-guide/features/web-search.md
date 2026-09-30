@@ -71,7 +71,7 @@ Some extract vendors bill a PDF per page (a 200-page manual can cost ~200 credit
 | `web.local_pdf` | `true` | `false` sends PDFs to the extract backend as before |
 | `web.pdf_max_bytes` | `52428800` (50 MB) | Larger PDFs are refused with a clear error |
 
-A locally read result carries `metadata.served_by: local-pdf`, the page count and byte size. A scanned PDF with no text layer returns `metadata.warning: "no text layer — run OCR"` instead of falling back to a paid vendor. A `.pdf` link that actually serves an HTML page goes to the extract backend normally.
+A locally read result carries `metadata.served_by: local-pdf`, the page count and byte size. A scanned PDF with no text layer returns `metadata.warning: "no text layer — run OCR"` instead of falling back to a paid vendor. A `.pdf` link that actually serves an HTML page goes to the extract backend normally. If neither pymupdf nor `pdftotext` is installed, PDFs keep going to the extract backend and a one-time warning is logged; install `pymupdf` (`pip install pymupdf`) or poppler to read them locally.
 
 ---
 
