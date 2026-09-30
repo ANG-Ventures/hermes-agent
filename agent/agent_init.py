@@ -3180,6 +3180,9 @@ def init_agent(
     # and the CLI snapshot can read it without extra IPC.
     from collections import deque as _deque
     agent._api_latency_history = _deque(maxlen=10)
+    # Per-API-call ledger (prompt/cached/output tokens, latency, served tier) for
+    # clients that attribute cache hits per call (tui_gateway usage.call_ledger).
+    agent._api_call_ledger = _deque(maxlen=64)
     agent._api_output_history = _deque(maxlen=10)
     
     # ── Ollama num_ctx injection ──

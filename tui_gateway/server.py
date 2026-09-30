@@ -3487,6 +3487,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
+            _stamp_declared_cache_scope(current, agent)
             current["agent"] = agent
             _session_todo_state(current)
             # Baseline for the per-turn config sync; the profile home
@@ -7048,6 +7049,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         finally:
             _clear_session_context(tokens)
         new_agent._session_title_hint = "Bot Chat"
+        _stamp_declared_cache_scope(session, new_agent)
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
         _emit(
@@ -7791,6 +7793,16 @@ def _turn_runtime_footer(agent, session: dict | None, turn_seconds: float | None
         return ""
 
 
+def _stamp_declared_cache_scope(session: dict, agent) -> None:
+    """Carry session.create ``cache_scope`` onto a (re)built agent (prompt_cache_scope)."""
+    scope = session.get("cache_scope")
+    if scope and agent is not None:
+        try:
+            agent._declared_cache_scope = scope
+        except Exception:
+            logger.debug("declared cache scope stamp failed", exc_info=True)
+
+
 def _get_usage(agent) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
@@ -7855,6 +7867,9 @@ def _get_usage(agent) -> dict:
         _ratio_unknown = (
             prompt_tokens_unknown(_flags) or _flags["cache_read_tokens_unknown"]
         )
+        if not _ratio_unknown:
+            # Exact cumulative cache reads (the pct below is rounded, and omitted at 0).
+            usage["cache_read"] = _cache_read
         if _ratio_unknown:
             usage["cache_hit_unknown"] = True
         elif _prompt_total > 0 and _cache_read > 0:
@@ -7881,6 +7896,17 @@ def _get_usage(agent) -> dict:
                 usage["avg_tps"] = round(float(_avg_vel), 1)
     except Exception:
         # A status-bar readout must never break usage reporting.
+        pass
+    # Served service_tier of the latest call + the per-call ledger (bounded), so
+    # a client can attribute cache hits, tier and latency per call.
+    try:
+        _served = getattr(agent, "_served_service_tier", None)
+        if isinstance(_served, str) and _served:
+            usage["service_tier"] = _served
+        _ledger = getattr(agent, "_api_call_ledger", None)
+        if _ledger is not None:
+            usage["call_ledger"] = [dict(c) for c in list(_ledger)]
+    except Exception:
         pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
@@ -9324,6 +9350,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         )
     finally:
         _clear_session_context(tokens)
+    _stamp_declared_cache_scope(session, new_agent)
     session["agent"] = new_agent
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
