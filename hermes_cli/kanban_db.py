@@ -5380,6 +5380,10 @@ class MutationActor:
     # ``--operator "<who: why>"``: an operator profile applying a relayed
     # human decision. Recorded as an ``operator_override`` event, no comment.
     operator: Optional[str] = None
+    # What a ``--takeover`` does to the card's home: ``"keep"`` (--keep-home),
+    # ``"transfer"`` (--transfer-home), or None = the verb's default (see
+    # :data:`KEEP_HOME_BY_DEFAULT_ACTIONS`).
+    home: Optional[str] = None
 
 
 # Profiles allowed to use the ``--operator`` override. ``default`` is Apollo.
@@ -5474,8 +5478,11 @@ def mutation_actor(
     foreign_ok: Optional[str] = None,
     surface: str = "cli",
     operator: Optional[str] = None,
+    home: Optional[str] = None,
 ):
     """Bind the chat-facing caller for the home-session guard."""
+    if home not in (None, "keep", "transfer"):
+        raise ValueError(f"home must be 'keep', 'transfer' or None, not {home!r}")
     ids = tuple(dict.fromkeys(
         str(s).strip() for s in (session_ids or ()) if s and str(s).strip()
     ))
@@ -5485,6 +5492,7 @@ def mutation_actor(
         foreign_ok=(str(foreign_ok).strip() or None) if foreign_ok else None,
         surface=surface,
         operator=(str(operator).strip() or None) if operator else None,
+        home=home,
     )
     token = _MUTATION_ACTOR.set(actor)
     ev_token = _EVENT_ACTOR.set(actor)
@@ -6209,6 +6217,39 @@ REHOME_ON_TAKEOVER_ACTIONS: frozenset[str] = frozenset({
     "assign", "unblock", "promote", "reclaim", "triage-resolve",
 })
 
+# Adopting verbs whose ``--takeover`` KEEPS the home unless the caller passes
+# ``--transfer-home``. A reclaim returns a running card to its queue (load
+# shedding, a hung worker); it is not an ownership transfer. Measured
+# 2026-09-29 19:12: 14 foreign cards reclaimed under load were re-homed into
+# the operator's session and their review pings moved to its chat (t_0b3b0667).
+KEEP_HOME_BY_DEFAULT_ACTIONS: frozenset[str] = frozenset({"reclaim"})
+
+
+def _takeover_transfers_home(action: str, actor: "MutationActor") -> bool:
+    """Whether this ``--takeover`` asks to move the card's home to the actor."""
+    if action not in REHOME_ON_TAKEOVER_ACTIONS:
+        return False
+    if actor.home is not None:
+        return actor.home == "transfer"
+    return action not in KEEP_HOME_BY_DEFAULT_ACTIONS
+
+
+def _home_conversation(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """The card's home CONVERSATION: the chats its pings go to right now."""
+    try:
+        rows = conn.execute(
+            "SELECT platform, chat_id, thread_id FROM kanban_notify_subs "
+            "WHERE task_id = ? ORDER BY created_at, platform, chat_id, thread_id",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [
+        {"platform": r["platform"], "chat_id": r["chat_id"],
+         "thread_id": r["thread_id"] or ""}
+        for r in rows
+    ]
+
 
 def _can_adopt_home(session_id: str) -> bool:
     """True when *session_id* may become a card's home on ``--takeover``.
@@ -6293,7 +6334,7 @@ def record_foreign_action(
         return None
     new_home = (
         actor.session_ids[0]
-        if action in REHOME_ON_TAKEOVER_ACTIONS
+        if _takeover_transfers_home(action, actor)
         and actor.session_ids
         and _can_adopt_home(actor.session_ids[0])
         else None
@@ -6307,10 +6348,23 @@ def record_foreign_action(
         or _ambient_session_env("HERMES_SESSION_CHAT_ID")
         or None,
         "home": prev_home,
+        # What a restore needs: the session and the chats the card belonged
+        # to BEFORE this takeover, and whether the home moved.
+        "previous_session": prev_home,
+        "previous_home": _home_conversation(conn, task_id),
+        "home_transfer": bool(new_home),
     }
     if new_home:
         payload["prev_session_id"] = prev_home
         payload["session_id"] = new_home
+        # The chat the post-commit subscribe adds: what a restore removes.
+        taker_platform = _ambient_session_env("HERMES_SESSION_PLATFORM")
+        taker_chat_id = _ambient_session_env("HERMES_SESSION_CHAT_ID")
+        if taker_platform and taker_chat_id:
+            payload["taker_chat"] = {
+                "platform": taker_platform, "chat_id": taker_chat_id,
+                "thread_id": _ambient_session_env("HERMES_SESSION_THREAD_ID"),
+            }
     with write_txn(conn, allow_nested=True):
         if new_home:
             conn.execute(
@@ -6330,7 +6384,11 @@ def record_foreign_action(
         body=(
             f"takeover: foreign-session action by {sess} "
             f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
-            + (f" -- card re-homed to {new_home}" if new_home else "")
+            + (
+                f" -- card re-homed to {new_home}" if new_home
+                else f" -- home kept ({prev_home})"
+                if action in REHOME_ON_TAKEOVER_ACTIONS else ""
+            )
         ),
         session_ref=session_ref,
     )
