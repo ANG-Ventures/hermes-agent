@@ -382,6 +382,16 @@ jobs:
             WF_NAME="[replay] ${WF_NAME}"
             DELIVERY="${DELIVERY}-replay-${GITHUB_RUN_ID}"
           fi
+          # Say WHAT went red on the page's second line: a scheduled run is not a
+          # merge, and GitHub reports a schedule's actor as whoever last touched the
+          # workflow (github-merge-queue[bot] on 2026-09-30, run 36724184458), which
+          # read as a merge regression (t_b4265523).
+          case "$WF_EVENT" in
+            schedule)    TRIGGER="scheduled run, not a merge"; WF_ACTOR="cron" ;;
+            merge_group) TRIGGER="merge queue" ;;
+            push)        TRIGGER="merge/push to ${WF_BRANCH}" ;;
+            *)           TRIGGER="$WF_EVENT" ;;
+          esac
           # Build the JSON body. event_type is what the receiver route filters
           # on (X-GitHub-Event header is also set to the same value):
           # ci_failure -> /ci-fail (#alerts), ci_failure_known_red -> /ci-fail-known (#logs).
@@ -399,7 +409,7 @@ jobs:
             --arg sha "$WF_SHA" \
             --arg run_url "$WF_URL" \
             --arg actor "$WF_ACTOR" \
-            --arg trigger "$WF_EVENT" \
+            --arg trigger "$TRIGGER" \
             --arg pr "${PR_NUM:-}" \
             '{event_type:$event_type, card:$card, repo:$repo, workflow:$workflow, branch:$branch, sha:$sha, run_url:$run_url, actor:$actor, trigger:$trigger, pr:$pr}')"
           # Generic HMAC-SHA256 hex over the raw body → X-Webhook-Signature.
