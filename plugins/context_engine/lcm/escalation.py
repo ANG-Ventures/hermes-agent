@@ -393,7 +393,9 @@ _META_REFUSAL_RE = re.compile(
     r"\bI\s*(?:won't|will\s+not|can't|cannot|can\s+not|am\s+unable\s+to|'m\s+unable\s+to"
     r"|am\s+not\s+able\s+to|'m\s+not\s+able\s+to|shouldn't|must\s+decline\s+to)\s+"
     r"(?:\w+\s+){0,6}?(?:redo|re-?summari[sz]e|summari[sz]e|continue|reproduce|rewrite|"
-    r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b",
+    r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b"
+    r"|\[cyber\]"
+    r"|\bsafeguards?\s+(?:flagged|blocked|interrupted)\s+(?:this|my|the)\b",
     re.IGNORECASE,
 )
 
@@ -620,9 +622,9 @@ def _invoke_summary_llm_chain(
             # About the content, not the route: latch the pair instead of
             # tripping the breaker, so other segments keep summarizing here.
             logger.warning(
-                "LCM summary refused by safeguards on %s; never re-sending this "
-                "segment on that route: %s",
-                candidate_model or _DEFAULT_ROUTE_KEY,
+                "LCM summary outcome=refusal provider_route=%s model=%s; "
+                "skipping this segment on that route: %s",
+                route_key, candidate_model or "<default>",
                 exc,
             )
             if segment_key:
