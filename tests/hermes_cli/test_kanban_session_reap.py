@@ -280,3 +280,44 @@ def test_env_identity_scan_never_lists_self_or_own_session(monkeypatch):
     # this very process carries the identity and must be invisible to the sweep
     assert all(pid != os.getpid() for pid, _ in kb._run_env_escapees("t_envreap3", 99))
     assert kb._reap_run_env_escapees("t_envreap3", 99, born_after=0.0, born_before=time.time() + 10) == 0
+
+
+def test_terminated_run_reap_never_targets_the_cards_newer_run(conn):
+    """Prism a8211e2aced2: the post-termination sweep must reap the run that was
+    terminated, not ``tasks.current_run_id``. When a claim is lost, another
+    dispatcher may already have started a NEWER run on the card; its freshly
+    spawned daemons fall inside the old run's birth window, and reading the
+    DB pointer would SIGTERM/SIGKILL them."""
+    tid = kb.create_task(conn, title="card", assignee="worker")
+    assert kb.claim_task(conn, tid) is not None
+    old_run = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()[0]
+    new_run = int(old_run) + 1000
+    with kb.write_txn(conn):   # the card has moved on to a newer run
+        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (new_run, tid))
+    born_after = time.time() - 5
+    victim = _spawn_escapee(tid, str(old_run))
+    bystander = _spawn_escapee(tid, str(new_run))
+    try:
+        info: dict = {}
+        kb._reap_terminated_worker_session(
+            99_999_9, info, None, (born_after, None, None), time.time(), conn, tid,
+            old_run,
+        )
+        assert info.get("env_escapees_reaped") == 1
+        assert _gone(victim.pid), "the terminated run's escapee survived"
+        assert not _gone(bystander.pid, timeout=1.0), "the newer run's process was signalled"
+        # No run identity -> no run-scoped sweep; never fall back to the DB pointer.
+        info = {}
+        kb._reap_terminated_worker_session(
+            99_999_9, info, None, (born_after, None, None), time.time(), conn, tid,
+        )
+        assert "env_escapees_reaped" not in info
+        assert not _gone(bystander.pid, timeout=1.0)
+    finally:
+        for p in (victim, bystander):
+            try:
+                p.kill(); p.wait(timeout=5)
+            except Exception:
+                pass

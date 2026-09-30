@@ -1309,7 +1309,7 @@ def _set_status_direct(
     # to kill (ignoring the result) let the dispatcher claim a second worker
     # beside a survivor. A failed or unprovable termination refuses the move.
     held = conn.execute(
-        "SELECT status, worker_pid, claim_lock FROM tasks WHERE id = ?",
+        "SELECT status, worker_pid, claim_lock, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if held is None:
@@ -1321,9 +1321,9 @@ def _set_status_direct(
     if held["status"] == "running" and new_status != "running":
         termination = kanban_db._terminate_reclaimed_worker(
             held["worker_pid"], held["claim_lock"],
-            conn=conn, task_id=task_id,
+            conn=conn, task_id=task_id, run_id=held["current_run_id"],
             owner_window=kanban_db._worker_owner_window(
-                conn, task_id, held["worker_pid"],
+                conn, task_id, held["worker_pid"], held["current_run_id"],
             ),
         )
         if kanban_db._worker_survived_termination(termination):
