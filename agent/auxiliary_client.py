@@ -11926,13 +11926,66 @@ async def _async_call_llm_impl(
                     _fallback_provider_from_label(fb_label),
                     async_fb_model or fb_model,
                 )
-                fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                try:
+                    fb_resp = await _call_fallback_candidate_async(
+                        async_fb, async_fb_model or fb_model, fb_label,
+                        task=task, messages=messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config)
+                except Exception as fb_err:
+                    if not (_is_context_length_error(fb_err) and fb_label.startswith("fallback_chain[")):
+                        raise
+                    skipped_indices = {int(fb_label.split("[", 1)[1].split("]", 1)[0])}
+                    fb_resp = None
+                    while True:
+                        next_client, next_model, next_label = _try_configured_fallback_chain(
+                            task, resolved_provider or "auto", reason="context length exceeded",
+                            failed_model=_chain_failed_model, skip_indices=skipped_indices)
+                        if next_client is None:
+                            break
+                        skipped_indices.add(int(next_label.split("[", 1)[1].split("]", 1)[0]))
+                        async_next, async_model = _to_async_client(
+                            next_client, next_model or "", is_vision=(task == "vision"))
+                        try:
+                            fb_resp = await _call_fallback_candidate_async(
+                                async_next, async_model or next_model, next_label,
+                                task=task, messages=messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools,
+                                effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config)
+                        except Exception as next_err:
+                            if _is_context_length_error(next_err):
+                                continue
+                            raise
+                        if fb_resp is not None:
+                            _record_route_info(route_info, _fallback_provider_from_label(next_label), async_model or next_model)
+                            break
+                    if fb_resp is None:
+                        if is_auto:
+                            next_client, next_model, next_label = _try_main_fallback_chain(
+                                task, resolved_provider or "auto", reason="context length exceeded")
+                            if next_client is None:
+                                next_client, next_model, next_label = _try_payment_fallback(
+                                    resolved_provider, task, reason="context length exceeded")
+                        else:
+                            next_client, next_model, next_label = _try_main_agent_model_fallback(
+                                resolved_provider, task, reason="context length exceeded",
+                                failed_model=_chain_failed_model)
+                        if next_client is not None:
+                            async_next, async_model = _to_async_client(
+                                next_client, next_model or "", is_vision=(task == "vision"))
+                            fb_resp = await _call_fallback_candidate_async(
+                                async_next, async_model or next_model, next_label,
+                                task=task, messages=messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools,
+                                effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config)
+                            if fb_resp is not None:
+                                _record_route_info(route_info, _fallback_provider_from_label(next_label), async_model or next_model)
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
