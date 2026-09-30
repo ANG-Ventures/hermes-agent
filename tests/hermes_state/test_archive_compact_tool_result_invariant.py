@@ -94,11 +94,49 @@ def test_concurrent_tail_clone_cannot_double_carry_a_result(db):
     assert _active_results(db, "t1") == 1
 
 
-def test_preexisting_duplicate_key_does_not_wedge_compaction(db):
-    """Providers that reuse index ids (``terminal:0``) left legacy dup keys; they must not block compaction."""
+def test_reused_provider_id_occurrences_carry_through_compaction(db):
+    """Providers reuse index ids (``terminal:0``): two call/result occurrences are two logical calls."""
     _append(db, [_call("terminal:0"), _result("terminal:0", "a"), _call("terminal:0"), _result("terminal:0", "b")])
     assert _active_results(db, "terminal:0") == 2
 
     db.archive_and_compact("S", [{"role": "user", "content": "[summary]"}, _call("terminal:0"),
                                  _result("terminal:0", "a"), _call("terminal:0"), _result("terminal:0", "b")])
     assert _active_results(db, "terminal:0") == 2
+
+
+def test_new_occurrence_of_a_reused_provider_id_is_not_a_duplicate(db):
+    """Providers reuse index ids: a second ``terminal:0`` call/result pair is a new logical occurrence."""
+    _append(db, [{"role": "user", "content": "go"}, _call("terminal:0"), _result("terminal:0", "a")])
+    assert _active_results(db, "terminal:0") == 1
+
+    db.archive_and_compact("S", [{"role": "user", "content": "[summary]"},
+                                 _call("terminal:0"), _result("terminal:0", "a"),
+                                 _call("terminal:0"), _result("terminal:0", "b")])
+    assert _active_results(db, "terminal:0") == 2
+
+
+def test_double_carry_is_caught_when_the_provider_id_is_already_reused(db):
+    """Two legitimate ``terminal:0`` occurrences, then the later result carried twice: 2 -> 3 must raise."""
+    _append(db, [{"role": "user", "content": "go"}, _call("terminal:0"), _result("terminal:0", "a"),
+                 _call("terminal:0")])
+    watermark = db.get_active_message_watermark("S")
+    _append(db, [_result("terminal:0", "b")])  # arrived during the slow summary
+    assert _active_results(db, "terminal:0") == 2
+    before = _rows(db)
+
+    with pytest.raises(TranscriptInvariantError, match="terminal:0"):
+        db.archive_and_compact("S", [{"role": "user", "content": "[summary]"},
+                                     _call("terminal:0"), _result("terminal:0", "a"),
+                                     _call("terminal:0"), _result("terminal:0", "b")],
+                               watermark=watermark)
+    assert _rows(db) == before
+
+
+def test_legacy_duplicate_result_carried_unchanged_does_not_wedge_compaction(db):
+    """A live set that ALREADY holds two results for one call (a legacy row) may be carried forward as-is."""
+    _append(db, [{"role": "user", "content": "go"}, _call("t1"), _result("t1", "a"), _result("t1", "a")])
+    assert _active_results(db, "t1") == 2
+
+    db.archive_and_compact("S", [{"role": "user", "content": "[summary]"}, _call("t1"),
+                                 _result("t1", "a"), _result("t1", "a")])
+    assert _active_results(db, "t1") == 2

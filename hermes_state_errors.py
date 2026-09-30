@@ -173,13 +173,14 @@ class SessionTurnLeaseLostError(RuntimeError):
 
 
 class TranscriptInvariantError(ValueError):
-    """A transcript rewrite would leave two ACTIVE result rows for one tool call.
+    """A transcript rewrite would leave two ACTIVE result rows for one logical tool call.
     Raised inside the write transaction (so it rolls back) by ``archive_and_compact``:
-    the live set it publishes must hold at most one ``role='tool'`` row per
-    ``(session_id, tool_call_id)``, or the next resume replays the same tool exchange
-    twice. Keys ALREADY duplicated in the pre-compaction live set (legacy rows,
-    providers that reuse index-style ids such as ``terminal:0``) are tolerated: the
-    invariant is that a compaction never INTRODUCES a duplicate."""
+    the live set it publishes must hold at most one ``role='tool'`` row per call
+    OCCURRENCE (``tool_call_uid``, else the nearest preceding call naming the id), or
+    the next resume replays the same tool exchange twice. The raw ``tool_call_id`` is
+    not the identity: providers reuse index-style ids such as ``terminal:0``. An excess
+    ALREADY in the pre-compaction live set (legacy rows) is tolerated: the invariant is
+    that a compaction never INTRODUCES one."""
 
 
 class SessionActiveWriteGuardError(RuntimeError):
