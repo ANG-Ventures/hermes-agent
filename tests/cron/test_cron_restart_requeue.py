@@ -287,3 +287,58 @@ def test_sigterm_outside_shutdown_still_pages(env, monkeypatch):
     content, success = sent[0]
     assert success is False
     assert "-15" in content or "exited with code" in content
+
+
+def _make_named_job(name):
+    from cron.jobs import create_job, get_job
+    job = create_job(
+        prompt=None, schedule="0 3 * * *", name=name,
+        script="long.sh", no_agent=True, deliver="local",
+    )
+    return get_job(job["id"])
+
+
+def test_single_requeue_fires_now(env):
+    """One marker in a scan keeps the run-now shape: due on the same scan."""
+    from cron import jobs as cj
+
+    job = _make_named_job("solo")
+    assert cj.request_restart_requeue(job["id"], "restart") is True
+    due = [j for j in cj.get_due_jobs() if j["id"] == job["id"]]
+    assert due, "single re-queue must fire on the first scan"
+    row = cj.get_job(job["id"])
+    assert row["next_run_at"] == row["manual_run_at"]
+
+
+def test_requeues_in_one_scan_are_staggered(env, monkeypatch):
+    """2026-09-30 09:28:43: one restart killed two scripts and both re-fired
+    71 ms apart. The n-th re-fire in one scan is deferred n * STAGGER."""
+    from datetime import datetime
+    from cron import jobs as cj
+
+    a = _make_named_job("fleet-config-lint")
+    b = _make_named_job("fleet-upstream-leak-lint")
+    assert cj.request_restart_requeue(a["id"], "restart") is True
+    assert cj.request_restart_requeue(b["id"], "restart") is True
+
+    t0 = cj._hermes_now()
+    monkeypatch.setattr(cj, "_hermes_now", lambda: t0)
+    due_ids = {j["id"] for j in cj.get_due_jobs()}
+    rows = [cj.get_job(a["id"]), cj.get_job(b["id"])]
+    for row in rows:
+        assert not row.get(cj.RESTART_REQUEUE_KEY), "marker must be consumed"
+        assert row["next_run_at"] == row["manual_run_at"], "run-now shape kept"
+    fire_at = sorted(datetime.fromisoformat(r["next_run_at"]) for r in rows)
+    gap = (fire_at[1] - fire_at[0]).total_seconds()
+    assert gap >= 60, f"re-fires {gap}s apart: same-second stampede"
+    assert gap == cj.RESTART_REQUEUE_STAGGER_S
+    assert len(due_ids & {a["id"], b["id"]}) == 1, "only the first fires now"
+
+    # The deferred one is not due before its slot, and IS due at it.
+    later = t0 + (fire_at[1] - fire_at[0]) - timedelta(seconds=1)
+    monkeypatch.setattr(cj, "_hermes_now", lambda: later)
+    pending = ({a["id"], b["id"]} - due_ids).pop()
+    assert pending not in {j["id"] for j in cj.get_due_jobs()}
+    at_slot = later + timedelta(seconds=1)
+    monkeypatch.setattr(cj, "_hermes_now", lambda: at_slot)
+    assert pending in {j["id"] for j in cj.get_due_jobs()}, "staggered re-fire lost"
