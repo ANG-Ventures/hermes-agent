@@ -15845,6 +15845,21 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Archive ``task_id``. Raises :class:`kanban_open_pr.ClosedUnmergedPrError` (no state change) when
     the card's own PR is closed-unmerged with no recorded superseder or close decision (t_a1550189)."""
     _archive_closed_pr_gate(conn, task_id)
+    # Capture the live worker BEFORE the UPDATE nulls worker_pid (t_89dfa2c9).
+    # Archive used to drop the pid, end the run and rmtree the workspace while
+    # the worker process kept running: t_cfbbf9a9's worker ran 12 more minutes
+    # from a deleted cwd (every guard-hook call failed closed, 12 CRITICAL
+    # pages) and armed launchd jobs for a dropped card. No later reaper could
+    # find it, because the only pointer to it was the pid this UPDATE clears.
+    prior = conn.execute(
+        "SELECT worker_pid, claim_lock, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    live_pid = int(prior["worker_pid"]) if prior is not None and prior["worker_pid"] else None
+    owner_window = (
+        _worker_owner_window(conn, task_id, live_pid, prior["current_run_id"])
+        if live_pid else (None, None, None)
+    )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -15863,13 +15878,28 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+    # Stop the worker before its workspace is reaped below. Same identity-checked
+    # host-local termination the reclaim paths use. If liveness cannot be
+    # disproven (remote worker, unknown identity, signal failure), KEEP the
+    # workspace: deleting it under a possibly-live worker recreates the incident.
+    can_reap = not live_pid
+    if live_pid and live_pid != os.getpid():
+        termination = _terminate_reclaimed_worker(
+            live_pid, prior["claim_lock"], owner_window=owner_window,
+            conn=conn, task_id=task_id,
+        )
+        can_reap = not _worker_survived_termination(termination)
+        with write_txn(conn):
+            _append_event(conn, task_id, "archive_worker_terminated",
+                          termination, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
-    # Reap the workspace on archive too — tasks archived without ever
-    # completing previously kept their scratch dir / worktree forever.
-    _cleanup_workspace(conn, task_id)
+    # Reap only after worker death is verified (or there was no worker). An
+    # in-worker archive cannot kill its own process before returning either.
+    if can_reap:
+        _cleanup_workspace(conn, task_id)
     return True
 
 
