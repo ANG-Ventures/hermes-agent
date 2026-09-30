@@ -764,6 +764,13 @@ class _GuardStuckNotifier:
         # on a canonical hit too: a ledger migrated by the pre-consume code
         # holds both keys (Prism #1534 a52a75cf4895).
         legacy_at = self._sent.pop(legacy, None)
+        pr_prefix = key.split("|pr=", 1)[0] + "|pr="
+        if legacy_at is not None and any(
+                k != key and k.startswith(pr_prefix) and at == legacy_at
+                for k, at in self._sent.items()):
+            # Already migrated to another PR of this card: that PR owns the page
+            # time; this one was never paged (Prism #1534 886ea41b20e6).
+            legacy_at = None
         if last is None and legacy_at is not None:
             # Migrate: the canonical per-PR key now carries the page time, so a
             # later streak reset on the same PR still finds it (Prism #1530 r2).

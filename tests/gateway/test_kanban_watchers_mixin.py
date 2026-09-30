@@ -562,6 +562,12 @@ def test_legacy_entry_left_by_a_prior_migration_is_consumed(tmp_path):
     assert _GuardStuckNotifier(state).observe([("default", a)], send, now=10_600.0) == 0
     assert "default|t_x|active_pr|1790739715" not in json.loads(state.read_text())
     assert _GuardStuckNotifier(state).observe([("default", b)], send, now=10_700.0) == 1
+    # Prism #1534 (886ea41b20e6): restart straight onto PR B from the two-entry
+    # ledger; the legacy time already belongs to A, so B pages.
+    state.write_text(json.dumps({"default|t_x|active_pr|1790739715": 10_000.0,
+                                 f"default|t_x|active_pr|pr={pr_a}": 10_000.0}))
+    assert _GuardStuckNotifier(state).observe([("default", b)], send, now=10_700.0) == 1
+    assert "default|t_x|active_pr|1790739715" not in json.loads(state.read_text())
 
 
 def test_active_pr_page_names_the_wanted_verb():
