@@ -18202,8 +18202,11 @@ def _session_owned_by_run(
             created = psutil.Process(pid).create_time()
         except (psutil.Error, OSError):
             continue
-        # 1 s slack each side: event times are whole seconds.
-        if born_after - 1.0 <= created <= born_before + 1.0:
+        # No upper slack: a recycled leader (and every child of it) is
+        # created after the worker died, i.e. strictly after its last
+        # evidence, and event times are floored, so ``<= born_before`` can
+        # never admit one. The lower bound only needs claim-time slack.
+        if born_after - 1.0 <= created <= born_before:
             return True
     return False
 
@@ -18438,8 +18441,8 @@ def _terminate_reclaimed_worker(
         if not _pid_alive(pid):
             info["terminated"] = True
             _reap_terminated_worker_session(
-            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
-        )
+                pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+            )
             return info
         time.sleep(0.5)
 

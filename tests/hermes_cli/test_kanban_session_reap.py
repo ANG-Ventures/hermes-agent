@@ -92,6 +92,14 @@ def _worker_card(conn, mode: str, max_runtime=None):
     _LEFTOVERS.append(sleep_pid)
     threading.Thread(target=worker.wait, daemon=True).start()  # no zombie
     assert kb._set_worker_pid(conn, tid, worker.pid)
+    # A real worker heartbeats after starting its children; event times are
+    # whole seconds, so step past the second the sleep was created in.
+    time.sleep(1.1)
+    with kb.write_txn(conn):
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()[0]
+        kb._append_event(conn, tid, "heartbeat", {}, run_id=run_id)
     assert os.getsid(sleep_pid) == worker.pid
     assert os.getpgid(sleep_pid) == sleep_pid != worker.pid
     return tid, worker, sleep_pid
