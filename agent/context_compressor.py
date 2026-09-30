@@ -45,7 +45,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_signing_material, redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -1554,11 +1554,16 @@ def _redact_compaction_text(text: Any) -> str:
     - ``redact_url_credentials=True`` — OAuth callback codes, magic-link
       tokens, and URL userinfo never need to survive summarization the way
       they must survive live navigation flows.
+    - ``redact_signing_material`` — billing-header integrity values and
+      ``*signature`` values: dense signing material trips summarizer
+      safeguards (``[cyber]``) and has no value in a summary (t_c2107577).
     """
-    return redact_sensitive_text(
-        text or "",
-        force=True,
-        redact_url_credentials=True,
+    return redact_signing_material(
+        redact_sensitive_text(
+            text or "",
+            force=True,
+            redact_url_credentials=True,
+        )
     )
 
 
