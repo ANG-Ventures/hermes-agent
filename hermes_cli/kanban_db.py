@@ -10367,8 +10367,10 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
-            owner_window=_worker_owner_window(conn, row["id"], row["worker_pid"]),
-            conn=conn, task_id=row["id"],
+            owner_window=_worker_owner_window(
+                conn, row["id"], row["worker_pid"], row["current_run_id"],
+            ),
+            conn=conn, task_id=row["id"], run_id=row["current_run_id"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -10511,8 +10513,10 @@ def reclaim_task(
     authorize_pending_operator_gate(conn)
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
-        owner_window=_worker_owner_window(conn, task_id, row["worker_pid"]),
-        conn=conn, task_id=task_id,
+        owner_window=_worker_owner_window(
+            conn, task_id, row["worker_pid"], row["current_run_id"],
+        ),
+        conn=conn, task_id=task_id, run_id=row["current_run_id"],
     )
     # Never release a claim while our host-local worker is alive or its
     # liveness is unknown. This also covers NULL pid in the TTL and stale
@@ -15865,8 +15869,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         live_pid = int(prior["worker_pid"]) if prior is not None and prior["worker_pid"] else None
         prior_lock = prior["claim_lock"] if prior is not None else None
+        prior_run_id = prior["current_run_id"] if prior is not None else None
         owner_window = (
-            _worker_owner_window(conn, task_id, live_pid, prior["current_run_id"])
+            _worker_owner_window(conn, task_id, live_pid, prior_run_id)
             if live_pid else (None, None, None)
         )
         cur = conn.execute(
@@ -15898,7 +15903,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if live_pid and live_pid != os.getpid():
         termination = _terminate_reclaimed_worker(
             live_pid, prior_lock, owner_window=owner_window,
-            conn=conn, task_id=task_id,
+            conn=conn, task_id=task_id, run_id=prior_run_id,
         )
         can_reap = bool(termination.get("host_local") and termination.get("terminated"))
         if not can_reap:
@@ -18848,8 +18853,15 @@ def _terminate_reclaimed_worker(
     signal_fn=None,
     conn: Optional[sqlite3.Connection] = None,
     task_id: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths.
+
+    ``run_id`` is the run ``owner_window`` was computed for. The post-death
+    reap sweeps only that run's identity; it never re-reads
+    ``tasks.current_run_id``, which may already name a NEWER run whose live
+    processes must not be touched (Prism a8211e2aced2). ``None`` skips the
+    run-scoped sweeps.
 
     ``owner_window`` is the recorded run's owner window
     ``(claimed_at, spawned_at, start_token)`` from :func:`_worker_owner_window`. It is a
@@ -18967,7 +18979,7 @@ def _terminate_reclaimed_worker(
         # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
         _reap_terminated_worker_session(
-            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
         )
         return info
     except PermissionError:
@@ -18984,7 +18996,7 @@ def _terminate_reclaimed_worker(
         if not _pid_alive(pid):
             info["terminated"] = True
             _reap_terminated_worker_session(
-                pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+                pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
             )
             return info
         time.sleep(0.5)
@@ -19002,7 +19014,7 @@ def _terminate_reclaimed_worker(
     info["terminated"] = not _pid_alive(pid)
     if info["terminated"]:
         _reap_terminated_worker_session(
-            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id,
+            pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
         )
     return info
 
@@ -19010,29 +19022,29 @@ def _terminate_reclaimed_worker(
 def _reap_terminated_worker_session(
     pid, info: dict, signal_fn, owner_window: tuple,
     verified_alive_at: Optional[float], conn, task_id,
+    run_id: Optional[int] = None,
 ) -> None:
     """Reap the leftovers of a worker ``_terminate_reclaimed_worker`` just
     proved gone. Session members must date from the recorded run: claimed
     at/after the claim and no later than the moment the worker was verified
     alive (or, if it was already dead, its last heartbeat/spawn event).
+    ``run_id`` is the TERMINATED run, never ``tasks.current_run_id``: by now
+    the card may carry a newer run whose processes share the task id.
     Skipped when a test ``signal_fn`` stands in for real signals (those runs
     use fake or borrowed pids)."""
     if signal_fn is not None:
         return
     born_before = verified_alive_at
-    if born_before is None:
-        born_before = _run_last_evidence_at(conn, task_id)
+    if born_before is None and run_id is not None:
+        born_before = _run_last_evidence_at(conn, task_id, run_id)
     reaped = _reap_worker_session(
         pid, born_after=owner_window[0] if owner_window else None,
         born_before=born_before,
     )
     if reaped:
         info["session_groups_reaped"] = reaped
-    run_row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone() if conn is not None else None
     escaped = _reap_run_env_escapees(
-        task_id, run_row[0] if run_row else None,
+        task_id, run_id,
         born_after=owner_window[0] if owner_window else None,
         born_before=born_before,
     )
@@ -19347,7 +19359,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -19372,8 +19384,8 @@ def enforce_max_runtime(
         # PID is never signalled and proves the recorded worker gone.
         termination = _terminate_reclaimed_worker(
             pid, row["claim_lock"], signal_fn=signal_fn,
-            owner_window=_worker_owner_window(conn, tid, pid),
-            conn=conn, task_id=tid,
+            owner_window=_worker_owner_window(conn, tid, pid, row["current_run_id"]),
+            conn=conn, task_id=tid, run_id=row["current_run_id"],
         )
         killed = bool(termination.get("sigkill"))
         if not termination.get("terminated"):
@@ -19594,7 +19606,7 @@ def detect_progress_stalls(
             continue
         termination = _terminate_reclaimed_worker(
             pid, lock, owner_window=_worker_owner_window(conn, row["id"], pid, rid),
-            conn=conn, task_id=row["id"],
+            conn=conn, task_id=row["id"], run_id=rid,
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -19692,7 +19704,8 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
-            owner_window=_worker_owner_window(conn, tid, pid),
+            run_id=row["current_run_id"],
+            owner_window=_worker_owner_window(conn, tid, pid, row["current_run_id"]),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -21165,6 +21178,7 @@ def _abort_lost_claim_spawn(
     if pid:
         termination = _terminate_reclaimed_worker(
             int(pid), task.claim_lock, conn=conn, task_id=task.id,
+            run_id=task.current_run_id,
             owner_window=_worker_owner_window(
                 conn, task.id, int(pid), task.current_run_id,
             ),
