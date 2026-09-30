@@ -81,6 +81,22 @@ def test_archive_never_signals_its_own_process(board, monkeypatch):
     assert "archive_worker_terminated" not in kinds
 
 
+def test_archive_keeps_workspace_when_worker_survives(board, monkeypatch):
+    sent = []
+    reaped = []
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
+                        lambda *a, **k: sent.append(a) or
+                        {"host_local": True, "termination_attempted": True,
+                         "terminated": False, "sigkill": True})
+    monkeypatch.setattr(kb, "_cleanup_workspace", lambda *a: reaped.append(a))
+    with kb.connect_closing() as conn:
+        tid = _running_card_with_worker(conn, lambda: os.getpid() + 1000000)
+        assert kb.archive_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "archived"
+    assert len(sent) == 1
+    assert reaped == []  # a live worker must never lose its cwd
+
+
 def test_archive_without_worker_signals_nothing(board, monkeypatch):
     sent = []
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker",

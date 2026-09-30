@@ -15606,13 +15606,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # Stop the worker before its workspace is reaped below. Same identity-checked
-    # host-local termination the reclaim paths use; a pid that is ours (an
-    # archive issued from inside the worker itself) is never signalled.
+    # host-local termination the reclaim paths use. If liveness cannot be
+    # disproven (remote worker, unknown identity, signal failure), KEEP the
+    # workspace: deleting it under a possibly-live worker recreates the incident.
+    can_reap = not live_pid
     if live_pid and live_pid != os.getpid():
         termination = _terminate_reclaimed_worker(
             live_pid, prior["claim_lock"], owner_window=owner_window,
             conn=conn, task_id=task_id,
         )
+        can_reap = not _worker_survived_termination(termination)
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_terminated",
                           termination, run_id=run_id)
@@ -15620,9 +15623,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
-    # Reap the workspace on archive too — tasks archived without ever
-    # completing previously kept their scratch dir / worktree forever.
-    _cleanup_workspace(conn, task_id)
+    # Reap only after worker death is verified (or there was no worker). An
+    # in-worker archive cannot kill its own process before returning either.
+    if can_reap:
+        _cleanup_workspace(conn, task_id)
     return True
 
 
