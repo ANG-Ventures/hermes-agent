@@ -34893,10 +34893,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and (getattr(session, "completion_reason", None) or "exited") == "exited"
                         and not _out.strip()
                     )
-                    if _agent_mode == "off" or (_agent_mode == "empty-success" and _healthy_silent):
+                    _required = bool(getattr(session, "completion_required", False))
+                    if not _required and (
+                        _agent_mode == "off"
+                        or (_agent_mode == "empty-success" and _healthy_silent)
+                    ):
                         # No synthetic agent turn, and no fall-through to a chat
                         # send. The session stays in the registry's finished
                         # table, so process(poll|wait|log) still reports it.
+                        # completion_required (goal wait barrier, code-spawned bot
+                        # delivery, promoted watch_patterns) always delivers.
                         logger.info(
                             "Process watcher: %s exited (code %s); agent completion "
                             "turn suppressed (display.background_process_agent_notify=%s)",

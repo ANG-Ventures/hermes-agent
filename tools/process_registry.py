@@ -433,6 +433,11 @@ class ProcessSession:
     # boundary (/new), instead of injecting them into the chat's NEW session.
     parent_session_id: str = ""
     notify_on_complete: bool = False             # Queue agent notification on exit
+    # Something structural depends on the completion turn (a goal parked on this
+    # process, a code-spawned bot delivery, a watch_patterns session promoted to
+    # notify_on_complete). The gateway delivers the turn even when
+    # display.background_process_agent_notify suppresses model-requested ones.
+    completion_required: bool = False
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -615,6 +620,7 @@ class ProcessRegistry:
                         # Promote to notify_on_complete so the agent still gets
                         # exactly one notification when the process actually ends.
                         session.notify_on_complete = True
+                        session.completion_required = True
                         should_disable = True
                 return_early = True
             else:
@@ -644,6 +650,7 @@ class ProcessRegistry:
                 if lifetime_exhausted:
                     session._watch_disabled = True
                     session.notify_on_complete = True
+                    session.completion_required = True
 
         if return_early:
             if should_disable:
@@ -2172,6 +2179,22 @@ class ProcessRegistry:
     # Minimum characters of the random suffix required for prefix resolution.
     # Short prefixes ("p", "pr", "proc_1") are too collision-prone to act on.
     _MIN_PREFIX_CHARS = 4
+
+    def require_completion(self, session_id: Optional[str] = None, pid: Optional[int] = None) -> int:
+        """Mark matching sessions ``completion_required`` (by id or OS pid).
+
+        Used by goal wait barriers: a parked goal resumes on the completion
+        turn, so that turn must be delivered even when the gateway suppresses
+        model-requested completion turns. Returns the number of sessions marked.
+        """
+        with self._lock:
+            sessions = list(self._running.values()) + list(self._finished.values())
+        marked = 0
+        for s in sessions:
+            if (session_id and s.id == session_id) or (pid and s.pid == pid):
+                s.completion_required = True
+                marked += 1
+        return marked
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
         """Get a session by ID (running or finished).

@@ -100,11 +100,11 @@ roots with repeatable `--add-dir`.
 
 ### Long / bounded runs (tests, builds, multi-file changes)
 
-Background it and get notified on completion, the same as the `codex` skill:
+Background it and collect the result with `process(action="wait")`:
 
 ```
-terminal(command="agy -p 'Implement the change described in TASK.md and run the tests' --dangerously-skip-permissions", workdir="/path/to/repo", background=true, notify_on_complete=true)
-# then: process(action="poll"/"log"/"wait", session_id=<id>)
+terminal(command="agy -p 'Implement the change described in TASK.md and run the tests' --dangerously-skip-permissions", workdir="/path/to/repo", background=true)
+# then: process(action="wait", session_id=<id>, timeout=...) (or "log")
 ```
 
 ### Interactive multi-turn (PTY + tmux)

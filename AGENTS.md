@@ -1359,7 +1359,12 @@ invalidation. See `/skills install --now` for the canonical pattern.
 ### Background Process Notifications (Gateway)
 
 When `terminal(background=true, notify_on_complete=true)` is used, the gateway runs a watcher that
-detects process completion and triggers a new agent turn. Control verbosity of background process
+detects process completion. Whether that exit injects a new agent turn is
+`display.background_process_agent_notify`: `off` (default — no turn; collect bounded jobs with
+`process(action="wait")`), `empty-success` (turn only on non-zero exit or non-empty output), or `on`.
+Sessions that structurally need the turn — a goal parked on the process, a code-spawned bot
+delivery, a `watch_patterns` session promoted to notify — always get it (`completion_required`).
+Control verbosity of background process
 messages with `display.background_process_notifications`
 in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 

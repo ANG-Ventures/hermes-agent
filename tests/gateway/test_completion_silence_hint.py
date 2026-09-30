@@ -63,7 +63,7 @@ class _OneShotRegistry:
 
 
 def _run_watcher(monkeypatch, tmp_path, *, exit_code, output, mode=None,
-                 completion_reason="exited"):
+                 completion_reason="exited", completion_required=False):
     import gateway.run as gateway_run
     import tools.process_registry as pr_module
 
@@ -76,7 +76,7 @@ def _run_watcher(monkeypatch, tmp_path, *, exit_code, output, mode=None,
     session = SimpleNamespace(
         output_buffer=output, exited=True, exit_code=exit_code,
         command="git-land-private.sh", completion_reason=completion_reason,
-        termination_source="", started_at=0.0,
+        termination_source="", started_at=0.0, completion_required=completion_required,
     )
     monkeypatch.setattr(pr_module, "process_registry", _OneShotRegistry(session))
 
@@ -163,3 +163,55 @@ def test_terminal_schema_steers_bounded_jobs_to_process_wait():
         assert "Pair with notify=true" not in text
     assert "Do NOT use notify=true for bounded jobs" in notify
     assert "notify=['pattern'" in notify   # readiness patterns stay documented
+
+
+# Prism P1 (round 1): flows that structurally depend on the completion turn must
+# still get it under the default-off knob.
+@pytest.mark.parametrize("mode", [None, "off", "empty-success"])
+def test_completion_required_session_injects_under_suppressing_modes(monkeypatch, tmp_path, mode):
+    enqueue, _ = _run_watcher(monkeypatch, tmp_path, exit_code=0, output="", mode=mode,
+                              completion_required=True)
+    enqueue.assert_awaited_once()
+
+
+def test_require_completion_marks_by_session_id_and_pid():
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    reg = ProcessRegistry()
+    a = ProcessSession(id="proc_a", command="x", pid=4242)
+    b = ProcessSession(id="proc_b", command="y", pid=4343)
+    reg._running[a.id] = a
+    reg._finished[b.id] = b
+    assert not a.completion_required and not b.completion_required
+    assert reg.require_completion(session_id="proc_b") == 1 and b.completion_required
+    assert reg.require_completion(pid=4242) == 1 and a.completion_required
+    assert reg.require_completion(session_id="nope", pid=1) == 0
+    # marking never turns a silent (non-notify) process into a notifying one
+    assert not a.notify_on_complete
+
+
+def test_goal_wait_barriers_mark_the_process(monkeypatch):
+    import hermes_cli.goals as goals
+
+    calls = []
+
+    class _Reg:
+        def require_completion(self, session_id=None, pid=None):
+            calls.append((session_id, pid))
+            return 1
+
+    import tools.process_registry as pr_module
+    monkeypatch.setattr(pr_module, "process_registry", _Reg())
+    goals._require_completion_turn(session_id="proc_ci")
+    goals._require_completion_turn(pid=77)
+    assert calls == [("proc_ci", None), (None, 77)]
+    import inspect
+    assert "_require_completion_turn(pid=pid)" in inspect.getsource(goals.GoalManager.wait_on)
+    assert "_require_completion_turn(session_id=session_id)" in inspect.getsource(goals.GoalManager.wait_on_session)
+
+
+def test_bot_dm_delivery_spawn_requires_completion():
+    import inspect
+    import tools.bot_mode_dm as bot_mode_dm
+
+    assert "_completion_required=True" in inspect.getsource(bot_mode_dm)

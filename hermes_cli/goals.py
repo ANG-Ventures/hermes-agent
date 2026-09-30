@@ -950,6 +950,17 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _require_completion_turn(*, session_id: str | None = None, pid: int | None = None) -> None:
+    """A parked goal resumes on the process's completion turn — make sure the
+    gateway delivers it even when display.background_process_agent_notify
+    suppresses model-requested completion turns. Best effort."""
+    try:
+        from tools.process_registry import process_registry
+        process_registry.require_completion(session_id=session_id, pid=pid)
+    except Exception:
+        pass
+
+
 def _session_waiting(session_id: str) -> bool:
     """Whether a goal parked on a process_registry session should stay parked.
 
@@ -1863,6 +1874,7 @@ class GoalManager:
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
         save_goal(self.session_id, self._state)
+        _require_completion_turn(pid=pid)
         return self._state
 
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
@@ -1885,6 +1897,7 @@ class GoalManager:
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
         save_goal(self.session_id, self._state)
+        _require_completion_turn(session_id=session_id)
         return self._state
 
     def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:

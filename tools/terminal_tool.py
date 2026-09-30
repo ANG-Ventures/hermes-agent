@@ -3068,6 +3068,7 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    _completion_required: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -3803,6 +3804,10 @@ def terminal_tool(
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
+                    # Internal (code-level) spawners whose flow depends on the
+                    # completion turn, e.g. bot DM delivery. Not model-settable.
+                    if _completion_required:
+                        proc_session.completion_required = True
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the

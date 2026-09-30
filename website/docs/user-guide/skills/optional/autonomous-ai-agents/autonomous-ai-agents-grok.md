@@ -155,11 +155,11 @@ terminal(command="grok --no-auto-update --always-approve -p 'Refactor the databa
 
 ```
 # Start headless in background
-terminal(command="grok --no-auto-update --always-approve -p 'Refactor the auth module'", workdir="/project", background=true, notify_on_complete=true)
+terminal(command="grok --no-auto-update --always-approve -p 'Refactor the auth module'", workdir="/project", background=true)
 # Returns session_id
 
-# Monitor
-process(action="poll", session_id="<id>")
+# Collect the result (exit notifications are off by default in messaging gateways)
+process(action="wait", session_id="<id>", timeout=600)
 process(action="log", session_id="<id>")
 
 # Kill if needed
@@ -237,10 +237,10 @@ terminal(command="git worktree add -b fix/issue-78 /tmp/issue-78 main", workdir=
 terminal(command="git worktree add -b fix/issue-99 /tmp/issue-99 main", workdir="~/project")
 
 # Launch Grok headless in each (background)
-terminal(command="grok --no-auto-update --always-approve -p 'Fix issue #78: <description>. Commit when done.'", workdir="/tmp/issue-78", background=true, notify_on_complete=true)
-terminal(command="grok --no-auto-update --always-approve -p 'Fix issue #99: <description>. Commit when done.'", workdir="/tmp/issue-99", background=true, notify_on_complete=true)
+terminal(command="grok --no-auto-update --always-approve -p 'Fix issue #78: <description>. Commit when done.'", workdir="/tmp/issue-78", background=true)
+terminal(command="grok --no-auto-update --always-approve -p 'Fix issue #99: <description>. Commit when done.'", workdir="/tmp/issue-99", background=true)
 
-# Monitor
+# Monitor, then collect each with process(action="wait", session_id=<id>, timeout=...)
 process(action="list")
 
 # After completion: push and open PRs
@@ -316,8 +316,8 @@ Put global preferences in `~/.grok/config.toml` (not project-scoped
 3. **Pass `--no-auto-update`** in every automated invocation.
 4. **Use `--always-approve` only when Grok should write autonomously**; omit it
    for read-only reviews and audits.
-5. **Background long tasks** with `background=true, notify_on_complete=true` and
-   monitor via the `process` tool.
+5. **Background long tasks** with `background=true` and collect the result with
+   `process(action="wait", timeout=...)` / `process(action="log")`.
 6. **Use tmux for multi-turn interactive work** and monitor with
    `tmux capture-pane -t <session> -p -S -50`.
 7. **Verify auth before relying on it** — check `~/.grok/auth.json` or run a
