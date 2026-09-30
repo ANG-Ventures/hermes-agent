@@ -951,7 +951,7 @@ def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
 MIXED_ROUTE = "mixed"
 
 
-def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> None:
+def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> int | None:
     """Set turns.corrected_context_used when context_used is not a context size.
 
     Only when the turn's final measured call carries usage_invariant_violation
@@ -973,8 +973,11 @@ def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> None:
         "SELECT usage_invariant_violation, corrected_prompt_tokens "
         "FROM turn_api_calls WHERE turn_id = ? AND parent_call_id IS NULL "
         "AND (http_status IS NULL OR http_status = 200) "
+        "AND coalesce(lane_family, '') != ? "
         "ORDER BY seq DESC LIMIT 1",
-        (turn_id,),
+        # An auxiliary call (title, compression) is not the turn's context:
+        # it must neither clear nor replace the main call's correction.
+        (turn_id, AUX_LANE_FAMILY),
     ).fetchone()
     violation, call_corrected = (last[0], last[1]) if last else (None, None)
     corrected = None
@@ -984,6 +987,7 @@ def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> None:
         "UPDATE turns SET corrected_context_used = ? WHERE turn_id = ?",
         (corrected, turn_id),
     )
+    return corrected
 
 
 def _refresh_turn_route(conn: sqlite3.Connection, turn_id: str) -> None:
@@ -1131,7 +1135,9 @@ def insert_turn(
                 return False
             _refresh_served_subs(conn, record.turn_id)
             _refresh_turn_route(conn, record.turn_id)
-            _refresh_context_invariant(conn, record.turn_id)
+            # The spend card renders this same record object after insert:
+            # carry the stored correction onto it (never into the upsert).
+            record.corrected_context_used = _refresh_context_invariant(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
             for seq, call in enumerate(record.tool_calls or []):
                 conn.execute(

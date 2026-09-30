@@ -67,6 +67,11 @@ class TurnRecord:
     # returned no usage sets them even when the final call is fully measured.
     # Renderers of last-call data must gate on THIS flag (r6 finding 9).
     last_call_prompt_unknown: bool = False
+    # Context-size correction (t_5918f6f7): NULL unless the final call carries
+    # the relay's usage_invariant_violation. Written by the store's
+    # _refresh_context_invariant (never by the turn upsert); insert_turn copies
+    # it back onto the record so the spend card renders the corrected size.
+    corrected_context_used: Optional[int] = None
     # Request composition of the FINAL call (char/4 fixed vs non-fixed buckets).
     # Distinct from the cache split above: this decomposes the request PAYLOAD
     # by source (system / tool schemas / history / tool results / tool args),

@@ -145,6 +145,44 @@ def test_backfilled_last_request_figure_survives_refinalize(db):
     assert _row(db, "SELECT corrected_context_used c FROM turns WHERE turn_id='t-bf'")["c"] == 897_883
 
 
+def test_auxiliary_call_does_not_clear_main_context_correction(db):
+    flagged = _bridge_usage(
+        1_795_696, usage_invariant_violation="prompt_exceeds_context_window",
+        relay_synthetic=True, context_window=1_000_000, upstream_requests=2,
+    )
+    _run_turn("t-aux", flagged, context_used=1_795_696)
+    # A title/compression call can land AFTER the main call and has a higher seq;
+    # its prompt is not the turn's context size (Prism round 1 on #1563).
+    blackbox.record_api_call(
+        turn_id="t-aux", seq=1, ts=101., provider="gemini-bridge",
+        model="gemini-3-flash", usage=_bridge_usage(1234), api_mode="chat_completions",
+        sub_key=None, attribution="aux:title_generation", http_status=200,
+        relay_synthetic=False, route_id=None,
+    )
+    assert _row(db, "SELECT corrected_context_used c FROM turns WHERE turn_id='t-aux'")["c"] == 1_000_000
+
+
+def test_card_hydration_and_just_finalized_record_receive_correction(db, monkeypatch):
+    from plugins.blackbox import card
+    from plugins.blackbox.record import TurnRecord
+
+    flagged = _bridge_usage(
+        1_795_696, usage_invariant_violation="prompt_exceeds_context_window",
+        relay_synthetic=True, context_window=1_000_000, upstream_requests=2,
+    )
+    _run_turn("t-card", flagged, context_used=1_795_696)
+    row = dict(_row(db, "SELECT * FROM turns WHERE turn_id='t-card'"))
+    rec = card._record_from_row(row)
+    assert rec.corrected_context_used == 1_000_000
+    assert "100%" in card._context_line(rec)
+    assert "180%" not in card._context_line(rec)
+    # Proactive cards render the freshly built record (not a rehydration).
+    rec2 = TurnRecord(turn_id="t-card", context_used=1_795_696, context_length=1_000_000)
+    store.insert_turn(rec2)
+    assert rec2.corrected_context_used == 1_000_000
+    assert "180%" not in card._context_line(rec2)
+
+
 def test_context_line_renders_corrected_and_names_raw():
     rec = {"context_used": 1_795_696, "context_length": 1_000_000,
            "corrected_context_used": 897_883, "input_tokens": 1_795_696,
