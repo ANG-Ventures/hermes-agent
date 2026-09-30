@@ -1066,14 +1066,16 @@ def _get_child_max_wall_seconds(child_timeout: Optional[float]) -> Optional[floa
     that keeps making progress is stopped once it has run this long since
     its start. Config ``delegation.child_max_wall_seconds``: 0/unset (and any
     invalid or negative value) = DEFAULT_CHILD_MAX_WALL_MULTIPLIER x
-    child_timeout; a positive value is used as-is, floored at child_timeout.
-    It cannot be disabled. None when there is no child_timeout (then no
-    wait ever returns TIMED_OUT_RUNNING, so there is nothing to bound).
+    child_timeout, never below that multiple of child_timeout's own 30 s
+    floor (120 s; identical for every configurable child_timeout); a
+    positive value is used as-is, floored at child_timeout. It cannot be
+    disabled. None when there is no child_timeout (then no wait ever
+    returns TIMED_OUT_RUNNING, so there is nothing to bound).
     """
     if not child_timeout:
         return None
     floor = float(child_timeout)
-    default = floor * DEFAULT_CHILD_MAX_WALL_MULTIPLIER
+    default = max(floor, 30.0) * DEFAULT_CHILD_MAX_WALL_MULTIPLIER
     val = _load_config().get("child_max_wall_seconds")
     if val is None:
         return default

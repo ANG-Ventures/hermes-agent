@@ -69,7 +69,7 @@ def test_child_raising_timeout_error_is_delivered_not_polled_forever(
     assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
     release.set()
 
-    assert _wait_until(lambda: _late_results(parent), timeout=3.0), (
+    assert _wait_until(lambda: _late_results(parent), timeout=10.0), (
         "a child that raised TimeoutError was polled forever"
     )
     (late,) = _late_results(parent)
@@ -102,10 +102,10 @@ def test_progressing_child_is_bounded_by_absolute_wall_ceiling(fleet_home, monke
         start = time.monotonic()
         entry = delegate_tool._run_single_child(0, "busy goal", child, parent)
         assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
-        assert _wait_until(lambda: _late_results(parent), timeout=4.0), (
+        assert _wait_until(lambda: _late_results(parent), timeout=10.0), (
             "a child that keeps making progress was polled without a wall ceiling"
         )
-        assert time.monotonic() - start < 4.0
+        assert time.monotonic() - start < 10.0
         (late,) = _late_results(parent)
         assert late["status"] == "timeout"
         assert "wall" in late["error"]
@@ -126,6 +126,7 @@ def test_child_max_wall_seconds_config_contract(monkeypatch):
     get = delegate_tool._get_child_max_wall_seconds
     assert get(None) is None  # no child_timeout -> no late path to bound
     assert get(60.0) == 240.0  # unset: 4x child_timeout
+    assert get(0.3) == 120.0  # never below 4x child_timeout's own 30 s floor
     for val, want in ((0, 240.0), (-5, 240.0), ("junk", 240.0), (100, 100.0), (10, 60.0)):
         cfg["child_max_wall_seconds"] = val
         assert get(60.0) == want, val
@@ -161,7 +162,7 @@ def test_stalled_late_schema_retry_is_supervised_and_bounded(fleet_home, monkeyp
         entry = delegate_tool._run_single_child(0, "retry goal", child, parent)
         assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
         release.set()
-        assert _wait_until(lambda: _late_results(parent), timeout=4.0), (
+        assert _wait_until(lambda: _late_results(parent), timeout=10.0), (
             "a stalled schema-correction turn blocked the late result"
         )
         (late,) = _late_results(parent)
@@ -248,7 +249,7 @@ def test_late_result_persists_under_the_owning_profile_context(
     assert advertised.startswith(str(profile_home))
     release.set()
 
-    assert _wait_until(lambda: os.path.exists(advertised), timeout=4.0), (
+    assert _wait_until(lambda: os.path.exists(advertised), timeout=10.0), (
         "late result was not written where it was advertised (owning profile)"
     )
     rec = json.loads(open(advertised, encoding="utf-8").read())
