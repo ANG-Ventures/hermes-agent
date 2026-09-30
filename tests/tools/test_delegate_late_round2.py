@@ -126,7 +126,8 @@ def test_child_max_wall_seconds_config_contract(monkeypatch):
     get = delegate_tool._get_child_max_wall_seconds
     assert get(None) is None  # no child_timeout -> no late path to bound
     assert get(60.0) == 240.0  # unset: 4x child_timeout
-    assert get(0.3) == 120.0  # never below 4x child_timeout's own 30 s floor
+    # never below 4x child_timeout's own floor
+    assert get(0.3) == delegate_tool._CHILD_TIMEOUT_FLOOR_S * 4
     for val, want in ((0, 240.0), (-5, 240.0), ("junk", 240.0), (100, 100.0), (10, 60.0)):
         cfg["child_max_wall_seconds"] = val
         assert get(60.0) == want, val

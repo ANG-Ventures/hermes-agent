@@ -2316,7 +2316,7 @@ DEFAULT_CONFIG = {
                                      # = no timeout: children fail only from real errors
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+                                     # (floor 60s) to enforce a hard cap.
         "child_max_wall_seconds": 0,  # absolute ceiling for a child whose wait hit
                                       # child_timeout_seconds while it was still working
                                       # (timed_out_running). The late owner stops such a
