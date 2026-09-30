@@ -122,6 +122,90 @@ def test_review_fork_inherited_tools_survive_compaction_refresh():
     assert fork.valid_tool_names == {"skill_view", "mem0_search"}
 
 
+def test_codex_review_fork_request_keeps_parent_cache_key_and_prefix():
+    """openai-codex: the review fork's Responses request must route to the
+    parent's cache (same ``prompt_cache_key``) and replay the parent's input
+    as a strict prefix.
+
+    ``prompt_cache_key`` hashes instructions + tool schemas + scope
+    (agent/transports/codex.py ``_content_cache_key``), so a fork whose
+    tools[] lacks the parent's provider schemas (mem0_*) gets a different
+    key and lands on a replica without the parent's prefix. Measured on
+    2026-09-23/24 (pre-#974, t_b28ced4f): 87 of 87 worker review-fork calls
+    on openai-codex read 0 or the ~14k cross-session head instead of the
+    parent's 100-275k prefix.
+    """
+    from agent.background_review import build_cache_parity_fork
+    from agent.prompt_cache_scope import resolve_prompt_cache_scope
+    from agent.transports import get_transport
+    import agent.transports.codex  # noqa: F401
+
+    parent_tools = [
+        {"type": "function", "function": {"name": "skill_view", "description": "v",
+                                          "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "mem0_search", "description": "m",
+                                          "parameters": {"type": "object"}}},
+    ]
+    parent = SimpleNamespace(
+        model="gpt-6-sol-900k", provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex", platform="cli",
+        session_id="20260924_093923_1574ec", tools=parent_tools,
+        valid_tool_names={"skill_view", "mem0_search"},
+        _cached_system_prompt="PARENT SYSTEM", session_start=object(),
+        _memory_store=None, _memory_enabled=False, _user_profile_enabled=False,
+        enabled_toolsets=["skills", "memory"], disabled_toolsets=None,
+        request_overrides={}, _session_db=None,
+    )
+
+    class Fork:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.provider = kwargs.get("provider")
+            self.base_url = kwargs.get("base_url")
+            # AIAgent(skip_memory=True) assembles tools without provider schemas.
+            self.tools = [parent_tools[0]]
+            self.valid_tool_names = {"skill_view"}
+            self._memory_manager = None
+            self.context_compressor = None
+
+    runtime = {"model": parent.model, "provider": parent.provider,
+               "base_url": parent.base_url, "routed": False}
+    with patch("run_agent.AIAgent", Fork), patch(
+        "agent.background_review._resolve_review_runtime", return_value=runtime
+    ):
+        fork, _, routed = build_cache_parity_fork(parent, max_iterations=3)
+    assert not routed
+
+    transport = get_transport("codex_responses")
+    history = [
+        {"role": "system", "content": parent._cached_system_prompt},
+        {"role": "user", "content": "work kanban task t_x"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    def request(agent, messages):
+        return transport.build_kwargs(
+            model=agent.model, messages=messages, tools=agent.tools,
+            session_id=agent.session_id,
+            cache_scope_id=resolve_prompt_cache_scope(agent),
+            is_codex_backend=True,
+        )
+
+    parent_kw = request(parent, history)
+    fork_kw = request(
+        fork,
+        [{**history[0], "content": fork._cached_system_prompt}] + history[1:]
+        + [{"role": "user", "content": "review the conversation above"}],
+    )
+
+    assert fork_kw["prompt_cache_key"] == parent_kw["prompt_cache_key"]
+    assert fork_kw["instructions"] == parent_kw["instructions"]
+    assert fork_kw["tools"] == parent_kw["tools"]
+    n = len(parent_kw["input"])
+    assert fork_kw["input"][:n] == parent_kw["input"]
+    assert len(fork_kw["input"]) > n
+
+
 def _make_agent_stub(agent_cls):
     """Create a minimal AIAgent-like object with just enough state for _spawn_background_review."""
     agent = object.__new__(agent_cls)
