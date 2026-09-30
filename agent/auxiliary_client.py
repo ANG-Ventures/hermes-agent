@@ -940,17 +940,19 @@ def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = Non
     ``gpt-daybreak-blue-latest`` Codex slug is also a verified Sol-family
     alias and receives the same autoraise.
 
-    ``-900k`` large-context picker variants are explicitly EXCLUDED: the
-    85% autoraise exists to stop wasting a small 272K window, and a 900K
-    window doesn't have that problem — those sessions keep the user's
-    global ``compression.threshold`` (default 50%, ~450K).
+    Slugs that resolve to the large verified window are explicitly EXCLUDED
+    (valid ``-900k`` variants always; bare eligible slugs under the default
+    ``model.codex_context_policy: large``): the 85% autoraise exists to stop
+    wasting a small 272K window, and a 900K window doesn't have that
+    problem — those sessions keep the user's global ``compression.threshold``
+    (default 50%, ~450K) and never show the 272K autoraise banner.
     """
     prov = (provider or "").strip().lower()
     if prov != "openai-codex":
         return False
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
-    from agent.model_metadata import is_codex_context_variant
-    if is_codex_context_variant(bare):
+    from agent.model_metadata import codex_uses_large_window
+    if codex_uses_large_window(bare):
         return False
     return (
         bare == "gpt-5.4"

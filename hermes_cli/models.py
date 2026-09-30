@@ -7408,6 +7408,22 @@ def validate_requested_model(
                         "message": None,
                     }
                 _base_guess = requested_for_lookup[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+                from agent.model_metadata import (
+                    CODEX_CONTEXT_POLICY_LARGE,
+                    codex_context_policy,
+                )
+                if codex_context_policy() == CODEX_CONTEXT_POLICY_LARGE:
+                    # Bare eligible slugs already get the large window; the
+                    # `-900k` suffix is a legacy alias, so point at the bare slug.
+                    _hint = (
+                        "Pick the base model, or a large-window model from the "
+                        "`/model` picker (e.g. `gpt-6-sol`)."
+                    )
+                else:
+                    _hint = (
+                        "Pick the base model, or a verified variant from the "
+                        "`/model` picker (e.g. `gpt-5.6-sol-900k`)."
+                    )
                 return {
                     "accepted": False,
                     "persist": False,
@@ -7415,9 +7431,7 @@ def validate_requested_model(
                     "message": (
                         f"`{requested}` is not a valid large-context variant — "
                         f"`{_base_guess}` enforces the standard 272K window on "
-                        f"Codex, so no `-900k` option exists for it. Pick the "
-                        f"base model, or a verified variant from the `/model` "
-                        f"picker (e.g. `gpt-5.6-sol-900k`)."
+                        f"Codex, so no `-900k` option exists for it. {_hint}"
                     ),
                 }
         if catalog_models:

@@ -2882,11 +2882,12 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 # ≥11K margin under the observed ceiling and matches the compaction point
 # Codex's own client config documents for the 1M window.
 #
-# OPT-IN ONLY (Aug 2026 policy, Teknium): the large window is exposed via
-# explicit ``-900k`` picker variants (e.g. ``gpt-5.6-sol-900k``) — the base
-# slugs keep the advertised 272K so the cheaper limit is the default. A
-# week of the 900K default burned through subscription usage for people
-# who never asked for it. The variant suffix is a Hermes-side alias: it is
+# POLICY (``model.codex_context_policy``, see codex_context_policy below):
+# upstream's Aug 2026 policy (Teknium) made the large window OPT-IN via
+# explicit ``-900k`` picker variants (e.g. ``gpt-5.6-sol-900k``) after a week
+# of a 900K default burned subscription usage. This fork defaults to
+# ``large`` (Ace 2026-09-30): bare eligible slugs get the verified window and
+# ``-900k`` is a legacy alias; ``advertised`` restores the opt-in behaviour. The variant suffix is a Hermes-side alias: it is
 # stripped before the model id hits the wire (see
 # ``strip_codex_context_variant_suffix`` callers in agent/transports/codex.py
 # and agent/auxiliary_client.py).
@@ -3028,20 +3029,96 @@ def has_codex_context_variant(model_bare: str) -> bool:
     return is_codex_900k_base(model_bare)
 
 
-def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
-    """Return the live-verified Codex cap for an OPTED-IN slug, or ``None``.
+# ``model.codex_context_policy`` (config.yaml) — which window an ELIGIBLE
+# Codex slug resolves to (Ace 2026-09-30 11:17 PT, "big window by default
+# forever"; card t_73689428):
+#   large      (default when absent) — a BARE eligible slug (``gpt-6-sol``)
+#              resolves to its live-verified large window; the ``-900k``
+#              picker suffix is a legacy alias for the SAME window.
+#   advertised — pre-2026-09-30 behaviour: bare slugs keep the advertised
+#              272K and only explicit ``-900k`` variants get the verified cap.
+# Nothing changes on the wire in either mode (bare slug is sent bare, the
+# ``-900k`` alias is stripped). Read from the ACTIVE config.yaml (root, or
+# the profile's own config under a profile home) so one agent can be flipped
+# back alone:  hermes config set model.codex_context_policy advertised
+CODEX_CONTEXT_POLICY_LARGE = "large"
+CODEX_CONTEXT_POLICY_ADVERTISED = "advertised"
+_CODEX_CONTEXT_POLICIES = frozenset(
+    {CODEX_CONTEXT_POLICY_LARGE, CODEX_CONTEXT_POLICY_ADVERTISED}
+)
+CODEX_CONTEXT_POLICY_DEFAULT = CODEX_CONTEXT_POLICY_LARGE
 
-    The large window is opt-in: only VALID ``-900k`` picker variants
-    (e.g. ``gpt-5.6-sol-900k``) resolve to the verified cap. Base slugs
-    keep the advertised 272K so the cheaper default limit applies unless
-    the user explicitly selects the large-context variant; ineligible
-    aliases (``gpt-5.5-900k``) never resolve here.
+
+def _codex_context_policy_from_config() -> str:
+    """Read ``model.codex_context_policy`` from the active config.yaml.
+
+    Absent, unreadable, or unrecognised values fall back to the default
+    (``large``). A legacy string-shaped ``model:`` key has no sub-keys and
+    therefore also resolves to the default.
+    """
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        cfg = read_raw_config_readonly()
+    except Exception:
+        return CODEX_CONTEXT_POLICY_DEFAULT
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    raw = model_cfg.get("codex_context_policy") if isinstance(model_cfg, dict) else None
+    if raw is None:
+        return CODEX_CONTEXT_POLICY_DEFAULT
+    value = str(raw).strip().lower()
+    if value in _CODEX_CONTEXT_POLICIES:
+        return value
+    logger.warning(
+        "Unknown model.codex_context_policy %r (expected 'large' or "
+        "'advertised'); using %r",
+        raw, CODEX_CONTEXT_POLICY_DEFAULT,
+    )
+    return CODEX_CONTEXT_POLICY_DEFAULT
+
+
+def codex_context_policy() -> str:
+    """Active ``model.codex_context_policy``: ``"large"`` or ``"advertised"``."""
+    return _codex_context_policy_from_config()
+
+
+def codex_uses_large_window(model: Optional[str]) -> bool:
+    """True when *model* resolves to the live-verified large Codex window.
+
+    A VALID ``-900k`` variant always does (legacy alias). A bare ELIGIBLE
+    base slug does under the default ``large`` policy. Ineligible slugs
+    (``gpt-5.5``, ``gpt-5.4-mini``, ``-pro``) and ineligible aliases
+    (``gpt-5.5-900k``) never do. Single predicate for every consumer that
+    must agree with the context resolver (compaction autoraise, LCM cap).
+    """
+    if is_codex_context_variant(model):
+        return True
+    return (
+        codex_context_policy() == CODEX_CONTEXT_POLICY_LARGE
+        and is_codex_900k_base(model)
+    )
+
+
+def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
+    """Return the live-verified Codex cap for a large-window slug, or ``None``.
+
+    Under ``model.codex_context_policy: large`` (default) an eligible BARE
+    slug and its VALID ``-900k`` alias both resolve to the verified cap.
+    Under ``advertised`` only valid ``-900k`` variants do; base slugs keep
+    the advertised 272K. Ineligible slugs and aliases (``gpt-5.5-900k``)
+    never resolve here.
     """
     slug = _bare_codex_slug(model_bare)
-    if not slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
-        return None
-    base = slug[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
-    if not is_codex_900k_base(base):
+    if slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
+        base = slug[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+        if not is_codex_900k_base(base):
+            return None
+    elif (
+        codex_context_policy() == CODEX_CONTEXT_POLICY_LARGE
+        and is_codex_900k_base(slug)
+    ):
+        base = slug
+    else:
         return None
     exact = _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT.get(base)
     if exact is not None:
@@ -3160,7 +3237,8 @@ def _resolve_codex_oauth_context_length_with_source(
     def _apply_verified_bump(ctx: int, source: str) -> Tuple[int, str]:
         """Lift a known-stale 272K advertisement to the live-verified cap.
 
-        Only fires for explicit ``-900k`` picker variants (opt-in), and only
+        Fires for eligible slugs per ``model.codex_context_policy`` (bare +
+        ``-900k`` under ``large``; ``-900k`` only under ``advertised``), and only
         when the resolved value is EXACTLY the stale 272,000 advertisement
         for a slug we have probed above it (see
         ``_verified_codex_ctx_for_slug``). Any other advertised value —
