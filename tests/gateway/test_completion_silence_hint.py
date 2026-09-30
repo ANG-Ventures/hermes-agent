@@ -61,9 +61,16 @@ class _OneShotRegistry:
     def is_completion_consumed(self, session_id):
         return False
 
+    def suppress_completion(self, session, replay):
+        if getattr(session, "completion_required", False):
+            return False
+        session._replay_completion = replay
+        return True
+
 
 def _run_watcher(monkeypatch, tmp_path, *, exit_code, output, mode=None,
-                 completion_reason="exited", completion_required=False):
+                 completion_reason="exited", completion_required=False,
+                 producer_mode=None):
     import gateway.run as gateway_run
     import tools.process_registry as pr_module
 
@@ -94,6 +101,8 @@ def _run_watcher(monkeypatch, tmp_path, *, exit_code, output, mode=None,
         "session_id": "proc_land", "check_interval": 0, "platform": "telegram",
         "chat_id": "123", "notify_on_complete": True,
     }
+    if producer_mode is not None:
+        watcher["agent_notify_mode"] = producer_mode
     asyncio.run(runner._run_process_watcher(watcher))
     return enqueue, adapter
 
@@ -228,3 +237,91 @@ def test_bot_dm_delivery_spawn_requires_completion(monkeypatch):
     bot_mode_dm._spawn_delivery("true", "@peer", dm_file=None, task_id=None, agent=None)
     assert calls and calls[0]["notify_on_complete"] is True
     assert calls[0]["_completion_required"] is True
+
+
+# Prism round 2.
+@pytest.mark.parametrize("producer,config,injects", [("on", "off", True), ("off", "on", False)])
+def test_mode_resolved_in_producing_profile_wins(monkeypatch, tmp_path, producer, config, injects):
+    enqueue, _ = _run_watcher(monkeypatch, tmp_path, exit_code=1, output="x\n", mode=config,
+                              producer_mode=producer)
+    assert enqueue.await_count == (1 if injects else 0)
+
+
+def test_goal_parking_after_suppressed_exit_replays_the_turn(monkeypatch, tmp_path):
+    """Lost-wakeup race: the process exits (turn suppressed) BEFORE the goal
+    parks; require_completion must replay the stashed completion turn."""
+    import gateway.run as gateway_run
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    (tmp_path / "config.yaml").write_text("display: {}\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", tmp_path / "procs.json")
+    reg = ProcessRegistry()
+    sess = ProcessSession(id="proc_ci", command="ci-watch", exited=True, exit_code=0,
+                          notify_on_complete=True)
+    reg._finished[sess.id] = sess
+    monkeypatch.setattr(pr_module, "process_registry", reg)
+
+    runner = GatewayRunner(GatewayConfig())
+    runner.adapters[Platform.TELEGRAM] = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    enqueue = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_enqueue_process_completion_notification", enqueue)
+
+    async def main():
+        await runner._run_process_watcher({
+            "session_id": "proc_ci", "check_interval": 0, "platform": "telegram",
+            "chat_id": "123", "notify_on_complete": True,
+        })
+        assert enqueue.await_count == 0          # default off: suppressed
+        # goal parks from the agent thread, after the exit
+        assert await asyncio.to_thread(reg.require_completion, session_id="proc_ci") == 1
+        for _ in range(50):
+            if enqueue.await_count:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(main())
+    enqueue.assert_awaited_once()
+    assert enqueue.await_args.args[1]["session_id"] == "proc_ci"
+    # replay is one-shot
+    assert sess._replay_completion is None
+
+
+def test_completion_required_and_mode_survive_checkpoint_round_trip(monkeypatch, tmp_path):
+    import json
+    import os
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    ckpt = tmp_path / "procs.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", ckpt)
+    reg = ProcessRegistry()
+    s = ProcessSession(id="proc_live", command="sleep 999", pid=os.getpid(), task_id="t1",
+                       notify_on_complete=True, completion_required=True, agent_notify_mode="on")
+    reg._running[s.id] = s
+    reg._write_checkpoint()
+    entry = json.loads(ckpt.read_text())[0]
+    assert entry["completion_required"] is True and entry["agent_notify_mode"] == "on"
+
+    reg2 = ProcessRegistry()
+    assert reg2.recover_from_checkpoint() == 1
+    r = reg2.get("proc_live")
+    assert r.completion_required is True and r.agent_notify_mode == "on"
+
+
+@pytest.mark.parametrize("raw,want", [(None, "off"), ("", "off"), (False, "off"), (True, "on"),
+                                      ("EMPTY_SUCCESS", "empty-success"), ("bogus", "off")])
+def test_normalize_agent_notify_mode(raw, want):
+    from tools.process_registry import normalize_agent_notify_mode
+    assert normalize_agent_notify_mode(raw) == want
+
+
+def test_spawn_stamps_producer_profile_mode(tmp_path, monkeypatch):
+    import tools.process_registry as pr_module
+    import yaml
+    home = __import__("os").environ["HERMES_HOME"]
+    from pathlib import Path
+    Path(home, "config.yaml").write_text(
+        yaml.safe_dump({"display": {"background_process_agent_notify": "empty_success"}}))
+    assert pr_module.resolve_agent_notify_mode() == "empty-success"

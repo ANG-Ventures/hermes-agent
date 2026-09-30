@@ -3808,6 +3808,10 @@ def terminal_tool(
                     # completion turn, e.g. bot DM delivery. Not model-settable.
                     if _completion_required:
                         proc_session.completion_required = True
+                    # Resolve the agent-notify knob in THIS (producing) profile;
+                    # the watcher may be drained by another profile's turn.
+                    from tools.process_registry import resolve_agent_notify_mode
+                    proc_session.agent_notify_mode = resolve_agent_notify_mode()
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
@@ -3826,6 +3830,7 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "agent_notify_mode": proc_session.agent_notify_mode,
                             "parent_session_id": proc_session.parent_session_id,
                         })
 

@@ -12535,18 +12535,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         in that turn was ignored 3x (09-27, 09-29, 09-30). Bounded jobs use
         ``process(action=wait)`` instead (Ace, 2026-09-30).
         """
+        from tools.process_registry import AGENT_NOTIFY_MODES, normalize_agent_notify_mode
         cfg = _load_gateway_runtime_config()
         raw = cfg_get(cfg, "display", "background_process_agent_notify")
-        if raw is False:
-            return "off"
-        if raw is True:
-            return "on"
-        mode = str(raw).strip().lower().replace("_", "-") if raw not in {None, ""} else "off"
-        if mode not in {"off", "empty-success", "on"}:
+        mode = normalize_agent_notify_mode(raw)
+        if raw not in (None, "", True, False) and str(raw).strip().lower().replace("_", "-") not in AGENT_NOTIFY_MODES:
             logger.warning(
                 "Unknown background_process_agent_notify '%s', defaulting to 'off'", raw,
             )
-            return "off"
         return mode
 
     @staticmethod
@@ -34887,28 +34883,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         _out = _raw
                     _out = _redact_gateway_user_facing_secrets(_out)
-                    _agent_mode = self._load_background_agent_notify_mode()
-                    _healthy_silent = (
-                        session.exit_code == 0
-                        and (getattr(session, "completion_reason", None) or "exited") == "exited"
-                        and not _out.strip()
-                    )
-                    _required = bool(getattr(session, "completion_required", False))
-                    if not _required and (
-                        _agent_mode == "off"
-                        or (_agent_mode == "empty-success" and _healthy_silent)
-                    ):
-                        # No synthetic agent turn, and no fall-through to a chat
-                        # send. The session stays in the registry's finished
-                        # table, so process(poll|wait|log) still reports it.
-                        # completion_required (goal wait barrier, code-spawned bot
-                        # delivery, promoted watch_patterns) always delivers.
-                        logger.info(
-                            "Process watcher: %s exited (code %s); agent completion "
-                            "turn suppressed (display.background_process_agent_notify=%s)",
-                            session_id, session.exit_code, _agent_mode,
-                        )
-                        break
                     completion_evt = {
                         "type": "completion",
                         "session_id": session_id,
@@ -34939,6 +34913,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
+                    # display.background_process_agent_notify, resolved in the
+                    # SPAWNING profile when known (the draining turn may belong
+                    # to another profile), else in this scope.
+                    _agent_mode = (
+                        watcher.get("agent_notify_mode")
+                        or getattr(session, "agent_notify_mode", "")
+                        or self._load_background_agent_notify_mode()
+                    )
+                    _healthy_silent = (
+                        session.exit_code == 0
+                        and (getattr(session, "completion_reason", None) or "exited") == "exited"
+                        and not _out.strip()
+                    )
+                    if _agent_mode == "off" or (_agent_mode == "empty-success" and _healthy_silent):
+                        # Suppress: no synthetic agent turn and no fall-through
+                        # to a chat post; process(poll|wait|log) still see the
+                        # exit. completion_required (goal wait barrier, code-
+                        # spawned bot delivery, promoted watch_patterns) always
+                        # delivers — decided atomically against
+                        # require_completion(), which replays the stashed turn
+                        # if a goal parks after this exit.
+                        _loop = asyncio.get_running_loop()
+
+                        def _replay(_t=synth_text, _e=completion_evt, _l=_loop):
+                            asyncio.run_coroutine_threadsafe(
+                                self._enqueue_process_completion_notification(_t, _e), _l,
+                            )
+
+                        if _pr_check.suppress_completion(session, _replay):
+                            logger.info(
+                                "Process watcher: %s exited (code %s); agent completion "
+                                "turn suppressed (display.background_process_agent_notify=%s)",
+                                session_id, session.exit_code, _agent_mode,
+                            )
+                            break
                     delivered = await self._enqueue_process_completion_notification(
                         synth_text, completion_evt,
                     )
