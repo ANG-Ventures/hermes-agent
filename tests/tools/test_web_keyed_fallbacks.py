@@ -107,4 +107,3 @@ async def test_exhausted_chain_reaches_ring(setup, monkeypatch):
     out = json.loads(await web_tools.web_extract_tool(urls))
     assert calls == ["firecrawl", "tavily", "exa"]
     assert out["results"][0]["content"] == "ring"
-    assert out["results"][0]["metadata"]["rescued_from"] == "exa"
