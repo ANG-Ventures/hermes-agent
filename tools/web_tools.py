@@ -431,7 +431,7 @@ def _ddgs_package_importable() -> bool:
 # ─── Configured keyed fallbacks, then one-shot keyless rescue ─────────────────
 
 def _keyed_fallbacks(capability: str, primary: str):
-    """Yield distinct configured providers with credentials, never anonymous ring paths."""
+    """Yield distinct configured providers with credentials for the keyed tier."""
     from agent.web_search_registry import get_provider
     from agent.web_search_provider import get_provider_env
 
