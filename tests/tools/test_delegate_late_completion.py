@@ -154,38 +154,59 @@ def _late_results(parent):
 
 # 1 ---------------------------------------------------------------------------
 def test_hung_child_after_one_api_call_is_reaped_at_child_timeout(fleet_home, monkeypatch):
-    """Active at the wait, then hangs: the late-completion ceiling reaps it."""
+    """Active at the wait, then hangs: the late-completion ceiling reaps it.
+
+    No stopwatch: a wall-clock bound from before ``_run_single_child`` mostly
+    measured setup and the wait phase (1.0-1.6 s of a 1.5-2.4 s run on an idle
+    box; 3.9-4.7 s on PR CI). The behaviour is asserted instead: the lease is
+    released and the child interrupted WHILE the child is still hung (so the
+    ceiling reaped it, not the child finishing), and the reap names the
+    child_timeout as its ceiling.
+    """
     from tools import delegate_tool
 
-    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+    child_timeout = 0.3
+    hang_seconds = 30.0
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: child_timeout)
     forever = threading.Event()
+    child_returned = threading.Event()
 
     def _hang(self):
-        # One API call; last activity 0.2 s into the wait, then blocked
-        # forever (ignores interrupts).
-        self.frozen_activity_ts = time.time() + 0.2
-        forever.wait(30)
-        return {"final_response": "", "completed": False, "api_calls": 1}
+        # One API call; last activity 0.2 s into the wait, then blocked for
+        # hang_seconds (ignores interrupts).
+        try:
+            self.frozen_activity_ts = time.time() + 0.2
+            forever.wait(hang_seconds)
+            return {"final_response": "", "completed": False, "api_calls": 1}
+        finally:
+            child_returned.set()
 
     parent = _Agent(None, depth=0)
     child = _Agent("sa-0-hung", parent=parent, api_calls=1, behavior=_hang)
     pool = _Pool()
     child._credential_pool = pool
     try:
-        start = time.monotonic()
         entry = delegate_tool._run_single_child(0, "hung goal", child, parent)
         assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
         assert pool.released == [], "lease must stay with the still-active child"
-        assert _wait_until(lambda: pool.released == ["cred-1"], timeout=3.0), (
+        # Deadlock backstop only: well below the child's own hang, so a missing
+        # ceiling fails here instead of the child returning and releasing.
+        assert _wait_until(lambda: pool.released == ["cred-1"], timeout=hang_seconds / 3), (
             "hung child kept its credential lease"
         )
-        assert time.monotonic() - start < 3.0
+        assert not child_returned.is_set(), (
+            "lease was released only after the hung child returned on its own; "
+            "the hang ceiling never reaped it"
+        )
         assert child.interrupt_seen.is_set(), "hung child was never stopped"
         assert not _registered("sa-0-hung")
         assert _wait_until(lambda: _late_results(parent))
         (late,) = _late_results(parent)
         assert late["status"] == "timeout"
         assert "hung" in late["error"]
+        assert f"no progress for {child_timeout}s" in late["error"], (
+            f"hang ceiling is not child_timeout: {late['error']!r}"
+        )
     finally:
         forever.set()
 
