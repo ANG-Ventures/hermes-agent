@@ -400,6 +400,74 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
     return False
 
 
+# Outcome of a delegate_task wait that hit child_timeout_seconds while the
+# child (or its subtree) is still working. NOT a failure: the child keeps
+# running and delivers its real result later. Reporting it as dead made a
+# root re-launch the same brief, running two trees concurrently (2026-09-08).
+TIMED_OUT_RUNNING = "timed_out_running"
+
+
+def _live_subtree_records(root_agent: Any) -> List[Dict[str, Any]]:
+    """Live registry records strictly BELOW *root_agent* in the spawn tree.
+
+    Matches on the weakref identity chain and, as a fallback for a broken
+    chain, on the ``parent_id`` subagent-id chain rooted at the root's id.
+    """
+    if root_agent is None:
+        return []
+    root_sid = getattr(root_agent, "_subagent_id", None)
+    with _active_subagents_lock:
+        records = list(_active_subagents.values())
+    below_ids: set = set()
+    if isinstance(root_sid, str) and root_sid:
+        frontier = {root_sid}
+        while frontier:
+            nxt = {
+                r.get("subagent_id")
+                for r in records
+                if r.get("parent_id") in frontier
+                and r.get("subagent_id") not in below_ids
+            }
+            nxt.discard(None)
+            below_ids |= nxt
+            frontier = nxt
+    out = []
+    for r in records:
+        agent = r.get("agent")
+        if agent is root_agent:
+            continue
+        if r.get("subagent_id") in below_ids or _is_descendant_of(agent, root_agent):
+            out.append(r)
+    return out
+
+
+def _reap_subtree(root_agent: Any, reason: str) -> List[str]:
+    """Cancel every live descendant of *root_agent* (its own stop is the caller's).
+
+    Called on a GENUINE failure of *root_agent* (exception, kill) so no orphan
+    outlives its parent's reported failure. A descendant carrying an explicit
+    internal ``_delegate_detach`` flag is left running. Returns reaped ids.
+    """
+    reaped: List[str] = []
+    for r in _live_subtree_records(root_agent):
+        agent = r.get("agent")
+        if agent is None or getattr(agent, "_delegate_detach", False) is True:
+            continue
+        try:
+            if request_hard_interrupt(agent, f"Parent subagent failed ({reason})"):
+                reaped.append(str(r.get("subagent_id")))
+        except Exception as exc:
+            logger.debug("subtree reap of %s failed: %s", r.get("subagent_id"), exc)
+    if reaped:
+        logger.info(
+            "delegate_task reap: parent=%s reason=%s reaped=%s",
+            getattr(root_agent, "_subagent_id", None),
+            reason,
+            ",".join(reaped),
+        )
+    return reaped
+
+
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
 _CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
@@ -486,10 +554,16 @@ def _handle_control_action(
             if not _owns_subagent_record(r, parent_agent):
                 continue
             started = r.get("started_at")
+            _spawn_depth = getattr(agent, "_delegate_depth", None)
+            if not isinstance(_spawn_depth, int) or isinstance(_spawn_depth, bool):
+                _rd = r.get("depth")
+                _spawn_depth = _rd + 1 if isinstance(_rd, int) else None
             entries.append(
                 {
                     "subagent_id": r.get("subagent_id"),
                     "parent_id": r.get("parent_id"),
+                    # Spawn depth (1 = direct child) so a lead sees a tree.
+                    "depth": _spawn_depth,
                     "goal": r.get("goal"),
                     "model": r.get("model"),
                     "status": r.get("status"),
@@ -2767,6 +2841,197 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+_LATE_RESULT_MAX_CHARS = 8000
+
+
+def _timed_out_running_entry(
+    *,
+    task_index: int,
+    child: Any,
+    subagent_id: Optional[str],
+    child_timeout: Optional[float],
+    duration: float,
+) -> Optional[Dict[str, Any]]:
+    """Result entry for a wait that timed out while the child still works.
+
+    Returns None for a child that never reached its first LLM call and has
+    no live descendants: that is a wedge, handled by the timeout+diagnostic
+    failure path (#14726), not live work.
+    """
+    api_calls = 0
+    try:
+        api_calls = int(child.get_activity_summary().get("api_call_count", 0) or 0)
+    except Exception:
+        pass
+    below = _live_subtree_records(child)
+    if api_calls == 0 and not below:
+        return None
+    live = [
+        {
+            "subagent_id": subagent_id,
+            "parent_id": getattr(child, "_parent_subagent_id", None),
+            "live_transcript": getattr(child, "_live_transcript_path", None),
+        }
+    ] + [
+        {
+            "subagent_id": r.get("subagent_id"),
+            "parent_id": r.get("parent_id"),
+            "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
+        }
+        for r in below
+    ]
+    live_ids = [e["subagent_id"] for e in live if e["subagent_id"]]
+    logger.info(
+        "delegate_task timed_out_running: subagent=%s live=%s timeout=%ss",
+        subagent_id,
+        ",".join(str(i) for i in live_ids),
+        child_timeout,
+    )
+    return {
+        "task_index": task_index,
+        "status": TIMED_OUT_RUNNING,
+        "summary": None,
+        "exit_reason": TIMED_OUT_RUNNING,
+        "api_calls": api_calls,
+        "duration_seconds": duration,
+        "timeout_seconds": child_timeout,
+        "timed_out_after_seconds": duration,
+        "subagent_id": subagent_id,
+        "live_subagents": live,
+        "control": {
+            "list": {"action": "list"},
+            "steer": {
+                "action": "steer",
+                "subagent_id": subagent_id,
+                "message": "<course correction>",
+            },
+            "stop": {"action": "stop", "subagent_id": subagent_id},
+        },
+        "note": (
+            f"Timed out ≠ dead: the wait hit {child_timeout}s but the subagent "
+            "and the listed descendants are STILL RUNNING. Do NOT re-delegate "
+            "the same task (that runs a second tree concurrently). Its result "
+            "is delivered to you when it finishes; meanwhile use "
+            "delegate_task(action='list'|'steer'|'stop') with the ids above."
+        ),
+        "_child_role": getattr(child, "_delegate_role", None),
+    }
+
+
+def _start_late_completion(
+    child_future: Any,
+    *,
+    child: Any,
+    parent_agent: Any,
+    task_index: int,
+    subagent_id: Optional[str],
+    child_start: float,
+    child_progress_cb: Any,
+    child_pool: Any,
+    leased_cred_id: Any,
+) -> threading.Thread:
+    """Own a TIMED_OUT_RUNNING child until it ends, then deliver its result.
+
+    Delivery uses the normal completion surfaces: the subagent.complete
+    progress event, the live transcript terminal marker + manifest, and a
+    steer into the parent agent (appended to its next tool result, so no
+    message is spliced and the prompt cache holds). Then the per-child
+    teardown the owner skipped runs here.
+    """
+
+    def _late() -> None:
+        error: Optional[str] = None
+        result: Dict[str, Any] = {}
+        try:
+            raw = child_future.result()
+            result = raw if isinstance(raw, dict) else {}
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        summary = str(result.get("final_response") or "").strip()
+        if error:
+            status = "error"
+        elif result.get("interrupted"):
+            status = "interrupted"
+        elif summary and result.get("completed", True) is not False:
+            status = "completed"
+        else:
+            status = "failed"
+        entry: Dict[str, Any] = {
+            "task_index": task_index,
+            "subagent_id": subagent_id,
+            "status": status,
+            "summary": summary or None,
+            "api_calls": result.get("api_calls", 0),
+            "duration_seconds": round(time.monotonic() - child_start, 2),
+            "after": TIMED_OUT_RUNNING,
+        }
+        if error:
+            entry["error"] = error
+            # A genuine failure of this child: reap whatever it spawned.
+            _reap_subtree(child, "error")
+        if child_progress_cb:
+            try:
+                child_progress_cb(
+                    "subagent.complete",
+                    preview=(summary or error or "")[:160],
+                    status=status,
+                    duration_seconds=entry["duration_seconds"],
+                    summary=(summary or error or "")[:500],
+                )
+            except Exception as exc:
+                logger.debug("late subagent.complete relay failed: %s", exc)
+        writer = getattr(child, "_live_writer", None)
+        if writer is not None:
+            try:
+                writer.finalize(entry)
+            except Exception:
+                logger.debug("late live transcript finalize failed", exc_info=True)
+        try:
+            from tools.delegation_live_log import update_manifest_statuses
+
+            deleg_id = getattr(child, "_delegation_id", None)
+            if isinstance(deleg_id, str):
+                update_manifest_statuses(deleg_id, [entry])
+        except Exception:
+            logger.debug("late manifest update failed", exc_info=True)
+        try:
+            _release_child_resources(
+                child, parent_agent, subagent_id, child_pool, leased_cred_id
+            )
+        except Exception:
+            logger.debug("late child teardown failed", exc_info=True)
+        body = summary or error or "(no final response)"
+        if len(body) > _LATE_RESULT_MAX_CHARS:
+            body = body[:_LATE_RESULT_MAX_CHARS] + " …[truncated; see live transcript]"
+        transcript = getattr(child, "_live_transcript_path", None)
+        text = (
+            f"[delegate_task late result] subagent {subagent_id} (task "
+            f"{task_index}), earlier reported {TIMED_OUT_RUNNING}, has "
+            f"finished: status={status}."
+            + (f" Transcript: {transcript}." if transcript else "")
+            + f"\n{body}"
+        )
+        delivered = False
+        steer = getattr(parent_agent, "steer", None)
+        if callable(steer):
+            try:
+                delivered = bool(steer(text))
+            except Exception as exc:
+                logger.debug("late result steer into parent failed: %s", exc)
+        logger.info(
+            "delegate_task late completion: subagent=%s status=%s delivered=%s",
+            subagent_id,
+            status,
+            delivered,
+        )
+
+    t = threading.Thread(
+        target=_late, name=f"delegate-late-{subagent_id or task_index}", daemon=True
+    )
+    t.start()
+    return t
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -3026,6 +3291,11 @@ def _run_single_child(
                     ),
                 }
 
+    # Set when a child_timeout fires while the child is still working: the
+    # child is NOT stopped, the owner returns TIMED_OUT_RUNNING, and the
+    # late-completion thread owns the registry/lease/close cleanup below.
+    _detached = [False]
+
     try:
         _heartbeat_thread.start()
         if child_progress_cb:
@@ -3175,6 +3445,34 @@ def _run_single_child(
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
+            # Timed out ≠ dead. A child still working (it made API calls or
+            # has live descendants) keeps running; report TIMED_OUT_RUNNING
+            # with live handles so the caller waits/steers instead of
+            # relaunching the same brief as a second concurrent tree.
+            if isinstance(
+                _timeout_exc, (FuturesTimeoutError, TimeoutError)
+            ) and not _child_future.done():
+                _tor_entry = _timed_out_running_entry(
+                    task_index=task_index,
+                    child=child,
+                    subagent_id=_subagent_id,
+                    child_timeout=child_timeout,
+                    duration=round(time.monotonic() - child_start, 2),
+                )
+                if _tor_entry is not None:
+                    _detached[0] = True
+                    _start_late_completion(
+                        _child_future,
+                        child=child,
+                        parent_agent=parent_agent,
+                        task_index=task_index,
+                        subagent_id=_subagent_id,
+                        child_start=child_start,
+                        child_progress_cb=child_progress_cb,
+                        child_pool=child_pool,
+                        leased_cred_id=leased_cred_id,
+                    )
+                    return _tor_entry
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
             # retain steer text that won the race with this failure/timeout.
@@ -3190,6 +3488,8 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            # This child is reported failed: no descendant may outlive that.
+            _reap_subtree(child, "timeout" if is_timeout else "error")
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -3634,6 +3934,7 @@ def _run_single_child(
         _late_pending_steer = (
             _close_subagent_steering(_subagent_id, child) if _subagent_id else None
         )
+        _reap_subtree(child, "error")
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
         if child_progress_cb:
@@ -3676,17 +3977,6 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id, agent=child)
-
-        if child_pool is not None and leased_cred_id is not None:
-            try:
-                child_pool.release_lease(leased_cred_id)
-            except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
-
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -3695,45 +3985,78 @@ def _run_single_child(
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
 
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
-                        parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
-
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
-
-        # The AIAgent turn boundary normally closes the child scope itself. This
-        # fallback covers failures before that boundary starts, but must not pop
-        # a scope while a timed-out child worker is still unwinding.
-        try:
-            from agent import relay_runtime
-
-            runtime = relay_runtime.get_runtime(create=False)
-            child_session_id = str(getattr(child, "session_id", "") or "")
-            child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=child_session_id,
+        if not _detached[0]:
+            _release_child_resources(
+                child,
+                parent_agent,
+                _subagent_id,
+                child_pool,
+                leased_cred_id,
             )
-            if runtime is not None and child_session_id and not child_turn_is_active:
-                runtime.unregister_subagent({"child_session_id": child_session_id})
-        except Exception:
-            logger.debug("Failed to close child Relay session after delegation")
+
+
+def _release_child_resources(
+    child: Any,
+    parent_agent: Any,
+    _subagent_id: Optional[str],
+    child_pool: Any,
+    leased_cred_id: Any,
+) -> None:
+    """Per-child teardown once the child's run has ended (or never started).
+
+    Runs in _run_single_child's finally, or on the late-completion thread
+    when the owner already returned TIMED_OUT_RUNNING.
+    """
+    # Drop the TUI-facing registry entry.  Safe to call even if the
+    # child was never registered (e.g. ID missing on test doubles).
+    if _subagent_id:
+        _unregister_subagent(_subagent_id, agent=child)
+
+    if child_pool is not None and leased_cred_id is not None:
+        try:
+            child_pool.release_lease(leased_cred_id)
+        except Exception as exc:
+            logger.debug("Failed to release credential lease: %s", exc)
+
+    # Remove child from active tracking
+
+    # Unregister child from interrupt propagation
+    if hasattr(parent_agent, "_active_children"):
+        try:
+            lock = getattr(parent_agent, "_active_children_lock", None)
+            if lock:
+                with lock:
+                    parent_agent._active_children.remove(child)
+            else:
+                parent_agent._active_children.remove(child)
+        except (ValueError, UnboundLocalError) as e:
+            logger.debug("Could not remove child from active_children: %s", e)
+
+    # Close tool resources (terminal sandboxes, browser daemons,
+    # background processes, httpx clients) so subagent subprocesses
+    # don't outlive the delegation.
+    try:
+        if hasattr(child, "close"):
+            child.close()
+    except Exception:
+        logger.debug("Failed to close child agent after delegation")
+
+    # The AIAgent turn boundary normally closes the child scope itself. This
+    # fallback covers failures before that boundary starts, but must not pop
+    # a scope while a timed-out child worker is still unwinding.
+    try:
+        from agent import relay_runtime
+
+        runtime = relay_runtime.get_runtime(create=False)
+        child_session_id = str(getattr(child, "session_id", "") or "")
+        child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
+            profile_key=relay_runtime.current_profile_key(),
+            session_id=child_session_id,
+        )
+        if runtime is not None and child_session_id and not child_turn_is_active:
+            runtime.unregister_subagent({"child_session_id": child_session_id})
+    except Exception:
+        logger.debug("Failed to close child Relay session after delegation")
 
 
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
@@ -4593,6 +4916,8 @@ def delegate_task(
                 getattr(child, "tool_progress_callback", None), _writer
             )
             child._live_transcript_path = str(_writer.path)
+            # Late-completion path finalizes after a timed_out_running return.
+            child._live_writer = _writer
         # Delegation identity for the live registry + process-notification
         # attribution (child-started background processes report under it).
         if live_deleg_id:
@@ -4671,6 +4996,10 @@ def delegate_task(
                         # Parent interrupted — collect whatever finished and
                         # abandon the rest.  Children already received the
                         # interrupt signal; we just can't wait forever.
+                        # Reap their subtrees too (detached descendants are
+                        # not on any _active_children propagation list).
+                        for _ci, _ct, _cc in children:
+                            _reap_subtree(_cc, "parent_interrupted")
                         for f in pending:
                             idx = futures[f]
                             if f.done():
@@ -4735,7 +5064,11 @@ def delegate_task(
                         )
                         dur = entry.get("duration_seconds", 0)
                         status = entry.get("status", "?")
-                        icon = "✓" if status == "completed" else "✗"
+                        icon = (
+                            "✓" if status == "completed"
+                            else "…" if status == TIMED_OUT_RUNNING
+                            else "✗"
+                        )
                         remaining = n_tasks - completed_count
                         completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
                         if spinner_ref:
@@ -4924,6 +5257,7 @@ def delegate_task(
                         _c._interrupt_requested = True
                 except Exception:
                     pass
+                _reap_subtree(_c, "async_cancelled")
 
         def _batch_progress():
             # Progress token for the async registry's stale monitor: the
@@ -5623,7 +5957,9 @@ def _build_top_level_description() -> str:
         "results in task order) re-enters the conversation on its own. Do NOT "
         "wait or poll; continue other work. While children run, `action` "
         "(list/steer/stop) controls them live — steer when a transcript shows "
-        "a child drifting.\n\n"
+        "a child drifting. A result with status 'timed_out_running' means "
+        "timed out ≠ dead: that child is still working and delivers later; "
+        "never re-delegate its task, use `action` on the listed ids.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"

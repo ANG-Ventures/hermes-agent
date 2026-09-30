@@ -1680,7 +1680,9 @@ def dispatch_async_delegation_batch(
                     ) if status is not None
                 ]
                 all_failed = bool(votes) and all(
-                    status not in ("completed", "success") for status in votes
+                    # timed_out_running = still working, never a failure.
+                    status not in ("completed", "success", "timed_out_running")
+                    for status in votes
                 )
             except Exception:  # noqa: BLE001 - classification must never lose children
                 logger.warning(

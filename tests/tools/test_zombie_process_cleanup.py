@@ -526,7 +526,8 @@ class TestDelegationCleanup:
             )
 
             assert child_started.wait(timeout=CHILD_BLOCK), "child never started"
-            assert result["status"] == "timeout"
+            # Timed out ≠ dead: a child that made API calls keeps running.
+            assert result["status"] == "timed_out_running"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,
