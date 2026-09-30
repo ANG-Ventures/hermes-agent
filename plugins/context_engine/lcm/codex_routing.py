@@ -50,14 +50,12 @@ def _is_host_codex_context_variant(bare_model: str) -> bool:
     in which case no variant is recognised and the conservative table applies.
     """
     try:
-        from agent import model_metadata as _host_mm
-    except Exception:  # pragma: no cover - host without the helper
-        return False
-    predicate = getattr(_host_mm, "codex_uses_large_window", None) or getattr(
-        _host_mm, "is_codex_context_variant", None
-    )
-    if predicate is None:  # pragma: no cover - host without the helper
-        return False
+        from agent.model_metadata import codex_uses_large_window as predicate
+    except Exception:
+        try:
+            from agent.model_metadata import is_codex_context_variant as predicate
+        except Exception:  # pragma: no cover - host without the helper
+            return False
     try:
         return bool(predicate(bare_model))
     except Exception:  # pragma: no cover - defensive
