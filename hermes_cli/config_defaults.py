@@ -616,6 +616,9 @@ DEFAULT_CONFIG = {
         # failing over to the next ring vendor on rate limits. Never
         # pre-empts a configured or keyed backend. Set false to disable.
         "keyless_fallback": True,
+        # Omit named vendors from the anonymous ring for this profile (e.g.
+        # an exhausted Firecrawl account); other free vendors still fail over.
+        "keyless_exclude": [],
         # One-shot keyless rescue: when the chosen/keyed backend fails a
         # web_search/web_extract call, THAT call retries once on the keyless
         # free-tier ring — the next call attempts the chosen backend again

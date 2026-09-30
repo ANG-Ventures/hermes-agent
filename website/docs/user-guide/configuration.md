@@ -2403,6 +2403,9 @@ web:
   # and no API keys present, web tools rotate across the Exa/Parallel/
   # Tavily/Firecrawl/Keenable free tiers. Set false to disable.
   keyless_fallback: true
+  # Optional per-profile exclusions from the anonymous ring (not the
+  # explicit backend selection). E.g. skip an exhausted Firecrawl account:
+  keyless_exclude: [firecrawl]
 
   # One-shot keyless rescue (default: true). When the chosen/keyed backend
   # fails a call, that single call retries on the keyless ring; the next

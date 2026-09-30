@@ -193,7 +193,7 @@ def test_failed_alert_is_retried_on_next_trip(setup, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_extract_whole_batch_402_trips_breaker(setup):
+async def test_target_site_401_402_does_not_trip_shared_breaker(setup):
     calls, providers, _cfg, _home = setup
     urls = ["https://a.example", "https://b.example"]
     providers.update(
@@ -202,5 +202,64 @@ async def test_extract_whole_batch_402_trips_breaker(setup):
     )
     out1 = json.loads(await web_tools.web_extract_tool(urls))
     out2 = json.loads(await web_tools.web_extract_tool([u + "/2" for u in urls]))
-    assert calls == ["firecrawl", "exa", "exa"]
+    assert calls == ["firecrawl", "exa", "firecrawl", "exa"]
     assert all(not r.get("error") for r in out1["results"] + out2["results"])
+    assert bb.open_until("firecrawl") is None
+
+
+def test_stale_page_completion_cannot_ack_new_episode(setup, monkeypatch):
+    _calls, _providers, cfg, home = setup
+    # Keep the alert worker queued so the first episode is removed before it
+    # finishes. Then a second episode begins. The old success must not ack it.
+    monkeypatch.setattr(bb, "_fire_alert", lambda *args: None)
+    cfg["dead_backend_alert_command"] = "true"
+    bb.record_failure("firecrawl", PAYMENT, now=1_000_000.0)
+    first = bb._entry("firecrawl")
+    bb.record_success("firecrawl")
+    bb.record_failure("firecrawl", PAYMENT, now=1_000_001.0)
+    second = bb._entry("firecrawl")
+    assert first["alert_id"] != second["alert_id"]
+    bb._mark_paged("firecrawl", first["episode_start"], first["alert_id"],
+                   ok=True, note="old alert")
+    entry = bb._entry("firecrawl")
+    assert entry["alert_id"] == second["alert_id"]
+    assert not entry.get("paged")
+    assert "paging" in entry
+
+
+def test_stale_alert_attempt_cannot_clear_new_attempt(setup, monkeypatch):
+    _calls, _providers, cfg, home = setup
+    monkeypatch.setattr(bb, "_fire_alert", lambda *args: None)
+    cfg["dead_backend_alert_command"] = "true"
+    bb.record_failure("firecrawl", PAYMENT, now=1_000_000.0)
+    first = bb._entry("firecrawl")
+    # The alert in flight has timed out and a new call attempts delivery.
+    bb.record_failure("firecrawl", PAYMENT, now=1_000_121.0)
+    second = bb._entry("firecrawl")
+    assert first["alert_id"] != second["alert_id"]
+    bb._mark_paged("firecrawl", first["episode_start"], first["alert_id"],
+                   ok=False, note="old alert failed")
+    assert bb._entry("firecrawl")["alert_id"] == second["alert_id"]
+    assert "paging" in bb._entry("firecrawl")
+
+
+def test_alert_thread_keeps_profile_home_and_scrubs_default_secrets(setup, monkeypatch):
+    _calls, _providers, cfg, home = setup
+    seen = []
+    cfg["dead_backend_alert_command"] = "fake pager"
+    monkeypatch.setenv("UNRELATED_DEFAULT_PROFILE_SECRET", "do-not-copy")
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs["env"])
+        return Proc()
+
+    monkeypatch.setattr(bb.subprocess, "run", fake_run)
+    bb.record_failure("firecrawl", PAYMENT)
+    _wait_paged(home, "firecrawl")
+    assert len(seen) == 1
+    assert seen[0]["HERMES_HOME"] == str(home)
+    assert "UNRELATED_DEFAULT_PROFILE_SECRET" not in seen[0]

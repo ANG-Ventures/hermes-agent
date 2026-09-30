@@ -23,10 +23,12 @@ profile (gateway, warm clients, subagents) shares one episode and one page.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -180,6 +182,9 @@ def record_failure(backend: str, error: Any, now: Optional[float] = None,
             need_page = not entry.get("paged") and not in_flight
             if need_page:
                 entry["paging"] = now
+                entry["alert_id"] = secrets.token_hex(8)
+            episode_start = entry["episode_start"]
+            alert_id = entry.get("alert_id", "")
     except Exception as exc:  # noqa: BLE001
         logger.debug("web backend breaker write failed: %s", exc)
         return False
@@ -192,7 +197,7 @@ def record_failure(backend: str, error: Any, now: Optional[float] = None,
     else:
         logger.debug("web backend '%s' still dead (HTTP %s); breaker re-opened", backend, status)
     if need_page:
-        _fire_alert(backend, status, str(error), cfg)
+        _fire_alert(backend, status, str(error), cfg, episode_start, alert_id)
     return new_episode
 
 
@@ -210,15 +215,29 @@ def record_success(backend: str) -> None:
         logger.info("web backend '%s' recovered; dead-backend episode closed", backend)
 
 
-def _fire_alert(backend: str, status: int, error: str, cfg: Dict[str, Any]) -> None:
+def _fire_alert(backend: str, status: int, error: str, cfg: Dict[str, Any],
+                episode_start: float, alert_id: str) -> None:
     command = str(cfg.get("dead_backend_alert_command") or "").strip()
     if not command:
-        _mark_paged(backend, ok=True, note="no alert command configured")
+        _mark_paged(backend, episode_start, alert_id, ok=True,
+                    note="no alert command configured")
         return
 
+    from hermes_constants import get_hermes_home
+
+    # The gateway can multiplex profiles with ContextVar-scoped homes. Capture
+    # the initiating context BEFORE spawning the alert thread and give the
+    # child only its profile home + path (never inherited default-profile
+    # credentials). A host-local pager can load its own credentials.
+    context = contextvars.copy_context()
+    profile_home = str(get_hermes_home())
+
     def _run() -> None:
-        env = dict(os.environ, WEB_BACKEND=backend, WEB_BACKEND_STATUS=str(status),
-                   WEB_BACKEND_ERROR=error[:300])
+        env = {"HOME": os.path.expanduser("~"),
+               "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+               "HERMES_HOME": profile_home,
+               "WEB_BACKEND": backend, "WEB_BACKEND_STATUS": str(status),
+               "WEB_BACKEND_ERROR": error[:300]}
         try:
             proc = subprocess.run(command, shell=True, env=env, capture_output=True,
                                   text=True, timeout=_ALERT_TIMEOUT_SECONDS)
@@ -231,17 +250,21 @@ def _fire_alert(backend: str, status: int, error: str, cfg: Dict[str, Any]) -> N
         else:
             logger.error("web backend '%s' dead-backend alert FAILED (%s); "
                          "will retry on the next trip", backend, note)
-        _mark_paged(backend, ok=ok, note=note)
+        _mark_paged(backend, episode_start, alert_id, ok=ok, note=note)
 
-    threading.Thread(target=_run, name="web-backend-alert", daemon=True).start()
+    threading.Thread(target=lambda: context.run(_run), name="web-backend-alert",
+                     daemon=True).start()
 
 
-def _mark_paged(backend: str, *, ok: bool, note: str) -> None:
+def _mark_paged(backend: str, episode_start: float, alert_id: str,
+                *, ok: bool, note: str) -> None:
     try:
         with _locked_state() as state:
             entry = state.get(backend)
-            if not isinstance(entry, dict):
-                return
+            if (not isinstance(entry, dict)
+                    or entry.get("episode_start") != episode_start
+                    or entry.get("alert_id") != alert_id):
+                return  # stale alert from an earlier episode/attempt
             entry.pop("paging", None)
             if ok:
                 entry["paged"] = True

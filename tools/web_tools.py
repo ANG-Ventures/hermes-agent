@@ -519,9 +519,10 @@ async def _breaker_extract(provider, urls: list, format) -> list:
     except Exception as exc:
         _bb.record_failure(provider.name, exc, cfg=_load_web_config())
         raise
-    if results and all(r.get("error") for r in results):
-        _bb.record_failure(provider.name, results[0].get("error"), cfg=_load_web_config())
-    elif results:
+    # Per-URL errors can be a target site's 401/402 (paywall/login), not
+    # the extract vendor's billing/auth status. Only an exception at the
+    # provider boundary above can trip the shared search/extract breaker.
+    if results and any(not r.get("error") for r in results):
         _bb.record_success(provider.name)
     return results
 
