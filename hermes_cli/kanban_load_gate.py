@@ -303,6 +303,7 @@ class LoadGate:
             )
         except (TypeError, ValueError):
             self.cpu_busy = None
+        self.running = None
         self.observe(load1, running, now)
         measured = self.measured_cost(now)
         self.cost = measured if measured is not None else self.worker_load_cost
@@ -322,6 +323,7 @@ class LoadGate:
         allowance = 0
         if headroom > 0:
             allowance = int(math.floor(headroom / self.cost))
+            allowance = max(allowance, self._empty_host_floor(now))
         allowance = max(0, min(allowance, self.max_spawn_per_tick))
         self.allowance = allowance
         if allowance == 0:
@@ -336,6 +338,20 @@ class LoadGate:
         self.state, self.last_reason = "admitting", None
         return allowance, None
 
+    def _empty_host_floor(self, now: float) -> int:
+        """1 when the host runs no kanban worker and none is ramping, else 0.
+
+        floor(headroom / cost) is 0 whenever headroom < cost. On a 1-2 core
+        host (pause_above = ncpu, cost prior 2.0) that is every tick, so the
+        host would never spawn. An empty host may always start one worker
+        while there is headroom: the overshoot that floor() guards against
+        needs workers already running. ``running`` must be KNOWN to be 0;
+        callers that cannot count keep plain floor().
+        """
+        if self.running == 0 and self.invisible_workers(now) <= 0:
+            return 1
+        return 0
+
     def _admit_on_cpu(self, now: float, hard: str) -> "tuple[int, Optional[str]]":
         """load1 is over the bar but the CPU is not: size from CPU headroom."""
         pending_cpu = self.invisible_workers(now) * self.worker_cpu_cost
@@ -343,6 +359,7 @@ class LoadGate:
         allowance = 0
         if headroom > 0:
             allowance = int(math.floor(headroom / self.worker_cpu_cost))
+            allowance = max(allowance, self._empty_host_floor(now))
         allowance = max(0, min(allowance, self.max_spawn_per_tick))
         self.allowance = allowance
         self.state = "cpu_headroom"

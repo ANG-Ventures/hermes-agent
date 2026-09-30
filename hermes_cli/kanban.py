@@ -5592,7 +5592,10 @@ def _one_shot_load_gate(conn, args, config, additive):
     # CPU corroboration of a load1 pause (t_bf26e8f1): a one-shot process
     # has no previous sample, so take a 0.25 s one.
     cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
-    allowance, reason = gate.admit(load1, load5=load5, cpu_busy=cpu_busy)
+    allowance, reason = gate.admit(
+        load1, load5=load5, cpu_busy=cpu_busy,
+        running=_klg.count_running_workers(),
+    )
     info = gate.snapshot()
     info.pop("boards", None)
     out["info"] = info

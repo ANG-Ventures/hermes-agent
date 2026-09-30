@@ -411,3 +411,35 @@ def test_count_running_workers(kanban_home, monkeypatch):
     assert klg.count_running_workers() == 2
     monkeypatch.setattr(kb, "connect", lambda *a, **k: 1 / 0)
     assert klg.count_running_workers() is None
+
+
+# -- small hosts: floor() must not starve an empty host (Prism P1 c966b642) --
+@pytest.mark.parametrize("ncpu,load1", [(1, 0.1), (2, 0.1), (2, 1.5)])
+def test_empty_small_host_admits_one_worker(ncpu, load1):
+    """1-2 core host, prior cost 2.0, headroom < cost: floor() alone gives 0."""
+    g = LoadGate({}, ncpu=ncpu)
+    allowance, reason = g.admit(load1, now=1000.0, running=0)
+    assert (allowance, reason) == (1, None)
+    assert g.state == "admitting"
+
+
+def test_small_host_floor_still_stops_short_once_a_worker_exists():
+    g = LoadGate({}, ncpu=2)
+    # A worker is running: no guarantee, floor(1.9 / 2.0) == 0.
+    assert g.admit(0.1, now=1000.0, running=1)[0] == 0
+    # Nothing running but a spawn is still ramping: no second free worker.
+    g2 = LoadGate({}, ncpu=2)
+    g2.record_spawns(1, now=1000.0)
+    assert g2.admit(0.1, now=1001.0, running=0)[0] == 0
+    # Unknown running count: plain floor(), never a guessed guarantee.
+    assert LoadGate({}, ncpu=2).admit(0.1, now=1000.0)[0] == 0
+
+
+def test_empty_small_host_cpu_headroom_arm_admits_one():
+    """Hard load1 pause, idle CPU, 1 core: (0.7 - busy) * 1 < 1 core."""
+    g = LoadGate({}, ncpu=1)
+    allowance, reason = g.admit(3.0, now=1000.0, running=0, cpu_busy=0.1)
+    assert (allowance, reason, g.state) == (1, None, "cpu_headroom")
+    # Busy CPU still pauses the empty host.
+    g2 = LoadGate({}, ncpu=1)
+    assert g2.admit(3.0, now=1000.0, running=0, cpu_busy=0.95)[0] == 0
