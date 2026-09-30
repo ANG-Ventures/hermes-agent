@@ -13,6 +13,15 @@ def _isolate_kanban_process_registry(monkeypatch):
     monkeypatch.setattr(kanban_db, "_recent_worker_exits", {})
 
 
+@pytest.fixture(autouse=True)
+def _quiet_host_loadavg(monkeypatch):
+    """Pin host load to idle: `kanban dispatch` consults the real load gate
+    (t_689b81b7), so an unpinned test would pause on a busy CI runner.
+    Gate tests override this with their own sample_loadavg patch."""
+    import os
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0), raising=False)
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
