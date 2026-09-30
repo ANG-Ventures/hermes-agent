@@ -1134,6 +1134,8 @@ class GatewaySlashCommandsMixin:
         route_resolved = False
         context_used = 0
         context_total = 0
+        context_estimated = False
+        context_post_compaction = False
         if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
             live_model = _clean_str(getattr(status_agent, "model", ""))
             live_provider = _clean_str(getattr(status_agent, "provider", ""))
@@ -1144,7 +1146,14 @@ class GatewaySlashCommandsMixin:
                 route_resolved = True
             ctx = getattr(status_agent, "context_compressor", None)
             if ctx is not None:
-                context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
+                # -1 after a compaction: the post-compaction estimate, never
+                # the stored pre-compaction figure (t_64728f32).
+                from gateway.runtime_footer import live_context_tokens
+
+                _reading = live_context_tokens(ctx)
+                context_used = _reading.tokens or 0
+                context_estimated = _reading.estimated
+                context_post_compaction = _reading.post_compaction
                 context_total = _int_value(getattr(ctx, "context_length", 0))
 
         persisted_model = _clean_str(persisted_route.get("model"))
@@ -1158,7 +1167,9 @@ class GatewaySlashCommandsMixin:
             model_name = _clean_str(session_row.get("model"))
             provider_name = _clean_str(session_row.get("billing_provider"))
             base_url = _clean_str(session_row.get("billing_base_url"))
-        context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
+        if not context_used and not context_post_compaction:
+            context_used = max(0, _int_value(getattr(session_entry, "last_prompt_tokens", 0)))
+        _used_label = f"~{context_used:,}" if context_estimated else f"{context_used:,}"
 
         user_config: dict[str, Any] = {}
         if not model_name or not provider_name or not context_total:
@@ -1190,11 +1201,12 @@ class GatewaySlashCommandsMixin:
             pct = min(100, round((context_used / context_total) * 100)) if context_total else 0
             context_line = t(
                 "gateway.status.context",
-                used=f"{context_used:,}",
+                used=_used_label,
                 total=f"{context_total:,}",
                 pct=f"{pct}",
             )
         elif context_used:
+            # This template already carries "~".
             context_line = t("gateway.status.context_used", used=f"{context_used:,}")
 
         lines = [
@@ -1294,14 +1306,23 @@ class GatewaySlashCommandsMixin:
         #   window: compressor.context_length → effective gateway model route
         used = 0
         context_length = 0
+        used_estimated = False
+        used_post_compaction = False
         if ctx is not None:
-            used = getattr(ctx, "last_prompt_tokens", 0) or 0
+            # -1 after a compaction: the post-compaction estimate, never the
+            # stored pre-compaction figure (t_64728f32).
+            from gateway.runtime_footer import live_context_tokens
+
+            _reading = live_context_tokens(ctx)
+            used = _reading.tokens or 0
+            used_estimated = _reading.estimated
+            used_post_compaction = _reading.post_compaction
             context_length = getattr(ctx, "context_length", 0) or 0
 
         model_name = _clean_str(getattr(agent, "model", "")) if has_agent else ""
 
-        if not used:
-            used = _int_value(getattr(session_entry, "last_prompt_tokens", 0))
+        if not used and not used_post_compaction:
+            used = max(0, _int_value(getattr(session_entry, "last_prompt_tokens", 0)))
 
         # getattr guard: this method is reachable on a GatewayRunner built via
         # object.__new__ (plugin-command tests, and any partially-initialised
@@ -1362,7 +1383,7 @@ class GatewaySlashCommandsMixin:
                 t("gateway.context.window", total=f"{context_length:,}"),
                 t(
                     "gateway.context.in_use",
-                    used=f"{used:,}",
+                    used=f"~{used:,}" if used_estimated else f"{used:,}",
                     total=f"{context_length:,}",
                     pct=f"{pct:.0f}",
                 ),
