@@ -15851,16 +15851,24 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # from a deleted cwd (every guard-hook call failed closed, 12 CRITICAL
     # pages) and armed launchd jobs for a dropped card. No later reaper could
     # find it, because the only pointer to it was the pid this UPDATE clears.
-    prior = conn.execute(
-        "SELECT worker_pid, claim_lock, current_run_id FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    live_pid = int(prior["worker_pid"]) if prior is not None and prior["worker_pid"] else None
-    owner_window = (
-        _worker_owner_window(conn, task_id, live_pid, prior["current_run_id"])
-        if live_pid else (None, None, None)
-    )
+    #
+    # The snapshot is read INSIDE the same write txn as the UPDATE (t_b9d9bcbc,
+    # Prism 82f34e87302a): read outside it, a worker stamping its pid between
+    # the SELECT and the UPDATE was invisible here, so its pid was cleared,
+    # it was never signalled, and its workspace was reaped. Inside the txn a
+    # later stamp is fenced by _set_worker_pid's run check (the run is ended
+    # below) and the spawner terminates that orphan.
     with write_txn(conn):
+        prior = conn.execute(
+            "SELECT worker_pid, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        live_pid = int(prior["worker_pid"]) if prior is not None and prior["worker_pid"] else None
+        prior_lock = prior["claim_lock"] if prior is not None else None
+        owner_window = (
+            _worker_owner_window(conn, task_id, live_pid, prior["current_run_id"])
+            if live_pid else (None, None, None)
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -15879,16 +15887,22 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # Stop the worker before its workspace is reaped below. Same identity-checked
-    # host-local termination the reclaim paths use. If liveness cannot be
-    # disproven (remote worker, unknown identity, signal failure), KEEP the
-    # workspace: deleting it under a possibly-live worker recreates the incident.
+    # host-local termination the reclaim paths use. Reap ONLY on proven death:
+    # a host-local termination that reports ``terminated``. Anything else keeps
+    # the workspace -- including a remote claim or a NULL claim_lock, where
+    # _terminate_reclaimed_worker returns host_local=False without checking
+    # anything (t_b9d9bcbc, Prism 6383a983f818). _worker_survived_termination
+    # reads host_local=False as "not ours to hold" (right for reclaim's claim
+    # release), which is not proof of death and must not gate a reap.
     can_reap = not live_pid
     if live_pid and live_pid != os.getpid():
         termination = _terminate_reclaimed_worker(
-            live_pid, prior["claim_lock"], owner_window=owner_window,
+            live_pid, prior_lock, owner_window=owner_window,
             conn=conn, task_id=task_id,
         )
-        can_reap = not _worker_survived_termination(termination)
+        can_reap = bool(termination.get("host_local") and termination.get("terminated"))
+        if not can_reap:
+            termination = {**termination, "workspace_kept": True}
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_terminated",
                           termination, run_id=run_id)
