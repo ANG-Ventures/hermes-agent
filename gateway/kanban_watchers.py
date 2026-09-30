@@ -982,7 +982,7 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
                       f"last run {item.get('last_outcome')} (dispatcher land-request)"]
     try:
         proc = subprocess.run(argv, check=False, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     except Exception:
         logger.exception("kanban dispatcher: active_pr land-request enqueue failed")
         return False
