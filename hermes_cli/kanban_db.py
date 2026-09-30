@@ -5201,6 +5201,14 @@ class UnhomedCreateError(ValueError):
     """``create`` would mint a card no session can drive (``unhomed``)."""
 
 
+# Suite-compat escape for the require_home refusal: the test suite's hermetic
+# environment sets it so the hundreds of fixture ``kanban create`` calls that
+# predate the refusal keep working; the refusal's own tests unset it. Not a
+# user-facing knob -- production callers pass ``--home operator`` /
+# ``--session <sid>`` instead (t_09fea045).
+ALLOW_UNHOMED_CREATE_ENV = "HERMES_KANBAN_ALLOW_UNHOMED_CREATE"
+
+
 def _ambient_session_env(name: str) -> str:
     """Per-session gateway context (ContextVar-first), env outside it."""
     try:
@@ -6696,6 +6704,7 @@ def create_task(
         and not session_explicit
         and is_unhomed(session_id)
         and not (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and (os.environ.get(ALLOW_UNHOMED_CREATE_ENV) or "").strip() != "1"
     ):
         raise UnhomedCreateError(
             "kanban: refused create: no home session (no session identity, "

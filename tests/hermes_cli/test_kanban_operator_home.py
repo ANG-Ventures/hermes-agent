@@ -30,6 +30,7 @@ def kanban_home(tmp_path, monkeypatch):
     for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "HERMES_PROFILE",
                 "HERMES_PROFILE_NAME"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv(kb.ALLOW_UNHOMED_CREATE_ENV, raising=False)  # arm the refusal
     monkeypatch.setattr(kb, "_caller_session_lineage", lambda sid: ())
     monkeypatch.setattr(kb, "_UNSTAMPED_WARNED", [False])
     kb.init_db()
