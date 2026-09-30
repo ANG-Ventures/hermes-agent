@@ -177,6 +177,53 @@ def test_stalled_late_schema_retry_is_supervised_and_bounded(fleet_home, monkeyp
         forever.set()
 
 
+def test_stalled_retry_drains_the_correction_turn_and_keeps_first_turn_steer(
+    fleet_home, monkeypatch
+):
+    """Prism #1549 r1: teardown waits on the RUNNING correction turn (not the
+    finished first turn), and the first turn's finalizer-drained steer is
+    still reported as missed_steer."""
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+    release = threading.Event()
+    order = []
+
+    def _answers(self):
+        if len(self.calls) == 1:
+            release.wait(10)
+            return {
+                "final_response": "not json",
+                "completed": True,
+                "api_calls": 3,
+                "pending_steer": "use the staging db",
+            }
+        # Correction turn: no activity until interrupted, then unwinds
+        # cooperatively (persisting takes a moment) before returning.
+        self.frozen_activity_ts = time.time() - 60
+        self.interrupt_seen.wait(10)
+        time.sleep(0.3)
+        order.append("retry_unwound")
+        return {"final_response": "", "completed": False, "api_calls": 0}
+
+    parent = _Agent(None, depth=0)
+    child = _Agent("sa-0-drain", parent=parent, api_calls=2, behavior=_answers)
+    child._delegate_output_schema = _SCHEMA
+    child.close = lambda: order.append("close")
+    entry = delegate_tool._run_single_child(0, "drain goal", child, parent)
+    assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
+    release.set()
+
+    assert _wait_until(lambda: _late_results(parent), timeout=10.0)
+    (late,) = _late_results(parent)
+    assert late["status"] == "timeout"
+    assert late.get("missed_steer") == "use the staging db", late
+    assert _wait_until(lambda: "close" in order, timeout=5.0)
+    assert order.index("retry_unwound") < order.index("close"), (
+        f"child closed under a still-running correction turn: {order}"
+    )
+
+
 # 3 ---------------------------------------------------------------------------
 def test_owned_late_result_listed_despite_many_newer_foreign_results(fleet_home):
     from tools import delegate_tool

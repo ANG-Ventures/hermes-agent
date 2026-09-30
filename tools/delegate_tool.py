@@ -3387,6 +3387,10 @@ def _start_late_completion(
     max_wall = _get_child_max_wall_seconds(ceiling)
     wall_deadline = child_start + max_wall if max_wall else None
     approval_cb = _get_subagent_approval_callback()
+    # The turn currently running on the child: the original future, or the
+    # supervised correction turn once it starts. Stop paths drain THIS one
+    # before teardown closes the child's resources.
+    active_turn: Dict[str, Any] = {"future": child_future}
 
     def _supervised_turn(message: str) -> Any:
         """One follow-up child turn under the late path's hang/wall bounds."""
@@ -3409,6 +3413,7 @@ def _start_late_completion(
                     )
                 args = (message,)
             fut = executor.submit(contextvars.copy_context().run, call, *args)
+            active_turn["future"] = fut
             outcome, raw = _supervise_child_future(
                 fut, child, float(ceiling or 0.0), wall_deadline
             )
@@ -3454,6 +3459,7 @@ def _start_late_completion(
             except Exception:
                 logger.warning("late schema validation failed", exc_info=True)
         hung = stop is not None
+        finalizer_pending = result.get("pending_steer")
 
         if hung:
             # Alive but stuck, or past the wall ceiling: bound it exactly like
@@ -3477,7 +3483,10 @@ def _start_late_completion(
                 pass
             _reap_subtree(child, "hung")
             try:
-                child_future.result(timeout=min(ceiling or 5.0, 5.0))
+                # Bounded drain of the turn that is actually running (the
+                # correction turn after a retry stall), so teardown does not
+                # close the child's session/tools under a still-unwinding turn.
+                active_turn["future"].result(timeout=min(ceiling or 5.0, 5.0))
             except Exception:
                 pass
             api_calls = 0
@@ -3518,13 +3527,16 @@ def _start_late_completion(
             pending_steer = (
                 _close_subagent_steering(subagent_id, child) if subagent_id else None
             )
-            finalizer_pending = result.get("pending_steer")
-            if isinstance(finalizer_pending, str) and finalizer_pending.strip():
-                pending_steer = (
-                    f"{finalizer_pending}\n{pending_steer}"
-                    if pending_steer
-                    else finalizer_pending
-                )
+        # Steer the child accepted but never consumed, drained by a finished
+        # turn's finalizer into result["pending_steer"]. Captured before the
+        # stop branch rebuilds `result`, so a stalled correction turn cannot
+        # drop the first turn's accepted steer.
+        if isinstance(finalizer_pending, str) and finalizer_pending.strip():
+            pending_steer = (
+                f"{finalizer_pending}\n{pending_steer}"
+                if pending_steer
+                else finalizer_pending
+            )
 
         summary = str(result.get("final_response") or "")
         if hung:
