@@ -18184,6 +18184,14 @@ def _worker_session_members(sid: int) -> list[tuple[int, int]]:
     return members
 
 
+def _member_birth(pid: int) -> Optional[float]:
+    """Create time of ``pid``, or None when it is gone/unreadable."""
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.Error, OSError):
+        return None
+
+
 def _session_owned_by_run(
     members: list[tuple[int, int]], born_after: float, born_before: float,
 ) -> bool:
@@ -18196,17 +18204,19 @@ def _session_owned_by_run(
     after the recorded worker died, which is after the run's last evidence,
     so they fail this check. While any member of the ORIGINAL session lives,
     the session is continuous and every group in it is the worker's.
+
+    Known residual (deliberate, safety over completeness): on the crash path
+    a child the worker started after its last heartbeat is indistinguishable
+    from a recycled session's child and is left alone. Paths that verified
+    the worker alive before signalling it bound on that moment instead.
     """
     for pid, _ in members:
-        try:
-            created = psutil.Process(pid).create_time()
-        except (psutil.Error, OSError):
-            continue
+        created = _member_birth(pid)
         # No upper slack: a recycled leader (and every child of it) is
         # created after the worker died, i.e. strictly after its last
         # evidence, and event times are floored, so ``<= born_before`` can
         # never admit one. The lower bound only needs claim-time slack.
-        if born_after - 1.0 <= created <= born_before:
+        if created is not None and born_after - 1.0 <= created <= born_before:
             return True
     return False
 
@@ -18224,9 +18234,10 @@ def _reap_worker_session(
     Call only once the worker is gone. Signals nothing unless the session is
     proved to be the recorded run's (:func:`_session_owned_by_run`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
-    worker was known alive); unknown bounds mean no reap. Never targets
-    sid <= 1, the caller's own session, or the caller's own process group.
-    POSIX only; a no-op elsewhere.
+    worker was known alive); unknown bounds mean no reap. Groups that appear
+    DURING the reap (a member that forks into a new group on SIGTERM) are
+    signalled too. Never targets sid <= 1, the caller's own session, or the
+    caller's own process group. POSIX only; a no-op elsewhere.
     """
     import signal
 
@@ -18249,29 +18260,43 @@ def _reap_worker_session(
             sid, len(members),
         )
         return 0
-    groups = sorted({pgid for _, pgid in members})
-    for pgid in groups:
-        try:
-            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
-        except OSError:
-            pass
+
+    signalled: set[int] = set()
+
+    def _term(groups: set[int]) -> None:
+        for pgid in sorted(groups - signalled):
+            try:
+                os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
+            except OSError:
+                pass
+            signalled.add(pgid)
 
     def _left() -> set[int]:
-        return {pgid for _, pgid in _worker_session_members(sid)} & set(groups)
+        # Ownership was proved above. Inside the few-second grace window the
+        # sid cannot change hands: reusing the pid needs the (sequential) pid
+        # space to wrap, so every group now in the session is the worker's,
+        # including ones a member created in answer to SIGTERM.
+        return {pgid for _, pgid in _worker_session_members(sid)}
 
+    _term({pgid for _, pgid in members})
     deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and _left():
+    while time.monotonic() < deadline:
+        left = _left()
+        if not left:
+            break
+        _term(left)  # groups born during the reap get their SIGTERM too
         time.sleep(0.1)
     for pgid in sorted(_left()):
         try:
             os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
         except OSError:
             pass
+        signalled.add(pgid)
     _log.warning(
         "kanban: reaped %d leftover process group(s) of worker session %d",
-        len(groups), sid,
+        len(signalled), sid,
     )
-    return len(groups)
+    return len(signalled)
 
 
 def _run_last_evidence_at(

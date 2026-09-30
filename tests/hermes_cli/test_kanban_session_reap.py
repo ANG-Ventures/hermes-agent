@@ -38,6 +38,7 @@ _WORKER = (
     "p = subprocess.Popen(['/bin/sleep', '120'], preexec_fn=os.setpgrp)\n"
     "print(p.pid, flush=True)\n"
     "if sys.argv[1] == 'exit':\n"
+    "    sys.stdin.readline()\n"  # crash only when the test says so
     "    os._exit(0)\n"
     "time.sleep(120)\n"
 )
@@ -85,15 +86,16 @@ def _worker_card(conn, mode: str, max_runtime=None):
     assert kb.claim_task(conn, tid) is not None
     worker = subprocess.Popen(
         [sys.executable, "-c", _WORKER, mode],
-        stdout=subprocess.PIPE, text=True, encoding="utf-8", start_new_session=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+        start_new_session=True,
     )
     assert worker.stdout is not None
     sleep_pid = int(worker.stdout.readline())
     _LEFTOVERS.append(sleep_pid)
     threading.Thread(target=worker.wait, daemon=True).start()  # no zombie
     assert kb._set_worker_pid(conn, tid, worker.pid)
-    # A real worker heartbeats after starting its children; event times are
-    # whole seconds, so step past the second the sleep was created in.
+    # The worker heartbeats (while alive) after starting its child; event
+    # times are whole seconds, so step past the second the sleep was born in.
     time.sleep(1.1)
     with kb.write_txn(conn):
         run_id = conn.execute(
@@ -103,6 +105,12 @@ def _worker_card(conn, mode: str, max_runtime=None):
     assert os.getsid(sleep_pid) == worker.pid
     assert os.getpgid(sleep_pid) == sleep_pid != worker.pid
     return tid, worker, sleep_pid
+
+
+def _crash(worker) -> None:
+    assert worker.stdin is not None
+    worker.stdin.write("go\n")
+    worker.stdin.flush()
 
 
 def test_max_runtime_reaps_session_leftovers(conn):
@@ -121,6 +129,8 @@ def test_max_runtime_reaps_session_leftovers(conn):
 def test_crashed_worker_session_leftovers_reaped(conn, monkeypatch):
     monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
     tid, worker, sleep_pid = _worker_card(conn, "exit")
+    assert kb._pid_alive(worker.pid)  # heartbeat above was sent while alive
+    _crash(worker)
     assert _gone(worker.pid)
     assert kb._pid_alive(sleep_pid)
     kb.detect_crashed_workers(conn)
@@ -142,10 +152,53 @@ def test_recycled_session_is_not_reaped(conn, monkeypatch):
             "UPDATE task_runs SET started_at = started_at - 7200 "
             "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)", (tid,),
         )
+    _crash(worker)
     assert _gone(worker.pid)
     kb.detect_crashed_workers(conn)
     time.sleep(0.5)
     assert kb._pid_alive(sleep_pid), "reaped a session that is not the recorded worker's"
+
+
+_FORK_ON_TERM = (
+    "import os, signal, subprocess, sys, time\n"
+    "def h(*_):\n"
+    "    p = subprocess.Popen(['/bin/sleep', '120'], preexec_fn=os.setpgrp)\n"
+    "    print(p.pid, flush=True)\n"
+    "    os._exit(0)\n"
+    "signal.signal(signal.SIGTERM, h)\n"
+    "os.setpgrp()\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+def test_group_born_during_reap_is_reaped():
+    """Prism: a member that answers SIGTERM by forking into a NEW process
+    group must not escape the reap."""
+    leader = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time\n"
+         "c = subprocess.Popen([sys.executable, '-c', sys.argv[1]], stdout=sys.stdout)\n"
+         "time.sleep(120)\n",
+         _FORK_ON_TERM],
+        stdout=subprocess.PIPE, text=True, encoding="utf-8", start_new_session=True,
+    )
+    assert leader.stdout is not None
+    assert leader.stdout.readline().strip() == "ready"
+    born_after = time.time() - 5
+    leader.kill()
+    leader.wait()
+    reaped = kb._reap_worker_session(leader.pid, born_after=born_after,
+                                     born_before=time.time())
+    escaped = int(leader.stdout.readline())
+    try:
+        assert reaped >= 2  # the forker's group and the one it created
+        assert _gone(escaped), "group created on SIGTERM escaped the reap"
+    finally:
+        try:
+            os.kill(escaped, 9)
+        except OSError:
+            pass
 
 
 def test_reap_refuses_init_and_own_session():
