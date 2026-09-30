@@ -6,10 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig, load_gateway_config
-from plugins.platforms.discord.adapter import (
-    DiscordAdapter,
-    _parse_slash_command_scope,
-)
+from plugins.platforms.discord.adapter import DiscordAdapter, _parse_slash_command_scope
 
 
 def _adapter(tmp_path, monkeypatch, scope="all"):
@@ -41,8 +38,7 @@ def _client(names=("status", "stop"), existing=("status", "stop"), guild_existin
     ("all", "all", set()), (True, "all", set()),
     ("none", "none", set()), (False, "none", set()),
     (["status", "/stop"], "list", {"status", "stop"}),
-    ("status,stop", "list", {"status", "stop"}),
-    ([], "none", set()),
+    ("status,stop", "list", {"status", "stop"}), ([], "none", set()),
 ])
 def test_parse_scope(raw, mode, names):
     actual_mode, actual_names = _parse_slash_command_scope(raw)
@@ -63,8 +59,7 @@ def test_scope_filters_all_registration_paths(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope,expected_names,expected_global_delete,expected_guild_delete", [
-    ("none", [], 2, 1),
-    (["status"], ["status"], 1, 1),
+    ("none", [], 2, 1), (["status"], ["status"], 1, 1),
     ("all", ["status", "stop"], 0, 0),
 ])
 async def test_connect_reconciles_scope_and_stale_guild_commands(tmp_path, monkeypatch, scope,
@@ -85,10 +80,22 @@ async def test_connect_reconciles_scope_and_stale_guild_commands(tmp_path, monke
     assert adapter._client.http.bulk_upsert_guild_commands.await_count == expected_guild_delete
     if expected_guild_delete:
         adapter._client.http.bulk_upsert_guild_commands.assert_awaited_once_with(123, 456, [])
-    # On a second connect the restricted scope still reconciles, never trusting
-    # the desired-tree fingerprint as proof Discord has no stale commands.
     await adapter._run_post_connect_initialization()
     assert adapter._client.tree.sync.await_count == (2 if expected_global_delete else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["bulk", "off"])
+async def test_none_also_clears_under_existing_sync_policy(tmp_path, monkeypatch, policy):
+    adapter = _adapter(tmp_path, monkeypatch, "none")
+    adapter._client = _client()
+    adapter._apply_slash_command_scope(adapter._client.tree)
+    adapter._state_write_off_loop = AsyncMock()
+    adapter._check_command_registry_drift = AsyncMock()
+    monkeypatch.setattr(adapter, "_get_discord_command_sync_policy", lambda: policy)
+    await adapter._run_post_connect_initialization()
+    adapter._client.tree.sync.assert_awaited_once()
+    adapter._client.http.bulk_upsert_guild_commands.assert_awaited_once_with(123, 456, [])
 
 
 def test_prefix_fallback_is_restricted_and_command_only(tmp_path, monkeypatch):

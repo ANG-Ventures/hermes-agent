@@ -3214,7 +3214,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         try:
             sync_policy = self._get_discord_command_sync_policy()
-            if sync_policy == "off":
+            if sync_policy == "off" and self._slash_scope_mode() == _SLASH_SCOPE_ALL:
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
                 return
 
@@ -7423,7 +7423,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     getattr(guild, "id", "?"),
                     e,
                 )
-                continue
+                raise
             cleared += len(existing)
             logger.info(
                 "[%s] Cleared %d stale guild-scoped slash command(s) in guild %s (discord.slash_commands=%s)",
