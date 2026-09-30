@@ -20,6 +20,10 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # they shipped (catalog visibility=list for both). Sol is the mid-tier
     # coding/agentic slug, Luna the cheap high-volume one.
     "gpt-6-sol",
+    # GPT-6.1 Sol (2026-09-29). Not yet listed by the account catalog
+    # (2026-09-30), but the Codex responses endpoint serves it (measured
+    # 921,028-token request OK), so it is curated + forward-compat'd here.
+    "gpt-6.1-sol",
     "gpt-6-luna",
     # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
     # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
@@ -61,6 +65,7 @@ DEFAULT_CODEX_MODELS: List[str] = [
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
     ("gpt-6-astra", ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
     ("gpt-6-sol", ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
+    ("gpt-6.1-sol", ("gpt-6-sol", "gpt-5.6-sol")),
     ("gpt-6-luna", ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),

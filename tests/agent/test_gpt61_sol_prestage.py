@@ -4,7 +4,7 @@ before the Codex lane serves it.
 Behaviour contracts, not snapshots:
 - context resolves to the documented 1.05M window on the direct API and to
   the advertised 272K on the Codex OAuth offline fallback;
-- the ``-900k`` opt-in is NOT granted (no measured max_context_window yet);
+- the ``-900k`` opt-in is granted since 2026-09-30 (measured 922,000 ceiling);
 - pricing resolves to 6.1's own rates (cache read $0.10) while gpt-6-sol keeps
   its own ($0.20), on both the ``openai`` and ``openai-codex`` routes;
 - ``openai-codex/gpt-6.1-sol`` normalizes to the bare slug.
@@ -47,9 +47,10 @@ def test_gpt61_sol_codex_offline_fallback_is_advertised_272k():
     assert ctx == 272_000
 
 
-def test_gpt61_sol_not_900k_eligible_until_measured():
+def test_gpt61_sol_900k_eligible_once_measured():
+    # Flipped 2026-09-30: ceiling measured at 922,000 (see test_gpt61_sol_900k.py).
     assert is_codex_900k_base("gpt-6-sol") is True
-    assert is_codex_900k_base("gpt-6.1-sol") is False
+    assert is_codex_900k_base("gpt-6.1-sol") is True
 
 
 def test_gpt61_sol_prices_distinct_from_gpt6_sol():
