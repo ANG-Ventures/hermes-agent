@@ -3486,7 +3486,9 @@ def _start_late_completion(
                 # Bounded drain of the turn that is actually running (the
                 # correction turn after a retry stall), so teardown does not
                 # close the child's session/tools under a still-unwinding turn.
-                active_turn["future"].result(timeout=min(ceiling or 5.0, 5.0))
+                # Flat 5 s: equals min(ceiling, 5) for every configurable
+                # child_timeout (floor 30 s).
+                active_turn["future"].result(timeout=5.0)
             except Exception:
                 pass
             api_calls = 0
