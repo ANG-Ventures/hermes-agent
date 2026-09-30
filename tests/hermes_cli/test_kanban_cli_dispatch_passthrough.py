@@ -83,9 +83,10 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     assert captured.get("max_in_progress_per_profile") == 2
 
 
-def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):
-    """--max on the CLI takes precedence over kanban.max_spawn in config.
-    The CLI flag is the explicit operator signal; config is the default."""
+def test_cli_max_flag_is_additive_and_max_running_overrides_config(isolated_kanban_home, monkeypatch):
+    """--max is ADDITIVE (spawn_limit), never the running ceiling; the ceiling
+    is --max-running, else kanban.max_spawn (t_689b81b7: `--max 6` was read as
+    "stop once 6 are running")."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
 
@@ -100,9 +101,15 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
     args = argparse.Namespace(dry_run=True, max=2, failure_limit=2, json=False)
     kb_cli._cmd_dispatch(args)
+    assert captured.get("max_spawn") == 10, captured
+    assert captured.get("spawn_limit") is not None and captured["spawn_limit"] <= 2
 
-    assert captured.get("max_spawn") == 2, (
-        f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
+    captured.clear()
+    args = argparse.Namespace(dry_run=True, max=None, max_running=4,
+                              failure_limit=2, json=False)
+    kb_cli._cmd_dispatch(args)
+    assert captured.get("max_spawn") == 4, (
+        f"--max-running=4 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
 
 
