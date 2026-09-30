@@ -232,7 +232,25 @@ if [ -n "$INSTALL_REF" ]; then
   # Peel to ^{commit} in both cases: an annotated tag fetches as a tag OBJECT,
   # and using it directly fails later with "trying to write non-commit object
   # ... to branch 'refs/heads/main'".
-  if git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$INSTALL_REF" 2>/dev/null; then
+  #
+  # Retry the fetch: a transient GitHub fetch failure made a real tag look
+  # unresolvable and failed 2 of 10 scheduled Install & Update E2E jobs on
+  # 2026-09-30 (run 36724184458; the same tags resolved in sibling jobs).
+  # Only after every attempt fails does the ref count as unresolvable.
+  # A raw SHA usually fails the direct fetch by design (see above), so it gets
+  # one attempt and goes straight to the main fallback.
+  fetch_ref_ok=false fetch_ref_err="" fetch_attempts=4
+  case "$INSTALL_REF" in *[!0-9a-f]*) ;; ???????*) fetch_attempts=1 ;; esac
+  for fetch_attempt in $(seq 1 "$fetch_attempts"); do
+    if fetch_ref_err="$(git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$INSTALL_REF" 2>&1)"; then
+      fetch_ref_ok=true
+      break
+    fi
+    if [ "$fetch_attempt" -lt "$fetch_attempts" ]; then
+      sleep "${SANDBOX_FETCH_RETRY_SLEEP:-$((fetch_attempt * 10))}"
+    fi
+  done
+  if [ "$fetch_ref_ok" = true ]; then
     UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse "FETCH_HEAD^{commit}")"
   elif git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" refs/heads/main \
     && UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse --verify -q "$INSTALL_REF^{commit}")"; then
@@ -240,6 +258,7 @@ if [ -n "$INSTALL_REF" ]; then
   else
     rm -rf -- "$UPSTREAM_REPO"
     echo "error: could not resolve upstream ref: $INSTALL_REF" >&2
+    if [ -n "$fetch_ref_err" ]; then echo "       last fetch error: $fetch_ref_err" >&2; fi
     echo '       Use a branch (main), a tag (v2026.7.7), or a SHA reachable from main.' >&2
     exit 1
   fi
