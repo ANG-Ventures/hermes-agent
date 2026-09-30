@@ -3218,6 +3218,22 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+            # agent.service_tier alone is inert; only request_overrides reach
+            # the wire. Route-gated like every other tier attach site.
+            from hermes_cli.fast_mode_contracts import parse_service_tier
+            from hermes_cli.models import service_tier_request_overrides
+
+            tier_overrides = service_tier_request_overrides(
+                model=model,
+                provider=runtime_kwargs.get("provider"),
+                api_mode=runtime_kwargs.get("api_mode"),
+                tier=parse_service_tier(request_service_tier),
+            )
+            if tier_overrides:
+                agent_kwargs["request_overrides"] = {
+                    **dict(agent_kwargs.get("request_overrides") or {}),
+                    **tier_overrides,
+                }
 
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {

@@ -6349,17 +6349,22 @@ def _load_reasoning_config(model: str = "") -> dict | None:
     return resolve_reasoning_config(_load_cfg(), model)
 
 
-def _load_service_tier() -> str | None:
-    raw = (
-        str((_load_cfg().get("agent") or {}).get("service_tier", "") or "")
-        .strip()
-        .lower()
+def _service_tier_request_overrides(model, runtime: dict, tier) -> dict:
+    """Route-gated request_overrides for a static ``agent.service_tier``."""
+    from hermes_cli.models import service_tier_request_overrides
+
+    return service_tier_request_overrides(
+        model=model,
+        provider=(runtime or {}).get("provider"),
+        api_mode=(runtime or {}).get("api_mode"),
+        tier=tier,
     )
-    if not raw or raw in {"normal", "default", "standard", "off", "none"}:
-        return None
-    if raw in {"fast", "priority", "on"}:
-        return "priority"
-    return None
+
+
+def _load_service_tier() -> str | None:
+    from hermes_cli.fast_mode_contracts import parse_service_tier
+
+    return parse_service_tier((_load_cfg().get("agent") or {}).get("service_tier", ""))
 
 
 def _load_provider_routing() -> dict:
@@ -8079,7 +8084,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
-        "fast": service_tier == "priority",
+        "fast": service_tier in {"priority", "ultrafast"},
         "yolo": yolo,
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
@@ -9616,6 +9621,11 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    _service_tier = (
+        service_tier_override
+        if service_tier_override is not None
+        else _load_service_tier()
+    )
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -9637,11 +9647,11 @@ def _make_agent(
             if reasoning_config_override is not None
             else _load_reasoning_config(str(model or ""))
         ),
-        service_tier=(
-            service_tier_override
-            if service_tier_override is not None
-            else _load_service_tier()
-        ),
+        service_tier=_service_tier,
+        # ``agent.service_tier`` alone is inert: only request_overrides reach
+        # the wire. Without this a `hermes serve` agent built from config
+        # (e.g. `agent.service_tier: ultrafast`) never sent the tier.
+        request_overrides=_service_tier_request_overrides(model, runtime, _service_tier),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         disabled_toolsets=_load_disabled_toolsets(),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
@@ -15158,33 +15168,39 @@ def _(rid, params: dict) -> dict:
     if key == "fast":
         raw = str(value or "").strip().lower()
         agent = session.get("agent") if session else None
+        from hermes_cli.fast_mode_contracts import service_tier_word
+
         if agent is not None:
-            current_fast = getattr(agent, "service_tier", None) == "priority"
+            current_tier = getattr(agent, "service_tier", None) or None
         elif session is not None and session.get("create_service_tier_override") is not None:
             # Pre-build session with a pinned tier (desktop draft pick or an
             # earlier session-scoped toggle) — report/toggle from the pin, not
             # the global default.
-            current_fast = session["create_service_tier_override"] == "priority"
+            current_tier = session["create_service_tier_override"] or None
         else:
-            current_fast = _load_service_tier() == "priority"
+            current_tier = _load_service_tier()
+        current_fast = current_tier is not None
 
         if raw in {"status"}:
             return _ok(
                 rid,
-                {"key": key, "value": "fast" if current_fast else "normal"},
+                {"key": key, "value": service_tier_word(current_tier)},
             )
 
         if raw in {"", "toggle"}:
             nv = "normal" if current_fast else "fast"
         elif raw in {"fast", "on"}:
             nv = "fast"
+        elif raw == "ultrafast":
+            nv = "ultrafast"
         elif raw in {"normal", "off"}:
             nv = "normal"
         else:
             return _err(rid, 4002, f"unknown fast mode: {value}")
+        new_tier = {"fast": "priority", "ultrafast": "ultrafast"}.get(nv)
 
         overrides = None
-        if nv == "fast":
+        if new_tier:
             from hermes_cli.models import resolve_fast_mode_capability
             from hermes_cli.providers import infer_api_mode_from_provider
 
@@ -15225,6 +15241,7 @@ def _(rid, params: dict) -> dict:
                 model=target_model,
                 provider=target_provider,
                 api_mode=target_api_mode,
+                tier=new_tier,
             )
             overrides = capability.request_overrides
             if not capability.supported:
@@ -15243,17 +15260,15 @@ def _(rid, params: dict) -> dict:
             # build ("switch one session, switches everywhere"). Pin the
             # create override so lazily-built sessions and rebuilds (/new,
             # deferred resume) keep the choice; "" pins normal explicitly.
-            session["create_service_tier_override"] = (
-                "priority" if nv == "fast" else ""
-            )
+            session["create_service_tier_override"] = new_tier or ""
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
+            agent.service_tier = new_tier
             current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
             current_overrides.pop("service_tier", None)
             current_overrides.pop("speed", None)
-            if nv == "fast":
+            if new_tier:
                 current_overrides.update(overrides)
             agent.request_overrides = current_overrides
             _persist_live_session_runtime(session)
@@ -17404,11 +17419,29 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             )
             return "\n".join(_lines)
         elif name == "fast" and agent:
-            mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
+            from hermes_cli.fast_mode_contracts import parse_service_tier
+
+            mode = arg.lower().strip()
+            if mode in {"fast", "on", "ultrafast", "normal", "off"}:
+                tier = parse_service_tier(mode)
+                # service_tier alone is inert; mirror the tier into
+                # request_overrides, route-gated, and leave the session
+                # untouched when the worker's /fast refused this route.
+                overrides = _service_tier_request_overrides(
+                    getattr(agent, "model", None),
+                    {
+                        "provider": getattr(agent, "provider", None),
+                        "api_mode": getattr(agent, "api_mode", None),
+                    },
+                    tier,
+                )
+                if tier is None or overrides:
+                    agent.service_tier = tier
+                    current = dict(getattr(agent, "request_overrides", {}) or {})
+                    current.pop("service_tier", None)
+                    current.pop("speed", None)
+                    current.update(overrides)
+                    agent.request_overrides = current
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()

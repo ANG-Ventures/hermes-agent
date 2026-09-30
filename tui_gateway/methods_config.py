@@ -291,7 +291,9 @@ def _(rid, params: dict) -> dict:
                 tier = session["create_service_tier_override"]
         if tier is None:
             tier = _load_service_tier()
-        return _ok(rid, {"value": "fast" if tier == "priority" else "normal"})
+        from hermes_cli.fast_mode_contracts import service_tier_word
+
+        return _ok(rid, {"value": service_tier_word(tier)})
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
     if key in {"approval_mode", "approvals.mode"}:

@@ -134,6 +134,50 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _record_served_service_tier(agent: Any, response: Any) -> None:
+    """Stamp the response's SERVED ``service_tier`` and WARN on a downgrade.
+
+    OpenAI reports the tier that actually served a request on the response
+    (not in ``usage``). A request for ``ultrafast`` answered with ``default``
+    was silently rate-limited to Standard; surface it instead of letting the
+    turn look like it ran at the requested tier.
+    """
+    # Per call: a response without a tier leaves the latest call's served
+    # tier unknown instead of inheriting an earlier call's value.
+    agent._served_service_tier = None
+    served = getattr(response, "service_tier", None)
+    if not isinstance(served, str) or not served.strip():
+        return
+    served = served.strip().lower()
+    agent._served_service_tier = served
+    requested = (getattr(agent, "request_overrides", None) or {}).get("service_tier")
+    try:
+        from hermes_cli.fast_mode_contracts import (
+            SERVED_TIER_ECHO_UNRELIABLE_PROVIDERS,
+            service_tier_downgraded,
+        )
+    except Exception:
+        return
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider in SERVED_TIER_ECHO_UNRELIABLE_PROVIDERS:
+        logger.debug(
+            "service_tier requested=%s served-echo=%s on %s (echo not authoritative)",
+            requested,
+            served,
+            provider,
+        )
+        return
+    if service_tier_downgraded(requested, served):
+        logger.warning(
+            "service_tier requested=%s but served=%s (model=%s provider=%s); "
+            "this call ran and bills at the served tier",
+            requested,
+            served,
+            getattr(agent, "model", None),
+            getattr(agent, "provider", None),
+        )
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -2632,6 +2676,9 @@ def run_conversation(
     # successful provider call appends a dict at the usage-commit site below;
     # folded into the on_session_end `turn_usage` kwarg at the end of the turn.
     _turn_calls: List[Dict[str, Any]] = []
+    # Tier the provider reports it SERVED on this turn's latest call (None
+    # until a response carries one); see _record_served_service_tier.
+    agent._served_service_tier = None
     # Published (same list object) for the run_agent forwarder's backstop
     # (turn_finalizer.emit_unfinalized_session_end): early returns and raises
     # below never reach finalize_turn but must still record their turn.
@@ -5405,6 +5452,7 @@ def run_conversation(
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
 
+                    _record_served_service_tier(agent, response)
                     agent.session_prompt_tokens += prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens

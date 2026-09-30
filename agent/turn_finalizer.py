@@ -801,11 +801,19 @@ def finalize_turn(
         "estimated_cost_usd": agent.session_estimated_cost_usd,
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
-        # Requested service tier (from request_overrides.extra_body), for
-        # billing audits by callers like `hermes -z --usage-file`.
+        # Requested service tier, for billing audits by callers like
+        # `hermes -z --usage-file`. Fast-mode tiers are top-level
+        # request_overrides keys; a custom provider may carry one in
+        # extra_body instead.
         "service_tier": (
-            (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
-        ).get("service_tier"),
+            (getattr(agent, "request_overrides", {}) or {}).get("service_tier")
+            or (
+                (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
+            ).get("service_tier")
+        ),
+        # Tier the provider reports it actually SERVED (may differ from the
+        # request: `default` for an ultrafast request = silent downgrade).
+        "service_tier_served": getattr(agent, "_served_service_tier", None),
         "session_id": agent.session_id,
     }
     if agent._tool_guardrail_halt_decision is not None:

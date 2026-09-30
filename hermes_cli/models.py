@@ -30,8 +30,10 @@ if TYPE_CHECKING:
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_cli.fast_mode_contracts import (
     FAST_MODE_CAPABILITY_CATALOG,
+    ULTRAFAST_CAPABILITY_CONTRACT,
     anthropic_fast_contract_accepts,
     normalize_fast_model_id,
+    ultrafast_contract_accepts,
 )
 from hermes_cli.urllib_security import open_credentialed_url, url_origin
 from hermes_cli import provider_seam
@@ -3946,11 +3948,56 @@ def _fast_model_base(model_id: Optional[str]) -> str:
     return normalize_fast_model_id(model_id)
 
 
+def model_supports_ultrafast(model_id: Optional[str]) -> bool:
+    """OpenAI Ultrafast (``service_tier: "ultrafast"``) is published per model, not per family."""
+    try:
+        from agent.model_metadata import strip_codex_context_variant_suffix
+
+        model_id = strip_codex_context_variant_suffix(str(model_id or ""))
+    except Exception:
+        pass
+    return ultrafast_contract_accepts(model_id)
+
+
+def _resolve_ultrafast_capability(
+    *, provider: str, api_mode: str, model: Optional[str], route: str
+) -> FastModeCapability:
+    """Ultrafast is a Responses-API tier on native OpenAI / Codex routes only.
+
+    Anything else gets NO tier rather than a silent swap to a different paid
+    tier (e.g. Priority): the operator asked for Ultrafast, not "some fast".
+    """
+    native = (
+        provider in {"openai", "openai-api"} and api_mode == "codex_responses"
+    ) or (provider == "openai-codex" and api_mode == "codex_responses")
+    supported = native and model_supports_ultrafast(model)
+    if supported:
+        reason = None
+    elif not native:
+        reason = (
+            f"OpenAI Ultrafast is only sent on native OpenAI / Codex Responses "
+            f"routes; `{route}` with API mode `{api_mode or '<unset>'}` gets "
+            "normal speed."
+        )
+    else:
+        reason = (
+            f"OpenAI Ultrafast is not documented for `{route}` (OpenAI currently "
+            f"lists {', '.join(m.upper() for m in ULTRAFAST_CAPABILITY_CONTRACT['models'])})."
+        )
+    return FastModeCapability(
+        supported=supported,
+        family="openai_ultrafast",
+        request_overrides={"service_tier": "ultrafast"} if supported else {},
+        reason=reason,
+    )
+
+
 def resolve_fast_mode_capability(
     *,
     model: Optional[str],
     provider: Optional[str],
     api_mode: Optional[str],
+    tier: Optional[str] = None,
 ) -> FastModeCapability:
     """Resolve Fast support from the complete transport contract.
 
@@ -3958,11 +4005,33 @@ def resolve_fast_mode_capability(
     Claude model name. This result is shared by command UX and request
     construction so support, explanation, and serialized overrides cannot
     drift apart.
+
+    ``tier`` is the session's ``agent.service_tier``. ``None`` / ``"priority"``
+    resolve the Priority/Fast contracts below; ``"ultrafast"`` resolves the
+    OpenAI Ultrafast contract and never falls back to another tier.
     """
     normalized_provider = normalize_provider(provider)
     normalized_mode = str(api_mode or "").strip().lower()
     base = _fast_model_base(model)
     route = f"{normalized_provider}/{base or '<unset>'}"
+
+    normalized_tier = str(tier or "").strip().lower()
+    if normalized_tier == "ultrafast":
+        return _resolve_ultrafast_capability(
+            provider=normalized_provider,
+            api_mode=normalized_mode,
+            model=model,
+            route=route,
+        )
+    if normalized_tier not in {"", "priority", "fast"}:
+        # Never substitute a paid Priority tier for some other requested
+        # tier (flex, default, ...): these contracts only cover fast tiers.
+        return FastModeCapability(
+            supported=False,
+            family="unsupported",
+            request_overrides={},
+            reason=f"service tier `{normalized_tier}` has no fast-mode contract.",
+        )
 
     openai_contract = FAST_MODE_CAPABILITY_CATALOG["openai_priority"]
     if normalized_provider in {"openai", "openai-api"} and normalized_mode in {
@@ -4067,11 +4136,50 @@ def _native_fast_route(model_id: Optional[str]) -> Optional[tuple[str, str]]:
     return None
 
 
+def service_tier_request_overrides(
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    api_mode: Optional[str],
+    tier: Optional[str],
+) -> dict[str, Any]:
+    """Route-gated request_overrides for a static ``agent.service_tier``.
+
+    For agent builders that pass ``service_tier`` to ``AIAgent`` directly
+    (``hermes serve`` / TUI, ``hermes -z``): ``agent.service_tier`` alone is
+    inert, only ``request_overrides`` reach the wire. Unsupported routes and
+    proxies get ``{}`` (with a warning) rather than a tier the endpoint may
+    reject or bill differently.
+    """
+    if not tier:
+        return {}
+    try:
+        capability = resolve_fast_mode_capability(
+            model=model, provider=provider, api_mode=api_mode, tier=tier
+        )
+    except Exception:
+        logger.warning(
+            "agent.service_tier=%s not sent: capability resolution failed",
+            tier,
+            exc_info=True,
+        )
+        return {}
+    if not capability.supported:
+        logger.warning(
+            "agent.service_tier=%s not sent: %s",
+            tier,
+            capability.reason or "unsupported route",
+        )
+        return {}
+    return dict(capability.request_overrides or {})
+
+
 def resolve_fast_mode_capability_for_configured_route(
     *,
     model: Optional[str],
     provider: Optional[str],
     api_mode: Optional[str],
+    tier: Optional[str] = None,
 ) -> FastModeCapability:
     """Resolve Fast support for a configured route whose provider may be unpinned.
 
@@ -4088,15 +4196,20 @@ def resolve_fast_mode_capability_for_configured_route(
     """
     if str(provider or "").strip().lower() not in _UNRESOLVED_PROVIDERS:
         return resolve_fast_mode_capability(
-            model=model, provider=provider, api_mode=api_mode
+            model=model, provider=provider, api_mode=api_mode, tier=tier
+        )
+    if str(tier or "").strip().lower() == "ultrafast" and model_supports_ultrafast(model):
+        # Ultrafast models are documented on the native OpenAI Responses route.
+        return resolve_fast_mode_capability(
+            model=model, provider="openai-api", api_mode="codex_responses", tier=tier
         )
     native = _native_fast_route(model)
     if native is None:
         return resolve_fast_mode_capability(
-            model=model, provider=provider, api_mode=api_mode
+            model=model, provider=provider, api_mode=api_mode, tier=tier
         )
     return resolve_fast_mode_capability(
-        model=model, provider=native[0], api_mode=native[1]
+        model=model, provider=native[0], api_mode=native[1], tier=tier
     )
 
 
@@ -4120,18 +4233,25 @@ def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
     return anthropic_fast_contract_accepts(model_id)
 
 
-def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | None:
+def resolve_fast_mode_overrides(
+    model_id: Optional[str], *, tier: Optional[str] = None
+) -> dict[str, Any] | None:
     """Return request_overrides for fast/priority mode, or None if unsupported.
 
     Returns provider-appropriate overrides:
     - OpenAI models: ``{"service_tier": "priority"}`` (Priority Processing)
     - Anthropic models: ``{"speed": "fast"}`` (Anthropic Fast Mode beta)
     - Grok 4.6: ``{"service_tier": "priority"}`` (xAI Priority Processing)
+    - ``tier="ultrafast"``: ``{"service_tier": "ultrafast"}`` on a documented
+      Ultrafast model, None elsewhere (never a silent swap to another tier).
 
-    The overrides are injected into the API request kwargs by
-    ``_build_api_kwargs`` in run_agent.py — each API path handles its own
-    keys (service_tier for OpenAI/Codex, speed for Anthropic Messages).
+    Model-only gate; request construction uses the route-aware
+    :func:`resolve_fast_mode_capability`. The overrides are injected into the
+    API request kwargs by ``_build_api_kwargs`` in run_agent.py — each API path
+    handles its own keys (service_tier for OpenAI/Codex, speed for Anthropic).
     """
+    if str(tier or "").strip().lower() == "ultrafast":
+        return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
     if not model_supports_fast_mode(model_id):
         return None
     if _is_anthropic_fast_model(model_id):

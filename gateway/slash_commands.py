@@ -2373,7 +2373,8 @@ class GatewaySlashCommandsMixin:
 
     def _fast_unavailable_model_switch_row(self, result: Any) -> Optional[str]:
         """Explain when an enabled Fast toggle cannot follow a new route."""
-        if getattr(self, "_service_tier", None) != "priority":
+        tier = getattr(self, "_service_tier", None)
+        if tier not in {"priority", "ultrafast"}:
             return None
         try:
             from hermes_cli.models import resolve_fast_mode_capability
@@ -2388,6 +2389,7 @@ class GatewaySlashCommandsMixin:
                 model=getattr(result, "new_model", None),
                 provider=provider,
                 api_mode=api_mode,
+                tier=tier,
             )
             if capability.supported:
                 return None
@@ -5365,6 +5367,12 @@ class GatewaySlashCommandsMixin:
             provider=provider,
             api_mode=api_mode,
         )
+        ultrafast_capability = resolve_fast_mode_capability(
+            model=model,
+            provider=provider,
+            api_mode=api_mode,
+            tier="ultrafast",
+        )
         route = f"{provider or '<unknown>'}/{model or '<unset>'}"
         persisted_preference = persisted_lookup.identity
         preference_unavailable = session_key in getattr(
@@ -5415,6 +5423,37 @@ class GatewaySlashCommandsMixin:
                 tier = "priority"
                 saved_value = "fast"
                 label = t("gateway.fast.label_fast")
+            elif value == "ultrafast":
+                if persist:
+                    from gateway.run import _resolve_gateway_model
+                    from hermes_cli.models import (
+                        resolve_fast_mode_capability_for_configured_route,
+                    )
+                    _, global_provider, global_api_mode = (
+                        self._configured_route_identity(user_config)
+                    )
+                    global_capability = resolve_fast_mode_capability_for_configured_route(
+                        model=_resolve_gateway_model(user_config),
+                        provider=global_provider,
+                        api_mode=global_api_mode,
+                        tier="ultrafast",
+                    )
+                    if not global_capability.supported:
+                        return t(
+                            "gateway.fast.route_unavailable",
+                            reason=global_capability.reason,
+                        )
+                else:
+                    if persisted_preference and preference_unavailable:
+                        return t("gateway.fast.preference_unavailable", route=route)
+                    if not ultrafast_capability.supported:
+                        return t(
+                            "gateway.fast.route_unavailable",
+                            reason=ultrafast_capability.reason,
+                        )
+                tier = "ultrafast"
+                saved_value = "ultrafast"
+                label = t("gateway.fast.label_ultrafast")
             elif value in {"normal", "off"}:
                 tier = None
                 saved_value = "normal"
@@ -5422,7 +5461,10 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.fast.unknown_arg", arg=value)
             self._service_tier = tier
-            family_label = t(f"gateway.fast.family_{capability.family}")
+            family = (
+                ultrafast_capability.family if tier == "ultrafast" else capability.family
+            )
+            family_label = t(f"gateway.fast.family_{family}")
             if persist:
                 if self._save_gateway_config_key("agent.service_tier", saved_value):
                     # Global write supersedes any session override.
@@ -5478,7 +5520,7 @@ class GatewaySlashCommandsMixin:
                 _fast_supported = False
 
             if _fast_supported:
-                _is_fast = self._service_tier == "priority"
+                _is_fast = self._service_tier in {"priority", "ultrafast"}
 
                 def _apply_fast_choice(value: str) -> str:
                     """Apply a picker tap. The picker was already gated on fast
@@ -5564,19 +5606,29 @@ class GatewaySlashCommandsMixin:
                     "gateway.fast.preference_unavailable",
                     route=route,
                 )
-            if not capability.supported:
+            status_capability = (
+                ultrafast_capability
+                if self._service_tier == "ultrafast"
+                or (
+                    self._service_tier is None
+                    and not capability.supported
+                    and ultrafast_capability.supported
+                )
+                else capability
+            )
+            if not status_capability.supported:
                 key = (
                     "gateway.fast.preference_off"
                     if persisted_preference
                     else "gateway.fast.route_off"
                 )
-                return t(key, reason=capability.reason)
+                return t(key, reason=status_capability.reason)
             state = t(
                 "gateway.fast.state_on"
-                if self._service_tier == "priority"
+                if self._service_tier in {"priority", "ultrafast"}
                 else "gateway.fast.state_off"
             )
-            family_label = t(f"gateway.fast.family_{capability.family}")
+            family_label = t(f"gateway.fast.family_{status_capability.family}")
             return t(
                 "gateway.fast.preference_status"
                 if persisted_preference

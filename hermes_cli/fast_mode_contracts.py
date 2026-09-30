@@ -84,6 +84,90 @@ FAST_MODE_CAPABILITY_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType
 )
 
 
+# OpenAI Ultrafast (``service_tier: "ultrafast"``, Responses API only). Published
+# per model, not per family: GPT-6 Astra is GA in the API and on the Codex
+# backend (Pro 500 / Enterprise) as of 2026-09-29; GPT-6.1 Sol is "coming soon".
+# Kept separate from FAST_MODE_CAPABILITY_CATALOG so the Priority/Fast contracts
+# (and their dated snapshot tests) stay untouched.
+ULTRAFAST_CAPABILITY_CONTRACT: Mapping[str, Any] = MappingProxyType(
+    {
+        "source_url": "https://developers.openai.com/api/docs/guides/ultrafast-mode",
+        "checked_date": "2026-09-29",
+        "models": ("gpt-6-astra",),
+    }
+)
+
+#: ``agent.service_tier`` values sent on every request of a session.
+STATIC_SERVICE_TIERS = frozenset({"priority", "ultrafast"})
+#: Config/slash words that mean "no tier".
+NORMAL_SERVICE_TIER_WORDS = frozenset({"", "normal", "default", "standard", "off", "none"})
+#: Config/slash word -> ``agent.service_tier``. The single table every config
+#: loader (CLI, gateway, TUI) parses through, so a new tier is one edit.
+SERVICE_TIER_WORDS: Mapping[str, str] = MappingProxyType(
+    {
+        "fast": "priority",
+        "priority": "priority",
+        "on": "priority",
+        "ultrafast": "ultrafast",
+    }
+)
+
+
+def parse_service_tier(raw: Any) -> Optional[str]:
+    """``agent.service_tier`` for a config/slash word; None for normal AND for unknown words."""
+    value = str(raw or "").strip().lower()
+    if value in NORMAL_SERVICE_TIER_WORDS:
+        return None
+    return SERVICE_TIER_WORDS.get(value)
+
+
+def is_known_service_tier_word(raw: Any) -> bool:
+    """True when *raw* is a recognized tier word (including the normal words)."""
+    value = str(raw or "").strip().lower()
+    return value in NORMAL_SERVICE_TIER_WORDS or value in SERVICE_TIER_WORDS
+
+
+def service_tier_word(tier: Any) -> str:
+    """User-facing word for a stored tier: ``priority`` -> ``fast``, None -> ``normal``."""
+    if not tier:
+        return "normal"
+    return "fast" if tier == "priority" else str(tier)
+
+
+# Request word -> the tier name a response reports when that tier served it.
+# OpenAI answers a ``fast``/``priority`` request with ``service_tier: "priority"``.
+_SERVED_TIER_FOR_REQUEST: Mapping[str, str] = MappingProxyType(
+    {"fast": "priority", "priority": "priority", "ultrafast": "ultrafast"}
+)
+
+
+# Providers whose response ``service_tier`` echo does NOT reflect the served
+# tier. Measured 2026-09-29 on chatgpt.com/backend-api/codex, gpt-6-astra,
+# reasoning low: response.completed reports ``default`` for ultrafast, priority
+# and no-tier requests alike, while ultrafast ran ~3x faster (4.7 s vs 13.8 s).
+# The value is still recorded; it just cannot prove a downgrade there.
+SERVED_TIER_ECHO_UNRELIABLE_PROVIDERS = frozenset({"openai-codex"})
+
+
+def service_tier_downgraded(requested: Any, served: Any) -> bool:
+    """True when a response reports a different tier than the static one requested.
+
+    OpenAI echoes the tier that actually served the request; ``default`` for an
+    Ultrafast request means the ramp limiter silently served (and billed) it at
+    Standard. Unknown/absent values on either side are not judged.
+    """
+    expected = _SERVED_TIER_FOR_REQUEST.get(str(requested or "").strip().lower())
+    served_norm = str(served or "").strip().lower() if isinstance(served, str) else ""
+    if not expected or not served_norm:
+        return False
+    return served_norm != expected
+
+
+def ultrafast_contract_accepts(model_id: Optional[str]) -> bool:
+    """Return whether *model_id* is documented for OpenAI Ultrafast."""
+    return normalize_fast_model_id(model_id) in ULTRAFAST_CAPABILITY_CONTRACT["models"]
+
+
 def normalize_fast_model_id(model_id: Optional[str]) -> str:
     """Normalize only documented spelling aliases; retain all other suffixes."""
     normalized = str(model_id or "").strip().lower()

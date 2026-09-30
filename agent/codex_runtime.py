@@ -1178,6 +1178,8 @@ def _consume_codex_event_stream(
     active_summary_index: Any = None
     terminal_status: str = "completed"
     terminal_usage: Any = None
+    # The tier the backend SERVED (may differ from the one requested).
+    terminal_service_tier: Any = None
     terminal_response_id: str = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
@@ -1389,6 +1391,9 @@ def _consume_codex_event_stream(
                 terminal_usage = getattr(resp_obj, "usage", None)
                 if terminal_usage is None and isinstance(resp_obj, dict):
                     terminal_usage = resp_obj.get("usage")
+                terminal_service_tier = getattr(resp_obj, "service_tier", None)
+                if terminal_service_tier is None and isinstance(resp_obj, dict):
+                    terminal_service_tier = resp_obj.get("service_tier")
                 rid = getattr(resp_obj, "id", None)
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
@@ -1504,6 +1509,7 @@ def _consume_codex_event_stream(
         model=model,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
+        service_tier=terminal_service_tier,
     )
     return final
 

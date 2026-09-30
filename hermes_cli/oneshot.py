@@ -190,6 +190,9 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             # paying for actually went out on the wire (July 2026 incident:
             # a config-matching bug silently dropped flex -> 2.3x billing).
             "service_tier": result.get("service_tier"),
+            # The tier the provider reports it SERVED (OpenAI echoes it on the
+            # response). Differs from service_tier on a silent downgrade.
+            "service_tier_served": result.get("service_tier_served"),
         }
         if failure is not None:
             report["failure"] = failure
@@ -476,6 +479,25 @@ def _run_agent(
 
         kanban_chat_id, kanban_chat_name = resolve_kanban_worker_chat_identity()
 
+        # agent.service_tier (fast / ultrafast) — route-gated, same contract
+        # as the interactive CLI; only request_overrides reach the wire.
+        from hermes_cli.fast_mode_contracts import parse_service_tier
+
+        _agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        _service_tier = parse_service_tier(
+            (_agent_cfg or {}).get("service_tier") if isinstance(_agent_cfg, dict) else None
+        )
+        _tier_overrides = {}
+        if _service_tier:
+            from hermes_cli.models import service_tier_request_overrides
+
+            _tier_overrides = service_tier_request_overrides(
+                model=effective_model,
+                provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                tier=_service_tier,
+            )
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -491,6 +513,8 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            service_tier=_service_tier,
+            request_overrides=_tier_overrides or None,
             ephemeral_system_prompt=skills_prompt,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:

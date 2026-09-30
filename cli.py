@@ -401,14 +401,15 @@ def _parse_reasoning_config(effort) -> dict | None:
 
 
 def _parse_service_tier_config(raw: str) -> str | None:
-    """Parse a persisted service-tier preference into a Responses API value."""
-    value = str(raw or "").strip().lower()
-    if not value or value in {"normal", "default", "standard", "off", "none"}:
-        return None
-    if value in {"fast", "priority", "on"}:
-        return "priority"
-    logger.warning("Unknown service_tier '%s', ignoring", raw)
-    return None
+    """Parse a persisted service-tier preference: None, "priority", or "ultrafast"."""
+    from hermes_cli.fast_mode_contracts import (
+        is_known_service_tier_word,
+        parse_service_tier,
+    )
+
+    if not is_known_service_tier_word(raw):
+        logger.warning("Unknown service_tier '%s', ignoring", raw)
+    return parse_service_tier(raw)
 
 def load_cli_config() -> Dict[str, Any]:
     """
@@ -9955,12 +9956,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ])
         self._console_print("\n".join(lines), highlight=False, markup=False)
     
-    def _fast_command_available(self) -> bool:
-        try:
-            from hermes_cli.models import resolve_fast_mode_capability
-            from hermes_cli.providers import infer_api_mode_from_provider
-        except Exception:
-            return False
+    def _fast_capability(self, tier=None):
+        """Route capability for *tier* on this session's model/provider/api_mode."""
+        from hermes_cli.models import resolve_fast_mode_capability
+        from hermes_cli.providers import infer_api_mode_from_provider
+
         agent = getattr(self, "agent", None)
         model = getattr(agent, "model", None) or getattr(self, "model", None)
         provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
@@ -9971,7 +9971,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model=model,
             provider=provider,
             api_mode=api_mode,
-        ).supported
+            tier=tier,
+        )
+
+    def _fast_command_available(self) -> bool:
+        """True when the route supports ANY static tier (fast/priority or ultrafast)."""
+        try:
+            return (
+                HermesCLI._fast_capability(self).supported
+                or HermesCLI._fast_capability(self, "ultrafast").supported
+            )
+        except Exception:
+            return False
 
     def _command_available(self, slash_command: str) -> bool:
         if slash_command == "/fast":

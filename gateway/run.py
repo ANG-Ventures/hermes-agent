@@ -10285,6 +10285,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 model=route["model"],
                 provider=runtime["provider"],
                 api_mode=runtime["api_mode"],
+                tier=service_tier,
             )
             overrides = capability.request_overrides
         except Exception:
@@ -12240,19 +12241,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load Priority Processing setting from config.yaml.
 
         Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
-        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
+        "fast"/"priority"/"on" => "priority", "ultrafast" => "ultrafast",
+        while "normal"/"off" disables it.
         Returns None when unset or unsupported.
         """
+        from hermes_cli.fast_mode_contracts import (
+            is_known_service_tier_word,
+            parse_service_tier,
+        )
+
         cfg = _load_gateway_runtime_config()
         raw = str(cfg_get(cfg, "agent", "service_tier", default="") or "").strip()
-
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        if not is_known_service_tier_word(raw):
+            logger.warning("Unknown service_tier '%s', ignoring", raw)
+        return parse_service_tier(raw)
 
     @staticmethod
     def _load_show_reasoning() -> bool:
