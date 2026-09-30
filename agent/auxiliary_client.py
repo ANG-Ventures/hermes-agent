@@ -11187,7 +11187,26 @@ def _call_llm_impl(
                             _record_route_info(route_info, _fallback_provider_from_label(next_label), next_model)
                             break
                     if fb_resp is None:
-                        raise first_err
+                        if is_auto:
+                            next_client, next_model, next_label = _try_main_fallback_chain(
+                                task, resolved_provider or "auto", reason="context length exceeded")
+                            if next_client is None:
+                                next_client, next_model, next_label = _try_payment_fallback(
+                                    resolved_provider, task, reason="context length exceeded")
+                        else:
+                            next_client, next_model, next_label = _try_main_agent_model_fallback(
+                                resolved_provider, task, reason="context length exceeded",
+                                failed_model=_chain_failed_model)
+                        if next_client is not None:
+                            fb_resp = _call_fallback_candidate_sync(
+                                next_client, next_model, next_label,
+                                task=task, messages=messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools,
+                                effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config)
+                            if fb_resp is not None:
+                                _record_route_info(route_info, _fallback_provider_from_label(next_label), next_model)
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was

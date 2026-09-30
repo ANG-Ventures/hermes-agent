@@ -94,6 +94,34 @@ def test_second_configured_slot_serves_after_first_slot_context_rejection(monkey
     assert large.chat.completions.create.call_count == 1
 
 
+def test_main_model_safety_net_after_all_configured_context_rejections(monkeypatch):
+    rejected = PromptTooLong("500 Claude Code returned an error result: Prompt is too long")
+    primary, small, main = (MagicMock() for _ in range(3))
+    for client, name in ((primary, "bpr"), (small, "gemini"), (main, "main")):
+        client.base_url = f"https://{name}.invalid/v1"
+    primary.chat.completions.create.side_effect = rejected
+    small.chat.completions.create.side_effect = rejected
+    served = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="Main model summary"), finish_reason="stop")])
+    main.chat.completions.create.return_value = served
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *a, **k: ("claude-bpr", "claude-sonnet-5-5", None, None, None))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *a, **k: (primary, "claude-sonnet-5-5"))
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {
+        "provider": "claude-bpr", "model": "claude-sonnet-5-5",
+        "fallback_chain": [{"provider": "gemini-bridge", "model": "gemini-small"}],
+    })
+    monkeypatch.setattr(aux, "_resolve_fallback_entry", lambda entry: (small, entry["model"]))
+    monkeypatch.setattr(aux, "_try_main_agent_model_fallback", lambda *a, **k: (main, "main-large", "main-agent(openai-codex)"))
+    monkeypatch.setattr(aux, "_task_minimum_context_length", lambda task: None)
+    monkeypatch.setattr(aux, "_transient_retry_count", lambda: 0)
+    monkeypatch.setattr(aux, "_record_aux_call_cost", lambda *a, **k: None)
+    monkeypatch.setattr("agent.aux_accounting.record_aux_api_call", lambda *a, **k: None)
+    response = aux.call_llm(task="compression", messages=[{"role": "user", "content": "long request"}])
+    assert response is served
+    assert small.chat.completions.create.call_count == 1
+    assert main.chat.completions.create.call_count == 1
+
+
 def test_non_context_failure_does_not_fall_back_as_a_window_miss():
     for status, text in ((500, "upstream timeout"), (413, "request too large"),
                          (200, "Prompt is too long")):
