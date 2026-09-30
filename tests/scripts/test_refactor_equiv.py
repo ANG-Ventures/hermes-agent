@@ -65,7 +65,7 @@ def test_mutation_cli_exits_nonzero_when_mutation_is_not_detected(tmp_path):
     module.write_text(
         textwrap.dedent(
             '''
-            _POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr"})
+            _POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr"})
             def f():
                 out = {}
                 sid = "x"

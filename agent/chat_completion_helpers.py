@@ -84,7 +84,7 @@ _POOL_HEADER_NAMES = (
     "x-pool-unreachable",
 )
 # Relay-pool providers whose responses carry the x-pool-* attribution headers.
-_POOLED_PROVIDERS = frozenset({"claude-apr", "claude-bpr"})
+_POOLED_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-bpr"})
 _PINNED_PROVIDER_KEYS = {
     "gemini-bridge": "gemini",
 }

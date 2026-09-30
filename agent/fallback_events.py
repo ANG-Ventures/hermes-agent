@@ -161,7 +161,7 @@ def classify_trigger(*, text: Optional[str] = None,
                          reason=reason), "text"
 
 
-RELAY_PROVIDERS = frozenset(("claude-apr", "claude-bpr"))
+RELAY_PROVIDERS = frozenset(("claude-apr", "claude-alr", "claude-bpr"))
 
 
 def relay_error_class(error: Any) -> Tuple[Optional[str], Optional[str]]:
