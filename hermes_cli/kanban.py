@@ -1410,7 +1410,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Spawn at most N MORE workers this call (additive; "
+                             "not a running-count ceiling). Intersects the host "
+                             "load gate (kanban.dispatch_load_gate), never raises it")
+    p_disp.add_argument("--max-running", type=int, default=None,
+                        help="Running-count ceiling for this board: spawn nothing "
+                             "once N are running (default: kanban.max_spawn)")
+    p_disp.add_argument("--ignore-load-gate", action="store_true",
+                        help="Bypass kanban.dispatch_load_gate for this call. Prints "
+                             "load1/pause_above and records a load_gate_override "
+                             "event on every card it spawns")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -5536,6 +5545,121 @@ def _cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
+def _one_shot_load_gate(conn, args, config, additive):
+    """Apply ``kanban.dispatch_load_gate`` to one ``kanban dispatch`` call.
+
+    Same gate object, allowance math and pause text as the gateway loop and
+    ``run_daemon``: allowance = ceil((pause_above - load1 - pending_ramp) /
+    worker_load_cost) capped at ``max_spawn_per_tick``, load5 floor on
+    resume. A one-shot process has no in-memory ramp, so this board's run
+    starts inside ``ramp_seconds`` are booked as the pending ramp; otherwise
+    back-to-back calls would each see an empty ramp and admit a full burst.
+
+    ``additive`` (``--max``) intersects the allowance; it never raises it.
+    ``--ignore-load-gate`` skips the gate but prints the load and returns an
+    ``override`` payload the caller writes as an event on every spawn.
+
+    Returns ``{spawn_paused, spawn_limit, limit_source, override, info}``.
+    """
+    import math as _math
+    from . import kanban_load_gate as _klg
+
+    out = {
+        "spawn_paused": None,
+        "spawn_limit": additive,
+        "limit_source": "--max" if additive is not None else None,
+        "override": None,
+        "info": None,
+    }
+    try:
+        gate = _klg.gate_from_config(config if isinstance(config, dict) else None)
+    except Exception:
+        return out
+    load1, load5 = _klg.sample_loadavg()
+    if not gate.enabled or load1 is None:
+        out["info"] = {"state": "disabled" if not gate.enabled else "unavailable"}
+        return out
+    try:
+        now_wall, now_mono = time.time(), time.monotonic()
+        rows = conn.execute(
+            "SELECT started_at FROM task_runs WHERE started_at >= ?",
+            (int(now_wall - gate.ramp_seconds),),
+        ).fetchall()
+        for row in rows:
+            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - float(row[0])))
+    except Exception:
+        pass
+    allowance, reason = gate.admit(load1, load5=load5)
+    info = gate.snapshot()
+    info.pop("boards", None)
+    out["info"] = info
+    stream = sys.stderr if getattr(args, "json", False) else sys.stdout
+    if getattr(args, "ignore_load_gate", False):
+        try:
+            from .profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        except Exception:
+            profile = "unknown"
+        print(
+            f"Load gate: load1={load1:.1f} pause_above={gate.pause_above:.1f} "
+            f"OVERRIDE by {profile} (--ignore-load-gate; gate state={gate.state}, "
+            f"would have allowed {allowance})",
+            file=stream, flush=True,
+        )
+        out["override"] = {
+            "source": "cli dispatch --ignore-load-gate",
+            "profile": profile,
+            "load1": round(load1, 2),
+            "load5": None if load5 is None else round(load5, 2),
+            "pause_above": gate.pause_above,
+            "gate_state": gate.state,
+            "gate_allowance": allowance,
+        }
+        info["override_by"] = profile
+        return out
+    if reason:
+        label = "PAUSED" if gate.state == "paused" else "SATURATED"
+        print(
+            f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) "
+            f"- spawning 0 this call: {reason}",
+            file=stream, flush=True,
+        )
+        out["spawn_paused"] = reason
+        out["spawn_limit"] = 0
+        out["limit_source"] = "load gate"
+        return out
+    print(
+        f"Load gate: admitting load1={load1:.1f} pending_ramp={gate.pending_ramp:.1f} "
+        f"allowance={allowance} (pause_above={gate.pause_above:.1f}, "
+        f"max_spawn_per_tick={gate.max_spawn_per_tick})",
+        file=stream, flush=True,
+    )
+    if allowance is not None and (additive is None or allowance < additive):
+        out["spawn_limit"] = allowance
+        out["limit_source"] = "load gate allowance"
+    return out
+
+
+def _dispatch_limit_notes(res, gate, max_spawn_source):
+    """Name which limit stopped a one-shot dispatch (``--max`` is additive)."""
+    notes = []
+    capped = getattr(res, "spawn_capped", None) or ""
+    if capped.startswith("max_spawn="):
+        notes.append(
+            f"running ceiling {max_spawn_source} fired ({capped}); "
+            f"--max N is additive and is not this ceiling"
+        )
+    limit = gate.get("spawn_limit")
+    spawned = len(getattr(res, "spawned", None) or [])
+    if limit is not None and limit > 0 and spawned >= limit:
+        src = gate.get("limit_source")
+        if src == "--max":
+            notes.append(f"--max={limit} reached: {spawned} spawned this call (additive)")
+        elif src:
+            notes.append(f"{src}={limit} reached: {spawned} spawned this call")
+    return notes
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
@@ -5571,18 +5695,32 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
-        # CLI --max overrides config kanban.max_spawn when both are present;
-        # CLI is the more explicit signal so it wins.
-        cli_max = getattr(args, "max", None)
-        max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
-            _kanban_cfg.get("max_spawn")
+        # --max-running N (else kanban.max_spawn) is the board's live
+        # running-count CEILING. --max N is ADDITIVE ("spawn up to N more this
+        # call") and never a ceiling: on 2026-09-29 `--max 6` was read as
+        # "stop at 6 running" and spawned nothing with 13 running (t_689b81b7).
+        cli_max_running = getattr(args, "max_running", None)
+        max_spawn = (
+            cli_max_running if cli_max_running is not None
+            else _coerce_positive_int(_kanban_cfg.get("max_spawn"))
+        )
+        max_spawn_source = (
+            "--max-running" if cli_max_running is not None else "kanban.max_spawn"
         )
     except Exception:
+        _cfg = None
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+        max_spawn = getattr(args, "max_running", None)
+        max_spawn_source = "--max-running"
+    additive = getattr(args, "max", None)
     with kb.connect_closing() as conn:
+        # Host load gate (kanban.dispatch_load_gate): the SAME gate the
+        # gateway loop and `kanban daemon` apply. The one-shot verb used to
+        # skip it; `dispatch --max 128` at load1 66 (pause_above 64) spawned
+        # 33 workers and took the Studio to load1 243 (t_689b81b7).
+        gate = _one_shot_load_gate(conn, args, _cfg, additive)
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
@@ -5591,7 +5729,24 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            spawn_paused=gate["spawn_paused"],
+            spawn_limit=gate["spawn_limit"],
         )
+        if gate["override"] is not None and not args.dry_run and res.spawned:
+            # Attribute any load episode to the override on every card it
+            # spawned (the overview reads task_events).
+            try:
+                with kb.write_txn(conn):
+                    for _tid, _who, _ws in res.spawned:
+                        kb._append_event(
+                            conn, _tid, "load_gate_override", dict(gate["override"]),
+                        )
+            except Exception as exc:
+                print(
+                    f"warning: could not record load_gate_override events: {exc}",
+                    file=sys.stderr,
+                )
+        limit_notes = _dispatch_limit_notes(res, gate, max_spawn_source)
         # Spawned cards nobody is watching will finish silently — surface
         # that at the point of confusion (every dispatch run) instead of
         # relying on the operator remembering to notify-subscribe. Computed
@@ -5694,6 +5849,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "gate_closed_unmerged": getattr(res, "gate_closed_unmerged", []),
             "spawn_paused": getattr(res, "spawn_paused", None),
             "spawn_capped": getattr(res, "spawn_capped", None),
+            "load_gate": gate["info"],
+            "limit_notes": limit_notes,
             "memory_pressure": getattr(res, "memory_pressure", None),
         }, indent=2))
         return 0
@@ -5745,6 +5902,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"  capped: {res.spawn_capped}")
     if getattr(res, "spawn_paused", None):
         print(f"  paused: {res.spawn_paused}")
+    for _note in limit_notes:
+        print(f"  limit: {_note}")
     if getattr(res, "memory_pressure", None):
         print(
             f"  memory pressure {res.memory_pressure}: "
