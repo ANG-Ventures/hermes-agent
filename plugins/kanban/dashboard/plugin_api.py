@@ -2174,13 +2174,16 @@ def reassign_task_endpoint(
         # while the worker is already dead — same silent post-effect class as
         # the set-model batch. The receipt makes the real outcome visible.
         receipt: dict = {}
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-            receipt=receipt,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+                receipt=receipt,
+            )
+        except kanban_db.NoWorkerFlagSet as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         if not ok:
             if receipt.get("hold_error"):
                 raise HTTPException(status_code=409, detail=receipt["hold_error"])

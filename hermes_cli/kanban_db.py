@@ -2338,6 +2338,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Operator-only card: never spawned by the dispatcher and never assignable
+    # to a worker profile without an explicit ``worker_ok``. See
+    # :func:`set_no_worker` and the ``no_worker`` column comment.
+    no_worker: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2443,6 +2447,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            no_worker=bool("no_worker" in keys and row["no_worker"]),
         )
 
 
@@ -2649,7 +2654,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Operator-only flag (1 = no worker). The dispatcher never spawns a
+    -- flagged card and assign/reassign refuse a worker profile unless the
+    -- same call passes worker_ok (which clears the flag). Prose such as
+    -- "do not dispatch a worker" in the body is not a guard; this is.
+    no_worker            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -4720,7 +4730,44 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    if "no_worker" not in cols:
+        # Added LAST so a migrated legacy table keeps the fresh column order.
+        _add_column_if_missing(
+            conn, "tasks", "no_worker", "no_worker INTEGER NOT NULL DEFAULT 0",
+        )
+        if "body" in cols:
+            _backfill_no_worker_from_body(conn)
+
     _rebuild_drifted_tables(conn)
+
+
+NO_WORKER_BODY_RE = re.compile(r"do not dispatch a worker", re.IGNORECASE)
+"""Body prose that marked a card operator-only before the ``no_worker``
+column existed. Used once, by the migration that adds the column."""
+
+
+def _backfill_no_worker_from_body(conn: sqlite3.Connection) -> list[str]:
+    """Flag legacy cards whose body says "do not dispatch a worker".
+
+    Runs only in the migration pass that adds the column, so a later operator
+    ``--worker-ok`` on such a card is never undone by a re-migration. Returns
+    and logs the flagged ids.
+    """
+    ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id, body FROM tasks WHERE body IS NOT NULL AND no_worker = 0"
+        )
+        if NO_WORKER_BODY_RE.search(row["body"] or "")
+    ]
+    for tid in ids:
+        conn.execute("UPDATE tasks SET no_worker = 1 WHERE id = ?", (tid,))
+    if ids:
+        _log.warning(
+            "kanban migrate: flagged %d card(s) no_worker from body text: %s",
+            len(ids), ", ".join(ids),
+        )
+    return ids
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -7464,6 +7511,88 @@ def _reassign_request_changes(
     return detail
 
 
+class NoWorkerFlagSet(RuntimeError):
+    """A worker assignee was requested for a card flagged ``no_worker``."""
+
+
+def is_worker_assignee(assignee: Optional[str]) -> bool:
+    """True when ``assignee`` names a lane the dispatcher would spawn.
+
+    Only "unassigned" and the explicit human sentinel (``human`` /
+    ``human:<name>``) are non-worker targets. Every profile name counts as a
+    worker, because the dispatcher spawns whatever profile the card names.
+    """
+    value = (assignee or "").strip()
+    return bool(value) and not is_human_reviewer(value)
+
+
+def _no_worker_refusal(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str],
+) -> Optional[str]:
+    """One-line refusal when ``profile`` is a worker and the card is flagged."""
+    if not is_worker_assignee(profile):
+        return None
+    row = conn.execute(
+        "SELECT no_worker FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["no_worker"]:
+        return None
+    return (
+        f"refused: {task_id} is no-worker (dispatch: operator-only); "
+        f"assigning worker {profile!r} needs --worker-ok on the same call "
+        "(clears the flag)"
+    )
+
+
+def _set_no_worker_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    flag: bool,
+    *,
+    source: str,
+    operator: Optional[str] = None,
+) -> bool:
+    """Write the flag inside an open txn; append an event only on a change."""
+    row = conn.execute(
+        "SELECT no_worker FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if bool(row["no_worker"]) == bool(flag):
+        return True
+    conn.execute(
+        "UPDATE tasks SET no_worker = ? WHERE id = ?", (1 if flag else 0, task_id),
+    )
+    payload: dict = {"source": source}
+    if operator:
+        payload["operator"] = operator
+    _append_event(
+        conn, task_id, "no_worker_set" if flag else "no_worker_cleared", payload,
+    )
+    return True
+
+
+def set_no_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    flag: bool,
+    *,
+    operator: Optional[str] = None,
+) -> bool:
+    """Set or clear a card's ``no_worker`` (operator-only) flag.
+
+    Returns False for an unknown id. A change records ``no_worker_set`` /
+    ``no_worker_cleared``; setting the current value is a silent no-op.
+    """
+    with write_txn(conn):
+        ok = _set_no_worker_locked(
+            conn, task_id, flag, source="edit", operator=operator,
+        )
+    if ok:
+        notify_task_updated(conn, task_id, ("no_worker",))
+    return ok
+
+
 @_home_session_guarded("assign")
 def assign_task(
     conn: sqlite3.Connection,
@@ -7473,6 +7602,7 @@ def assign_task(
     request_changes_reason: Optional[str] = None,
     operator: Optional[str] = None,
     pr_query=None,
+    worker_ok: bool = False,
 ) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
@@ -7484,8 +7614,16 @@ def assign_task(
     it the reassign goes through :func:`request_changes` (card ``ready``,
     implementer restored, ``changes_requested`` with ``operator``), then
     ``profile`` becomes the assignee if it differs from the implementer.
+
+    A card flagged ``no_worker`` refuses a worker ``profile`` with
+    :class:`NoWorkerFlagSet` — ``operator`` does not bypass it. Only
+    ``worker_ok=True`` does, and it clears the flag (``no_worker_cleared``).
     """
     profile = _canonical_assignee(profile)
+    refusal = _no_worker_refusal(conn, task_id, profile)
+    if refusal and not worker_ok:
+        raise NoWorkerFlagSet(refusal)
+    clear_no_worker = bool(refusal)
     changes_reason = str(request_changes_reason or "").strip()
     if not changes_reason:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
@@ -7501,6 +7639,11 @@ def assign_task(
             conn, task_id, profile, changes_reason, operator,
         )
         if implementer == profile:
+            if clear_no_worker:
+                with write_txn(conn):
+                    _set_no_worker_locked(
+                        conn, task_id, False, source="worker_ok", operator=operator,
+                    )
             notify_task_updated(conn, task_id, ("assignee", "status"))
             return True
     with write_txn(conn):
@@ -7525,6 +7668,10 @@ def assign_task(
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+        if clear_no_worker:
+            _set_no_worker_locked(
+                conn, task_id, False, source="worker_ok", operator=operator,
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
@@ -10481,6 +10628,7 @@ def reassign_task(
     request_changes_reason: Optional[str] = None,
     operator: Optional[str] = None,
     pr_query=None,
+    worker_ok: bool = False,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -10508,7 +10656,14 @@ def reassign_task(
     function for the same reason the set-model batch catches by position:
     an irreversible effect that already fired must not take its own receipt
     down with it.
+
+    The ``no_worker`` refusal (:class:`NoWorkerFlagSet`) is checked BEFORE
+    the reclaim, so a refused reassign never signals a live worker.
     """
+    if not worker_ok:
+        refusal = _no_worker_refusal(conn, task_id, _canonical_assignee(profile))
+        if refusal:
+            raise NoWorkerFlagSet(refusal)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         try:
@@ -10531,7 +10686,7 @@ def reassign_task(
     try:
         return assign_task(
             conn, task_id, profile, request_changes_reason=request_changes_reason,
-            operator=operator, pr_query=pr_query,
+            operator=operator, pr_query=pr_query, worker_ok=worker_ok,
         )
     except ReviewHoldRequired as exc:
         if receipt is None:
@@ -17798,6 +17953,9 @@ class DispatchResult:
     Surfaces the auto-assignment to telemetry / CLI / dashboard so the
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
+    skipped_no_worker: list[str] = field(default_factory=list)
+    """Ready/review task ids skipped because the card is flagged
+    ``no_worker`` (operator-only). Never claimed, never spawned."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -21965,6 +22123,59 @@ def _prefetch_pr_gates_for_tick(
         return None
 
 
+def _drop_no_worker_rows(
+    conn: sqlite3.Connection,
+    rows: list,
+    result: "DispatchResult",
+    *,
+    dry_run: bool,
+) -> list:
+    """Remove ``no_worker`` cards from a dispatch candidate list.
+
+    Each dropped id lands in ``result.skipped_no_worker``. A real tick also
+    records ``dispatch_skipped {"reason": "no_worker"}`` once per flagging
+    (not once per tick); a dry run writes nothing.
+    """
+    kept = []
+    for row in rows:
+        if not row["no_worker"]:
+            kept.append(row)
+            continue
+        result.skipped_no_worker.append(row["id"])
+        if not dry_run:
+            _record_no_worker_skip_once(conn, row["id"])
+    return kept
+
+
+def _record_no_worker_skip_once(conn: sqlite3.Connection, task_id: str) -> None:
+    try:
+        with write_txn(conn):
+            last_set = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_events "
+                "WHERE task_id = ? AND kind = 'no_worker_set'",
+                (task_id,),
+            ).fetchone()[0]
+            seen = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'dispatch_skipped' AND id > ? "
+                "AND payload LIKE '%\"no_worker\"%' LIMIT 1",
+                (task_id, last_set),
+            ).fetchone()
+            if seen is None:
+                _append_event(
+                    conn, task_id, "dispatch_skipped", {"reason": "no_worker"},
+                )
+                _log.info(
+                    "kanban dispatch: %s is no_worker (operator-only); not spawned",
+                    task_id,
+                )
+    except Exception:
+        _log.debug(
+            "kanban dispatch: could not record no_worker skip for %s",
+            task_id, exc_info=True,
+        )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -22427,10 +22638,12 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, body, workspace_kind, workspace_path FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "SELECT id, assignee, body, workspace_kind, workspace_path, no_worker "
+        "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    # Operator-only cards are never spawnable, whatever their assignee.
+    ready_rows = _drop_no_worker_rows(conn, ready_rows, result, dry_run=dry_run)
     if spillover is not None:
         # Only cards a worker host can take: scratch workspace + allowlisted
         # assignee. Everything else waits for this host's gate to reopen.
@@ -22451,10 +22664,13 @@ def _dispatch_once_locked(
     review_rows = []
     if spillover is None and review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, no_worker FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
+        review_rows = _drop_no_worker_rows(
+            conn, review_rows, result, dry_run=dry_run,
+        )
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
