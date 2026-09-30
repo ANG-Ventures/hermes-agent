@@ -192,12 +192,13 @@ def test_failed_alert_is_retried_on_next_trip(setup, tmp_path):
     assert _wait_paged(home, "firecrawl").get("paged") is True
 
 
+@pytest.mark.parametrize("site_error", ["401 Unauthorized", "402 Payment Required"])
 @pytest.mark.asyncio
-async def test_target_site_401_402_does_not_trip_shared_breaker(setup):
+async def test_target_site_401_402_does_not_trip_shared_breaker(setup, site_error):
     calls, providers, _cfg, _home = setup
     urls = ["https://a.example", "https://b.example"]
     providers.update(
-        firecrawl=Provider("firecrawl", calls, extract=[{"content": "", "error": PAYMENT}]),
+        firecrawl=Provider("firecrawl", calls, extract=[{"content": "", "error": site_error}]),
         exa=Provider("exa", calls, extract=[{"content": "ok", "error": None}]),
     )
     out1 = json.loads(await web_tools.web_extract_tool(urls))
