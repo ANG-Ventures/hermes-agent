@@ -1211,6 +1211,7 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
             _interrupt_async_delegations(reason="CLI shutdown")
         except Exception:
             pass
+        _record_abandoned_review_turns("cli_exit")
         try:
             _cleanup_all_browsers()
         except Exception:
@@ -1405,6 +1406,29 @@ def _finalize_signaled_kanban_worker(cli, signum) -> None:
     try:
         reason = f"signal_{int(signum)}"
         _emit_interrupted_session_end(cli, reason=reason, terminal_error=reason)
+    except Exception:
+        pass
+    _record_abandoned_review_turns(f"signal_{int(signum)}")
+
+
+def _record_abandoned_review_turns(reason: str) -> None:
+    """Record the in-flight background-review turns this process is abandoning.
+
+    A review fork runs on a daemon thread that starts after its parent turn
+    finalized, so a CLI that exits (one-shot kanban worker, ``/quit``, SIGTERM)
+    while the fork is mid-turn kills it before ``finalize_turn``: its
+    ``turn_api_calls`` rows are left with no ``turns`` row (daedalus
+    2026-09-29 19:15:59, review turn ``...:a92c4fba`` retrying a refused relay
+    at exit). Same provisional ``on_turn_abandoned`` row the gateway writes at
+    shutdown; a fork whose turn already emitted is skipped. Never raises.
+    """
+    try:
+        from agent.background_review import live_background_review_agents
+        from agent.turn_finalizer import emit_abandoned_session_ends
+
+        agents = live_background_review_agents()
+        if agents:
+            emit_abandoned_session_ends(agents, reason)
     except Exception:
         pass
 

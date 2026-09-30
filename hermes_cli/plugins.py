@@ -5634,7 +5634,11 @@ class PluginManager:
         # about to exec. Evict the package and everything nested under
         # it so this import starts clean.
         stale_prefix = f"{module_name}."
-        for name in [n for n in sys.modules if n == module_name or n.startswith(stale_prefix)]:
+        # Snapshot first: another thread importing mid-scan raises
+        # "dictionary changed size during iteration", which failed the whole
+        # plugin load (blackbox, 2026-09-29 18:24:52: its hooks never
+        # registered, so the worker's turn had calls and no turns row).
+        for name in [n for n in list(sys.modules) if n == module_name or n.startswith(stale_prefix)]:
             del sys.modules[name]
 
         spec = importlib.util.spec_from_file_location(
@@ -5656,7 +5660,7 @@ class PluginManager:
             # imported relative submodules it pulled in before failing)
             # cached in sys.modules — a retry or a same-slug plugin in a
             # different profile would otherwise inherit broken state.
-            for name in [n for n in sys.modules if n == module_name or n.startswith(stale_prefix)]:
+            for name in [n for n in list(sys.modules) if n == module_name or n.startswith(stale_prefix)]:
                 del sys.modules[name]
             raise
         return module
@@ -6375,7 +6379,7 @@ def _clear_plugin_submodules(manager: Optional[PluginManager]) -> None:
         if not module_name or not module_name.startswith(f"{_NS_PARENT}."):
             continue
         prefix = f"{module_name}."
-        for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
+        for name in [n for n in list(sys.modules) if n == module_name or n.startswith(prefix)]:
             del sys.modules[name]
         with _MODULE_NAMESPACE_LOCK:
             if _BARE_MODULE_SCOPE.get(module_name) == manager.scope_key:
