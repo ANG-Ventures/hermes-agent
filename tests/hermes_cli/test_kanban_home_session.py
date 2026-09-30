@@ -225,9 +225,12 @@ def test_cli_create_stamps_env_session_by_default(kanban_home, monkeypatch):
     assert unstamped["session_id"] is None
 
 
-def test_cli_create_without_env_stays_unstamped(kanban_home):
-    created = json.loads(kc.run_slash("create 'x' --json"))
-    assert created["session_id"] is None
+def test_cli_create_without_env_is_refused_unless_homed(kanban_home, monkeypatch):
+    # t_09fea045: an implicit unhomed card is undrivable -> refused.
+    monkeypatch.delenv(kb.ALLOW_UNHOMED_CREATE_ENV, raising=False)  # arm the refusal
+    assert "refused create" in kc.run_slash("create 'x' --json")
+    created = json.loads(kc.run_slash("create 'x' --home operator --json"))
+    assert created["session_id"] == kb.OPERATOR_HOME_SESSION
 
 
 def test_cli_list_home(kanban_home, monkeypatch):
@@ -979,8 +982,10 @@ def test_cli_create_stamps_session_and_origin_line(kanban_home, monkeypatch):
     assert first.startswith("origin: discord #sub-vps-n (1550) \u00b7 session " + HOME)
 
 
-def test_cli_create_without_session_is_unhomed(kanban_home):
-    out = kc.run_slash("create 'cron card' --json")
+def test_cli_create_session_none_is_unhomed(kanban_home):
+    # Implicit sessionless create is refused (t_09fea045); the explicit
+    # ``--session none`` opt-out still stamps the sentinel, never NULL.
+    out = kc.run_slash("create 'cron card' --session none --json")
     tid = json.loads(out[out.index("{"):])["id"]
     with kb.connect_closing() as conn:
         raw = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (tid,)).fetchone()

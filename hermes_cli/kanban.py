@@ -677,6 +677,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "An explicit --session WINS over a --parent's "
                                "home; omitted, the child follows the parent's "
                                "current home.")
+    p_create.add_argument("--home", default=None, metavar="operator",
+                          help="Home the card on the fleet operator "
+                               "pseudo-session (operator:apollo) that any "
+                               "operator-profile session may act on. For "
+                               "cron/script minters with no session of their "
+                               "own: create REFUSES a card that would be born "
+                               "unhomed. Accepts 'operator' or "
+                               "'operator:<name>'; exclusive with --session.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -2116,6 +2124,8 @@ def _home_label(session_id: Optional[str], *, unhomed: bool = False) -> str:
         return "unhomed (no session owns it; --takeover to act)"
     if not session_id:
         return "unstamped"
+    if kb.is_operator_home(session_id):
+        return f"operator ({session_id}; any operator-profile session may act)"
     caller = _caller_session_id()
     if caller and session_id in kb.home_ids(caller):
         return "this-session"
@@ -2698,6 +2708,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    home_flag = (getattr(args, "home", None) or "").strip()
+    if home_flag:
+        if getattr(args, "session", None) is not None:
+            print("kanban: --home and --session are mutually exclusive", file=sys.stderr)
+            return 2
+        if home_flag == "operator":
+            home_flag = kb.OPERATOR_HOME_SESSION
+        if not kb.is_operator_home(home_flag):
+            print(
+                f"kanban: --home: expected 'operator' or 'operator:<name>', got {home_flag!r}",
+                file=sys.stderr,
+            )
+            return 2
+        args.session = home_flag
     try:
         with kb.connect_closing() as conn:
             task_id = kb.create_task(
@@ -2735,6 +2759,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
                 session_explicit=getattr(args, "session", None) is not None,
+                require_home=True,
                 duplicate_guard=True,
                 force_reason=getattr(args, "force_reason", None),
             )

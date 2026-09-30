@@ -633,6 +633,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # hermes_state's live-DB guard stays armed in them even when the test
     # strips pytest's own PYTEST_* vars from the child env.
     monkeypatch.setenv("HERMES_TEST_ISOLATION", str(fake_hermes_home))
+    # t_09fea045: `kanban create` refuses to mint an unhomed card; fixtures that
+    # create cards without a session predate that. The refusal's own tests
+    # (test_kanban_operator_home.py) unset this.
+    monkeypatch.setenv("HERMES_KANBAN_ALLOW_UNHOMED_CREATE", "1")
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
