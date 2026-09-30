@@ -7793,6 +7793,18 @@ def _turn_runtime_footer(agent, session: dict | None, turn_seconds: float | None
         return ""
 
 
+def _declared_cache_scope_param(raw) -> str | None:
+    """session.create ``cache_scope`` -> ``declared:<value>`` (<=96 printable chars) or None.
+
+    Lives here, not in methods_session.py: registered handlers are rebound onto
+    this module's globals (method_ctx.HandlerRegistry.install).
+    """
+    if not isinstance(raw, str):
+        return None
+    value = "".join(ch for ch in raw.strip() if ch.isprintable() and not ch.isspace())[:96]
+    return f"declared:{value}" if value else None
+
+
 def _stamp_declared_cache_scope(session: dict, agent) -> None:
     """Carry session.create ``cache_scope`` onto a (re)built agent (prompt_cache_scope)."""
     scope = session.get("cache_scope")

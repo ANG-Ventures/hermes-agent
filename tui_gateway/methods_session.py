@@ -178,14 +178,6 @@ def _(rid, params: dict) -> dict:
     )
 
 
-def _declared_cache_scope_param(raw) -> str | None:
-    """``cache_scope`` param -> ``declared:<value>`` (<=96 printable chars) or None."""
-    if not isinstance(raw, str):
-        return None
-    value = "".join(ch for ch in raw.strip() if ch.isprintable() and not ch.isspace())[:96]
-    return f"declared:{value}" if value else None
-
-
 @method("session.list")
 def _(rid, params: dict) -> dict:
     with _profile_db(params) as db:

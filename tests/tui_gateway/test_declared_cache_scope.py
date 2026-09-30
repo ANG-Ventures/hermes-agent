@@ -15,7 +15,7 @@ import types
 
 from agent.prompt_cache_scope import resolve_prompt_cache_scope
 from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
-from tui_gateway import methods_session, server
+from tui_gateway import server
 
 
 def _agent(sid, **extra):
@@ -43,7 +43,7 @@ class TestDeclaredScope:
         assert len(keys) == 2
 
     def test_param_is_bounded_and_printable(self):
-        f = methods_session._declared_cache_scope_param
+        f = server._declared_cache_scope_param
         assert f(None) is None and f("") is None and f("   ") is None and f(7) is None
         assert f("clanker warm\nkitchen") == "declared:clankerwarmkitchen"
         assert len(f("x" * 500)) == len("declared:") + 96
@@ -55,6 +55,30 @@ class TestDeclaredScope:
         bare = types.SimpleNamespace()
         server._stamp_declared_cache_scope({}, bare)
         assert not hasattr(bare, "_declared_cache_scope")
+
+
+class TestRegisteredSessionCreate:
+    """Exercise the REGISTERED handler: it runs on server.py's globals, not its module's."""
+
+    def _create(self, monkeypatch, params):
+        monkeypatch.setattr(server, "_sessions", {})
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda sid: None)
+        monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+        resp = server._methods["session.create"](1, params)
+        assert "error" not in resp, resp
+        sid = resp["result"]["session_id"]
+        return resp["result"], server._sessions[sid]
+
+    def test_cache_scope_is_stored_and_echoed(self, monkeypatch, tmp_path):
+        result, session = self._create(monkeypatch, {"cache_scope": "clanker-warm:x:clanker",
+                                                     "cwd": str(tmp_path)})
+        assert session["cache_scope"] == "declared:clanker-warm:x:clanker"
+        assert result["info"]["declared_cache_scope"] is True
+
+    def test_omitted_cache_scope_still_creates_the_session(self, monkeypatch, tmp_path):
+        result, session = self._create(monkeypatch, {"cwd": str(tmp_path)})
+        assert session["cache_scope"] is None
+        assert result["info"]["declared_cache_scope"] is False
 
 
 class TestUsageFields:
