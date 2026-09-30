@@ -869,7 +869,7 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
 
     # Drop any cached certifi module so where() re-resolves the new bundle.
     import importlib
-    for mod_name in [m for m in sys.modules if m == "certifi" or m.startswith("certifi.")]:
+    for mod_name in [m for m in list(sys.modules) if m == "certifi" or m.startswith("certifi.")]:
         sys.modules.pop(mod_name, None)
     importlib.invalidate_caches()
 

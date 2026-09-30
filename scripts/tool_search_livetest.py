@@ -346,7 +346,7 @@ def register_fake_tools() -> int:
 
 def reset_module_state():
     """Drop cached modules so the new HERMES_HOME takes effect."""
-    keys = [k for k in sys.modules.keys()
+    keys = [k for k in list(sys.modules)
             if k.startswith(("tools.", "model_tools", "toolsets",
                              "hermes_cli", "agent.", "run_agent"))]
     for k in keys:

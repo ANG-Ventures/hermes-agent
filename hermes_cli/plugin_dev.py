@@ -76,7 +76,7 @@ def _doctor_runtime(plugin_path: Path):
     policy_before = dict(registry._plugin_override_policy)
     modules_before = {
         name
-        for name in sys.modules
+        for name in list(sys.modules)
         if name == "hermes_plugins" or name.startswith("hermes_plugins.")
     }
     manager = PluginManager()
