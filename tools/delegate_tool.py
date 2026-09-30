@@ -2955,6 +2955,145 @@ class _LateCompletion:
         self.result_path: Optional[str] = None
 
 
+# Bounded wait for the live turn after a stop decision, before the result is
+# persisted. Equals min(ceiling, 5) for every configurable child_timeout
+# (floor 30 s). Only delivery is bounded by it: persistence teardown waits
+# for the turn to exit (docs/dev/delegate-child-lifecycle.md, I2).
+_LATE_STOP_DRAIN_SECONDS = 5.0
+# Children whose persistence teardown is waiting on a still-live turn.
+_deferred_teardowns = 0
+_deferred_teardowns_lock = threading.Lock()
+
+
+def _count_deferred_teardown(delta: int) -> int:
+    global _deferred_teardowns
+    with _deferred_teardowns_lock:
+        _deferred_teardowns += delta
+        return _deferred_teardowns
+
+
+class IllegalTransition(RuntimeError):
+    """A child lifecycle event fired from a state that has no such edge."""
+
+
+class _ChildLifecycle:
+    """The late-path child lifecycle as an explicit state machine.
+
+    Design of record: docs/dev/delegate-child-lifecycle.md. ``fire`` is the
+    only way to change state and performs each edge's side effects; the
+    steer ledger collects every accepted-but-unconsumed steer (I1). One lock
+    serializes transitions and ledger access across the owner, the late
+    thread and the live turn's exit callback.
+    """
+
+    STATES = (
+        "running",
+        "timed_out_running",
+        "correcting",
+        "late_completed",
+        "reaped",
+        "persisted",
+        "torn_down",
+    )
+    EVENTS = ("timeout", "correct", "finish", "stall", "persist", "amend", "teardown")
+    EDGES = {
+        ("running", "timeout"): "timed_out_running",
+        ("timed_out_running", "correct"): "correcting",
+        ("timed_out_running", "finish"): "late_completed",
+        ("correcting", "finish"): "late_completed",
+        ("timed_out_running", "stall"): "reaped",
+        ("correcting", "stall"): "reaped",
+        ("late_completed", "persist"): "persisted",
+        ("reaped", "persist"): "persisted",
+        ("persisted", "amend"): "persisted",
+        ("persisted", "teardown"): "torn_down",
+    }
+
+    def __init__(
+        self, *, subagent_id: Optional[str], child: Any, state: str = "running"
+    ) -> None:
+        self.subagent_id = subagent_id
+        self.child = child
+        self.state = state
+        self.history: List[str] = [state]
+        # The turn currently (or last) running off the late thread; None
+        # when the last turn ran inline on the late thread itself.
+        self.live: Any = None
+        self._lock = threading.RLock()
+        self._steer: List[str] = []
+        self._harvested: set = set()
+
+    def fire(self, event: str, *, live: Any = None) -> str:
+        with self._lock:
+            nxt = self.EDGES.get((self.state, event))
+            if nxt is None:
+                raise IllegalTransition(f"{self.state} --{event}--> (no such edge)")
+            if event == "teardown" and self.live is not None and not self.live.done():
+                raise IllegalTransition("teardown while a turn of this child is live")
+            if event == "correct":
+                self.live = live
+            if event in ("finish", "stall") and self.subagent_id:
+                # Linearization point: close acceptance, keep what won.
+                self.add_steer(_close_subagent_steering(self.subagent_id, self.child))
+            self.state = nxt
+            self.history.append(nxt)
+            return nxt
+
+    def add_steer(self, text: Any) -> bool:
+        """Ledger an accepted-but-unconsumed steer. True if it was new."""
+        if not (isinstance(text, str) and text.strip()):
+            return False
+        with self._lock:
+            if text in self._steer:
+                return False
+            self._steer.append(text)
+            return True
+
+    def mark_harvested(self, future: Any) -> None:
+        with self._lock:
+            self._harvested.add(id(future))
+
+    def take_result_steer(self, future: Any, result: Dict[str, Any]) -> None:
+        """Source 2/3: a finished turn's finalizer-drained steer."""
+        with self._lock:
+            if future is not None:
+                self._harvested.add(id(future))
+            self.add_steer(result.pop("pending_steer", None))
+
+    def harvest(self, future: Any) -> bool:
+        """Source 4: read a finished turn's steer exactly once per future."""
+        if future is None or not future.done():
+            return False
+        with self._lock:
+            if id(future) in self._harvested:
+                return False
+            self._harvested.add(id(future))
+        try:
+            raw = future.result(timeout=0)
+        except BaseException:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        return self.add_steer(raw.get("pending_steer"))
+
+    @property
+    def missed_steer(self) -> Optional[str]:
+        with self._lock:
+            return "\n".join(self._steer) or None
+
+
+def _with_missed_steer(entry: Dict[str, Any], summary: str, pending: Optional[str]) -> None:
+    """Report *pending* on *entry* as missed_steer, with a summary note."""
+    if not (isinstance(pending, str) and pending.strip()):
+        return
+    entry["missed_steer"] = pending
+    note = (
+        "[steer did not land — the subagent finished before it could "
+        f"be delivered: {pending}]"
+    )
+    entry["summary"] = f"{summary}\n\n{note}" if summary else note
+
+
 def _late_results_dir():
     from hermes_constants import get_hermes_dir
 
@@ -3081,7 +3220,14 @@ def _owned_late_results(parent_agent: Any) -> List[Dict[str, Any]]:
             "finished_at": rec.get("finished_at"),
             "result_path": rec.get("result_path"),
         }
-        for k in ("error", "missed_steer", "schema_valid", "schema_retries", "schema_errors"):
+        for k in (
+            "error",
+            "missed_steer",
+            "steer_fate_unknown",
+            "schema_valid",
+            "schema_retries",
+            "schema_errors",
+        ):
             if k in entry:
                 item[k] = entry[k]
         out.append(item)
@@ -3405,10 +3551,11 @@ def _start_late_completion(
     max_wall = _get_child_max_wall_seconds(ceiling)
     wall_deadline = child_start + max_wall if max_wall else None
     approval_cb = _get_subagent_approval_callback()
-    # The turn currently running on the child: the original future, or the
-    # supervised correction turn once it starts. Stop paths drain THIS one
-    # before teardown closes the child's resources.
-    active_turn: Dict[str, Any] = {"future": child_future}
+    # The explicit lifecycle (docs/dev/delegate-child-lifecycle.md). The
+    # owner fires the entry edge; the first turn is the live turn.
+    lc = _ChildLifecycle(subagent_id=subagent_id, child=child)
+    lc.live = child_future
+    lc.fire("timeout")
 
     def _supervised_turn(message: str) -> Any:
         """One follow-up child turn under the late path's hang/wall bounds."""
@@ -3431,20 +3578,36 @@ def _start_late_completion(
                     )
                 args = (message,)
             fut = executor.submit(contextvars.copy_context().run, call, *args)
-            active_turn["future"] = fut
+            lc.fire("correct", live=fut)
             outcome, raw = _supervise_child_future(
                 fut, child, float(ceiling or 0.0), wall_deadline
             )
             if outcome != "done":
                 raise _LateTurnStalled(outcome)
+            # _apply_output_schema merges this turn's pending_steer.
+            lc.mark_harvested(fut)
             return raw
         finally:
             executor.shutdown(wait=False)
+
+    def _correction_turn(message: str) -> Any:
+        if ceiling:
+            return _supervised_turn(message)
+        # No ceiling: the turn runs inline on the late thread.
+        lc.fire("correct", live=None)
+        if child_turn is not None:
+            return child_turn(message)
+        return child.run_conversation(
+            user_message=message,
+            task_id=child_task_id,
+            stream_callback=stream_callback,
+        )
 
     def _late() -> None:
         error: Optional[str] = None
         result: Dict[str, Any] = {}
         stop: Optional[str] = None  # "hung" | "wall" | "retry_hung" | "retry_wall"
+        turn_outlived_drain = False
         try:
             if ceiling is None:
                 raw = child_future.result()
@@ -3457,6 +3620,9 @@ def _start_late_completion(
             result = raw if isinstance(raw, dict) else {}
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+        if stop is None:
+            # Ledger source 2, before anything can rebuild `result`.
+            lc.take_result_steer(child_future, result)
 
         schema_valid: Optional[bool] = None
         schema_errors: List[str] = []
@@ -3469,15 +3635,16 @@ def _start_late_completion(
                     task_index=task_index,
                     child_task_id=child_task_id,
                     stream_callback=stream_callback,
-                    run_turn=_supervised_turn if ceiling else None,
+                    run_turn=_correction_turn,
                 )
             except _LateTurnStalled as stalled:
                 stop = f"retry_{stalled.reason}"
                 schema_retries = 1
             except Exception:
                 logger.warning("late schema validation failed", exc_info=True)
+            # Ledger source 3: the finished correction turn's steer.
+            lc.add_steer(result.pop("pending_steer", None))
         hung = stop is not None
-        finalizer_pending = result.get("pending_steer")
 
         if hung:
             # Alive but stuck, or past the wall ceiling: bound it exactly like
@@ -3489,9 +3656,7 @@ def _start_late_completion(
                 )
             else:
                 why = f"no progress for {ceiling}s"
-            pending_steer = (
-                _close_subagent_steering(subagent_id, child) if subagent_id else None
-            )
+            lc.fire("stall")  # closes steering (ledger source 1)
             try:
                 if not request_hard_interrupt(
                     child, f"Subagent stopped: {why}"
@@ -3500,15 +3665,19 @@ def _start_late_completion(
             except Exception:
                 pass
             _reap_subtree(child, "hung")
-            try:
-                # Bounded drain of the turn that is actually running (the
-                # correction turn after a retry stall), so teardown does not
-                # close the child's session/tools under a still-unwinding turn.
-                # Flat 5 s: equals min(ceiling, 5) for every configurable
-                # child_timeout (floor 30 s).
-                active_turn["future"].result(timeout=5.0)
-            except Exception:
-                pass
+            live = lc.live
+            if live is not None:
+                # Bounded drain of the turn that is actually running; its
+                # finalizer's steer (ledger source 4) goes into the first
+                # write when it exits in time.
+                try:
+                    live.result(timeout=_LATE_STOP_DRAIN_SECONDS)
+                except BaseException:
+                    pass
+                lc.harvest(live)
+                # Its finalizer may yet return steer it already drained;
+                # the exit callback amends the record if so (I1 caveat).
+                turn_outlived_drain = not live.done()
             api_calls = 0
             try:
                 api_calls = int(child.get_activity_summary().get("api_call_count", 0) or 0)
@@ -3542,22 +3711,8 @@ def _start_late_completion(
                 max_wall,
             )
         else:
-            # Same linearization boundary as the normal path: close steering
-            # and keep any accepted-but-unconsumed text.
-            pending_steer = (
-                _close_subagent_steering(subagent_id, child) if subagent_id else None
-            )
-        # Steer the child accepted but never consumed, drained by a finished
-        # turn's finalizer into result["pending_steer"]. Captured before the
-        # stop branch rebuilds `result`, so a stalled correction turn cannot
-        # drop the first turn's accepted steer.
-        if isinstance(finalizer_pending, str) and finalizer_pending.strip():
-            pending_steer = (
-                f"{finalizer_pending}\n{pending_steer}"
-                if pending_steer
-                else finalizer_pending
-            )
-
+            lc.fire("finish")  # closes steering (ledger source 1)
+        pending_steer = lc.missed_steer
         summary = str(result.get("final_response") or "")
         if hung:
             status = "timeout"
@@ -3605,6 +3760,8 @@ def _start_late_completion(
             }.get(stop or "", "hung_after_timed_out_running")
             if stop and stop.endswith("wall"):
                 entry["max_wall_seconds"] = max_wall
+            if turn_outlived_drain:
+                entry["steer_fate_unknown"] = True
         if error:
             entry["error"] = error
             if not hung:
@@ -3618,13 +3775,7 @@ def _start_late_completion(
                 entry["schema_retries"] = schema_retries
             if not schema_valid and schema_errors:
                 entry["schema_errors"] = schema_errors
-        if isinstance(pending_steer, str) and pending_steer.strip():
-            entry["missed_steer"] = pending_steer
-            note = (
-                "[steer did not land — the subagent finished before it could "
-                f"be delivered: {pending_steer}]"
-            )
-            entry["summary"] = f"{summary}\n\n{note}" if summary else note
+        _with_missed_steer(entry, summary, pending_steer)
 
         if child_progress_cb:
             try:
@@ -3654,14 +3805,17 @@ def _start_late_completion(
             except Exception:
                 logger.debug("late manifest update failed", exc_info=True)
         try:
-            _release_child_resources(
+            # Lease, registry and parent link go at the stop decision (#1535);
+            # they hold no transcript data. Persistence teardown is below.
+            _release_child_handles(
                 child, parent_agent, subagent_id, child_pool, leased_cred_id
             )
         except Exception:
-            logger.debug("late child teardown failed", exc_info=True)
+            logger.debug("late child handle release failed", exc_info=True)
 
         # Durable first: the steer below is only a nudge and can be lost.
         path = _record_late_result(handle, entry, child=child, parent_agent=parent_agent)
+        lc.fire("persist")
         handle.entry = entry
         handle.done.set()
         if not handle.absorbed:
@@ -3697,6 +3851,71 @@ def _start_late_completion(
             delivered,
             handle.absorbed,
         )
+
+        # One post-persist path for every live turn (I1 source 4 + I2):
+        # runs now if the turn already exited, else when it exits.
+        live = lc.live
+        exit_ctx = contextvars.copy_context()
+
+        def _after_live_exit(fut: Any) -> None:
+            try:
+                if lc.harvest(fut):
+                    lc.fire("amend")
+                    pending = lc.missed_steer
+                    entry.pop("steer_fate_unknown", None)
+                    _with_missed_steer(entry, summary, pending)
+                    amended = _record_late_result(
+                        handle, entry, child=child, parent_agent=parent_agent
+                    )
+                    handle.entry = entry
+                    logger.warning(
+                        "delegate_task late result %s amended: steer returned "
+                        "by a turn that exited after the result was recorded",
+                        late_id,
+                    )
+                    # Sent even when absorbed: the unit's event already went.
+                    steer_parent = getattr(parent_agent, "steer", None)
+                    if callable(steer_parent):
+                        try:
+                            steer_parent(
+                                f"[delegate_task late result amended] subagent "
+                                f"{subagent_id} (task {task_index}): steer did not "
+                                f"land: {pending}"
+                                + (f" Result: {amended}." if amended else "")
+                            )
+                        except Exception as exc:
+                            logger.debug("late amendment steer failed: %s", exc)
+            except Exception:
+                logger.warning("late steer amendment failed", exc_info=True)
+            finally:
+                if fut is not None and deferred:
+                    _count_deferred_teardown(-1)
+                try:
+                    _close_child_persistence(child)
+                except Exception:
+                    logger.debug("late child teardown failed", exc_info=True)
+                try:
+                    lc.fire("teardown")
+                except IllegalTransition:
+                    logger.warning("late child teardown out of order", exc_info=True)
+
+        deferred = live is not None and not live.done()
+        if deferred:
+            waiting = _count_deferred_teardown(1)
+            logger.warning(
+                "delegate_task late child %s: turn still running after the stop "
+                "drain; persistence teardown deferred until it exits "
+                "(deferred teardowns: %d)",
+                subagent_id,
+                waiting,
+            )
+        if live is None:
+            exit_ctx.copy().run(_after_live_exit, None)
+        else:
+            # A fresh copy per run: this callback may run right here (turn
+            # already done) or on the worker thread, never in a context
+            # that is already entered.
+            live.add_done_callback(lambda f: exit_ctx.copy().run(_after_live_exit, f))
 
     # A bare Thread starts with an EMPTY context: run _late in a copy of the
     # spawning thread's context so profile-scoped state (the context-local
@@ -4678,9 +4897,21 @@ def _release_child_resources(
 ) -> None:
     """Per-child teardown once the child's run has ended (or never started).
 
-    Runs in _run_single_child's finally, or on the late-completion thread
-    when the owner already returned TIMED_OUT_RUNNING.
+    Runs in _run_single_child's finally. The late-completion path calls the
+    two halves separately (docs/dev/delegate-child-lifecycle.md, I2).
     """
+    _release_child_handles(child, parent_agent, _subagent_id, child_pool, leased_cred_id)
+    _close_child_persistence(child)
+
+
+def _release_child_handles(
+    child: Any,
+    parent_agent: Any,
+    _subagent_id: Optional[str],
+    child_pool: Any,
+    leased_cred_id: Any,
+) -> None:
+    """Registry entry, credential lease and parent link (no transcript data)."""
     # Drop the TUI-facing registry entry.  Safe to call even if the
     # child was never registered (e.g. ID missing on test doubles).
     if _subagent_id:
@@ -4706,6 +4937,13 @@ def _release_child_resources(
         except (ValueError, UnboundLocalError) as e:
             logger.debug("Could not remove child from active_children: %s", e)
 
+
+def _close_child_persistence(child: Any) -> None:
+    """Close the child's SessionDB/tool resources and its relay session.
+
+    Never while a turn of the child is live: the late path defers this to
+    the live turn's exit.
+    """
     # Close tool resources (terminal sandboxes, browser daemons,
     # background processes, httpx clients) so subagent subprocesses
     # don't outlive the delegation.
