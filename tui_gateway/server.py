@@ -3487,6 +3487,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
+            _stamp_declared_cache_scope(current, agent)
             current["agent"] = agent
             _session_todo_state(current)
             # Baseline for the per-turn config sync; the profile home
@@ -7048,6 +7049,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         finally:
             _clear_session_context(tokens)
         new_agent._session_title_hint = "Bot Chat"
+        _stamp_declared_cache_scope(session, new_agent)
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
         _emit(
@@ -7791,6 +7793,28 @@ def _turn_runtime_footer(agent, session: dict | None, turn_seconds: float | None
         return ""
 
 
+def _declared_cache_scope_param(raw) -> str | None:
+    """session.create ``cache_scope`` -> ``declared:<value>`` (<=96 printable chars) or None.
+
+    Lives here, not in methods_session.py: registered handlers are rebound onto
+    this module's globals (method_ctx.HandlerRegistry.install).
+    """
+    if not isinstance(raw, str):
+        return None
+    value = "".join(ch for ch in raw.strip() if ch.isprintable() and not ch.isspace())[:96]
+    return f"declared:{value}" if value else None
+
+
+def _stamp_declared_cache_scope(session: dict, agent) -> None:
+    """Carry session.create ``cache_scope`` onto a (re)built agent (prompt_cache_scope)."""
+    scope = session.get("cache_scope")
+    if scope and agent is not None:
+        try:
+            agent._declared_cache_scope = scope
+        except Exception:
+            logger.debug("declared cache scope stamp failed", exc_info=True)
+
+
 def _get_usage(agent) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
@@ -7855,6 +7879,9 @@ def _get_usage(agent) -> dict:
         _ratio_unknown = (
             prompt_tokens_unknown(_flags) or _flags["cache_read_tokens_unknown"]
         )
+        if not _ratio_unknown:
+            # Exact cumulative cache reads (the pct below is rounded, and omitted at 0).
+            usage["cache_read"] = _cache_read
         if _ratio_unknown:
             usage["cache_hit_unknown"] = True
         elif _prompt_total > 0 and _cache_read > 0:
@@ -7881,6 +7908,13 @@ def _get_usage(agent) -> dict:
                 usage["avg_tps"] = round(float(_avg_vel), 1)
     except Exception:
         # A status-bar readout must never break usage reporting.
+        pass
+    # Served service_tier of the latest call (per-call history is Blackbox's).
+    try:
+        _served = getattr(agent, "_served_service_tier", None)
+        if isinstance(_served, str) and _served:
+            usage["service_tier"] = _served
+    except Exception:
         pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
@@ -9324,6 +9358,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         )
     finally:
         _clear_session_context(tokens)
+    _stamp_declared_cache_scope(session, new_agent)
     session["agent"] = new_agent
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []

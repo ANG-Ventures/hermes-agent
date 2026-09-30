@@ -75,6 +75,11 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    # Declared prompt-cache scope: a client that opens a fresh session per
+    # request (voice warm pool) shares one cache bucket across them instead of
+    # paying a cold first call in every session. Bounded, printable only.
+    cache_scope = _declared_cache_scope_param(params.get("cache_scope"))
+
     ready = threading.Event()
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -101,6 +106,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "cache_scope": cache_scope,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
@@ -165,6 +171,8 @@ def _(rid, params: dict) -> dict:
                 # prompt.submit accepts ``system_context`` (per-turn system
                 # metadata). Clients feature-detect on this key.
                 "turn_system_context": True,
+                # session.create accepts ``cache_scope``; echoed when applied.
+                "declared_cache_scope": bool(cache_scope),
             },
         },
     )
