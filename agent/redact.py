@@ -1311,7 +1311,9 @@ _SIGNING_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
         # (``protocol_v2``, ``HmacSHA256``, ``RequestSignatureV2Payload``,
         # ``inspect.signature``) have at most a digit run or two and are kept.
         re.compile(
-            r"(?i:([A-Za-z0-9_-]*(?:signature|hmac)(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])?))"
+            # Anchored at the start of a word run: an unanchored ``[...]*``
+            # prefix re-scans every suffix of a long base64 run (O(n^2)).
+            r"(?<![A-Za-z0-9_-])(?i:([A-Za-z0-9_-]*(?:signature|hmac)(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])?))"
             r"(?:[0-9a-fA-F]{8,}"
             r"|(?=[0-9+/=a-z-]*[A-Z])(?=[0-9+/=A-Z-]*[a-z])"
             r"(?=[A-Za-z0-9=-]*[+/]|(?:[A-Za-z+/=-]*[0-9]+(?![0-9])){3})[A-Za-z0-9+/=-]{32,})"
@@ -1322,6 +1324,10 @@ _SIGNING_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
 )
 
 
+# Every pattern above needs one of these (case-insensitive) substrings.
+_SIGNING_NEEDLES = ("cch=", "cc_prompt_id=", "cc_version=", "signature", "hmac")
+
+
 def redact_signing_material(text: str) -> str:
     """Mask request-signing / integrity VALUES, keeping the key and narrative.
 
@@ -1330,6 +1336,9 @@ def redact_signing_material(text: str) -> str:
     are deliberately kept: they are identifiers a summary must carry.
     """
     if not text or not isinstance(text, str):
+        return text
+    lowered = text.lower()
+    if not any(needle in lowered for needle in _SIGNING_NEEDLES):
         return text
     for pattern, replacement in _SIGNING_PATTERNS:
         text = pattern.sub(replacement, text)

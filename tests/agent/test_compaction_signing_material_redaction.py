@@ -84,6 +84,18 @@ def test_code_and_identifiers_survive(keep):
     assert redact_signing_material(keep) == keep
 
 
+def test_linear_on_long_runs():
+    """A long base64/alnum run next to a key must not backtrack per suffix
+    (the unanchored key prefix was O(n^2): 42k chars took ~22 s)."""
+    import time
+
+    run = "Ab3" * 70000
+    started = time.monotonic()
+    for text in (f"signature: {run}", run + " signature", "a" * 200000 + "hmac"):
+        redact_signing_material(text)
+    assert time.monotonic() - started < 5.0
+
+
 def _transcript():
     msgs = [{"role": "user", "content": "probe the relay billing header"}]
     for i in range(6):
