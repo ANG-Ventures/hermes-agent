@@ -34,6 +34,7 @@ def fake_gh(monkeypatch):
     """Route ``gh pr view`` through the REAL ``_query_github_pr_state``."""
     prs: dict[int, dict] = {}
     monkeypatch.setattr(kb, "_PR_HEAD_REF_CACHE", {}, raising=False)
+    monkeypatch.setattr(kb, "_PR_MERGE_HEALTH_CACHE", {}, raising=False)
 
     def run(cmd, *args, **kwargs):
         payload = prs.get(int(cmd[3]))
@@ -68,7 +69,10 @@ def test_cards_own_open_pr_still_guards_and_names_the_pr(kanban_home, fake_gh):
         kb.add_comment(conn, tid, "worker", "PR https://github.com/o/home/pull/1271 open")
         detail: dict = {}
         assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
-        assert detail == {"pr": "https://github.com/o/home/pull/1271", "pr_state": "OPEN"}
+        assert detail == {
+            "pr": "https://github.com/o/home/pull/1271", "pr_state": "OPEN",
+            "hold": "PR merge state unknown",
+        }
 
 
 @pytest.mark.parametrize(
@@ -109,6 +113,7 @@ def test_dispatch_event_and_show_name_the_holding_pr(
         payloads = [e.payload for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
         assert payloads[-1] == {
             "reason": "active_pr", "pr": "https://github.com/o/home/pull/1271", "pr_state": "OPEN",
+            "hold": "PR merge state unknown",
         }
     out = kc.run_slash(f"show {tid}")
     guard = [ln for ln in out.splitlines() if ln.strip().startswith("guard:")]
@@ -187,3 +192,86 @@ def test_show_hides_active_pr_hold_on_review_card(kanban_home):
         conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
         conn.commit()
     assert "guard:" not in kc.run_slash(f"show {tid}")
+
+
+# 2026-09-30, t_64d223f2: t_57274bc7 sat ready 12 h, held every tick by its OWN
+# DIRTY PR #1871 with no live worker, while only that worker could rebase it.
+# A PR only the worker can move holds the card only while the worker lives.
+
+
+def _with_health(head: str, merge_state: str, rollup=None) -> dict:
+    return {**_open(head), "mergeStateStatus": merge_state,
+            "statusCheckRollup": rollup or []}
+
+
+_RED_ROLLUP = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}]
+
+
+@pytest.mark.parametrize(
+    ("merge_state", "rollup", "needs"),
+    [("DIRTY", None, "DIRTY"), ("BEHIND", None, "BEHIND"),
+     ("UNSTABLE", None, "UNSTABLE"), ("BLOCKED", _RED_ROLLUP, "CI red")],
+)
+def test_workerless_card_spawns_to_fix_its_own_unmergeable_pr(
+    kanban_home, fake_gh, merge_state, rollup, needs,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="D-perf1", assignee="alice")
+        fake_gh[1871] = _with_health(f"daedalus-opus/{tid}-perf", merge_state, rollup)
+        kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/1871")
+        assert kb._prior_worker_still_alive(conn, tid) is None
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert kb._pr_needs_its_worker("o/r", 1871) == needs
+
+
+def test_unmergeable_pr_holds_while_its_worker_is_alive(kanban_home, fake_gh, monkeypatch):
+    monkeypatch.setattr(
+        kb, "_prior_worker_still_alive", lambda conn, tid: {"prev_pid": 4242},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="D-perf1", assignee="alice")
+        fake_gh[1871] = _with_health(f"daedalus-opus/{tid}-perf", "DIRTY")
+        kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/1871")
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+    assert detail == {
+        "pr": "https://github.com/o/r/pull/1871", "pr_state": "OPEN",
+        "merge_state": "DIRTY", "pr_needs": "DIRTY", "hold": "worker alive",
+    }
+
+
+@pytest.mark.parametrize("merge_state", ["CLEAN", "HAS_HOOKS", "BLOCKED"])
+def test_mergeable_pr_still_holds_and_says_the_closer_lands_it(
+    kanban_home, fake_gh, merge_state,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="lane work", assignee="alice")
+        fake_gh[9] = _with_health(f"alice/{tid}-x", merge_state)
+        kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/9")
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+    assert detail["hold"] == "PR mergeable, closer will land it"
+    assert detail["merge_state"] == merge_state
+
+
+def test_dispatch_spawns_workerless_card_behind_planted_dirty_pr(
+    kanban_home, fake_gh, all_assignees_spawnable,
+):
+    """Tick-level: a planted DIRTY own-PR no longer defers the card."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="D-perf1", assignee="alice")
+        fake_gh[1871] = _with_health(f"daedalus-opus/{tid}-perf", "DIRTY")
+        kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/1871")
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert (tid, "active_pr") not in res.respawn_guarded
+        assert tid in [t for (t, _a, _w) in res.spawned]
+
+
+def test_deferred_tick_line_names_pr_and_hold_reason():
+    line = kc._fmt_respawn_guard_detail({
+        "pr": "https://github.com/o/r/pull/9", "pr_state": "OPEN",
+        "merge_state": "CLEAN", "hold": "PR mergeable, closer will land it",
+    })
+    assert line == (
+        " — https://github.com/o/r/pull/9 (OPEN/CLEAN), PR mergeable, closer will land it"
+    )

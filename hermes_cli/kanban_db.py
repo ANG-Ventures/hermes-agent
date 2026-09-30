@@ -17810,7 +17810,8 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
         proc = subprocess.run(
             [
                 "gh", "pr", "view", str(number), "-R", repo,
-                "--json", "state,mergedAt,headRefName",
+                "--json",
+                "state,mergedAt,headRefName,mergeStateStatus,statusCheckRollup",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -17833,10 +17834,63 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
         _PR_HEAD_REF_CACHE[(repo.lower(), int(number))] = head
         while len(_PR_HEAD_REF_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
             _PR_HEAD_REF_CACHE.pop(next(iter(_PR_HEAD_REF_CACHE)))
+    _PR_MERGE_HEALTH_CACHE[(repo.lower(), int(number))] = {
+        "merge_state": str(payload.get("mergeStateStatus") or "").upper() or None,
+        "ci_red": _pr_rollup_is_red(payload.get("statusCheckRollup")),
+    }
+    while len(_PR_MERGE_HEALTH_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
+        _PR_MERGE_HEALTH_CACHE.pop(next(iter(_PR_MERGE_HEALTH_CACHE)))
     if payload.get("mergedAt"):
         return "MERGED"
     state = str(payload.get("state") or "").upper()
     return state if state in {"OPEN", "CLOSED", "MERGED"} else None
+
+
+# Health of every PR the guard has queried, filled by the same query as the
+# state (no extra budget): ``{"merge_state": mergeStateStatus, "ci_red": bool}``.
+# Absent entry = health unknown = the ``active_pr`` guard keeps holding.
+_PR_MERGE_HEALTH_CACHE: dict[tuple[str, int], dict] = {}
+# mergeStateStatus values only the card's own worker can fix (rebase /
+# update-branch / fix checks). BLOCKED is excluded: it is usually a review or
+# required-approval wait; red required checks are caught by ``ci_red``.
+_PR_WORKER_FIXABLE_MERGE_STATES = frozenset({"DIRTY", "BEHIND", "UNSTABLE"})
+_PR_RED_CHECK_VALUES = frozenset({
+    "FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
+})
+# States in which the PR can land without its worker.
+_PR_MERGEABLE_STATES = frozenset({"CLEAN", "HAS_HOOKS", "BLOCKED"})
+
+
+def _pr_rollup_is_red(rollup) -> bool:
+    """True when any check-run conclusion / status-context state is failing."""
+    if not isinstance(rollup, list):
+        return False
+    for item in rollup:
+        if not isinstance(item, dict):
+            continue
+        for key in ("conclusion", "state"):
+            if str(item.get(key) or "").upper() in _PR_RED_CHECK_VALUES:
+                return True
+    return False
+
+
+def _pr_needs_its_worker(repo: str, number: int) -> Optional[str]:
+    """Why an OPEN PR can only move with its card's worker, else None.
+
+    ``DIRTY``/``BEHIND``/``UNSTABLE`` or a red check: nobody but the worker
+    rebases or fixes it, so holding the workerless card for it deadlocks
+    (2026-09-30, t_57274bc7 sat ready 12 h behind its own DIRTY #1871).
+    """
+    health = _PR_MERGE_HEALTH_CACHE.get((repo.lower(), int(number)))
+    if not health:
+        return None
+    merge_state = health.get("merge_state")
+    if merge_state in _PR_WORKER_FIXABLE_MERGE_STATES:
+        return merge_state
+    if health.get("ci_red"):
+        return "CI red"
+    return None
 
 
 @dataclass
@@ -21105,8 +21159,13 @@ def check_respawn_guard(
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
         A PR whose head branch names a DIFFERENT card id is skipped (see
-        ``_pr_belongs_to_other_card``). ``detail`` gets ``pr`` and
-        ``pr_state`` for the PR that is holding the card.
+        ``_pr_belongs_to_other_card``). An OPEN PR only the card's worker can
+        move (mergeStateStatus DIRTY/BEHIND/UNSTABLE or a red check, see
+        ``_pr_needs_its_worker``) holds the card ONLY while a prior worker is
+        alive; a workerless card spawns so its worker can fix the PR.
+        ``detail`` gets ``pr``, ``pr_state``, ``merge_state`` and ``hold``
+        (``worker alive`` / ``PR mergeable, closer will land it`` /
+        ``PR merge state unknown``) for the PR that is holding the card.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -21278,11 +21337,29 @@ def check_respawn_guard(
             # Another card's PR mentioned here is not this card's work.
             if _pr_belongs_to_other_card(repo, number, task_id):
                 continue
+            health = _PR_MERGE_HEALTH_CACHE.get((repo.lower(), int(number))) or {}
+            merge_state = health.get("merge_state")
+            fixable = _pr_needs_its_worker(repo, number) if state == "OPEN" else None
+            if fixable is not None:
+                # Only the card's own worker can rebase / fix this PR. Hold
+                # only while that worker is alive; a workerless card spawns.
+                if _prior_worker_still_alive(conn, task_id) is None:
+                    continue
+                hold = "worker alive"
+            elif merge_state in _PR_MERGEABLE_STATES:
+                hold = "PR mergeable, closer will land it"
+            else:
+                hold = "PR merge state unknown"
             if detail is not None:
                 detail.update(
                     pr=f"https://github.com/{repo}/pull/{number}",
                     pr_state=state or "unknown",
+                    hold=hold,
                 )
+                if merge_state:
+                    detail["merge_state"] = merge_state
+                if fixable is not None:
+                    detail["pr_needs"] = fixable
             return "active_pr"
 
     return None
