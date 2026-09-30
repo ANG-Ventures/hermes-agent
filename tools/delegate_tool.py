@@ -911,7 +911,7 @@ def _looks_like_error_output(content: Any) -> bool:
     )
 
 
-def _normalize_role(r: Optional[str]) -> str:
+def _normalize_role(r: Optional[str]) -> str:  # ci-probe t_b7237e76 (throwaway)
     """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
 
     None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
