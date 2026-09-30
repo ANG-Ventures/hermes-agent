@@ -341,6 +341,12 @@ class GatewayStreamConsumer:
         # replies after an early/partial multi-message delivery.
         self._turn_split_delivery = False
         self._delivered_commentary_texts: list[str] = []
+        # Internal-event turns: interim content (a streamed preamble cut at
+        # a tool boundary, or interim commentary) is held here until got_done
+        # knows whether the turn ended in silence.  Released as commentary
+        # sends when the final is not silent, dropped when it is.
+        self._internal_held: list[str] = []
+        self._internal_final_text: Optional[str] = None
         # Retains the finalized visible text of each streaming segment so
         # ``has_delivered_text`` can still match after ``_reset_segment_state``
         # clears ``_last_sent_text``. Without this, a segment break (triggered
@@ -1308,9 +1314,12 @@ class GatewayStreamConsumer:
                             got_done = True
                             break
                         if item is _NEW_SEGMENT:
+                            if self._hold_internal_interim(None):
+                                continue
                             got_segment_break = True
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FINAL_TEXT:
+                            self._internal_final_text = item[1]
                             # Authoritative turn-final payload (see finish()).
                             # Adopt it as the finalize content so the seal /
                             # final edit carries the TRUE final — including
@@ -1371,6 +1380,8 @@ class GatewayStreamConsumer:
                             approval_boundary_cancelled = item[2]
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                            if self._hold_internal_interim(item[1]):
+                                continue
                             commentary_text = item[1]
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
@@ -1392,6 +1403,12 @@ class GatewayStreamConsumer:
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
+
+                # A flush barrier (clarify poll ordering) or an approval
+                # boundary must put everything queued before it on screen,
+                # including held internal-event interim content.
+                if (got_flush or got_approval_boundary) and self._internal_held:
+                    await self._release_internal_held()
 
                 # Handle approval boundary: close current stream, reset for new turn.
                 # Must happen before got_done/segment_break processing since it
@@ -1484,8 +1501,23 @@ class GatewayStreamConsumer:
                     if _silence_fn(
                         self._clean_for_display(self._accumulated)
                     ):
+                        self._internal_held = []
                         await self._suppress_silence_marker()
                         return
+                    if self._internal_held:
+                        # Nothing streamed after the last held boundary: the
+                        # gateway delivers (or silences) the final itself, so
+                        # judge the held interim content by that final.
+                        if (
+                            not self._accumulated.strip()
+                            and self._internal_final_text is not None
+                            and _silence_fn(
+                                self._clean_for_display(self._internal_final_text)
+                            )
+                        ):
+                            self._internal_held = []
+                        else:
+                            await self._release_internal_held()
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -2720,6 +2752,34 @@ class GatewayStreamConsumer:
                 self._last_sent_text = prefix
         except Exception:
             pass  # best-effort — don't let this block the fallback path
+
+    def _hold_internal_interim(self, commentary: Optional[str]) -> bool:
+        """Hold a segment break / commentary on an internal-event turn.
+
+        Returns True when the boundary was absorbed into ``_internal_held``
+        (the caller keeps draining), False when the legacy boundary path must
+        run.  The streamed text before the boundary is held too, so order is
+        preserved on release.  Only while nothing is on screen yet: once a
+        preview exists (e.g. a flush barrier delivered it) the legacy path
+        owns that message.
+        """
+        if not self.cfg.internal_event:
+            return False
+        if self._message_id is not None or self._native_stream_opened:
+            return False
+        if self._accumulated.strip():
+            self._internal_held.append(self._accumulated)
+        self._accumulated = ""
+        self._stream_ledger = ""
+        if commentary:
+            self._internal_held.append(commentary)
+        return True
+
+    async def _release_internal_held(self) -> None:
+        """Deliver held internal-event interim content, in order."""
+        held, self._internal_held = self._internal_held, []
+        for text in held:
+            await self._send_commentary(text)
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
