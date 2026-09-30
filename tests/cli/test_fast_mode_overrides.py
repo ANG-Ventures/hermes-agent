@@ -438,3 +438,38 @@ def test_slash_mirror_routes_tier_into_request_overrides():
         server._mirror_slash_side_effects("sid", session, "/fast normal")
     assert agent.service_tier is None
     assert agent.request_overrides == {"extra_body": {"x": 1}}
+
+
+def test_model_only_overrides_never_substitute_priority_for_other_tier():
+    """Prism t_62b562f6: flex/default/normal must not fall through to Priority."""
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    for tier in ("flex", "default", "normal", "scale", "bogus"):
+        assert resolve_fast_mode_overrides("gpt-5.5", tier=tier) is None, tier
+        assert resolve_fast_mode_overrides("claude-opus-4-6", tier=tier) is None, tier
+    # Legacy None / priority / fast keep the model's fast contract.
+    for tier in (None, "", "priority", "fast"):
+        assert resolve_fast_mode_overrides("gpt-5.5", tier=tier) == {
+            "service_tier": "priority"
+        }, tier
+
+
+def test_cli_fast_capability_fails_closed_on_resolution_error():
+    """Prism t_62b562f6: `/fast ultrafast` called _fast_capability unguarded."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from cli import HermesCLI
+
+    stub = SimpleNamespace(
+        agent=None, model="gpt-6-astra", provider="openai-codex", api_mode="codex_responses"
+    )
+    with patch(
+        "hermes_cli.models.resolve_fast_mode_capability",
+        side_effect=RuntimeError("boom"),
+    ):
+        for tier in (None, "ultrafast"):
+            capability = HermesCLI._fast_capability(stub, tier)
+            assert capability.supported is False
+            assert capability.request_overrides == {}
+            assert capability.reason
