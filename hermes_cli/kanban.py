@@ -203,6 +203,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "pin_sub_fallback": bool(getattr(t, "pin_sub_fallback", False)),
         "session_id": t.session_id,
         "unhomed": bool(getattr(t, "unhomed", False)),
+        "no_worker": bool(getattr(t, "no_worker", False)),
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -777,6 +778,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Required to hand a card in review with an open PR back: records "
              "changes_requested (operator), status ready, assignee = implementer",
     )
+    p_assign.add_argument(
+        "--worker-ok", action="store_true", dest="worker_ok",
+        help="Allow a worker profile on a no-worker (operator-only) card; "
+             "clears the flag and records no_worker_cleared",
+    )
 
     # --- set-model (per-task model/provider/effort override) ---
     p_set_model = sub.add_parser(
@@ -969,6 +975,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Required to hand a card in review with an open PR back: records "
              "changes_requested (operator), status ready, assignee = implementer",
     )
+    p_reassign.add_argument(
+        "--worker-ok", action="store_true", dest="worker_ok",
+        help="Allow a worker profile on a no-worker (operator-only) card; "
+             "clears the flag and records no_worker_cleared",
+    )
 
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
@@ -1155,6 +1166,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         metavar="SESSION_ID",
         help="(Re)stamp the card's home session ('none' = unstamped).",
+    )
+    _nw = p_edit.add_mutually_exclusive_group()
+    _nw.add_argument(
+        "--no-worker", action="store_const", const=True, dest="no_worker",
+        default=None,
+        help="Mark the card operator-only: the dispatcher never spawns it and "
+             "assign/reassign refuse worker profiles (even with --operator)",
+    )
+    _nw.add_argument(
+        "--worker-ok", action="store_const", const=False, dest="no_worker",
+        help="Clear the no-worker flag",
     )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
@@ -3149,6 +3171,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if guard_line:
         print(f"  guard:     {guard_line}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if task.no_worker:
+        print("  dispatch:  operator-only")
     print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
     print(f"  home:      {_home_label(task.session_id, unhomed=task.unhomed)}")
     if task.tenant:
@@ -3273,8 +3297,9 @@ def _cmd_assign(args: argparse.Namespace) -> int:
                 conn, args.task_id, profile,
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
+                worker_ok=bool(getattr(args, "worker_ok", False)),
             )
-        except kb.ReviewHoldRequired as exc:
+        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet) as exc:
             print(str(exc), file=sys.stderr)
             return 1
     if not ok:
@@ -4214,14 +4239,19 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     # receipt so the failure path can say what really landed.
     receipt: dict = {}
     with kb.connect_closing() as conn:
-        ok = kb.reassign_task(
-            conn, args.task_id, profile,
-            reclaim_first=reclaim_first,
-            reason=getattr(args, "reason", None),
-            receipt=receipt,
-            request_changes_reason=getattr(args, "request_changes", None),
-            operator=_profile_author(),
-        )
+        try:
+            ok = kb.reassign_task(
+                conn, args.task_id, profile,
+                reclaim_first=reclaim_first,
+                reason=getattr(args, "reason", None),
+                receipt=receipt,
+                request_changes_reason=getattr(args, "request_changes", None),
+                operator=_profile_author(),
+                worker_ok=bool(getattr(args, "worker_ok", False)),
+            )
+        except kb.NoWorkerFlagSet as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     reclaimed = bool(receipt.get("reclaimed"))
     if not ok and receipt.get("hold_error"):
         print(
@@ -4913,17 +4943,28 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     do_model = model_override is not None or clear_model
     new_session = getattr(args, "session", None)
     do_session = new_session is not None
+    no_worker = getattr(args, "no_worker", None)
 
-    if not do_result and not do_model and not do_session:
+    if not do_result and not do_model and not do_session and no_worker is None:
         print(
             "kanban: nothing to edit (pass --result, --model, --clear-model, "
-            "or --session)",
+            "--session, --no-worker or --worker-ok)",
             file=sys.stderr,
         )
         return 2
 
     rc = 0
     with kb.connect_closing() as conn:
+        if no_worker is not None:
+            if not kb.set_no_worker(
+                conn, args.task_id, no_worker, operator=_profile_author(),
+            ):
+                print(f"cannot edit {args.task_id} (unknown id)", file=sys.stderr)
+                return 1
+            print(
+                f"{args.task_id}: dispatch: "
+                + ("operator-only (no-worker)" if no_worker else "worker-ok")
+            )
         if do_session:
             sid = None if new_session.strip().lower() in ("", "none") else new_session.strip()
             if not kb.set_task_session(conn, args.task_id, sid):
@@ -5804,6 +5845,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_unassigned": res.skipped_unassigned,
             "flagship_refused": res.flagship_refused,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            # Count only, like the text line: operator-only cards are never
+            # listed by dispatch output.
+            "skipped_no_worker_count": len(getattr(res, "skipped_no_worker", []) or []),
             "stranded_by_triage": [
                 {"task_id": child, "parent_id": parent}
                 for (child, parent) in res.stranded_by_triage
@@ -5983,6 +6027,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — HUMAN review required): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if getattr(res, "skipped_no_worker", None):
+        # Count only: an operator-only card never appears in the spawn listing.
+        print(
+            f"Skipped (no-worker, operator-only): "
+            f"{len(res.skipped_no_worker)} card(s)"
         )
     # --dry-run is documented (and mandated by the incident runbook) as the
     # SAFE probe, so it must not arm alerts or send: arming writes a durable
