@@ -1099,6 +1099,11 @@ DEFAULT_CONFIG = {
                                       # autoraise banner. Set False to keep the
                                       # 85% threshold autoraise but suppress the
                                       # user-facing notice in CLI/gateway output.
+        "codex_tier_notice": True,    # One-time per-session notice the first time a
+                                      # large-window Codex prompt (model.codex_context_policy:
+                                      # large) passes 272K tokens: turns above 272K price at
+                                      # the higher tier (2x input). Display-only; set False
+                                      # to silence it. Never shown under `advertised`.
         "codex_app_server_auto": "native",  # Codex app-server (codex CLI runtime) thread
                                       # compaction mode. The codex agent owns the real
                                       # thread context, so Hermes' summarizer cannot
