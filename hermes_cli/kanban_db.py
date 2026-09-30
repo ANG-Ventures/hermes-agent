@@ -5181,6 +5181,26 @@ def is_unhomed(session_id: Any) -> bool:
     return str(session_id or "").strip() == UNHOMED_SESSION
 
 
+# Fleet OPERATOR pseudo-session (t_09fea045). A card minted by a cron/script
+# that has no chat session of its own is homed here instead of ``unhomed``:
+# ``unhomed`` is foreign to EVERY session, so such cards (review-merge-pass,
+# main-red-watch, horizon-watch rebase cards) sat Stuck with no session able
+# to unblock/complete them. Any session of an operator profile
+# (:data:`OPERATOR_PROFILES`) owns an operator-homed card; every other
+# session still sees it as foreign.
+OPERATOR_HOME_PREFIX = "operator:"
+OPERATOR_HOME_SESSION = OPERATOR_HOME_PREFIX + "apollo"
+
+
+def is_operator_home(session_id: Any) -> bool:
+    sid = str(session_id or "").strip()
+    return sid.startswith(OPERATOR_HOME_PREFIX) and len(sid) > len(OPERATOR_HOME_PREFIX)
+
+
+class UnhomedCreateError(ValueError):
+    """``create`` would mint a card no session can drive (``unhomed``)."""
+
+
 def _ambient_session_env(name: str) -> str:
     """Per-session gateway context (ContextVar-first), env outside it."""
     try:
@@ -5203,6 +5223,12 @@ def format_origin_line(
     session reading the card sees whose it is without a DB lookup.
     """
     date = time.strftime("%Y-%m-%d", time.localtime(now if now is not None else time.time()))
+    if is_operator_home(session_id):
+        who = f" · by {created_by}" if created_by else ""
+        return (
+            f"origin: operator ({str(session_id).strip()}: cron/script, any "
+            f"operator-profile session may act){who} · {date}"
+        )
     if not session_id or is_unhomed(session_id):
         who = f" · by {created_by}" if created_by else ""
         return (
@@ -6076,6 +6102,10 @@ def check_home_session(
         return None
     if home in actor.session_ids:
         return None
+    # Operator-homed (cron/script minted): any operator-profile session owns
+    # it -- the whole point of the pseudo-session (t_09fea045).
+    if is_operator_home(home) and (_actor_profiles(actor) & OPERATOR_PROFILES):
+        return None
     # Execution lane: a dispatched worker always owns the card it was spawned
     # for. The assignee match lives below, on :func:`_actor_profiles` (session
     # owner over env profile), not on the raw env profile (FleetReview #1074).
@@ -6545,6 +6575,7 @@ def create_task(
     session_explicit: bool = False,
     duplicate_guard: bool = False,
     force_reason: Optional[str] = None,
+    require_home: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6654,6 +6685,25 @@ def create_task(
         conn, session_id, parents, explicit=session_explicit
     )
     session_id, inherited_origin = birth
+    # ``require_home`` (the ``hermes kanban create`` CLI): a caller with NO
+    # session identity, no homed parent and no worker run would mint an
+    # ``unhomed`` card that no session can drive. Refuse; a cron/script says
+    # whose it is (``--session <sid>`` or ``--home operator``). An explicit
+    # ``--session none`` is a deliberate choice and stays allowed; so does a
+    # dispatched worker's fan-out (execution lane) (t_09fea045).
+    if (
+        require_home
+        and not session_explicit
+        and is_unhomed(session_id)
+        and not (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    ):
+        raise UnhomedCreateError(
+            "kanban: refused create: no home session (no session identity, "
+            "no homed --parent). An unhomed card is undrivable: no session "
+            "can unblock/complete it. Pass --home operator (fleet operator "
+            f"pseudo-session {OPERATOR_HOME_SESSION}, owned by any "
+            f"{'/'.join(sorted(OPERATOR_PROFILES))} session) or --session <sid>."
+        )
     body = stamp_origin_body(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
