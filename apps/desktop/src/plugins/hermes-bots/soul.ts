@@ -40,7 +40,7 @@ function messagingProtocolSection(name: string, roster: RosterRow[] | null | und
     'background process notification. Never block waiting for it. In a',
     'messaging gateway, exit notifications are off by default',
     '(display.background_process_agent_notify): there, collect the reply',
-    'with process(action=\'wait\', timeout=...) instead of ending the turn.',
+    "with process(action='wait', timeout=...) instead of ending the turn.",
     '```',
     '',
     '(`--in ~ -c "Bot Chat" --create-if-missing` resumes their canonical',
