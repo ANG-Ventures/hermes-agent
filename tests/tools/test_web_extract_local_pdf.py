@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -72,6 +73,22 @@ ROUTES = {
 }
 
 
+# A server that never stalls long enough to trip httpx's per-operation
+# timeouts but never finishes either: one byte per TRICKLE_INTERVAL.
+TRICKLE_INTERVAL = 0.1
+TRICKLE_SECONDS = 15.0
+
+
+def _trickle(wfile, data):
+    try:
+        for i in range(len(data)):
+            wfile.write(data[i:i + 1])
+            wfile.flush()
+            time.sleep(TRICKLE_INTERVAL)
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the client gave up — the point of the test
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _route(self):
         path = self.path.split("?", 1)[0]
@@ -94,9 +111,22 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802
+        if self.path.startswith("/trickle.pdf"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.end_headers()
+            _trickle(self.wfile, b"%PDF-1.4\n" + b"x" * int(TRICKLE_SECONDS / TRICKLE_INTERVAL))
+            return
         self._send(True)
 
     def do_HEAD(self):  # noqa: N802
+        if self.path.startswith("/trickle-head"):
+            # Status line + a header that never ends.
+            _trickle(
+                self.wfile,
+                b"HTTP/1.1 200 OK\r\nX-Slow: " + b"y" * int(TRICKLE_SECONDS / TRICKLE_INTERVAL),
+            )
+            return
         self._send(False)
 
     def log_message(self, *args):
@@ -288,3 +318,35 @@ def test_no_local_extractor_keeps_backend_dispatch(server, vendor, monkeypatch):
     results = _run([url])
     assert vendor.calls == [[url]]
     assert results[0]["content"] == f"VENDOR:{url}"
+
+
+def _tight_deadlines(monkeypatch):
+    # raising=False so this runs red (not AttributeError) on a base without them.
+    monkeypatch.setattr(web_pdf_local, "GET_DEADLINE_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(web_pdf_local, "HEAD_DEADLINE_SECONDS", 0.5, raising=False)
+
+
+def test_trickling_pdf_download_hits_overall_deadline(server, vendor, monkeypatch):
+    """httpx's timeout is per read; a byte-every-100ms server must still be cut off."""
+    _write_config({})
+    _tight_deadlines(monkeypatch)
+    url = f"{server}/trickle.pdf"
+    started = time.monotonic()
+    results = _run([url])
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"download ran {elapsed:.1f}s past its deadline"
+    assert vendor.calls == []
+    assert results[0]["url"] == url
+    assert results[0]["error"].startswith("Timed out fetching PDF locally"), results[0]
+
+
+def test_trickling_head_probe_hits_overall_deadline(server, vendor, monkeypatch):
+    """A HEAD probe that never finishes means "not known PDF" -> vendor, promptly."""
+    _write_config({})
+    _tight_deadlines(monkeypatch)
+    url = f"{server}/trickle-head"
+    started = time.monotonic()
+    flags = asyncio.run(web_pdf_local.classify_pdf_urls([url]))
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"HEAD probe ran {elapsed:.1f}s past its deadline"
+    assert flags == [False]
