@@ -240,7 +240,8 @@ def _fire_alert(backend: str, status: int, error: str, cfg: Dict[str, Any],
                "WEB_BACKEND_ERROR": error[:300]}
         try:
             proc = subprocess.run(command, shell=True, env=env, capture_output=True,
-                                  text=True, timeout=_ALERT_TIMEOUT_SECONDS)
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=_ALERT_TIMEOUT_SECONDS)
             ok = proc.returncode == 0
             note = f"rc={proc.returncode} {(proc.stderr or '').strip()[:200]}"
         except Exception as exc:  # noqa: BLE001
