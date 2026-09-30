@@ -416,6 +416,54 @@ def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD
 # retry the SAME provider/model. A timeout is not a restart signal (a hung relay
 # still listens), so only connection-class errors qualify.
 LOCAL_RELAY_RESTART_WAIT_DEFAULT_S = 20.0
+
+# ── Relay deploy-drain wait (``FailoverReason.relay_draining``) ───────────
+#
+# claude-pool deploy = POST /admin/pool/deploy-drain: new turns get 503
+# {"error":"draining-for-deploy"} + Retry-After: 15 while in-flight turns
+# finish, then the relay restarts (the listener gap after that is the
+# loopback-restart wait above). Every model on the relay gets the same 503,
+# so a model fallback on it is pointless; wait on the SAME model instead.
+# Default 150 s = relay drain TTL 120 s (its own worst case: it force-restarts
+# after that even with turns still in flight; FAD_RELAY_SELF_DRAIN_MAX 30 s is
+# the p90 shape) + ~5 s relaunch + health gate, rounded up. Measured
+# 2026-09-30 13:03:28-45: the live drain lasted ~17 s. Config:
+# ``fallback.relay_drain_wait_s`` (0 disables -> pre-fix overloaded policy).
+RELAY_DRAIN_WAIT_DEFAULT_S = 150.0
+# Poll interval when the relay sends no usable Retry-After.
+RELAY_DRAIN_DEFAULT_POLL_S = 5.0
+
+
+def relay_drain_wait(
+    *,
+    raw_retry_after: Any,
+    waited_s: float,
+    max_wait_s: float,
+    default_poll_s: float = RELAY_DRAIN_DEFAULT_POLL_S,
+) -> Optional[float]:
+    """Seconds to sleep before re-trying the SAME model on a draining relay.
+
+    Pure. ``None`` when the wall-clock budget is spent (caller hands off to the
+    retries-exhausted -> fallback branch). Otherwise the relay's numeric
+    ``Retry-After`` (or ``default_poll_s``) clamped to the remaining budget.
+    Unlike :func:`capacity_retry_wait` a long hint is clamped, not a reason to
+    leave: the drain is bounded by the relay itself.
+    """
+    try:
+        remaining = float(max_wait_s) - float(waited_s)
+    except (TypeError, ValueError):
+        return None
+    if remaining <= 0:
+        return None
+    wait = float(default_poll_s)
+    if raw_retry_after not in (None, ""):
+        try:
+            secs = float(raw_retry_after)
+        except (TypeError, ValueError):
+            secs = None
+        if secs is not None and secs > 0:
+            wait = secs
+    return min(wait, remaining)
 LOCAL_RELAY_MAX_RECOVERIES_PER_TURN = 3
 
 _LOCAL_RELAY_CONN_ERROR_NAMES = frozenset({

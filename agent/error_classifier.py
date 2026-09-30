@@ -72,6 +72,14 @@ class FailoverReason(enum.Enum):
     # each). Fail over to the next provider on the FIRST hit. Never rotate a
     # credential — the keys are healthy; the sub stalled.
     pool_stalled = "pool_stalled"
+    # Local pool relay DRAINING FOR A DEPLOY (claude-pool deploy-drain,
+    # t_826861ab): 503 {"error":"draining-for-deploy"} + Retry-After: 15 for
+    # <=30 s, then the relay restarts. PROVIDER-WIDE (every model on that relay
+    # gets the same 503) and self-clearing: wait it out on the SAME model, and
+    # if the wait bound is spent never fall back to another model on the same
+    # provider. Not ``overloaded`` (nothing is overloaded) and not
+    # ``pool_exhausted`` (no seat is capped).
+    relay_draining = "relay_draining"
 
     # Server-side
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
@@ -364,6 +372,36 @@ _POOL_MODEL_SCOPED_PATTERN = "no eligible sub for the requested model"
 # historical classification: generic retryable server_error via the 5xx
 # floor when the code is extractable, or the timeout bucket when only the
 # message survives.
+# Relay deploy-drain token (claude-pool t_826861ab). Matched EXACTLY against
+# the JSON body's ``error`` value, never as a substring of free text: a message
+# that merely mentions draining is not the relay's drain refusal.
+RELAY_DRAIN_ERROR = "draining-for-deploy"
+
+
+def _is_relay_deploy_drain(error: Exception, body: Any) -> bool:
+    """True when ``error`` is the relay's deploy-drain 503.
+
+    The OpenAI SDK hands the relay's ``{"error": "draining-for-deploy"}`` over
+    as ``body="draining-for-deploy"`` (``data.get("error", data)``);
+    ``_extract_error_body`` then recovers the dict from ``response.json()``.
+    Accept either shape, exact value only.
+    """
+    if isinstance(body, dict) and body.get("error") == RELAY_DRAIN_ERROR:
+        return True
+    current = error
+    for _ in range(5):
+        raw = getattr(current, "body", None)
+        if raw == RELAY_DRAIN_ERROR:
+            return True
+        if isinstance(raw, dict) and raw.get("error") == RELAY_DRAIN_ERROR:
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
+
+
 _POOL_STALLED_PATTERNS = [
     "upstream attempt timed out",
     "pool deadline exceeded",
@@ -1172,6 +1210,20 @@ def classify_api_error(
             reason.value, provider, status_code,
         )
         return _result(reason, **plugin_classification)
+
+    # ── 0.4 Relay deploy-drain (503 {"error":"draining-for-deploy"}) ──
+    #
+    # Before the relay-stated class: the drain is its own recovery (wait on
+    # the same model, see conversation_loop), whatever class header a relay
+    # version stamps on it. 2026-09-30 13:03: classified ``overloaded`` it
+    # failed over fable -> opus on the SAME draining relay (5 sessions).
+    if status_code in (None, 503) and _is_relay_deploy_drain(error, body):
+        return _result(
+            FailoverReason.relay_draining,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
 
     # ── 0.5 Relay-stated error class (fallback spec D2, Phase 1b) ───
     #

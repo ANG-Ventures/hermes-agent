@@ -139,6 +139,10 @@ async def bind_delivery(agent, adapter):
 def test_every_cause_announces_route_change_in_same_turn(monkeypatch, reason):
     """Mutation: remove _emit_fallback_announce in try_activate_fallback -> RED."""
     agent = make_agent(monkeypatch)
+    if reason is FailoverReason.relay_draining:
+        # Provider-wide: same-provider entries are skipped by design
+        # (t_4349cf26), so the contract runs on a cross-provider entry.
+        agent._fallback_chain = [{"provider": "openai-codex", "model": "fallback/one"}]
     adapter = RecordingAdapter()
 
     async def scenario():
@@ -153,7 +157,9 @@ def test_every_cause_announces_route_change_in_same_turn(monkeypatch, reason):
     asyncio.run(scenario())
     chat, text, metadata = adapter.messages[0]
     assert chat == "test-chat" and metadata == {"thread_id": "test-thread"}
-    assert "openrouter/primary/model" in text and "openrouter/fallback/one" in text
+    fb_route = ("openai-codex/fallback/one" if reason is FailoverReason.relay_draining
+                else "openrouter/fallback/one")
+    assert "openrouter/primary/model" in text and fb_route in text
     assert "Model fallback" in text
 
 

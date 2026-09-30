@@ -56,7 +56,7 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("quota_model", ("no eligible sub for the requested model",
                      "this model's budget is capped")),
     # Operator drain is deliberate capacity withholding, not quota.
-    ("pool_pressure", ("drained",)),
+    ("pool_pressure", ("drained", "draining-for-deploy")),
     # Pool-wide exhaustion for every model is still pool-wide quota.
     ("quota_model", ("no eligible sub",)),
     ("conn", ("upstream connect timed out", "upstream unreachable",
@@ -244,6 +244,16 @@ def stash_api_error(agent: Any, api_error: BaseException,
         response = getattr(api_error, "response", None)
         headers = _lower_headers(getattr(response, "headers", None))
         body = getattr(api_error, "body", None)
+        if not isinstance(body, dict) and response is not None:
+            # OpenAI SDK passes ``data.get("error", data)``: a relay's
+            # {"error": "<token>"} arrives as the bare string. Recover the
+            # JSON dict so the rider keeps the error head (err_head).
+            try:
+                _json = response.json()
+                if isinstance(_json, dict):
+                    body = _json
+            except Exception:  # noqa: BLE001
+                pass
         msg = ""
         if isinstance(error_context, dict):
             msg = str(error_context.get("message") or "")

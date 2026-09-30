@@ -106,6 +106,23 @@ def local_relay_restart_wait_s() -> float:
         return LOCAL_RELAY_RESTART_WAIT_DEFAULT_S
 
 
+def relay_drain_wait_s() -> float:
+    """``fallback.relay_drain_wait_s`` (default 150, see
+    ``retry_utils.RELAY_DRAIN_WAIT_DEFAULT_S``): how long a relay deploy-drain
+    503 is waited out on the SAME model before the fallback chain. ``0``
+    disables."""
+    from agent.retry_utils import RELAY_DRAIN_WAIT_DEFAULT_S
+
+    fb = _raw_config().get("fallback")
+    val: Any = RELAY_DRAIN_WAIT_DEFAULT_S
+    if isinstance(fb, dict) and "relay_drain_wait_s" in fb:
+        val = fb.get("relay_drain_wait_s")
+    try:
+        return max(float(val), 0.0)
+    except (TypeError, ValueError):
+        return RELAY_DRAIN_WAIT_DEFAULT_S
+
+
 def announce_seat_names() -> bool:
     model = _raw_config().get("model")
     if isinstance(model, dict) and "announce_seat_names" in model:

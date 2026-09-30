@@ -981,6 +981,10 @@ def normalize_hop(raw: Optional[str]) -> Optional[str]:
     return _RELAY_HOP_ASCII.get(raw.lower())
 
 
+# claude-pool deploy-drain 503 (t_4349cf26): decided AT the relay, no seat.
+RELAY_DRAIN_CAUSE = "relay draining for deploy"
+
+
 def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
@@ -995,6 +999,8 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return "read timeout"
         return "connection error"
     if cls == "pool_pressure":
+        if "draining-for-deploy" in t or ("drain" in t and "deploy" in t):
+            return RELAY_DRAIN_CAUSE
         if "burn" in t:
             return "burn-in ceiling"
         if "newly-activated" in t or "young" in t:
@@ -1106,6 +1112,8 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
     if _is_pool_wide_relay_busy(row, hop, cause):
+        if cause == RELAY_DRAIN_CAUSE:
+            return f"{prefix}{cause} (at the relay), {window}"
         return f"{prefix}relay busy: all subs at capacity (at the relay), {window}"
     return f"{prefix}{cause} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
 
@@ -1211,7 +1219,7 @@ def _is_pool_wide_relay_busy(row: Mapping[str, Any], hop: Optional[str], cause: 
     unknown)" through a 9-minute tailnet outage, which read as missing data."""
     return (row.get("trigger_class") == "pool_pressure"
             and not row.get("seat") and hop in (None, "relay")
-            and cause in ("relay busy", "pool at capacity")
+            and cause in ("relay busy", "pool at capacity", RELAY_DRAIN_CAUSE)
             and not is_direct_pin(row.get("from_provider")))
 
 
@@ -1222,6 +1230,8 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     cls = row.get("trigger_class")
     relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
                      or bool(row.get("relay_synthetic")))
+    if cls == "pool_pressure" and _cause_phrase(row) == RELAY_DRAIN_CAUSE:
+        return "relay deploying"
     if not relay_sourced:
         return None
     return {"conn": "connection issue", "pool_pressure": "relay busy"}.get(cls)

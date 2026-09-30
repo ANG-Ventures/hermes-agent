@@ -3295,6 +3295,7 @@ _FALLBACK_REASON_LABELS = {
     "upstream_rate_limit": "rate limit",
     "pool_exhausted": "sub pool capped",
     "pool_stalled": "pool sub stalled mid-turn",
+    "relay_draining": "relay deploying",
     "billing": "credit exhausted",
     "overloaded": "provider overloaded",
     "server_error": "provider error",
@@ -3924,6 +3925,20 @@ def _restore_switch_state(agent, snap: Dict[str, Any]) -> None:
             pass
 
 
+def _same_provider_entry(agent, fb: Dict[str, Any]) -> bool:
+    """True when chain entry ``fb`` is served by the agent's CURRENT provider.
+
+    base_url decides when both sides have one (a generic ``custom`` provider
+    name can front different relays); otherwise the provider name does."""
+    cur_base = str(getattr(agent, "base_url", "") or "").strip().rstrip("/").lower()
+    fb_base = str(fb.get("base_url") or "").strip().rstrip("/").lower()
+    if cur_base and fb_base:
+        return fb_base == cur_base
+    cur_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    fb_provider = (fb.get("provider") or "").strip().lower()
+    return bool(cur_provider) and fb_provider == cur_provider
+
+
 def try_activate_fallback(
     agent,
     reason: "FailoverReason | None" = None,
@@ -4073,6 +4088,16 @@ def try_activate_fallback(
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)  # skip invalid, try next
+    # A relay deploy-drain refuses EVERY model on the failing provider, so a
+    # same-provider entry (a MODEL fallback, e.g. fable -> opus on claude-bpr)
+    # only collects the same 503 (2026-09-30 13:03, 5 sessions). Skip entries
+    # on the failing provider or its base_url.
+    if getattr(reason, "value", reason) == "relay_draining" and _same_provider_entry(agent, fb):
+        logger.warning(
+            "Fallback skip: %s/%s is on the relay that is draining for deploy",
+            fb_provider, fb_model,
+        )
+        return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)
 
     # A card-pinned kanban worker never leaves its pinned provider mid-turn
     # (t_ed0289e3): a card pinned to openai-codex to escape a bridge fault must
