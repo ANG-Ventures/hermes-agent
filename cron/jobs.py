@@ -3455,6 +3455,12 @@ RESTART_REQUEUE_MAX = 1
 # restart, gateway down for a day): same window as the one-shot restart
 # catch-up default.
 RESTART_REQUEUE_MAX_AGE_SECONDS = DEFAULT_ONESHOT_CATCHUP_SECONDS
+# One restart kills every in-flight script at once, so the next boot scan
+# consumes all their markers together. Firing them all in the same second
+# stacks the heavy ones (2026-09-30 09:28:43: fleet-config-lint +
+# fleet-upstream-leak-lint re-fired 71 ms apart -> Studio load1=67). The n-th
+# re-fire in one scan is deferred n * this many seconds; the first fires now.
+RESTART_REQUEUE_STAGGER_S = 300
 
 
 def request_restart_requeue(job_id: str, reason: str) -> bool:
@@ -3491,12 +3497,19 @@ def request_restart_requeue(job_id: str, reason: str) -> bool:
     return False
 
 
-def _apply_restart_requeue(job: Dict[str, Any], raw_jobs: List[Dict[str, Any]], now: datetime) -> bool:
+def _apply_restart_requeue(
+    job: Dict[str, Any],
+    raw_jobs: List[Dict[str, Any]],
+    now: datetime,
+    fired_this_scan: Optional[List[Any]] = None,
+) -> bool:
     """Turn a pending restart re-queue marker into a run-now fire.
 
     Mutates ``job`` (scan copy) and its ``raw_jobs`` record in place. Uses the
     same ``next_run_at == manual_run_at`` shape as ``trigger_job`` so the
     cron-expression / TZ / stale-grace guards treat it as an explicit run-now.
+    ``fired_this_scan`` is the due scan's list of re-fires so far: the n-th
+    one is stamped ``now + n * RESTART_REQUEUE_STAGGER_S`` instead of now.
     Returns True when storage needs saving.
     """
     marker = job.get(RESTART_REQUEUE_KEY)
@@ -3518,15 +3531,21 @@ def _apply_restart_requeue(job: Dict[str, Any], raw_jobs: List[Dict[str, Any]], 
             "marker (age=%s)", name, job.get("id"), age,
         )
         return True
-    stamp = now.isoformat()
+    slot = 0
+    if fired_this_scan is not None:
+        slot = len(fired_this_scan)
+        fired_this_scan.append(job.get("id"))
+    delay_s = slot * RESTART_REQUEUE_STAGGER_S
+    stamp = (now + timedelta(seconds=delay_s)).isoformat()
     for record in (job, raw):
         if record is not None:
             record["next_run_at"] = stamp
             record["manual_run_at"] = stamp
     logger.warning(
         "cron.restart_requeue.fire job='%s' id=%s — previous run was killed by "
-        "a gateway restart (%s); firing once now",
+        "a gateway restart (%s); firing once at %s (stagger %ds, slot %d)",
         name, job.get("id"), str(marker.get("reason") or "")[:200],
+        stamp, delay_s, slot,
     )
     return True
 
@@ -4665,6 +4684,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         needs_save = True
         jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
 
+    requeue_fired: List[Any] = []
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
         # unexpected job record must never abort the whole scan. The id /
@@ -4706,7 +4726,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     break
                 continue
 
-            if _apply_restart_requeue(job, raw_jobs, now):
+            if _apply_restart_requeue(job, raw_jobs, now, requeue_fired):
                 needs_save = True
 
             # Cross-process running-claim guard (#59229): if another scheduler
@@ -4840,6 +4860,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             #     occurrence; a correctly-parked cron value is left as-is.
             if (
                 kind in ("cron", "interval")
+                and not manual_run  # a staggered restart re-fire is pending
                 and next_run_dt > now
                 and _job_is_stale_error_recurring(job, schedule, now)
             ):
