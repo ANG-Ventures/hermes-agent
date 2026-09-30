@@ -1160,30 +1160,10 @@ async def web_extract_tool(
         # Paid extract vendors bill PDFs per page (Firecrawl: 45–263 credits
         # per manual). Read PDFs locally instead and never send them to a
         # vendor. ``web.local_pdf: false`` restores vendor dispatch.
-        local_pdf_done: Dict[int, Dict[str, Any]] = {}
-        from tools.web_pdf_local import (
-            classify_pdf_urls as _classify_pdf_urls,
-            local_pdf_settings as _local_pdf_settings,
-            read_pdf_locally as _read_pdf_locally,
+        from tools.web_pdf_local import split_local_pdfs as _split_local_pdfs
+        local_pdf_done, safe_urls, safe_indices = await _split_local_pdfs(
+            safe_urls, safe_indices, _load_web_config()
         )
-        _pdf_enabled, _pdf_max_bytes = _local_pdf_settings(_load_web_config())
-        if _pdf_enabled and safe_urls:
-            _is_pdf = await _classify_pdf_urls(safe_urls)
-            _pdf_reads = await asyncio.gather(*(
-                _read_pdf_locally(url, _pdf_max_bytes)
-                for url, flag in zip(safe_urls, _is_pdf) if flag
-            ))
-            _pdf_iter = iter(_pdf_reads)
-            _vendor_urls: List[str] = []
-            _vendor_indices: List[int] = []
-            for url, index, flag in zip(safe_urls, safe_indices, _is_pdf):
-                _local = next(_pdf_iter) if flag else None
-                if _local is not None:
-                    local_pdf_done[index] = _local
-                else:
-                    _vendor_urls.append(url)
-                    _vendor_indices.append(index)
-            safe_urls, safe_indices = _vendor_urls, _vendor_indices
 
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:

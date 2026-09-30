@@ -75,14 +75,16 @@ ROUTES = {
 class _Handler(BaseHTTPRequestHandler):
     def _route(self):
         path = self.path.split("?", 1)[0]
-        if path == "/redirect-to-pdf":
+        if path in ("/redirect-to-pdf", "/redirect-to-metadata.pdf"):
             return 302, None, b""
         return ROUTES.get(path, (404, "text/html", b"not found"))
 
     def _send(self, with_body):
         status, ctype, body = self._route()
         self.send_response(status)
-        if status == 302:
+        if status == 302 and self.path.startswith("/redirect-to-metadata"):
+            self.send_header("Location", "http://169.254.169.254/latest/doc.pdf")
+        elif status == 302:
             self.send_header("Location", "/manual.pdf")
         else:
             self.send_header("Content-Type", ctype)
@@ -262,6 +264,24 @@ def test_scanned_pdf_warns_and_never_falls_back(server, vendor):
 def test_pdf_link_landing_on_html_uses_vendor(server, vendor):
     _write_config({})
     url = f"{server}/landing.pdf"
+    results = _run([url])
+    assert vendor.calls == [[url]]
+    assert results[0]["content"] == f"VENDOR:{url}"
+
+def test_blocked_redirect_keeps_requested_url(server, vendor):
+    _write_config({})
+    url = f"{server}/redirect-to-metadata.pdf"
+    results = _run([url])
+    assert vendor.calls == []
+    assert results[0]["url"] == url
+    assert results[0]["error"].startswith("Blocked")
+    assert "redirected to http://169.254.169.254/" in results[0]["error"]
+
+
+def test_no_local_extractor_keeps_backend_dispatch(server, vendor, monkeypatch):
+    _write_config({})
+    monkeypatch.setattr(web_pdf_local, "local_extractor_available", lambda: False)
+    url = f"{server}/manual.pdf"
     results = _run([url])
     assert vendor.calls == [[url]]
     assert results[0]["content"] == f"VENDOR:{url}"

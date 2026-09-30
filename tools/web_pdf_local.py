@@ -158,6 +158,11 @@ async def _download(url: str, max_bytes: int) -> Tuple[str, bytes, Optional[Dict
         for _ in range(GET_MAX_REDIRECTS + 1):
             hop_error = await _check_hop(current)
             if hop_error is not None:
+                # Keep the result attributed to the REQUESTED url so batch
+                # callers can match it; name the redirect target in the error.
+                if current != url:
+                    hop_error["error"] = f"{hop_error['error']} (redirected to {current})"
+                hop_error["url"] = url
                 return current, b"", hop_error
             async with client.stream("GET", current) as resp:
                 if resp.is_redirect and resp.headers.get("location"):
@@ -245,6 +250,22 @@ def _extract_pdftotext(data: bytes) -> Optional[Tuple[List[str], str]]:
     return pages, ""
 
 
+def local_extractor_available() -> bool:
+    """True when pymupdf is importable or poppler's ``pdftotext`` is on PATH."""
+    import importlib.util
+
+    for name in ("pymupdf", "fitz"):
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return True
+        except (ImportError, ValueError):
+            continue
+    return shutil.which("pdftotext") is not None
+
+
+_warned_no_extractor = False
+
+
 def extract_pdf_text(data: bytes) -> Tuple[List[str], str, str]:
     """Return ``(page_texts, title, extractor)``; raises when no extractor exists."""
     got = _extract_pymupdf(data)
@@ -314,3 +335,39 @@ async def read_pdf_locally(url: str, max_bytes: int) -> Optional[Dict[str, Any]]
         "error": None,
         "metadata": metadata,
     }
+
+
+async def split_local_pdfs(
+    urls: List[str], indices: List[int], web_config: Optional[dict]
+) -> Tuple[Dict[int, Dict[str, Any]], List[str], List[int]]:
+    """Read every PDF in *urls* locally; return ``(done_by_index, vendor_urls, vendor_indices)``."""
+    global _warned_no_extractor
+    enabled, max_bytes = local_pdf_settings(web_config)
+    if not enabled or not urls:
+        return {}, list(urls), list(indices)
+    if not local_extractor_available():
+        # No way to read a PDF here: keep today's backend dispatch rather than
+        # turning every PDF into an error. Warn once so the cost is visible.
+        if not _warned_no_extractor:
+            _warned_no_extractor = True
+            logger.warning(
+                "web_extract: web.local_pdf is on but neither pymupdf nor pdftotext "
+                "is installed; PDFs go to the extract backend (billed per page). "
+                "Install pymupdf (pip install pymupdf) or poppler to read them locally."
+            )
+        return {}, list(urls), list(indices)
+    flags = await classify_pdf_urls(urls)
+    reads = iter(await asyncio.gather(
+        *(read_pdf_locally(u, max_bytes) for u, f in zip(urls, flags) if f)
+    ))
+    done: Dict[int, Dict[str, Any]] = {}
+    vendor_urls: List[str] = []
+    vendor_indices: List[int] = []
+    for url, index, flag in zip(urls, indices, flags):
+        local = next(reads) if flag else None
+        if local is not None:
+            done[index] = local
+        else:
+            vendor_urls.append(url)
+            vendor_indices.append(index)
+    return done, vendor_urls, vendor_indices
