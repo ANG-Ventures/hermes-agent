@@ -4820,7 +4820,7 @@ def _is_context_length_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(marker in text for marker in (
         "prompt is too long", "context length exceeded", "context_length_exceeded",
-        "maximum context length", "input is too long", "request too large",
+        "maximum context length", "input is too long",
     ))
 
 

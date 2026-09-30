@@ -94,6 +94,14 @@ def test_second_configured_slot_serves_after_first_slot_context_rejection(monkey
     assert large.chat.completions.create.call_count == 1
 
 
+def test_non_context_failure_does_not_fall_back_as_a_window_miss():
+    for status, text in ((500, "upstream timeout"), (413, "request too large"),
+                         (200, "Prompt is too long")):
+        exc = PromptTooLong(text)
+        exc.status_code = status
+        assert not aux._is_context_length_error(exc)
+
+
 @pytest.mark.parametrize("message", ["Prompt is too long", "context_length_exceeded"])
 def test_context_rejection_is_not_retried_as_transient(message):
     exc = PromptTooLong(message)
