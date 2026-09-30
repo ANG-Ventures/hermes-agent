@@ -1516,8 +1516,74 @@ def test_cli_reclaim_keep_default_and_transfer_flag(kanban_home, monkeypatch):
     assert "not allowed with" in out
 
 
-def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
+def _restore_mod():
     import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "restore", Path(__file__).resolve().parents[2]
+        / "scripts" / "kanban_restore_reclaim_homes.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _historical_rehome(conn, monkeypatch):
+    """A pre-fix event: re-homed, no previous_home / taker_chat recorded."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "taker-chat")
+    tid = _running_card(conn)
+    with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                           foreign_ok="load", home="transfer"):
+        assert kb.reclaim_task(conn, tid, reason="load")
+    ev = _takeover_events(conn, tid)[0]
+    payload = {k: v for k, v in ev.payload.items()
+               if k not in ("previous_home", "taker_chat")}
+    conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
+                 (json.dumps(payload), ev.id))
+    conn.commit()
+    return tid
+
+
+def test_restore_without_taker_chat_keeps_every_sub(kanban_home, monkeypatch):
+    import time
+    mod = _restore_mod()
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        tid = _historical_rehome(conn, monkeypatch)
+        rows = mod.plan(conn, since=now - 60, until=now + 60,
+                        by_session=None, sub_window=30)
+        assert rows[0]["remove_subs"] == [] and rows[0]["note"]
+        assert mod.apply(conn, rows, sub_window=30) == 1
+        assert kb.get_task(conn, tid).session_id == HOME
+        assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
+            "home-chat", "taker-chat"}
+        # With the taker named, only the taker's sub goes.
+        tid2 = _historical_rehome(conn, monkeypatch)
+        rows = [r for r in mod.plan(conn, since=now - 60, until=now + 60,
+                                    by_session=None, sub_window=30,
+                                    taker_chats={("discord", "taker-chat")})
+                if r["task_id"] == tid2]
+        assert mod.apply(conn, rows, sub_window=30,
+                         taker_chats={("discord", "taker-chat")}) == 1
+        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid2)] == ["home-chat"]
+
+
+def test_restore_rechecks_home_inside_apply(kanban_home, monkeypatch):
+    import time
+    mod = _restore_mod()
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        tid = _historical_rehome(conn, monkeypatch)
+        rows = mod.plan(conn, since=now - 60, until=now + 60,
+                        by_session=None, sub_window=30)
+        assert rows[0]["skip"] is None
+        # Between plan and apply the card is re-stamped to the same taker.
+        assert kb.set_task_session(conn, tid, OTHER)
+        assert mod.apply(conn, rows, sub_window=30) == 0
+        assert "changed before apply" in rows[0]["skip"]
+        assert kb.get_task(conn, tid).session_id == OTHER
+
+
+def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
     import time
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "taker-chat")
@@ -1530,21 +1596,19 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).session_id == OTHER
         assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
             "home-chat", "taker-chat"}
-    spec = importlib.util.spec_from_file_location(
-        "restore", Path(__file__).resolve().parents[2]
-        / "scripts" / "kanban_restore_reclaim_homes.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _restore_mod()
     now = int(time.time())
     with kb.connect_closing() as conn:
         rows = mod.plan(conn, since=now - 60, until=now + 60,
                         by_session=None, sub_window=30)
         assert [(r["task_id"], r["restore_to"], r["skip"]) for r in rows] == [
             (tid, HOME, None)]
-        assert mod.apply(conn, rows) == 1
+        assert rows[0]["remove_subs"] == [
+            {"platform": "discord", "chat_id": "taker-chat", "thread_id": ""}]
+        assert mod.apply(conn, rows, sub_window=30) == 1
         assert kb.get_task(conn, tid).session_id == HOME
         assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
         # Idempotent: the second pass skips (home no longer the taker's).
         again = mod.plan(conn, since=now - 60, until=now + 60,
                          by_session=None, sub_window=30)
-        assert again[0]["skip"] and mod.apply(conn, again) == 0
+        assert again[0]["skip"] and mod.apply(conn, again, sub_window=30) == 0

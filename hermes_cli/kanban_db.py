@@ -6319,6 +6319,13 @@ def record_foreign_action(
     if new_home:
         payload["prev_session_id"] = prev_home
         payload["session_id"] = new_home
+        # The chat the post-commit subscribe adds: what a restore removes.
+        taker_platform = _ambient_session_env("HERMES_SESSION_PLATFORM")
+        taker_chat_id = _ambient_session_env("HERMES_SESSION_CHAT_ID")
+        if taker_platform and taker_chat_id:
+            payload["taker_chat"] = {
+                "platform": taker_platform, "chat_id": taker_chat_id,
+            }
     with write_txn(conn, allow_nested=True):
         if new_home:
             conn.execute(
