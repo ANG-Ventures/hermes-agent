@@ -207,24 +207,43 @@ To keep the 85% autoraise but hide only the one-time notice:
 hermes config set compression.codex_gpt55_autoraise_notice false
 ```
 
-### Codex large-context `-900k` picker variants (opt-in)
+### Codex large context window: `model.codex_context_policy`
 
-The ChatGPT Codex backend *advertises* a 272K window for the gpt-5.4 and
-gpt-5.6 (Sol/Terra/Luna) families, but actually accepts ~911K input tokens
-for ChatGPT-subscription accounts (live-verified Aug 2026). Hermes keeps the
-**advertised 272K as the default** for the base slugs — a bigger window means
-more tokens per request and much faster subscription-usage burn, so the large
-window is strictly opt-in.
+The ChatGPT Codex backend *advertises* a 272K window for the gpt-6 (Sol/Astra/
+Luna), gpt-6.1-sol, gpt-5.6 (Sol/Terra/Luna), gpt-5.4 and
+gpt-daybreak-blue-latest slugs, but actually accepts far more input tokens for
+ChatGPT-subscription accounts (live-verified 872K-922K).
 
-To use the large window, pick the explicit `-900k` variant in `/model` (e.g.
+`model.codex_context_policy` picks which window those slugs get:
+
+| Value | Bare slug (`gpt-6-sol`) | `-900k` alias (`gpt-6-sol-900k`) |
+|-------|-------------------------|----------------------------------|
+| `large` (default when absent) | verified large window | same window (legacy alias) |
+| `advertised` | advertised 272K | verified large window |
+
+Under `large` the `/model` picker lists only the bare slugs; `-900k` pins in
+existing configs, crons and sessions keep validating and resolving to the same
+window. Slugs that genuinely enforce 272K (gpt-5.5, gpt-5.4-mini, `-pro`) are
+unaffected by the policy and have no `-900k` alias. The model id on the wire is
+the bare slug in both modes. The knob is read from the active config.yaml, so a
+single profile can be flipped back on its own:
+
+```bash
+hermes config set model.codex_context_policy advertised
+```
+
+Under `advertised`, Hermes keeps the **advertised 272K as the default** for
+the base slugs (a bigger window means more tokens per request and faster
+subscription-usage burn) and the large window is opt-in:
+pick the explicit `-900k` variant in `/model` (e.g.
 `gpt-5.6-sol-900k`, `gpt-5.6-terra-900k`, `gpt-5.6-luna-900k`,
 `gpt-5.4-900k`). These are Hermes-side aliases: the suffix is stripped before
 the model id is sent to the backend, and pricing/usage accounting treats them
 as the base model. Slugs that genuinely enforce 272K (gpt-5.5, gpt-5.4-mini)
 have no `-900k` variant.
 
-Compaction thresholds follow the window: base slugs (272K) get the **85%
-autoraise** described above, while `-900k` variants keep your global
+Compaction thresholds follow the window: slugs resolving to 272K get the **85%
+autoraise** described above, while large-window slugs keep your global
 `compression.threshold` (default 50%, ~450K) — the autoraise exists to stop
 wasting a small window, which a 900K window doesn't need.
 

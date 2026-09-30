@@ -45,6 +45,20 @@ model:
   # Both "default" and "model" work as the key name here.
   default: "anthropic/claude-opus-4.6"
 
+  # Codex OAuth context window policy (default: large). Added 2026-09-30
+  # (Ace, "big window by default forever"; card t_73689428): the ChatGPT Codex
+  # backend advertises 272K for gpt-6-sol/-astra/-luna, gpt-6.1-sol, the
+  # gpt-5.6 family, gpt-5.4 and gpt-daybreak-blue-latest but accepts far more
+  # (live-verified 872K-900K). Before this knob the large window needed an
+  # explicit `-900k` picker variant, and every bare slug silently ran at 272K.
+  #   large      - bare eligible slugs get the verified window; `-900k` is a
+  #                legacy alias for the SAME window (still accepted everywhere).
+  #   advertised - old behaviour: bare = 272K, only `-900k` variants go large.
+  # Nothing changes on the wire either way. Per profile: each profile reads its
+  # own config.yaml. Flip back with:
+  #   hermes config set model.codex_context_policy advertised
+  # codex_context_policy: large
+
   # Inference provider selection:
   #   "auto"         - Auto-detect from credentials (default)
   #   "openrouter"   - OpenRouter (requires: OPENROUTER_API_KEY or OPENAI_API_KEY)
@@ -647,6 +661,8 @@ compression:
 
   # Existing Codex gpt-5.5 behavior: raise Hermes' compaction trigger to 85%
   # for the ChatGPT Codex OAuth route. Set false to opt back down to threshold.
+  # Slugs that resolve to the large verified window (see
+  # model.codex_context_policy above; default large) are never autoraised.
   codex_gpt55_autoraise: true
 
   # Fraction of the threshold to preserve as recent tail (default: 0.20 = 20%)

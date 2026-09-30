@@ -904,6 +904,29 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_codex_context_policy_advertised(request, monkeypatch):
+    """Pin ``model.codex_context_policy`` to ``advertised`` for every test.
+
+    The runtime default is ``large`` (bare eligible Codex slugs resolve to
+    the live-verified window; card t_73689428). The pre-existing suite was
+    written against the ``advertised`` opt-in behaviour and must keep
+    passing UNCHANGED under it, so it is pinned here. Tests that exercise
+    the knob itself (default, config read, ``large`` behaviour) opt out with
+    ``@pytest.mark.real_codex_context_policy``.
+    """
+    if request.node.get_closest_marker("real_codex_context_policy"):
+        return
+    try:
+        from agent import model_metadata as _mm
+    except Exception:
+        return
+    monkeypatch.setattr(
+        _mm, "_codex_context_policy_from_config", lambda: "advertised",
+        raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser
@@ -1591,6 +1614,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "require_symlinks: skip the test if symbolic links cannot be "
         "created in the current environment (needs admin/developer mode "
         "on Windows).",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_codex_context_policy: bypass the autouse fixture that pins "
+        "model.codex_context_policy to 'advertised' — only for tests that "
+        "exercise the knob (default 'large', config read, large behaviour).",
     )
     config.addinivalue_line(
         "markers",
