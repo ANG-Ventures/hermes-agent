@@ -11,6 +11,7 @@ def _isolate_kanban_process_registry(monkeypatch):
     from hermes_cli import kanban_db
     monkeypatch.setattr(kanban_db, "_worker_processes", {})
     monkeypatch.setattr(kanban_db, "_recent_worker_exits", {})
+    monkeypatch.setattr(kanban_db, "_worker_identities", {})
 
 
 @pytest.fixture(autouse=True)

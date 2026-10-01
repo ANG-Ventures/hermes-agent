@@ -456,6 +456,8 @@ def _fire_dispatch_tick_hook(
             result.promoted,
             result.reconciled_orphans,
             result.ended_terminal_runs,
+            result.worker_leftovers_reaped,
+            result.orphans_reaped,
             result.crashed,
             result.stale,
             result.timed_out,
@@ -18491,6 +18493,12 @@ class DispatchResult:
     """Run ids closed by :func:`end_orphaned_terminal_runs` this tick — runs
     still open on a ``done``/``archived`` card (outcome
     ``orphaned_terminal_task``)."""
+    worker_leftovers_reaped: list[str] = field(default_factory=list)
+    """Task ids whose exited worker left processes that were reaped this tick
+    (:func:`reap_exited_worker_leftovers`)."""
+    orphans_reaped: dict = field(default_factory=dict)
+    """``{card: [{pid, name, cwd}]}`` reaped by
+    :func:`sweep_terminal_workspace_orphans` this tick."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     spawn_routes: dict[str, str] = field(default_factory=dict)
@@ -18702,6 +18710,11 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 _worker_processes: dict = {}
 _worker_processes_lock = threading.Lock()
+# pid -> (task_id, run_id, spawned_at) for every worker THIS process spawned.
+# Read when the worker is seen to exit, so the leftovers of a run that ended
+# cleanly (worker called kanban_complete, then exited) are reaped too: the
+# crash path only ever looks at ``running`` cards (t_446b6b99).
+_worker_identities: "dict[int, tuple[str, Optional[int], float]]" = {}
 # Startup stranding is a boot/restart reconciliation pass, not a per-tick
 # mount-probe fan-out. Ready/review candidates are still checked every tick
 # immediately before claim.
@@ -19261,6 +19274,261 @@ def _reap_run_env_escapees(
         len(targets), task_id, run_id,
     )
     return len(targets)
+
+
+#: TERM -> KILL grace for the exit-path and orphan-sweep reaps (t_446b6b99).
+WORKER_LEFTOVER_KILL_GRACE_SECONDS = 10.0
+#: A card must have been terminal this long before the orphan sweep touches
+#: processes in its workspace: a worker that called ``kanban_complete`` is
+#: still finishing its turn for a few seconds after the card flips to done.
+ORPHAN_SWEEP_MIN_TERMINAL_AGE_SECONDS = 300
+_ORPHAN_SWEEP_CARD_RE = re.compile(r"t_[0-9a-f]+")
+
+
+def _register_worker_identity(
+    pid: int, task_id: str, run_id: Optional[int], spawned_at: float,
+) -> None:
+    """Remember which card/run a spawned worker pid belongs to."""
+    with _worker_processes_lock:
+        _worker_identities[int(pid)] = (str(task_id), run_id, float(spawned_at))
+
+
+def reap_exited_worker_leftovers(
+    conn: Optional[sqlite3.Connection],
+    exited_pids: Iterable[int],
+    *,
+    grace: float = WORKER_LEFTOVER_KILL_GRACE_SECONDS,
+) -> list[str]:
+    """Reap what each just-exited worker left behind, whatever the card state.
+
+    Workers run in their own session (``start_new_session=True``). A worker
+    that completes its card and exits leaves every server it started (a
+    ``caddy``, a preview server, a bridge) running with ppid 1; the crash
+    path never sees it because the card is no longer ``running``
+    (2026-10-01: four such listeners, 3 h 42 m to 2 d 7 h old). For each pid
+    observed exiting this tick, reap its session's process groups and the
+    run-identified processes that left the session, then record a
+    ``worker_leftovers_reaped`` event on the card. Members must be born
+    between the spawn and the moment ``poll()`` reaped the worker: its pid
+    (= sid) is only free for reuse after that, so a recycled session leader
+    is always born too late to qualify. Returns the task ids that had
+    leftovers.
+    """
+    reaped_cards: list[str] = []
+    for pid in exited_pids:
+        with _worker_processes_lock:
+            ident = _worker_identities.pop(int(pid), None)
+        if ident is None:
+            continue
+        task_id, run_id, spawned_at = ident
+        exit_entry = _recent_worker_exits.get(int(pid))
+        now = exit_entry[1] if exit_entry else time.time()
+        try:
+            groups = _reap_worker_session(
+                int(pid), born_after=spawned_at, born_before=now, grace=grace,
+            )
+            escaped = _reap_run_env_escapees(
+                task_id, run_id, born_after=spawned_at, born_before=now, grace=grace,
+            )
+        except Exception as exc:  # never break a dispatcher tick
+            _log.warning("kanban: leftover reap of worker %s failed: %s", pid, exc)
+            continue
+        if not (groups or escaped):
+            continue
+        reaped_cards.append(task_id)
+        _log.warning(
+            "kanban: reaped leftovers of exited worker pid=%s task=%s run=%s "
+            "(session_groups=%d env_escapees=%d)",
+            pid, task_id, run_id, groups, escaped,
+        )
+        if conn is not None:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "worker_leftovers_reaped",
+                        {"pid": int(pid), "session_groups": groups,
+                         "env_escapees": escaped},
+                        run_id=run_id,
+                    )
+            except Exception as exc:
+                _log.debug("worker_leftovers_reaped event failed: %s", exc)
+    return reaped_cards
+
+
+def _card_terminal_since(conn: sqlite3.Connection, task_id: str) -> Optional[float]:
+    """When ``task_id`` last changed if it is ``done``/``archived``, else None.
+
+    "Last changed" is its newest event, so a card reopened and closed again
+    restarts the age clock."""
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] not in ("done", "archived"):
+        return None
+    ev = conn.execute(
+        "SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    return float(ev[0]) if ev and ev[0] is not None else 0.0
+
+
+_INIT_REAPER_NAMES = frozenset({"launchd", "init", "systemd"})
+
+
+def _init_parented(proc: "psutil.Process", ppid: Optional[int]) -> bool:
+    """True when ``proc`` was reparented to init: ppid 1 (launchd on macOS),
+    or a Linux ``systemd --user`` child subreaper that adopts orphans in a
+    user session (the CI runner's case)."""
+    if ppid == 1:
+        return True
+    if not ppid or not sys.platform.startswith("linux"):
+        return False
+    try:
+        return psutil.Process(ppid).name() in _INIT_REAPER_NAMES
+    except (psutil.Error, OSError):
+        return False
+
+
+def sweep_terminal_workspace_orphans(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    root: Optional[Path] = None,
+    grace: float = WORKER_LEFTOVER_KILL_GRACE_SECONDS,
+    min_terminal_age: float = ORPHAN_SWEEP_MIN_TERMINAL_AGE_SECONDS,
+    notify: bool = True,
+) -> dict[str, list[dict]]:
+    """Reap ppid-1 processes whose cwd is a TERMINAL card's scratch workspace.
+
+    Backstop for leftovers the exit-path reap cannot see: workers spawned by a
+    dispatcher that has since restarted (no retained Popen), or children that
+    dropped both the session and the run identity. A candidate must be ours
+    (same uid), reparented to init (:func:`_init_parented`), have its cwd under
+    ``<workspaces_root>/<card>/``, and that card must be ``done``/``archived``
+    for at least ``min_terminal_age`` seconds. A process whose environment
+    names a DIFFERENT card that is not terminal is left alone. Each target and
+    its descendants get SIGTERM, then SIGKILL after ``grace`` seconds. Records
+    an ``orphans_reaped`` event per card and sends ONE #logs line per sweep,
+    only when something was reaped. Returns ``{card: [{pid, name, cwd}]}``.
+    """
+    if not hasattr(os, "getuid"):
+        return {}
+    try:
+        base = root if root is not None else workspaces_root(board, stale_pin_ok=True)
+        base_real = os.path.realpath(str(base))
+    except Exception:
+        return {}
+    me, uid = os.getpid(), os.getuid()  # windows-footgun: ok (hasattr-gated above)
+    candidates: dict[str, list] = {}
+    for proc in psutil.process_iter(["pid", "ppid", "uids"]):
+        info = proc.info
+        pid = info.get("pid") or 0
+        if pid <= 1 or pid == me or not _init_parented(proc, info.get("ppid")):
+            continue
+        uids = info.get("uids")
+        if uids is None or uids.real != uid:
+            continue
+        try:
+            cwd = proc.cwd()
+        except (psutil.Error, OSError):
+            continue
+        if not cwd:
+            continue
+        try:
+            rel = os.path.relpath(os.path.realpath(cwd), base_real)
+        except ValueError:
+            continue
+        card = rel.split(os.sep, 1)[0]
+        if rel.startswith(os.pardir) or not _ORPHAN_SWEEP_CARD_RE.fullmatch(card):
+            continue
+        candidates.setdefault(card, []).append((proc, cwd))
+    if not candidates:
+        return {}
+
+    now = time.time()
+    terminal: dict[str, bool] = {}
+
+    def _is_terminal(card: str) -> bool:
+        if card not in terminal:
+            since = _card_terminal_since(conn, card)
+            terminal[card] = since is not None and now - since >= min_terminal_age
+        return terminal[card]
+
+    plan: dict[str, list] = {}
+    for card, procs in candidates.items():
+        if not _is_terminal(card):
+            continue
+        for proc, cwd in procs:
+            try:
+                env_card = proc.environ().get("HERMES_KANBAN_TASK")
+            except (psutil.Error, OSError):
+                env_card = None
+            if env_card and env_card != card and not _is_terminal(env_card):
+                continue
+            plan.setdefault(card, []).append((proc, cwd))
+    if not plan:
+        return {}
+
+    targets: dict[int, "psutil.Process"] = {}
+    reaped: dict[str, list[dict]] = {}
+    for card, procs in plan.items():
+        for proc, cwd in procs:
+            try:
+                name = proc.name()
+                family = [proc, *proc.children(recursive=True)]
+            except (psutil.Error, OSError):
+                continue
+            for p in family:
+                if p.pid > 1 and p.pid != me:
+                    targets.setdefault(p.pid, p)
+            reaped.setdefault(card, []).append({"pid": proc.pid, "name": name, "cwd": cwd})
+    for p in targets.values():
+        try:
+            p.terminate()  # psutil refuses a pid reused since it was listed
+        except (psutil.Error, OSError):
+            pass
+    _, alive = psutil.wait_procs(list(targets.values()), timeout=grace)
+    for p in alive:
+        try:
+            p.kill()
+        except (psutil.Error, OSError):
+            pass
+    if not reaped:
+        return {}
+    for card, items in reaped.items():
+        _log.warning("kanban: reaped %d orphan(s) in terminal card %s workspace: %s",
+                     len(items), card, ", ".join(f"{i['name']}({i['pid']})" for i in items))
+        try:
+            with write_txn(conn):
+                _append_event(conn, card, "orphans_reaped",
+                              {"processes": items, "sigkill": len(alive)})
+        except Exception as exc:
+            _log.debug("orphans_reaped event failed: %s", exc)
+    if notify:
+        _notify_orphan_sweep(board, reaped)
+    return reaped
+
+
+def _notify_orphan_sweep(board: Optional[str], reaped: dict[str, list[dict]]) -> None:
+    """ONE #logs line for a sweep that reaped something. Best-effort."""
+    try:
+        from hermes_cli import kanban_budget as _kbudget
+
+        script = _kbudget._notify_script_path()
+        if script is None:
+            return
+        n = sum(len(v) for v in reaped.values())
+        detail = "; ".join(
+            f"{card}: " + ", ".join(f"{i['name']}({i['pid']})" for i in items)
+            for card, items in sorted(reaped.items())
+        )
+        body = (
+            f"🧹 Kanban '{board or 'default'}': reaped {n} orphan process(es) "
+            f"left in terminal cards' workspaces: {detail}"
+        )
+        _kbudget._run_notify([
+            sys.executable, script, "--channel", "discord",
+            "--target", _kbudget.RECOVERY_TARGET, "--send", body[:1900],
+        ])
+    except Exception as exc:  # pragma: no cover - paging must never break a tick
+        _log.debug("orphan sweep notify failed: %s", exc)
 
 
 def _run_last_evidence_at(
@@ -23178,9 +23446,18 @@ def _dispatch_once_locked(
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    exited_workers = reap_worker_zombies()
 
     result = DispatchResult()
+    if not dry_run:
+        # A worker that exited (cleanly or not) leaves its servers behind;
+        # reap them now, and sweep init-parented strays in terminal cards'
+        # workspaces that no retained worker handle can reach (t_446b6b99).
+        result.worker_leftovers_reaped = reap_exited_worker_leftovers(conn, exited_workers)
+        try:
+            result.orphans_reaped = sweep_terminal_workspace_orphans(conn, board=board)
+        except Exception as exc:  # never break a dispatcher tick
+            _log.warning("kanban orphan sweep failed: %s", exc)
 
     # ---- lane-model overrides (board-level, time-boxed routing) ----
     # One clock read for the whole tick so every card in this pass sees the
@@ -25652,6 +25929,7 @@ def _default_spawn(
         cpu_nice,
         " ".join(darwin_prefix[1:]) or "-",
     )
+    spawned_at = time.time()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             spawn_cmd,
@@ -25675,6 +25953,7 @@ def _default_spawn(
     with _worker_processes_lock:
         _recent_worker_exits.pop(proc.pid, None)
         _worker_processes[proc.pid] = proc
+    _register_worker_identity(proc.pid, task.id, task.current_run_id, spawned_at)
     return proc.pid
 
 
