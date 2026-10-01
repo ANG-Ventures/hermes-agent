@@ -159,17 +159,28 @@ child's completion entry or durable late record.
 
 Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
 
-- `steer_subagent` appends an `accept` entry under the registry lock, BEFORE
-  calling `agent.steer()`, so a delivery that happens the instant the text
-  lands in the child's slot finds its entry. If `agent.steer()` refuses, the
-  entry is marked `withdrawn`.
-- The only consumer is the agent loop: `apply_pending_steer_to_tool_results`
-  and the pre-API injection call `note_steer_delivered(agent, text)` after the
-  text is in a tool result. That calls `child._steer_delivery_sink`, which
-  settles the matching entries. Matching is by content, longest first, each
-  entry consuming its own span. The agent joins pending steers with newlines
-  and can put a drained batch back behind newer text, so order is not
-  relied on.
+- `_SteerLedger.for_child` wraps the child's `steer` and
+  `_drain_pending_steer`, so EVERY producer is ledgered: `steer_subagent`
+  and any direct `child.steer()` (e.g. `_start_late_completion` notifying a
+  delegated orchestrator, #1595 Prism r1 2910). The entry is appended under
+  the ledger lock BEFORE the text reaches the slot; if the real `steer()`
+  returns False, it is `withdrawn`.
+- Drained text is bound to acceptance ids, never inferred from text (#1595
+  r1 ae8c, #1585 :334). The ledger mirrors the slot as pieces with ids. The
+  slot only grows at its end (`steer`, the one put-back
+  `requeue_pending_steer`) and only clears whole (drain, `interrupt`), so at
+  a drain the real text is a suffix of the mirror: that suffix becomes a
+  batch with ids, the prefix was dropped and stays open. A put-back returns
+  the batch, with its ids, to the end of the mirror.
+- Delivered means a model READ it (#1595 r1 26b4, Argus F3 `t_race1`). The
+  two injection sites call `note_steer_injected` once the text is in a tool
+  result; `conversation_loop` calls `note_steer_consumed` after the next model
+  response returns, and only then are the injected batches settled. A turn
+  that exits by interrupt in between leaves them in `missed()`.
+- `deliver(text)` (inject + consume in one step) and text with no batch fall
+  back to an exact line-aligned tiling of open entries (iterative, budgeted:
+  #1595 r1 7dac; a trailing separator is not a tiling: r2 32e5), else
+  line-aligned spans.
 - `missed()` is "accepted and not delivered", in acceptance order, with
   duplicates kept (#1573 :3057). Every completion path reads it: the normal
   path's success, failure and exception branches (through
@@ -184,8 +195,10 @@ Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
   `deliver`) in the owning profile's delegation live dir: next to the
   child's live transcript (`<transcript>.steer.jsonl`), else in
   `live/steer_<sid>_<hex>/steer.jsonl`, which the live-dir retention prune
-  also covers. The path is resolved on the spawning thread. Memory is
-  authoritative; a failed write is logged once at WARNING.
+  also covers. The path is resolved on the spawning thread. That tree is
+  mounted into remote sandboxes, so steer text is redacted there like every
+  transcript line (#1595 r1 d066). Memory is authoritative and unredacted; a
+  failed write is logged once at WARNING.
 
 A steer accepted after closure is impossible: closure (`finish`/`stall`, or
 the normal path's completion) sets `accepting_steer=False` under the lock
@@ -214,8 +227,12 @@ Mechanism, the door (`_teardown`, with its deferred half `_release_hold`):
   `_release_child_resources` on the normal path, and the late thread after
   `persist`. It releases the run hold first. A second request after the
   close is a no-op.
-- Parent-driven closes go through the same door. `_run_single_child` stamps
-  `child._owner_teardown`. `AIAgent.close()` and `AIAgent.release_clients()`
+- Parent-driven closes go through the same door. `_build_child_agent` stamps
+  `child._owner_teardown` BEFORE it appends the child to the parent's
+  `_active_children`, so no parent close can reach the child outside the
+  door. A close that wins before the run's hold marks the slot closed;
+  `_hold_run` then returns False and `_run_single_child` fails the task
+  instead of running on closed resources (#1595 r1 f983). `AIAgent.close()` and `AIAgent.release_clients()`
   hand each active child to `_close_delegated_child(child, reason)`, which
   calls that door. A recursive close of a delegated orchestrator therefore
   reaches its still-running late grandchildren through their own doors
@@ -292,6 +309,14 @@ record.
 | `:3564` parent-driven close of a live child | real | door via `_owner_teardown` |
 | `:4963` recursive ancestor cleanup | real | door, reached by the recursion |
 
+#1585 @ eeb1e221. Tests in `tests/tools/test_delegate_round6_findings.py`:
+
+| Finding | Verdict | Mechanism |
+|---|---|---|
+| `:334` ambiguous delivery (substring settle) | real, RED on eeb1e221 | ledger: exact line-aligned tiling |
+| `:486` door raising treated as handled | by design: a raising door must not fall back to a direct close (I2); the owner's `_teardown(owner=True)` still closes the child; the swallow is now a WARNING | proof test |
+| `:297` unbounded ledger file | false: both path shapes sit in a top-level live dir that `prune_stale_live_dirs` (run on every dispatch) removes; one line per accept/withdraw/deliver | proof test |
+
 ## Test obligations
 
 - One test per finding, RED on the head where it was raised.
@@ -310,7 +335,7 @@ record.
   exactly once on the last release, and the deferred counter returns to its
   baseline.
 - Ledger unit test: duplicates are kept, a withdrawn entry is not missed,
-  matching is longest-first, and the durable operation log is complete.
+  delivery settles an exact line-aligned tiling, and the durable operation log is complete.
 - The AST contract test (`test_delegate_teardown_door.py`) is RED on
   f9d4df5a, naming its four bypasses (two door references, two run_agent loops). It includes killer mutations: a new
   door bypass in each of the three rule shapes must be reported.

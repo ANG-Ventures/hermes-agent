@@ -2909,9 +2909,9 @@ def run_conversation(
                     except Exception:
                         pass
             if _injected:
-                from agent.agent_runtime_helpers import note_steer_delivered
+                from agent.agent_runtime_helpers import note_steer_injected
 
-                note_steer_delivered(agent, _pre_api_steer)
+                note_steer_injected(agent, _pre_api_steer)
                 logger.info(
                     "Delivered /steer to agent (pre-API, tool msg index %d) (%d chars)",
                     _si,
@@ -2920,16 +2920,9 @@ def run_conversation(
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                from agent.agent_runtime_helpers import requeue_pending_steer
+
+                requeue_pending_steer(agent, _pre_api_steer)
 
         # ── Wall-clock run-budget wrap-up notice ───────────────────────
         # One-shot: when a run budget (agent.run_budget_seconds /
@@ -4336,7 +4329,14 @@ def run_conversation(
                     else:
                         interrupted = True
                     break
-                
+
+                # The model answered a request carrying every steer injected
+                # so far: only now are they delivered (I1). An interrupt that
+                # ends the turn before this point leaves them missed.
+                from agent.agent_runtime_helpers import note_steer_consumed
+
+                note_steer_consumed(agent)
+
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool

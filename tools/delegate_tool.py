@@ -242,27 +242,45 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
 
 
 class _SteerLedger:
-    """Per-child append-only record of every steer ``steer_subagent`` accepted.
+    """Per-child append-only record of every steer the child accepted.
 
-    The I1 mechanism (docs/dev/delegate-child-lifecycle.md). An entry is
-    appended under the registry lock BEFORE the text reaches the child's
-    pending slot, and the only thing that ever marks it is its consumer: the
-    agent loop calls ``deliver`` (via ``_steer_delivery_sink``) after it has
-    actually written the text into a tool result. Nothing else clears an
-    entry, so the paths that empty the child's in-memory slot (the
-    finalizer's drain, ``clear_interrupt``, an interrupted early return, the
-    closure drain) cannot drop one. ``missed()`` is "accepted and never
-    delivered", in acceptance order, duplicates kept.
+    The I1 mechanism (docs/dev/delegate-child-lifecycle.md). ``for_child``
+    wraps the child's ``steer`` and ``_drain_pending_steer`` and installs the
+    agent loop's requeue/inject/consume sinks, so every producer (``steer_subagent``
+    and any direct ``child.steer``, e.g. a late-result notification to a
+    delegated orchestrator) is ledgered, and every drained batch carries the
+    acceptance ids it holds. Delivery settles by id, never by inferring
+    identity from text:
+
+    - accept: entry appended, its piece appended to the mirrored slot.
+    - drain: the slot is a suffix of the mirror (``interrupt`` clears it
+      without telling us); the matched suffix becomes a batch with ids, the
+      rest was dropped and stays open.
+    - requeue: the batch goes back to the end of the mirrored slot.
+    - inject: the batch was written into a message (``note_steer_injected``).
+    - consume: a model response came back after the injection; injected
+      batches are delivered. A turn that exits first leaves them open.
+
+    ``missed()`` is "accepted and never delivered", in acceptance order,
+    duplicates kept. ``deliver(text)`` (inject + consume) remains for callers
+    that write and read in one step; text with no matching batch falls back to
+    a line-aligned exact tiling of open entries.
 
     Durable copy: one JSON line per operation, appended to a file in the
     owning profile's delegation live dir (resolved on the spawning thread).
-    Memory stays authoritative; a failed write is logged, never raised.
+    Steer text is redacted there, as every line of that sandbox-mounted tree
+    is; memory stays authoritative and unredacted. A failed write is logged,
+    never raised.
     """
+
+    _MAX_BATCHES = 64
 
     def __init__(self, path: Any = None) -> None:
         self.path = path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._entries: List[Dict[str, Any]] = []
+        self._slot: List[Tuple[str, Optional[List[int]]]] = []
+        self._batches: List[Dict[str, Any]] = []
         self._write_failed = False
 
     @classmethod
@@ -287,17 +305,33 @@ class _SteerLedger:
         except Exception:
             logger.debug("steer ledger path unresolved for %s", subagent_id, exc_info=True)
         ledger = cls(path)
+        ledger.attach(child, subagent_id)
+        return ledger
+
+    def attach(self, child: Any, subagent_id: str = "") -> None:
         try:
-            child._steer_ledger = ledger
-            child._steer_delivery_sink = ledger.deliver
+            orig_steer = getattr(child, "steer", None)
+            orig_drain = getattr(child, "_drain_pending_steer", None)
+            if callable(orig_steer):
+                child.steer = lambda text, _o=orig_steer: self.steer_via(_o, text)
+            if callable(orig_drain):
+                child._drain_pending_steer = lambda _o=orig_drain: self.drain_via(_o)
+            child._steer_ledger = self
+            child._steer_delivery_sink = self.deliver
+            child._steer_inject_sink = self.inject
+            child._steer_consume_sink = self.consume
+            child._steer_requeue_sink = self.requeue
         except Exception:
             logger.debug("could not attach steer ledger to %s", subagent_id, exc_info=True)
-        return ledger
 
     def _append(self, op: Dict[str, Any]) -> None:
         if self.path is None:
             return
         try:
+            if "text" in op:
+                from tools.delegation_live_log import _redact
+
+                op = {**op, "text": _redact(op["text"])}
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({**op, "ts": time.time()}, ensure_ascii=False) + "\n")
@@ -316,30 +350,168 @@ class _SteerLedger:
             return seq
 
     def withdraw(self, seq: int) -> None:
-        """The child refused the text after the entry was written."""
+        """The child did not take the text after the entry was written."""
         with self._lock:
             self._entries[seq]["state"] = "withdrawn"
             self._append({"op": "withdraw", "seq": seq})
 
-    def deliver(self, text: Any) -> None:
-        """Consumer: *text* was written into the child's transcript.
+    def steer_via(self, orig: Any, text: Any) -> bool:
+        """The child's ``steer``: ledger entry first, then the real slot."""
+        if not isinstance(text, str) or not text.strip():
+            return bool(orig(text))
+        with self._lock:
+            seq = self.accept(text)
+            try:
+                ok = bool(orig(text))
+            except BaseException:
+                self.withdraw(seq)
+                raise
+            if ok:
+                self._slot.append((text.strip(), [seq]))
+            else:
+                self.withdraw(seq)
+            return ok
 
-        The agent concatenates pending steers with newlines and may put a
-        drained batch back behind newer text, so entries are matched by
-        content, longest first, each consuming its own span of *text*.
-        """
+    def drain_via(self, orig: Any) -> Any:
+        """The child's ``_drain_pending_steer``: bind the drained text to ids."""
+        with self._lock:
+            text = orig()
+            pieces, self._slot = self._slot, []
+            if not isinstance(text, str) or not text:
+                return text  # cleared by interrupt: those entries stay open
+            for k in range(len(pieces) + 1):
+                if "\n".join(p[0] for p in pieces[k:]) == text:
+                    seqs: Optional[List[int]] = []
+                    for _t, ids in pieces[k:]:
+                        if ids is None:
+                            seqs = None
+                            break
+                        seqs.extend(ids)
+                    break
+            else:
+                seqs = None  # text the ledger never saw: settle by text
+            self._batches.append({"text": text, "seqs": seqs, "injected": False})
+            del self._batches[: -self._MAX_BATCHES]
+            return text
+
+    def _take_batch(self, text: str, *, injected: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+        for i in range(len(self._batches) - 1, -1, -1):
+            b = self._batches[i]
+            if b["text"] == text and (injected is None or b["injected"] is injected):
+                return self._batches.pop(i)
+        return None
+
+    def requeue(self, text: str, put_back: Any) -> None:
+        """The agent puts a drained batch back; it keeps its ids."""
+        with self._lock:
+            put_back()
+            b = self._take_batch(text, injected=False)
+            self._slot.append((text, b["seqs"] if b is not None else None))
+
+    def inject(self, text: Any) -> None:
+        """*text* was written into a message; delivered on the next ``consume``."""
         if not isinstance(text, str) or not text:
             return
         with self._lock:
-            remaining = text
+            b = self._take_batch(text, injected=False)
+            if b is None:
+                b = {"text": text, "seqs": None}
+            b["injected"] = True
+            self._batches.append(b)
+
+    def consume(self) -> None:
+        """A model response came back after every injection so far."""
+        with self._lock:
+            done = [b for b in self._batches if b["injected"]]
+            self._batches = [b for b in self._batches if not b["injected"]]
+            for b in done:
+                self._settle(b)
+
+    def deliver(self, text: Any) -> None:
+        """Consumer: *text* was written into the transcript and read."""
+        if not isinstance(text, str) or not text:
+            return
+        with self._lock:
+            b = self._take_batch(text, injected=False) or {"text": text, "seqs": None}
+            self._settle(b)
+
+    def _settle(self, batch: Dict[str, Any]) -> None:
+        seqs = batch.get("seqs")
+        if seqs is None:
             open_ = [e for e in self._entries if e["state"] == "accepted" and e["text"]]
-            for e in sorted(open_, key=lambda e: (-len(e["text"]), e["seq"])):
-                i = remaining.find(e["text"])
-                if i < 0:
+            chosen = self._tile(batch["text"], open_)
+            if chosen is None:
+                chosen = self._aligned_spans(batch["text"], open_)
+        else:
+            chosen = [self._entries[s] for s in seqs if self._entries[s]["state"] == "accepted"]
+        for e in sorted(chosen, key=lambda e: e["seq"]):
+            e["state"] = "delivered"
+            self._append({"op": "deliver", "seq": e["seq"]})
+
+    @staticmethod
+    def _tile(text: str, open_: List[Dict[str, Any]], budget: int = 10000) -> Optional[List[Dict[str, Any]]]:
+        """Fallback for text with no batch: open entries whose texts, joined
+        by "\n" in some order, equal *text*; newest acceptance preferred.
+
+        Iterative (explicit stack), so a batch of thousands of steers cannot
+        hit the recursion limit; *budget* bounds the search.
+        """
+        by_text: Dict[str, List[Dict[str, Any]]] = {}
+        for e in sorted(open_, key=lambda e: -e["seq"]):
+            by_text.setdefault(e["text"], []).append(e)
+        texts = sorted(by_text, key=lambda t: -max(e["seq"] for e in by_text[t]))
+        used: Dict[str, int] = {}
+        picked: List[Dict[str, Any]] = []
+        # Frame: (pos, next text index to try, text taken to reach pos or None).
+        stack: List[List[Any]] = [[0, 0, None]]
+        steps = 0
+        while stack:
+            frame = stack[-1]
+            pos, i, _taken = frame
+            if pos == len(text):
+                return list(picked)
+            steps += 1
+            if steps > budget:
+                return None
+            advanced = False
+            while i < len(texts):
+                t = texts[i]
+                i += 1
+                n = used.get(t, 0)
+                if n >= len(by_text[t]) or not text.startswith(t, pos):
                     continue
-                e["state"] = "delivered"
-                remaining = remaining[:i] + "\0" * len(e["text"]) + remaining[i + len(e["text"]):]
-                self._append({"op": "deliver", "seq": e["seq"]})
+                end = pos + len(t)
+                # A separator must be followed by another entry: a trailing
+                # "\n" is not a tiling (Prism r2 32e5dda430de).
+                if end != len(text) and (text[end] != "\n" or end + 1 == len(text)):
+                    continue
+                frame[1] = i
+                used[t] = n + 1
+                picked.append(by_text[t][n])
+                stack.append([end if end == len(text) else end + 1, 0, t])
+                advanced = True
+                break
+            if advanced:
+                continue
+            stack.pop()
+            if frame[2] is not None:
+                picked.pop()
+                used[frame[2]] -= 1
+        return None
+
+    @staticmethod
+    def _aligned_spans(text: str, open_: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fallback: newest-first, longest-first, line-aligned, disjoint spans."""
+        remaining = "\n" + text + "\n"
+        chosen = []
+        for e in sorted(open_, key=lambda e: (-len(e["text"]), -e["seq"])):
+            i = remaining.find("\n" + e["text"] + "\n")
+            if i < 0:
+                continue
+            chosen.append(e)
+            span = len(e["text"])
+            remaining = remaining[: i + 1] + "\0" * span + remaining[i + 1 + span :]
+        return chosen
 
     def missed(self) -> Optional[str]:
         with self._lock:
@@ -459,9 +631,12 @@ def steer_subagent(
         if agent is None:
             return False
         # Ledger first: the child may deliver the text the moment it lands
-        # in its slot, and the delivery must find its entry.
+        # in its slot, and the delivery must find its entry. A ledger-wrapped
+        # child.steer does both itself.
         ledger = record.get("steer_ledger")
-        seq = ledger.accept(text) if isinstance(ledger, _SteerLedger) else None
+        seq = None
+        if isinstance(ledger, _SteerLedger) and _steer_ledger_of(agent) is not ledger:
+            seq = ledger.accept(text)
         try:
             accepted = bool(agent.steer(text))
         except Exception as exc:
@@ -2610,6 +2785,12 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
+    # I2: the door goes on BEFORE the parent can see the child, so a parent
+    # close/release_clients from here on is routed to _teardown. A close that
+    # wins before the run takes its hold marks the slot closed, and
+    # _hold_run then returns False and the run fails (Prism f983a90e).
+    _attach_owner_teardown(child)
+
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
         lock = getattr(parent_agent, "_active_children_lock", None)
@@ -4425,10 +4606,14 @@ def _run_single_child(
     _detached = [False]
     # I2: the run holds the child; parent-driven closes defer until the run
     # (or, once detached, the late thread) releases it via _teardown.
-    _attach_owner_teardown(child)
-    _hold_run(child)
+    _attach_owner_teardown(child)  # idempotent; _build_child_agent did it
+    _held = _hold_run(child)
 
     try:
+        if not _held:
+            raise RuntimeError(
+                "delegated child was closed by its parent before its run started"
+            )
         _heartbeat_thread.start()
         if child_progress_cb:
             try:
@@ -5202,10 +5387,18 @@ def _door_slot(child: Any) -> Dict[str, Any]:
     return slot
 
 
-def _hold_run(child: Any) -> None:
-    """The run that owns *child* holds it until it calls ``_teardown(owner=True)``."""
+def _hold_run(child: Any) -> bool:
+    """The run that owns *child* holds it until it calls ``_teardown(owner=True)``.
+
+    False (no hold taken) if the door already closed the child: a parent close
+    won the race with the run's start, and the run must not use it.
+    """
     with _door_lock:
-        _door_slot(child)["run"] = True
+        slot = _door_slot(child)
+        if slot["closed"]:
+            return False
+        slot["run"] = True
+        return True
 
 
 def _release_hold(child: Any, *, run: bool = False, turn: bool = False) -> None:
