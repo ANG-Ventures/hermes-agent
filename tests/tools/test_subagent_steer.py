@@ -336,6 +336,7 @@ class TestMissedSteerRetention:
             "messages": [],
         }
 
+        steer_mock = child.steer  # the steer ledger wraps child.steer at run start
         runner = threading.Thread(
             target=lambda: _run_single_child(0, "late", child=child, parent_agent=MagicMock())
         )
@@ -343,7 +344,7 @@ class TestMissedSteerRetention:
         assert callback_entered.wait(5)
         try:
             assert steer_subagent(child._subagent_id, "too late") is False
-            child.steer.assert_not_called()
+            steer_mock.assert_not_called()
         finally:
             release_callback.set()
             runner.join(5)
@@ -441,6 +442,7 @@ class TestSubagentSteerRPC:
         child._delegate_depth = 1
         child.model = "test-model"
         child.steer.return_value = True
+        steer_mock = child.steer  # the steer ledger wraps child.steer at run start
 
         def run_conversation(**_kwargs):
             observed["owner"] = steer_subagent(
@@ -484,7 +486,7 @@ class TestSubagentSteerRPC:
             clear_session_vars(tokens)
 
         assert observed == {"owner": True, "foreign": False}
-        child.steer.assert_called_once_with("owned steer")
+        steer_mock.assert_called_once_with("owned steer")
 
     def test_unknown_child_is_rejected_not_an_error(self):
         envelope = self._call(

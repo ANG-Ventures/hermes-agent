@@ -93,8 +93,7 @@ def test_f334_real_agent_drain_then_delivery_reports_the_dropped_steer(tmp_path)
     led.path = tmp_path / "steer.jsonl"
 
     def accept(text):
-        led.accept(text)
-        assert child.steer(text)
+        assert child.steer(text)  # the ledger-wrapped steer records it
 
     accept("o\nb")
     child._drain_pending_steer()  # dropped, like clear_interrupt / finalizer
