@@ -85,6 +85,57 @@ def test_fingerprint_ignores_cache_control_placement():
     assert all(isinstance(h, str) and isinstance(n, int) for h, n in a["messages"])
 
 
+def _schema_tools(default):
+    return [{"type": "function", "function": {"name": "post", "parameters": {
+        "type": "object",
+        "properties": {"payload": {"type": "object", "default": default,
+                                   "enum": [default]}},
+    }}}]
+
+
+def test_marker_wrap_fold_leaves_tool_schemas_alone():
+    """Prism 74d0162aae64 (#1606): a schema value shaped like wrapped content is
+    a real accepted-input change, not marker residue."""
+    msgs = [{"role": "user", "content": "hi"}]
+    wrapped = {"content": [{"type": "text", "text": "x"}]}
+    bare = {"content": "x"}
+    a = pg.fingerprint_request({"messages": msgs, "tools": _schema_tools(wrapped)})
+    b = pg.fingerprint_request({"messages": msgs, "tools": _schema_tools(bare)})
+    assert a["tools"] != b["tools"]
+    assert pg.compare(a, b), "tool-schema mutation must be reported"
+
+
+def test_marker_wrap_fold_leaves_nested_message_payloads_alone():
+    """Only a message's own top-level content is folded; a nested dict with a
+    ``content`` key (tool_result block, argument payload) is hashed as sent."""
+    def req(inner):
+        return {"messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                                          "content": inner}]},
+            {"role": "assistant", "content": "ok"},
+        ]}
+    a = pg.fingerprint_request(req([{"type": "text", "text": "x"}]))
+    b = pg.fingerprint_request(req("x"))
+    assert a["messages"][0] != b["messages"][0]
+
+
+def test_marker_wrap_fold_still_covers_message_and_system_content():
+    """The class #1606 fixed stays fixed: top-level wrap of a message (and of a
+    leading OpenAI system message) is marker residue."""
+    marker = {"type": "ephemeral"}
+    wrapped = {"messages": [
+        {"role": "system", "content": [{"type": "text", "text": "SOUL", "cache_control": marker}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": marker}]},
+        {"role": "assistant", "content": "ok"},
+    ]}
+    bare = {"messages": [
+        {"role": "system", "content": "SOUL"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+    ]}
+    assert pg.fingerprint_request(wrapped) == pg.fingerprint_request(bare)
+
+
 def test_fingerprint_retains_no_text():
     fp = pg.fingerprint_request(_request(2))
     assert "SOUL" not in json.dumps(fp) and "m0" not in json.dumps(fp)

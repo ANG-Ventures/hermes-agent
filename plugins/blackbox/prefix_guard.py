@@ -58,8 +58,8 @@ def _strip_cache_control(node: Any) -> Any:
     return node
 
 
-def _collapse_marker_wrap(node: Any) -> Any:
-    """Fold a lone ``[{"type": "text", "text": X}]`` message content back to ``X``.
+def _collapse_marker_wrap(message: Any) -> Any:
+    """Fold a message's lone ``[{"type": "text", "text": X}]`` content back to ``X``.
 
     The breakpoint decorator (``agent.prompt_caching._apply_cache_marker``)
     wraps a string ``content`` into one text part to carry ``cache_control``.
@@ -67,28 +67,33 @@ def _collapse_marker_wrap(node: Any) -> Any:
     bare string again: same text, 25 bytes of wrapper less (t_29abfaf6: 2602
     OpenRouter kimi-k3 rows). Both forms are one text block to the provider,
     so after the marker is stripped the wrapper is marker residue too.
+
+    Scope: only the TOP-LEVEL ``content`` of a message dict, the one field the
+    decorator rewrites. Nested dicts (tool-parameter schemas, an ``enum`` or
+    ``default`` that happens to hold ``{"content": [...]}``, tool_result
+    blocks, arguments) are left exactly as sent, so a real change there still
+    trips the guard (Prism 74d0162aae64 on #1606).
     """
-    if isinstance(node, dict):
-        out = {k: _collapse_marker_wrap(v) for k, v in node.items()}
-        content = out.get("content")
-        if (
-            isinstance(content, list)
-            and len(content) == 1
-            and isinstance(content[0], dict)
-            and set(content[0]) == {"type", "text"}
-            and content[0]["type"] == "text"
-            and isinstance(content[0]["text"], str)
-        ):
-            out["content"] = content[0]["text"]
+    if not isinstance(message, dict):
+        return message
+    content = message.get("content")
+    if (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and set(content[0]) == {"type", "text"}
+        and content[0]["type"] == "text"
+        and isinstance(content[0]["text"], str)
+    ):
+        out = dict(message)
+        out["content"] = content[0]["text"]
         return out
-    if isinstance(node, (list, tuple)):
-        return [_collapse_marker_wrap(v) for v in node]
-    return node
+    return message
 
 
 def _canonical_bytes(obj: Any) -> bytes:
     return json.dumps(
-        _collapse_marker_wrap(_strip_cache_control(obj)), sort_keys=True, separators=(",", ":"),
+        _strip_cache_control(obj), sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, default=str,
     ).encode("utf-8", "surrogatepass")
 
@@ -100,6 +105,22 @@ def _digest(data: bytes) -> str:
 def _entry(obj: Any) -> list:
     data = _canonical_bytes(obj)
     return [_digest(data), len(data)]
+
+
+def _message_entry(message: Any) -> list:
+    """``_entry`` for one message: marker-wrap residue folded first."""
+    return _entry(_collapse_marker_wrap(_strip_cache_control(message)))
+
+
+def _system_entry(system: Any) -> list:
+    """``_entry`` for the system segment. Leading system/developer MESSAGES
+    (OpenAI chat) fold their own content; an Anthropic ``system`` block list
+    or a Responses ``instructions`` string is hashed as sent."""
+    if isinstance(system, list) and all(
+        isinstance(m, dict) and m.get("role") in _SYSTEM_ROLES for m in system
+    ):
+        return _entry([_collapse_marker_wrap(_strip_cache_control(m)) for m in system])
+    return _entry(system)
 
 
 def fingerprint_request(api_kwargs: Any) -> dict[str, Any] | None:
@@ -140,9 +161,9 @@ def fingerprint_request(api_kwargs: Any) -> dict[str, Any] | None:
         if isinstance(item, dict) and item.get("type") == "compaction":
             checkpoint = _entry(item)[0]
     return {
-        "system": _entry(system) if system is not None else None,
+        "system": _system_entry(system) if system is not None else None,
         "tools": _entry(tools) if tools else None,
-        "messages": [_entry(m) for m in history],
+        "messages": [_message_entry(m) for m in history],
         "checkpoint": checkpoint,
     }
 
