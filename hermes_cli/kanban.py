@@ -1209,6 +1209,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--worker-ok", action="store_const", const=False, dest="no_worker",
         help="Clear the no-worker flag",
     )
+    _np = p_edit.add_mutually_exclusive_group()
+    _np.add_argument(
+        "--no-page", action="store_const", const=False, dest="page",
+        default=None,
+        help="Opt the card out of the needs-input pager (no origin-channel "
+             "page when it blocks on a human ruling)",
+    )
+    _np.add_argument(
+        "--page", action="store_const", const=True, dest="page",
+        help="Re-enable the needs-input pager for the card",
+    )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
@@ -5035,12 +5046,13 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     do_session = new_session is not None
     no_worker = getattr(args, "no_worker", None)
     new_priority = getattr(args, "priority", None)
+    page = getattr(args, "page", None)
 
     if (not do_result and not do_model and not do_session and no_worker is None
-            and new_priority is None):
+            and new_priority is None and page is None):
         print(
             "kanban: nothing to edit (pass --result, --model, --clear-model, "
-            "--session, --priority, --no-worker or --worker-ok)",
+            "--session, --priority, --no-worker, --worker-ok, --no-page or --page)",
             file=sys.stderr,
         )
         return 2
@@ -5059,6 +5071,13 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 f"{args.task_id}: dispatch: "
                 + ("operator-only (no-worker)" if no_worker else "worker-ok")
             )
+        if page is not None:
+            if not kb.set_needs_input_page(
+                conn, args.task_id, page, operator=_profile_author(),
+            ):
+                print(f"cannot edit {args.task_id} (unknown id)", file=sys.stderr)
+                return 1
+            print(f"{args.task_id}: needs-input pager: " + ("on" if page else "off"))
         if do_session:
             sid = None if new_session.strip().lower() in ("", "none") else new_session.strip()
             if not kb.set_task_session(conn, args.task_id, sid):

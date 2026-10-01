@@ -6691,6 +6691,146 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Needs-input pager (t_c8ca40b4). A priority-chain card that blocks on a human
+# question paged nobody: 3x in 24 h on the DPX chain, ~12 h of silence. The
+# gateway dispatcher pages the card's origin channel (dedup + re-page lives in
+# gateway/kanban_watchers.py); this half picks the cards and holds the opt-out.
+# ---------------------------------------------------------------------------
+
+NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
+NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
+_NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
+_NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
+# ``origin: discord <name> (<numeric channel id>) · session ...`` (see
+# format_origin_line). The id is the LAST parenthetical of the first `` · ``
+# field, so a chat name with its own parentheses still resolves. Numeric ids
+# only: a channel NAME is never a delivery target.
+_ORIGIN_DISCORD_CHANNEL_RE = re.compile(r"^origin:\s*discord\b.*\((\d{15,22})\)\s*$", re.I)
+
+
+def origin_discord_channel(body: Optional[str]) -> Optional[str]:
+    """The numeric Discord channel id in the card's ``origin:`` line, else None."""
+    line = _origin_line(body)
+    where = line.split(" \u00b7 ", 1)[0] if line else ""
+    match = _ORIGIN_DISCORD_CHANNEL_RE.match(where) if where else None
+    return match.group(1) if match else None
+
+
+def needs_input_page_enabled(conn: sqlite3.Connection, task_id: str) -> bool:
+    """False once ``edit --no-page`` opted the card out (latest toggle wins)."""
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, _NEEDS_INPUT_PAGE_OFF, _NEEDS_INPUT_PAGE_ON),
+    ).fetchone()
+    return row is None or row["kind"] == _NEEDS_INPUT_PAGE_ON
+
+
+def set_needs_input_page(
+    conn: sqlite3.Connection,
+    task_id: str,
+    enabled: bool,
+    *,
+    operator: Optional[str] = None,
+) -> bool:
+    """Opt a card out of (or back into) the needs-input pager.
+
+    Returns False for an unknown id. A change records ``needs_input_page_off``
+    / ``needs_input_page_on``; setting the current value is a silent no-op.
+    """
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            return False
+        if needs_input_page_enabled(conn, task_id) != bool(enabled):
+            _append_event(
+                conn, task_id,
+                _NEEDS_INPUT_PAGE_ON if enabled else _NEEDS_INPUT_PAGE_OFF,
+                {"operator": operator},
+            )
+    return True
+
+
+_BLOCK_REASON_EVENTS = ("blocked", "block_loop_detected")
+
+
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_REASON_EVENTS),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return str((payload or {}).get("reason") or "").strip() if isinstance(payload, dict) else ""
+
+
+def needs_input_page_candidates(
+    conn: sqlite3.Connection,
+    *,
+    include_dependency: bool = False,
+    min_priority: int = NEEDS_INPUT_PAGE_MIN_PRIORITY,
+) -> list[dict]:
+    """Cards waiting on a human ruling that should page their origin channel.
+
+    A card qualifies when it sits in ``blocked`` with kind ``needs_input`` (a
+    same-kind re-block escalates to ``triage`` and still waits on a human, so
+    that counts too) or,
+    with ``include_dependency``, waits as ``dependency`` on a parent that is
+    itself ``blocked``), was not opted out, and has ``priority >= min_priority``
+    OR an ``origin:`` line naming a numeric Discord channel. Each item carries
+    ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
+    """
+    rows = list(conn.execute(
+        "SELECT id, title, body, priority, status, block_kind FROM tasks "
+        "WHERE status IN ('blocked', 'triage') AND block_kind = 'needs_input' ORDER BY id"
+    ))
+    if include_dependency:
+        rows += list(conn.execute(
+            "SELECT id, title, body, priority, status, block_kind FROM tasks t "
+            "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
+            "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) = ? "
+            "            AND p.status = 'blocked') ORDER BY id",
+            (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        ))
+    out: list[dict] = []
+    for row in rows:
+        priority = int(row["priority"] or 0)
+        channel = origin_discord_channel(row["body"])
+        if priority < int(min_priority) and channel is None:
+            continue
+        if not needs_input_page_enabled(conn, row["id"]):
+            continue
+        if row["block_kind"] == "dependency":
+            parents = [
+                (r["id"], _latest_block_reason(conn, r["id"]))
+                for r in conn.execute(
+                    "SELECT p.id AS id FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? "
+                    "AND p.status = 'blocked' ORDER BY p.id",
+                    (row["id"], DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+                )
+            ]
+            reason = "; ".join(
+                f"waiting on blocked parent {pid}: {why or '(no reason)'}" for pid, why in parents
+            )
+        else:
+            reason = _latest_block_reason(conn, row["id"])
+        out.append({
+            "task_id": row["id"],
+            "title": row["title"],
+            "priority": priority,
+            "kind": row["block_kind"],
+            "reason": reason or "(no reason given)",
+            "channel": channel,
+            "alerts": priority >= NEEDS_INPUT_PAGE_ALERTS_PRIORITY,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Near-duplicate guard (opt-in per create surface: CLI + kanban_create tool)
 # ---------------------------------------------------------------------------
 # Sibling sessions re-filing the same card minutes apart burn worker slots and
