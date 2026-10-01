@@ -472,8 +472,14 @@ _ACCOUNT_BLOCKED_PATTERNS = [
 # combined message. Mirrors claude-bpx's RATE_LIMIT_RESULT_RE so both sides of
 # the wire agree this is a periodic quota. Keep anchored on "hit your ... limit"
 # — a bare "limit" would collide with context-length and billing phrases.
+# The model-cap variant ("You've reached your Fable limit. Switch to another
+# model to continue.") names a model family, never "spending"/"credit", so it
+# cannot collide with billing. 2026-09-24 08:02-08:16 it reached the harness as
+# a status-less openai.APIError (SSE error after HTTP 200), missed this regex
+# and announced "(connection issue)" 9 times (t_6d5eac97).
 _CLAUDE_CLI_USAGE_CAP_RE = re.compile(
     r"\bhit your (?:weekly|monthly|session|5-hour|five-hour)? ?(?:usage )?limit\b"
+    r"|\breached your (?:fable|opus|sonnet|haiku|claude)(?: \d+(?:\.\d+)?)? limit\b"
 )
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)

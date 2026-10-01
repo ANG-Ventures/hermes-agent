@@ -58,6 +58,47 @@ def test_cli_usage_cap_statusless_is_rate_limit():
     assert r.reason is FailoverReason.rate_limit
 
 
+# "reached your <model> limit" (t_6d5eac97): 2026-09-24 08:02-08:16 claude-bpx-12
+# handed this up as an SSE error after HTTP 200, so the harness saw
+# openai.APIError with no status (openai/_streaming.py raises
+# APIError(message, request, body=data["error"])). The regex only knew
+# "hit your ... limit"; the reason fell to unknown -> "(connection issue)" x9.
+FABLE = ("Claude Code returned an error result: You've reached your Fable limit. "
+         "Switch to another model to continue.")
+
+
+@pytest.mark.parametrize("msg", [
+    FABLE,
+    "Claude Code returned an error result: You've reached your Opus 4.5 limit.",
+])
+def test_model_cap_sse_statusless_is_rate_limit(msg):
+    req = httpx.Request("POST", "http://bpx.test/v1/chat/completions")
+    err = openai.APIError(msg, request=req, body={"message": msg})
+    r = classify_api_error(err, provider="claude-bpx-12", model="claude-fable-5-1")
+    assert r.status_code is None
+    assert r.reason is FailoverReason.rate_limit, r
+    assert r.should_fallback and r.should_rotate_credential
+
+
+def test_model_cap_statusless_announce_is_not_the_connection_floor():
+    req = httpx.Request("POST", "http://bpx.test/v1/chat/completions")
+    r = classify_api_error(openai.APIError(FABLE, request=req, body={"message": FABLE}),
+                           provider="claude-bpx-12", model="claude-fable-5-1")
+    line = _announce(r.reason, window_ctx=None)
+    assert "connection issue" not in line, line
+    assert "rate limit" in line, line
+
+
+@pytest.mark.parametrize("msg", [
+    "You've reached your spending limit for this month.",
+    "You have reached your credit limit.",
+    "You've reached your maximum context limit.",
+])
+def test_reached_your_non_model_limit_is_not_a_cli_cap(msg):
+    from agent.error_classifier import _CLAUDE_CLI_USAGE_CAP_RE
+    assert not _CLAUDE_CLI_USAGE_CAP_RE.search(msg.lower())
+
+
 def test_genuine_500_still_server_error():
     r = classify_api_error(_status_error("Claude Code process exited with code 1. stderr: ENOSPC", 500, "internal_error"),
                            provider="claude-bpx-12", model="x")
