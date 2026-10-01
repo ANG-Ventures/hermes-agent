@@ -269,9 +269,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
-    is_commentary_send,
     keep_head_and_tail_chunks,
-    strip_chunk_indicators,
     utf16_len,
     validate_inbound_media_size,
 )
@@ -4310,23 +4308,6 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         return [kept[0], notice, *kept[1:]]
 
-    _COMMENTARY_CONTINUED_MARKER = "\n\n… (continued in session log)"
-
-    def _commentary_chunks(self, formatted: str) -> List[str]:
-        """Interim commentary is delivered as ONE message (t_784a01bd).
-
-        Between-tool-call narration is already durable in the transcript; a
-        long block must not flood the channel or trip the split cap.  Keep
-        the first chunk's worth of text and mark the rest as elided.
-        """
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        if len(chunks) <= 1:
-            return chunks
-        marker = self._COMMENTARY_CONTINUED_MARKER
-        first = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH - len(marker))
-        bodies, _tagged = strip_chunk_indicators(first)
-        return [bodies[0] + marker]
-
     async def send(
         self,
         chat_id: str,
@@ -4421,12 +4402,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
-            if is_commentary_send(metadata):
-                chunks = self._commentary_chunks(formatted)
-            else:
-                chunks = self._cap_split_chunks(
-                    self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-                )
+            chunks = self._cap_split_chunks(
+                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            )
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
