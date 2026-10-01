@@ -74,6 +74,7 @@ _NON_RETRYABLE_REASONS = {
     "content_policy_blocked",
     "provider_policy_blocked",
     "model_not_found",
+    "endpoint_not_found",
     "format_error",
     "ssl_cert_verification",
 }
