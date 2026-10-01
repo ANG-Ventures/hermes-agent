@@ -6374,6 +6374,8 @@ def _launcher_install_root(python: str) -> Path | None:
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
