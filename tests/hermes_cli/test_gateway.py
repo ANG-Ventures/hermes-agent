@@ -339,6 +339,7 @@ def test_spawn_detached_gateway_timestamps_stderr(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(gateway, "get_python_path", lambda: "/usr/bin/python3")
     monkeypatch.setattr(gateway, "_gateway_run_command", lambda: child_cmd)
+    monkeypatch.setattr(gateway, "_launcher_install_root", lambda _python: gateway.PROJECT_ROOT)
     monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
 
     assert gateway._spawn_detached_gateway() is True
@@ -347,6 +348,7 @@ def test_spawn_detached_gateway_timestamps_stderr(monkeypatch, tmp_path):
     cmd, kwargs = calls[0]
     assert cmd == [
         "/usr/bin/python3",
+        "-P",
         "-m",
         "hermes_cli.stderr_timestamp",
         "--error-log",
