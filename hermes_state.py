@@ -9085,6 +9085,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def set_message_api_content(
+        self, session_id: str, row_id: int, api_content: str
+    ) -> int:
+        """Stamp the ``api_content`` sidecar onto an already-persisted row.
+
+        The incremental flush writes each live message once. A mid-turn /steer
+        (or the run-budget notice) is appended to the current turn's tool
+        result AFTER the sequential executor flushed it, so the row held only
+        the bare tool output: the steer vanished from reloaded history and the
+        next turn's prompt-cache prefix broke (t_a17e2305). ``content`` stays
+        the clean tool output (rendered content is append-only); the sidecar
+        carries the bytes that were sent, and replay substitutes it. Returns
+        the number of rows updated (0 or 1).
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ?",
+                (_scrub_surrogates(api_content), row_id, session_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
+
     def most_recent_interrupt_close_session(
         self, *, source: str = "cli", within_seconds: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
@@ -14255,6 +14278,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
                 msg["tool_name"] = row["tool_name"]
+                # The live tool message carries ``name`` too (Gemini requires
+                # it; chat transports send it). Restore it so a reloaded
+                # history replays the bytes the previous turn sent (t_a17e2305).
+                if row["role"] == "tool":
+                    msg["name"] = row["tool_name"]
             if row["effect_disposition"]:
                 msg["effect_disposition"] = row["effect_disposition"]
             if row["tool_calls"]:

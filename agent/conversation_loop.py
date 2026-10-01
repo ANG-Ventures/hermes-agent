@@ -47,6 +47,7 @@ from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, is_
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
+    _API_CONTENT_SIDECAR_ROLES,
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
     build_turn_context,
@@ -3116,7 +3117,7 @@ def run_conversation(
             elif (
                 isinstance(_api_content, str)
                 and _api_content
-                and msg.get("role") in ("user", "assistant")
+                and msg.get("role") in _API_CONTENT_SIDECAR_ROLES
             ):
                 # Historical message: replay the exact bytes sent when it was
                 # live, so the provider prompt-cache prefix stays byte-stable
