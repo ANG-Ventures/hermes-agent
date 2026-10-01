@@ -604,6 +604,26 @@ def _reap_subtree(root_agent: Any, reason: str) -> List[str]:
     return reaped
 
 
+def _classify_child_outcome(result: Dict[str, Any]) -> Tuple[str, str]:
+    """One terminal-outcome classifier for a child turn that RETURNED a result.
+
+    Returns ``(status, exit_reason)``. A child whose run_conversation returned
+    ``failed=True`` (non-retryable API error, billing wall, content-policy
+    block, ...) is ``failed``/``error`` even though its ``final_response``
+    carries the error text: that text is not a usable answer, and calling it
+    ``completed``/``max_iterations`` hid the failure and skipped the subtree
+    reap (Argus QA t_86717544 F1/F4). The raise path stays the caller's.
+    """
+    summary = str(result.get("final_response") or "")
+    if result.get("interrupted"):
+        return "interrupted", "interrupted"
+    if result.get("failed"):
+        return "failed", "error"
+    if summary and summary.strip() != "(empty)":
+        return "completed", ("completed" if result.get("completed", False) else "max_iterations")
+    return "failed", ("completed" if result.get("completed", False) else "max_iterations")
+
+
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
 _CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
@@ -3826,23 +3846,11 @@ def _start_late_completion(
         pending_steer = lc.missed_steer
         summary = str(result.get("final_response") or "")
         if hung:
-            status = "timeout"
+            status, exit_reason = "timeout", "timeout"
         elif error:
-            status = "error"
-        elif result.get("interrupted"):
-            status = "interrupted"
-        elif summary and summary.strip() != "(empty)":
-            status = "completed"
+            status, exit_reason = "error", "error"
         else:
-            status = "failed"
-        if hung or error:
-            exit_reason = "timeout" if hung else "error"
-        elif result.get("interrupted"):
-            exit_reason = "interrupted"
-        elif result.get("completed", False):
-            exit_reason = "completed"
-        else:
-            exit_reason = "max_iterations"
+            status, exit_reason = _classify_child_outcome(result)
         _model = getattr(child, "model", None)
         _cost = getattr(child, "session_estimated_cost_usd", 0.0)
         _cost = float(_cost) if isinstance(_cost, (int, float)) else 0.0
@@ -3875,11 +3883,12 @@ def _start_late_completion(
                 entry["steer_fate_unknown"] = True
         if error:
             entry["error"] = error
-            if not hung:
-                # A genuine failure of this child: reap whatever it spawned.
-                _reap_subtree(child, "error")
         elif status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if not hung and (error or status == "failed"):
+            # A genuine failure of this child, raised or returned: reap
+            # whatever it spawned.
+            _reap_subtree(child, "error")
         if not hung and isinstance(getattr(child, "_delegate_output_schema", None), dict):
             entry["schema_valid"] = bool(schema_valid)
             if schema_retries:
@@ -4657,26 +4666,16 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
-        completed = result.get("completed", False)
-        interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
         # transport bug (misrouted provider, adapter returning empty
         # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
-        # it instead of silently accepting zero-content "success".
-        _empty_sentinel = summary.strip() == "(empty)"
-
-        if interrupted:
-            status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
-            status = "completed"
-        else:
-            status = "failed"
+        # it instead of silently accepting zero-content "success". A returned
+        # failed=True (non-retryable API error) is failed/error, not
+        # completed/max_iterations; see _classify_child_outcome.
+        status, exit_reason = _classify_child_outcome(result)
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -4715,14 +4714,6 @@ def _run_single_child(
                     elif tool_trace:
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
-
-        # Determine exit reason
-        if interrupted:
-            exit_reason = "interrupted"
-        elif completed:
-            exit_reason = "completed"
-        else:
-            exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
@@ -4784,6 +4775,9 @@ def _run_single_child(
         )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+            # Same reap as the raise path below: a child that fails by
+            # RETURNING must not leave its live subtree running.
+            _reap_subtree(child, "error")
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
