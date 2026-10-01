@@ -420,7 +420,7 @@ def test_dispatch_skips_spawn_over_ceiling_and_pages_once(
     assert spawns == []
     assert res1.budget_paused is True
     assert res2.budget_paused is True
-    marker = kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json"
+    marker = kb.board_state_dir(kb.DEFAULT_BOARD) / ".budget_paused.json"
     assert marker.exists()
     data = json.loads(marker.read_text(encoding="utf-8"))
     assert data["ceiling"] == 10.0
@@ -533,7 +533,7 @@ def test_recovery_clears_marker_and_reports_once(
 ):
     from hermes_cli import kanban_budget
 
-    marker = kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json"
+    marker = kb.board_state_dir(kb.DEFAULT_BOARD) / ".budget_paused.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(
         json.dumps({"since": 1, "spend": 25.0, "ceiling": 10.0}), encoding="utf-8",
@@ -587,7 +587,7 @@ def test_dry_run_never_writes_a_marker_or_pages(
         )
     assert res.budget_paused is False
     assert sent == []
-    assert not (kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json").exists()
+    assert not (kb.board_state_dir(kb.DEFAULT_BOARD) / ".budget_paused.json").exists()
 
 
 def test_pause_without_a_notify_script_is_a_silent_noop(
@@ -639,7 +639,7 @@ def test_cli_budget_subcommand_is_read_only(kanban_home, monkeypatch):
     assert "4.25" in out, out
     assert "10.00" in out, out
     # Read-only: no pause marker written by a report.
-    assert not (kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json").exists()
+    assert not (kb.board_state_dir(kb.DEFAULT_BOARD) / ".budget_paused.json").exists()
 
 
 
