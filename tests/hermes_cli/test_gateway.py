@@ -347,6 +347,7 @@ def test_spawn_detached_gateway_timestamps_stderr(monkeypatch, tmp_path):
     cmd, kwargs = calls[0]
     assert cmd == [
         "/usr/bin/python3",
+        "-P",
         "-m",
         "hermes_cli.stderr_timestamp",
         "--error-log",

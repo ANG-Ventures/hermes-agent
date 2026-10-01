@@ -1678,12 +1678,14 @@ class TestProfileArg:
 
         assert program_args == [
             "/usr/bin/python3",
+            "-P",
             "-m",
             "hermes_cli.stderr_timestamp",
             "--error-log",
             str(profile_dir / "logs" / "gateway.error.log"),
             "--",
             "/usr/bin/python3",
+            "-P",
             "-m",
             "hermes_cli.main",
             "--profile",
