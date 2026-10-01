@@ -277,6 +277,46 @@ def _has_mutable_flush_state(msg: Any) -> bool:
     )
 
 
+def _persisted_content_projection(msg: Dict[str, Any], content: Any) -> Any:
+    """The ``content`` value the flush writes for *msg* (image-free text).
+
+    Shared by the first write and the in-place content re-persist so both
+    store the same projection of a multimodal list.
+    """
+    _multimodal_projection = _multimodal_message_text_projection(
+        {**msg, "content": content}
+    )
+    if _multimodal_projection is not None:
+        return _multimodal_projection
+    if isinstance(content, list):
+        # List of OpenAI-style content parts: strip images, keep text.
+        _txt = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                _txt.append(str(p.get("text", "")))
+            elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
+                _txt.append("[screenshot]")
+        return "\n".join(_txt) if _txt else None
+    return content
+
+
+def _tool_content_mutated_since_flush(msg: Any, content_refs: Dict[int, Any]) -> bool:
+    """True when a flushed ``role:"tool"`` row's live content was replaced.
+
+    The flush is append-only, but a mid-turn /steer and the run-budget notice
+    append text to the current turn's newest tool result AFTER the sequential
+    executor already flushed it. ``content_refs`` maps the row id to the exact
+    content object that was written; content is replaced (never edited in
+    place), so an identity check is O(1) and catches every such writer.
+    """
+    if not isinstance(msg, dict) or msg.get("role") != "tool":
+        return False
+    row_id = msg.get("_db_persisted_row_id")
+    if not isinstance(row_id, int) or row_id not in content_refs:
+        return False
+    return content_refs[row_id] is not msg.get("content")
+
+
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """Return True when ``msg`` is internal recovery scaffolding that must never
     be persisted to the durable transcript (SQLite session store or JSON log)."""
@@ -2332,6 +2372,7 @@ class AIAgent:
             if flushed_session_id != current_session_id or self._last_flushed_db_idx == 0:
                 self._flushed_db_message_ids = set()
                 self._flushed_db_row_ids = {}
+                self._flushed_db_content_refs = {}
                 self._interrupt_close_repersisted_ids = set()
                 seed_ids = set()
             else:
@@ -2344,6 +2385,10 @@ class AIAgent:
             if not isinstance(flushed_row_ids, dict):
                 flushed_row_ids = {}
                 self._flushed_db_row_ids = flushed_row_ids
+            content_refs = getattr(self, "_flushed_db_content_refs", None)
+            if not isinstance(content_refs, dict):
+                content_refs = {}
+                self._flushed_db_content_refs = content_refs
             repersisted_ids = getattr(self, "_interrupt_close_repersisted_ids", None)
             if not isinstance(repersisted_ids, set):
                 repersisted_ids = set()
@@ -2420,6 +2465,9 @@ class AIAgent:
                     and messages[_scan_start] is _prev_prefix[_scan_start]
                     and bool(messages[_scan_start].get(_DB_PERSISTED_MARKER))
                     and not _has_mutable_flush_state(messages[_scan_start])
+                    and not _tool_content_mutated_since_flush(
+                        messages[_scan_start], content_refs
+                    )
                 ):
                     _scan_start += 1
 
@@ -2432,6 +2480,24 @@ class AIAgent:
                 if not isinstance(msg, dict):
                     continue
                 msg_id = id(msg)
+                # A flushed tool row whose content was replaced in place (the
+                # /steer marker or run-budget notice appended after the
+                # per-result flush): stamp the sent bytes as the row's
+                # api_content sidecar so the reloaded history replays what was
+                # sent and keeps the steer (t_a17e2305).
+                if _tool_content_mutated_since_flush(msg, content_refs):
+                    _row_id = msg["_db_persisted_row_id"]
+                    _sent = _persisted_content_projection(msg, msg.get("content"))
+                    try:
+                        if isinstance(_sent, str) and _sent:
+                            self._session_db.set_message_api_content(
+                                self.session_id, _row_id, _sent,
+                            )
+                        content_refs[_row_id] = msg.get("content")
+                    except Exception as _e:
+                        logger.warning(
+                            "tool api_content re-persist failed (row=%s): %s", _row_id, _e,
+                        )
                 # Never write ephemeral recovery scaffolding to the session
                 # store. The flush is append-only (it only advances
                 # _last_flushed_db_idx via identity tracking), so a synthetic
@@ -2637,20 +2703,7 @@ class AIAgent:
                 # boundary. This keeps live-history and rebuilt requests
                 # byte-identical instead of accounting for a tiny text row while
                 # the in-memory request silently retains base64 pixels.
-                _multimodal_projection = _multimodal_message_text_projection(
-                    {**msg, "content": content}
-                )
-                if _multimodal_projection is not None:
-                    content = _multimodal_projection
-                elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
-                    _txt = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            _txt.append(str(p.get("text", "")))
-                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
-                    content = "\n".join(_txt) if _txt else None
+                content = _persisted_content_projection(msg, content)
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [
@@ -2662,7 +2715,12 @@ class AIAgent:
                 _row = {
                     "role": role,
                     "content": content,
-                    "tool_name": msg.get("tool_name"),
+                    # Tool rows built without ``tool_name`` (interrupt/invalid-call
+                    # stubs) still carry the ``name`` the wire sends; keep it so the
+                    # reload restores it (t_a17e2305).
+                    "tool_name": msg.get("tool_name") or (
+                        msg.get("name") if role == "tool" else None
+                    ),
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),
                     "finish_reason": msg.get("finish_reason"),
@@ -2755,6 +2813,8 @@ class AIAgent:
                     if isinstance(_row_id, int):
                         flushed_row_ids[_written_id] = _row_id
                         _written["_db_persisted_row_id"] = _row_id
+                        if _written.get("role") == "tool":
+                            content_refs[_row_id] = _written.get("content")
                         # If this message was appended already carrying the flag,
                         # it is durably persisted — no later re-persist needed.
                         if _written.get("finish_reason") == _INTERRUPT_CLOSE_FINISH_REASON:

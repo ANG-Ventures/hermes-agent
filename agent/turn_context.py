@@ -174,6 +174,12 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
+# Roles whose ``api_content`` sidecar replaces ``content`` on replay. Tool rows
+# carry one when a mid-turn /steer or the run-budget notice was appended after
+# the row was flushed (t_a17e2305).
+_API_CONTENT_SIDECAR_ROLES = ("user", "assistant", "tool")
+
+
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
@@ -191,7 +197,7 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     if (
         isinstance(sidecar, str)
         and sidecar
-        and api_msg.get("role") in ("user", "assistant")
+        and api_msg.get("role") in _API_CONTENT_SIDECAR_ROLES
     ):
         api_msg["content"] = sidecar
     return sidecar
