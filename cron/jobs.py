@@ -5130,10 +5130,73 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             )
             continue
 
+    _warn_overdue_oneshots_not_due(jobs, due, intentionally_removed, now)
+
     if needs_save:
         save_jobs(raw_jobs, removed_ids=intentionally_removed or None)
 
     return due
+
+
+# Last-warned monotonic time per one-shot id for _warn_overdue_oneshots_not_due.
+_overdue_oneshot_warned: Dict[str, float] = {}
+_OVERDUE_ONESHOT_WARN_INTERVAL_SECONDS = 600.0
+
+
+def _warn_overdue_oneshots_not_due(
+    jobs: List[Dict[str, Any]],
+    due: List[Dict[str, Any]],
+    removed_ids: Set[str],
+    now: datetime,
+) -> None:
+    """Name the reason a past-due, never-run one-shot was left out of this scan.
+
+    Every skip in the due-scan that can hold back a one-shot (disabled, terminal
+    state, a live run/fire claim, a ``next_run_at`` parked after ``run_at``) is
+    silent. On 2026-09-30 a 09:45 one-shot (28a5a721bb20) was skipped by every
+    tick until it was removed by hand at 09:51, and nothing in the logs said why.
+    This logs one WARNING per job per 10 min with the fields that decide it.
+    """
+    due_ids = {str(j.get("id")) for j in due}
+    for job in jobs:
+        try:
+            schedule = job.get("schedule") or {}
+            if schedule.get("kind") != "once" or job.get("last_run_at"):
+                continue
+            if job.get("state") == "paused" or job.get("paused_at"):
+                continue  # operator pause: intentional, not a miss
+            jid = str(job.get("id") or "")
+            if not jid or jid in due_ids or jid in removed_ids:
+                continue
+            run_at = schedule.get("run_at") or job.get("next_run_at")
+            if not run_at:
+                continue
+            overdue = (now - _ensure_aware(datetime.fromisoformat(run_at))).total_seconds()
+            if overdue <= ONESHOT_GRACE_SECONDS:
+                continue
+            last = _overdue_oneshot_warned.get(jid)
+            mono = time.monotonic()
+            if last is not None and mono - last < _OVERDUE_ONESHOT_WARN_INTERVAL_SECONDS:
+                continue
+            _overdue_oneshot_warned[jid] = mono
+            logger.warning(
+                "cron.oneshot.overdue_not_due job='%s' id=%s run_at=%s overdue=%ds "
+                "next_run_at=%s enabled=%s state=%s run_claim=%s fire_claim=%s "
+                "manual_run_at=%s repeat=%s",
+                job.get("name", jid),
+                jid,
+                run_at,
+                int(overdue),
+                job.get("next_run_at"),
+                job.get("enabled", True),
+                job.get("state"),
+                job.get("run_claim"),
+                job.get("fire_claim"),
+                job.get("manual_run_at"),
+                job.get("repeat"),
+            )
+        except Exception:
+            logger.debug("overdue one-shot diagnostic failed", exc_info=True)
 
 
 # Per-run cron output (`cron/output/<job>/<timestamp>.md`) is written once per
