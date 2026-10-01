@@ -1114,6 +1114,7 @@ class _NeedsInputPager(_GuardStuckNotifier):
     def __init__(self, state_path: Optional[Path] = None,
                  remind_seconds: int = _NEEDS_INPUT_REPAGE_SECONDS) -> None:
         super().__init__(state_path, remind_seconds)
+        self._rotation = 0
 
     @staticmethod
     def _key(board: str, item: dict) -> str:
@@ -1138,6 +1139,14 @@ class _NeedsInputPager(_GuardStuckNotifier):
             or now - at < self._remind
         }
         delivered = 0
+        # Rotate the start each tick: failing sends stay due, and without the
+        # rotation a run of them at the head of the list would spend the page
+        # budget every tick and starve the cards behind them.
+        cards = list(cards)
+        if cards:
+            start = self._rotation % len(cards)
+            cards = cards[start:] + cards[:start]
+            self._rotation += 1
         for board, item in cards:
             key = self._key(board, item)
             last = self._sent.get(key)

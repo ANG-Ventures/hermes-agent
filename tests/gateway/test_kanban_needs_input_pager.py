@@ -135,6 +135,19 @@ def test_origin_channel_must_be_numeric_discord():
     assert kb.origin_discord_channel("origin: discord Srv / #x (cc-native) · s") is None
     assert kb.origin_discord_channel(f"origin: telegram chat ({CHAN}) · s") is None
     assert kb.origin_discord_channel(f"title\n{ORIGIN}") is None  # must be first line
+    # a chat name with its own parentheses (format_origin_line copies it verbatim)
+    assert kb.origin_discord_channel(
+        f"origin: discord Team (EU) / #ops ({CHAN}) · session s · 2026-10-01") == CHAN
+    assert kb.origin_discord_channel(
+        f"origin: discord Srv (123456789012345678) / #ops · session s · 2026-10-01") is None
+
+
+def test_origin_line_from_format_origin_line(monkeypatch):
+    real_get = kb._ambient_session_env
+    env = {"HERMES_SESSION_PLATFORM": "discord", "HERMES_SESSION_CHAT_NAME": "Team (EU) / #ops", "HERMES_SESSION_CHAT_ID": CHAN}
+    monkeypatch.setattr(kb, "_ambient_session_env", lambda k: env.get(k, real_get(k)))
+    line = kb.format_origin_line("20260928_010147_13a37c43")
+    assert kb.origin_discord_channel(line) == CHAN
 
 
 def test_edit_no_page_opts_out_and_page_restores(kanban_home):
@@ -216,3 +229,26 @@ def test_failed_send_retries_next_tick(kanban_home):
     pager = kw._NeedsInputPager()
     assert pager.observe(cards, lambda b, i, s: False, boards, now=1000.0) == 0
     assert pager.observe(cards, lambda b, i, s: True, boards, now=1005.0) == 1
+
+
+def test_failing_sends_cannot_starve_later_cards(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        bad = _card(conn, reason="bad channel")
+        good = _card(conn, reason="good channel")
+    cards, boards = kw._needs_input_cards([("default", object())])
+    assert [c["task_id"] for _, c in cards] == sorted([bad, good])
+    first = cards[0][1]["task_id"]
+    # budget admits ONE send per tick; the first card always fails
+    clock = iter(range(0, 1000, 20))
+    monkeypatch.setattr(kw.time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(kw, "_GUARD_STUCK_PAGE_BUDGET_S", 30.0)
+    tried = []
+
+    def send(board, item, still):
+        tried.append(item["task_id"])
+        return item["task_id"] != first
+
+    pager = kw._NeedsInputPager()
+    pager.observe(cards, send, boards, now=1000.0)
+    pager.observe(cards, send, boards, now=1001.0)
+    assert set(tried) == {bad, good}

@@ -6571,15 +6571,18 @@ NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
 NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
 _NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
 _NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
-# ``origin: discord <name> (<numeric channel id>) · session ...``. Numeric ids
+# ``origin: discord <name> (<numeric channel id>) · session ...`` (see
+# format_origin_line). The id is the LAST parenthetical of the first `` · ``
+# field, so a chat name with its own parentheses still resolves. Numeric ids
 # only: a channel NAME is never a delivery target.
-_ORIGIN_DISCORD_CHANNEL_RE = re.compile(r"^origin:\s*discord\b[^(\n]*\((\d{15,22})\)", re.I)
+_ORIGIN_DISCORD_CHANNEL_RE = re.compile(r"^origin:\s*discord\b.*\((\d{15,22})\)\s*$", re.I)
 
 
 def origin_discord_channel(body: Optional[str]) -> Optional[str]:
     """The numeric Discord channel id in the card's ``origin:`` line, else None."""
     line = _origin_line(body)
-    match = _ORIGIN_DISCORD_CHANNEL_RE.match(line) if line else None
+    where = line.split(" \u00b7 ", 1)[0] if line else ""
+    match = _ORIGIN_DISCORD_CHANNEL_RE.match(where) if where else None
     return match.group(1) if match else None
 
 
