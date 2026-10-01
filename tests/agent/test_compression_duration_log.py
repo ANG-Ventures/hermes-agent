@@ -138,6 +138,37 @@ class TestCallLlmEmitsDuration:
         assert len(lines) == 1, lines
         assert "outcome=failed" in lines[0]
 
+    @pytest.mark.parametrize("verdict,expected", [
+        ("refusal", "outcome=refusal"),
+        (None, "outcome=ok"),
+    ])
+    def test_response_validator_labels_the_attempt_row(self, stub_impl, caplog, verdict, expected):
+        aux = stub_impl()
+        seen = []
+
+        def validator(response):
+            seen.append(response)
+            return verdict
+
+        with caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+            result = aux.call_llm(task="compression", response_validator=validator,
+                                  messages=[{"role": "user", "content": "x"}])
+        assert result == "summary" and seen == ["summary"]
+        lines = _compression_lines(caplog)
+        assert len(lines) == 1 and expected in lines[0], lines
+
+    def test_broken_response_validator_keeps_outcome_ok(self, stub_impl, caplog):
+        aux = stub_impl()
+
+        def validator(response):
+            raise ValueError("bad shape")
+
+        with caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+            assert aux.call_llm(task="compression", response_validator=validator,
+                                messages=[{"role": "user", "content": "x"}]) == "summary"
+        lines = _compression_lines(caplog)
+        assert len(lines) == 1 and "outcome=ok" in lines[0], lines
+
     def test_non_compression_task_logs_nothing(self, stub_impl, caplog):
         aux = stub_impl()
         with caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):

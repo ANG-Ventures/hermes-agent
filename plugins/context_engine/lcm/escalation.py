@@ -501,6 +501,24 @@ def _is_meta_refusal_reply(content: str, max_tokens: int) -> bool:
     )
 
 
+def _summary_content(response) -> str:
+    content = response.choices[0].message.content
+    if not isinstance(content, str):
+        content = str(content) if content else ""
+    return content
+
+
+def _summary_refusal_reason(response, max_tokens: int) -> Optional[str]:
+    """Why a returned summary response is a refusal, or None when it is not."""
+    finish_reason = getattr(response.choices[0], "finish_reason", None)
+    if finish_reason in ("content_filter", "refusal"):
+        return f"summary finished with {finish_reason}"
+    sanitized = _sanitize_reasoning_summary(_summary_content(response))
+    if sanitized and _is_meta_refusal_reply(sanitized, max_tokens):
+        return "summary reply is a safeguard meta-refusal, not a summary: " + sanitized[:200]
+    return None
+
+
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -511,27 +529,25 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
             "max_tokens": max_tokens,
+            # t_3494b652: the same classification labels call_llm's attempt row
+            # outcome=refusal, so it agrees with the outcome=refusal line below.
+            "response_validator": lambda r: (
+                "refusal" if _summary_refusal_reason(r, max_tokens) else None
+            ),
         }
         apply_lcm_model_route(call_kwargs, model)
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
-        finish_reason = getattr(response.choices[0], "finish_reason", None)
-        if finish_reason in ("content_filter", "refusal"):
-            raise SummaryRefusedError(f"summary finished with {finish_reason}")
-        content = response.choices[0].message.content
-        if not isinstance(content, str):
-            content = str(content) if content else ""
+        refusal = _summary_refusal_reason(response, max_tokens)
+        if refusal:
+            raise SummaryRefusedError(refusal)
+        content = _summary_content(response)
         sanitized = _sanitize_reasoning_summary(content)
         if content.strip() and not sanitized:
             logger.warning(
                 "LCM summary discarded reasoning-only output (model=%s); escalating",
                 model or "<default>",
-            )
-        if sanitized and _is_meta_refusal_reply(sanitized, max_tokens):
-            raise SummaryRefusedError(
-                "summary reply is a safeguard meta-refusal, not a summary: "
-                + sanitized[:200]
             )
         return sanitized
     except SummaryRefusedError:
