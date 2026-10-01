@@ -227,6 +227,43 @@ def test_stalled_retry_drains_the_correction_turn_and_keeps_first_turn_steer(
     )
 
 
+
+def test_straggler_late_result_from_another_root_is_not_listed(fleet_home, monkeypatch):
+    """#1579 merge-queue ejection: a wedged correction turn re-records its late
+    result when it finally exits (deferred persistence teardown), after the
+    registry was cleared. A different root agent must not list it as its own."""
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+    release, forever = threading.Event(), threading.Event()
+
+    def _answers(self):
+        if len(self.calls) == 1:
+            release.wait(10)
+            return {"final_response": "not json", "completed": True, "api_calls": 3}
+        self.frozen_activity_ts = time.time() - 60
+        forever.wait(30)
+        return {"final_response": '{"answer": 1}', "completed": True, "api_calls": 1}
+
+    first = _Agent(None, depth=0)
+    child = _Agent("sa-0-straggler", parent=first, api_calls=2, behavior=_answers)
+    child._delegate_output_schema = _SCHEMA
+    try:
+        entry = delegate_tool._run_single_child(0, "straggler goal", child, first)
+        assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
+        release.set()
+        assert _wait_until(lambda: _late_results(first), timeout=10.0)
+    finally:
+        forever.set()
+    with delegate_tool._late_results_lock:
+        delegate_tool._late_results.clear()  # what _clean_registry does between tests
+    # The deferred teardown re-records once the wedged turn exits.
+    assert _wait_until(lambda: _late_results(first), timeout=10.0)
+    second = _Agent(None, depth=0)
+    assert _late_results(second) == []
+    assert second.session_id != first.session_id
+
+
 # 3 ---------------------------------------------------------------------------
 def test_owned_late_result_listed_despite_many_newer_foreign_results(fleet_home):
     from tools import delegate_tool
