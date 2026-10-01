@@ -67,6 +67,12 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
                      "this model's budget is capped")),
     # Operator drain is deliberate capacity withholding, not quota.
     ("pool_pressure", ("drained", "draining-for-deploy")),
+    # Bridge interactive (TUI) session demotion, HTTP 409 tui_history_diverged
+    # (claude-bpx bridge/src/tuiRunner.js). The bridge withdrew this
+    # conversation's resident session; it is sticky until the bridge's idle TTL
+    # reaps it, so the route is unavailable for this session, not a bad request
+    # and not quota (t_693aa2e5: 145 rows/7d rendered "unclassified error").
+    ("pool_pressure", ("replayed history no longer matches",)),
     # Pool-wide exhaustion for every model is still pool-wide quota.
     ("quota_model", ("no eligible sub",)),
     ("conn", ("upstream connect timed out", "upstream unreachable",

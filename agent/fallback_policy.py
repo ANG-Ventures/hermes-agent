@@ -987,6 +987,16 @@ RELAY_DRAIN_CAUSE = "relay draining for deploy"
 THIRD_PARTY_CAUSE = "plan billing refused (extra usage only)"
 # Anthropic 400 "You're out of extra usage" (t_f00f05bd).
 EXTRA_USAGE_EXHAUSTED_CAUSE = "extra usage exhausted"
+# Bridge 409 tui_history_diverged (t_693aa2e5): the bridge demoted this
+# conversation's interactive session; its reason follows in parentheses.
+SESSION_DEMOTED_CAUSE = "interactive session demoted"
+_DEMOTE_REASON_RE = re.compile(r"has been demoted \(([^)]+)")
+
+
+def _session_demoted_cause(t: str) -> str:
+    m = _DEMOTE_REASON_RE.search(t)
+    reason = m.group(1).strip() if m else ""
+    return f"{SESSION_DEMOTED_CAUSE} ({reason})" if reason else SESSION_DEMOTED_CAUSE
 
 
 def _cause_phrase(row: Mapping[str, Any]) -> str:
@@ -1003,6 +1013,8 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return "read timeout"
         return "connection error"
     if cls == "pool_pressure":
+        if "replayed history no longer matches" in t:
+            return _session_demoted_cause(t)
         if "draining-for-deploy" in t or ("drain" in t and "deploy" in t):
             return RELAY_DRAIN_CAUSE
         if "burn" in t:
@@ -1321,6 +1333,8 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
                      or bool(row.get("relay_synthetic")))
     if cls == "pool_pressure" and _cause_phrase(row) == RELAY_DRAIN_CAUSE:
         return "relay deploying"
+    if cls == "pool_pressure" and _cause_phrase(row).startswith(SESSION_DEMOTED_CAUSE):
+        return "session demoted"
     if not relay_sourced:
         return None
     return {"conn": "connection issue", "pool_pressure": "relay busy"}.get(cls)
