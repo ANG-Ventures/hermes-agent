@@ -19,7 +19,9 @@ _log = logging.getLogger(__name__)
 # 2026-09-22: 3,706 rate_limited runs in 7d, 42% lived >2 min).
 _RELAY_RE = re.compile(r"^claude-(apr|bpr)$", re.IGNORECASE)
 # claude-alr is the apr relay under its a-local name (t_4c1a9bee): same capacity signal.
-_RELAY_ALIAS = {"claude-alr": "claude-apr"}
+# t_ee99d1cd: so are its a/d f/s harness faces (hermes-home#2173).
+_RELAY_ALIAS = {p: "claude-apr" for p in (
+    "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf")}
 _PINNED_RE = re.compile(r"^claude-(apx|bpx)-(\d+)$", re.IGNORECASE)
 
 # Each family has its OWN relay and its own eligible_count (Argus r1, PR #953:

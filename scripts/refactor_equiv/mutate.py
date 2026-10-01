@@ -67,8 +67,8 @@ def relay_header_mutations() -> list[Mutation]:
             "return-value: provider gate accepts direct anthropic",
             lambda p: replace_once(
                 p,
-                '_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr"})',
-                '_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "anthropic"})',
+                '_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf"})',
+                '_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "anthropic"})',
             ),
         ),
         Mutation(

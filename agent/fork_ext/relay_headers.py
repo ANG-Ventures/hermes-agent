@@ -84,13 +84,14 @@ def _pool_lane_src(agent, aux_task=None) -> str:
 # config/session/cron references remain), so it is no longer accepted here.
 # claude-alr (t_4c1a9bee, Ace 2026-09-30) is the SAME apr relay (:18810) under the
 # a-family local-execution name: it must carry the same affinity/lane headers.
-_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr"})
+# t_ee99d1cd: so are its a/d f/s harness-matrix faces (hermes-home#2173).
+_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf"})
 
 
 # Pool relays that speak the error-class-v2 contract (fallback spec 2026-09-25
 # D2 / Phase 1b). Both lanes: the affinity helper above is apr-only, but the
 # capability header must reach bpr too, so it has its own provider set.
-_POOL_CAPABILITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-bpr"})
+_POOL_CAPABILITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"})
 POOL_ACCEPTS_HEADER = "x-hermes-accepts"
 POOL_ACCEPTS_VALUE = "error-class-v2"
 

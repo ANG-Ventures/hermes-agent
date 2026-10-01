@@ -736,7 +736,7 @@ def lane_family(provider: str) -> str:
     if proxy_lane(p):
         return "cpa"
     for prefixes, family in (
-        (("claude-apx", "claude-apr", "claude-alr", "claude-api-proxy"), "apx/apr"),
+        (("claude-apx", "claude-apr", "claude-alr", "claude-dalr", "claude-api-proxy"), "apx/apr"),
         (("claude-bpx", "claude-bpr", "claude-bridge"), "bpx/bpr"),
         (("claude-cpx", "claude-cpr"), "cpx/cpr"),
         (("xai",), "xai"), (("openrouter",), "openrouter"),

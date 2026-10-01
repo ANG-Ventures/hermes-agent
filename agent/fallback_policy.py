@@ -108,7 +108,7 @@ def is_direct_pin(provider: Optional[str]) -> bool:
     return direct_pin(provider) is not None
 
 
-RELAY_PROVIDERS = frozenset(("claude-apr", "claude-alr", "claude-bpr"))
+RELAY_PROVIDERS = frozenset(("claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"))
 
 
 def has_seat_signal(provider: Optional[str]) -> bool:
