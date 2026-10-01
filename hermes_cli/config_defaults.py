@@ -2335,6 +2335,12 @@ DEFAULT_CONFIG = {
                                       # if it keeps making progress. 0 = 4x
                                       # child_timeout_seconds; positive = seconds (floor
                                       # child_timeout_seconds). Cannot be disabled.
+        "hung_child_seconds": 900,  # stop a child that makes no PROGRESS (token, API call
+                                    # boundary, tool start/result, turn boundary) for this
+                                    # long. Liveness heartbeats don't count. Independent of
+                                    # child_timeout_seconds (0 there = no budget, not no
+                                    # hang detection). Floor 60s; 0 = disabled. Default from
+                                    # measured subagent turns (max legit gap ~606s).
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch

@@ -1698,7 +1698,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         )
         if _is_progress:
             agent._codex_stream_last_progress_ts = now
-        agent._touch_activity("receiving stream response")
+        # A keepalive frame proves liveness only; it must not reset the
+        # delegate hung-child clock (delegation.hung_child_seconds).
+        agent._touch_activity("receiving stream response", heartbeat=not _is_progress)
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:

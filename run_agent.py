@@ -4481,6 +4481,7 @@ class AIAgent:
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
         progress: bool = True,
+        heartbeat: bool = False,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
@@ -4488,6 +4489,15 @@ class AIAgent:
         the provider"): it refreshes liveness but not ``_last_progress_ts``,
         which the kanban stall detector reads to tell a live wrapper from a
         progressing loop (t_7d034e3b).
+
+        ``heartbeat=True`` marks a periodic liveness tick fired while ONE
+        tool call is still running (tool-activity heartbeat, "terminal
+        command running (Ns elapsed)"). It still advances ``_last_progress_ts``
+        (the kanban stall detector counts a running tool as progress), but
+        neither it nor a ``progress=False`` ticker advances
+        ``_last_progress_event_ts``: the delegate hung-child detector keys on
+        that, so a child blocked inside one API call or one tool call is not
+        mistaken for one making progress (docs/dev/delegate-child-lifecycle.md).
 
         Also bridges to the kanban board's heartbeat fields when this
         process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
@@ -4515,6 +4525,8 @@ class AIAgent:
         self._last_activity_ts = time.time()
         if progress:
             self._last_progress_ts = self._last_activity_ts
+            if not heartbeat:
+                self._last_progress_event_ts = self._last_activity_ts
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
         if os.environ.get("HERMES_KANBAN_TASK"):
@@ -4846,6 +4858,7 @@ class AIAgent:
             last_activity_provenance=provenance,
             extra={
             "current_tool": self._current_tool,
+            "last_progress_event_ts": getattr(self, "_last_progress_event_ts", None),
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,

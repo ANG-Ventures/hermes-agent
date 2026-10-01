@@ -1140,6 +1140,11 @@ def init_agent(
     # Last REAL progress (API call, stream chunk, tool call) — wait tickers
     # refresh _last_activity_ts only. Read by the kanban stall detector.
     agent._last_progress_ts: float = agent._last_activity_ts
+    # Last progress EVENT (model token, API call boundary, tool start/result,
+    # turn boundary). Unlike _last_progress_ts, in-tool heartbeats
+    # (_touch_activity(heartbeat=True)) do not advance it. Read by the
+    # delegate hung-child detector (delegation.hung_child_seconds).
+    agent._last_progress_event_ts: float = agent._last_activity_ts
     agent._last_activity_desc: str = "initializing"
     # Default / unmigrated paths and _touch_activity stamp unknown; named
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).
