@@ -19415,7 +19415,7 @@ def sweep_terminal_workspace_orphans(
         base_real = os.path.realpath(str(base))
     except Exception:
         return {}
-    me, uid = os.getpid(), os.getuid()
+    me, uid = os.getpid(), os.getuid()  # windows-footgun: ok (hasattr-gated above)
     candidates: dict[str, list] = {}
     for proc in psutil.process_iter(["pid", "ppid", "uids"]):
         info = proc.info

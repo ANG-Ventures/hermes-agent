@@ -54,10 +54,10 @@ _WORKER = (
 _ORPHAN = (
     "import os, sys, time\n"
     "r, w = os.pipe()\n"
-    "if os.fork():\n"
+    "if os.fork():  # windows-footgun: ok (POSIX-only test, module skipif)\n"
     "    os.close(w); print(os.read(r, 32).decode().strip(), flush=True); os._exit(0)\n"
-    "os.setsid()\n"
-    "if os.fork():\n"
+    "os.setsid()  # windows-footgun: ok (POSIX-only test)\n"
+    "if os.fork():  # windows-footgun: ok (POSIX-only test, module skipif)\n"
     "    os._exit(0)\n"
     "os.chdir(sys.argv[1])\n"
     "n = os.open(os.devnull, os.O_RDWR)\n"
@@ -118,7 +118,7 @@ def test_completed_worker_listener_is_reaped_on_exit(conn):
     # identity registered.
     worker = subprocess.Popen(
         [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, text=True, start_new_session=True,
+        stdout=subprocess.PIPE, text=True, encoding="utf-8", start_new_session=True,
     )
     with kb._worker_processes_lock:
         kb._worker_processes[worker.pid] = worker
@@ -151,7 +151,8 @@ def test_completed_worker_listener_is_reaped_on_exit(conn):
 
 def _spawn_orphan(cwd: Path) -> int:
     out = subprocess.run([sys.executable, "-c", _ORPHAN, str(cwd)],
-                         capture_output=True, text=True, timeout=30, check=True).stdout
+                         capture_output=True, text=True, encoding="utf-8",
+                         timeout=30, check=True).stdout
     pid = int(out.strip())
     _STARTED.append(pid)
     deadline = time.monotonic() + 5
