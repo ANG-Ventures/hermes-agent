@@ -4929,6 +4929,101 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES
 
 
+def _relay_drain_wait_for(exc: Exception, started_at: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """``(seconds_to_wait, started_at)`` for a relay deploy-drain 503, else ``(None, started_at)``.
+
+    claude-pool deploy-drain answers 503 {"error":"draining-for-deploy"} +
+    Retry-After 15 for every model on the relay (t_826861ab); the transient
+    retry above gave it 1 s + 2 s and then raised to the caller (LCM opened its
+    summary circuit and truncated at L3). Same wait the main loop uses
+    (t_4349cf26): ``retry_utils.relay_drain_wait`` with the
+    ``fallback.relay_drain_wait_s`` wall-clock budget (default 150 s = relay
+    drain TTL 120 s + relaunch + health gate). ``None`` = not a drain, or the
+    budget is spent.
+    """
+    if not _is_relay_drain(exc):
+        return None, started_at
+    from agent.fallback_wiring import relay_drain_wait_s
+    from agent.retry_utils import relay_drain_wait
+
+    now = time.monotonic()
+    if started_at is None:
+        started_at = now
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    raw_ra = None
+    if headers is not None and hasattr(headers, "get"):
+        raw_ra = headers.get("retry-after") or headers.get("Retry-After")
+    wait = relay_drain_wait(
+        raw_retry_after=raw_ra, waited_s=now - started_at, max_wait_s=relay_drain_wait_s(),
+    )
+    return wait, started_at
+
+
+def _is_relay_drain(exc: Exception) -> bool:
+    from agent.error_classifier import is_relay_deploy_drain
+
+    return is_relay_deploy_drain(exc)
+
+
+def _relay_drain_sleep(seconds: float) -> None:
+    """Interruptible sleep for the drain wait (host cancel aborts it)."""
+    end = time.monotonic() + max(seconds, 0.0)
+    while True:
+        _raise_if_aux_cancel_requested()
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(0.2, left))
+
+
+async def _arelay_drain_sleep(seconds: float) -> None:
+    """Async twin of :func:`_relay_drain_sleep`."""
+    import asyncio
+
+    end = time.monotonic() + max(seconds, 0.0)
+    while True:
+        _raise_if_aux_cancel_requested()
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        await asyncio.sleep(min(0.2, left))
+
+
+def _call_through_relay_drain(call: Callable[[], Any], task: Optional[str]) -> Any:
+    """Run ``call``; while it fails with a relay deploy-drain 503, wait and re-run it
+    on the SAME provider/model (not an attempt, not a fallback trigger)."""
+    started_at = None
+    while True:
+        try:
+            return call()
+        except Exception as exc:
+            wait, started_at = _relay_drain_wait_for(exc, started_at)
+            if wait is None:
+                raise
+            logger.warning(
+                "Auxiliary %s: relay draining for deploy; retry same model in %.1fs "
+                "(waited %.0fs)", task or "call", wait, time.monotonic() - started_at,
+            )
+            _relay_drain_sleep(wait)
+
+
+async def _acall_through_relay_drain(call: Callable[[], Any], task: Optional[str]) -> Any:
+    """Async twin of :func:`_call_through_relay_drain`."""
+    started_at = None
+    while True:
+        try:
+            return await call()
+        except Exception as exc:
+            wait, started_at = _relay_drain_wait_for(exc, started_at)
+            if wait is None:
+                raise
+            logger.warning(
+                "Auxiliary %s (async): relay draining for deploy; retry same model in "
+                "%.1fs (waited %.0fs)", task or "call", wait, time.monotonic() - started_at,
+            )
+            await _arelay_drain_sleep(wait)
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -10725,7 +10820,7 @@ def _call_llm_impl(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _validate_llm_response(
+            return _call_through_relay_drain(lambda: _validate_llm_response(
                 _relay_sync_completion(
                     client,
                     kwargs,
@@ -10741,9 +10836,11 @@ def _call_llm_impl(
                     ),
                 ),
                 task,
-                provider=request_provider, base_url=_base_info)
+                provider=request_provider, base_url=_base_info), task)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+            # A drain that outlived its wait budget: the 1 s/2 s transient
+            # retries cannot outlast it, so hand it straight to the caller.
+            if not _is_transient_transport_error(transient_err) or _is_relay_drain(transient_err):
                 raise
             # Compression is on the critical preflight path: a user cannot
             # continue or resume an oversized session until it compacts. A
@@ -11602,7 +11699,7 @@ async def _async_call_llm_impl(
                 return await _acreate_with_stream(client, _kwargs, task)
             return await client.chat.completions.create(**_kwargs)
 
-        try:
+        async def _first_attempt():
             return _validate_llm_response(
                 await _relay_async_completion(
                     client,
@@ -11613,8 +11710,11 @@ async def _async_call_llm_impl(
                 ),
                 task,
                 provider=request_provider, base_url=_client_base)
+
+        try:
+            return await _acall_through_relay_drain(_first_attempt, task)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+            if not _is_transient_transport_error(transient_err) or _is_relay_drain(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
             # so skip the same-provider retry on a full-budget timeout and

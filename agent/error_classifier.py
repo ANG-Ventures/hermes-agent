@@ -423,6 +423,15 @@ def _is_relay_deploy_drain(error: Exception, body: Any) -> bool:
     return False
 
 
+def is_relay_deploy_drain(error: Exception) -> bool:
+    """Public form of the drain check for callers outside ``classify_api_error``
+    (auxiliary client, LCM summariser): same exact-key match, same status gate."""
+    status_code = _extract_status_code(error)
+    if status_code not in (None, 503):
+        return False
+    return _is_relay_deploy_drain(error, _extract_error_body(error))
+
+
 _POOL_STALLED_PATTERNS = [
     "upstream attempt timed out",
     "pool deadline exceeded",
