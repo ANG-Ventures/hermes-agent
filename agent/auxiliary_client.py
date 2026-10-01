@@ -605,6 +605,62 @@ def aux_progress_hook(hook):
         yield
 
 
+class _CombinedAuxCancelSignal:
+    """Event-like OR of a captured host cancel source and a local Event."""
+
+    __slots__ = ("_host_check", "_local_event")
+
+    def __init__(self, host_check: Optional[Callable[[], Any]], local_event: Any) -> None:
+        self._host_check = host_check
+        self._local_event = local_event
+
+    def is_set(self) -> bool:
+        local = self._local_event
+        if local is not None and local.is_set():
+            return True
+        check = self._host_check
+        return check is not None and _captured_aux_cancel_requested(check)
+
+
+def capture_aux_thread_state(extra_cancel_event: Any = None) -> Callable[[], Any]:
+    """Snapshot this thread's aux call state for a worker thread.
+
+    Interrupt protection (active flag + the explicit cancel source) and the
+    progress / dispatch / provider-response hooks are thread-local, so a
+    worker started from a compression call would otherwise lose the host
+    cancel source (a cancelled commit fence could not abort its stream) and
+    stop ticking liveness. Call on the owning thread; the returned factory
+    yields a context manager that installs the snapshot inside the worker and
+    restores the worker's prior state on exit. ``extra_cancel_event`` (an
+    Event) is OR-ed into the cancel source so the owner can abort sibling
+    workers. ContextVars (cost sink, route pins) are not covered: propagate
+    them with ``contextvars.copy_context``.
+    """
+    host_check = _capture_aux_cancel_check()
+    cancel_signal: Any = None
+    if host_check is not None or extra_cancel_event is not None:
+        cancel_signal = _CombinedAuxCancelSignal(host_check, extra_cancel_event)
+    active = getattr(_aux_interrupt_protection, "active", False)
+    progress = getattr(_aux_progress, "hook", None)
+    dispatch = getattr(_aux_dispatch, "hook", None)
+    provider_response = getattr(_aux_provider_response, "hook", None)
+
+    @contextlib.contextmanager
+    def _install():
+        with aux_interrupt_protection(active=active, cancel_event=cancel_signal), \
+                _aux_thread_local_hook(_aux_progress, progress), \
+                _aux_thread_local_hook(_aux_dispatch, dispatch), \
+                _aux_thread_local_hook(_aux_provider_response, provider_response):
+            yield
+
+    return _install
+
+
+def raise_if_aux_cancel_requested() -> None:
+    """Public form of the per-frame cancel check for callers outside a stream."""
+    _raise_if_aux_cancel_requested()
+
+
 # Back-compat alias — the timing hooks were introduced with this name.
 _aux_timing_hook = _aux_thread_local_hook
 

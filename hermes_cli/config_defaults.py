@@ -1182,6 +1182,17 @@ DEFAULT_CONFIG = {
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
+        "parallel_chunks": {          # LCM leaf summary map-reduce (default OFF).
+            "enabled": False,         # When True, a leaf summary whose source
+                                      # exceeds chunk_tokens is split at message
+                                      # boundaries (never inside a tool-call/result
+                                      # pair), the chunks are summarized concurrently,
+                                      # then one reduce call merges them into the
+                                      # same single leaf node the serial path writes.
+            "chunk_tokens": 120000,   # target source tokens per chunk
+            "max_concurrency": 4,     # concurrent chunk calls; keep <= the relay's
+                                      # max_inflight for the summary route
+        },
         "hygiene_failure_alert_after": 3,  # after N consecutive hygiene-compression failures, escalate
         "announce_below_threshold_compaction": True,  # announce a compaction the
                                       # CONTEXT ENGINE requested while the context was
