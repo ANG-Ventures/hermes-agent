@@ -7276,6 +7276,23 @@ def create_task(
                             **({"reason": force_reason} if forced else {}),
                         },
                     )
+                overlap_hits: list[dict] = []
+                if duplicate_guard:
+                    # Same-incident gate (t_ba30f0de): another session minted
+                    # this incident in the last 30 min. Never refuses; comments
+                    # both cards and holds this one in ready for 10 min.
+                    from . import kanban_overlap as _kov
+
+                    overlap_hits = _kov.find_overlaps(
+                        conn, task_id=task_id, title=title, body=body,
+                        session_id=session_id, tenant=tenant, now=now,
+                        parents=parents,
+                    )
+                    if overlap_hits:
+                        _kov.record_overlaps(
+                            conn, task_id, overlap_hits, now=now,
+                            append_event=_append_event, add_comment=add_comment,
+                        )
                 if flagship_override_reason:
                     from hermes_cli.model_policy import override_comment
 
@@ -7322,6 +7339,9 @@ def create_task(
                         },
                     )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            if overlap_hits:
+                # After commit, fire-and-forget: a create never waits on Discord.
+                _kov.notify_logs(board, task_id, overlap_hits)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -21390,6 +21410,21 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+
+    # 0. Same-incident overlap hold (t_ba30f0de). A card minted while another
+    #    session's card for the same incident was <30 min old waits in ready
+    #    for 10 min so the minting session can merge or withdraw it. An
+    #    operator requeue verb after the hold releases it early.
+    if lane == "ready":
+        from . import kanban_overlap as _kov
+
+        hold_until = _kov.overlap_hold_until(
+            conn, task_id, _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
+        )
+        if hold_until is not None and now < hold_until:
+            if detail is not None:
+                detail["eligible_at"] = hold_until
+            return "overlap_hold"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
