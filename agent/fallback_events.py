@@ -49,9 +49,14 @@ _PENDING_MAX_AGE_S = 900.0
 # unreachable / capacity wording is checked before generic "rate limit".
 _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("refusal", ("content_policy", "content policy", "safety refusal")),
+    # "Third-party apps now draw from your extra usage" (HTTP 400) is filed
+    # under auth on purpose: like a revoked token it is the ACCOUNT refusing
+    # this route, with no reset window to wait for. quota_seat/quota_model
+    # would arm the sticky quota clock and render "seat quota exhausted",
+    # both false. Its own backoff is fallback_policy.same_error_backoff.
     ("auth", ("oauth access token has been revoked", "token has been revoked",
               "invalid x-api-key", "authentication_error", "invalid bearer",
-              "unauthorized")),
+              "unauthorized", "third-party apps now draw from")),
     # Relay pool-wide model exhaustion (sent as 503) — pool-wide ONLY.
     ("quota_model", ("no eligible sub for the requested model",
                      "this model's budget is capped")),
@@ -265,7 +270,8 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "text": msg[:2000],
             "headers": {k: v for k, v in headers.items()
                         if k in ("x-relay-error-class", "x-relay-error-hop",
-                                 "x-relay-seat", "x-pool-unreachable",
+                                 "x-relay-seat", "x-pool-served-by",
+                                 "x-pool-unreachable",
                                  "x-pool-route-id", "retry-after",
                                  "x-ratelimit-limit", "x-ratelimit-remaining",
                                  "x-ratelimit-reset")},
@@ -364,6 +370,13 @@ def relay_hop_seat(headers: Any, body: Any) -> Tuple[Optional[str], Optional[str
     except Exception:  # noqa: BLE001
         return None, None
     return hop, seat
+
+
+def served_by_seat(headers: Any) -> Optional[str]:
+    """Seat in ``x-pool-served-by`` (claude-pool emits it on EVERY response,
+    upstream 4xx passthrough included); None when absent or ``none``/``unknown``."""
+    s = _lower_headers(headers).get("x-pool-served-by", "").strip()
+    return s if s and s.lower() not in _SEAT_UNSTATED else None
 
 
 PROVIDER_MESSAGE_MAX = 120
@@ -546,6 +559,10 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         r_hop, r_seat = relay_hop_seat(headers, body)
         if r_hop and not row.get("hop"):
             row["hop"] = r_hop
+        if not r_seat:
+            # A pooled relay names the seat that answered an upstream 4xx
+            # passthrough only in x-pool-served-by (no error-class-v2 headers).
+            r_seat = served_by_seat(headers)
         if r_seat and (not row.get("seat") or row.get("seat") == "unknown"):
             row["seat"] = r_seat
         # §4.8: a direct pin's seat and hop are knowable locally (no relay

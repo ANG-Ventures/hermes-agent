@@ -375,6 +375,52 @@ def post_failover(agent: Any, plan: FailoverPlan, *, failing: Tuple[Any, Any],
     return extra
 
 
+def same_error_on_failover(agent: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """Same-error re-failover backoff (t_7f2ced0d). Call on every failover
+    BEFORE the ledger row consumes the pending error. When this failover
+    repeats the previous one's ``err_hash`` within ``SAME_ERR_RETURN_WINDOW_S``
+    of a primary return, return the rider fields for the row, including
+    ``same_err_backoff_s``: the caller (``try_activate_fallback``, the one
+    writer of ``_rate_limited_until``) benches the primary for that long.
+    Else ``{}``. Never raises."""
+    try:
+        from agent import fallback_events as fbe
+
+        now = time.time() if now is None else now
+        pend = _pending(agent)
+        text = pend.get("text")
+        if not text:
+            return {}
+        headers = pend.get("headers") or {}
+        seat = fbe.relay_hop_seat(headers, pend.get("body"))[1] or fbe.served_by_seat(headers)
+        ep = fp.same_error_backoff(
+            getattr(agent, "_same_err_episode", None), err_hash=fbe.err_hash(text),
+            now=now, last_return_ts=getattr(agent, "_last_primary_return_ts", None), seat=seat)
+        agent._same_err_episode = ep
+        if ep["backoff_s"] is None:
+            return {}
+        logger.warning(
+            "same error as %s on %s/%s (seat %s, err_hash %s, repeat %d): "
+            "primary benched %.0f s", time.strftime("%H:%M:%S", time.localtime(ep["prev_ts"])),
+            getattr(agent, "provider", "?"),
+            getattr(agent, "model", "?"), ep["prev_seat"] or ep["seat"] or "unknown",
+            ep["err_hash"], ep["repeats"], ep["backoff_s"])
+        return {"same_err_prev_ts": ep["prev_ts"],
+                "same_err_prev_seat": ep["prev_seat"] or ep["seat"],
+                "same_err_backoff_s": ep["backoff_s"]}
+    except Exception:  # noqa: BLE001
+        logger.debug("same-error backoff failed open", exc_info=True)
+        return {}
+
+
+def note_primary_return(agent: Any, now: Optional[float] = None) -> None:
+    """Stamp the wall time of a primary return for :func:`same_error_on_failover`."""
+    try:
+        agent._last_primary_return_ts = time.time() if now is None else now
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ── success bookkeeping (§4.3 State) ─────────────────────────────────────
 
 def note_success(agent: Any, headers: Optional[Dict[str, str]]) -> None:
