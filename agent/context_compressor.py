@@ -5306,6 +5306,21 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _summary_main_runtime(self) -> Dict[str, Any]:
+        """The session's main route as ``call_llm(main_runtime=...)``.
+
+        One dict for every summary-path consumer, so a ``{provider: auto}``
+        fallback rung inherits the session's endpoint and key, not only its
+        provider/model.
+        """
+        return {
+            "model": self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "api_mode": self.api_mode,
+        }
+
     def _summary_refusal_call_route(self, route: Dict[str, Any]) -> Dict[str, Any]:
         """Routing kwargs ``_generate_summary`` sends for a refusal override."""
         call_route: Dict[str, Any] = {}
@@ -5345,9 +5360,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         tried = getattr(self, "_summary_refusal_routes_tried", None)
         if tried is None:
             tried = set()
-        for route in _compression_refusal_fallback_routes(
-            {"provider": self.provider, "model": self.model}
-        ):
+        for route in _compression_refusal_fallback_routes(self._summary_main_runtime()):
             # Same kwargs ``_generate_summary`` will send, so the key checked
             # here is the key it latches (t_2ba784cc: a model-less entry keeps
             # ``summary_model``; keying the bare entry recursed forever).
@@ -5716,13 +5729,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         try:
             call_kwargs = {
                 "task": "compression",
-                "main_runtime": {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "api_mode": self.api_mode,
-                },
+                "main_runtime": self._summary_main_runtime(),
                 "messages": [{"role": "user", "content": prompt}],
                 # NO max_tokens: the output cap must never truncate a summary.
                 # ``summary_budget`` is prompt-level guidance only ("Target ~N
