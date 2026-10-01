@@ -324,22 +324,79 @@ class _SteerLedger:
     def deliver(self, text: Any) -> None:
         """Consumer: *text* was written into the child's transcript.
 
-        The agent concatenates pending steers with newlines and may put a
-        drained batch back behind newer text, so entries are matched by
-        content, longest first, each consuming its own span of *text*.
+        The agent joins pending steers with newlines and may put a drained
+        batch back behind newer text, so *text* is always whole steers joined
+        by "\n", in some order. Settle the set of open entries that tiles
+        *text* exactly, on line boundaries (``_tile``). A substring match is
+        not enough: an undelivered "o\nb" sits inside a delivered "foo\nbar"
+        and would be settled in place of the two steers that were delivered.
+        If no exact tiling exists, settle only line-aligned spans.
         """
         if not isinstance(text, str) or not text:
             return
         with self._lock:
-            remaining = text
             open_ = [e for e in self._entries if e["state"] == "accepted" and e["text"]]
-            for e in sorted(open_, key=lambda e: (-len(e["text"]), e["seq"])):
-                i = remaining.find(e["text"])
-                if i < 0:
-                    continue
+            chosen = self._tile(text, open_)
+            if chosen is None:
+                chosen = self._aligned_spans(text, open_)
+            for e in sorted(chosen, key=lambda e: e["seq"]):
                 e["state"] = "delivered"
-                remaining = remaining[:i] + "\0" * len(e["text"]) + remaining[i + len(e["text"]):]
                 self._append({"op": "deliver", "seq": e["seq"]})
+
+    @staticmethod
+    def _tile(text: str, open_: List[Dict[str, Any]], budget: int = 10000) -> Optional[List[Dict[str, Any]]]:
+        """Open entries whose texts, joined by "\n" in some order, equal *text*.
+
+        Two acceptances can compose the same string ("foo\nbar" once, or
+        "foo" then "bar"). The newest acceptance is preferred: a drain empties
+        the whole slot, so an older entry still open beside newer ones with
+        the same text is the one that was dropped. Either tiling settles the
+        same lines, so ``missed()`` reports the same text.
+        """
+        by_text: Dict[str, List[Dict[str, Any]]] = {}
+        for e in sorted(open_, key=lambda e: -e["seq"]):
+            by_text.setdefault(e["text"], []).append(e)
+        texts = sorted(by_text, key=lambda t: -max(e["seq"] for e in by_text[t]))
+        used: Dict[str, int] = {}
+        picked: List[Dict[str, Any]] = []
+        steps = [0]
+
+        def walk(pos: int) -> bool:
+            if pos == len(text):
+                return True
+            steps[0] += 1
+            if steps[0] > budget:
+                return False
+            for t in texts:
+                n = used.get(t, 0)
+                if n >= len(by_text[t]) or not text.startswith(t, pos):
+                    continue
+                end = pos + len(t)
+                if end != len(text) and text[end] != "\n":
+                    continue
+                used[t] = n + 1
+                picked.append(by_text[t][n])
+                if walk(end if end == len(text) else end + 1):
+                    return True
+                picked.pop()
+                used[t] = n
+            return False
+
+        return list(picked) if walk(0) else None
+
+    @staticmethod
+    def _aligned_spans(text: str, open_: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fallback: newest-first, longest-first, line-aligned, disjoint spans."""
+        remaining = "\n" + text + "\n"
+        chosen = []
+        for e in sorted(open_, key=lambda e: (-len(e["text"]), -e["seq"])):
+            i = remaining.find("\n" + e["text"] + "\n")
+            if i < 0:
+                continue
+            chosen.append(e)
+            span = len(e["text"])
+            remaining = remaining[: i + 1] + "\0" * span + remaining[i + 1 + span :]
+        return chosen
 
     def missed(self) -> Optional[str]:
         with self._lock:

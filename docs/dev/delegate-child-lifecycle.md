@@ -125,10 +125,14 @@ Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
 - The only consumer is the agent loop: `apply_pending_steer_to_tool_results`
   and the pre-API injection call `note_steer_delivered(agent, text)` after the
   text is in a tool result. That calls `child._steer_delivery_sink`, which
-  settles the matching entries. Matching is by content, longest first, each
-  entry consuming its own span. The agent joins pending steers with newlines
-  and can put a drained batch back behind newer text, so order is not
-  relied on.
+  settles the matching entries. The agent joins pending steers with newlines
+  and can put a drained batch back behind newer text, so the delivered text
+  is whole steers joined by `"\n"` in some order. Delivery settles the set of
+  open entries that tiles it exactly on line boundaries, newest acceptance
+  first (#1585 :334: a substring match let an undelivered `"o\nb"` be settled
+  for a delivered `"foo\nbar"`). Two tilings of one text settle the same
+  lines, so `missed()` text is the same either way. Text with no exact tiling
+  settles only line-aligned entries.
 - `missed()` is "accepted and not delivered", in acceptance order, with
   duplicates kept (#1573 :3057). Every completion path reads it: the normal
   path's success, failure and exception branches (through
@@ -251,6 +255,14 @@ record.
 | `:3564` parent-driven close of a live child | real | door via `_owner_teardown` |
 | `:4963` recursive ancestor cleanup | real | door, reached by the recursion |
 
+#1585 @ eeb1e221. Tests in `tests/tools/test_delegate_round6_findings.py`:
+
+| Finding | Verdict | Mechanism |
+|---|---|---|
+| `:334` ambiguous delivery (substring settle) | real, RED on eeb1e221 | ledger: exact line-aligned tiling |
+| `:486` door raising treated as handled | by design: a raising door must not fall back to a direct close (I2); the owner's `_teardown(owner=True)` still closes the child; the swallow is now a WARNING | proof test |
+| `:297` unbounded ledger file | false: both path shapes sit in a top-level live dir that `prune_stale_live_dirs` (run on every dispatch) removes; one line per accept/withdraw/deliver | proof test |
+
 ## Test obligations
 
 - One test per finding, RED on the head where it was raised.
@@ -269,7 +281,7 @@ record.
   exactly once on the last release, and the deferred counter returns to its
   baseline.
 - Ledger unit test: duplicates are kept, a withdrawn entry is not missed,
-  matching is longest-first, and the durable operation log is complete.
+  delivery settles an exact line-aligned tiling, and the durable operation log is complete.
 - The AST contract test (`test_delegate_teardown_door.py`) is RED on
   f9d4df5a, naming its four bypasses (two door references, two run_agent loops). It includes killer mutations: a new
   door bypass in each of the three rule shapes must be reported.
