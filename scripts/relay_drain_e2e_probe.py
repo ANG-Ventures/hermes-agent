@@ -113,6 +113,14 @@ def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
         return json.loads(r.read() or b"{}")
 
 
+def write_private(path: Path, text: str) -> None:
+    """Create ``path`` 0600 from the first byte (no write-then-chmod window)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, 0o600)
+
+
 def one_seat_registry(seat_label_prefix: str, dest: Path) -> None:
     d = json.loads(PROD_REGISTRY.read_text(encoding="utf-8"))
     subs = d["subs"]
@@ -126,8 +134,7 @@ def one_seat_registry(seat_label_prefix: str, dest: Path) -> None:
     if seat_label_prefix in SUB0_KEYS or "Mac Studio" in str(keep[0].get("label")):
         raise SystemExit("refusing sub 0 (Ace's own seat)")
     d["subs"] = keep
-    dest.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    dest.chmod(0o600)
+    write_private(dest, json.dumps(d, indent=2))
 
 
 class ScratchRelay:
@@ -281,7 +288,11 @@ def scratch_home(
         "blackbox:",
         "  enabled: true",
         "  alerts_enabled: false",
-        "toolsets: []",
+        # oneshot resolves tools via platform_toolsets.cli (default hermes-cli);
+        # an explicit empty list is the "no tools" selection. tools_preflight()
+        # proves it before any turn.
+        "platform_toolsets:",
+        "  cli: []",
         "memory:",
         "  memory_enabled: false",
         "  user_profile_enabled: false",
@@ -295,12 +306,10 @@ def scratch_home(
         for ln in PROD_ENV.read_text(encoding="utf-8").splitlines()
         if ln.startswith("CLAUDE_BPP_KEY=")
     ]
-    envf = home / ".env"
-    envf.write_text(
+    write_private(
+        home / ".env",
         "\n".join(key + [f"CLAUDE_BPP_BASE_URL=http://127.0.0.1:{port}/v1"]) + "\n",
-        encoding="utf-8",
     )
-    envf.chmod(0o600)
     (home / "plugins").symlink_to(PROD_PLUGINS)
     return home
 
@@ -325,7 +334,39 @@ def tree_python(tree: Path) -> Path:
     return py
 
 
-def confirm_tree(tree: Path, env: dict) -> str:
+def tools_preflight(tree: Path, env: dict, cwd: Path) -> None:
+    """Resolve the tool schema exactly as oneshot does; refuse unless empty."""
+    code = (
+        "import json;"
+        "from hermes_cli.config import load_config;"
+        "from hermes_cli.tools_config import _get_platform_tools;"
+        "from model_tools import get_tool_definitions;"
+        "ts = sorted(_get_platform_tools(load_config(), 'cli'));"
+        "d = get_tool_definitions(enabled_toolsets=ts, quiet_mode=True);"
+        "print(json.dumps({'toolsets': ts, 'tools': [t['function']['name'] for t in d]}))"
+    )
+    out = subprocess.run(
+        [str(tree_python(tree)), "-c", code],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+    if out.returncode:
+        raise SystemExit(f"tools preflight failed: {out.stderr[-800:]}")
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    if got["tools"]:
+        raise SystemExit(
+            f"tools preflight: the probe turn would expose {len(got['tools'])} tools "
+            f"({got['tools'][:8]}...); refusing"
+        )
+    log(f"tools preflight: toolsets={got['toolsets']} tools=0")
+
+
+def confirm_tree(tree: Path, env: dict, cwd: Path) -> str:
     code = (
         "import agent.error_classifier as m, agent.conversation_loop as c;"
         "print(m.__file__);print(c.__file__);"
@@ -333,7 +374,7 @@ def confirm_tree(tree: Path, env: dict) -> str:
     )
     out = subprocess.run(
         [str(tree_python(tree)), "-c", code],
-        cwd=str(tree),
+        cwd=str(cwd),
         env=env,
         capture_output=True,
         text=True,
@@ -450,7 +491,13 @@ def main() -> int:
     )
     a = ap.parse_args()
     if a.hold_drain:
-        a.drain_ttl = max(a.drain_ttl, int(min(a.turn_timeout + 60, 600)))
+        # The relay clamps a drain TTL to 600 s and an active drain is not
+        # renewable without an undrain gap, so a held drain must outlast the turn.
+        if a.turn_timeout + 60 > 600:
+            raise SystemExit(
+                "--hold-drain needs --turn-timeout <= 540 (relay drain TTL cap 600 s)"
+            )
+        a.drain_ttl = max(a.drain_ttl, int(a.turn_timeout + 60))
 
     tree = a.runtime_tree.resolve()
     live = (USER_HOME / ".hermes/runtime/hermes-agent").resolve()
@@ -466,7 +513,9 @@ def main() -> int:
                 f"(no {OUT_MARKER}); refusing to delete it"
             )
         shutil.rmtree(work)
-    work.mkdir(parents=True)
+    # 0700 before anything sensitive (relay bearer, registry) lands inside.
+    work.mkdir(parents=True, mode=0o700)
+    os.chmod(work, 0o700)
     (work / OUT_MARKER).write_text(
         "relay_drain_e2e_probe output dir\n", encoding="utf-8"
     )
@@ -477,7 +526,8 @@ def main() -> int:
     log(
         f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) home={home}"
     )
-    fixed = confirm_tree(tree, env)
+    fixed = confirm_tree(tree, env, work)
+    tools_preflight(tree, env, work)
 
     relay = ScratchRelay(a.port, work, registry, v2=a.relay_v2)
     relay.start()
@@ -497,7 +547,6 @@ def main() -> int:
         driver,
         "-z",
         PROMPT,
-        "--yolo",
         "--usage-file",
         str(usage_p),
     ]
@@ -513,7 +562,7 @@ def main() -> int:
             drained = True
         turn = subprocess.Popen(
             cmd,
-            cwd=str(tree),
+            cwd=str(work),
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=open(stdout_p, "wb"),
