@@ -125,16 +125,35 @@ def _is_json_call(node, attr):
     )
 
 
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _scope_walk(scope):
+    """Nodes of ONE scope: do not descend into nested function/class bodies.
+
+    A name assigned from json.dumps in one function must not taint a same-named
+    variable in another (t_b9839378: `text = json.dumps(...)` in one helper made the
+    module-scope pass flag `redact_sensitive_text(text)` in an unrelated helper).
+    Each nested scope is checked on its own by the outer ast.walk in _violations.
+    """
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, _SCOPES):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _violations(tree):
     out = []
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
             continue
         dumped = set()
-        for node in ast.walk(fn):
+        for node in _scope_walk(fn):
             if isinstance(node, ast.Assign) and _is_json_call(node.value, "dumps"):
                 dumped.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        for node in ast.walk(fn):
+        for node in _scope_walk(fn):
             if _is_call_to(node, "redact_sensitive_text") and node.args:
                 a = node.args[0]
                 if _is_json_call(a, "dumps") or (isinstance(a, ast.Name) and a.id in dumped):
@@ -155,6 +174,23 @@ def test_guard_detects_the_shapes():
         "def ok(m):\n    return json.dumps(redact_sensitive_json(m))\n"
     )
     assert _violations(ast.parse(src)) == [3, 6, 9]
+
+
+def test_guard_does_not_taint_names_across_scopes():
+    # t_b9839378: a dumps-assigned name in one function is a different variable in another.
+    src = (
+        "import json\n"
+        "def scrub(text):\n    return redact_sensitive_text(text)\n"
+        "def body(raw):\n    text = json.dumps(raw)\n    return text\n"
+    )
+    assert _violations(ast.parse(src)) == []
+    nested = (
+        "import json\n"
+        "def outer(m):\n"
+        "    def inner(m):\n        s = json.dumps(m)\n        return redact_sensitive_text(s)\n"
+        "    return inner(m)\n"
+    )
+    assert _violations(ast.parse(nested)) == [5]
 
 
 def test_no_serialize_then_redact_text_call_sites():
