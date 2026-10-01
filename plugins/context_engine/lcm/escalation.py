@@ -224,6 +224,24 @@ class SummaryRefusedError(RuntimeError):
 _SAFEGUARD_REFUSAL_MARKERS = ("safeguard_refusal", "safeguards flagged this")
 
 
+class SummaryRelayDrainingError(RuntimeError):
+    """The summary route's relay is draining for a deploy (503
+    ``draining-for-deploy``) and stayed so past the auxiliary client's wait.
+
+    About the relay, not the route or the content: it never counts toward the
+    summary-route circuit, and it propagates instead of escalating to L2 (same
+    relay) or committing an L3 truncation (t_0c8c3203).
+    """
+
+
+def _is_relay_drain(exc: BaseException) -> bool:
+    try:
+        from agent.error_classifier import is_relay_deploy_drain
+    except Exception:  # vendored plugin running outside the fork
+        return False
+    return isinstance(exc, Exception) and is_relay_deploy_drain(exc)
+
+
 def _is_safeguard_refusal(exc: BaseException) -> bool:
     if getattr(exc, "code", None) == "safeguard_refusal":
         return True
@@ -407,6 +425,8 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
     except SummaryRefusedError:
         raise
     except Exception as e:
+        if _is_relay_drain(e):
+            raise SummaryRelayDrainingError(str(e)[:300]) from e
         if _is_safeguard_refusal(e):
             raise SummaryRefusedError(str(e)[:300]) from e
         logger.warning("LLM summarization failed: %s", e)
@@ -532,6 +552,7 @@ def _invoke_summary_llm_chain(
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
+    drained: SummaryRelayDrainingError | None = None
     for candidate_model in chain:
         route_key = _summary_route_key(candidate_model) if segment_key else ""
         latched_for = _SUMMARY_REFUSALS.remaining(route_key, segment_key) if segment_key else 0.0
@@ -577,6 +598,17 @@ def _invoke_summary_llm_chain(
             if segment_key:
                 _SUMMARY_REFUSALS.record(route_key, segment_key)
             continue
+        except SummaryRelayDrainingError as exc:
+            # Not a route failure: no breaker tick. Another chain model may
+            # sit on a different relay, so keep walking.
+            logger.warning(
+                "LCM summary route %s: relay draining for deploy; not counted "
+                "toward the circuit: %s",
+                candidate_model or _DEFAULT_ROUTE_KEY,
+                exc,
+            )
+            drained = exc
+            continue
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
             result = None
@@ -588,6 +620,10 @@ def _invoke_summary_llm_chain(
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
         logger.warning("LCM summary fallback chain exhausted: all routes are temporarily open")
+    if drained is not None:
+        # Escalating would hit the same draining relay (L2) or commit a
+        # truncation (L3); let the caller defer the compaction instead.
+        raise drained
     return None
 
 
