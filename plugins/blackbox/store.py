@@ -154,6 +154,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_cache_write INT,
             last_uncached INT,
             last_call_prompt_unknown INT DEFAULT 0,
+            corrected_context_used INT,
             comp_sys_tokens INT,
             comp_tool_schema_tokens INT,
             comp_history_tokens INT,
@@ -242,6 +243,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             http_status INT,
             relay_synthetic INT NOT NULL DEFAULT 0,
             route_id TEXT,
+            -- Relay usage invariant (claude-bpx#397, card t_5918f6f7): the
+            -- relay's reason string when its reported prompt exceeds the
+            -- model's context window (e.g. 'prompt_exceeds_context_window'),
+            -- else NULL. The raw token columns stay as billed; only CONTEXT
+            -- SIZE readers use corrected_prompt_tokens (the last-request
+            -- prompt, or the context window when unrecoverable).
+            -- upstream_requests = the relay's count of upstream requests
+            -- behind this one call (NULL when the relay does not say).
+            usage_invariant_violation TEXT,
+            corrected_prompt_tokens INT,
+            upstream_requests INT,
             -- Who minted route_id (S7 D1): relay | harness | cli, derived from
             -- the id's prefix by relay_headers.route_id_origin. NULL with it.
             route_id_origin TEXT,
@@ -431,7 +443,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT"),
                       ("call_id", "TEXT"), ("parent_call_id", "INT"),
                       ("sub_harness", "TEXT"), ("route_id_origin", "TEXT"),
-                      ("vendor", "TEXT"), ("served_provider", "TEXT")):
+                      ("vendor", "TEXT"), ("served_provider", "TEXT"),
+                      ("usage_invariant_violation", "TEXT"),
+                      ("corrected_prompt_tokens", "INT"),
+                      ("upstream_requests", "INT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -459,6 +474,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if "last_call_prompt_unknown" not in _existing:
         try:
             conn.execute("ALTER TABLE turns ADD COLUMN last_call_prompt_unknown INT")
+        except sqlite3.OperationalError:
+            pass  # raced with another writer; column now exists
+    # Context-size correction (t_5918f6f7): NULL unless the stored
+    # context_used is not a context size (relay usage invariant, or a value
+    # over context_length). Written by _refresh_context_invariant, never by
+    # the upsert, so a re-finalize cannot erase a backfilled correction.
+    if "corrected_context_used" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN corrected_context_used INT")
         except sqlite3.OperationalError:
             pass  # raced with another writer; column now exists
     # Request-composition columns (fixed vs non-fixed breakdown of the final
@@ -927,6 +951,47 @@ def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
 MIXED_ROUTE = "mixed"
 
 
+def _refresh_context_invariant(conn: sqlite3.Connection, turn_id: str) -> int | None:
+    """Set turns.corrected_context_used when context_used is not a context size.
+
+    Only when the turn's final measured call carries usage_invariant_violation
+    (the relay's claude-bpx#397 flag, or a backfilled pre-#397 relay sum,
+    t_5918f6f7). The correction is that call's corrected_prompt_tokens, else
+    the context window. Otherwise NULL. context_used > context_length alone is
+    NOT enough: on 2026-09-30, 38 codex/Claude turns in three stores exceeded a
+    context_length of 128k-272k with real prompts (the harness's configured
+    length, not the model window). Billing columns are never touched.
+    """
+    row = conn.execute(
+        "SELECT context_used, context_length FROM turns WHERE turn_id = ?",
+        (turn_id,),
+    ).fetchone()
+    if row is None:
+        return
+    last = conn.execute(
+        "SELECT usage_invariant_violation, corrected_prompt_tokens "
+        "FROM turn_api_calls WHERE turn_id = ? AND parent_call_id IS NULL "
+        "AND (http_status IS NULL OR http_status = 200) "
+        "AND coalesce(lane_family, '') != ? "
+        "ORDER BY seq DESC LIMIT 1",
+        # An auxiliary call (title, compression) is not the turn's context:
+        # it must neither clear nor replace the main call's correction.
+        (turn_id, AUX_LANE_FAMILY),
+    ).fetchone()
+    violation, call_corrected = (last[0], last[1]) if last else (None, None)
+    corrected = None
+    if violation:
+        # The relay omitted a usable model window: context_length may be the
+        # harness's configured limit (272k on a 1M model), so it cannot be a
+        # fallback. -1 is the display-only unknown marker, not a token count.
+        corrected = call_corrected if call_corrected is not None else -1
+    conn.execute(
+        "UPDATE turns SET corrected_context_used = ? WHERE turn_id = ?",
+        (corrected, turn_id),
+    )
+    return corrected
+
+
 def _refresh_turn_route(conn: sqlite3.Connection, turn_id: str) -> None:
     """Stamp lane_family/vendor/served_provider ``mixed`` when calls disagree.
 
@@ -1072,6 +1137,9 @@ def insert_turn(
                 return False
             _refresh_served_subs(conn, record.turn_id)
             _refresh_turn_route(conn, record.turn_id)
+            # The spend card renders this same record object after insert:
+            # carry the stored correction onto it (never into the upsert).
+            record.corrected_context_used = _refresh_context_invariant(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
             for seq, call in enumerate(record.tool_calls or []):
                 conn.execute(
@@ -1228,6 +1296,9 @@ def insert_api_call(
     cache_write_1h: int | None = None,
     cache_ttl_requested: str | None = None,
     call_id: str | None = None,
+    usage_invariant_violation: str | None = None,
+    corrected_prompt_tokens: int | None = None,
+    upstream_requests: int | None = None,
 ) -> None:
     """Append one call, including zero-usage failures, without changing turn totals.
 
@@ -1254,8 +1325,11 @@ def insert_api_call(
                 output_tokens, cache_read, cache_write, reasoning, attribution,
                 http_status, relay_synthetic, route_id, cache_write_5m,
                 cache_write_1h, cache_ttl_requested, lane_family, call_id,
-                route_id_origin, vendor, served_provider
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                route_id_origin, vendor, served_provider,
+                usage_invariant_violation, corrected_prompt_tokens,
+                upstream_requests
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model,
              _measured(usage, "input_tokens"), _measured(usage, "output_tokens"),
@@ -1264,12 +1338,15 @@ def insert_api_call(
              _bool_int(relay_synthetic), route_id, cache_write_5m,
              cache_write_1h, cache_ttl_requested,
              AUX_LANE_FAMILY if aux else lane_family(provider), call_id,
-             _route_id_origin(route_id), *_route_columns(provider, model)[1:]),
+             _route_id_origin(route_id), *_route_columns(provider, model)[1:],
+             usage_invariant_violation, _int_or_none(corrected_prompt_tokens),
+             _int_or_none(upstream_requests)),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
             _refresh_served_subs(conn, turn_id)
             _refresh_turn_route(conn, turn_id)
+            _refresh_context_invariant(conn, turn_id)
         if http_status in (None, 200):
             _backfill_fallback_next_call(conn, turn_id, ts, usage)
 

@@ -475,6 +475,58 @@ def _failed_extract_batch(results: list, urls: list) -> bool:
             and not all(_policy_blocked_result(r) for r in results))
 
 
+# ─── Dead-backend circuit breaker (tools/web_backend_breaker.py) ─────────────
+
+def _breaker_search(provider, query: str, limit: int) -> dict:
+    """``provider.search`` behind the 402/401 breaker.
+
+    An open breaker skips the network call and returns a failure, so the
+    normal fallback chain / keyless rescue serves the call without first
+    paying a doomed round-trip.
+    """
+    from tools import web_backend_breaker as _bb
+
+    until = _bb.open_until(provider.name)
+    if until:
+        return {"success": False, "error": _bb.skip_error(provider.name, until)}
+    try:
+        resp = provider.search(query, limit)
+    except Exception as exc:
+        _bb.record_failure(provider.name, exc, cfg=_load_web_config())
+        raise
+    if resp.get("success"):
+        _bb.record_success(provider.name)
+    else:
+        _bb.record_failure(provider.name, resp.get("error"), cfg=_load_web_config())
+    return resp
+
+
+async def _breaker_extract(provider, urls: list, format) -> list:
+    """``provider.extract`` behind the 402/401 breaker (whole-batch semantics)."""
+    import inspect
+
+    from tools import web_backend_breaker as _bb
+
+    until = _bb.open_until(provider.name)
+    if until:
+        err = _bb.skip_error(provider.name, until)
+        return [{"url": u, "title": "", "content": "", "error": err} for u in urls]
+    try:
+        if inspect.iscoroutinefunction(provider.extract):
+            results = await provider.extract(urls, format=format)
+        else:
+            results = await asyncio.to_thread(provider.extract, urls, format=format)
+    except Exception as exc:
+        _bb.record_failure(provider.name, exc, cfg=_load_web_config())
+        raise
+    # Per-URL errors can be a target site's 401/402 (paywall/login), not
+    # the extract vendor's billing/auth status. Only an exception at the
+    # provider boundary above can trip the shared search/extract breaker.
+    if results and any(not r.get("error") for r in results):
+        _bb.record_success(provider.name)
+    return results
+
+
 # ─── One-shot keyless rescue (keyed/configured backend failed) ───────────────
 
 def _keyless_rescue_enabled() -> bool:
@@ -540,8 +592,11 @@ def _rescue_search(provider_name: str, original_error: str, query: str, limit: i
     user) can see the configured backend needs attention.
     """
     from plugins.web.keyless_mcp import search_with_failover
+    from tools import web_backend_breaker as _bb
 
-    logger.warning(
+    # A dead (402/401) backend already logged once for its episode.
+    logger.log(
+        logging.DEBUG if _bb.open_until(provider_name) else logging.WARNING,
         "web_search backend '%s' failed (%s); one-shot keyless rescue",
         provider_name, (original_error or "")[:200],
     )
@@ -1031,7 +1086,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 _rescued = False
                 current = provider
                 try:
-                    _resp = current.search(query, _fetch_limit)
+                    _resp = _breaker_search(current, query, _fetch_limit)
                 except Exception as exc:  # noqa: BLE001 — candidate for fallback
                     _resp = {"success": False, "error": str(exc)}
                     if not _load_web_config().get("search_fallbacks") and not _rescue_eligible(current):
@@ -1045,7 +1100,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     )
                     current = candidate
                     try:
-                        _resp = candidate.search(query, _fetch_limit)
+                        _resp = _breaker_search(candidate, query, _fetch_limit)
                     except Exception as exc:  # noqa: BLE001 — next keyed candidate
                         _resp = {"success": False, "error": str(exc)}
                 if current is not provider:
@@ -1374,16 +1429,10 @@ async def web_extract_tool(
 
                 # Async-or-sync dispatch: parallel + firecrawl have async
                 # extract(); exa + tavily are sync.
-                import inspect
                 _extract_rescued = False
                 current = provider
                 try:
-                    if inspect.iscoroutinefunction(current.extract):
-                        results = await current.extract(fetch_urls, format=format)
-                    else:
-                        results = await asyncio.to_thread(
-                            current.extract, fetch_urls, format=format
-                        )
+                    results = await _breaker_extract(current, fetch_urls, format)
                 except Exception as exc:  # noqa: BLE001 — candidate for fallback
                     if not _load_web_config().get("extract_fallbacks") and not _rescue_eligible(current):
                         raise
@@ -1402,12 +1451,7 @@ async def web_extract_tool(
                     )
                     current = candidate
                     try:
-                        if inspect.iscoroutinefunction(current.extract):
-                            results = await current.extract(fetch_urls, format=format)
-                        else:
-                            results = await asyncio.to_thread(
-                                current.extract, fetch_urls, format=format
-                            )
+                        results = await _breaker_extract(current, fetch_urls, format)
                     except Exception as exc:  # noqa: BLE001 — next keyed candidate
                         results = [{"url": u, "title": "", "content": "", "error": str(exc)}
                                    for u in fetch_urls]

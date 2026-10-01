@@ -73,6 +73,12 @@ def resolve_prompt_cache_scope(agent: Any) -> str:
     keyed by the current session id, so the DB walk happens once per
     transcript segment rather than once per API call.
     """
+    # A host that mints one short-lived session per request/room can declare the
+    # logical cache scope explicitly (tui_gateway session.create ``cache_scope``).
+    # It wins over the lineage walk; forks still get their tag.
+    declared = getattr(agent, "_declared_cache_scope", None)
+    if isinstance(declared, str) and declared:
+        return _apply_fork_tag(agent, declared)
     sid = str(getattr(agent, "session_id", None) or "")
     if not sid:
         return ""

@@ -616,11 +616,24 @@ DEFAULT_CONFIG = {
         # failing over to the next ring vendor on rate limits. Never
         # pre-empts a configured or keyed backend. Set false to disable.
         "keyless_fallback": True,
+        # Omit named vendors from the anonymous ring for this profile (e.g.
+        # an exhausted Firecrawl account); other free vendors still fail over.
+        "keyless_exclude": [],
         # One-shot keyless rescue: when the chosen/keyed backend fails a
         # web_search/web_extract call, THAT call retries once on the keyless
         # free-tier ring — the next call attempts the chosen backend again
         # (no sticky failover). Off when keyless_fallback is false.
         "keyless_rescue": True,
+        # Dead-backend circuit breaker: a keyed backend answering HTTP 402
+        # (out of credits) or 401 (bad key) is skipped for this many seconds
+        # instead of being retried on every call; the fallback chain serves
+        # meanwhile. One WARNING per episode (first failure to next success).
+        # 0 disables the breaker.
+        "dead_backend_cooldown_seconds": 3600,
+        # Shell command run ONCE per dead-backend episode (e.g. a pager).
+        # Env: WEB_BACKEND, WEB_BACKEND_STATUS (402|401), WEB_BACKEND_ERROR.
+        # A nonzero exit is retried on the next trip. Empty = log only.
+        "dead_backend_alert_command": "",
         # Per-provider tier selection for ring vendors with both a keyless
         # free endpoint and a keyed paid path (exa, parallel, tavily,
         # firecrawl, keenable). Set by the `hermes tools` picker's
@@ -1083,6 +1096,8 @@ DEFAULT_CONFIG = {
         # a bare string). Slugs resolving to the large verified window are
         # never autoraised below. Flip back: `hermes config set
         # model.codex_context_policy advertised` (2026-09-30, t_73689428).
+        # Managed-scope overrides apply; running agents keep their resolved
+        # window until a new session or restart (t_27a85d2c).
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
@@ -1099,6 +1114,11 @@ DEFAULT_CONFIG = {
                                       # autoraise banner. Set False to keep the
                                       # 85% threshold autoraise but suppress the
                                       # user-facing notice in CLI/gateway output.
+        "codex_tier_notice": True,    # One-time per-session notice the first time a
+                                      # large-window Codex prompt (model.codex_context_policy:
+                                      # large) passes 272K tokens: turns above 272K price at
+                                      # the higher tier (2x input). Display-only; set False
+                                      # to silence it. Never shown under `advertised`.
         "codex_app_server_auto": "native",  # Codex app-server (codex CLI runtime) thread
                                       # compaction mode. The codex agent owns the real
                                       # thread context, so Hermes' summarizer cannot
@@ -1162,6 +1182,17 @@ DEFAULT_CONFIG = {
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
+        "parallel_chunks": {          # LCM leaf summary map-reduce (default OFF).
+            "enabled": False,         # When True, a leaf summary whose source
+                                      # exceeds chunk_tokens is split at message
+                                      # boundaries (never inside a tool-call/result
+                                      # pair), the chunks are summarized concurrently,
+                                      # then one reduce call merges them into the
+                                      # same single leaf node the serial path writes.
+            "chunk_tokens": 120000,   # target source tokens per chunk
+            "max_concurrency": 4,     # concurrent chunk calls; keep <= the relay's
+                                      # max_inflight for the summary route
+        },
         "hygiene_failure_alert_after": 3,  # after N consecutive hygiene-compression failures, escalate
         "announce_below_threshold_compaction": True,  # announce a compaction the
                                       # CONTEXT ENGINE requested while the context was
@@ -2296,7 +2327,14 @@ DEFAULT_CONFIG = {
                                      # = no timeout: children fail only from real errors
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+                                     # (floor 60s) to enforce a hard cap.
+        "child_max_wall_seconds": 0,  # absolute ceiling for a child whose wait hit
+                                      # child_timeout_seconds while it was still working
+                                      # (timed_out_running). The late owner stops such a
+                                      # child after this many seconds from its start even
+                                      # if it keeps making progress. 0 = 4x
+                                      # child_timeout_seconds; positive = seconds (floor
+                                      # child_timeout_seconds). Cannot be disabled.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch
@@ -2611,6 +2649,11 @@ DEFAULT_CONFIG = {
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
         },
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
+        # Native slash-menu scope for THIS bot: "all" (default) | "none" | list of
+        # names (e.g. ["status", "stop"]). "none" registers nothing and deletes this
+        # app's existing global + guild commands on every connect, so a second bot
+        # in a guild adds zero "/" picker entries; "!status" text still works.
+        "slash_commands": "all",
         # Discord Gateway transport health. These settings inspect the active
         # WebSocket's ready/open/heartbeat state; they never use Discord REST as
         # proof that Gateway events are still arriving. Set any value to 0 to

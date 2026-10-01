@@ -92,6 +92,16 @@ class ProviderProfile:
     # row, #48879) keep the default.
     owns_transcript: bool = False
 
+    # codex_subscription_backend: the provider serves Codex-family slugs
+    # (gpt-*) from a ChatGPT/Codex SUBSCRIPTION (e.g. the cpa CLIProxyAPI
+    # lane), so the backend enforces the Codex window, not the API
+    # platform's. Opt-in: Codex-family slugs on such a provider resolve their
+    # context window exactly as ``openai-codex`` does (verified tables,
+    # ``model.codex_context_policy``, ``-900k`` alias); other ids on the same
+    # provider are unaffected. See agent/model_metadata.py
+    # ``provider_serves_codex_subscription``.
+    codex_subscription_backend: bool = False
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.

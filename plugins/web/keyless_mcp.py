@@ -799,7 +799,15 @@ def _ring_order(name: str) -> List[str]:
         _KEYLESS_RING[(start + i) % len(_KEYLESS_RING)]
         for i in range(len(_KEYLESS_RING))
     ]
-    return [v for v in ordered if provider_tier(v) != "paid"]
+    try:
+        import tools.web_tools as _wt
+
+        excluded = _wt._load_web_config().get("keyless_exclude", [])
+        if not isinstance(excluded, list):
+            excluded = []
+    except Exception:  # noqa: BLE001 — config optional during early discovery
+        excluded = []
+    return [v for v in ordered if provider_tier(v) != "paid" and v not in excluded]
 
 
 def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any]:

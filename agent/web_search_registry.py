@@ -196,9 +196,14 @@ def _keyless_preference() -> tuple:
         from plugins.web.keyless_mcp import _KEYLESS_RING, _ring_cursor
 
         start = _ring_cursor % len(_KEYLESS_RING)
+        from tools.web_tools import _load_web_config
+
+        excluded = _load_web_config().get("keyless_exclude", [])
+        if not isinstance(excluded, list):
+            excluded = []
         return tuple(
-            _KEYLESS_RING[(start + i) % len(_KEYLESS_RING)]
-            for i in range(len(_KEYLESS_RING))
+            vendor for i in range(len(_KEYLESS_RING))
+            if (vendor := _KEYLESS_RING[(start + i) % len(_KEYLESS_RING)]) not in excluded
         )
     except Exception as exc:  # noqa: BLE001 — ring optional in stripped envs
         logger.debug("keyless ring order unavailable: %s", exc)

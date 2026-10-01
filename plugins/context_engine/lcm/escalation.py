@@ -157,6 +157,17 @@ class SummarySpendGuard:
             self._prune(current_time)
             return len(self._calls) < self.max_calls
 
+    def remaining(self, *, now: float | None = None) -> int | None:
+        """Calls left in the current window; None when the guard is disabled."""
+        if self.max_calls <= 0:
+            return None
+        current_time = time.monotonic() if now is None else now
+        with self._lock:
+            if current_time < self._backoff_until:
+                return 0
+            self._prune(current_time)
+            return max(0, self.max_calls - len(self._calls))
+
     def try_record_call(self, *, now: float | None = None) -> bool:
         """Atomically reserve one provider call if the budget allows it."""
         if self.max_calls <= 0:
@@ -366,6 +377,63 @@ def _sanitize_reasoning_summary(text: str) -> str:
     return stripped
 
 
+# t_cdf67f57: a safeguard interruption can also come back as an ordinary
+# finish_reason=stop reply in which the model talks ABOUT the interruption
+# instead of summarizing (LCM node 946 on claude-sonnet-5-5, 2/2 replays, ~140
+# tokens against a 12,000 budget): "Understood. I won't redo that summary, even
+# in a different wording. I can't tell which part tripped the classifier...".
+# It is shorter than the source, so the length gate alone accepts it. Both
+# signals are required, never either alone: the reply's OWN first sentence
+# (quoted spans removed, a bare "Understood."/"Okay." lead-in skipped) opens
+# with first-person refusal phrasing or carries a safeguard tag, AND the reply
+# is tiny relative to the requested budget. A summary that quotes or reports a
+# refusal ('Assistant said "I cannot ..."') is third-person and not a refusal.
+_META_REFUSAL_MAX_TOKENS_FLOOR = 256
+_META_REFUSAL_BUDGET_FRACTION = 0.05
+_META_REFUSAL_QUOTED_RE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d|`[^`\n]*`')
+_META_REFUSAL_SENTENCE_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+_META_REFUSAL_FIRST_PERSON_RE = re.compile(
+    r"(?:(?:sorry|unfortunately|but|so|okay|ok|understood)[,.!]?\s+)*"
+    r"I\s*(?:won't|will\s+not|can't|cannot|can\s+not|am\s+unable\s+to|'m\s+unable\s+to"
+    r"|am\s+not\s+able\s+to|'m\s+not\s+able\s+to|shouldn't|must\s+decline\s+to)\s+"
+    r"(?:\w+\s+){0,6}?(?:redo|re-?summari[sz]e|summari[sz]e|continue|reproduce|rewrite|"
+    r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b",
+    re.IGNORECASE,
+)
+_META_REFUSAL_TAG_RE = re.compile(
+    r"\[cyber\]|\bsafeguards?\s+(?:flagged|blocked|interrupted)\s+(?:this|my|the)\b",
+    re.IGNORECASE,
+)
+
+
+def _meta_refusal_own_first_sentence(text: str) -> str:
+    """First sentence in the reply's own voice: quotes removed, bare acks skipped."""
+    own = _META_REFUSAL_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
+    for sentence in _META_REFUSAL_SENTENCE_RE.split(own):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence.split()) <= 2 and not _META_REFUSAL_TAG_RE.search(sentence):
+            continue  # "Understood." / "Okay." lead-in
+        return sentence
+    return ""
+
+
+def _is_meta_refusal_reply(content: str, max_tokens: int) -> bool:
+    """True when a finish_reason=stop reply is a safeguard meta-refusal, not a summary."""
+    text = (content or "").strip()
+    if not text:
+        return False
+    ceiling = max(_META_REFUSAL_MAX_TOKENS_FLOOR, int(max_tokens * _META_REFUSAL_BUDGET_FRACTION))
+    if count_tokens(text) > ceiling:
+        return False
+    sentence = _meta_refusal_own_first_sentence(text)
+    return bool(
+        _META_REFUSAL_FIRST_PERSON_RE.match(sentence)
+        or _META_REFUSAL_TAG_RE.search(sentence)
+    )
+
+
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -381,8 +449,9 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
-        if getattr(response.choices[0], "finish_reason", None) == "content_filter":
-            raise SummaryRefusedError("summary finished with content_filter")
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        if finish_reason in ("content_filter", "refusal"):
+            raise SummaryRefusedError(f"summary finished with {finish_reason}")
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
@@ -391,6 +460,11 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
             logger.warning(
                 "LCM summary discarded reasoning-only output (model=%s); escalating",
                 model or "<default>",
+            )
+        if sanitized and _is_meta_refusal_reply(sanitized, max_tokens):
+            raise SummaryRefusedError(
+                "summary reply is a safeguard meta-refusal, not a summary: "
+                + sanitized[:200]
             )
         return sanitized
     except SummaryRefusedError:
@@ -518,13 +592,27 @@ def _invoke_summary_llm_chain(
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
     segment_key: str | None = None,
+    refused_routes: list[str] | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        # t_5e0ae3b8: gemini-bridge currently drops the tail of prompts over
+        # ~200k chars. Never accept a partial-transcript "summary" from that
+        # route; try luna/another configured route, then deterministic fallback.
+        if len(prompt) > 200_000 and any(
+            tag in candidate_model.lower() for tag in ("flash", "gemini")
+        ):
+            logger.warning(
+                "LCM summary skipping %s for >200k-char prompt: bridge may "
+                "truncate its tail (t_5e0ae3b8)", candidate_model,
+            )
+            continue
         route_key = _summary_route_key(candidate_model) if segment_key else ""
         latched_for = _SUMMARY_REFUSALS.remaining(route_key, segment_key) if segment_key else 0.0
         if latched_for > 0.0:
+            if refused_routes is not None:
+                refused_routes.append(candidate_model or _DEFAULT_ROUTE_KEY)
             logger.warning(
                 "LCM summary route %s skipped: it refused this segment; latch "
                 "expires in %.0fs",
@@ -558,11 +646,13 @@ def _invoke_summary_llm_chain(
             # About the content, not the route: latch the pair instead of
             # tripping the breaker, so other segments keep summarizing here.
             logger.warning(
-                "LCM summary refused by safeguards on %s; never re-sending this "
-                "segment on that route: %s",
-                candidate_model or _DEFAULT_ROUTE_KEY,
+                "LCM summary outcome=refusal provider_route=%s model=%s; "
+                "skipping this segment on that route: %s",
+                route_key, candidate_model or "<default>",
                 exc,
             )
+            if refused_routes is not None:
+                refused_routes.append(candidate_model or _DEFAULT_ROUTE_KEY)
             if segment_key:
                 _SUMMARY_REFUSALS.record(route_key, segment_key)
             continue
@@ -747,6 +837,80 @@ def _deterministic_truncate(text: str, max_tokens: int) -> str:
     return best
 
 
+def _redact_summary_input(text: str) -> str:
+    """Strip secrets and request-signing values before the summarizer sees them.
+
+    Ingest redaction (``sensitive_patterns``) is opt-in, so serialized chunks
+    reach here raw. Dense signing material (billing-header ``cch=``,
+    ``*signature`` values) trips model safeguards (``[cyber]``) and costs a
+    failed attempt per chunk; credentials in summaries persist in lcm.db
+    (t_c2107577). Values are masked, keys and narrative are kept. The L3
+    truncation below uses the same redacted text.
+    """
+    if not text:
+        return text
+    try:
+        from agent.redact import redact_signing_material, redact_sensitive_text
+    except Exception:  # vendored plugin running outside the fork
+        return text
+    return redact_signing_material(
+        redact_sensitive_text(text, force=True, redact_url_credentials=True)
+    )
+
+
+# t_cdf67f57 (Apollo 2026-09-30 18:20): when every summary route refused the
+# segment, the node never carries refusal text and never looks like a real
+# summary. It carries this explicit marker plus the deterministic excerpt, and
+# the operator is paged once per session.
+SUMMARY_UNAVAILABLE_MARKER = (
+    "[summary_unavailable: every summary route refused this segment; "
+    "deterministic excerpt follows, expand the node for the source]\n"
+)
+_PAGED_SUMMARY_UNAVAILABLE: set[str] = set()
+_PAGED_SUMMARY_UNAVAILABLE_LOCK = threading.Lock()
+
+
+def _send_summary_unavailable_page(message: str) -> None:
+    """Best-effort #alerts page via the fleet notify.py; never raises."""
+    try:
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        try:
+            from hermes_cli.config import get_hermes_home
+            home = Path(str(get_hermes_home()))
+        except Exception:
+            home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+        script = home / "scripts" / "notify.py"
+        if not script.exists():
+            logger.warning("LCM summary_unavailable page skipped: %s missing", script)
+            return
+        subprocess.Popen(
+            [sys.executable, str(script), "--send", message,
+             "--channel", "discord", "--sev", "error"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except Exception:
+        logger.warning("LCM summary_unavailable page failed", exc_info=True)
+
+
+def _page_summary_unavailable_once(session_id: str, routes: list[str]) -> bool:
+    """Page at most once per session; returns True when this call paged."""
+    key = session_id or "<no-session>"
+    with _PAGED_SUMMARY_UNAVAILABLE_LOCK:
+        if key in _PAGED_SUMMARY_UNAVAILABLE:
+            return False
+        _PAGED_SUMMARY_UNAVAILABLE.add(key)
+    _send_summary_unavailable_page(
+        "LCM summary_unavailable: every summary route refused a segment "
+        f"(session {key}, routes {', '.join(dict.fromkeys(routes))}); stored a "
+        "marker + deterministic excerpt instead. Card t_cdf67f57."
+    )
+    return True
+
+
 def summarize_with_escalation(
     text: str,
     source_tokens: int,
@@ -761,15 +925,22 @@ def summarize_with_escalation(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
+    session_id: str = "",
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    text = _redact_summary_input(text)
+    # Both prompts interpolate these too; the auto focus topic is built from
+    # recent user messages that ingest redaction (opt-in) leaves raw.
+    focus_topic = _redact_summary_input(focus_topic)
+    custom_instructions = _redact_summary_input(custom_instructions)
     segment_key = _segment_key(
         text, focus_topic=focus_topic, custom_instructions=custom_instructions
     )
+    refused_routes: list[str] = []
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
@@ -784,6 +955,7 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
+        refused_routes=refused_routes,
     )
 
     if l1_result:
@@ -805,6 +977,7 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
+        refused_routes=refused_routes,
     )
 
     if l2_result:
@@ -813,5 +986,13 @@ def summarize_with_escalation(
 
     # Level 3: deterministic truncation — guaranteed convergence
     l3_result = _deterministic_truncate(text, l3_truncate_tokens)
+    if refused_routes:
+        logger.warning(
+            "LCM summary_unavailable session=%s: every route refused (%s); "
+            "storing marker + deterministic excerpt",
+            session_id or "<no-session>", ", ".join(dict.fromkeys(refused_routes)),
+        )
+        _page_summary_unavailable_once(session_id, refused_routes)
+        l3_result = SUMMARY_UNAVAILABLE_MARKER + l3_result
     logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
     return l3_result, 3

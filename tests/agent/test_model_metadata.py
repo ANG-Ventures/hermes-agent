@@ -379,6 +379,22 @@ class TestDefaultContextLengths:
                 "claude-haiku-4-5 should resolve to its real 200k window, not 1M"
             )
 
+    def test_gemini_4_argon_resolves_to_1m_bare_and_bridge_suffixed(self):
+        """Gemini 4 Argon is announced at a 1M-token window (2026-09-30). The
+        bare id and the gemini-bridge effort-suffixed ids must resolve to that
+        row, not the 1,048,576 "gemini" catch-all; 3.8-flash keeps the catch-all."""
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            for model_id in ("gemini-4-argon", "gemini-4-argon-low",
+                             "gemini-4-argon-medium", "gemini-4-argon-high"):
+                assert get_model_context_length(model_id) == 1_000_000, model_id
+            assert get_model_context_length("gemini-3.8-flash-high") == 1048576
+
     def test_xai_oauth_grok_build_uses_xai_models_dev_context(self):
         """xAI OAuth should share the xAI provider metadata path.
 

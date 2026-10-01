@@ -2282,6 +2282,12 @@ def init_agent(
         _compression_cfg.get("codex_gpt55_autoraise_notice", True)
     ).lower() in {"true", "1", "yes"}
     agent._compression_threshold_autoraised = None
+    # One-time per-session notice when a large-window Codex prompt first
+    # crosses the 272K price tier (agent/codex_tier_notice.py, t_a56d83c1).
+    agent._codex_tier_notice_enabled = str(
+        _compression_cfg.get("codex_tier_notice", True)
+    ).lower() in {"true", "1", "yes"}
+    agent._codex_tier_notice_shown = False
     if _cfg_model_thresh is not None:
         # Explicit user config for this model wins over every built-in default.
         compression_threshold = _cfg_model_thresh

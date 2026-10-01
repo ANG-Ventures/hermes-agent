@@ -665,6 +665,14 @@ compression:
   # model.codex_context_policy above; default large) are never autoraised.
   codex_gpt55_autoraise: true
 
+  # Large-window Codex sessions (model.codex_context_policy: large) show ONE
+  # notice per session the first time a prompt passes 272K tokens: requests
+  # above 272K price at the higher tier (2x input, 1.5x output on gpt-6-sol /
+  # gpt-6.1-sol; the Codex subscription meters ~2x). Display-only, nothing
+  # changes on the wire. Never shown under `advertised`. Silence it with:
+  #   hermes config set compression.codex_tier_notice false
+  codex_tier_notice: true
+
   # Fraction of the threshold to preserve as recent tail (default: 0.20 = 20%)
   # e.g. 20% of 50% threshold = 10% of total context kept as recent messages.
   # Summary output is separately capped at 12K tokens (Gemini output limit).

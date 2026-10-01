@@ -303,6 +303,13 @@ class TestResolutionOrder:
         assert keyless_mcp._ring_order("tavily")[0] == "tavily"
         assert keyless_mcp._ring_order("tavily")[0] == "tavily"
 
+    def test_keyless_exclusion_removes_vendor_from_ring_and_resolution(self, fresh_registry, monkeypatch):
+        monkeypatch.setattr("tools.web_tools._load_web_config",
+                            lambda: {"keyless_exclude": ["firecrawl"]})
+        assert "firecrawl" not in keyless_mcp._ring_order("searxng")
+        assert "firecrawl" not in registry._keyless_preference()
+        assert all(keyless_mcp._ring_order("firecrawl"))  # no empty ring
+
     def test_registry_keyless_disabled_returns_none(self, fresh_registry, monkeypatch):
         monkeypatch.setattr(registry, "_read_config_key", lambda *p: None)
         monkeypatch.setattr(registry, "_keyless_tier_enabled", lambda: False)

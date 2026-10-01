@@ -232,6 +232,19 @@ single profile can be flipped back on its own:
 hermes config set model.codex_context_policy advertised
 ```
 
+The knob is read through the same merged view as every other behavioural
+setting: a value pinned in the administrator's managed-scope `config.yaml`
+wins over the user file, and `${VAR}` references expand.
+
+**When an edit takes effect.** Every fresh resolve sees the new value: new
+sessions, newly built agents and the `/model` picker. An agent that is already
+running keeps the window it resolved when it was built — the compaction
+threshold, the 85% autoraise decision and the LCM context cap are all derived
+from that one resolve — until a new session or a restart (a `/model` switch
+re-resolves the window for the new route). This is deliberate: re-reading the window mid-session
+would change it without re-deriving the values built from it, leaving them
+inconsistent, and the policy is a fleet-level setting that is rarely flipped.
+
 Under `advertised`, Hermes keeps the **advertised 272K as the default** for
 the base slugs (a bigger window means more tokens per request and faster
 subscription-usage burn) and the large window is opt-in:

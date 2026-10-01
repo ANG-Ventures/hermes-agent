@@ -2179,6 +2179,7 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
         # degenerate same-route case.
         # Close the sticky episode on ANY return (active=false, returned_at).
         _policy_row = _fw.on_primary_return(agent, _decision)
+        _fw.note_primary_return(agent)
         try:
             _to_route = (rt["provider"], rt["model"])
             if provider_fallback_active and recovery_should_announce(

@@ -342,6 +342,41 @@ def _hermes_compression_float(key: str, default: float) -> float:
         return default
 
 
+def _hermes_parallel_chunks(
+    enabled: bool, chunk_tokens: int, max_concurrency: int
+) -> tuple[bool, int, int]:
+    """Read ``compression.parallel_chunks`` from ~/.hermes/config.yaml.
+
+    Absent, malformed, or out-of-range fields keep their defaults, so a bad
+    value can never turn the feature on or produce a zero-size chunk.
+    """
+    try:
+        cfg = _hermes_config_yaml()
+        section = (cfg.get("compression") or {}).get("parallel_chunks")
+    except Exception:
+        return enabled, chunk_tokens, max_concurrency
+    if not isinstance(section, dict):
+        return enabled, chunk_tokens, max_concurrency
+    raw_enabled = section.get("enabled")
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    for key, current in (("chunk_tokens", chunk_tokens), ("max_concurrency", max_concurrency)):
+        raw = section.get(key)
+        if isinstance(raw, bool) or raw is None:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        if key == "chunk_tokens":
+            chunk_tokens = max(1000, value)
+        else:
+            max_concurrency = min(16, value)
+    return enabled, chunk_tokens, max_concurrency
+
+
 def _hermes_lcm_value(key: str):
     """Read ``lcm.<key>`` from ~/.hermes/config.yaml; None on absence/failure."""
     # fork-parity: same single-read-path rule as above.
@@ -692,6 +727,14 @@ class LCMConfig:
     # Raw-rough window fraction at which compaction fires regardless of skew
     # (dense-paste / 413 ceiling). Sourced from compression.calibration_hard_frac.
     calibration_hard_frac: float = 0.95
+
+    # -- Parallel leaf summary (compression.parallel_chunks) ---
+    # Map-reduce a large leaf summary: split at message boundaries that never
+    # cut a tool-call/result pair, summarize chunks concurrently, reduce once.
+    # Default OFF. Sourced from compression.parallel_chunks in config.yaml.
+    parallel_chunks_enabled: bool = False
+    parallel_chunk_tokens: int = 120_000
+    parallel_max_concurrency: int = 4
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -1105,6 +1148,15 @@ class LCMConfig:
             _hermes_compression_float(
                 "maintenance_max_cache_hit_ratio", c.maintenance_max_cache_hit_ratio
             ),
+        )
+        (
+            c.parallel_chunks_enabled,
+            c.parallel_chunk_tokens,
+            c.parallel_max_concurrency,
+        ) = _hermes_parallel_chunks(
+            c.parallel_chunks_enabled,
+            c.parallel_chunk_tokens,
+            c.parallel_max_concurrency,
         )
         # Upstream source-tracked summary_timeout_ms (computed default + provenance).
         c.summary_timeout_ms, source, warning = _parse_int_env_with_source(

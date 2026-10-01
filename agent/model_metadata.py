@@ -642,6 +642,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     "gpt-4.1": 1047576,
     "gpt-4": 128000,
     # Google
+    # Gemini 4 Argon (announced 2026-09-30): "1 million token limit" and a 1M
+    # output limit (up from 64K), per blog.google. Explicit row so it does not
+    # inherit the 1,048,576 "gemini" catch-all; the substring match also covers
+    # the gemini-bridge ids gemini-4-argon-{low,medium,high}. This table has no
+    # output-limit column, so the 1M output cap is not encoded here.
+    "gemini-4-argon": 1_000_000,
     "gemini": 1048576,
     # Gemma (open models served via AI Studio)
     "gemma-4": 256000,  # Gemma 4 family
@@ -3041,6 +3047,15 @@ def has_codex_context_variant(model_bare: str) -> bool:
 # ``-900k`` alias is stripped). Read from the ACTIVE config.yaml (root, or
 # the profile's own config under a profile home) so one agent can be flipped
 # back alone:  hermes config set model.codex_context_policy advertised
+# The read goes through the merged ``load_config_readonly()`` view, so an
+# administrator's managed-scope config.yaml wins over the user file and
+# ``${VAR}`` references expand (t_27a85d2c). WHEN AN EDIT TAKES EFFECT: every
+# fresh resolve sees it (new sessions, new agents, the /model picker), but an
+# agent that is already running keeps the window it resolved at agent init
+# (compressor threshold, 85% autoraise, LCM cap) until a new session or a
+# restart; a /model switch re-resolves the window for the new route.
+# Deliberate: those values are derived together once per agent, so a
+# mid-session re-read would leave them disagreeing.
 CODEX_CONTEXT_POLICY_LARGE = "large"
 CODEX_CONTEXT_POLICY_ADVERTISED = "advertised"
 _CODEX_CONTEXT_POLICIES = frozenset(
@@ -3050,16 +3065,21 @@ CODEX_CONTEXT_POLICY_DEFAULT = CODEX_CONTEXT_POLICY_LARGE
 
 
 def _codex_context_policy_from_config() -> str:
-    """Read ``model.codex_context_policy`` from the active config.yaml.
+    """Read ``model.codex_context_policy`` from the active merged config.
+
+    Uses ``load_config_readonly()`` (cached on the user AND managed-scope
+    file signatures, no deepcopy), NOT the raw user file: a managed-scope
+    value must override the user's, and ``${VAR}`` values must expand, exactly
+    as for every other behavioural config read.
 
     Absent, unreadable, or unrecognised values fall back to the default
     (``large``). A legacy string-shaped ``model:`` key has no sub-keys and
     therefore also resolves to the default.
     """
     try:
-        from hermes_cli.config import read_raw_config_readonly
+        from hermes_cli.config import load_config_readonly
 
-        cfg = read_raw_config_readonly()
+        cfg = load_config_readonly()
     except Exception:
         return CODEX_CONTEXT_POLICY_DEFAULT
     model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
@@ -3280,6 +3300,28 @@ def _resolve_codex_oauth_context_length_with_source(
             return _apply_verified_bump(ctx, "fallback")
 
     return None, ""
+
+
+def provider_serves_codex_subscription(provider: Optional[str]) -> bool:
+    """True when *provider* serves Codex-family slugs from a Codex subscription.
+
+    ``openai-codex`` always does. Any other provider opts in through its
+    profile's ``codex_subscription_backend`` capability flag (e.g. the ``cpa``
+    CLIProxyAPI lane, which fronts the SAME ChatGPT/Codex tokens): the backend
+    enforces the Codex window, not the API platform's 1.05M (t_c1403b02).
+    """
+    p = (provider or "").strip().lower()
+    if not p:
+        return False
+    if p == "openai-codex":
+        return True
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(p)
+    except Exception:
+        return False
+    return bool(getattr(profile, "codex_subscription_backend", False))
 
 
 def _resolve_codex_oauth_context_length(
@@ -3506,6 +3548,25 @@ def get_model_context_length(
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
+
+    # 0d. Codex-subscription proxy lanes (a provider profile with
+    # ``codex_subscription_backend``, e.g. cpa -> CLIProxyAPI). Codex-family
+    # slugs there hit the SAME Codex backend as openai-codex, which enforces
+    # the Codex window (gpt-6.1-sol: 922K input) — not the API-platform 1.05M
+    # the endpoint probe / catalog / persistent cache would report. Resolve
+    # through the openai-codex tables (policy knob, verified caps, ``-900k``
+    # alias). Runs before the persistent cache so a stale API value already
+    # persisted for the proxy URL cannot win. No access token is passed: the
+    # proxy bearer is not a ChatGPT OAuth token and must never be sent to
+    # chatgpt.com. Non-Codex ids (kimi-*, grok-*) miss the table and fall
+    # through unchanged.
+    if (
+        (provider or "").strip().lower() != "openai-codex"
+        and provider_serves_codex_subscription(provider)
+    ):
+        codex_ctx, _codex_source = _resolve_codex_oauth_context_length_with_source(model)
+        if codex_ctx:
+            return codex_ctx
 
     # Endpoint-scoped provider metadata. Keep this ahead of the persistent
     # cache so a value learned for a multiplexed provider's other endpoint

@@ -114,6 +114,12 @@ from .session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from .parallel_summary import (
+    format_reduce_input,
+    plan_reduce_groups,
+    run_map_reduce,
+    split_pair_safe,
+)
 from .message_analysis import (
     _is_synthetic_assistant_noise,
     _matched_tool_call_ids,
@@ -1861,6 +1867,179 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         return current_chunk[:-1]
 
+    @staticmethod
+    def _leaf_summary_token_budget(source_tokens: int) -> int:
+        return min(max(2000, int(source_tokens * 0.20)), 12000)
+
+    def _summarize_leaf_text(
+        self,
+        text: str,
+        source_tokens: int,
+        token_budget: int,
+        *,
+        timeout_seconds: float,
+        focus_topic: Optional[str],
+    ) -> tuple[str, int]:
+        return summarize_with_escalation(
+            text=text,
+            source_tokens=source_tokens,
+            token_budget=token_budget,
+            depth=0,
+            model=self._config.summary_model,
+            fallback_models=self._config.summary_fallback_models,
+            circuit_breaker=self._summary_circuit_breaker,
+            spend_guard=self._summary_spend_guard,
+            timeout=timeout_seconds,
+            l2_budget_ratio=self._config.l2_budget_ratio,
+            l3_truncate_tokens=self._config.l3_truncate_tokens,
+            focus_topic=focus_topic or "",
+            custom_instructions=self._config.custom_instructions,
+            session_id=self._session_id or "",
+        )
+
+    def _summarize_leaf_source(
+        self,
+        chunk: List[Dict[str, Any]],
+        source_tokens: int,
+        *,
+        timeout_seconds: float,
+        focus_topic: Optional[str],
+    ) -> tuple[str, int]:
+        """One leaf summary: serial, or map-reduce when parallel_chunks is on.
+
+        The parallel path only engages when the source is larger than one
+        chunk and splits into at least two pair-safe chunks. Every chunk and
+        the reduce go through the same escalation ladder as the serial call,
+        and the final summary gets the serial token budget, so the leaf node
+        written by the caller is the same shape either way.
+        """
+        final_budget = self._leaf_summary_token_budget(source_tokens)
+        chunk_target = int(self._config.parallel_chunk_tokens or 0)
+        chunks: List[List[Dict[str, Any]]] = []
+        if (
+            self._config.parallel_chunks_enabled
+            and chunk_target > 0
+            and source_tokens > chunk_target
+        ):
+            chunks = split_pair_safe(chunk, chunk_target)
+        if len(chunks) < 2:
+            return self._summarize_leaf_text(
+                self._serialize_messages(chunk),
+                source_tokens,
+                final_budget,
+                timeout_seconds=timeout_seconds,
+                focus_topic=focus_topic,
+            )
+
+        # Plan against the spend guard: every chunk and every reduce call is a
+        # provider call. If the window cannot hold the whole fan-out plus its
+        # reduction, stay serial (one call) rather than let the guard trip
+        # mid-map and push the reduce onto deterministic truncation.
+        reduce_cap = max(1, chunk_target)
+        n = len(chunks)
+        planned_calls = n + max(1, -(-n * 1000 // reduce_cap)) + 1
+        guard_left = (
+            self._summary_spend_guard.remaining()
+            if self._summary_spend_guard is not None
+            else None
+        )
+        if guard_left is not None and planned_calls > guard_left:
+            logger.info(
+                "LCM parallel leaf summary skipped: %d planned calls exceed the %d the "
+                "summary spend guard has left; summarizing serially",
+                planned_calls,
+                guard_left,
+            )
+            return self._summarize_leaf_text(
+                self._serialize_messages(chunk),
+                source_tokens,
+                final_budget,
+                timeout_seconds=timeout_seconds,
+                focus_topic=focus_topic,
+            )
+
+        # Serialize on the owning thread. Workers only make provider calls, so
+        # an aborted worker left running cannot read session/profile state
+        # that a later rebind changes, nor externalize output under it.
+        # Each part's budget is scaled so all parts together fit one reduce
+        # input no larger than a map chunk (a size the operator has declared
+        # the summary model can take); plan_reduce_groups covers the floor.
+        per_part_cap = max(1000, reduce_cap // n)
+        payloads = []
+        for part in chunks:
+            part_tokens = count_messages_tokens(part)
+            budget = min(self._leaf_summary_token_budget(part_tokens), per_part_cap)
+            payloads.append((self._serialize_messages(part), part_tokens, budget))
+
+        started = time.monotonic()
+        map_done: list[float] = []
+
+        def _summarize_chunk(payload: tuple, _index: int) -> tuple[str, int]:
+            text, part_tokens, budget = payload
+            return self._summarize_leaf_text(
+                text,
+                part_tokens,
+                budget,
+                timeout_seconds=timeout_seconds,
+                focus_topic=focus_topic,
+            )
+
+        def _reduce_once(parts: List[str], budget: int) -> tuple[str, int]:
+            joined = format_reduce_input(parts)
+            text, lvl = self._summarize_leaf_text(
+                joined,
+                source_tokens,
+                budget,
+                timeout_seconds=timeout_seconds,
+                focus_topic=focus_topic,
+            )
+            if lvl >= 3 and count_tokens(joined) < source_tokens:
+                # The reduce fell to head/tail truncation while every part
+                # summary exists: keep the parts rather than drop the middle.
+                return joined, 2
+            return text, lvl
+
+        def _reduce(parts: List[str]) -> tuple[str, int]:
+            map_done.append(time.monotonic())
+            level_seen = 1
+            while True:
+                groups = plan_reduce_groups([count_tokens(p) for p in parts], reduce_cap)
+                if len(groups) == 1:
+                    text, lvl = _reduce_once(parts, final_budget)
+                    return text, max(level_seen, lvl)
+                merged = []
+                for group in groups:
+                    text, lvl = _reduce_once(
+                        [parts[i] for i in group],
+                        min(final_budget, max(1000, reduce_cap // len(groups))),
+                    )
+                    merged.append(text)
+                    level_seen = max(level_seen, lvl)
+                if len(merged) >= len(parts):
+                    text, lvl = _reduce_once(merged, final_budget)
+                    return text, max(level_seen, lvl)
+                parts = merged
+
+        summary_text, level = run_map_reduce(
+            payloads,
+            summarize_chunk=_summarize_chunk,
+            reduce=_reduce,
+            max_concurrency=self._config.parallel_max_concurrency,
+        )
+        finished = time.monotonic()
+        map_end = map_done[0] if map_done else finished
+        logger.info(
+            "LCM parallel leaf summary: chunks=%d source_tokens=%d concurrency=%d "
+            "map=%.1fs reduce=%.1fs level=%d",
+            len(chunks),
+            source_tokens,
+            min(len(chunks), max(1, int(self._config.parallel_max_concurrency or 1))),
+            map_end - started,
+            finished - map_end,
+            level,
+        )
+        return summary_text, level
+
     def _summarize_leaf_chunk_with_rescue(
         self,
         initial_chunk: List[Dict[str, Any]],
@@ -1874,9 +2053,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         while attempt_chunk and attempt_number < max_attempts:
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
-            serialized = self._serialize_messages(attempt_chunk)
-            token_budget = max(2000, int(source_tokens * 0.20))
-            token_budget = min(token_budget, 12000)
 
             try:
                 timeout_seconds = self._config.summary_timeout_ms / 1000
@@ -1885,20 +2061,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     if remaining_seconds <= 0:
                         raise TimeoutError("threshold full sweep time budget exhausted")
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
-                summary_text, level = summarize_with_escalation(
-                    text=serialized,
-                    source_tokens=source_tokens,
-                    token_budget=token_budget,
-                    depth=0,
-                    model=self._config.summary_model,
-                    fallback_models=self._config.summary_fallback_models,
-                    circuit_breaker=self._summary_circuit_breaker,
-                    spend_guard=self._summary_spend_guard,
-                    timeout=timeout_seconds,
-                    l2_budget_ratio=self._config.l2_budget_ratio,
-                    l3_truncate_tokens=self._config.l3_truncate_tokens,
-                    focus_topic=focus_topic or "",
-                    custom_instructions=self._config.custom_instructions,
+                summary_text, level = self._summarize_leaf_source(
+                    attempt_chunk,
+                    source_tokens,
+                    timeout_seconds=timeout_seconds,
+                    focus_topic=focus_topic,
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
@@ -6934,6 +7101,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
+            session_id=self._session_id or "",
         )
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]

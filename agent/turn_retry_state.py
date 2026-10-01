@@ -92,6 +92,11 @@ class TurnRetryState:
     local_relay_waited_s: float = 0.0
     local_relay_recoveries: int = 0
 
+    # ── Relay deploy-drain wait (``FailoverReason.relay_draining``) ──────
+    # Wall-clock seconds since the first drain 503 of this attempt block;
+    # bounded by ``fallback.relay_drain_wait_s``.
+    relay_drain_started_at: float | None = None
+
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False
