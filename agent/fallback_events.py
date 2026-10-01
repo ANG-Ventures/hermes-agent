@@ -56,7 +56,12 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # both false. Its own backoff is fallback_policy.same_error_backoff.
     ("auth", ("oauth access token has been revoked", "token has been revoked",
               "invalid x-api-key", "authentication_error", "invalid bearer",
-              "unauthorized", "third-party apps now draw from")),
+              "unauthorized", "third-party apps now draw from",
+              # CLIProxyAPI (cpa) 503 when it holds no credential for the
+              # requested upstream ("auth_unavailable: no auth available
+              # (providers=kimi, model=kimi-k3)"). Not capacity: nothing to
+              # wait out until a credential is loaded (t_ac76e76f).
+              "auth_unavailable", "no auth available")),
     # Relay pool-wide model exhaustion (sent as 503) — pool-wide ONLY.
     ("quota_model", ("no eligible sub for the requested model",
                      "this model's budget is capped")),
