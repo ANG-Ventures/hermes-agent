@@ -111,13 +111,16 @@ def test_launcher_argvs_keep_cwd_off_sys_path(monkeypatch, tmp_path):
     for argv in argvs:
         m = argv.index("-m")
         assert "-P" in argv[1:m], argv
-    import inspect
-
-    src = inspect.getsource(gateway_cli.generate_systemd_unit)
-    assert "-m hermes_cli.main" in src
-    assert src.count("ExecStart={python_path} -P -m hermes_cli.main") == src.count(
-        "-m hermes_cli.main"
-    )
+    tmp_home = tmp_path / "home"
+    tmp_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_home))
+    unit = gateway_cli.generate_systemd_unit(system=False)
+    exec_start = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
+    assert exec_start, unit
+    for line in exec_start:
+        parts = line.split()
+        m = parts.index("-m")
+        assert "-P" in parts[1:m], line
 
 
 def test_guard_exits_nonzero_not_75(tmp_path, monkeypatch):
