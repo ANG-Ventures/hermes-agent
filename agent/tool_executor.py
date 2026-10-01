@@ -684,6 +684,26 @@ def _managed_values(
 _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S = 30.0
 
 
+def _touch_heartbeat(agent, desc: str) -> None:
+    """Liveness-only activity tick while one tool call is still running.
+
+    ``heartbeat=True`` keeps the gateway/kanban clocks fresh but does not
+    count as a progress EVENT, so the delegate hung-child detector
+    (delegation.hung_child_seconds) still sees a child blocked in one tool.
+    Falls back to a plain touch for agents whose ``_touch_activity`` predates
+    the kwarg (test doubles), so the liveness tick itself never stops.
+    """
+    try:
+        agent._touch_activity(desc, heartbeat=True)
+    except TypeError:
+        agent._touch_activity(desc)
+
+
+def _heartbeat_touch_fn(agent):
+    """Activity callback for in-tool tickers (``touch_activity_if_due``)."""
+    return lambda desc: _touch_heartbeat(agent, desc)
+
+
 def _run_tool_activity_heartbeat(
     agent,
     stop_event: threading.Event,
@@ -716,7 +736,7 @@ def _run_tool_activity_heartbeat(
 
     try:
         while not stop_event.wait(interval):
-            agent._touch_activity(label)
+            _touch_heartbeat(agent, label)
     except Exception:
         # A heartbeat must never break the agent loop.
         pass
@@ -1064,8 +1084,8 @@ def _run_sequential_tool_execution_middleware(
                 elapsed = int(time.monotonic() - started)
                 if elapsed - _last_heartbeat >= 30:
                     _last_heartbeat = elapsed
-                    agent._touch_activity(
-                        f"sequential tool running ({elapsed}s): {function_name}"
+                    _touch_heartbeat(
+                        agent, f"sequential tool running ({elapsed}s): {function_name}"
                     )
 
         if interrupted:
@@ -1203,7 +1223,7 @@ def _begin_tool_execution(
     try:
         from tools.environments.base import set_activity_callback
 
-        set_activity_callback(agent._touch_activity)
+        set_activity_callback(_heartbeat_touch_fn(agent))
     except Exception:
         pass
 
@@ -1508,7 +1528,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # is invisible to worker threads.
         try:
             from tools.environments.base import set_activity_callback
-            set_activity_callback(agent._touch_activity)
+            set_activity_callback(_heartbeat_touch_fn(agent))
         except Exception:
             pass
         # Approval/sudo callbacks (thread-local) and the agent turn's
@@ -1840,7 +1860,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             for f in not_done
                             if f in future_to_index
                         ]
-                        agent._touch_activity(
+                        _touch_heartbeat(
+                            agent,
                             f"concurrent tools running ({_conc_elapsed}s, "
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
                         )

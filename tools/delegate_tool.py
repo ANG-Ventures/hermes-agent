@@ -1189,9 +1189,9 @@ def _get_child_timeout() -> Optional[float]:
     routinely killed mid-task by the old blanket cap even though they were
     making steady progress. Failures should come from what the child is
     actually doing — API errors, tool errors, iteration budget — not from a
-    generic delegation-level stopwatch. Stuck-child protection is handled
-    separately by the heartbeat staleness monitor, which stops refreshing
-    parent activity so the gateway inactivity timeout can fire.
+    generic delegation-level stopwatch. Stuck-child protection is separate
+    and independent of this budget: ``delegation.hung_child_seconds``
+    (``_get_hung_child_seconds``) reaps a child with no progress event.
 
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor ``_CHILD_TIMEOUT_FLOOR_S``, 60 s); ``0`` or a
@@ -1267,6 +1267,46 @@ def _get_child_max_wall_seconds(child_timeout: Optional[float]) -> Optional[floa
     if parsed == 0:
         return default
     return max(floor, parsed)
+
+
+# Default hung-child ceiling (delegation.hung_child_seconds). A hang is a
+# liveness fault, not a budget, so it applies with child_timeout_seconds: 0.
+# Measured reason (blackbox turns.db, 2026-06-12..2026-09-30, 3,945
+# subagent-turn intervals between consecutive API-call completions, each an
+# upper bound on one progress-free stretch): p50 11.5 s, p90 67 s, p99 270 s,
+# p99.9 600 s, max 606 s; 34 exceeded 300 s, including legit non-streaming
+# calls that returned 12k-37k output tokens after 398-588 s. 300 s would have
+# reaped those; nothing exceeded 900 s.
+DEFAULT_HUNG_CHILD_SECONDS = 900.0
+
+
+def _get_hung_child_seconds() -> Optional[float]:
+    """Seconds without a progress EVENT before a child is reaped as hung.
+
+    Config ``delegation.hung_child_seconds``. Independent of
+    ``child_timeout_seconds``: ``child_timeout_seconds: 0`` means "no
+    budget", not "no hang detection". Unset/invalid =
+    ``DEFAULT_HUNG_CHILD_SECONDS``; a positive value is floored at
+    ``_CHILD_TIMEOUT_FLOOR_S``; ``0`` or negative disables the detector.
+    Progress = model token / API-call boundary / tool start or result /
+    turn boundary; liveness heartbeats do not count (see
+    ``_child_progress_ts``).
+    """
+    val = _load_config().get("hung_child_seconds")
+    if val is None:
+        return DEFAULT_HUNG_CHILD_SECONDS
+    try:
+        parsed = float(val)
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.hung_child_seconds=%r is not a valid number; using %ss",
+            val,
+            DEFAULT_HUNG_CHILD_SECONDS,
+        )
+        return DEFAULT_HUNG_CHILD_SECONDS
+    if parsed <= 0:
+        return None
+    return max(_CHILD_TIMEOUT_FLOOR_S, parsed)
 
 
 def _get_max_spawn_depth() -> int:
@@ -3385,14 +3425,29 @@ def _activity_agents(child: Any) -> List[Any]:
     ]
 
 
+def _child_progress_ts(summary: Dict[str, Any]) -> Any:
+    """The agent's last progress EVENT time, not its last liveness tick.
+
+    ``last_progress_event_ts`` is advanced by model tokens, API-call
+    boundaries, tool start/result and turn boundaries, never by the wait /
+    in-tool heartbeats that keep ``last_activity_ts`` fresh while one API
+    call or one tool call blocks. Agents that do not report it (foreign
+    shapes, older doubles) fall back to ``last_activity_ts``.
+    """
+    ts = summary.get("last_progress_event_ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return ts
+    return summary.get("last_activity_ts")
+
+
 def _progress_signature(child: Any) -> Tuple[Any, ...]:
-    """(api calls, current tool, activity ts) of the child and its live subtree."""
+    """(api calls, current tool, progress ts) of the child and its live subtree."""
     sig = []
     for a in _activity_agents(child):
         try:
             s = a.get_activity_summary()
             sig.append(
-                (id(a), s.get("api_call_count"), s.get("current_tool"), s.get("last_activity_ts"))
+                (id(a), s.get("api_call_count"), s.get("current_tool"), _child_progress_ts(s))
             )
         except Exception:
             sig.append((id(a), None, None, None))
@@ -3400,16 +3455,16 @@ def _progress_signature(child: Any) -> Tuple[Any, ...]:
 
 
 def _subtree_idle_seconds(child: Any) -> float:
-    """Seconds since the most recent activity anywhere in the child's subtree.
+    """Seconds since the most recent progress event anywhere in the subtree.
 
-    0.0 when no agent reports a numeric ``last_activity_ts`` (unknown is
-    treated as active, never as hung).
+    0.0 when no agent reports a numeric progress/activity timestamp (unknown
+    is treated as active, never as hung).
     """
     idles = []
     now = time.time()
     for a in _activity_agents(child):
         try:
-            ts = a.get_activity_summary().get("last_activity_ts")
+            ts = _child_progress_ts(a.get_activity_summary())
         except Exception:
             ts = None
         if isinstance(ts, (int, float)) and not isinstance(ts, bool):
@@ -3513,11 +3568,50 @@ class _LateTurnStalled(Exception):
         self.reason = reason  # "hung" | "wall"
 
 
+class _ChildHung(TimeoutError):
+    """The child made no progress event for delegation.hung_child_seconds."""
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f"no progress for {seconds:g}s")
+        self.seconds = seconds
+
+
+def _wait_child_turn(
+    future: Any,
+    child: Any,
+    child_timeout: Optional[float],
+    hung_seconds: Optional[float],
+) -> Any:
+    """Wait for the child's first turn under the budget AND the hang ceiling.
+
+    ``child_timeout`` is the budget (None = no budget): reaching it raises
+    ``FuturesTimeoutError`` exactly like ``future.result(timeout=...)``.
+    ``hung_seconds`` is the liveness bound, independent of the budget: no
+    progress event anywhere in the subtree for that long raises
+    ``_ChildHung``.
+    """
+    if not hung_seconds:
+        return future.result(timeout=child_timeout)
+    budget_deadline = (
+        time.monotonic() + float(child_timeout) if child_timeout else None
+    )
+    outcome, raw = _supervise_child_future(
+        future, child, float(hung_seconds), budget_deadline, from_now=True
+    )
+    if outcome == "done":
+        return raw
+    if outcome == "hung":
+        raise _ChildHung(float(hung_seconds))
+    raise FuturesTimeoutError()
+
+
 def _supervise_child_future(
     future: Any,
     child: Any,
     ceiling: float,
     wall_deadline: Optional[float],
+    *,
+    from_now: bool = False,
 ) -> Tuple[str, Any]:
     """Wait for a child turn's future under progress + absolute-wall bounds.
 
@@ -3526,10 +3620,16 @@ def _supervise_child_future(
     (``time.monotonic()`` passed *wall_deadline*, progress or not). An
     exception the turn itself raised -- including a ``TimeoutError`` --
     re-raises here: a finished future is never polled again.
+
+    *from_now* starts the hang clock at the call instead of back-dating it by
+    the subtree's existing idle time (a just-submitted turn whose agent was
+    built long ago, e.g. queued behind max_concurrent_children).
     """
     poll = max(0.05, min(5.0, ceiling / 4.0))
     last_sig = _progress_signature(child)
-    last_progress = time.monotonic() - min(_subtree_idle_seconds(child), ceiling)
+    last_progress = time.monotonic() - (
+        0.0 if from_now else min(_subtree_idle_seconds(child), ceiling)
+    )
     while True:
         wait = poll
         if wall_deadline is not None:
@@ -3686,6 +3786,12 @@ def _start_late_completion(
         _late_handles[late_id] = handle
     ceiling = float(child_timeout) if child_timeout else None
     max_wall = _get_child_max_wall_seconds(ceiling)
+    # The hang ceiling is the tighter of the budget's progress window and
+    # the budget-independent delegation.hung_child_seconds; the wall cap
+    # stays keyed on child_timeout.
+    _hung_s = _get_hung_child_seconds()
+    if ceiling and _hung_s:
+        ceiling = min(ceiling, _hung_s)
     wall_deadline = child_start + max_wall if max_wall else None
     approval_cb = _get_subagent_approval_callback()
     # The explicit lifecycle (docs/dev/delegate-child-lifecycle.md). The
@@ -4410,6 +4516,7 @@ def _run_single_child(
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
         child_timeout = _get_child_timeout()
+        hung_seconds = _get_hung_child_seconds()
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -4476,15 +4583,18 @@ def _run_single_child(
             _run_with_thread_capture,
         )
         try:
-            result = _child_future.result(timeout=child_timeout)
+            result = _wait_child_turn(
+                _child_future, child, child_timeout, hung_seconds
+            )
         except Exception as _timeout_exc:
             # Timed out ≠ dead. A child still working (it made API calls or
             # has live descendants) keeps running; report TIMED_OUT_RUNNING
             # with live handles so the caller waits/steers instead of
             # relaunching the same brief as a second concurrent tree.
+            _hung = isinstance(_timeout_exc, _ChildHung)
             if isinstance(
                 _timeout_exc, (FuturesTimeoutError, TimeoutError)
-            ) and not _child_future.done():
+            ) and not _hung and not _child_future.done():
                 _tor_entry = _timed_out_running_entry(
                     task_index=task_index,
                     child=child,
@@ -4555,7 +4665,9 @@ def _run_single_child(
                     task_index=task_index,
                     # is_timeout implies a cap was configured (result(timeout=None)
                     # never raises FuturesTimeoutError); guard for the type checker.
-                    timeout_seconds=float(child_timeout or 0.0),
+                    timeout_seconds=float(
+                        (hung_seconds if _hung else child_timeout) or 0.0
+                    ),
                     duration_seconds=float(duration),
                     worker_thread=_worker_thread_holder.get("t"),
                     goal=goal,
@@ -4583,7 +4695,17 @@ def _run_single_child(
                 except Exception:
                     pass
 
-            if is_timeout:
+            if _hung:
+                _err = (
+                    f"Subagent made no progress for {hung_seconds:g}s "
+                    f"(delegation.hung_child_seconds) with {child_api_calls} "
+                    f"API call(s) completed — blocked inside one API call or "
+                    f"one tool call (liveness heartbeats are not progress). "
+                    f"It was stopped."
+                )
+                if diagnostic_path:
+                    _err += f" Diagnostic: {diagnostic_path}"
+            elif is_timeout:
                 if child_api_calls == 0:
                     _err = (
                         f"Subagent timed out after {child_timeout}s without "
@@ -4613,10 +4735,13 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
-                "timeout_seconds": child_timeout if is_timeout else None,
+                "timeout_seconds": (
+                    hung_seconds if _hung else child_timeout if is_timeout else None
+                ),
                 "timed_out_after_seconds": duration if is_timeout else None,
                 "timeout_phase": (
-                    "before_first_llm_call" if is_timeout and child_api_calls == 0
+                    "no_progress" if _hung
+                    else "before_first_llm_call" if is_timeout and child_api_calls == 0
                     else "after_llm_calls" if is_timeout
                     else None
                 ),

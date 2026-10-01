@@ -29,6 +29,47 @@ The lifecycle below starts when `_run_single_child`'s wait hits
 Children that finish inside the wait never enter it; the normal path in
 `_run_single_child` owns them and is out of scope, apart from the entry edge.
 
+## Liveness vs progress
+
+Every hang verdict on this path reads progress. None of them reads liveness.
+
+- **Liveness**: the process is alive. `_last_activity_ts` advances on every
+  `_touch_activity` call, including the periodic tickers that run while one
+  call blocks: the non-streaming wait ticker (`progress=False`), the streaming
+  wait ticker and `_emit_wait_notice`, an Anthropic `ping` / Codex keepalive
+  frame, the tool-activity heartbeat, and `touch_activity_if_due` inside a
+  running tool (`heartbeat=True`). The gateway inactivity watchdog and the
+  parent heartbeat read this clock.
+- **Progress**: the child did something. `_last_progress_event_ts`
+  (`last_progress_event_ts` in `get_activity_summary()`) advances only on a
+  model token or stream chunk, an API call starting or finishing, a tool
+  starting or returning, or a turn boundary: any `_touch_activity` call that
+  is neither `progress=False` nor `heartbeat=True`.
+- The kanban `progress_at` clock (`_last_progress_ts`) sits between the two.
+  It ignores provider-wait tickers but still counts the in-tool heartbeat,
+  because the stall detector treats a running tool as a live worker.
+
+`_progress_signature` and `_subtree_idle_seconds` read the progress clock
+(falling back to `last_activity_ts` for agents that do not report it). So a
+child blocked inside one HTTP request or one tool call is hung once it has
+gone the ceiling without a progress event, even though its liveness clock is
+seconds old.
+
+Hang ceilings:
+
+| Where | Ceiling | Applies when |
+|---|---|---|
+| owner wait in `_run_single_child` (`_wait_child_turn`) | `delegation.hung_child_seconds` (default 900, floor 60, `0` disables) | always, including `child_timeout_seconds: 0`. A hang is a liveness fault, not a budget. Reaped as `status=timeout`, `timeout_phase=no_progress` |
+| owner wait, `timed_out_running` check | `child_timeout` | `child_timeout_seconds > 0` |
+| late thread (`_supervise_child_future`) | `min(child_timeout, hung_child_seconds)` | `child_timeout_seconds > 0`; the wall cap (`child_max_wall_seconds`) still applies |
+
+The 900 s default is measured from blackbox `turns.db` (2026-06-12 to
+2026-09-30). Across 3,945 subagent-turn intervals between consecutive API-call
+completions, each an upper bound on one progress-free stretch: p50 11.5 s,
+p90 67 s, p99 270 s, p99.9 600 s, max 606 s. 34 intervals exceeded 300 s,
+including legitimate non-streaming calls that returned 12k to 37k output
+tokens after 398 to 588 s. None exceeded 900 s.
+
 ## Actors
 
 | Actor | Thread | Owns |

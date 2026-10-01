@@ -254,7 +254,14 @@ delegate_task(
 
 By default there is **no wall-clock timeout** on subagents. Children fail only from what they're actually doing — API errors, tool errors, or hitting their iteration budget — never from a delegation-level stopwatch. Earlier releases shipped a hard cap (300s, later 600s), which kept killing legitimately busy children mid-task: deep code reviews, large research fan-outs, and slow reasoning models routinely need more than 10 minutes while making steady progress the whole time.
 
-Genuinely stuck children are still detected: the heartbeat staleness monitor stops refreshing the parent's activity when a child makes no progress (no API calls, no tool starts, and no activity-timestamp ticks), letting the gateway inactivity timeout fire on a truly wedged worker. An in-flight model wait still counts as progress — subagents refresh the activity clock while waiting on the provider, so a slow local / long-prefill completion is not treated as stalled.
+Genuinely stuck children are still detected, independently of any timeout: a child that makes no **progress** for `hung_child_seconds` is stopped and reported as `timeout` with `timeout_phase: no_progress`. Progress means a model token or stream chunk, an API call starting or finishing, a tool starting or returning, or a turn boundary. Liveness heartbeats are not progress: the "still waiting on the provider" ticker, a streaming keepalive, and the periodic "tool still running" tick only prove the process is alive, so a child blocked inside one API call or one tool call is caught.
+
+```yaml
+delegation:
+  hung_child_seconds: 900      # default; 0 or negative disables hang detection
+```
+
+The default comes from measured subagent turns: the longest legitimate progress-free stretch observed was about 10 minutes (a non-streaming call returning ~37k tokens), and none reached 15 minutes. Positive values are floored at 60s. Raise it if your children run single tool calls longer than 15 minutes.
 
 If you want a hard cap anyway (e.g. cost control on unattended cron-driven delegation), opt in per-install:
 
@@ -264,12 +271,13 @@ delegation:
   # child_timeout_seconds: 1800  # opt-in hard cap (floor 60s)
 ```
 
-A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
+A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it. `child_timeout_seconds: 0` means "no budget"; it does not turn off hang detection (`hung_child_seconds`).
 
 When the cap fires on a child that is still working, the call returns
 `timed_out_running` and the child keeps going; its result is recorded when it
 finishes. That late phase has two bounds: a child that makes no progress for
-`child_timeout_seconds` is stopped, and so is any child that has run for
+`child_timeout_seconds` (or `hung_child_seconds`, whichever is shorter) is
+stopped, and so is any child that has run for
 `child_max_wall_seconds` in total, progress or not:
 
 ```yaml
@@ -285,7 +293,8 @@ metadata alongside the error message so parents and hooks can distinguish a
 stopwatch kill from other failures without parsing text: `timeout_seconds`
 (the configured cap), `timed_out_after_seconds` (actual wall clock), and
 `timeout_phase` (`before_first_llm_call` when the child never reached its
-first request, `after_llm_calls` otherwise). All three are `null` on
+first request, `no_progress` when the hang detector stopped it, in which case
+`timeout_seconds` is `hung_child_seconds`, `after_llm_calls` otherwise). All three are `null` on
 non-timeout errors.
 
 :::tip Diagnostic dump on zero-call timeout

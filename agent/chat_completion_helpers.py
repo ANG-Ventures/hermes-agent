@@ -6698,7 +6698,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             for event in stream:
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
-                agent._touch_activity("receiving stream response")
+                # A keepalive ``ping`` event proves liveness only; it must
+                # not reset the delegate hung-child clock.
+                agent._touch_activity(
+                    "receiving stream response",
+                    heartbeat=getattr(event, "type", None) == "ping",
+                )
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
@@ -7351,8 +7356,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             else:
                 # Chunks are flowing — keep the activity tracker fresh but
                 # leave the live display alone.
+                # Wait ticker, not a progress event: chunks advance the
+                # hung-child clock themselves ("receiving stream response").
                 agent._touch_activity(
-                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)",
+                    heartbeat=True,
                 )
 
         # Detect stale streams: connections kept alive by SSE pings
