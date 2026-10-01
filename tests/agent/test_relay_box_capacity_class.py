@@ -27,7 +27,7 @@ CASES = [
 
 
 @pytest.mark.parametrize("text,cause", CASES)
-def test_box_refusal_is_pool_pressure_with_named_cause(text, cause):
+def test_box_refusal_is_pool_pressure_with_named_cause(text, cause, tmp_path):
     assert fbe.classify_text(text, http_status=503) == "pool_pressure"
     # Through the full trigger path too (no relay header: text decides).
     assert fbe.classify_trigger(text=f"Error code: 503 - {text}", http_status=503) == (
@@ -39,6 +39,12 @@ def test_box_refusal_is_pool_pressure_with_named_cause(text, cause):
     # The dead-letter floor keys on the cause falling to "unclassified error".
     assert "unclassified" not in rider
     assert rider.startswith(cause)
+    # No floor branch rendered, so the dead-letter sentinel writes no row.
+    _, floors = fp.cause_rider_with_floors(dict(row, ts=0))
+    assert floors == ()
+    ledger = tmp_path / "dead.jsonl"
+    assert fbe.note_unclassified(row, rider, floors, path=ledger) is False
+    assert not ledger.exists()
 
 
 def test_startup_deadline_is_not_a_connection_timeout():
