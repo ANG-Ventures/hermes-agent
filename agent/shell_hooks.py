@@ -206,8 +206,14 @@ _STDERR_MESSAGE_LIMIT = 400
 # the same event (e.g. one entry per tool the user wants to gate).
 # Second registration attempts for the exact same triple become no-ops
 # so the CLI and gateway can both call register_from_config() safely.
-_registered: Set[Tuple[str, Optional[str], str]] = set()
+_registered: Set[Tuple[str, str, Optional[str], str]] = set()
 _registered_lock = threading.Lock()
+
+
+def _home_key() -> str:
+    """Resolved home the plugin manager is scoped to; part of every idempotence key, so two
+    profiles configuring an identical hook each register on their own manager."""
+    return str(get_hermes_home().expanduser().resolve())
 
 # Intra-process lock for allowlist read-modify-write on platforms that
 # lack ``fcntl`` (non-POSIX).  Kept separate from ``_registered_lock``
@@ -312,13 +318,14 @@ def register_from_config(
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
+    home_key = _home_key()
 
     # Idempotence + allowlist read happen under the lock; the TTY
     # prompt runs outside so other threads aren't parked on a blocking
     # input().  Mutation re-takes the lock with a defensive idempotence
     # re-check in case two callers ever race through the prompt.
     for spec in specs:
-        key = (spec.event, spec.matcher, spec.command)
+        key = (home_key, spec.event, spec.matcher, spec.command)
         with _registered_lock:
             if key in _registered:
                 continue
@@ -375,8 +382,11 @@ def re_register_config_hooks() -> None:
     Commands already allowlisted stay allowlisted, so this never re-prompts
     at a TTY for hooks the user previously approved.
     """
+    home_key = _home_key()
     with _registered_lock:
-        _registered.clear()
+        # Only this home's keys: a force-reload unloads one home's manager, and
+        # clearing another home's keys would let its hooks register twice.
+        _registered.difference_update({k for k in _registered if k[0] == home_key})
     from hermes_cli.config import load_config
 
     register_from_config(load_config())

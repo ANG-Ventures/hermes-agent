@@ -1004,13 +1004,19 @@ class TestForceReloadSymmetry:
         monkeypatch.setattr(
             "hermes_cli.config.load_config", lambda: {"hooks": {}}
         )
+        here = shell_hooks_mod._home_key()
+        other = ("/some/other/profile", "post_llm_call", None, "echo hi")
         with shell_hooks_mod._registered_lock:
-            shell_hooks_mod._registered.add(("post_llm_call", None, "echo hi"))
+            shell_hooks_mod._registered.add((here, "post_llm_call", None, "echo hi"))
+            shell_hooks_mod._registered.add(other)
 
         shell_hooks_mod.re_register_config_hooks()
 
+        # Only the reloaded home's keys are forgotten; another profile's stay,
+        # or its next registration would attach a duplicate callback.
         with shell_hooks_mod._registered_lock:
-            assert not shell_hooks_mod._registered
+            assert shell_hooks_mod._registered == {other}
+            shell_hooks_mod._registered.discard(other)
         assert recorded["cfg"] == {"hooks": {}}
 
     def test_hook_timeout_does_not_block_caller(self, monkeypatch):
