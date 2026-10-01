@@ -118,17 +118,23 @@ def origin_session(body: Optional[str], session_id: Optional[str]) -> Optional[s
     The ``session_id`` column is the card's current home and moves on a
     takeover/restamp (all four 09-30 cards ended up homed on one session), so
     the birth line is the better witness; the column is the fallback.
+    Every line is scanned: the origin line is not always first (Prism P1
+    51592f1748eb). The shared pseudo-homes (``unhomed``, ``operator:*``)
+    name no minting session, so they count as unknown (Prism P1
+    ead8d09886c1), never as one session's deliberate fan-out.
     """
     for line in (body or "").splitlines():
         line = line.strip()
-        if not line:
-            continue
         if line.lower().startswith("origin:"):
             m = _ORIGIN_SESSION_RE.search(line)
             if m:
                 return m.group(1)
-        break
-    return (session_id or "").strip() or None
+    from .kanban_db import is_operator_home, is_unhomed
+
+    sid = (session_id or "").strip()
+    if not sid or is_unhomed(sid) or is_operator_home(sid):
+        return None
+    return sid
 
 
 def _shingles(text: str) -> set[str]:
@@ -194,11 +200,12 @@ def score_pair(a: dict, b: dict, *, exclude_cards: Iterable[str] = ()) -> tuple[
     if shared_sl:
         statuses = sorted({s for s, _ in shared_sl})
         lanes = sorted({l for _, l in shared_sl})
+        # Common statuses add at most _W_STATUS_LANE_COMMON in total, so
+        # they never flag without a second feature (Prism P1 e07748e2edd5).
+        common = sum(1 for s in statuses if s in _COMMON_STATUSES)
+        rare = len(statuses) - common
         score += min(
-            sum(
-                _W_STATUS_LANE_COMMON if s in _COMMON_STATUSES else _W_STATUS_LANE_RARE
-                for s in statuses
-            ),
+            min(common, 1) * _W_STATUS_LANE_COMMON + rare * _W_STATUS_LANE_RARE,
             _W_STATUS_LANE_CAP,
         )
         reasons.append(f"HTTP {'/'.join(statuses)} + {'/'.join(lanes)}")

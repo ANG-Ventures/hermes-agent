@@ -231,3 +231,48 @@ def test_origin_line_beats_a_restamped_home():
     assert kov.origin_session(a["body"], a["session_id"]) != kov.origin_session(
         b["body"], b["session_id"]
     )
+
+
+def test_origin_line_after_a_description_is_still_read():
+    """Prism P1 51592f1748eb: an origin line that is not the first non-empty
+    line was never inspected, so the shared home masked two minters."""
+    home = "20260927_055505_057adbbe"
+    a = "Fix the 426.\norigin: discord #prism, session 20260930_180500_aaaaaa1"
+    b = ("Fix the 426 too.\nsee t_12345678\n"
+         "origin: discord #pr-judge, session 20260930_180700_bbbbbb2")
+    assert kov.origin_session(a, home) == "20260930_180500_aaaaaa1"
+    assert kov.origin_session(b, home) == "20260930_180700_bbbbbb2"
+    assert kov.origin_session("no provenance here", home) == home
+
+
+@pytest.mark.parametrize("home", ["unhomed", "operator:apollo"])
+def test_pseudo_session_homes_are_not_a_minting_session(home):
+    """Prism P1 ead8d09886c1: ``unhomed`` and ``operator:*`` are shared
+    sentinels, not a session; two cards on one are not one session's split."""
+    assert kov.origin_session("plain body", home) is None
+
+
+def test_pseudo_session_homes_still_overlap(kanban_home, clock):
+    with kb.connect_closing() as conn:
+        ids = {}
+        for fid in ("t_f1437191", "t_d979a494"):
+            card = CARDS[fid]
+            clock["now"] = card["created_at"]
+            ids[fid] = kb.create_task(
+                conn, title=card["title"], body=kov._strip_origin(card["body"]),
+                assignee="daedalus", session_id="operator:apollo",
+                session_explicit=True, duplicate_guard=True,
+            )
+        assert ids["t_f1437191"] in _overlaps_of(conn, ids["t_d979a494"])
+
+
+def test_common_statuses_alone_never_reach_the_threshold():
+    """Prism P1 e07748e2edd5: everyday statuses need a second feature,
+    however many of them two cards share."""
+    a = kov.features("claude lane flaky", "seeing 429, 500 and 503 on claude all morning")
+    b = kov.features("bpr retries", "429, 500 and 503 on claude again in the relay log")
+    assert len(a["status_lanes"] & b["status_lanes"]) == 3
+    assert kov.score_pair(a, b)[0] < kov.OVERLAP_THRESHOLD
+    r1 = kov.features("grok down", "426 on grok since 18:00")
+    r2 = kov.features("grok client", "426 on grok after the bump")
+    assert kov.score_pair(r1, r2)[0] >= kov.OVERLAP_THRESHOLD
