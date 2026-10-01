@@ -29,6 +29,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -71,10 +72,10 @@ def test_landed_refuses_missing_recorded_repo_even_when_replacement_ignores_its_
     import hermes_cli.kanban_survivor as survivor_mod
 
     tid = kb.create_task(board, title="missing recorded implementation")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     original = init(ws / "a")
     commit(original, "lost_impl.py", "unpublished original implementation\n", "original")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     survivor_mod.record_baseline(board, tid, ws)
     assert set(survivor_mod._state(board, tid)[0]) == {"a"}
 
@@ -101,7 +102,7 @@ def test_landed_covers_all_recorded_repositories_with_independent_live_trees(boa
     import hermes_cli.kanban_survivor as survivor_mod
 
     tid = kb.create_task(board, title="two landed repositories")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     entries = []
     for key in ("a", "b"):
         repo = init(ws / key)
@@ -109,7 +110,7 @@ def test_landed_covers_all_recorded_repositories_with_independent_live_trees(boa
         live = tmp_path / f"live-{key}"
         git(tmp_path, "clone", "--no-local", str(repo), str(live))
         entries.append({"repo_path": str(live), "sha": sha})
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     survivor_mod.record_baseline(board, tid, ws)
     assert set(survivor_mod._state(board, tid)[0]) == {"a", "b"}
 
@@ -130,10 +131,10 @@ def test_landed_missing_repo_explicit_rescue_requires_bound_ref_for_cleanup(
     tid = kb.create_task(board, title="missing child with explicit rescue")
     task = kb.get_task(board, tid)
     assert task is not None
-    ws = kb.resolve_workspace(task)
+    ws = kbw.resolve_workspace(task)
     child = init(ws / "a")
     commit(child, "lost_impl.py", "unpublished child bytes\n", "implementation")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     survivor_mod.record_baseline(board, tid, ws)
     assert set(survivor_mod._state(board, tid)[0]) == {"a"}
 
@@ -245,7 +246,7 @@ def home_clone(board, tmp_path, *, live_remote=True):
     git(live, "commit", "-m", "local-only content")
 
     tid = kb.create_task(board, title="home clone work")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.parent.mkdir(parents=True, exist_ok=True)
     git(tmp_path, "clone", "--no-local", str(live), str(ws))
     git(ws, "config", "user.name", "Worker")
@@ -262,7 +263,7 @@ def home_clone(board, tmp_path, *, live_remote=True):
     git(ws, "remote", "set-url", "origin", str(mirror))
     if live_remote:
         git(ws, "remote", "add", "live", str(live))
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     return tid, ws, live, head, mirror_sha
 
 
@@ -416,7 +417,7 @@ def test_same_diff_different_base_fails_closed(board, tmp_path):
     from hermes_cli.kanban_survivor import _patch_id, _published_refs, _canonical_survivor
 
     tid = kb.create_task(board, title="divergent work")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.parent.mkdir(parents=True, exist_ok=True)
     local, head, published_fix, mirror = divergent_history(tmp_path)
     # `cp -R src dst` NESTS when dst exists, which silently produced a
@@ -424,7 +425,7 @@ def test_same_diff_different_base_fails_closed(board, tmp_path):
     assert not any(ws.iterdir())
     shutil.copytree(local, ws, symlinks=True, dirs_exist_ok=True)
     assert (ws / ".git").exists()
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
 
     # Premise: the diffs ARE identical, so a patch-id check would match here.
     probe = tmp_path / "divergent-probe"
@@ -485,7 +486,7 @@ def test_landed_rejects_patch_id_whitespace_collision(board, tmp_path):
     source = init(tmp_path / "collision-source")
     commit(source, "implementation.py", "if False:\n    safe = True\n", "base")
     tid = kb.create_task(board, title="whitespace collision")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     git(ws, "config", "user.name", "Workspace")
     git(ws, "config", "user.email", "workspace@example.invalid")
@@ -499,7 +500,7 @@ def test_landed_rejects_patch_id_whitespace_collision(board, tmp_path):
     assert git(ws, "rev-parse", f"{work_head}^:implementation.py") == git(live, "rev-parse", f"{live_head}^:implementation.py")
     assert _execution_value(ws) == 42
     assert _execution_value(live) is None
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with pytest.raises(ValueError, match="survivor_unavailable"):
         kb.complete_task(board, tid, metadata={
             "changed_files": ["implementation.py"],
@@ -568,7 +569,7 @@ def test_landed_accepts_byte_identical_rewritten_workspace_history(board, tmp_pa
     source = init(tmp_path / "patch-source")
     commit(source, "code.py", "value = 1\n", "base")
     tid = kb.create_task(board, title="rewritten landed history")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     git(ws, "config", "user.name", "Workspace")
     git(ws, "config", "user.email", "workspace@example.invalid")
@@ -580,7 +581,7 @@ def test_landed_accepts_byte_identical_rewritten_workspace_history(board, tmp_pa
     git(live, "config", "user.email", "live@example.invalid")
     landed_head = commit(live, "code.py", "value = 2\n", "rewritten implementation")
     assert landed_head != workspace_head
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
 
     assert kb.complete_task(board, tid, metadata={
         "changed_files": ["code.py"],
@@ -597,7 +598,7 @@ def test_landed_rejects_replaced_workspace_commit_without_discarding_raw_work(bo
     source = init(tmp_path / "replace-source")
     base = commit(source, "code.py", "value = 1\n", "base")
     tid = kb.create_task(board, title="replaced workspace history")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     git(ws, "config", "user.name", "Test")
     git(ws, "config", "user.email", "test@example.invalid")
@@ -610,7 +611,7 @@ def test_landed_rejects_replaced_workspace_commit_without_discarding_raw_work(bo
         ["git", "-C", str(ws), "--no-replace-objects", "show", f"{work}:code.py"],
         stdin=subprocess.DEVNULL, capture_output=True, check=True,
     ).stdout == b"value = 2\n"
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with pytest.raises(ValueError, match="survivor_unavailable"):
         kb.complete_task(board, tid, metadata={
             "changed_files": ["code.py"], "landed": [{"repo_path": str(live), "sha": base}],
@@ -624,7 +625,7 @@ def test_landed_allows_unrelated_edit_to_inherited_path(board, tmp_path):
     commit(source, "config.txt", "version=1\n", "baseline config")
     commit(source, "implementation.py", "result=0\n", "baseline implementation")
     tid = kb.create_task(board, title="inherited path edited independently")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     live = tmp_path / "inherited-live"
     for path in (ws, live):
         git(tmp_path, "clone", "--no-local", str(source), str(path))
@@ -634,7 +635,7 @@ def test_landed_allows_unrelated_edit_to_inherited_path(board, tmp_path):
     landed = commit(live, "implementation.py", "result=1\n", "rewritten implementation")
     assert work != landed
     commit(live, "config.txt", "version=2\n", "unrelated configuration")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     assert kb.complete_task(board, tid, metadata={
         "changed_files": ["implementation.py"],
         "landed": [{"repo_path": str(live), "sha": landed}],
@@ -647,7 +648,7 @@ def test_landed_rejects_work_reverted_from_canonical_head(board, tmp_path, rewri
     source = init(tmp_path / "reverted-source")
     commit(source, "implementation.py", "result = 0\n", "base")
     tid = kb.create_task(board, title="reverted landed work")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     live = tmp_path / "reverted-live"
     git(tmp_path, "clone", "--no-local", str(source), str(live))
@@ -666,7 +667,7 @@ def test_landed_rejects_work_reverted_from_canonical_head(board, tmp_path, rewri
     reverted = commit(live, "implementation.py", "result = 0\n", "revert implementation")
     assert _execution_value(ws) == 1
     assert _execution_value(live) == 0
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
 
     with pytest.raises(ValueError, match="survivor_unavailable"):
         kb.complete_task(board, tid, metadata={
@@ -682,7 +683,7 @@ def test_landed_allows_unrelated_canonical_addition(board, tmp_path):
     source = init(tmp_path / "addition-source")
     commit(source, "implementation.py", "result = 0\n", "base")
     tid = kb.create_task(board, title="canonical independent addition")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     git(ws, "config", "user.name", "Test")
     git(ws, "config", "user.email", "test@example.invalid")
@@ -694,7 +695,7 @@ def test_landed_allows_unrelated_canonical_addition(board, tmp_path):
     git(live, "fetch", str(ws), "main")
     git(live, "reset", "--hard", "FETCH_HEAD")
     commit(live, "independent.py", "other = 2\n", "unrelated addition")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     assert kb.complete_task(board, tid, metadata={
         "changed_files": ["implementation.py"],
         "landed": [{"repo_path": str(live), "sha": work}],
@@ -708,7 +709,7 @@ def test_landed_checks_deleted_paths_and_modes_at_live_head(board, tmp_path, res
     source = init(tmp_path / "mode-source")
     commit(source, "implementation.py", "result = 1\n", "base")
     tid = kb.create_task(board, title="deleted path or mode reverted")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     live = tmp_path / "mode-live"
     git(tmp_path, "clone", "--no-local", str(source), str(live))
@@ -729,7 +730,7 @@ def test_landed_checks_deleted_paths_and_modes_at_live_head(board, tmp_path, res
         git(live, "commit", "-m", "remove executable mode")
     else:
         commit(live, "implementation.py", "result = 1\n", "restore deleted path")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with pytest.raises(ValueError, match="survivor_unavailable"):
         kb.complete_task(board, tid, metadata={
             "changed_files": ["implementation.py"],
@@ -745,7 +746,7 @@ def test_landed_rename_checks_both_source_and_destination(board, tmp_path, resto
     source = init(tmp_path / "rename-source")
     commit(source, "old.py", "value = 1\n", "base")
     tid = kb.create_task(board, title="renamed implementation")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     live = tmp_path / "rename-live"
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     if shared_history:
@@ -761,7 +762,7 @@ def test_landed_rename_checks_both_source_and_destination(board, tmp_path, resto
         git(repo, "commit", "-m", message)
     if restore_source:
         commit(live, "old.py", "value = 1\n", "restore old path")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     metadata = {
         "changed_files": ["old.py", "new.py"],
         "landed": [{"repo_path": str(live), "sha": git(live, "rev-parse", "HEAD")}],
@@ -836,7 +837,7 @@ def test_diff_collision_over_attachment_limit_holds_workspace(board, tmp_path, m
     """A matching patch-id cannot bypass the cap by claiming a durable ref."""
     tid = kb.create_task(board, title="oversized divergent work")
     ws, _, _, _ = divergent_history(tmp_path)
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
     with pytest.raises(ValueError, match="exceeds attachment limit"):
         kb.complete_task(board, tid, metadata={"changed_files": ["unpublished.py"]})

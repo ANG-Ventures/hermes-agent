@@ -1,93 +1,48 @@
 """Kanban board watcher methods for GatewayRunner.
 
-Extracted verbatim from ``gateway/run.py`` (god-file decomposition Phase 3).
-These are the background-loop methods that subscribe to kanban boards, deliver
-notifications/artifacts, and drive the multi-agent dispatcher. They use only
-``self`` state, so they live on a mixin that ``GatewayRunner`` inherits — the
-``self._kanban_*`` call sites resolve identically via the MRO, making this a
-behavior-neutral move that lifts ~1,000 LOC out of run.py.
+Background loops that subscribe to kanban boards, deliver notifications and
+artifacts, and drive the multi-agent dispatcher. They use only ``self`` state,
+so they live on a mixin ``GatewayRunner`` inherits. Shared plumbing (thread
+offload, board enumeration, singleton lock, live-config coercers) lives in
+``kanban_watchers_common``; the event-formatter table and the standalone
+``_KanbanNotification`` / ``_notifier_collect`` pipeline in
+``kanban_watchers_notifier``; ``_KanbanDispatcher`` in ``kanban_watchers_dispatcher``.
+This module keeps the fleet's notifier loop (lane-failure dedupe, self-echo wake
+suppression, wake-identity resolution, card home line) and the leadership-aware
+dispatcher loop (standby retry, guard-stuck episodes, land queue, workspace
+refusal paging) as the loop bodies ``GatewayRunner`` runs.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 import os
-import re
 import sqlite3
 import subprocess
 import sys
 import time
-from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Iterable, NamedTuple, Optional
 
 from agent.i18n import t
+from gateway.kanban_watchers_common import (
+    _acquire_singleton_lock,
+    _kanban_dispatch_allowed,
+    _release_singleton_lock,
+    _resolve_auto_decompose_settings,
+    _to_thread_process_service,
+    logger,
+)
+from gateway.kanban_watchers_notifier import _safe_review_reason, _wake_scope_id
 from gateway.routing_identity import (
     creator_stamp_is_session_key,
     effective_routing_lane,
     routing_key_carries_identity,
 )
 
-# Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
-# "gateway.run") so extracted log records keep their original logger name.
-logger = logging.getLogger("gateway.run")
-
-
-_LOCAL_PATH_RE = re.compile(
-    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
-    r"[A-Za-z]:\\[^\s,;]+)"
-)
-
-
-def _safe_review_reason(value: Any, limit: int = 160) -> str:
-    """Return a mobile-friendly review reason safe for external delivery."""
-    from agent.redact import redact_sensitive_text
-
-    reason = redact_sensitive_text(
-        "" if value is None else str(value),
-        force=True,
-        redact_url_credentials=True,
-    )
-    reason = _LOCAL_PATH_RE.sub("[local path]", reason)
-    reason = " ".join(reason.split())
-    if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
-    return reason
-
-
-def _resolve_auto_decompose_settings(
-    load_config: Callable[[], Any],
-) -> "tuple[bool, int]":
-    """Resolve the live (enabled, per_tick) auto-decompose settings.
-
-    Read fresh from config on every dispatcher tick (#49638) so that flipping
-    ``kanban.auto_decompose: false`` to STOP runaway fan-out takes effect on the
-    next tick instead of requiring a gateway restart. Auto-decompose is a
-    safety toggle — a user who sees it create and launch tasks they didn't
-    intend reaches for this flag to halt it, and a stale boot-captured value
-    silently ignoring that change is the bug reported in #49638.
-
-    Fails **safe**: if the config read raises, return ``(False, 3)`` — a
-    transient read error must never re-enable a feature the user turned off,
-    nor fall back to the burst-prone default-on behaviour. ``per_tick`` is
-    clamped to ``>= 1``.
-    """
-    try:
-        cfg = load_config()
-    except Exception:
-        return False, 3
-    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    enabled = bool(kcfg.get("auto_decompose", True))
-    try:
-        per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
-    except (TypeError, ValueError):
-        per_tick = 3
-    if per_tick < 1:
-        per_tick = 1
-    return enabled, per_tick
-
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 
 class _WakeRoutingIdentity(NamedTuple):
     """One coherent routing identity from a live session entry."""
@@ -187,95 +142,6 @@ def resolve_wake_participant(
         ),
     )
     return identity.participant or None
-
-
-def _kanban_dispatch_allowed() -> bool:
-    """Return False while the global emergency stop (`hermes pause`) is engaged.
-
-    Checked every dispatcher tick BEFORE spawning new workers so a pause takes
-    effect on the next tick without a gateway restart. In-flight workers are
-    never touched — this only stops NEW spawns. Fails open: if the estop
-    module is unimportable, dispatch proceeds (the sentinel gate must not
-    become a new crash surface for the dispatcher).
-    """
-    try:
-        from agent.estop import check_paused
-    except ImportError:
-        return True
-    return not check_paused("kanban", logger)
-
-
-def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
-    """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
-
-    ``asyncio.to_thread`` copies the calling task's context onto the worker
-    thread. Supervised Kanban ticks are process-owned writers; if that copy
-    still carries a ``delegate_task`` child marker, ``write_txn``
-    false-trips. Since watchers spawn from a fresh ``Context``
-    (``_spawn_supervised``), this offload-boundary scrub is defense in
-    depth: it covers non-supervised spawn paths and any task context frozen
-    before spawn isolation shipped. An empty Context keeps the DB guard
-    intact for real children without exempting dispatcher writes.
-    """
-    return Context().run(func, *args)
-
-
-async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) -> Any:
-    """Offload blocking process-service work (dispatcher + notifier writers)
-    without inheriting request-local ContextVars."""
-    return await asyncio.to_thread(_run_in_fresh_context, func, *args)
-
-
-def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
-    """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
-
-    Only one gateway process machine-wide may run the embedded kanban
-    dispatcher: concurrent dispatchers double the reclaim frequency (each
-    runs its own ``release_stale_claims`` → promote → dispatch loop), double
-    claim-attempt events in the event log, and — with ``wal_autocheckpoint=0`` —
-    concurrent manual WAL checkpoints can corrupt index pages. The
-    ``dispatch_in_gateway`` config flag is the primary control; this lock is the
-    backstop that survives config drift and same-profile restart races.
-
-    Delegates to :func:`gateway.status._try_acquire_file_lock` (``fcntl`` on
-    POSIX, ``msvcrt`` on Windows) so the guard is cross-platform.
-
-    Returns ``(handle, "held")`` on success — the caller keeps the file handle
-    for the process lifetime and **must** release it via
-    :func:`_release_singleton_lock` when done. ``(None, "contended")`` when
-    another process holds the lock (caller must NOT dispatch). ``(None,
-    "unavailable")`` when locking cannot be performed (non-POSIX filesystem
-    without flock, or the status.py helpers are unimportable) — caller must
-    not dispatch without proven exclusion.
-    """
-    try:
-        from gateway.status import _try_acquire_file_lock  # deferred; same package
-    except ImportError:
-        return None, "unavailable"
-    try:
-        Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
-        handle = open(str(lock_path), "a+", encoding="utf-8")
-    except OSError:
-        return None, "unavailable"
-    if not _try_acquire_file_lock(handle):
-        handle.close()
-        return None, "contended"
-    return handle, "held"
-
-
-def _release_singleton_lock(handle) -> None:
-    """Release a dispatcher singleton lock acquired via :func:`_acquire_singleton_lock`."""
-    if handle is None:
-        return
-    try:
-        from gateway.status import _release_file_lock
-        _release_file_lock(handle)
-    except Exception:
-        pass
-    try:
-        handle.close()
-    except Exception:
-        pass
 
 
 # Benign-decline buckets on a ``DispatchResult``: the dispatcher looked at the
@@ -1091,44 +957,6 @@ def _stall_streak_is_bad(ready_pending, any_spawned, results, *, guard_stuck=Fal
     return fault_seen or not declined_benign
 
 
-def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
-    """Return the tenant scope (Slack workspace) a subscription's wake keys to.
-
-    ``build_session_key()`` includes ``SessionSource.scope_id`` on platforms
-    where one bot serves several isolated tenants, so a wake source must carry
-    the same scope as inbound messages from that chat to resolve to the same
-    session.
-
-    The subscription's persisted ``delivery_metadata`` wins over the adapter's
-    live chat → scope mapping, because it records the scope the subscription was
-    created from; the mapping only covers rows that stored no metadata. ``None``
-    means the chat has no scope, which is what an unscoped platform's key
-    contains.
-    """
-    delivery_meta = sub.get("delivery_metadata")
-    if isinstance(delivery_meta, dict):
-        for key in ("scope_id", "slack_team_id", "team_id"):
-            value = delivery_meta.get(key)
-            if value:
-                return str(value)
-    resolver = getattr(adapter, "scope_id_for_chat", None)
-    if callable(resolver):
-        try:
-            resolved = resolver(str(sub.get("chat_id") or ""))
-        except Exception as exc:
-            # An adapter-side lookup failure yields no scope, never an error.
-            logger.debug(
-                "kanban notifier: scope lookup failed for chat %s: %s",
-                sub.get("chat_id"),
-                exc,
-                exc_info=True,
-            )
-            return None
-        if resolved:
-            return str(resolved)
-    return None
-
-
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1298,6 +1126,13 @@ class GatewayKanbanWatchersMixin:
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
+    async def _sleep_between_ticks(self, interval: float) -> None:
+        """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
+        interval = max(interval, 1.0)
+        slept = 0.0
+        while slept < interval and self._running:
+            await asyncio.sleep(min(1.0, interval - slept))
+            slept += 1.0
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -1333,6 +1168,18 @@ class GatewayKanbanWatchersMixin:
             from hermes_cli import kanban_db as _kb
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
+            return
+
+        try:
+            from hermes_cli.config import load_config as _load_config
+
+            cfg = _load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception as exc:
+            logger.warning("kanban notifier: cannot load config (%s); continuing enabled", exc)
+            kanban_cfg = {}
+        if not kanban_cfg.get("notify_in_gateway", True):
+            logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
             return
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
@@ -1485,7 +1332,8 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(
+                            from hermes_cli import kanban_db_notify as _kbn
+                            if _kbn.count_notify_subs(
                                 board=slug,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
@@ -2325,128 +2173,58 @@ class GatewayKanbanWatchersMixin:
                     return
                 await asyncio.sleep(1)
 
-    def _kanban_advance(
-        self, sub: dict, cursor: int, board: Optional[str] = None,
-    ) -> None:
-        """Sync helper: advance a subscription's cursor. Runs in to_thread.
-
-        ``board`` scopes the DB connection to the board that owns this
-        subscription. Unsub cursors in one board can't touch another's.
-        """
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
+        """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
+        from hermes_cli import kanban_db_connect as _kbc
+        from hermes_cli import kanban_db_notify as _kbn
+        conn = _kbc.connect(board=board)
         try:
-            _kb.advance_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
+            getattr(_kbn, op)(
+                conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "", **extra,
             )
         finally:
             conn.close()
+
+    def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
+        self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.remove_notify_sub(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-            )
-        finally:
-            conn.close()
+        self._kanban_sub_op(board, "remove_notify_sub", sub)
 
-    def _kanban_rewind(
-        self,
-        sub: dict,
-        claimed_cursor: int,
-        old_cursor: int,
-        board: Optional[str] = None,
-    ) -> None:
-        """Sync helper: undo a claimed notification cursor after send failure."""
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
-            )
-        finally:
-            conn.close()
+    def _kanban_rewind(self, sub: dict, claimed_cursor: int, old_cursor: int, board: Optional[str] = None) -> None:
+        """Undo a claimed notification cursor after send failure."""
+        self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
-    async def _deliver_kanban_artifacts(
-        self,
-        *,
-        adapter,
-        chat_id: str,
-        metadata: dict,
-        event_payload: Optional[dict],
-        task,
-    ) -> None:
+    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
-        Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
-        file paths through the completion event so downstream humans get
-        the deliverable as a native upload instead of a path printed in
-        chat.
-
-        Sources scanned, in priority order:
-          1. ``event_payload['artifacts']`` (explicit list — preferred)
-          2. ``event_payload['summary']`` (truncated first line)
-          3. ``task.result`` (legacy fallback)
-
-        Files are deduplicated, missing files are silently skipped (the
-        path may have been mentioned for reference only), and delivery
-        errors are logged but do not break the notifier loop.
+        Sources, in priority order: ``event_payload['artifacts']``,
+        ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
+        deduplicated, missing files are skipped (may be mentioned for
+        reference only), and upload errors are logged, never raised.
         """
-        from pathlib import Path as _Path
-
-        candidates: list[str] = []
-        seen: set[str] = set()
-
-        def _add(path: str) -> None:
-            if not path:
-                return
-            expanded = os.path.expanduser(path)
-            if expanded in seen:
-                return
-            if not os.path.isfile(expanded):
-                return
-            seen.add(expanded)
-            candidates.append(expanded)
-
-        # 1. Explicit artifacts list in payload.
+        raw_paths: list[str] = []
+        prose_paths: list[str] = []
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
             if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    if isinstance(item, str):
-                        _add(item)
-
-            # 2. Paths embedded in the payload summary.
+                raw_paths += [item for item in raw if isinstance(item, str)]
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
-                for p in paths:
-                    _add(p)
-
-        # 3. Legacy: paths embedded in task.result.
+                prose_paths += adapter.extract_local_files(summary)[0]
         if task is not None and getattr(task, "result", None):
-            result_text = str(task.result)
-            paths, _ = adapter.extract_local_files(result_text)
-            for p in paths:
-                _add(p)
-
+            prose_paths += adapter.extract_local_files(str(task.result))[0]
+        # A staged copy and the scratch original it was copied from are the
+        # same deliverable; on a review handoff the original still exists, so
+        # prose mentions of it must not upload the file a second time.
+        staged_names = {os.path.basename(p) for p in raw_paths}
+        raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
+        candidates: list[str] = []
+        for path in raw_paths:
+            expanded = os.path.expanduser(path) if path else ""
+            if expanded and expanded not in candidates and os.path.isfile(expanded):
+                candidates.append(expanded)
         if not candidates:
             return
 
@@ -2455,43 +2233,25 @@ class GatewayKanbanWatchersMixin:
         if not candidates:
             return
 
-        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-
         from urllib.parse import quote as _quote
 
-        # Partition images so they ride a single send_multiple_images call
-        # on platforms that support batch image uploads (Signal/Slack RPCs).
-        image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
-        other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
-
+        # Images ride one send_multiple_images call (batch uploads on Signal/Slack).
+        image_paths = [p for p in candidates if Path(p).suffix.lower() in _IMAGE_EXTS]
+        other_paths = [p for p in candidates if Path(p).suffix.lower() not in _IMAGE_EXTS]
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(
-                    chat_id=chat_id, images=batch, metadata=metadata,
-                )
+                await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
             except Exception as exc:
-                logger.warning(
-                    "kanban notifier: image batch upload failed: %s", exc,
-                )
-
+                logger.warning("kanban notifier: image batch upload failed: %s", exc)
         for path in other_paths:
-            ext = _Path(path).suffix.lower()
             try:
-                if ext in _VIDEO_EXTS:
-                    await adapter.send_video(
-                        chat_id=chat_id, video_path=path, metadata=metadata,
-                    )
+                if Path(path).suffix.lower() in _VIDEO_EXTS:
+                    await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
                 else:
-                    await adapter.send_document(
-                        chat_id=chat_id, file_path=path, metadata=metadata,
-                    )
+                    await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
             except Exception as exc:
-                logger.warning(
-                    "kanban notifier: artifact upload (%s) failed: %s",
-                    path, exc,
-                )
+                logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Own leadership until the watcher and any in-flight service work exit."""
@@ -2937,7 +2697,8 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                from hermes_cli import kanban_db_dispatch as _kbd
+                return _kbd.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,

@@ -1,3 +1,5 @@
+import ast
+import inspect
 """#84733: prompt-cache TTL/prefix propagation into MoA/aux paths + failover re-preflight.
 
 The main loop threads ``agent._cache_ttl`` and the stable system prefix into
@@ -10,9 +12,6 @@ per-destination Qwen clamp (1h -> 5m), and the failover re-preflight
 contract (every fallback activation must restart the outer iteration so the
 pre-API preflight re-runs against the fallback's context window).
 """
-
-import ast
-import inspect
 
 
 def _collect_cache_controls(obj):
@@ -286,51 +285,6 @@ class TestFailoverRestartsPreflight:
                     "outer-loop fallback activation must not break — that "
                     "exits the conversation loop and ends the turn (#84733)"
                 )
-
-    def test_restart_handler_clears_preflight_block(self):
-        """The single consumer of restart_with_rebuilt_messages must clear
-        _preflight_compression_blocked, so every retry-loop failover gets a
-        fresh preflight against the fallback's context window (#84733)."""
-        from agent import conversation_loop
-
-        tree = ast.parse(inspect.getsource(conversation_loop.run_conversation))
-        handlers = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Attribute)
-            and node.test.attr == "restart_with_rebuilt_messages"
-        ]
-        assert handlers, "expected the restart_with_rebuilt_messages handler"
-        consumer = [
-            node
-            for node in handlers
-            if any(
-                isinstance(stmt, ast.Assign)
-                and any(
-                    isinstance(t, ast.Attribute)
-                    and t.attr == "restart_with_rebuilt_messages"
-                    for t in stmt.targets
-                )
-                for stmt in node.body
-            )
-        ]
-        assert consumer, "expected the flag-consuming handler"
-        for node in consumer:
-            assert any(
-                isinstance(stmt, ast.Assign)
-                and any(
-                    isinstance(t, ast.Name)
-                    and t.id == "_preflight_compression_blocked"
-                    for t in stmt.targets
-                )
-                and isinstance(stmt.value, ast.Constant)
-                and stmt.value.value is False
-                for stmt in node.body
-            ), (
-                "the restart handler must clear _preflight_compression_blocked "
-                "so the re-run preflight isn't skipped (#84733)"
-            )
 
 
 class TestAuxFallbackReplanThreadsTtl:

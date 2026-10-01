@@ -25,6 +25,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -139,7 +140,7 @@ def test_operator_cannot_release_live_claimer(conn, operator_token):
 def test_operator_cannot_release_dead_claimer_with_worker_heartbeat(conn, operator_token):
     lock = _host(_dead_pid())
     tid, _ = _running_card(conn, lock)
-    assert kb.heartbeat_worker(conn, tid, note="unstamped orphan alive")
+    assert kbd.heartbeat_worker(conn, tid, note="unstamped orphan alive")
     assert kb.reclaim_task(conn, tid, operator="apollo: x") is False
     assert not _events(conn, tid, "reclaimed")
 
@@ -315,7 +316,7 @@ def test_operator_release_rechecks_worker_pid_inside_txn(conn, operator_token, m
     lock = _host(_dead_pid())
     tid, run_id = _running_card(conn, lock)
     _stamp_between_check_and_update(
-        monkeypatch, lambda c, t: kb._set_worker_pid(c, t, os.getpid(), run_id=run_id),
+        monkeypatch, lambda c, t: kbd._set_worker_pid(c, t, os.getpid(), run_id=run_id),
     )
     assert kb.reclaim_task(conn, tid, operator="apollo: x") is False
     row = conn.execute("SELECT claim_lock, worker_pid FROM tasks WHERE id=?", (tid,)).fetchone()
@@ -327,7 +328,7 @@ def test_operator_release_rechecks_worker_evidence_inside_txn(conn, operator_tok
     lock = _host(_dead_pid())
     tid, _ = _running_card(conn, lock)
     _stamp_between_check_and_update(
-        monkeypatch, lambda c, t: kb.heartbeat_worker(c, t, note="orphan alive"),
+        monkeypatch, lambda c, t: kbd.heartbeat_worker(c, t, note="orphan alive"),
     )
     assert kb.reclaim_task(conn, tid, operator="apollo: x") is False
     assert conn.execute("SELECT claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()[0] == lock

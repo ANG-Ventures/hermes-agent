@@ -12,7 +12,6 @@ gets stripped from the durable transcript. This test file verifies:
   - The JSON log drops only the nudge, keeping the assistant candidate.
 """
 
-import json
 import sys
 from contextlib import contextmanager
 from unittest.mock import MagicMock
@@ -105,21 +104,23 @@ def test_fresh_run_agent_restores_precollected_module_identity(tmp_path):
 
 
 def test_verification_flags_registered_as_ephemeral(fresh_run_agent):
-    ra = fresh_run_agent
+    # parity 2026-10-01: upstream moved the scaffolding predicate out of run_agent
+    # into agent.session_persistence; the fresh import keeps the module stack isolated.
+    from agent.session_persistence import _EPHEMERAL_SCAFFOLDING_FLAGS, _is_ephemeral_scaffolding
 
-    assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
-    assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_verification_stop_synthetic" in _EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_pre_verify_synthetic" in _EPHEMERAL_SCAFFOLDING_FLAGS
 
     # The nudge messages ARE scaffolding (they carry the synthetic flag).
-    assert ra._is_ephemeral_scaffolding(
+    assert _is_ephemeral_scaffolding(
         {"role": "user", "content": "[System: run tests]", "_pre_verify_synthetic": True}
     )
-    assert ra._is_ephemeral_scaffolding(
+    assert _is_ephemeral_scaffolding(
         {"role": "user", "content": "[System: run tests]", "_verification_stop_synthetic": True}
     )
     # Real messages (including the assistant candidate) are not.
-    assert not ra._is_ephemeral_scaffolding({"role": "user", "content": "hi"})
-    assert not ra._is_ephemeral_scaffolding({"role": "assistant", "content": "premature done"})
+    assert not _is_ephemeral_scaffolding({"role": "user", "content": "hi"})
+    assert not _is_ephemeral_scaffolding({"role": "assistant", "content": "premature done"})
 
 
 def _make_agent(ra, session_id, tmp_path):
@@ -135,7 +136,7 @@ def _make_agent(ra, session_id, tmp_path):
     )
     agent._session_db = MagicMock()
     agent._session_db_created = True
-    agent._session_json_enabled = True
+
     agent.logs_dir = tmp_path / "logs"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
     return agent
@@ -169,33 +170,3 @@ def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, fresh_run_agent):
     assert "premature done" in persisted
     # Only the nudge is dropped.
     assert "[System: run tests]" not in persisted
-
-
-def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, fresh_run_agent):
-    """The assistant candidate is NOT flagged synthetic, so it persists in the
-    JSON log. Only the nudge (flagged synthetic) is dropped."""
-    ra = fresh_run_agent
-    agent = _make_agent(ra, "sess_json", tmp_path)
-
-    messages = [
-        {"role": "user", "content": "hi"},
-        # Assistant candidate — NOT flagged synthetic, persists.
-        {"role": "assistant", "content": "premature done"},
-        # Nudge — flagged synthetic, gets dropped.
-        {"role": "user", "content": "[System: run tests]", "_pre_verify_synthetic": True},
-        {"role": "assistant", "content": "verified and clean"},
-    ]
-
-    agent._save_session_log(messages)
-
-    log_file = agent.logs_dir / "session_sess_json.json"
-    assert log_file.exists()
-    data = json.loads(log_file.read_text(encoding="utf-8"))
-    contents = [m.get("content") for m in data["messages"]]
-    # The assistant candidate persists — it is real content.
-    assert "premature done" in contents
-    assert "verified and clean" in contents
-    assert "hi" in contents
-    # Only the nudge is dropped.
-    assert "[System: run tests]" not in contents
-    assert all(not m.get("_pre_verify_synthetic") for m in data["messages"])

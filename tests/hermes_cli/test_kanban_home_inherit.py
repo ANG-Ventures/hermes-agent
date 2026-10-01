@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_graph as kbg
 
 HOME = "20260922_000000_home"
 WORKER_RUN = "20260924_999999_workerrun"
@@ -93,7 +94,7 @@ def test_decomposed_children_inherit_root_home_and_origin(kanban_home):
         root_id = kb.create_task(conn, title="root", assignee="apollo",
                                  session_id=HOME, body=ORIGIN + "\n\nroot",
                                  triage=True)
-        kids = kb.decompose_triage_task(
+        kids = kbg.decompose_triage_task(
             conn, root_id, root_assignee="apollo",
             children=[{"title": "a", "assignee": "w", "body": "A"},
                       {"title": "b", "assignee": "w"}],

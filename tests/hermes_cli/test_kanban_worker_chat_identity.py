@@ -12,6 +12,7 @@ import subprocess
 from types import SimpleNamespace
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 
 
@@ -44,8 +45,8 @@ def _capture_spawn_env(monkeypatch, tmp_path) -> dict[str, str]:
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: False)
 
     captured: dict[str, object] = {}
@@ -61,7 +62,7 @@ def _capture_spawn_env(monkeypatch, tmp_path) -> dict[str, str]:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    assert kb._default_spawn(_task(), str(workspace), board="identity-board") == 4242
+    assert kbd._default_spawn(_task(), str(workspace), board="identity-board") == 4242
     return captured["env"]  # type: ignore[return-value]
 
 

@@ -38,6 +38,7 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -120,6 +121,7 @@ def test_dispatcher_stamps_pending_grant_on_worker_spawn(monkeypatch, tmp_path):
         KANBAN_OWNER_PID_PENDING,
     )
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     captured = {}
 
@@ -148,7 +150,7 @@ def test_dispatcher_stamps_pending_grant_on_worker_spawn(monkeypatch, tmp_path):
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
 
     assert captured["env"][KANBAN_OWNER_PID_ENV] == KANBAN_OWNER_PID_PENDING
     assert captured["env"]["HERMES_KANBAN_TASK"] == tid

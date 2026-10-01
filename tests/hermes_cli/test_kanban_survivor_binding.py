@@ -27,6 +27,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 HEAD = "a1" * 20
 MERGE = "b2" * 20
@@ -117,8 +118,8 @@ def test_unrelated_live_claim_is_refused(board, unrelated, kwargs, monkeypatch):
 def test_unrelated_live_claim_does_not_delete_the_workspace(board, unrelated):
     """The consequence, not just the return value: the bytes must survive."""
     tid = _claimed_card(board)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "implementation.py").write_text("work that lives nowhere else\n")
 
@@ -180,8 +181,8 @@ def test_a_mention_does_not_delete_the_workspace(board, unrelated, field):
     """
     tid = _claimed_card(board)
     unrelated[0][field] = f"mentions {tid} in passing"
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "implementation.py").write_text("work that lives nowhere else\n")
 
@@ -540,8 +541,8 @@ def _reclaimable(board, tid):
     delete. With the directory present, an in-tree capture answers first and
     the recorded survivor is never consulted.
     """
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     shutil.rmtree(ws, ignore_errors=True)
     return ws
 

@@ -21,6 +21,7 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -38,7 +39,7 @@ def board(tmp_path, monkeypatch):
 def claim(conn, title="infra probe"):
     tid = kb.create_task(conn, title=title, assignee="worker")
     task = kb.claim_task(conn, tid)
-    kb._set_worker_pid(conn, tid, 99999999)
+    kbd._set_worker_pid(conn, tid, 99999999)
     return task
 
 
@@ -54,7 +55,7 @@ def receipt(task, code):
 def test_classifier_names_the_infra_class(code):
     """Both shell "could not execute" codes map to infra, not a crash."""
     assert kb._classify_worker_exit.__module__  # sanity: symbol exists
-    kb._record_worker_exit(4242, code << 8)
+    kbd._record_worker_exit(4242, code << 8)
     try:
         assert kb._classify_worker_exit(4242) == ("infra_unavailable", code)
     finally:
@@ -64,7 +65,7 @@ def test_classifier_names_the_infra_class(code):
 @pytest.mark.parametrize("code", [1, 2, 3, 70, 125, 128])
 def test_neighbouring_codes_are_still_real_failures(code):
     """The class must stay NARROW: only 126/127 are pre-start failures."""
-    kb._record_worker_exit(4243, code << 8)
+    kbd._record_worker_exit(4243, code << 8)
     try:
         kind, got = kb._classify_worker_exit(4243)
         assert (kind, got) == ("nonzero_exit", code)
@@ -79,7 +80,7 @@ def test_infra_exit_requeues_without_blaming_the_card(board, monkeypatch, code):
     task = claim(board)
     receipt(task, code)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    kb.detect_crashed_workers(board)
+    kbd.detect_crashed_workers(board)
 
     current = kb.get_task(board, task.id)
     assert current.status == "ready", "an infra outage must not park the card"
@@ -93,18 +94,18 @@ def test_infra_exit_requeues_without_blaming_the_card(board, monkeypatch, code):
     assert meta["exit_code"] == code
     assert meta["exit_class"] == "infra_unavailable"
 
-    assert task.id in kb.detect_crashed_workers._last_infra_unavailable
-    assert task.id not in kb.detect_crashed_workers._last_rate_limited, (
+    assert task.id in kbd.detect_crashed_workers._last_infra_unavailable
+    assert task.id not in kbd.detect_crashed_workers._last_rate_limited, (
         "an infra outage is not a quota wall; the board must not say it is"
     )
-    assert task.id not in kb.detect_crashed_workers._last_auto_blocked
+    assert task.id not in kbd.detect_crashed_workers._last_auto_blocked
 
 
 def test_infra_exit_emits_its_own_event_kind(board, monkeypatch):
     task = claim(board)
     receipt(task, 127)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    kb.detect_crashed_workers(board)
+    kbd.detect_crashed_workers(board)
     kinds = [
         r["kind"] for r in board.execute(
             "SELECT kind FROM task_events WHERE task_id=?", (task.id,)
@@ -119,10 +120,10 @@ def test_infra_exit_defers_the_respawn(board, monkeypatch):
     task = claim(board)
     receipt(task, 127)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    kb.detect_crashed_workers(board)
+    kbd.detect_crashed_workers(board)
     current = kb.get_task(board, task.id)
     assert current.next_eligible_at >= int(time.time()) + 295
-    assert kb.check_respawn_guard(board, task.id) == "rate_limit_cooldown"
+    assert kbd.check_respawn_guard(board, task.id) == "rate_limit_cooldown"
 
 
 def test_repeated_infra_exits_never_trip_the_breaker(board, monkeypatch):
@@ -134,9 +135,9 @@ def test_repeated_infra_exits_never_trip_the_breaker(board, monkeypatch):
             "UPDATE tasks SET status='ready', next_eligible_at=NULL WHERE id=?", (tid,)
         )
         task = kb.claim_task(board, tid)
-        kb._set_worker_pid(board, tid, 99999999)
+        kbd._set_worker_pid(board, tid, 99999999)
         receipt(task, 127)
-        kb.detect_crashed_workers(board)
+        kbd.detect_crashed_workers(board)
     current = kb.get_task(board, tid)
     assert current.consecutive_failures == 0
     assert current.status == "ready"
@@ -149,30 +150,30 @@ def test_infra_run_is_neutral_for_the_protocol_violation_streak(board, monkeypat
 
     # one real protocol violation (clean exit, still running)
     task = kb.claim_task(board, tid)
-    kb._set_worker_pid(board, tid, 99999999)
+    kbd._set_worker_pid(board, tid, 99999999)
     receipt(task, 0)
-    kb.detect_crashed_workers(board)
-    assert kb._protocol_violation_streak(board, tid) == 1
+    kbd.detect_crashed_workers(board)
+    assert kbd._protocol_violation_streak(board, tid) == 1
 
     # an infra exit on top of it is NEUTRAL — the streak is unchanged
     board.execute(
         "UPDATE tasks SET status='ready', next_eligible_at=NULL WHERE id=?", (tid,)
     )
     task = kb.claim_task(board, tid)
-    kb._set_worker_pid(board, tid, 99999999)
+    kbd._set_worker_pid(board, tid, 99999999)
     receipt(task, 127)
-    kb.detect_crashed_workers(board)
-    assert kb._protocol_violation_streak(board, tid) == 1
+    kbd.detect_crashed_workers(board)
+    assert kbd._protocol_violation_streak(board, tid) == 1
 
 
 def test_status_fallback_classifies_infra_without_a_receipt(board, monkeypatch):
     """Legacy path: no exit receipt, only the reaped wait status."""
     task = claim(board)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    kb._record_worker_exit(99999999, 127 << 8)
-    kb.detect_crashed_workers(board)
+    kbd._record_worker_exit(99999999, 127 << 8)
+    kbd.detect_crashed_workers(board)
     assert kb.get_task(board, task.id).consecutive_failures == 0
-    assert task.id in kb.detect_crashed_workers._last_infra_unavailable
+    assert task.id in kbd.detect_crashed_workers._last_infra_unavailable
 
 
 # --------------------------------------------------------------- mutation guard
@@ -185,7 +186,7 @@ def test_mutation_removing_the_class_reblames_the_card(board, monkeypatch):
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(kb, "KANBAN_INFRA_EXIT_CODES", frozenset())
 
-    kb.detect_crashed_workers(board)
+    kbd.detect_crashed_workers(board)
 
     current = kb.get_task(board, task.id)
     assert current.consecutive_failures == 1, (

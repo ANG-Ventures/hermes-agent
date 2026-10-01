@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -102,7 +103,7 @@ def test_superseded_run_counts_as_a_success_downstream(kanban_home):
         # A card closed superseded must not be immediately respawned.
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
         conn.commit()
-        assert kb.check_respawn_guard(conn, parent) is not None
+        assert kbd.check_respawn_guard(conn, parent) is not None
 
 
 def test_plain_completion_outcome_is_unchanged(kanban_home):
@@ -133,13 +134,14 @@ def _drive_clean_exit(
     how the append-mode defects survived.
     """
     import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli.kanban_worker_exit import exit_file
 
     host_prefix = _kb._claimer_id().split(":", 1)[0]
     assert _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
     task = _kb.get_task(conn, tid)
     assert task is not None and task.current_run_id is not None
-    _kb._set_worker_pid(conn, tid, fake_pid)
+    kbd._set_worker_pid(conn, tid, fake_pid)
 
     log_dir = _kb.worker_logs_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -163,11 +165,11 @@ def _drive_clean_exit(
         }),
         encoding="utf-8",
     )
-    _kb._record_worker_exit(fake_pid, 0)  # receipt outranks this PID fallback
+    kbd._record_worker_exit(fake_pid, 0)  # receipt outranks this PID fallback
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
-        return _kb.detect_crashed_workers(conn)
+        return kbd.detect_crashed_workers(conn)
     finally:
         _kb._pid_alive = original_alive
 
@@ -251,7 +253,7 @@ def test_differing_clean_exits_keep_the_full_retry_budget(kanban_home):
         assert task.status == "blocked", "budget still bounded at the violation limit"
         payload = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"][0].payload or {}
         assert payload.get("stopped_early") is None
-        assert payload.get("protocol_violations") == kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+        assert payload.get("protocol_violations") == kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -346,6 +348,7 @@ def test_unsegmentable_run_never_counts_as_identical(kanban_home):
     on the strength of a window that spans several of them.
     """
     import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     body = _run_output("identical text with no boundary", "20260922_000001_aaaaaa")
     original = _kb._stamp_worker_log_run_boundary
@@ -365,6 +368,7 @@ def test_unsegmentable_run_never_counts_as_identical(kanban_home):
 def test_run_segment_isolates_this_run_from_the_appended_history(kanban_home):
     """Unit-level proof of the producer: the segment is ONE run, not the file."""
     import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     log_dir = _kb.worker_logs_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -386,6 +390,7 @@ def test_run_segment_isolates_this_run_from_the_appended_history(kanban_home):
 def test_run_fingerprint_ignores_per_run_session_id(kanban_home):
     """Same work + different session_id must fingerprint the same; different work must not."""
     import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     a = _kb._run_output_fingerprint(_run_output("did the same thing", "20260922_111111_aaaaaa"))
     b = _kb._run_output_fingerprint(_run_output("did the same thing", "20260922_222222_bbbbbb"))

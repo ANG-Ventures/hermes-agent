@@ -30,6 +30,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_pr_gate as prg
 
 
@@ -1274,7 +1276,7 @@ def test_dispatch_tick_resolves_a_satisfied_gate(
         )
 
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
 
     assert tid in result.gate_auto_resolved
     assert len(calls) == 1
@@ -1311,12 +1313,12 @@ def test_dispatch_tick_queries_github_before_taking_dispatch_lock(
         calls.append((repo, number))
         return _merged()
 
-    monkeypatch.setattr(kb, "_dispatch_tick_lock", tracked_lock)
+    monkeypatch.setattr(kbc, "_dispatch_tick_lock", tracked_lock)
     monkeypatch.setattr(prg, "query_pr", query)
 
     with kb.connect() as conn:
         tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.status in {"ready", "running"}
@@ -1337,7 +1339,7 @@ def test_dispatch_tick_leaves_a_non_pr_block_alone(
         tid = _blocked_card(conn, reason="need Ace to choose the cap")
 
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
 
     assert result.gate_auto_resolved == []
     with kb.connect() as conn:
@@ -1449,7 +1451,7 @@ def test_dispatch_tick_runs_no_subprocess_under_dispatch_lock(
             under_lock.append(list(argv)[:3])
         return real_run(argv, *a, **k)
 
-    monkeypatch.setattr(kb, "_dispatch_tick_lock", tracked_lock)
+    monkeypatch.setattr(kbc, "_dispatch_tick_lock", tracked_lock)
     monkeypatch.setattr(prg.subprocess, "run", watched_run)
     monkeypatch.setattr(prg, "query_pr", lambda repo_, number: _merged())
 
@@ -1464,7 +1466,7 @@ def test_dispatch_tick_runs_no_subprocess_under_dispatch_lock(
         )
 
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
 
     assert under_lock == [], f"subprocess ran under the dispatch lock: {under_lock}"
     # The bare #7 still resolved against the workspace remote, so the gate
@@ -1661,6 +1663,8 @@ os.environ["HERMES_HOME"] = {home!r}
 os.environ["HERMES_KANBAN_DB"] = {live!r}
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_pr_gate as prg
 
 # Fabricated oracle: every PR is MERGED, and gh is never consulted.
@@ -1749,6 +1753,8 @@ os.environ["HERMES_KANBAN_DB"] = {live!r}
 os.environ["HERMES_KANBAN_HOME"] = {live_root!r}
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_pr_gate as prg
 
 refused = False
@@ -1833,6 +1839,8 @@ for pin in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME",
 os.environ["HERMES_HOME"] = {home!r}
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_pr_gate as prg
 
 prg.query_pr = lambda repo, number: {{
@@ -1960,7 +1968,7 @@ def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(
     with kb.connect() as conn:
         tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
         with pytest.raises(prg.SandboxEscape):
-            kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+            kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
         # The card is untouched: no fabricated unblock, no event.
         assert kb.get_task(conn, tid).status == "blocked"
         assert conn.execute(
@@ -2447,7 +2455,7 @@ def test_t213f5d63_replay_through_dispatch_spawns_nothing(
             )
         for _ in range(3):
             with kb.connect() as conn:
-                result = kb.dispatch_once(
+                result = kbd.dispatch_once(
                     conn, spawn_fn=lambda *a, **k: spawns.append(a),
                 )
                 assert tid not in result.gate_auto_resolved

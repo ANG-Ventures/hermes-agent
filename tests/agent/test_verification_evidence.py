@@ -14,6 +14,11 @@ from agent.verification_evidence import (
     verification_status,
 )
 
+@pytest.fixture(autouse=True)
+def _ledger_on(monkeypatch):
+    """The ledger is inert unless verify-on-stop is enabled; these tests exercise the ledger."""
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
 
 def _node_project(root: Path) -> None:
     (root / "package.json").write_text(
@@ -27,12 +32,6 @@ def _node_project(root: Path) -> None:
 
 def _python_project(root: Path) -> None:
     (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
-
-
-
-
-
-
 
 
 def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch):
@@ -58,8 +57,6 @@ def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch
     assert test is not None
     assert test.kind == "test"
     assert test.scope == "targeted"
-
-
 
 
 def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
@@ -296,8 +293,6 @@ def test_masked_verifier_does_not_clear_edited_ledger_state(tmp_path, monkeypatc
     assert verification_status(session_id="s1", cwd=tmp_path)["status"] == "stale"
 
 
-
-
 def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
@@ -321,14 +316,53 @@ def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, m
     assert evidence.status == "passed"
 
 
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "python3.12 {script}",
+        "/usr/bin/python3 {script}",
+        "/usr/bin/python3.12 {script}",
+        "python3 -u {script}",
+        "/usr/bin/env python3 {script}",
+    ],
+)
+def test_versioned_or_absolute_interpreter_records_ad_hoc_evidence(tmp_path, monkeypatch, invocation):
+    """A versioned, absolute or `env`-prefixed interpreter names the same interpreter as a bare
+    `python3`. Matching only the bare token left the ad-hoc branch blind to the invocation shapes
+    the verify-on-stop nudge itself hands the agent, so a passing run recorded no evidence and
+    every later turn re-nudged the same workspace as unverified.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    script = Path(tempfile.gettempdir()) / f"hermes-verify-{tmp_path.name}.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    try:
+        evidence = classify_verification_command(
+            invocation.format(script=script),
+            cwd=tmp_path,
+            session_id="s1",
+            exit_code=0,
+            output="ok",
+        )
+    finally:
+        script.unlink(missing_ok=True)
+
+    assert evidence is not None
+    assert evidence.kind == "ad_hoc"
+    assert evidence.status == "passed"
 
 
+def test_non_interpreter_command_touching_the_temp_script_is_not_evidence(tmp_path, monkeypatch):
+    """The nudge also tells the agent to clean the temp script up. A command that merely names
+    the script — `rm`, `chmod`, `cat` — runs no verification and must not satisfy the gate.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    script = Path(tempfile.gettempdir()) / f"hermes-verify-{tmp_path.name}.py"
 
-
-
-
-
-
+    for command in (f"rm -f {script}", f"/usr/bin/chmod +x {script}", f"/usr/bin/cat {script}"):
+        evidence = classify_verification_command(command, cwd=tmp_path, session_id="s1", exit_code=0)
+        assert evidence is None, f"{command!r} must not be recorded as verification evidence"
 
 
 def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, monkeypatch):
@@ -359,10 +393,6 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
     assert result["files_modified"] == [str(target.resolve())]
     assert verification_status(session_id="conversation", cwd=tmp_path)["status"] == "stale"
     assert verification_status(session_id="turn", cwd=tmp_path)["status"] == "unverified"
-
-
-
-
 
 
 def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
@@ -457,6 +487,22 @@ def test_cd_prefixed_pytest_credits_the_repo_root_and_clears_stale(tmp_path, mon
     assert Path(event["root"]) == repo.resolve()
     assert verification_status(session_id="s1", cwd=repo)["status"] == "passed"
 
+
+@pytest.mark.parametrize(
+    "interpreter",
+    [r"C:\Users\me\venv\Scripts\python.exe", "python.EXE", "py -3"],
+)
+def test_windows_exe_interpreter_records_ad_hoc_evidence(tmp_path, monkeypatch, interpreter):
+    """A venv's absolute ``Scripts\\python.exe`` (or the ``py`` launcher) is the interpreter shape
+    Windows hands the agent; ``.exe`` must not hide it from the ad-hoc branch (review follow-up)."""
+    from agent.verification_evidence import _find_ad_hoc_match
+
+    monkeypatch.setattr(
+        "agent.verification_evidence._is_temp_script_path",
+        lambda token, root: "hermes-verify-" in token and token.endswith(".py"),
+    )
+    win_script = r"C:\Users\me\AppData\Local\Temp\hermes-verify-x.py"
+    assert _find_ad_hoc_match(f"{interpreter} {win_script}", tmp_path) == []
 
 
 def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):

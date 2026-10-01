@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.model_policy import firepower_guard_error, route_kind
 
 
@@ -193,7 +194,7 @@ def test_batch_flagship_route_passes_main_dispatch_gate(kanban_home):
     for task_id in ids:
         assert f"{task_id}: route=gpt-6-astra-900k" in out, out
     with kb.connect() as conn:
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kbd.dispatch_once(conn, dry_run=True)
         for task_id in ids:
             bodies = [c.body for c in kb.list_comments(conn, task_id)]
             assert any(b.startswith("flagship override:") for b in bodies), bodies
@@ -238,7 +239,7 @@ def test_dispatch_tick_records_route_for_each_spawn(kanban_home, monkeypatch):
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="route announce", assignee="worker")
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             spawn_fn=lambda _task, _workspace: 12345,
             reconcile_orphans=False,

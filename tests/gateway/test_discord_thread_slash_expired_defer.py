@@ -25,7 +25,7 @@ def _adapter():
 
 
 @pytest.mark.asyncio
-async def test_thread_create_slash_survives_expired_defer(tmp_path):
+async def test_thread_create_slash_survives_expired_defer(tmp_path, monkeypatch):
     adapter = _adapter()
     interaction = SimpleNamespace(
         response=SimpleNamespace(defer=AsyncMock(side_effect=_UnknownInteraction("Unknown interaction"))),
@@ -40,11 +40,8 @@ async def test_thread_create_slash_survives_expired_defer(tmp_path):
     # `mark_async`), and the test then fails for a reason that has nothing to
     # do with expired defers.
     state = tmp_path / "discord_threads.json"
-    tracker = ThreadParticipationTracker.__new__(ThreadParticipationTracker)
-    tracker._state_path = lambda: state
-    ThreadParticipationTracker.__init__(tracker, "discord")
-    tracker._state_path = lambda: state
-    adapter._threads = tracker
+    monkeypatch.setattr(ThreadParticipationTracker, "_state_path", lambda self: state)
+    adapter._threads = ThreadParticipationTracker("discord")
 
     await adapter._handle_thread_create_slash(interaction, name="t")
 

@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -65,7 +66,7 @@ def test_resolve_per_profile_cap_int_and_mapping():
 
 
 def test_dispatch_honours_mapping_cap_per_assignee(kanban_home, monkeypatch):
-    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     for prof in ("alpha", "beta"):
         (kanban_home / "profiles" / prof).mkdir(parents=True, exist_ok=True)
@@ -76,7 +77,7 @@ def test_dispatch_honours_mapping_cap_per_assignee(kanban_home, monkeypatch):
         for i in range(4):
             kb.create_task(conn, title=f"b{i}", assignee="beta")
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=lambda *a, **k: 1, dry_run=True,
             max_in_progress_per_profile={"default": 3, "beta": 1},
         )
@@ -89,21 +90,21 @@ def test_dispatch_honours_mapping_cap_per_assignee(kanban_home, monkeypatch):
 # ── spawn pause ─────────────────────────────────────────────────────────────
 
 def test_spawn_paused_tick_spawns_nothing_but_reports_reason(kanban_home, monkeypatch):
-    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     (kanban_home / "profiles" / "alpha").mkdir(parents=True, exist_ok=True)
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         kb.create_task(conn, title="a", assignee="alpha")
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=lambda *a, **k: 1, dry_run=True,
             spawn_paused="load1=90.0 > pause_above=32.0",
         )
     assert res.spawned == []
     assert res.spawn_paused == "load1=90.0 > pause_above=32.0"
     with kb.connect_closing() as conn:
-        res2 = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, dry_run=True)
+        res2 = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, dry_run=True)
     assert len(res2.spawned) == 1 and res2.spawn_paused is None
 
 
@@ -275,6 +276,7 @@ def test_review_policy_none_skips_every_card(tmp_path, monkeypatch):
     """kanban.review_policy=none (live fleet value, Ace 2026-09-24) must never spawn a
     reviewer — milestone or not — and must not silently map to ``all``."""
     import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
     assert "none" in kb.REVIEW_POLICIES
     # Drive the REAL resolver through its config seam (board home first), not a
     # patched configured_review_policy that would only assert the patch.

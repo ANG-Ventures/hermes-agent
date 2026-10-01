@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 import weakref
 
 from agent.memory_provider import MemoryProvider
-from agent.secret_scope import get_secret
+from agent.secret_scope import UnscopedSecretError, get_secret
 from tools.registry import tool_error
 
 from .temporal_parse import created_at_in_window, parse_temporal_window
@@ -183,6 +183,15 @@ def _warn_retired_qmd_keys(config: Optional[dict]) -> None:
             "delete them from mem0.json", ", ".join(present))
 
 
+def _scoped_env(name: str) -> str:
+    """Profile-scoped read of a non-secret mem0 setting; no scope under multiplex = unset (never
+    ``os.environ``). Only the API key may fail closed (upstream a9838c2100 / #99121)."""
+    try:
+        return get_secret(name, "") or ""
+    except UnscopedSecretError:
+        return ""
+
+
 def _load_config() -> dict:
     """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
 
@@ -197,11 +206,11 @@ def _load_config() -> dict:
         # this module); ADOPTED upstream's get_secret() secret-scope routing for the
         # credential (falls through to os.environ when no scope is installed).
         "api_key": get_secret("MEM0_API_KEY", ""),
-        "host": os.environ.get("MEM0_HOST", ""),
-        "admin_api_key": os.environ.get("MEM0_ADMIN_API_KEY", ""),
-        "ca_bundle": os.environ.get("MEM0_CA_BUNDLE", ""),
-        "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
-        "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
+        "host": _scoped_env("MEM0_HOST"),
+        "admin_api_key": get_secret("MEM0_ADMIN_API_KEY", ""),
+        "ca_bundle": _scoped_env("MEM0_CA_BUNDLE"),
+        "user_id": _scoped_env("MEM0_USER_ID") or "hermes-user",
+        "agent_id": _scoped_env("MEM0_AGENT_ID") or "hermes",
         # Default-off safety gate for single-user fleets that want one shared
         # user memory scope across Discord/Telegram/CLI sender ids. When false,
         # gateway-provided user_id continues to win exactly as today.
@@ -218,7 +227,7 @@ def _load_config() -> dict:
     config_path = get_hermes_home() / "mem0.json"
     if config_path.exists():
         try:
-            file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            file_cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
             config.update({k: v for k, v in file_cfg.items()
                            if v is not None and v != ""})
         except Exception:
@@ -623,7 +632,7 @@ class Mem0MemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text(encoding="utf-8"))
+                existing = json.loads(config_path.read_text(encoding="utf-8-sig"))
             except Exception:
                 pass
         existing.update(values)

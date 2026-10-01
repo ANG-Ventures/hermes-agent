@@ -38,6 +38,7 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore, build_session_key
 from gateway.session_context import get_session_env, reset_session_vars
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_state import SessionDB
 from tools.kanban_tools import subscribe_calling_session
 
@@ -127,7 +128,7 @@ def _create_and_subscribe_as(source: SessionSource, entry) -> tuple[str, dict]:
             # Wake is opt-in (t_6d6e9467); this file tests wake routing.
             assert subscribe_calling_session(conn, tid, wake=True) is True
             kb.complete_task(conn, tid, summary="done")
-            return tid, kb.list_notify_subs(conn, tid)[0]
+            return tid, kbn.list_notify_subs(conn, tid)[0]
         finally:
             conn.close()
     finally:
@@ -274,28 +275,28 @@ def test_backfill_never_repoints_a_named_lane(env):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="w")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="feishu", chat_id=CHAT,
             chat_type="group", user_id=OPEN_ID,
         )
         # A DIFFERENT participant subscribing in the same chat.
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="feishu", chat_id=CHAT,
             chat_type="group", user_id="ou_someone_else",
             user_id_alt="on_someone_else",
         )
-        row = kb.list_notify_subs(conn, tid)[0]
+        row = kbn.list_notify_subs(conn, tid)[0]
         assert row["user_id"] == OPEN_ID, "the named lane was repointed"
         assert not row.get("user_id_alt"), (
             "a foreign alt id was grafted onto another participant's row"
         )
 
         # The SAME participant re-subscribing DOES fill the hole.
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="feishu", chat_id=CHAT,
             chat_type="group", user_id=OPEN_ID, user_id_alt=UNION_ID,
         )
-        healed = kb.list_notify_subs(conn, tid)[0]
+        healed = kbn.list_notify_subs(conn, tid)[0]
         assert healed["user_id"] == OPEN_ID
         assert healed["user_id_alt"] == UNION_ID
     finally:
@@ -321,12 +322,12 @@ def test_legacy_rows_without_the_columns_behave_exactly_as_before(
         # delivery_mode the first-add migration stamps on every pre-existing
         # gateway row ('notify+wake' WHERE platform != 'tui') — a fresh test
         # DB never runs that backfill, so simulate its effect here.
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT,
             chat_type="group", user_id=OPEN_ID, delivery_mode="notify+wake",
         )
         kb.complete_task(conn, tid, summary="done")
-        row = kb.list_notify_subs(conn, tid)[0]
+        row = kbn.list_notify_subs(conn, tid)[0]
     finally:
         conn.close()
     assert row["user_id_alt"] is None
@@ -344,13 +345,13 @@ def test_child_tasks_inherit_the_full_identity(env):
     conn = kb.connect()
     try:
         parent = kb.create_task(conn, title="p", assignee="w")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=parent, platform="slack", chat_id="C1",
             chat_type="group", user_id="U1", user_id_alt="alt-1",
             scope_id=SLACK_TEAM,
         )
         child = kb.create_task(conn, title="c", assignee="w", parents=(parent,))
-        row = kb.list_notify_subs(conn, child)[0]
+        row = kbn.list_notify_subs(conn, child)[0]
         assert row["user_id"] == "U1"
         assert row["user_id_alt"] == "alt-1"
         assert row["scope_id"] == SLACK_TEAM

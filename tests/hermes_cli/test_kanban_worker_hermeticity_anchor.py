@@ -34,6 +34,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -88,7 +89,7 @@ def _spawn_and_capture_env(fresh_home, monkeypatch, task_id: str) -> dict:
         claim_expires=None,
         tenant=None,
     )
-    kb._default_spawn(task, str(fresh_home / "ws"), board=None)
+    kbd._default_spawn(task, str(fresh_home / "ws"), board=None)
     return captured["env"]
 
 

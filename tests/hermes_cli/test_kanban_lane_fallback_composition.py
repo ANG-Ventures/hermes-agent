@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -22,7 +23,7 @@ def board(tmp_path, monkeypatch):
     kb.init_db()
     assert kb.kanban_db_path().resolve().is_relative_to(home.resolve())
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
     (home / "config.yaml").write_text(json.dumps({"kanban": {"provider_health_probes": {
         "pool": "http://localhost/pool", "lanepool": "http://localhost/lanepool",
     }}}))
@@ -75,7 +76,7 @@ def test_capped_lane_still_falls_back_on_effective_route(board, monkeypatch, tmp
     _health(monkeypatch, capped={"lanepool"})
     tid = _card(board, lane)
     observed = []
-    result = kb.dispatch_once(board, spawn_fn=_spawn(observed))
+    result = kbd.dispatch_once(board, spawn_fn=_spawn(observed))
     assert [s[0] for s in result.spawned] == [tid]
     assert observed == [("gpt-5.5", "openai-codex")]
     assert result.spawn_route_sources[tid].startswith("dispatch-fallback(capped lane-override(")
@@ -90,7 +91,7 @@ def test_healthy_lane_over_capped_profile_spawns_on_lane_without_fallback(board,
     _health(monkeypatch, capped={"pool"})
     tid = _card(board, lane)
     observed = []
-    result = kb.dispatch_once(board, spawn_fn=_spawn(observed))
+    result = kbd.dispatch_once(board, spawn_fn=_spawn(observed))
     assert observed == [("lane-model", "lanepool")]
     assert result.spawn_route_sources[tid].startswith("lane-override(")
     assert _events(board, tid, "dispatch_provider_fallback") == []
@@ -102,7 +103,7 @@ def test_flagship_gate_covers_post_fallback_route(board, monkeypatch, tmp_path, 
     _health(monkeypatch, capped={"lanepool"})
     tid = _card(board, lane)
     observed = []
-    result = kb.dispatch_once(board, spawn_fn=_spawn(observed))
+    result = kbd.dispatch_once(board, spawn_fn=_spawn(observed))
     assert observed == [] and result.spawned == []
     assert kb.get_task(board, tid).status == lane
     deferred = _events(board, tid, "deferred")
@@ -112,5 +113,5 @@ def test_flagship_gate_covers_post_fallback_route(board, monkeypatch, tmp_path, 
     }
     # The card's own flagship authorization admits the fallback rung.
     kb.add_comment(board, tid, "apollo", "flagship override: capacity emergency")
-    result = kb.dispatch_once(board, spawn_fn=_spawn(observed))
+    result = kbd.dispatch_once(board, spawn_fn=_spawn(observed))
     assert observed == [("gpt-6-astra-900k", "openai-codex")]

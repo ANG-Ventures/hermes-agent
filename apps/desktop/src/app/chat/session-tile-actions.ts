@@ -9,12 +9,13 @@
  */
 
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
+import { SLASH_COMMAND_RE } from '@hermes/shared'
 import { useCallback, useMemo, useRef } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
+import type { WorkspaceMode } from '@/contrib/types'
 import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
-import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
@@ -30,6 +31,7 @@ import {
 } from '@/store/session-request-router'
 import {
   $sessionStates,
+  $sessionTiles,
   isSessionRemote,
   patchSessionTile,
   sessionTileDelegate,
@@ -43,13 +45,14 @@ import type { SessionInfo } from '@/types/hermes'
 
 import type { GatewayRequester } from '../contrib/types'
 import { uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
+import { isStaleTargetError } from '../session/hooks/use-prompt-actions'
 import {
   appendMidTurnUserMessage,
   applyBranchVisibility,
   applyReloadOptimistic,
   applyRewindOptimistic,
   durableRowIdsForRebind,
-  finalizeInterruptedMessages,
+  finalizeUserInterruptedMessages,
   planEdit,
   planReload,
   planRestore,
@@ -89,7 +92,16 @@ export function listTileSessionRow(deps: {
   runtimeId: string
   sessions: readonly SessionInfo[]
   storedSessionId: string
+  workspaceMode?: WorkspaceMode
 }): boolean {
+  // Bot Mode tabs mirror hidden relationship chats (canonical Bot Chats stay
+  // off the Sessions list by design — the bot row is the only door), so a
+  // first send must not seed a flagless row the refresh keep-list would then
+  // hold forever (#113273).
+  if (deps.workspaceMode === 'bots') {
+    return false
+  }
+
   const preview = deps.preview.trim()
 
   if (!preview || deps.sessions.some(session => sessionMatchesStoredId(session, deps.storedSessionId))) {
@@ -203,7 +215,8 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       preview,
       runtimeId,
       sessions: $sessions.get(),
-      storedSessionId: storedIdRef.current
+      storedSessionId: storedIdRef.current,
+      workspaceMode: $sessionTiles.get().find(tile => tile.storedSessionId === storedIdRef.current)?.workspaceMode
     })
   }, [])
 
@@ -332,7 +345,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
     update(state => ({
       ...state,
-      messages: finalizeInterruptedMessages(state.messages, state.streamId),
+      messages: finalizeUserInterruptedMessages(state.messages, state.streamId),
       busy: false,
       awaitingResponse: false,
       streamId: null,
@@ -362,6 +375,37 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       notifyError(err, copy.stopFailed)
     }
   }, [bindRecoveredRuntime, copy.stopFailed, requestSessionGateway, update])
+
+  // A hidden note mid-turn rides session.steer into the model's next tool
+  // result: no optimistic bubble, no user turn. The main composer has the same
+  // primitive in use-prompt-actions.
+  const injectHiddenPrompt = useCallback(
+    async (rawText: string): Promise<boolean> => {
+      const text = rawText.trim()
+      const sessionId = runtimeIdRef.current
+
+      if (!text || !sessionId) {
+        return false
+      }
+
+      try {
+        const { result } = await withSessionNotFoundResume(
+          sessionId,
+          storedIdRef.current,
+          liveId => requestSessionGateway<{ status?: string }>('session.steer', { session_id: liveId, text }),
+          {
+            requestGateway: requestSessionGateway,
+            onRecovered: bindRecoveredRuntime
+          }
+        )
+
+        return result?.status === 'queued'
+      } catch {
+        return false
+      }
+    },
+    [bindRecoveredRuntime, requestSessionGateway]
+  )
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
@@ -504,6 +548,8 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         return
       }
 
+      const messages = state.messages
+
       update(current => applyReloadOptimistic(current, plan))
 
       try {
@@ -518,11 +564,20 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
             plan.truncateMessageId,
             plan.truncateRowId,
             plan.sourceText,
-            durableRowIdsForRebind(state.messages)
+            durableRowIdsForRebind(messages)
           )
         )
       } catch (err) {
-        update(current => ({ ...current, busy: false, awaitingResponse: false, turnLive: false, turnStartedAt: null }))
+        // Mirror the primary-chat reload catch: optimistic hide/truncate
+        // must roll back when the submit is rejected (#95745).
+        update(current => ({
+          ...current,
+          busy: false,
+          awaitingResponse: false,
+          turnLive: false,
+          turnStartedAt: null,
+          messages
+        }))
         notifyError(err, copy.regenerateFailed)
       }
     },
@@ -559,6 +614,47 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
           )
         )
       } catch (err) {
+        // Same stale-target hazard as the primary chat's restore (#107593): a
+        // tile's cached durable row ids go stale after optimistic sends, resume
+        // drift, or session.branch remapping, and the gateway refuses with 4018.
+        // Mirror edit's recovery: refresh the transcript from the stored
+        // session, recompute the restore plan against fresh history, retry once.
+        if ((plan.truncateMessageId || plan.truncateRowId !== undefined) && isStaleTargetError(err)) {
+          try {
+            const refreshed = await sessionTileDelegate()!.resumeTile(storedIdRef.current, {
+              refreshTranscript: true
+            })
+            if (typeof refreshed === 'string' && refreshed && refreshed !== sessionId) {
+              runtimeIdRef.current = refreshed
+            }
+
+            const freshMessages = readMessages()
+            const retryPlan = planRestore(freshMessages, messageId, {
+              text: target?.text ?? plan.sourceText,
+              userOrdinal: target?.userOrdinal ?? plan.truncateOrdinal
+            })
+
+            if (retryPlan.truncateMessageId || retryPlan.truncateRowId !== undefined) {
+              applySurvivorRowIds(
+                await submitRewind(
+                  retryPlan.text,
+                  retryPlan.truncateOrdinal,
+                  interruptFirst,
+                  retryPlan.truncateMessageId,
+                  retryPlan.truncateRowId,
+                  retryPlan.sourceText,
+                  durableRowIdsForRebind(freshMessages)
+                )
+              )
+
+              return
+            }
+          } catch {
+            // Fall through to the rollback below: the optimistic truncation
+            // must never survive a failed retry.
+          }
+        }
+
         update(state => ({
           ...state,
           busy: false,
@@ -641,6 +737,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       dismissError,
       editMessage,
       handleThreadMessagesChange,
+      injectHiddenPrompt,
       reloadFromMessage,
       restoreToMessage,
       steerPrompt,
@@ -651,6 +748,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       dismissError,
       editMessage,
       handleThreadMessagesChange,
+      injectHiddenPrompt,
       reloadFromMessage,
       restoreToMessage,
       steerPrompt,

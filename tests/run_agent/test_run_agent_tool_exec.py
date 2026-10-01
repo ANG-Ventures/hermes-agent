@@ -28,7 +28,7 @@ class TestExecuteToolCalls:
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
         with patch(
-            "run_agent.handle_function_call", return_value="search result"
+            "model_tools.handle_function_call", return_value="search result"
         ) as mock_hfc:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
             # enabled_tools passes the agent's own valid_tool_names
@@ -60,7 +60,7 @@ class TestExecuteToolCalls:
         }
 
         with (
-            patch("run_agent.handle_function_call", return_value=result),
+            patch("model_tools.handle_function_call", return_value=result),
             patch.object(agent, "_model_supports_vision", return_value=True),
             patch.object(
                 agent,
@@ -93,7 +93,7 @@ class TestExecuteToolCalls:
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
 
         with (
-            patch("run_agent.handle_function_call", side_effect=KeyboardInterrupt),
+            patch("model_tools.handle_function_call", side_effect=KeyboardInterrupt),
             patch("run_agent._set_interrupt"),
             pytest.raises(KeyboardInterrupt),
         ):
@@ -141,7 +141,7 @@ class TestExecuteToolCalls:
         )
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
-        with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
+        with patch("model_tools.handle_function_call", return_value="ok") as mock_hfc:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
             # Malformed args are rejected before dispatch — the tool never runs.
             mock_hfc.assert_not_called()
@@ -158,7 +158,7 @@ class TestExecuteToolCalls:
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
         big_result = "x" * 150_000
-        with patch("run_agent.handle_function_call", return_value=big_result):
+        with patch("model_tools.handle_function_call", return_value=big_result):
             agent._execute_tool_calls(mock_msg, messages, "task-1")
         # Content should be replaced with persisted-output or truncation
         assert len(messages[0]["content"]) < 150_000
@@ -170,7 +170,7 @@ class TestExecuteToolCalls:
         messages = []
         agent.tool_progress_callback = lambda *args, **kwargs: None
 
-        with patch("run_agent.handle_function_call", return_value="search result"), \
+        with patch("model_tools.handle_function_call", return_value="search result"), \
              patch.object(agent, "_safe_print") as mock_print:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
 
@@ -185,7 +185,7 @@ class TestExecuteToolCalls:
         agent.platform = "cli"
         agent.tool_progress_callback = None
 
-        with patch("run_agent.handle_function_call", return_value="search result"), \
+        with patch("model_tools.handle_function_call", return_value="search result"), \
              patch.object(agent, "_safe_print") as mock_print:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
 
@@ -201,7 +201,7 @@ class TestExecuteToolCalls:
         agent.platform = None
         agent.tool_progress_callback = None
 
-        with patch("run_agent.handle_function_call", return_value="search result"), \
+        with patch("model_tools.handle_function_call", return_value="search result"), \
              patch.object(agent, "_safe_print") as mock_print:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
 
@@ -391,7 +391,7 @@ class TestConcurrentToolExecution:
             call_log.append(name)
             return json.dumps({"result": args.get("q", "")})
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         assert len(messages) == 3
@@ -421,7 +421,7 @@ class TestConcurrentToolExecution:
                 _time.sleep(0.1)  # Slow tool
             return f"result_{q}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         assert messages[0]["tool_call_id"] == "c1"
@@ -448,7 +448,7 @@ class TestConcurrentToolExecution:
                 raise RuntimeError("boom")
             return "success"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         assert len(messages) == 2
@@ -484,7 +484,7 @@ class TestConcurrentToolExecution:
         messages = []
         big_result = "x" * 150_000
 
-        with patch("run_agent.handle_function_call", return_value=big_result):
+        with patch("model_tools.handle_function_call", return_value=big_result):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         assert len(messages) == 2
@@ -504,7 +504,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
-        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+        with patch("model_tools.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
@@ -530,7 +530,7 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true}'):
+        with patch("model_tools.handle_function_call", return_value='{"success": true}'):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
@@ -546,7 +546,7 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
-        with patch("run_agent.handle_function_call", side_effect=['{"id":1}', '{"id":2}']):
+        with patch("model_tools.handle_function_call", side_effect=['{"id":1}', '{"id":2}']):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         assert starts == [
@@ -607,7 +607,7 @@ class TestConcurrentToolExecution:
             "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
             lambda *args, **kwargs: ("Blocked", None),
         )
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+        with patch("model_tools.handle_function_call", side_effect=AssertionError("should not run")):
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
 
         assert json.loads(result) == {"error": "Blocked"}
@@ -632,7 +632,7 @@ class TestConcurrentToolExecution:
         starts = []
         agent.tool_start_callback = lambda *a: starts.append(a)
 
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+        with patch("model_tools.handle_function_call", side_effect=AssertionError("should not run")):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
@@ -660,7 +660,7 @@ class TestConcurrentToolExecution:
         )
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
 
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+        with patch("model_tools.handle_function_call", side_effect=AssertionError("should not run")):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
@@ -830,7 +830,7 @@ class TestConcurrentToolExecution:
         def fake_handle(name, args, task_id, **kwargs):
             return f"result_{name}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
@@ -857,7 +857,7 @@ class TestConcurrentToolExecution:
         def fake_handle(name, args, task_id, **kwargs):
             return f"result_{name}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
@@ -884,7 +884,7 @@ class TestConcurrentToolExecution:
         def fake_handle(name, args, task_id, **kwargs):
             return f"result_{name}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 with patch("agent.tool_executor._is_destructive_command", return_value=True):
                     agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
@@ -918,7 +918,7 @@ class TestConcurrentToolExecution:
         def fake_handle(name, args, task_id, **kwargs):
             return f"result_{name}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
@@ -1115,8 +1115,7 @@ class TestParallelScopePathNormalization:
         assert _paths_overlap(rel_scoped, abs_scoped)
 
     def test_should_parallelize_tool_batch_rejects_same_file_with_mixed_path_spellings(self, tmp_path, monkeypatch):
-        from run_agent import _should_parallelize_tool_batch
-
+        from agent.tool_dispatch_helpers import _should_parallelize_tool_batch
         monkeypatch.chdir(tmp_path)
         tc1 = _mock_tool_call(name="write_file", arguments='{"path":"notes.txt","content":"one"}', call_id="c1")
         tc2 = _mock_tool_call(name="write_file", arguments=f'{{"path":"{tmp_path / "notes.txt"}","content":"two"}}', call_id="c2")
@@ -1129,14 +1128,14 @@ class TestMcpParallelToolBatch:
 
     def test_mcp_tools_default_sequential(self):
         """MCP tools without supports_parallel_tool_calls are sequential."""
-        from run_agent import _should_parallelize_tool_batch
+        from agent.tool_dispatch_helpers import _should_parallelize_tool_batch
         tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
         tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
         assert not _should_parallelize_tool_batch([tc1, tc2])
 
     def test_mcp_tools_parallel_when_server_opted_in(self):
         """MCP tools from a parallel-safe server can run concurrently."""
-        from run_agent import _should_parallelize_tool_batch
+        from agent.tool_dispatch_helpers import _should_parallelize_tool_batch
         from tools.mcp_tool import _mcp_tool_server_names, _parallel_safe_servers, _lock
         with _lock:
             _parallel_safe_servers.add("github")
@@ -1239,3 +1238,73 @@ class TestNormalizeCodexDictArguments:
         msg, _ = _normalize_codex_response(response)
         tc = msg.tool_calls[0]
         assert tc.function.arguments == args_str
+
+
+class TestRuntimeToolTransformToolResult:
+    """A registered ``transform_tool_result`` replaces what the model sees for an
+    agent-runtime tool, on both the sequential and the concurrent executor path."""
+
+    @staticmethod
+    def _install_rewriting_transform(agent, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *args, **kwargs: (None, None),
+        )
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: (
+                [f'REWRITTEN[{kwargs["tool_name"]}]{kwargs["result"]}']
+                if hook_name == "transform_tool_result"
+                else []
+            ),
+        )
+        monkeypatch.setattr("tools.todo_tool.todo_tool", lambda **kwargs: '{"ok":true}')
+        agent._memory_manager = None
+
+    def test_concurrent_path_applies_transform(self, agent, monkeypatch):
+        self._install_rewriting_transform(agent, monkeypatch)
+        messages = []
+
+        agent._execute_tool_calls_concurrent(
+            _mock_assistant_msg(
+                content="",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="todo_list", arguments=json.dumps({"todos": []}), call_id=call_id
+                    )
+                    for call_id in ("todo-c1", "todo-c2")
+                ],
+            ),
+            messages,
+            "task-concurrent",
+        )
+
+        tool_results = [m for m in messages if m.get("role") == "tool"]
+        assert [m["tool_call_id"] for m in tool_results] == ["todo-c1", "todo-c2"]
+        # Exactly once per call: a second invocation would nest the prefix.
+        assert [str(m["content"]) for m in tool_results] == ['REWRITTEN[todo_list]{"ok":true}'] * 2
+
+    def test_sequential_path_applies_transform(self, agent, monkeypatch):
+        self._install_rewriting_transform(agent, monkeypatch)
+        messages = []
+
+        agent._execute_tool_calls_sequential(
+            _mock_assistant_msg(
+                content="",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="todo_list",
+                        arguments=json.dumps({"todos": []}),
+                        call_id="todo-sequential",
+                    )
+                ],
+            ),
+            messages,
+            "task-sequential",
+        )
+
+        tool_results = [m for m in messages if m.get("role") == "tool"]
+        assert tool_results, "sequential path appended no tool result"
+        # Exactly once: a second invocation would nest the prefix.
+        assert str(tool_results[-1]["content"]) == 'REWRITTEN[todo_list]{"ok":true}'

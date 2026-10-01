@@ -31,6 +31,7 @@ import pytest
 from gateway.config import Platform
 from gateway.session import SessionSource, build_session_key
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 CHAT_ID = "1535189663533506600"
 USER_ID = "117431298246705156"
@@ -57,7 +58,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _sub_for(conn, task_id: str) -> dict:
-    subs = kb.list_notify_subs(conn, task_id)
+    subs = kbn.list_notify_subs(conn, task_id)
     assert len(subs) == 1, subs
     return subs[0]
 
@@ -101,7 +102,7 @@ def test_notify_sub_user_id_round_trips_to_the_creators_session_key(kanban_home)
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="round trip", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             task_id=tid,
             platform="discord",
@@ -132,7 +133,7 @@ def test_blank_user_id_in_the_wake_path_splits_the_session(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="mutation", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             task_id=tid,
             platform="discord",
@@ -168,13 +169,13 @@ def test_resubscribe_backfills_user_id_on_a_legacy_row(kanban_home):
     try:
         tid = kb.create_task(conn, title="legacy row", assignee="worker")
         # Legacy write: no identity (the bug's output).
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT_ID,
         )
         assert _sub_for(conn, tid)["user_id"] in (None, "")
 
         # Same chat re-subscribes from a turn that HAS an identity.
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             task_id=tid,
             platform="discord",
@@ -198,11 +199,11 @@ def test_self_heal_never_overwrites_an_existing_identity(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="no clobber", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT_ID,
             chat_type="group", user_id=USER_ID,
         )
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT_ID,
             chat_type="group", user_id=other,
         )
@@ -226,7 +227,7 @@ def test_userless_origin_still_delivers_and_is_not_fabricated(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cron origin", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT_ID,
             chat_type="group",
         )

@@ -101,6 +101,7 @@ def test_store_and_runner_keys_ignore_wrong_type(lane):
 @pytest.mark.asyncio
 async def test_kanban_notify_wake_tick(lane, tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_notify as kbn
     from tests.gateway.test_kanban_wake_key_identity import _run_one_notifier_tick
     runner, adapter, channel, source, human, received = lane
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
@@ -109,7 +110,7 @@ async def test_kanban_notify_wake_tick(lane, tmp_path, monkeypatch):
     conn = kb.connect()
     try:
         task = kb.create_task(conn, title="test", assignee="worker", session_id=human.session_key)
-        kb.add_notify_sub(conn, task_id=task, platform="discord", chat_id="123",
+        kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id="123",
                           chat_type="channel", user_id="456", delivery_mode="notify+wake")
         kb.complete_task(conn, task, summary="finished")
     finally:

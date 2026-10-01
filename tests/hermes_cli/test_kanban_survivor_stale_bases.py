@@ -22,6 +22,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 HEAD = "a1" * 20
 PR = "example/project#68"
@@ -84,11 +85,11 @@ def names_card(remote, tid):
 def stale_card(conn, *, title="review lane", loose=True):
     """A card whose recorded repo is gone but whose workspace dir survives."""
     tid = kb.create_task(conn, title=title)
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     if loose:
         (ws / "qa-output").mkdir(parents=True, exist_ok=True)
         (ws / "qa-output" / "verdict.md").write_text("APPROVED\n")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -211,7 +212,7 @@ def partial_loss_card(conn, tmp_path, monkeypatch):
         ], capture_output=True, check=True).stdout.decode().strip()
 
     tid = kb.create_task(conn, title="partial loss")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     kept = ws / "kept"
     kept.mkdir(parents=True)
     git(kept, "init", "-b", "main")
@@ -223,7 +224,7 @@ def partial_loss_card(conn, tmp_path, monkeypatch):
     git(kept, "init", "--bare", str(tmp_path / "kept.git"))
     git(kept, "remote", "add", "origin", str(tmp_path / "kept.git"))
     git(kept, "push", "origin", "HEAD:main")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -507,13 +508,13 @@ def test_partial_loss_at_cleanup_still_holds_for_loose_unvouched_evidence(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="partial loss with loose evidence")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "kept.git")
     evidence = ws / "qa-output" / "verdict.md"
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text("APPROVED\n")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -544,10 +545,10 @@ def test_partial_loss_at_cleanup_still_reclaims_when_nothing_is_loose(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="partial loss, clean workspace")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "clean-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -579,10 +580,10 @@ def test_a_bundle_vouched_missing_repo_is_carried_into_the_rewritten_survivor(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="bundle-vouched loss")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     a_head = _seed_published_repo(ws / "a", tmp_path / "a.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     bundle = {"repository": "b", "path": str(tmp_path / "implementation-0.bundle"),
               "sha256": "f" * 64, "bytes": 42}
     with kb.write_txn(board):
@@ -618,7 +619,7 @@ def test_a_bundle_vouched_missing_repo_is_carried_into_the_rewritten_survivor(
 
 
 def _seed_survivor(conn, tid, ws, bases, survivor):
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -642,7 +643,7 @@ def test_reclamation_carries_a_survivor_for_a_repo_cloned_after_dispatch(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="repo cloned after dispatch")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "late-kept.git")
     bundle = {"repository": "cloned", "path": str(tmp_path / "implementation-0.bundle"),
@@ -676,10 +677,10 @@ def test_one_operator_survivor_cannot_vouch_for_two_vanished_repositories(
 
     tid = kb.create_task(board, title="two vanished repositories")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "two-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -707,10 +708,10 @@ def test_a_single_vanished_repository_is_still_covered_by_the_operator_flag(
 
     tid = kb.create_task(board, title="one vanished repository")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "one-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -738,7 +739,7 @@ def test_reclamation_never_erases_a_recorded_survivor_it_cannot_recapture(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="recorded survivor, nothing to recapture")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     evidence = ws / "qa-output" / "verdict.md"
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text("APPROVED\n")
@@ -767,7 +768,7 @@ def test_a_recorded_survivor_with_nothing_loose_is_kept_and_reclaimable(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="recorded survivor, clean workspace")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     recorded = {"kind": "ref", "refs": [
         {"repository": ".", "sha": HEAD, "pr": PR, "external": True}]}
@@ -831,7 +832,7 @@ def test_the_carried_ref_is_never_recorded_twice(board, remote, tmp_path, monkey
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="carried ref plus an empty in-tree capture")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_base = _seed_unpublished_empty_diff_repo(ws / "kept", tmp_path / "dup-kept.git")
     recorded = {"kind": "ref", "refs": [
@@ -874,7 +875,7 @@ def test_reclamation_carries_a_patch_pointer_the_recapture_cannot_reproduce(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="patch survivor, clean at cleanup")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "patch-kept.git")
     recorded = _patch_survivor(tmp_path, [{"repository": "kept", "sha": kept_head,
@@ -913,7 +914,7 @@ def test_reclamation_carries_a_patch_pointer_for_a_repo_cloned_after_dispatch(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="patch survivor, repo cloned after dispatch")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "late-patch-kept.git")
     recorded = _patch_survivor(tmp_path, [
@@ -943,7 +944,7 @@ def test_a_clean_recapture_without_a_recorded_patch_stays_a_ref(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="no recorded patch")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "plain-kept.git")
     _seed_survivor(board, tid, ws, {"kept": kept_head},
@@ -974,10 +975,10 @@ def test_qualified_operator_survivors_cover_two_vanished_repositories(
 
     tid = kb.create_task(board, title="two vanished repositories, qualified claims")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "qual-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -1010,10 +1011,10 @@ def test_a_partially_qualified_claim_still_fails_closed(board, remote, tmp_path,
 
     tid = kb.create_task(board, title="partially qualified claim")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "partial-qual-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -1040,10 +1041,10 @@ def test_the_multi_repository_refusal_names_a_remedy_that_actually_works(
 
     tid = kb.create_task(board, title="unqualified claim, two vanished repositories")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "hint-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -1140,7 +1141,7 @@ def test_reclamation_keeps_a_bundle_for_a_repo_that_is_still_on_disk(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="bundle survivor, repo still on disk")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "bundle-kept.git")
     recorded = _bundle_survivor(tmp_path, "kept")
@@ -1186,7 +1187,7 @@ def test_a_recorded_patch_vouches_for_the_repositories_its_sidecar_names(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="patch survivor, recorded repo now gone")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "vouch-kept.git")
     sidecar = tmp_path / "vouch-implementation.json"
@@ -1214,7 +1215,7 @@ def test_an_unreadable_sidecar_vouches_for_nothing(board, remote, tmp_path, monk
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="patch survivor, sidecar missing")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "nosidecar-kept.git")
     recorded = _patch_survivor(tmp_path, [{"repository": "kept", "sha": kept_head,
@@ -1274,10 +1275,10 @@ def test_a_qualifier_naming_a_repository_still_on_disk_is_refused(
 
     tid = kb.create_task(board, title="qualifier naming a live repository")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "intrude-kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -1311,8 +1312,8 @@ def test_a_non_code_recompletion_never_erases_a_recorded_survivor(board, remote)
 
     tid = kb.create_task(board, title="external implementation, re-completed")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     if ws.is_dir():
         ws.rmdir()  # the workspace-MISSING branch: the dir was reaped
     recorded = survivor.preserve(board, tid, workspace=ws, survivor_pr=PR)
@@ -1335,9 +1336,9 @@ def test_a_card_with_no_recorded_survivor_still_completes_with_none(board, remot
     from hermes_cli import kanban_survivor as survivor
 
     tid = kb.create_task(board, title="docs only")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
 
     assert survivor.preserve(board, tid, workspace=ws) is None
 
@@ -1354,7 +1355,7 @@ def test_a_bundle_shaped_external_survivor_does_not_raise_keyerror(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="bundle survivor, every checkout gone")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     recorded = {"kind": "bundle", "notice": "NOT PUSHED",
                 "bundles": [{"repository": "gone", "path": str(tmp_path / "gone.bundle"),
@@ -1413,9 +1414,9 @@ def test_the_unrepresentable_remedy_reaches_the_refusal_message(board, remote, t
 
     tid = kb.create_task(board, title="unrepresentable repository key")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -1472,7 +1473,7 @@ def test_a_recorded_patch_survives_a_recapture_that_emits_its_own_patch(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="recorded patch vs recaptured patch")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "collide-kept.git")
     (ws / "kept" / "a.py").write_text("value = 2  # uncommitted at cleanup\n")
@@ -1517,7 +1518,7 @@ def test_a_recompletion_may_not_shrink_the_index_either(
 
     tid = kb.create_task(board, title="re-completion drops the recorded patch")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "recomplete-kept.git")
     recorded = _sidecar_patch_survivor(tmp_path, [], sidecar_repos=["gone"],
@@ -1554,7 +1555,7 @@ def test_the_workspace_missing_exit_may_not_shrink_the_index(
 
     tid = kb.create_task(board, title="workspace missing, operator PR")
     names_card(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     recorded = dict(_sidecar_patch_survivor(
         tmp_path,
         [{"repository": "other", "sha": HEAD, "pr": "example/other#9", "external": True}],
@@ -1686,9 +1687,9 @@ def test_cleanup_partial_loss_keeps_the_recorded_ref_for_the_vanished_repo(
                               capture_output=True, check=True).stdout.decode().strip()
 
     tid = kb.create_task(board, title="partial loss at cleanup")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     kept_head = _seed_repo(git, ws / "kept", tmp_path / "kept.git")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -1844,13 +1845,13 @@ def test_partial_loss_holds_for_loose_evidence_under_a_bundle_shaped_survivor(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="bundle-vouched partial loss with loose evidence")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "bundle-loose-kept.git")
     evidence = ws / "qa-output" / "verdict.md"
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text("APPROVED\n")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -1890,12 +1891,12 @@ def test_partial_loss_holds_for_loose_evidence_under_a_bundle_shaped_survivor(
 def _partially_vouched_card(conn, tmp_path, *, partial):
     """Two recorded repos gone; the recorded survivor covers only `gone_a`."""
     tid = kb.create_task(conn, title="partially vouched multi-repo loss")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(parents=True, exist_ok=True)
     bases = {"gone_a": STALE, "gone_b": STALE}
     if partial:
         bases["kept"] = _seed_published_repo(ws / "kept", tmp_path / "multi-kept.git")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -1947,9 +1948,9 @@ def test_cleanup_reclaims_when_every_missing_repository_is_vouched_for(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="fully vouched multi-repo loss")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     with kb.write_txn(board):
         board.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
@@ -1990,7 +1991,7 @@ def test_a_mixed_shaped_survivor_carries_the_ref_AND_the_bundle(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="mixed partial loss")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "mixed-kept.git")
     bundle = {"repository": "gone_bundle", "path": str(tmp_path / "implementation-0.bundle"),

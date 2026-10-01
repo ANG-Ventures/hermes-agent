@@ -1,14 +1,7 @@
-"""Shared OpenRouter API client for Hermes tools.
-
-Provides a single lazy-initialized AsyncOpenAI client that all tool modules
-can share.  Routes through the centralized provider router in
-agent/auxiliary_client.py so auth, headers, and API format are handled
-consistently.
-"""
-
-import os
+"""OpenRouter API key probe + per-credential async client shared by Hermes tools (MoA)."""
 
 import hashlib
+import os
 
 # One client per OpenRouter credential, never one per process: in a multiplexed
 # gateway each profile has its own secret scope, and a single cached client would
@@ -54,19 +47,16 @@ def get_async_client():
 
 
 def check_api_key() -> bool:
-    """Check whether the OpenRouter API key is present.
+    """Return True if OPENROUTER_API_KEY is present.
 
-    Scope-aware (Slack pattern): tool paths run inside an installed profile
-    secret scope, whose verdict is authoritative under multiplex; unscoped
-    CLI probes keep the legacy env read.
+    Scope-aware: an installed profile secret scope is authoritative under
+    multiplex; unscoped CLI probes fall back to the plain env read. Any other
+    scope failure propagates -- a failed scoped read must never silently
+    borrow another profile's key from ``os.environ``.
     """
-    try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+    from agent.secret_scope import UnscopedSecretError, get_secret
 
-        try:
-            return bool(get_secret("OPENROUTER_API_KEY"))
-        except UnscopedSecretError:
-            pass
-    except Exception:
-        pass
-    return bool(os.getenv("OPENROUTER_API_KEY"))
+    try:
+        return bool(get_secret("OPENROUTER_API_KEY"))
+    except UnscopedSecretError:
+        return bool(os.getenv("OPENROUTER_API_KEY"))

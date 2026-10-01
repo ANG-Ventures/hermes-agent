@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -45,7 +46,7 @@ def test_trigger_fires_on_status_run_id_and_pid_changes(kanban_home):
         assert _rows(conn, tid) == []
         assert kb.claim_task(conn, tid) is not None          # ready -> running + run id
         run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
-        assert kb._set_worker_pid(conn, tid, 4242, run_id=run_id)  # pid
+        assert kbd._set_worker_pid(conn, tid, 4242, run_id=run_id)  # pid
         rows = _rows(conn, tid)
     # claim_task writes status and current_run_id in separate UPDATEs: a row each
     assert any(r["old_status"] == "ready" and r["new_status"] == "running" for r in rows), rows
@@ -107,7 +108,7 @@ def test_one_run_lifecycle_row_count_and_attribution(kanban_home):
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
         run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
-        assert kb._set_worker_pid(conn, tid, 4243, run_id=run_id)
+        assert kbd._set_worker_pid(conn, tid, 4243, run_id=run_id)
         assert kb.complete_task(conn, tid, result="ok")
         rows = _rows(conn, tid)
     print(f"audit rows per run lifecycle: {len(rows)}")
