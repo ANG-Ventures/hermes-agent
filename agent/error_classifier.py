@@ -226,6 +226,16 @@ _EXTRA_USAGE_ONLY_PATTERNS = (
     "third-party apps now draw from extra usage",
 )
 
+# CLIProxyAPI (cpa) holds NO credential for the requested upstream and says so
+# with a 503: "auth_unavailable: no auth available (providers=kimi,
+# model=kimi-k3)". The generic 503 bucket called it ``overloaded`` ("provider
+# overloaded", 34 rows 09-30). It is an auth failure on the proxy side: our key
+# to the proxy is fine (no refresh/rotate), and retrying waits on nothing.
+_NO_AUTH_AVAILABLE_PATTERNS = (
+    "auth_unavailable",
+    "no auth available",
+)
+
 # Patterns that indicate billing exhaustion (not transient rate limit)
 _BILLING_PATTERNS = [
     "insufficient credits",
@@ -1391,6 +1401,18 @@ def classify_api_error(
     if any(p in error_msg for p in _EXTRA_USAGE_ONLY_PATTERNS):
         return _result(
             FailoverReason.extra_usage_only,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
+    # Proxy has no upstream credential for this provider/model (cpa 503).
+    # ``auth_permanent``: is_auth escalates to the fallback chain, and unlike
+    # ``auth`` it skips the credential-pool refresh/rotate path, which would
+    # bench our healthy proxy key for a credential the PROXY is missing.
+    if any(p in error_msg for p in _NO_AUTH_AVAILABLE_PATTERNS):
+        return _result(
+            FailoverReason.auth_permanent,
             retryable=False,
             should_rotate_credential=False,
             should_fallback=True,
