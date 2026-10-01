@@ -80,9 +80,13 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
                        "per-minute ceiling", "newly-activated",
                        "share ceiling", "overloaded", "capacity",
                        "overflow_exhausted")),
+    # "You're out of extra usage" (HTTP 400, t_f00f05bd) is this seat's
+    # overage wall, not a malformed request; the third-party-apps 400 above
+    # matches auth first and never reaches this row.
     ("quota_seat", ("fable limit", "session limit", "5-hour limit",
                     "5 hour limit", "weekly limit", "usage limit",
-                    "opus limit", "hit your limit", "reached your")),
+                    "opus limit", "hit your limit", "reached your",
+                    "out of extra usage")),
     ("rate_upstream", ("exceed your account's rate limit",
                        "exceeded your account's rate limit",
                        "rate limit", "rate_limit", "too many requests")),
