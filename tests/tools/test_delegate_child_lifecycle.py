@@ -20,6 +20,7 @@ import os
 import random
 import threading
 import time
+import types
 
 import pytest
 
@@ -166,16 +167,19 @@ def test_turn_exiting_between_drain_expiry_and_teardown_keeps_its_steer(
     dt = fast_late
     unblock = threading.Event()
     exited = threading.Event()
+    steered = threading.Event()
 
     def _hang(self):
-        self.frozen_activity_ts = time.time() + 0.1
+        steered.wait(10)
+        pending = self._drain_pending_steer()  # the finalizer's drain
+        self.frozen_activity_ts = time.time() - 60
         unblock.wait(30)
         try:
             return {
                 "final_response": "",
                 "completed": False,
                 "api_calls": 1,
-                "pending_steer": "drained in the window",
+                "pending_steer": pending,
             }
         finally:
             exited.set()
@@ -196,6 +200,8 @@ def test_turn_exiting_between_drain_expiry_and_teardown_keeps_its_steer(
     try:
         entry = dt._run_single_child(0, "window goal", child, parent)
         assert entry["status"] == dt.TIMED_OUT_RUNNING
+        assert dt.steer_subagent("sa-0-window", "drained in the window") is True
+        steered.set()
         assert _wait_until(lambda: closed, timeout=10.0)
     finally:
         unblock.set()
@@ -247,7 +253,7 @@ def test_f3434_first_turn_pending_steer_kept_when_correction_hangs(
                 "final_response": "not json",
                 "completed": True,
                 "api_calls": 3,
-                "pending_steer": "use the staging db",
+                "pending_steer": self._drain_pending_steer(),
             }
         self.frozen_activity_ts = time.time() - 60
         self.interrupt_seen.wait(10)
@@ -258,6 +264,7 @@ def test_f3434_first_turn_pending_steer_kept_when_correction_hangs(
     child._delegate_output_schema = _SCHEMA
     entry = dt._run_single_child(0, "f3434 goal", child, parent)
     assert entry["status"] == dt.TIMED_OUT_RUNNING
+    assert dt.steer_subagent("sa-0-f3434", "use the staging db") is True
     release.set()
     assert _wait_until(lambda: _late_results(parent), timeout=10.0)
     (late,) = _late_results(parent)
@@ -284,7 +291,7 @@ def test_f3494_accepted_steer_kept_when_correction_hits_the_wall(
                 "final_response": "not json",
                 "completed": True,
                 "api_calls": 3,
-                "pending_steer": "first-turn steer",
+                "pending_steer": self._drain_pending_steer(),
             }
         self.interrupt_seen.wait(10)  # busy (activity advances) until stopped
         return {"final_response": "", "completed": False, "api_calls": 0}
@@ -294,6 +301,7 @@ def test_f3494_accepted_steer_kept_when_correction_hits_the_wall(
     child._delegate_output_schema = _SCHEMA
     entry = dt._run_single_child(0, "f3494 goal", child, parent)
     assert entry["status"] == dt.TIMED_OUT_RUNNING
+    assert dt.steer_subagent("sa-0-f3494", "first-turn steer") is True
     release.set()
     assert _wait_until(lambda: len(child.calls) == 2)
     assert dt.steer_subagent("sa-0-f3494", "queued steer") is True
@@ -306,19 +314,22 @@ def test_f3494_accepted_steer_kept_when_correction_hits_the_wall(
 
 
 # I1 amendment: a turn that exits after persist -------------------------------
-def test_steer_returned_after_persist_amends_the_one_record(fleet_home, fast_late):
+def test_record_written_under_a_live_turn_is_settled_when_it_exits(
+    fleet_home, fast_late
+):
+    """The steer is reported missed at the FIRST write (the ledger already
+    holds it) with steer_fate_unknown; when the turn exits without having
+    delivered it, the one record keeps missed_steer and drops the flag."""
     dt = fast_late
     unblock = threading.Event()
+    steered = threading.Event()
 
     def _hang(self):
-        self.frozen_activity_ts = time.time() + 0.1
+        steered.wait(10)
+        self._drain_pending_steer()  # into a local the turn never returns
+        self.frozen_activity_ts = time.time() - 60
         unblock.wait(30)  # ignores the interrupt, outlives the stop drain
-        return {
-            "final_response": "",
-            "completed": False,
-            "api_calls": 1,
-            "pending_steer": "drained before the stall",
-        }
+        return {"final_response": "", "completed": False, "api_calls": 1}
 
     parent = _Agent(None, depth=0)
     child = _Agent("sa-0-amend", parent=parent, api_calls=1, behavior=_hang)
@@ -327,21 +338,66 @@ def test_steer_returned_after_persist_amends_the_one_record(fleet_home, fast_lat
     try:
         entry = dt._run_single_child(0, "amend goal", child, parent)
         assert entry["status"] == dt.TIMED_OUT_RUNNING
+        assert dt.steer_subagent("sa-0-amend", "drained before the stall") is True
+        steered.set()
         assert _wait_until(lambda: _late_results(parent), timeout=10.0)
         (late,) = _late_results(parent)
-        assert not late.get("missed_steer")
+        assert late.get("missed_steer") == "drained before the stall", late
+        assert late.get("steer_fate_unknown") is True
         assert not closed
     finally:
         unblock.set()
     assert _wait_until(lambda: closed, timeout=5.0)
+    assert _wait_until(lambda: "steer_fate_unknown" not in _late_results(parent)[0])
     (late,) = _late_results(parent)
     assert late.get("missed_steer") == "drained before the stall", late
     assert _late_files(fleet_home) == [f"{late['late_result_id']}.json"]
     on_disk = json.loads(open(late["result_path"], encoding="utf-8").read())
     assert on_disk["entry"]["missed_steer"] == "drained before the stall"
-    assert _wait_until(
-        lambda: any("drained before the stall" in s for s in parent.steered)
-    )
+    assert "steer_fate_unknown" not in on_disk["entry"]
+
+
+def test_steer_delivered_after_persist_is_removed_from_the_one_record(
+    fleet_home, fast_late
+):
+    """The live turn outlives the stop drain and THEN writes the steer into a
+    tool result (the real delivery path calls the sink). The record said
+    missed; the amendment must say delivered, in the same file."""
+    from agent.agent_runtime_helpers import note_steer_delivered
+
+    dt = fast_late
+    unblock = threading.Event()
+    steered = threading.Event()
+
+    def _hang(self):
+        steered.wait(10)
+        held = self._drain_pending_steer()  # pre-API drain, not yet injected
+        self.frozen_activity_ts = time.time() - 60
+        unblock.wait(30)
+        note_steer_delivered(self, held)  # injected into the tool result
+        return {"final_response": "", "completed": False, "api_calls": 1}
+
+    parent = _Agent(None, depth=0)
+    child = _Agent("sa-0-late-deliver", parent=parent, api_calls=1, behavior=_hang)
+    closed = []
+    child.close = lambda: closed.append(1)
+    try:
+        entry = dt._run_single_child(0, "deliver goal", child, parent)
+        assert entry["status"] == dt.TIMED_OUT_RUNNING
+        assert dt.steer_subagent("sa-0-late-deliver", "check the replica") is True
+        steered.set()
+        assert _wait_until(lambda: _late_results(parent), timeout=10.0)
+        assert _late_results(parent)[0].get("missed_steer") == "check the replica"
+    finally:
+        unblock.set()
+    assert _wait_until(lambda: closed, timeout=5.0)
+    assert _wait_until(lambda: "missed_steer" not in _late_results(parent)[0])
+    (late,) = _late_results(parent)
+    assert "steer_fate_unknown" not in late
+    assert "steer did not land" not in (late.get("summary") or "")
+    assert _late_files(fleet_home) == [f"{late['late_result_id']}.json"]
+    on_disk = json.loads(open(late["result_path"], encoding="utf-8").read())
+    assert "missed_steer" not in on_disk["entry"]
 
 
 # Momus r2 RC-6: the exit callback runs in a fresh copy of the owner context --
@@ -357,10 +413,14 @@ def test_exit_callback_runs_in_the_owner_context(fleet_home, fast_late, exit_pat
     marker = contextvars.ContextVar("owner_marker", default=None)
     token = marker.set("owner")
     unblock = threading.Event()
+    handed = threading.Event()
     seen = []
 
     def _hang(self):
-        self.frozen_activity_ts = time.time() + 0.1
+        # Active until the late thread owns the child, then stalled: no
+        # race between the wait's idle check and a fixed freeze time.
+        handed.wait(10)
+        self.frozen_activity_ts = time.time() - 60
         if exit_path == "immediate":
             self.interrupt_seen.wait(10)  # exits inside the stop drain
         else:
@@ -373,6 +433,7 @@ def test_exit_callback_runs_in_the_owner_context(fleet_home, fast_late, exit_pat
     try:
         entry = dt._run_single_child(0, "ctx goal", child, parent)
         assert entry["status"] == dt.TIMED_OUT_RUNNING
+        handed.set()
         assert _wait_until(lambda: _late_results(parent), timeout=10.0)
         if exit_path == "worker_thread":
             assert not seen
@@ -426,30 +487,104 @@ def test_lifecycle_edge_table_is_exactly_the_documented_one():
                 assert lc.state == state
 
 
-def test_teardown_is_refused_while_a_turn_is_live():
-    from concurrent.futures import Future
+def test_teardown_door_defers_while_held_and_closes_exactly_once(fleet_home):
+    """I2 by construction: the run hold and every live turn keep the one door
+    shut; the deferred close runs once, when the last hold goes."""
+    from concurrent.futures import ThreadPoolExecutor
 
-    from tools.delegate_tool import IllegalTransition, _ChildLifecycle
+    from tools import delegate_tool as dt
 
-    fut: Future = Future()
-    lc = _ChildLifecycle(subagent_id=None, child=None, state="persisted")
-    lc.live = fut
-    with pytest.raises(IllegalTransition):
-        lc.fire("teardown")
-    fut.set_result({})
-    assert lc.fire("teardown") == "torn_down"
+    class _C:
+        def __init__(self):
+            self.closes = []
+
+        def close(self):
+            self.closes.append(threading.current_thread().name)
+
+    baseline = dt._count_deferred_teardown(0)
+    c = _C()
+    dt._hold_run(c)
+    assert dt._teardown(c, "parent_close") is False  # the run holds it
+    assert c.closes == []
+    gate = threading.Event()
+    ex = ThreadPoolExecutor(1, thread_name_prefix="turn")
+    try:
+        fut = dt._submit_turn(ex, c, gate.wait, 5)
+        assert dt._teardown(c, "run_end", owner=True) is False  # a turn is live
+        with dt._inline_turn(c):
+            pass
+        assert c.closes == []
+        gate.set()
+        fut.result(timeout=5)
+        assert _wait_until(lambda: c.closes)
+    finally:
+        gate.set()
+        ex.shutdown(wait=True)
+    assert len(c.closes) == 1 and c.closes[0].startswith("turn")
+    assert dt._teardown(c, "again") is False
+    assert dt._teardown(c, "again", owner=True) is False
+    assert len(c.closes) == 1
+    assert dt._count_deferred_teardown(0) == baseline
+
+
+def test_teardown_door_closes_an_unheld_child_immediately(fleet_home):
+    from tools import delegate_tool as dt
+
+    closes = []
+    c = types.SimpleNamespace(close=lambda: closes.append(1))
+    assert dt._teardown(c, "construction_failed", owner=True) is True
+    assert closes == [1]
+
+
+def test_steer_ledger_counts_duplicates_and_settles_only_on_delivery(tmp_path):
+    from tools.delegate_tool import _SteerLedger
+
+    path = tmp_path / "steer.jsonl"
+    led = _SteerLedger(path)
+    a = led.accept("stop")
+    led.accept("stop now")
+    led.accept("stop")
+    led.withdraw(a)
+    led.deliver("stop now")  # longest first: does not settle "stop"
+    assert led.missed() == "stop"
+    led.deliver("unrelated")
+    assert led.missed() == "stop"
+    led.deliver("stop")
+    assert led.missed() is None
+    ops = [json.loads(line)["op"] for line in path.read_text().splitlines()]
+    assert ops == ["accept", "accept", "accept", "withdraw", "deliver", "deliver"]
 
 
 # Interleaving property ---------------------------------------------------------
+def _real_agent_methods(agent):
+    """Bind the real AIAgent steer/drain/clear_interrupt code to a stub, so
+    stub turns empty the pending slot exactly the way the real agent does."""
+    from run_agent import AIAgent
+
+    agent._pending_steer_lock = threading.Lock()
+    agent._execution_thread_id = None
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    for name in ("steer", "_drain_pending_steer", "clear_interrupt"):
+        setattr(agent, name, types.MethodType(getattr(AIAgent, name), agent))
+    agent._persist_session = lambda *a, **k: None
+    agent._cleanup_task_resources = lambda *a, **k: None
+    return agent
+
+
 class _ScriptedChild(_Agent):
     """A child whose turns are driven by the test, one control flag per turn.
 
-    Tracks live turns so close() can prove I2, and every steer text it
-    consumed at a tool boundary so I1 can be checked exactly.
+    Its steer slot is the real AIAgent's. Tracks live turns so close() can
+    prove I2, and every steer text it delivered at a tool boundary (through
+    the real delivery sink) so I1 can be checked exactly. Turn exits model
+    the real finalizer (drain, then clear_interrupt), a turn that raises
+    after the drain, and the interrupted early return.
     """
 
     def __init__(self, sid, parent, rng):
         super().__init__(sid, parent=parent, api_calls=2, behavior=self._turn)
+        _real_agent_methods(self)
         self.rng = rng
         self.lock = threading.Lock()
         self.live_turns = 0
@@ -459,6 +594,7 @@ class _ScriptedChild(_Agent):
         self.finish = {1: threading.Event(), 2: threading.Event()}
         self.freeze = {1: False, 2: False}
         self.schema_fail = False
+        self.exit_mode = "return"  # | "raise" | "interrupted"
         self.cooperative = rng.random() < 0.5
 
     def close(self):
@@ -468,6 +604,8 @@ class _ScriptedChild(_Agent):
                 self.violations.append(f"I2: close() with {self.live_turns} live turn(s)")
 
     def _turn(self, _self):
+        from agent.agent_runtime_helpers import note_steer_delivered
+
         n = len(self.calls)
         with self.lock:
             self.live_turns += 1
@@ -481,16 +619,28 @@ class _ScriptedChild(_Agent):
                     self.frozen_activity_ts = None
                     # A tool boundary: sometimes delivers queued steer.
                     if self._pending_steer and self.rng.random() < 0.003:
-                        self.consumed.append(self._drain_pending_steer())
+                        text = self._drain_pending_steer()
+                        if text:
+                            self.consumed.append(text)
+                            note_steer_delivered(self, text)
                 time.sleep(0.01)
-            # The real finalizer drains pending steer into the return value
-            # BEFORE its post-turn hooks run; hooks make no progress and may
-            # outlive the hang ceiling and the stop drain.
+            if self.exit_mode == "interrupted":
+                from agent.conversation_loop import _return_interrupted
+
+                return _return_interrupted(self, [], None, 1, "interrupted")
+            # The real finalizer drains pending steer into the return value,
+            # then resets (clear_interrupt empties the slot), then runs its
+            # post-turn hooks, which make no progress and may outlive the
+            # hang ceiling and the stop drain.
             pending = self._drain_pending_steer()
+            time.sleep(self.rng.choice((0.0, 0.0, 0.05)))  # steer can land here
+            self.clear_interrupt()
             hooks = self.rng.choice((0.0, 0.0, 0.1, 0.4, 0.8))
             if hooks:
                 self.frozen_activity_ts = time.time() - 60
                 time.sleep(hooks)
+            if self.exit_mode == "raise":
+                raise RuntimeError("post-turn hook failed")
             if n == 1 and self.schema_fail:
                 answer = "not json"
             else:
@@ -507,7 +657,19 @@ class _ScriptedChild(_Agent):
                 self.live_turns -= 1
 
 
-_EVENTS = ("timeout", "steer", "schema-fail", "correction-timeout", "late-finish", "parent-exit")
+_EVENTS = (
+    "timeout",
+    "steer",
+    "steer",
+    "schema-fail",
+    "correction-timeout",
+    "late-finish",
+    "parent-exit",
+    "future-raise",
+    "interrupted-exit",
+    "parent-close",
+    "ancestor-cleanup",
+)
 
 
 def _split(text):
@@ -516,15 +678,20 @@ def _split(text):
 
 @pytest.mark.parametrize("seed", range(int(os.environ.get("DELEGATE_LIFECYCLE_SEEDS", "32"))))
 def test_interleavings_preserve_i1_i2_i3(fleet_home, fast_late, monkeypatch, seed):
+    from run_agent import AIAgent
+
     dt = fast_late
     rng = random.Random(seed)
     monkeypatch.setattr(dt, "_get_child_timeout", lambda: 0.2)
     monkeypatch.setattr(dt, "_LATE_STOP_DRAIN_SECONDS", 0.3)
     monkeypatch.setattr(dt, "_get_child_max_wall_seconds", lambda ct: 4.0)
 
-    parent = _Agent(None, depth=0)
-    child = _ScriptedChild(f"sa-0-prop{seed}", parent, rng)
+    root = _Agent(None, depth=0)
+    parent = _real_agent_methods(_Agent("sa-0-orch", parent=root, depth=1))
+    parent.close = types.MethodType(AIAgent.close, parent)
+    child = _ScriptedChild(f"sa-1-prop{seed}", parent, rng)
     child._delegate_output_schema = _SCHEMA
+    parent._active_children.append(child)
     sid = child._subagent_id
     accepted = []
     history = []
@@ -537,7 +704,7 @@ def test_interleavings_preserve_i1_i2_i3(fleet_home, fast_late, monkeypatch, see
 
     # Random words over the alphabet (with repetition), so that orders like
     # steer < late-finish < (hooks outlive the ceiling) are common.
-    events = [rng.choice(_EVENTS) for _ in range(rng.randint(3, 8))]
+    events = [rng.choice(_EVENTS) for _ in range(rng.randint(3, 9))]
     try:
         entry = dt._run_single_child(0, f"prop goal {seed}", child, parent)
         assert entry["status"] == dt.TIMED_OUT_RUNNING, (seed, entry)
@@ -560,6 +727,15 @@ def test_interleavings_preserve_i1_i2_i3(fleet_home, fast_late, monkeypatch, see
             elif ev == "parent-exit":
                 parent.steer = lambda text: False
                 dt.request_hard_interrupt(child, "parent exited")
+            elif ev == "future-raise":
+                child.exit_mode = "raise"
+            elif ev == "interrupted-exit":
+                child.exit_mode = "interrupted"
+                dt.request_hard_interrupt(child, "parent interrupted")
+            elif ev == "parent-close":
+                AIAgent.close(parent)  # gateway reset of the owning agent
+            elif ev == "ancestor-cleanup":
+                dt._teardown(parent, "ancestor_cleanup")  # recursive close
             check_step(ev)
     finally:
         for f in child.finish.values():
@@ -567,18 +743,30 @@ def test_interleavings_preserve_i1_i2_i3(fleet_home, fast_late, monkeypatch, see
 
     assert _wait_until(lambda: _late_results(parent), timeout=15.0), (seed, history)
     assert _wait_until(lambda: child.close_calls >= 1, timeout=10.0), (seed, history)
+    assert _wait_until(
+        lambda: "steer_fate_unknown" not in _late_results(parent)[0], timeout=10.0
+    ), (seed, history)
     time.sleep(0.1)
     check_step("terminal")
     assert child.close_calls == 1, (seed, history, child.close_calls)
     assert child.live_turns == 0
     (late,) = _late_results(parent)
-    # I3: exactly one durable record under the owning profile.
+    # I3: exactly one durable record under the owning profile, carrying the
+    # number of correction turns the late thread started.
     assert _late_files(fleet_home) == [f"{late['late_result_id']}.json"], seed
     assert str(fleet_home) in late["result_path"]
-    # I1: every accepted steer was consumed or is reported as missed_steer.
+    if "schema_retries" in late:
+        assert late["schema_retries"] == len(child.calls) - 1 == 1, (seed, late)
+    # I1, exactly: missed_steer is every accepted steer the child did not
+    # deliver -- nothing lost, nothing delivered reported as missed.
     missed = _split(late.get("missed_steer"))
     consumed = [s for c in child.consumed for s in _split(c)]
-    lost = [s for s in accepted if s not in missed and s not in consumed]
-    assert not lost, (seed, history, lost, late)
+    assert sorted(missed) == sorted(s for s in accepted if s not in consumed), (
+        seed,
+        history,
+        accepted,
+        consumed,
+        late,
+    )
     on_disk = json.loads(open(late["result_path"], encoding="utf-8").read())
     assert _split(on_disk["entry"].get("missed_steer")) == missed
