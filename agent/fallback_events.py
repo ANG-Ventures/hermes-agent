@@ -24,6 +24,7 @@ Three pieces:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -236,6 +237,150 @@ def _scrub(text: str) -> str:
         return ""
 
 
+# Dead-letter ledger for unclassified fallback riders (t_a716610d).
+DEAD_LETTER_BODY_MAX = 400
+DEAD_LETTER_REL = ("state", "fallback-unclassified.jsonl")
+# Memory bound on the kept raw body. Scrubbing runs on ALL of it before the
+# 400-char cut, so only a secret starting in the first 400 chars and ending
+# past 64 KiB could be split; an unterminated key block is cut anyway
+# (:func:`_cut_unterminated_key`). Error bodies are small; 64 KiB covers an
+# HTML error page head.
+_DL_RAW_MAX = 65536
+_DL_HEADER_PREFIXES = ("x-relay-", "retry-after", "anthropic-ratelimit-")
+_KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
+
+
+def _dead_letter_headers(headers: Any) -> Dict[str, str]:
+    return {k: v for k, v in _lower_headers(headers).items()
+            if k.startswith(_DL_HEADER_PREFIXES)}
+
+
+def _raw_body_text(response: Any, body: Any, msg: str) -> Any:
+    """The failing response body: parsed JSON (dict/list) when there is any,
+    so the scrubber sees decoded strings (``https:\\/\\/u:p@h`` on the wire
+    hides URL credentials from it), else the wire text, else the message.
+    Never raises."""
+    text = None
+    try:
+        text = getattr(response, "text", None) if response is not None else None
+    except Exception:  # noqa: BLE001 - an unread stream raises here
+        text = None
+    if isinstance(text, str) and text:
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            if isinstance(parsed, str):  # a top-level JSON string: decoded too
+                return parsed[:_DL_RAW_MAX]
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(body, (dict, list)):
+        return body
+    if isinstance(text, str) and text:
+        return text[:_DL_RAW_MAX]
+    if isinstance(body, str) and body:
+        return body[:_DL_RAW_MAX]
+    return str(msg or "")[:_DL_RAW_MAX]
+
+
+def _cut_unterminated_key(text: str) -> str:
+    """Fail closed on a key block the redactor could not match whole."""
+    m = _KEY_BEGIN_RE.search(text)
+    return text if m is None else text[:m.start()] + "[REDACTED PRIVATE KEY]"
+
+
+def _scrub_dead_letter(text: str) -> str:
+    """``_scrub`` plus the repo's leak-corpus catalog (LCM sensitive patterns,
+    ``all``): the core redactor misses ``op://`` refs, cookies and
+    ``password: x`` lines, and this sink keeps raw bodies. Scrub the WHOLE
+    string, cut later. Fails CLOSED ("")."""
+    try:
+        from types import SimpleNamespace
+
+        from plugins.context_engine.lcm.ingest_protection import redact_sensitive_text
+
+        out = _scrub(text)
+        if text and not out:
+            return ""
+        out = redact_sensitive_text(out, SimpleNamespace(
+            sensitive_patterns_enabled=True, sensitive_patterns=["all"])) or ""
+        return _cut_unterminated_key(out)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _scrub_leaves(obj: Any, depth: int = 0) -> Any:
+    """Scrub every decoded string (keys too) in a parsed JSON body."""
+    if depth > 20:
+        return "[depth]"
+    if isinstance(obj, str):
+        return _scrub_dead_letter(obj)
+    if isinstance(obj, dict):
+        return {_scrub_dead_letter(str(k)): _scrub_leaves(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub_leaves(v, depth + 1) for v in obj]
+    return obj
+
+
+def _dead_letter_body(raw: Any) -> str:
+    """Scrubbed body, cut to DEAD_LETTER_BODY_MAX only after scrubbing."""
+    if isinstance(raw, (dict, list)):
+        text = json.dumps(_scrub_leaves(raw), ensure_ascii=False, default=str)
+    else:
+        text = str(raw or "")
+    return _scrub_dead_letter(text)[:DEAD_LETTER_BODY_MAX]
+
+
+def dead_letter_path() -> Any:
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()).joinpath(*DEAD_LETTER_REL)
+
+
+def note_unclassified(row: Optional[Dict[str, Any]], rendered: str,
+                      floors: Any, *, path: Any = None) -> bool:
+    """Append ONE JSON line to the dead-letter ledger for an announce rendered
+    from a floor branch (``unclassified error`` / ``(hop unknown, sub
+    unknown)`` / the generic ``connection issue`` head). The raw evidence
+    (relay/retry/ratelimit headers, scrubbed 400-char body) is what the next
+    ``_TEXT_TABLE`` row gets written from. Never raises; never touches the
+    rendered text. Returns True when a line was written."""
+    try:
+        floors = [str(f) for f in (floors or ()) if f]
+        if not floors:
+            return False
+        row = row if isinstance(row, dict) else {}
+        ev = row.get("_dead_letter") if isinstance(row.get("_dead_letter"), dict) else {}
+        rec = {
+            "ts": time.time(),
+            "session": row.get("session_id"),
+            "provider": row.get("from_provider"),
+            "model": row.get("from_model"),
+            "to_provider": row.get("to_provider"),
+            "to_model": row.get("to_model"),
+            "http_status": row.get("http_status"),
+            "exc_name": ev.get("exc"),
+            "reason": row.get("reason"),
+            "trigger_class": row.get("trigger_class"),
+            "class_source": row.get("class_source"),
+            "err_hash": row.get("err_hash"),
+            "floors": floors,
+            "headers": {str(k): _scrub_dead_letter(str(v))
+                        for k, v in (ev.get("headers") or {}).items()},
+            "body": _dead_letter_body(ev.get("body")),
+            "rendered": _scrub_dead_letter(str(rendered or "")),
+        }
+        target = path or dead_letter_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("fallback dead-letter write failed", exc_info=True)
+        return False
+
+
 def stash_api_error(agent: Any, api_error: BaseException,
                     status_code: Optional[int],
                     error_context: Optional[Dict[str, Any]] = None) -> None:
@@ -278,6 +423,10 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "body": body if isinstance(body, dict) else None,
             "exc": type(api_error).__name__,
             "endpoint": _endpoint(api_error),
+            # Dead-letter evidence (t_a716610d), in memory until a floor rider
+            # renders; scrubbed by note_unclassified before it reaches disk.
+            "dl_headers": _dead_letter_headers(headers),
+            "dl_body": _raw_body_text(response, body, msg),
         }
     except Exception:  # noqa: BLE001
         logger.debug("fallback ledger: stash failed", exc_info=True)
@@ -574,6 +723,12 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         except Exception:  # noqa: BLE001
             logger.debug("fallback ledger: pin seat/hop fill failed", exc_info=True)
         _note_relay_conn(row, pending)
+        # Raw evidence for the dead-letter ledger (t_a716610d). Not a column.
+        row["_dead_letter"] = {
+            "exc": pending.get("exc") if pending else None,
+            "headers": dict(pending.get("dl_headers") or {}) if pending else {},
+            "body": pending.get("dl_body") if pending else None,
+        }
     return row
 
 

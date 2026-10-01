@@ -987,6 +987,16 @@ RELAY_DRAIN_CAUSE = "relay draining for deploy"
 THIRD_PARTY_CAUSE = "plan billing refused (extra usage only)"
 
 
+# §4.8 renderer floors (t_a716610d): the branches that render when the harness
+# did NOT classify the failure. Each one is a dead-letter detection point
+# (``fallback_events.note_unclassified``); the rendered text stays as is.
+UNCLASSIFIED_CAUSE = "unclassified error"
+FLOOR_CAUSE = "unclassified_cause"
+FLOOR_HOP_SUB = "hop_sub_unknown"
+FLOOR_HEAD = "generic_head"
+_HOP_SUB_UNKNOWN_SEG = f"({HOP_UNKNOWN}, {SUB_UNKNOWN})"
+
+
 def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
@@ -1033,7 +1043,7 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         "rate_upstream": "account rate limit",
         "refusal": "content policy refusal",
         "auth": "OAuth revoked (401)",
-    }.get(cls, "unclassified error")
+    }.get(cls, UNCLASSIFIED_CAUSE)
 
 
 def _seat_token(row: Mapping[str, Any], seat_names: bool) -> str:
@@ -1060,7 +1070,7 @@ def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
             "client→cli": "to the CLI (direct)",
             "cli→anthropic": f"(Anthropic {st}) via the CLI",
         }.get(hop or "")
-        return f"{known} ({SUB_UNKNOWN})" if known else f"({HOP_UNKNOWN}, {SUB_UNKNOWN})"
+        return f"{known} ({SUB_UNKNOWN})" if known else _HOP_SUB_UNKNOWN_SEG
     return {
         "client→relay": f"to the relay for {seat}",
         "relay": f"at the relay on {seat}",
@@ -1095,35 +1105,55 @@ def _count_window(row: Mapping[str, Any], tz: Optional[_dt.tzinfo]) -> Tuple[str
 
 
 def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
-                       tz: Optional[_dt.tzinfo] = None) -> str:
+                       tz: Optional[_dt.tzinfo] = None,
+                       floors: Optional[List[str]] = None) -> str:
     """Four mandatory fields: cause, hop, sub, count+window (§4.8).
 
     Built from the Phase 1 ``fallback_events`` row dict. A direct pin's
     missing seat/hop are derived locally (:func:`fill_pin_evidence`); a
     genuinely unknown hop/sub renders as ``hop unknown`` / ``sub unknown``,
-    never omitted or guessed.
+    never omitted or guessed. ``floors``, when given, is extended with the
+    floor branches the cause rendered from (``FLOOR_CAUSE``: the cause fell to
+    ``unclassified error``; ``FLOOR_HOP_SUB``: ``(hop unknown, sub unknown)``).
     """
     row = fill_pin_evidence(row)
-    return _cause_body(row, seat_names, tz) + same_error_rider(row, seat_names=seat_names, tz=tz)
+    body, hit = _cause_body(row, seat_names, tz)
+    if floors is not None:
+        floors.extend(hit)
+    return body + same_error_rider(row, seat_names=seat_names, tz=tz)
 
 
-def _cause_body(row: Mapping[str, Any], seat_names: bool, tz: Optional[_dt.tzinfo]) -> str:
+def cause_rider_with_floors(row: Mapping[str, Any], *, seat_names: bool = True,
+                            tz: Optional[_dt.tzinfo] = None) -> Tuple[str, Tuple[str, ...]]:
+    """:func:`format_cause_rider` text plus the floor branches it rendered from."""
+    hit: List[str] = []
+    text = format_cause_rider(row, seat_names=seat_names, tz=tz, floors=hit)
+    return text, tuple(hit)
+
+
+def _cause_body(row: Mapping[str, Any], seat_names: bool,
+                tz: Optional[_dt.tzinfo]) -> Tuple[str, Tuple[str, ...]]:
     prefix, window = _count_window(row, tz)
     if _plain_provider(row):
         # The banner ends after the vendor's words when there are any (Ace,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).
         cause = _provider_cause(row)
-        return f"{prefix}{cause}" if row.get("provider_message") else f"{prefix}{cause}, {window}"
+        floors = (FLOOR_CAUSE,) if cause.startswith(UNCLASSIFIED_CAUSE) else ()
+        text = f"{prefix}{cause}" if row.get("provider_message") else f"{prefix}{cause}, {window}"
+        return text, floors
     if relay_conn_without_evidence(row):
-        return f"{prefix}{_relay_conn_cause(row, tz)}, {window}"
+        return f"{prefix}{_relay_conn_cause(row, tz)}, {window}", ()
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
     if _is_pool_wide_relay_busy(row, hop, cause):
         if cause == RELAY_DRAIN_CAUSE:
-            return f"{prefix}{cause} (at the relay), {window}"
-        return f"{prefix}relay busy: all subs at capacity (at the relay), {window}"
-    return f"{prefix}{cause} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+            return f"{prefix}{cause} (at the relay), {window}", ()
+        return f"{prefix}relay busy: all subs at capacity (at the relay), {window}", ()
+    seg = _hop_segment(hop, seat, row.get("http_status"))
+    floors = tuple(f for f, hit in ((FLOOR_CAUSE, cause == UNCLASSIFIED_CAUSE),
+                                    (FLOOR_HOP_SUB, seg == _HOP_SUB_UNKNOWN_SEG)) if hit)
+    return f"{prefix}{cause} {seg}, {window}", floors
 
 
 # ── same-error re-failover backoff (t_7f2ced0d) ───────────────────────────

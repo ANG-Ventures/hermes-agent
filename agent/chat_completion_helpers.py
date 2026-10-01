@@ -3415,6 +3415,17 @@ def _fallback_reason_label(reason: "Any | None") -> "str | None":
     return _FALLBACK_REASON_LABELS.get(val, _GENERIC_FALLBACK_LABEL)
 
 
+def _fallback_reason_label_is_floor(reason: "Any | None") -> bool:
+    """True when ``_fallback_reason_label`` renders the generic floor because
+    the reason has no mapping (not because a mapping says so). t_a716610d."""
+    if reason is None:
+        return False
+    try:
+        return str(getattr(reason, "value", reason)).strip().lower() not in _FALLBACK_REASON_LABELS
+    except Exception:
+        return True
+
+
 def _resolve_failover_reason(agent, reason: "Any | None") -> "Any | None":
     """Resolve the effective failover reason and clear the pending stamp.
 
@@ -3528,6 +3539,7 @@ def _emit_fallback_announce(
         _reason_suffix = f" ({recovery_via})" if recovery_via else ""
     else:
         _reason_label = _fallback_reason_label(reason)
+        _head_floor = _fallback_reason_label_is_floor(reason)
         # §4.8 head-label override: a relay-sourced conn / pool_pressure names
         # the real cause, and the quota-window suffix is not applied.
         _head_override = None
@@ -3546,6 +3558,7 @@ def _emit_fallback_announce(
         _scope_label = _pool_scope_label(agent, old_model)
         if _scope_label and getattr(reason, "value", reason) == "pool_exhausted":
             _reason_label = _scope_label
+            _head_floor = False
         # For a quota 429, name WHICH window bound (5h vs 7d) and when it
         # clears — those are opposite decisions ("wait an hour" vs "this sub is
         # gone for two days") that both used to render as a flat "rate limit".
@@ -3553,6 +3566,7 @@ def _emit_fallback_announce(
         if _head_override:
             _quota_window_suffix(agent)  # consume the stamp; never rendered here
             _reason_label = _head_override
+            _head_floor = False
         elif reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit,
                         FailoverReason.pool_exhausted}:
             _window = _quota_window_suffix(agent)
@@ -3572,6 +3586,7 @@ def _emit_fallback_announce(
     new_lbl = _format_context_window(new_window)
     if old_lbl and new_lbl and old_lbl != new_lbl:
         msg += f" · context window {old_lbl}→{new_lbl}"
+    _floors: tuple = ()
     if isinstance(ledger_row, dict):
         try:
             from agent import fallback_policy as _fp
@@ -3582,10 +3597,29 @@ def _emit_fallback_announce(
                 if ledger_row.get("return_branch"):
                     msg += " — " + _fp.format_recovery_rider(ledger_row, seat_names=_names)
             else:
-                msg += " — " + _fp.format_cause_rider(ledger_row, seat_names=_names)
+                _hit: list = []
+                msg += " — " + _fp.format_cause_rider(ledger_row, seat_names=_names, floors=_hit)
+                _floors = tuple(_hit)
         except Exception:
             logger.debug("route-change rider failed", exc_info=True)
         ledger_row["notice_text"] = msg
+    if kind != "recovery":
+        # Write-path sentinel (t_a716610d): an announce rendered from a floor
+        # branch files its raw evidence to the dead-letter ledger. Before the
+        # dedupe and the announce gate, like notice_text; never alters msg.
+        if _head_floor:
+            _floors = (*_floors, "generic_head")
+        if _floors:
+            try:
+                from agent.fallback_events import note_unclassified
+
+                note_unclassified(
+                    ledger_row if isinstance(ledger_row, dict)
+                    else {"from_provider": old_provider, "from_model": old_model,
+                          "to_provider": new_provider, "to_model": new_model},
+                    msg, _floors)
+            except Exception:
+                logger.debug("fallback dead-letter sentinel failed", exc_info=True)
     if getattr(agent, "_last_fallback_announced", None) == transition:
         # Already announced THIS transition in the current episode (I5: once per
         # episode). Logged at INFO so "suppressed as a repeat" is distinguishable
