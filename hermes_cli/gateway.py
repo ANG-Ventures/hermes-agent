@@ -6301,6 +6301,36 @@ def _shadow_cwd_reason(
     return None
 
 
+def _shadow_import_reason(
+    cwd: str,
+    *,
+    package_root: Path | None = None,
+    prefix: str | None = None,
+) -> str | None:
+    """Return why the RUNNING code looks loaded from a shadow cwd, else None.
+
+    Under ``python -m hermes_cli.main`` the cwd is ``sys.path[0]``, so a
+    checkout in the cwd is imported instead of the install and becomes
+    ``PROJECT_ROOT`` itself (the ``hermes_cli/`` check then passes). Flag that
+    case unless the interpreter's own environment lives inside that tree (a
+    checkout running its own venv, as in CI or a dev clone).
+    """
+    try:
+        root = (package_root or PROJECT_ROOT).resolve()
+        here = Path(cwd).resolve()
+        env = Path(prefix if prefix is not None else sys.prefix).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if here != root:
+        return None
+    if env == root or root in env.parents:
+        return None
+    return (
+        f"{root} is the imported code tree (loaded from the cwd), "
+        f"but the interpreter environment {env} is not inside it"
+    )
+
+
 def _guard_shadow_cwd() -> None:
     """Refuse ``gateway run`` from a cwd/sys.path[0] that shadows the install."""
     if _truthy_env(os.getenv(SHADOW_CWD_ALLOW_ENV)):
@@ -6320,6 +6350,12 @@ def _guard_shadow_cwd() -> None:
         refused = True
         logger.error("Refusing gateway start: %s %s", label, reason)
         print_error(f"Refusing to start the gateway: {label} {reason}.")
+    if cwd:
+        reason = _shadow_import_reason(cwd)
+        if reason is not None:
+            refused = True
+            logger.error("Refusing gateway start: %s", reason)
+            print_error(f"Refusing to start the gateway: {reason}.")
     if refused:
         print(
             "  A gateway started from a worker workspace or checkout can import\n"

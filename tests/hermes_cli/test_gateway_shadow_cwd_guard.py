@@ -51,6 +51,32 @@ def test_default_forbidden_roots_include_fleet_scratch_and_workspaces():
     assert any(r.endswith(os.path.join("kanban", "workspaces")) for r in roots)
 
 
+def test_shadow_import_refuses_cwd_loaded_tree_with_foreign_env(tmp_path):
+    checkout = tmp_path / "wt"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    runtime_venv = tmp_path / "runtime" / "venv"
+    runtime_venv.mkdir(parents=True)
+    reason = gateway_cli._shadow_import_reason(
+        str(checkout), package_root=checkout, prefix=str(runtime_venv)
+    )
+    assert reason is not None and "imported code tree" in reason
+
+
+def test_shadow_import_allows_own_venv_and_other_cwd(tmp_path):
+    checkout = tmp_path / "wt"
+    (checkout / "venv").mkdir(parents=True)
+    profile = tmp_path / "profiles" / "apollo"
+    profile.mkdir(parents=True)
+    # checkout running its own venv (CI / dev clone)
+    assert gateway_cli._shadow_import_reason(
+        str(checkout), package_root=checkout, prefix=str(checkout / "venv")
+    ) is None
+    # service cwd is a profile dir, code is the install
+    assert gateway_cli._shadow_import_reason(
+        str(profile), package_root=checkout, prefix=str(tmp_path / "elsewhere")
+    ) is None
+
+
 def test_guard_exits_nonzero_not_75(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_ALLOW_SHADOW_CWD", raising=False)
     checkout = tmp_path / "wt"
@@ -94,3 +120,23 @@ def test_gateway_run_subprocess_refuses_shadow_cwd(tmp_path):
     # under /Volumes/fleet-scratch); the cwd line is reported either way, with
     # the forbidden-root or foreign-hermes_cli/ reason depending on tmp_path.
     assert f"cwd {shadow.resolve()} " in out
+
+
+@pytest.mark.skipif(
+    Path(sys.prefix).resolve() == REPO_ROOT or REPO_ROOT in Path(sys.prefix).resolve().parents,
+    reason="interpreter env lives inside this checkout (CI .venv): not a shadow import",
+)
+def test_gateway_run_subprocess_refuses_real_shadow_package():
+    """A real checkout in the cwd is what gets imported (Prism r1 P1)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("HERMES_ALLOW_SHADOW_CWD", "PYTHONPATH")}
+    proc = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == gateway_cli.GATEWAY_SHADOW_CWD_EXIT_CODE, out
+    assert "imported code tree" in out
