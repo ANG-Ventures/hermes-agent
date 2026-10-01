@@ -216,6 +216,7 @@ def test_pool_health_urls_default_and_config_via_production_loader(home):
 @pytest.mark.parametrize("provider,key", [
     ("claude-apr", ("claude-apr", None)),
     ("claude-bpr", ("claude-bpr", None)),
+    ("claude-alr", ("claude-apr", None)),
     ("claude-apx-0", ("claude-apr", "local")),
     ("claude-apx-7", ("claude-apr", "sub-vps-7")),
     ("claude-bpx-22", ("claude-bpr", "sub-vps-22")),

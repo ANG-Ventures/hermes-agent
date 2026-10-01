@@ -82,13 +82,15 @@ def _pool_lane_src(agent, aux_task=None) -> str:
 # stamping when the pool was renamed claude-app→claude-apr (caught 2026-07-08,
 # #241). The legacy `claude-app` alias was fully retired 2026-07-08 (no live
 # config/session/cron references remain), so it is no longer accepted here.
-_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr"})
+# claude-alr (t_4c1a9bee, Ace 2026-09-30) is the SAME apr relay (:18810) under the
+# a-family local-execution name: it must carry the same affinity/lane headers.
+_POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr"})
 
 
 # Pool relays that speak the error-class-v2 contract (fallback spec 2026-09-25
 # D2 / Phase 1b). Both lanes: the affinity helper above is apr-only, but the
 # capability header must reach bpr too, so it has its own provider set.
-_POOL_CAPABILITY_PROVIDERS = frozenset({"claude-apr", "claude-bpr"})
+_POOL_CAPABILITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-bpr"})
 POOL_ACCEPTS_HEADER = "x-hermes-accepts"
 POOL_ACCEPTS_VALUE = "error-class-v2"
 

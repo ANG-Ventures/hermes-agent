@@ -194,7 +194,7 @@ def _eligibility_fn(agent: Any):
         if route is None:
             return None
         provider, model, base_url, sid = route
-        if provider.strip().lower() == "claude-apr":
+        if provider.strip().lower() in ("claude-apr", "claude-alr"):
             return fp.fetch_eligibility(base_url, model=model, session=sid or None)
         return fp.fetch_eligibility(base_url, model=model,
                                     user=f"hermes-sess:{sid}" if sid else None)
