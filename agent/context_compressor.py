@@ -318,20 +318,22 @@ class _SummaryRouteAlreadyRefused(RuntimeError):
     """Raised before sending: this route already refused this content."""
 
 
-def _compression_refusal_fallback_routes() -> List[Dict[str, Any]]:
+def _compression_refusal_fallback_routes(
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """``auxiliary.compression.fallback_chain`` entries as ``call_llm`` kwargs.
 
     These are the user's declared alternate summary routes (e.g. a non-Claude
     model). They are the only place a refused segment is re-sent: to a
     DIFFERENT model, once each, never to a route that already refused it.
+    A ``{provider: auto}`` entry is the session's main model (``main_runtime``)
+    and is left out when it IS the configured compression primary.
     """
     try:
-        from agent.auxiliary_client import _get_auxiliary_task_config
+        from agent.auxiliary_client import resolve_task_fallback_chain
 
-        chain = _get_auxiliary_task_config("compression").get("fallback_chain")
+        chain = [entry for _i, entry in resolve_task_fallback_chain("compression", main_runtime)]
     except Exception:  # pragma: no cover - config read is best-effort
-        return []
-    if not isinstance(chain, list):
         return []
     routes: List[Dict[str, Any]] = []
     for entry in chain:
@@ -5343,7 +5345,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         tried = getattr(self, "_summary_refusal_routes_tried", None)
         if tried is None:
             tried = set()
-        for route in _compression_refusal_fallback_routes():
+        for route in _compression_refusal_fallback_routes(
+            {"provider": self.provider, "model": self.model}
+        ):
             # Same kwargs ``_generate_summary`` will send, so the key checked
             # here is the key it latches (t_2ba784cc: a model-less entry keeps
             # ``summary_model``; keying the bare entry recursed forever).

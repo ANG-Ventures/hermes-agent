@@ -1369,17 +1369,19 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         from agent.auxiliary_client import (
             _fallback_entry_api_key,
             _get_auxiliary_task_config,
+            resolve_task_fallback_chain,
         )
 
         task_config = _get_auxiliary_task_config("compression")
-        chain = task_config.get("fallback_chain")
+        # ``{provider: auto}`` resolves to the session's main model (context-
+        # local runtime); dropped when absent or equal to the stalled primary.
+        chain = resolve_task_fallback_chain("compression")
         # Explicit task routes retain precedence. Auto tasks without one use
         # the same eligibility policy as the auxiliary client's error path.
-        has_task_route = isinstance(chain, list) and any(
-            isinstance(entry, dict)
-            and str(entry.get("provider") or "").strip()
+        has_task_route = any(
+            str(entry.get("provider") or "").strip()
             and str(entry.get("model") or "").strip()
-            for entry in chain
+            for _i, entry in chain
         )
         inherited = False
         if not has_task_route and str(task_config.get("provider") or "auto").strip().lower() == "auto":
@@ -1393,11 +1395,11 @@ def resolve_compression_fallback_route() -> Optional[dict]:
             )
             if entry is not None:
                 destination = _fallback_destination_from_entry(entry, client, model)
-                chain = [dict(
+                chain = [(0, dict(
                     entry, model=model, base_url=destination.base_url,
                     api_mode=destination.api_mode,
                     api_key=_fallback_entry_api_key(entry) or getattr(client, "api_key", None),
-                )]
+                ))]
                 inherited = True
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
@@ -1405,7 +1407,7 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     if not isinstance(chain, list):
         return None
 
-    for index, entry in enumerate(chain):
+    for index, entry in chain:
         if not isinstance(entry, dict):
             continue
         provider = str(entry.get("provider") or "").strip()
