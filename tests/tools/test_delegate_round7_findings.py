@@ -147,18 +147,58 @@ def test_f3_control_model_reads_it_then_it_is_delivered(tmp_path):
     assert led.missed() is None
 
 
-def test_f3_the_loop_settles_only_after_a_model_response():
-    """conversation_loop marks steers consumed after the API call returned,
-    and both injection sites call note_steer_injected, not _delivered."""
-    import agent.conversation_loop as cl
-    import agent.agent_runtime_helpers as arh
+def _loop_child(sid, tmp_path):
+    """A real AIAgent behind the delegate ledger, driven through run_conversation."""
+    from tests.agent.test_pre_api_steer_drain_turn_bound import _make_agent
+    from tools.delegate_tool import _SteerLedger
 
-    src = inspect.getsource(cl)
-    assert "note_steer_consumed(agent)" in src
-    assert src.index("note_steer_consumed(agent)") > src.index("run_llm_execution_middleware(")
-    assert "note_steer_delivered(" not in src
-    helper = inspect.getsource(arh.apply_pending_steer_to_tool_results)
-    assert "note_steer_injected(agent, steer_text)" in helper
+    agent = _make_agent()
+    led = _SteerLedger.for_child(agent, sid)
+    led.path = tmp_path / "steer.jsonl"
+    return agent, led
+
+
+def _loop_responses():
+    from tests.agent.test_pre_api_steer_drain_turn_bound import _response, _tool_call
+
+    return [
+        _response(finish_reason="tool_calls", tool_calls=[_tool_call("c1")]),
+        _response(content="done"),
+    ]
+
+
+def test_f3_the_loop_settles_only_after_a_model_response(tmp_path):
+    """Real loop: the steer lands in the turn's tool result and the next model
+    response reads it, so the ledger settles it (control for t_race1)."""
+    from tests.agent.test_pre_api_steer_drain_turn_bound import _run, _tool_contents
+
+    agent, led = _loop_child("sa-loop-ok", tmp_path)
+    assert agent.steer("check the replica")
+    result, sent = _run(agent, _loop_responses())
+    assert result["final_response"] == "done"
+    assert "check the replica" in _tool_contents(sent[1])["c1"]  # the model read it
+    assert led.missed() is None
+
+
+def test_f3_the_loop_interrupt_after_injection_leaves_the_steer_missed(tmp_path):
+    """Real loop, t_race1 interleaving: the steer is written into the tool
+    result, then the turn is interrupted before any model request reads it."""
+    from tests.agent.test_pre_api_steer_drain_turn_bound import _run
+    from tests.agent.test_pre_api_steer_drain_turn_bound import make_tool_result_message
+
+    agent, led = _loop_child("sa-loop-int", tmp_path)
+
+    def _execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        for tc in assistant_message.tool_calls:
+            messages.append(make_tool_result_message("web_search", "new result", tc.id))
+        agent._apply_pending_steer_to_tool_results(messages, len(assistant_message.tool_calls))
+        assert "check the replica" in messages[-1]["content"]  # injected
+        agent.interrupt("parent stop")  # hard interrupt before the next request
+
+    assert agent.steer("check the replica")
+    result, sent = _run(agent, _loop_responses(), execute=_execute)
+    assert len(sent) == 1  # no model request after the injection
+    assert led.missed() == "check the replica"
 
 
 # r1 f983a90e -----------------------------------------------------------------
