@@ -592,6 +592,7 @@ def _invoke_summary_llm_chain(
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
     segment_key: str | None = None,
+    refused_routes: list[str] | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -610,6 +611,8 @@ def _invoke_summary_llm_chain(
         route_key = _summary_route_key(candidate_model) if segment_key else ""
         latched_for = _SUMMARY_REFUSALS.remaining(route_key, segment_key) if segment_key else 0.0
         if latched_for > 0.0:
+            if refused_routes is not None:
+                refused_routes.append(candidate_model or _DEFAULT_ROUTE_KEY)
             logger.warning(
                 "LCM summary route %s skipped: it refused this segment; latch "
                 "expires in %.0fs",
@@ -648,6 +651,8 @@ def _invoke_summary_llm_chain(
                 route_key, candidate_model or "<default>",
                 exc,
             )
+            if refused_routes is not None:
+                refused_routes.append(candidate_model or _DEFAULT_ROUTE_KEY)
             if segment_key:
                 _SUMMARY_REFUSALS.record(route_key, segment_key)
             continue
@@ -853,6 +858,59 @@ def _redact_summary_input(text: str) -> str:
     )
 
 
+# t_cdf67f57 (Apollo 2026-09-30 18:20): when every summary route refused the
+# segment, the node never carries refusal text and never looks like a real
+# summary. It carries this explicit marker plus the deterministic excerpt, and
+# the operator is paged once per session.
+SUMMARY_UNAVAILABLE_MARKER = (
+    "[summary_unavailable: every summary route refused this segment; "
+    "deterministic excerpt follows, expand the node for the source]\n"
+)
+_PAGED_SUMMARY_UNAVAILABLE: set[str] = set()
+_PAGED_SUMMARY_UNAVAILABLE_LOCK = threading.Lock()
+
+
+def _send_summary_unavailable_page(message: str) -> None:
+    """Best-effort #alerts page via the fleet notify.py; never raises."""
+    try:
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        try:
+            from hermes_cli.config import get_hermes_home
+            home = Path(str(get_hermes_home()))
+        except Exception:
+            home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+        script = home / "scripts" / "notify.py"
+        if not script.exists():
+            logger.warning("LCM summary_unavailable page skipped: %s missing", script)
+            return
+        subprocess.Popen(
+            [sys.executable, str(script), "--send", message,
+             "--channel", "discord", "--sev", "error"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except Exception:
+        logger.warning("LCM summary_unavailable page failed", exc_info=True)
+
+
+def _page_summary_unavailable_once(session_id: str, routes: list[str]) -> bool:
+    """Page at most once per session; returns True when this call paged."""
+    key = session_id or "<no-session>"
+    with _PAGED_SUMMARY_UNAVAILABLE_LOCK:
+        if key in _PAGED_SUMMARY_UNAVAILABLE:
+            return False
+        _PAGED_SUMMARY_UNAVAILABLE.add(key)
+    _send_summary_unavailable_page(
+        "LCM summary_unavailable: every summary route refused a segment "
+        f"(session {key}, routes {', '.join(dict.fromkeys(routes))}); stored a "
+        "marker + deterministic excerpt instead. Card t_cdf67f57."
+    )
+    return True
+
+
 def summarize_with_escalation(
     text: str,
     source_tokens: int,
@@ -867,6 +925,7 @@ def summarize_with_escalation(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
+    session_id: str = "",
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
@@ -881,6 +940,7 @@ def summarize_with_escalation(
     segment_key = _segment_key(
         text, focus_topic=focus_topic, custom_instructions=custom_instructions
     )
+    refused_routes: list[str] = []
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
@@ -895,6 +955,7 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
+        refused_routes=refused_routes,
     )
 
     if l1_result:
@@ -916,6 +977,7 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
+        refused_routes=refused_routes,
     )
 
     if l2_result:
@@ -924,5 +986,13 @@ def summarize_with_escalation(
 
     # Level 3: deterministic truncation — guaranteed convergence
     l3_result = _deterministic_truncate(text, l3_truncate_tokens)
+    if refused_routes:
+        logger.warning(
+            "LCM summary_unavailable session=%s: every route refused (%s); "
+            "storing marker + deterministic excerpt",
+            session_id or "<no-session>", ", ".join(dict.fromkeys(refused_routes)),
+        )
+        _page_summary_unavailable_once(session_id, refused_routes)
+        l3_result = SUMMARY_UNAVAILABLE_MARKER + l3_result
     logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
     return l3_result, 3

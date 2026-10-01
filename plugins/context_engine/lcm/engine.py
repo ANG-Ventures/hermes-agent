@@ -1894,6 +1894,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
+            session_id=self._session_id or "",
         )
 
     def _summarize_leaf_source(
@@ -7100,6 +7101,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
+            session_id=self._session_id or "",
         )
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]

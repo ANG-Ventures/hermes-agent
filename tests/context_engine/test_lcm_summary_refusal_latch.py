@@ -453,3 +453,69 @@ def test_huge_prompt_skips_flash_bridge_with_truncated_tail(monkeypatch):
     )
     assert seen == ["sonnet", "gpt-6-luna-900k"]
     assert (summary, level) == ("A summary from luna", 1)
+
+
+# --- t_cdf67f57 (Apollo 18:20): all routes refuse => explicit marker + one page per session ---
+
+
+@pytest.fixture
+def pages(monkeypatch):
+    sent: list[str] = []
+    monkeypatch.setattr(escalation, "_send_summary_unavailable_page", sent.append)
+    monkeypatch.setattr(escalation, "_PAGED_SUMMARY_UNAVAILABLE", set())
+    return sent
+
+
+def _segment(n: int) -> str:
+    return f"user: segment {n} " + ("detail " * 400)
+
+
+def test_refusal_shaped_200_is_never_stored_as_the_summary(monkeypatch, pages):
+    seen: list[str] = []
+
+    def route(**kw):
+        seen.append(kw.get("model") or "")
+        return _ok(NODE_946_REPLY)  # every route answers 200 with the meta-refusal
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = summarize_with_escalation(
+        text=_segment(1), source_tokens=1200, token_budget=600,
+        model="claude-sonnet-5-5", fallback_models=["gpt-6-luna-900k"],
+        session_id="sess-a",
+    )
+    assert level == 3
+    assert summary.startswith(escalation.SUMMARY_UNAVAILABLE_MARKER)
+    assert "classifier" not in summary and "I won't" not in summary
+    # One hop to the other provider, never a same-route resend (latch contract).
+    assert seen == ["claude-sonnet-5-5", "gpt-6-luna-900k"]
+    assert len(pages) == 1 and "sess-a" in pages[0]
+
+
+def test_summary_unavailable_pages_once_per_session(monkeypatch, pages):
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", lambda **kw: _ok(NODE_946_REPLY))
+    for n in (2, 3):
+        summary, _ = summarize_with_escalation(
+            text=_segment(n), source_tokens=1200, token_budget=600,
+            model="claude-sonnet-5-5", session_id="sess-b",
+        )
+        assert summary.startswith(escalation.SUMMARY_UNAVAILABLE_MARKER)
+    assert len(pages) == 1
+    summarize_with_escalation(
+        text=_segment(4), source_tokens=1200, token_budget=600,
+        model="claude-sonnet-5-5", session_id="sess-c",
+    )
+    assert len(pages) == 2 and "sess-c" in pages[1]
+
+
+def test_non_refusal_l3_has_no_marker_and_no_page(monkeypatch, pages):
+    def route(**kw):
+        raise RuntimeError("502 upstream")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = summarize_with_escalation(
+        text=_segment(5), source_tokens=1200, token_budget=600,
+        model="claude-sonnet-5-5", session_id="sess-d",
+    )
+    assert level == 3
+    assert not summary.startswith(escalation.SUMMARY_UNAVAILABLE_MARKER)
+    assert pages == []
