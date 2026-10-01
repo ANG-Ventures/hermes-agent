@@ -985,6 +985,8 @@ def normalize_hop(raw: Optional[str]) -> Optional[str]:
 RELAY_DRAIN_CAUSE = "relay draining for deploy"
 # Anthropic 400 "Third-party apps now draw from your extra usage" (t_7f2ced0d).
 THIRD_PARTY_CAUSE = "plan billing refused (extra usage only)"
+# Anthropic 400 "You're out of extra usage" (t_f00f05bd).
+EXTRA_USAGE_EXHAUSTED_CAUSE = "extra usage exhausted"
 
 
 def _cause_phrase(row: Mapping[str, Any]) -> str:
@@ -1015,6 +1017,8 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return "seat drained"
         return "relay busy"
     if cls in ("quota_model", "quota_seat"):
+        if "out of extra usage" in t:
+            return EXTRA_USAGE_EXHAUSTED_CAUSE
         if "budget" in t and "capped" in t:
             return "model budget capped"
         if "no eligible sub" in t:
