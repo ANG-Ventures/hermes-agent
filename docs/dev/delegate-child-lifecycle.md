@@ -37,14 +37,19 @@ Every hang verdict on this path reads progress. None of them reads liveness.
   `_touch_activity` call, including the periodic tickers that run while one
   call blocks: the non-streaming wait ticker (`progress=False`), the streaming
   wait ticker and `_emit_wait_notice`, an Anthropic `ping` / Codex keepalive
-  frame, the tool-activity heartbeat, and `touch_activity_if_due` inside a
-  running tool (`heartbeat=True`). The gateway inactivity watchdog and the
-  parent heartbeat read this clock.
+  frame, a content-free Chat Completions chunk (`{"delta": {}}` with no
+  finish_reason or usage, `_chat_chunk_is_progress`), the tool-activity
+  heartbeat, and `touch_activity_if_due` inside a running tool
+  (`heartbeat=True`). The gateway inactivity watchdog and the parent heartbeat
+  read this clock.
 - **Progress**: the child did something. `_last_progress_event_ts`
   (`last_progress_event_ts` in `get_activity_summary()`) advances only on a
-  model token or stream chunk, an API call starting or finishing, a tool
-  starting or returning, or a turn boundary: any `_touch_activity` call that
-  is neither `progress=False` nor `heartbeat=True`.
+  model token or a stream chunk that carries content (a content/reasoning
+  delta, a tool_call delta, a finish_reason, or usage), an API call starting
+  or finishing, a tool starting or returning, or a turn boundary: any
+  `_touch_activity` call that is neither `progress=False` nor
+  `heartbeat=True`. A stuck relay that trickles empty deltas is therefore
+  reaped at `hung_child_seconds` like one that sends SSE comment keepalives.
 - The kanban `progress_at` clock (`_last_progress_ts`) sits between the two.
   It ignores provider-wait tickers but still counts the in-tool heartbeat,
   because the stall detector treats a running tool as a live worker.
