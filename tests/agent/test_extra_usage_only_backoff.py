@@ -120,7 +120,7 @@ def _agent():
 def _fail(agent, now):
     err = _bad_request(MSG)
     fbe.stash_api_error(agent, err, 400, extract_api_error_context(err))
-    extra = fw.same_error_on_failover(agent, now=now)
+    extra = fw.same_error_on_failover(agent, failing=("claude-apr", "claude-fable-5-1"), now=now)
     row = fbe.build_row(agent, "failover", from_provider="claude-apr", from_model="claude-fable-5-1",
                         to_provider="claude-bpr", to_model="claude-opus-5-5",
                         reason=FailoverReason.extra_usage_only, extra=extra)
@@ -200,3 +200,51 @@ def test_hot_path_return_into_same_400_benches_primary(wired):
 
     assert _restore(a) is False                    # the next turn stays on opus: no cold cycle
     assert (a.provider, a.model) == ("claude-bpr", "claude-opus-5-5")
+
+
+# ── Prism round 1 (#1581): episode scoping ──────────────────────────────────
+
+APR_FABLE = ("claude-apr", "claude-fable-5-1")
+
+
+def test_same_hash_on_a_different_route_is_not_a_repeat():
+    prev = fp.same_error_backoff(None, err_hash="h", now=_ts("14:01:40"), last_return_ts=None,
+                                 route=APR_FABLE)
+    ret = _ts("14:19:41")
+    ep = fp.same_error_backoff(prev, err_hash="h", now=ret + 2, last_return_ts=ret,
+                               route=("claude-apr", "claude-opus-5-5"))
+    assert ep["backoff_s"] is None
+
+
+def test_fallback_chain_walk_neither_clobbers_nor_counts():
+    """primary fails (A) -> fallback #1 fails too (B) -> return -> primary fails (A):
+    the walk's failure must not replace the primary's episode."""
+    agent = _agent()
+    _stash_err = lambda msg: fbe.stash_api_error(  # noqa: E731
+        agent, _bad_request(msg), 400, extract_api_error_context(_bad_request(msg)))
+    _stash_err(MSG)
+    assert fw.same_error_on_failover(agent, failing=APR_FABLE, now=_ts("14:01:40")) == {}
+    before = dict(agent._same_err_episode)
+    _stash_err("Opus limit reached")  # the fallback's own, different failure
+    assert fw.same_error_on_failover(agent, failing=("claude-bpr", "claude-opus-5-5"),
+                                     now=_ts("14:01:50")) == {}
+    assert agent._same_err_episode == before
+    fw.note_primary_return(agent, now=_ts("14:19:41"))
+    _stash_err(MSG)
+    out = fw.same_error_on_failover(agent, failing=APR_FABLE, now=_ts("14:19:43"))
+    assert out["same_err_backoff_s"] == 20 * 60
+
+
+def test_second_activation_for_one_failure_does_not_inflate_backoff():
+    """A second call for the same logical failure (pending error already
+    consumed by the row) returns {} and leaves the episode alone."""
+    agent = _agent()
+    fbe.stash_api_error(agent, _bad_request(MSG), 400, extract_api_error_context(_bad_request(MSG)))
+    fw.same_error_on_failover(agent, failing=APR_FABLE, now=_ts("14:01:40"))
+    fw.note_primary_return(agent, now=_ts("14:19:41"))
+    fbe.stash_api_error(agent, _bad_request(MSG), 400, extract_api_error_context(_bad_request(MSG)))
+    first = fw.same_error_on_failover(agent, failing=APR_FABLE, now=_ts("14:19:43"))
+    ep = dict(agent._same_err_episode)
+    fbe.clear_pending(agent)  # build_row consumed it
+    assert fw.same_error_on_failover(agent, failing=APR_FABLE, now=_ts("14:19:44")) == {}
+    assert agent._same_err_episode == ep and first["same_err_backoff_s"] == 20 * 60

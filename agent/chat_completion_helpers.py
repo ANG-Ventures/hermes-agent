@@ -4694,7 +4694,7 @@ def try_activate_fallback(
             # Same-error re-failover backoff (t_7f2ced0d): reads the pending
             # error before build_row consumes it. A return that re-failed with
             # the identical error benches the primary for the doubled window.
-            _same_err = _fw.same_error_on_failover(agent)
+            _same_err = _fw.same_error_on_failover(agent, failing=(old_provider, old_model))
             if _same_err.get("same_err_backoff_s"):
                 agent._rate_limited_until = max(
                     getattr(agent, "_rate_limited_until", 0) or 0,

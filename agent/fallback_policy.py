@@ -1151,19 +1151,22 @@ SAME_ERR_BACKOFF_CEILING_S = 4 * HOUR
 
 def same_error_backoff(prev: Optional[Mapping[str, Any]], *, err_hash: Optional[str],
                        now: float, last_return_ts: Optional[float],
-                       seat: Optional[str] = None) -> Dict[str, Any]:
-    """Next same-error episode for a failover with ``err_hash`` at ``now``.
+                       seat: Optional[str] = None,
+                       route: Tuple[Any, Any] = ("", "")) -> Dict[str, Any]:
+    """Next same-error episode for a failover of ``route`` with ``err_hash``.
 
-    ``prev`` is the episode the previous failover left (``{}``/None if none).
-    Returns ``{err_hash, ts, seat, repeats, backoff_s, prev_ts, prev_seat}``:
-    ``backoff_s`` is None unless this failover repeats ``prev``'s hash within
-    :data:`SAME_ERR_RETURN_WINDOW_S` of a primary return, in which case it is
-    ``min(BASE * 2**(repeats-1), CEILING)`` and ``prev_ts`` / ``prev_seat``
-    name the earlier failure for the rider. Pure.
+    ``prev`` is the episode the previous PRIMARY failover left (``{}``/None if
+    none). Returns ``{route, err_hash, ts, seat, repeats, backoff_s, prev_ts,
+    prev_seat}``: ``backoff_s`` is None unless this failover repeats ``prev``'s
+    route AND hash within :data:`SAME_ERR_RETURN_WINDOW_S` of a primary
+    return, in which case it is ``min(BASE * 2**(repeats-1), CEILING)`` and
+    ``prev_ts`` / ``prev_seat`` name the earlier failure for the rider. Pure.
     """
     prev = dict(prev or {})
+    route_l = list(_norm_pm(*route))
     repeat = bool(
         err_hash and prev.get("err_hash") == err_hash
+        and list(prev.get("route") or ()) == route_l
         and last_return_ts is not None
         and isinstance(prev.get("ts"), (int, float)) and prev["ts"] <= last_return_ts
         and 0.0 <= now - float(last_return_ts) <= SAME_ERR_RETURN_WINDOW_S)
@@ -1171,7 +1174,7 @@ def same_error_backoff(prev: Optional[Mapping[str, Any]], *, err_hash: Optional[
     backoff = (min(SAME_ERR_BACKOFF_BASE_S * (2 ** (repeats - 1)), SAME_ERR_BACKOFF_CEILING_S)
                if repeat else None)
     return {
-        "err_hash": err_hash, "ts": now,
+        "route": route_l, "err_hash": err_hash, "ts": now,
         "seat": (seat or prev.get("seat")) if repeat else seat,
         "repeats": repeats, "backoff_s": backoff,
         "prev_ts": prev.get("ts") if repeat else None,
