@@ -242,6 +242,10 @@ _PROXY_VENDOR_PRICING_LANE = {
     "moonshotai": "kimi-oauth",
     "openai": "openai-codex",
     "xai": "xai-oauth",
+    # Gemini via the Antigravity (Google AI Ultra OAuth) lane: priced at the
+    # Google snapshot rows, the same numbers the gemini-bridge ids get
+    # (t_673e956a). Antigravity's renamed ids go through _ANTIGRAVITY_GEMINI_ALIASES.
+    "google": "google",
 }
 
 # Vendor key (_infer_vendor_from_model) -> (display vendor, upstream provider a
@@ -1361,6 +1365,29 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
             pricing_version="google-pricing-2027-01-01",
         ),
     ),
+    # gemini-3.7-flash Standard paid tier, read 2026-10-01 from the pricing page:
+    # the same launch / 2027 rates as gemini-3.8-flash. Served on the Ultra sub
+    # (agy, cpa/Antigravity gemini-3.7-flash-high), unpriced until t_673e956a.
+    (
+        "google",
+        "gemini-3.7-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("3.75"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-10-01",
+        superseded_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        superseded_by=PricingEntry(
+            input_cost_per_million=Decimal("1.50"),
+            output_cost_per_million=Decimal("7.50"),
+            cache_read_cost_per_million=Decimal("0.15"),
+            source="official_docs_snapshot",
+            source_url="https://ai.google.dev/gemini-api/docs/pricing",
+            pricing_version="google-pricing-2027-01-01",
+        ),
+    ),
     (
         "google",
         "gemini-3.6-flash",
@@ -2456,7 +2483,21 @@ def _strip_anthropic_release_date(name: str) -> Optional[str]:
 
 # Trailing reasoning-effort tier the gemini-bridge appends to a Gemini id
 # (agy's "(Low|Medium|High)" display suffix, slugged: gemini-3.8-flash-low).
-_GEMINI_EFFORT_SUFFIX_RE = re.compile(r"^(gemini-.+)-(?:low|medium|high)$")
+# CLIProxyAPI's Antigravity registry also uses -minimal and -extra-low
+# (gemini-3.5-flash-extra-low = "Gemini 3.5 Flash (Low)"). Non-greedy so the
+# two-word tier is stripped whole, not as "-low" off "gemini-3.5-flash-extra".
+_GEMINI_EFFORT_SUFFIX_RE = re.compile(
+    r"^(gemini-.+?)-(?:extra-low|minimal|low|medium|high)$"
+)
+
+# Antigravity ids (CLIProxyAPI internal/registry/models/models.json,
+# "antigravity" section, read at ANG-Ventures/CLIProxyAPI@684e390c) that do not
+# carry the Google API id. Mapped by the registry's display_name.
+_ANTIGRAVITY_GEMINI_ALIASES = {
+    "gemini-3-flash": "gemini-3-flash-preview",  # "Gemini 3 Flash"
+    "gemini-3-flash-agent": "gemini-3.5-flash",  # "Gemini 3.5 Flash (High)"
+    "gemini-pro-agent": "gemini-3.1-pro",  # "Gemini 3.1 Pro (High)"
+}
 
 
 def _strip_gemini_effort_suffix(name: str) -> Optional[str]:
@@ -2531,6 +2572,11 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         base = _strip_gemini_effort_suffix(model)
         if base:
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
+            if entry:
+                return entry
+        alias = _ANTIGRAVITY_GEMINI_ALIASES.get(base or model)
+        if alias:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, alias))
             if entry:
                 return entry
     # Bedrock cross-region inference profiles carry a region prefix
