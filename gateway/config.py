@@ -3007,5 +3007,48 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 )
             platform_config.enabled = False
 
+    # Must run before the marker cleanup below: it reads _enabled_explicit.
+    _warn_configured_platforms_without_token(config, getenv)
+
     for platform_config in config.platforms.values():
         platform_config.extra.pop("_enabled_explicit", None)
+
+
+def _warn_configured_platforms_without_token(config: GatewayConfig, getenv) -> None:
+    """Log loudly when a messaging platform is wanted but its bot token is blank.
+
+    A blank token never enables the adapter (``_enable_from_env`` only fires on a
+    non-empty value), so the "enabled but empty" warning in
+    ``_validate_gateway_config`` cannot see this case: the platform is quietly
+    skipped. That hid a dead Discord leg on a break-glass gateway for 17 days
+    (2026-09-13..30). "Wanted" means: the token key is present but empty, a
+    ``<PLATFORM>_HOME_CHANNEL`` is set, or YAML enables the platform with no
+    token. ``platforms.<name>.enabled: false`` is the explicit opt-out and stays
+    silent.
+    """
+    for platform, env_name in PLATFORM_TOKEN_ENV_NAMES.items():
+        pconfig = config.platforms.get(platform)
+        token = getenv(env_name) or ""
+        if token.strip() or (pconfig is not None and (pconfig.token or "").strip()):
+            continue
+        if pconfig is not None and not pconfig.enabled and pconfig.extra.get("_enabled_explicit"):
+            continue  # explicitly disabled in config: a decision, not a fault
+        if pconfig is not None and pconfig.enabled and pconfig.token is not None:
+            continue  # enabled with an empty string: _validate_gateway_config warns
+        prefix = env_name.split("_", 1)[0]
+        reasons = []
+        if _getenv(env_name, None) is not None:
+            reasons.append(f"{env_name} is present but empty")
+        if getenv(f"{prefix}_HOME_CHANNEL"):
+            reasons.append(f"{prefix}_HOME_CHANNEL is set")
+        if pconfig is not None and pconfig.enabled:
+            reasons.append(f"platforms.{platform.value}.enabled is true")
+        if not reasons:
+            continue
+        logger.error(
+            "PLATFORM TOKEN MISSING: %s is configured (%s) but %s is empty, "
+            "so the %s adapter will NOT start. Restore the token, or set "
+            "platforms.%s.enabled: false if this profile intentionally has no %s.",
+            platform.value, "; ".join(reasons), env_name, platform.value,
+            platform.value, platform.value,
+        )
