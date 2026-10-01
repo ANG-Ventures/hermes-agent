@@ -9,11 +9,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 import gateway.run as gateway_run
 from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 
 
@@ -215,6 +215,34 @@ def test_gateway_configured_identity_uses_shared_api_mode_inference(monkeypatch)
     infer.assert_called_once_with("openai-codex")
 
 
+def test_turn_route_injects_priority_for_native_openai_and_not_for_proxied_route():
+    """Upstream c7e2e0b779 (route-aware fast gate) variant of the test above;
+    renamed at the 2026-10-01 parity merge because the fork keeps its own
+    same-named test for the openai-api/codex_responses route."""
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://api.openai.com/v1",
+        "provider": "openai",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.4", runtime_kwargs)
+
+    assert route["runtime"]["provider"] == "openai"
+    assert route["runtime"]["api_mode"] == "chat_completions"
+    assert route["request_overrides"] == {"service_tier": "priority"}
+
+    # Proxied routes never receive the param (OpenRouter strips it / others 400).
+    runtime_kwargs.update(base_url="https://openrouter.ai/api/v1", provider="openrouter")
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.4", runtime_kwargs)
+    assert route["request_overrides"] == {}
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
@@ -240,10 +268,9 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     runner = _make_runner()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(
         gateway_run,
-        "_load_gateway_runtime_config",
+        "_load_gateway_config",
         lambda: {"agent": {"service_tier": "fast"}},
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")

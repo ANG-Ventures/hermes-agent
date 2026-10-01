@@ -41,6 +41,7 @@ def _task(kb):
 def spawn_env(monkeypatch, tmp_path):
     """Run the REAL spawn env builder under a release-pinned dispatcher env."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     decoy = tmp_path / "decoy_release"
     pkg = decoy / "hermes_cli"
@@ -65,9 +66,9 @@ def spawn_env(monkeypatch, tmp_path):
     # Fakes scoped to the spawn call only: the probe arm needs the real Popen.
     with monkeypatch.context() as m:
         m.setattr("subprocess.Popen", _fake_popen)
-        m.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+        m.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
         m.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
-        kb._default_spawn(_task(kb), str(workspace))
+        kbd._default_spawn(_task(kb), str(workspace))
     return captured["env"], decoy
 
 

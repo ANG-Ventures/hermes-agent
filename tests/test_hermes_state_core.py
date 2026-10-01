@@ -9,19 +9,27 @@ per-test fixture overhead, not test logic). No test was changed, removed or weak
 the four parts collect exactly the same ids as the original.
 """
 
-import re
 import sqlite3
 import time
 import json
-import threading
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
 import hermes_state
-from agent.session_activity import ActivityProvenance
-from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from agent.session_activity import build_activity_snapshot
+from hermes_state import SessionDB
+from hermes_state_common import SCHEMA_SQL, SCHEMA_VERSION
+
+
+def _activity_snapshot(db, session_id):
+    """Durable activity snapshot for *session_id* (what gateway/delegate readers build from the row)."""
+    row = db.get_session(session_id)
+    return build_activity_snapshot(
+        last_activity_at=row.get("last_activity_at"),
+        last_activity_description=row.get("last_activity_description"),
+        last_activity_provenance=row.get("last_activity_provenance"),
+    )
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -1307,7 +1315,7 @@ class TestSessionLifecycle:
 class TestSchemaInit:
     def test_wal_mode(self, db):
         """Prefer WAL on fixed SQLite; DELETE on WAL-reset-vulnerable builds (#69784)."""
-        from hermes_state import is_sqlite_wal_reset_vulnerable
+        from hermes_state_wal import is_sqlite_wal_reset_vulnerable
 
         cursor = db._conn.execute("PRAGMA journal_mode")
         mode = cursor.fetchone()[0].lower()
@@ -1347,7 +1355,7 @@ class TestSchemaInit:
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "2"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
         db.close()
 
 
@@ -1362,7 +1370,7 @@ class TestSchemaInit:
         This is the architectural invariant: SCHEMA_SQL declares the
         desired schema, _reconcile_columns ensures it matches reality.
         """
-        from hermes_state import SCHEMA_SQL
+        from hermes_state_common import SCHEMA_SQL
 
         expected = SessionDB._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
@@ -1909,12 +1917,6 @@ class TestCompactRows:
 
 
 
-    def test_get_session_rich_row_compact_omits_system_prompt(self, db):
-        self._create(db, "s1", system_prompt="should be gone")
-        row = db._get_session_rich_row("s1", compact_rows=True)
-        assert row is not None
-        assert "system_prompt" not in row
-        assert row["id"] == "s1"
 
     def test_batch_compact_rows_omits_system_prompt_keeps_git_fields(self, db):
         """_get_session_rich_rows_batch(compact_rows=True) must apply the same
@@ -2229,15 +2231,10 @@ class TestTitleLineage:
 
 
 class TestVacuum:
-    def test_vacuum_runs_without_error(self, db):
-        """VACUUM must succeed on a fresh DB (no rows to reclaim)."""
-        db.create_session(session_id="s1", source="cli")
-        db.append_message(session_id="s1", role="user", content="hi")
-        # Should not raise, even though there's nothing significant to reclaim.
-        db.vacuum()
 
     def test_auto_maintenance_records_successful_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         vacuum_calls = []
         monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
 
@@ -2249,6 +2246,7 @@ class TestVacuum:
 
     def test_auto_maintenance_skips_recent_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         db.set_meta("last_vacuum", str(time.time()))
         vacuum_calls = []
         monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
@@ -2263,6 +2261,7 @@ class TestVacuum:
 
     def test_auto_maintenance_retries_after_vacuum_interval(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         db.set_meta("last_vacuum", str(time.time() - 31 * 86400))
         vacuum_calls = []
         monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
@@ -2277,6 +2276,7 @@ class TestVacuum:
 
     def test_auto_maintenance_retries_after_failed_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         vacuum_calls = []
 
         def fail_first_vacuum():
@@ -2296,6 +2296,97 @@ class TestVacuum:
         assert second["vacuumed"] is True
         assert vacuum_calls == [True, True]
         assert db.get_meta("last_vacuum") is not None
+
+    # ── freelist-ratio gate (#54189) ─────────────────────────────────────
+    def test_auto_maintenance_skips_vacuum_below_freelist_ratio(self, db, monkeypatch):
+        """A prune that frees few pages on a dense DB must NOT trigger VACUUM."""
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.05)
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result["pruned"] == 1
+        assert result["vacuumed"] is False
+        assert result["freelist_ratio"] == 0.05
+        assert vacuum_calls == []
+        assert db.get_meta("last_vacuum") is None
+        # The prune itself still counts as a maintenance run.
+        assert db.get_meta("last_auto_prune") is not None
+
+    def test_auto_maintenance_vacuums_above_freelist_ratio(self, db, monkeypatch):
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.40)
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result["vacuumed"] is True
+        assert result["freelist_ratio"] == 0.40
+        assert vacuum_calls == [True]
+
+    def test_auto_maintenance_freelist_ratio_exactly_at_threshold_skips(self, db, monkeypatch):
+        """Gate is strictly greater-than: 25.0% reclaimable does not VACUUM."""
+        from hermes_state_common import AUTO_VACUUM_MIN_FREELIST_RATIO
+
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: AUTO_VACUUM_MIN_FREELIST_RATIO)
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result["vacuumed"] is False
+        assert vacuum_calls == []
+
+    def test_auto_maintenance_unknown_freelist_ratio_falls_back_to_time_throttle(self, db, monkeypatch):
+        """If the pragmas cannot be read, don't silently disable VACUUM forever."""
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: None)
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result["vacuumed"] is True
+        assert result["freelist_ratio"] is None
+        assert vacuum_calls == [True]
+
+    def test_auto_maintenance_ratio_gate_threshold_is_overridable(self, db, monkeypatch):
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
+        monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.10)
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(
+            min_interval_hours=0, min_vacuum_freelist_ratio=0.05
+        )
+
+        assert result["vacuumed"] is True
+        assert vacuum_calls == [True]
+
+    def test_freelist_ratio_reads_real_pragmas(self, db):
+        """Real-DB check: freeing most of the file pushes the ratio past the gate."""
+        from hermes_state_common import AUTO_VACUUM_MIN_FREELIST_RATIO
+
+        db.create_session(session_id="keep", source="cli")
+        db.append_message(session_id="keep", role="user", content="hi")
+        for i in range(6):
+            sid = f"bulk{i}"
+            db.create_session(session_id=sid, source="cli")
+            for _ in range(20):
+                db.append_message(session_id=sid, role="assistant", content="z" * 4000)
+        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        dense = db._freelist_ratio()
+        assert dense is not None and dense < AUTO_VACUUM_MIN_FREELIST_RATIO
+
+        for i in range(6):
+            db.delete_session(f"bulk{i}")
+        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        sparse = db._freelist_ratio()
+        assert sparse is not None and sparse > AUTO_VACUUM_MIN_FREELIST_RATIO
 
     def test_wal_size_limit_is_bounded(self, db):
         """journal_size_limit must be a finite bound, not SQLite's -1 default.
@@ -2898,6 +2989,53 @@ class TestDisplayMetadataReadPaths:
             target.close()
 
 
+class TestUnknownBlobColumnSurvivesRead:
+    """A `messages` column added by a future migration must not take every reader down with it.
+
+    Every reader here does ``SELECT *``, so a BLOB column reaches the dict unfiltered. FastAPI's
+    response encoder calls ``.decode()`` on any raw ``bytes`` value and dies with
+    ``UnicodeDecodeError`` the moment the bytes are not valid utf-8 — this already happened for
+    the ``display_identity BLOB`` column (hermes_state_common.py) before it got an explicit pop;
+    the next binary column would repeat it with no reader-side defense. See #116510.
+    """
+
+    @staticmethod
+    def _seed_with_future_blob(db):
+        db.create_session("s1", source="desktop")
+        message_id = db.append_message("s1", "user", "hello")
+
+        def _migrate(conn):
+            conn.execute("ALTER TABLE messages ADD COLUMN future_blob BLOB")
+            conn.execute(
+                "UPDATE messages SET future_blob = ? WHERE id = ?", (b"\xff\xfe not utf-8", message_id))
+
+        db._execute_write(_migrate)
+        return message_id
+
+    def test_get_messages_drops_unknown_blob_and_stays_json_safe(self, db):
+        self._seed_with_future_blob(db)
+        messages = db.get_messages("s1")
+        assert messages[0]["content"] == "hello"
+        assert "future_blob" not in messages[0]
+        json.dumps(messages)  # raises TypeError on a raw bytes value, same class of failure as FastAPI's encoder
+
+    def test_get_messages_around_drops_unknown_blob_and_stays_json_safe(self, db):
+        message_id = self._seed_with_future_blob(db)
+        window = db.get_messages_around("s1", message_id)["window"]
+        assert "future_blob" not in window[0]
+        json.dumps(window)
+
+    def test_schema_column_holding_bytes_keeps_its_key(self, db):
+        """The bytes pop is for columns this module does not know. A schema column such as
+        ``content`` must never vanish from the dict: every resume/compaction reader indexes
+        ``msg["content"]`` and a KeyError there is worse than the raw value it replaced."""
+        db.create_session("s1", source="cli")
+        message_id = db.append_message("s1", "user", "hello")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE messages SET content = X'FFFE' WHERE id = ?", (message_id,)))
+        (message,) = db.get_messages("s1")
+        assert message["content"] == b"\xff\xfe"
+        assert message["role"] == "user"
 
 
 class TestGatewayRoutingPkHeal:

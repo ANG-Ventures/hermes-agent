@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worker_hosts as kwh
 
 
@@ -25,7 +26,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     for p in ("alpha", "beta"):
         (home / "profiles" / p).mkdir(parents=True, exist_ok=True)
@@ -50,7 +51,7 @@ def _tick(spillover_fn, spawned_with):
         spawned_with.append((task.id, placement.name if placement else None))
         return 4242
     with kb.connect_closing() as conn:
-        return kb.dispatch_once(
+        return kbd.dispatch_once(
             conn, spawn_fn=spawn, max_spawn=64,
             spawn_paused="load1=150.0 > pause_above=64.0", spawn_limit=0,
             spillover_fn=spillover_fn,

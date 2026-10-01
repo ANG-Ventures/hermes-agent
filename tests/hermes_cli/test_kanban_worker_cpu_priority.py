@@ -32,6 +32,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -89,7 +90,7 @@ def _spawn_and_capture_kwargs(fresh_home, monkeypatch, task_id="t_prio") -> dict
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_task(task_id), str(fresh_home / "ws"), board=None)
+    kbd._default_spawn(_task(task_id), str(fresh_home / "ws"), board=None)
     return captured
 
 

@@ -219,7 +219,7 @@ def _multimodal_history() -> tuple[list[dict], list[str]]:
 def _make_agent(*, stream: bool) -> AIAgent:
     with (
         patch("agent.model_metadata.get_model_context_length", return_value=256_000),
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):

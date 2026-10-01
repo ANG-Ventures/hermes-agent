@@ -11,13 +11,13 @@ before mutation, so ``--global`` succeeds and the config is rewritten in
 the proper ``model: {default: ..., provider: ...}`` form.
 """
 
-import yaml
+import hermes_yaml as yaml
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.config import GatewayConfig
 from gateway.session import SessionSource, SessionStore
@@ -105,7 +105,8 @@ async def test_model_global_persists_when_config_has_flat_string_model(tmp_path,
     )
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
-    assert "base_url" not in written["model"]
+    # The resolved aggregator endpoint is persisted (same shape as CLI/TUI --global, #25106).
+    assert written["model"]["base_url"] == "https://openrouter.ai/api/v1"
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ outgrew the per-file CI wall-clock cap). Shared fixtures live in ``conftest.py``
 mock-builders in ``_run_agent_helpers.py``.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import pytest
@@ -269,6 +270,60 @@ class TestStreamingApiCall:
 
         assert resp.choices[0].message.content == "Hello"
         assert resp.model == "gpt-4"
+
+    @pytest.mark.parametrize("finish_reason", [None, "tool_calls"])
+    def test_cut_tool_args_are_repaired_only_once_the_provider_finished(self, agent, finish_reason):
+        # Cut after the first digit of "timeout": 600. Every string is closed, so the
+        # prefix repairs to valid JSON that carries timeout=6. Without a finish_reason
+        # nothing says the model was done: retry, never run what happened to arrive.
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+        raw = '{"command": "make deploy", "timeout": 6'
+        chunks = [_make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "terminal", raw)])]
+        if finish_reason:
+            chunks.append(_make_chunk(finish_reason=finish_reason))
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        if finish_reason is None:
+            assert resp.id == PARTIAL_STREAM_STUB_ID
+            assert resp.choices[0].message.tool_calls is None
+            assert resp._dropped_tool_names == ["terminal"]
+        else:
+            args = resp.choices[0].message.tool_calls[0].function.arguments
+            assert json.loads(args) == {"command": "make deploy", "timeout": 6}
+
+    def test_final_response_object_replays_reasoning_from_model_extra(self, agent):
+        """The 'completed response instead of an iterator' branch reads reasoning through the
+        same ``model_extra`` fallback as the delta path, so it is still shown (#56516)."""
+        message = SimpleNamespace(content="done", tool_calls=None, model_extra={"reasoning": "thought"})
+        final = SimpleNamespace(model="m", choices=[SimpleNamespace(message=message, finish_reason="stop")])
+        agent.client.chat.completions.create.return_value = final
+        agent.reasoning_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp is final
+        agent.reasoning_callback.assert_called_once_with("thought")
+
+    @pytest.mark.parametrize("carrier", ["reasoning_content", "reasoning"])
+    def test_reasoning_only_in_delta_model_extra_counts_as_stream_output(self, agent, carrier):
+        """Reasoning that reaches the stream only via ``delta.model_extra`` is real output:
+        the empty-stream guard must not fire and the text must survive (#56516)."""
+        def _extra_delta(text):
+            return SimpleNamespace(content=None, tool_calls=None, model_extra={carrier: text})
+
+        chunks = [
+            SimpleNamespace(model="m", choices=[SimpleNamespace(delta=_extra_delta("thinking "), finish_reason=None)]),
+            SimpleNamespace(model="m", choices=[SimpleNamespace(delta=_extra_delta("only"), finish_reason="length")]),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content is None
+        assert resp.choices[0].message.reasoning_content == "thinking only"
+        assert resp.choices[0].finish_reason == "length"
 
 
 class TestInterruptVprintForceTrue:

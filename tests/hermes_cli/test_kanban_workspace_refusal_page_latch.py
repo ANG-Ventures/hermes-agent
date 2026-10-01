@@ -16,6 +16,8 @@ import yaml
 
 import gateway.kanban_watchers as kw
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -45,12 +47,12 @@ def _card_under_retired_root(home, monkeypatch, conn, *, kind='scratch', status=
     _configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == ramscratch)
     task_id = kb.create_task(conn, title='retired root', assignee='default')
-    path = kb.resolve_workspace(
+    path = kbw.resolve_workspace(
         SimpleNamespace(id=task_id, workspace_kind='scratch', workspace_path=None),
         board='default',
     )
     assert path == root / 'default' / task_id
-    kb.set_workspace_path(conn, task_id, path)
+    kbw.set_workspace_path(conn, task_id, path)
     conn.execute('UPDATE tasks SET workspace_kind=?, status=? WHERE id=?', (kind, status, task_id))
     # Retire: config no longer names ramscratch; the volume goes away.
     _configure(home, None)
@@ -68,7 +70,7 @@ def _events(conn, task_id, kind):
 
 
 def _tick(conn, notifier, pages):
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
     kw._observe_workspace_refusal_outages(notifier, [("default", result)])
     return result
 

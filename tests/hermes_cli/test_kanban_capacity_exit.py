@@ -16,6 +16,7 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.kanban_worker_exit import (
     EXIT_CLASS_POOL_EXHAUSTED,
     EXIT_CLASS_QUOTA,
@@ -153,7 +154,7 @@ def board(tmp_path, monkeypatch):
 def _claim_with_receipt(conn, payload):
     tid = kb.create_task(conn, title="capacity probe", assignee="worker")
     task = kb.claim_task(conn, tid)
-    kb._set_worker_pid(conn, tid, 99999999)
+    kbd._set_worker_pid(conn, tid, 99999999)
     path = kb.kanban_db_path().parent / "runs" / f"{task.id}.{task.current_run_id}.exit.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -172,18 +173,18 @@ def test_capacity_receipt_parks_with_cooldown_without_failure(board, monkeypatch
         "exit_class": exit_class, "ts": time.time(),
     })
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    kb.detect_crashed_workers(board)
+    kbd.detect_crashed_workers(board)
     current = kb.get_task(board, task.id)
     assert current.status == "ready"
     assert current.consecutive_failures == 0
     assert current.next_eligible_at >= int(time.time()) + 295
-    assert kb.check_respawn_guard(board, task.id) == "rate_limit_cooldown"
+    assert kbd.check_respawn_guard(board, task.id) == "rate_limit_cooldown"
     assert label in current.last_failure_error
     run = board.execute("SELECT * FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()
     assert run["outcome"] == "rate_limited"
     meta = json.loads(run["metadata"])
     assert meta.get("exit_class") == exit_class
-    assert task.id in kb.detect_crashed_workers._last_rate_limited
+    assert task.id in kbd.detect_crashed_workers._last_rate_limited
 
 
 def test_exit_one_receipt_with_capacity_class_is_still_a_crash(board, monkeypatch):
@@ -193,7 +194,7 @@ def test_exit_one_receipt_with_capacity_class_is_still_a_crash(board, monkeypatc
         "exit_class": EXIT_CLASS_UPSTREAM_CAPACITY, "ts": time.time(),
     })
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    kb.detect_crashed_workers(board)
+    kbd.detect_crashed_workers(board)
     current = kb.get_task(board, task.id)
     assert current.consecutive_failures == 1
     run = board.execute("SELECT * FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()

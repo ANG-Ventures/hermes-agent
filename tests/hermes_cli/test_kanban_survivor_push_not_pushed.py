@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -37,7 +38,7 @@ def board(tmp_path, monkeypatch):
 
 def fixture_repo(conn, nested=False):
     tid = kb.create_task(conn, title="implement fixture")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     repo = ws / "repo" if nested else ws
     repo.mkdir(exist_ok=True)
     git(repo, "init", "-b", "main")
@@ -51,7 +52,7 @@ def fixture_repo(conn, nested=False):
     git(repo, "init", "--bare", str(remote))
     git(repo, "remote", "add", "origin", str(remote))
     git(repo, "push", "origin", "HEAD:main")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws, repo
 
 

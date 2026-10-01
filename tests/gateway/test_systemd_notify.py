@@ -7,32 +7,10 @@ import socket
 
 import pytest
 
-
-def _abstract_unix_sockets_supported() -> bool:
-    """True only where a LEADING-NUL (abstract namespace) bind actually works.
-
-    hasattr(socket, "AF_UNIX") is the wrong probe: macOS and the BSDs have
-    AF_UNIX but NOT Linux's abstract namespace, so the bind below raises
-    FileNotFoundError and the test fails for platform reasons rather than
-    behaviour. systemd's NOTIFY_SOCKET="@name" form is Linux-only by
-    definition, so skipping elsewhere loses no coverage.
-    """
-    if not hasattr(socket, "AF_UNIX"):
-        return False
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    try:
-        probe.bind("\0hermes-abstract-ns-probe")
-        return True
-    except OSError:
-        return False
-    finally:
-        probe.close()
+pytestmark = pytest.mark.platforms("linux")
 
 
-@pytest.mark.skipif(
-    not _abstract_unix_sockets_supported(),
-    reason="abstract-namespace Unix sockets are Linux-only (systemd @-sockets)",
-)
+# abstract (NUL-prefixed) AF_UNIX names are a Linux kernel feature
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
     receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

@@ -45,7 +45,7 @@ def _response(*, usage, content="ok", finish_reason="stop", choices=True):
 
 def _make_agent(responses):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):

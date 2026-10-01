@@ -98,6 +98,8 @@ def test_storage_resolver_leaves_vendor_namespace_alone():
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -109,6 +111,8 @@ def kanban_home(tmp_path, monkeypatch):
 
 def test_kanban_create_resolves_alias_at_write_time(kanban_home):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -124,6 +128,8 @@ def test_kanban_create_resolves_alias_at_write_time(kanban_home):
 
 def test_kanban_create_explicit_provider_still_wins(kanban_home):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -139,6 +145,8 @@ def test_kanban_create_explicit_provider_still_wins(kanban_home):
 
 def test_kanban_set_model_override_resolves_alias(kanban_home):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -152,6 +160,8 @@ def test_kanban_edit_set_task_model_resolves_alias(kanban_home):
     """`kanban edit --model grok` goes through set_task_model, a DIFFERENT
     setter from set-model — both must resolve or the class survives in one."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -165,6 +175,8 @@ def test_kanban_stored_alias_reaches_worker_argv_resolved(kanban_home, monkeypat
     """End of the chain: the dispatcher's `-m` token is the resolved model and
     `--provider` names its provider — the literal word `grok` never spawns."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -182,8 +194,8 @@ def test_kanban_stored_alias_reaches_worker_argv_resolved(kanban_home, monkeypat
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
-    workspace = kb.resolve_workspace(task)
-    kb._default_spawn(task, str(workspace))
+    workspace = kbw.resolve_workspace(task)
+    kbd._default_spawn(task, str(workspace))
     argv = captured["cmd"]
     assert argv[argv.index("-m") + 1] == "grok-4.6"
     assert argv[argv.index("--provider") + 1] == "xai-oauth"
@@ -193,6 +205,8 @@ def test_kanban_stored_alias_reaches_worker_argv_resolved(kanban_home, monkeypat
 def test_kanban_non_alias_model_is_still_stored_verbatim(kanban_home):
     """Unresolvable strings keep the previous literal-storage behaviour."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -329,6 +343,8 @@ def test_kanban_set_task_model_does_not_leave_a_stale_provider(kanban_home):
     this resolution exists to kill.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -346,6 +362,8 @@ def test_kanban_edit_then_spawn_never_emits_a_mismatched_pair(
 ):
     """End of the chain for the same sequence: what actually spawns."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -364,7 +382,7 @@ def test_kanban_edit_then_spawn_never_emits_a_mismatched_pair(
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
-    kb._default_spawn(task, str(kb.resolve_workspace(task)))
+    kbd._default_spawn(task, str(kbw.resolve_workspace(task)))
     argv = captured["cmd"]
     assert argv[argv.index("-m") + 1] == "claude-opus-5"
     assert "xai-oauth" not in argv
@@ -373,6 +391,8 @@ def test_kanban_edit_then_spawn_never_emits_a_mismatched_pair(
 def test_kanban_set_task_model_clear_also_clears_the_provider(kanban_home):
     """Clearing the model must not strand the provider it was pinned with."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -387,6 +407,8 @@ def test_kanban_set_task_model_clear_also_clears_the_provider(kanban_home):
 def test_kanban_set_task_model_selfnamed_alias_updates_the_provider(kanban_home):
     """Self-named alias: the model string does not change, the provider does."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -399,6 +421,8 @@ def test_kanban_set_task_model_selfnamed_alias_updates_the_provider(kanban_home)
 def test_kanban_set_model_override_does_not_leave_a_stale_provider(kanban_home):
     """The sibling setter — same invariant, asserted rather than assumed."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
 
     with kb.connect() as conn:
         tid = kb.create_task(

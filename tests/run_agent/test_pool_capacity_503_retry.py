@@ -144,7 +144,7 @@ def _make_agent(statuses: list[tuple[str, str]]) -> AIAgent:
         }
     ]
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=MagicMock()),
     ):
@@ -427,7 +427,7 @@ def test_config_knobs_are_read_from_the_agent_section():
     land on the agent; garbage falls back to the defaults; negatives clamp."""
     def _build(agent_section):
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("model_tools.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch("hermes_cli.config.load_config_readonly", return_value={"agent": agent_section}),

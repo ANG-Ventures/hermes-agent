@@ -52,7 +52,7 @@ def test_append_inside_success_block_only(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("model_tools.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch.object(lifecycle, "invoke_hook", _fake_invoke_hook),

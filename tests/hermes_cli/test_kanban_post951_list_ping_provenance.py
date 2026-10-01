@@ -10,6 +10,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 HOME = "20260922_000000_home"
 OTHER = "20260922_000000_other"
@@ -110,7 +111,7 @@ def test_notifier_delivers_home_line_in_ping_and_wake(tmp_path, monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="home ping", assignee="worker", session_id=sid)
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
                           chat_type="dm", delivery_mode="notify+wake")
         kb.complete_task(conn, tid, summary="done")
     finally:

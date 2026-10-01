@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 BACKDATE = 7200
 
@@ -96,7 +97,7 @@ def _card(conn, *, recycled: bool, parents=None, max_runtime=None, title="card",
     assert task is not None
     holder = _sleeper()
     _reaper(holder)
-    assert kb._set_worker_pid(conn, tid, holder.pid)
+    assert kbd._set_worker_pid(conn, tid, holder.pid)
     if legacy:
         with kb.write_txn(conn):
             conn.execute(
@@ -243,7 +244,7 @@ def test_recycled_holder_ttl_release(conn):
 def test_recycled_holder_max_runtime(conn):
     tid, holder, _ = _card(conn, recycled=True, max_runtime=1)
     rec = _Recorder()
-    assert tid in kb.enforce_max_runtime(conn, signal_fn=rec)
+    assert tid in kbd.enforce_max_runtime(conn, signal_fn=rec)
     assert rec.calls == []
     assert _alive(holder)
     assert _status(conn, tid) == "ready"
@@ -252,7 +253,7 @@ def test_recycled_holder_max_runtime(conn):
 def test_recycled_holder_stale_running(conn):
     tid, holder, _ = _card(conn, recycled=True)
     rec = _Recorder()
-    assert tid in kb.detect_stale_running(conn, stale_timeout_seconds=60, signal_fn=rec)
+    assert tid in kbd.detect_stale_running(conn, stale_timeout_seconds=60, signal_fn=rec)
     assert rec.calls == []
     assert _alive(holder)
 
@@ -260,7 +261,7 @@ def test_recycled_holder_stale_running(conn):
 def test_recycled_holder_progress_stall(conn, monkeypatch):
     tid, holder, rid = _card(conn, recycled=True)
     monkeypatch.setattr(kb, "_worker_cpu_active", lambda _pid: False)
-    assert kb.heartbeat_worker(conn, tid, expected_run_id=rid,
+    assert kbd.heartbeat_worker(conn, tid, expected_run_id=rid,
                                progress_at=int(time.time()) - 3600)
     assert kb.detect_progress_stalls(conn, stall_seconds=900, reclaim_seconds=1500) == [tid]
     assert _alive(holder)
@@ -288,7 +289,7 @@ def test_recycled_holder_parent_reopen_invalidation(conn):
 def test_recycled_holder_does_not_hide_a_crash(conn):
     """Liveness path: a recycled holder must not keep a dead worker 'alive'."""
     tid, holder, _ = _card(conn, recycled=True)
-    assert tid in kb.detect_crashed_workers(conn)
+    assert tid in kbd.detect_crashed_workers(conn)
     assert _alive(holder)
     assert _status(conn, tid) != "running"
 
@@ -322,7 +323,7 @@ def test_genuine_worker_max_runtime_signalled(conn):
     tid, holder, _ = _card(conn, recycled=False, max_runtime=1)
     _backdate_run(conn, tid, 60)
     rec = _Recorder()
-    assert tid in kb.enforce_max_runtime(conn, signal_fn=rec)
+    assert tid in kbd.enforce_max_runtime(conn, signal_fn=rec)
     assert rec.calls and rec.calls[0] == (holder.pid, signal.SIGTERM)
 
 
@@ -330,7 +331,7 @@ def test_genuine_worker_stale_running_signalled(conn):
     tid, holder, _ = _card(conn, recycled=False)
     _backdate_run(conn, tid, 3600)
     rec = _Recorder()
-    assert tid in kb.detect_stale_running(conn, stale_timeout_seconds=60, signal_fn=rec)
+    assert tid in kbd.detect_stale_running(conn, stale_timeout_seconds=60, signal_fn=rec)
     assert rec.calls and rec.calls[0] == (holder.pid, signal.SIGTERM)
 
 
@@ -338,7 +339,7 @@ def test_genuine_worker_progress_stall_signalled(conn, monkeypatch):
     tid, holder, rid = _card(conn, recycled=False)
     _backdate_run(conn, tid, 7200)
     monkeypatch.setattr(kb, "_worker_cpu_active", lambda _pid: False)
-    assert kb.heartbeat_worker(conn, tid, expected_run_id=rid,
+    assert kbd.heartbeat_worker(conn, tid, expected_run_id=rid,
                                progress_at=int(time.time()) - 3600)
     assert kb.detect_progress_stalls(conn, stall_seconds=900, reclaim_seconds=1500) == [tid]
     assert holder.wait(timeout=10) == -signal.SIGTERM
@@ -363,7 +364,7 @@ def test_genuine_worker_parent_reopen_signalled(conn):
 
 def test_genuine_worker_not_reported_crashed(conn):
     tid, holder, _ = _card(conn, recycled=False)
-    assert tid not in kb.detect_crashed_workers(conn)
+    assert tid not in kbd.detect_crashed_workers(conn)
     assert _status(conn, tid) == "running"
 
 
@@ -468,7 +469,7 @@ def test_unreadable_create_time_max_runtime_holds(conn, monkeypatch):
     monkeypatch.setattr(kb, "_pid_create_time", lambda _pid: None)
     monkeypatch.setattr(kb, "_pid_start_token", lambda _pid: None)
     rec = _Recorder()
-    assert kb.enforce_max_runtime(conn, signal_fn=rec) == []
+    assert kbd.enforce_max_runtime(conn, signal_fn=rec) == []
     assert rec.calls == []
     assert _status(conn, tid) == "running"
     refused = _events(conn, tid, "timeout_refused")

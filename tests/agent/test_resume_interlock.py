@@ -34,7 +34,7 @@ def _assistant_message(*tool_calls):
 
 def _make_agent(*tool_names: str) -> AIAgent:
     with (
-        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("hermes_cli.config.load_config", return_value={}),
         patch("run_agent.OpenAI"),

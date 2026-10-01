@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,7 +56,7 @@ def test_discord_guild_row_is_always_stored_canonically(tmp_path, given):
     """🔴 THE REGRESSION: the raw envelope spelling must never reach the DB."""
     conn = _conn(tmp_path)
     try:
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id="t_probe", platform="discord",
             chat_id="1514857406025306212", chat_type=given,
             user_id="117431298246705156",
@@ -74,7 +75,7 @@ def test_platforms_that_own_channel_keep_it(tmp_path, platform):
     """Negative control: a guard that rewrote every platform re-lanes three."""
     conn = _conn(tmp_path)
     try:
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id="t_probe", platform=platform,
             chat_id="C1", chat_type="channel", user_id="u1",
         )
@@ -90,7 +91,7 @@ def test_dm_is_never_collapsed(tmp_path):
     """Negative control: dm keys on a wholly different shape than group."""
     conn = _conn(tmp_path)
     try:
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id="t_probe", platform="discord",
             chat_id="D1", chat_type="dm", user_id="u1",
         )
@@ -103,7 +104,7 @@ def test_unset_chat_type_still_defaults_to_dm(tmp_path):
     """Negative control: the pre-existing default must be preserved."""
     conn = _conn(tmp_path)
     try:
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id="t_probe", platform="discord",
             chat_id="D1", chat_type=None, user_id="u1",
         )

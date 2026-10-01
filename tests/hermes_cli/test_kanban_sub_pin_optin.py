@@ -26,6 +26,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_provider_health as ph
 from hermes_cli.model_policy import (
     SUB_PIN_COMMENT_PREFIX,
@@ -59,7 +60,7 @@ def kanban_home(tmp_path, monkeypatch, registry):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
     getattr(ph, "_PROBE_STATE", {}).clear()
     kb.init_db()
     (home / "config.yaml").write_text(
@@ -275,7 +276,7 @@ def test_dispatch_honors_pin_route_effort_and_source(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         tid = _pinned_card(conn)
         seen = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
     assert seen == [(tid, "claude-bpx-24", OPUS, "xhigh")]
     assert res.spawn_route_sources[tid] == "pin"
 
@@ -296,7 +297,7 @@ def test_spawn_argv_carries_pinned_provider_model_and_effort(kanban_home, monkey
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = kanban_home / "ws"
     workspace.mkdir(exist_ok=True)
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
     cmd = captured["cmd"]
     assert cmd[cmd.index("-m") + 1] == OPUS
     assert cmd[cmd.index("--provider") + 1] == "claude-bpx-24"
@@ -320,7 +321,7 @@ def test_capped_pin_waits_by_default(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         tid = _pinned_card(conn)
         seen = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         events = [json.loads(r[0]) for r in conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='deferred'", (tid,))]
     assert seen == []
@@ -334,6 +335,6 @@ def test_capped_pin_with_fallback_rides_family_pool(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         tid = _pinned_card(conn, fallback=True)
         seen = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
     assert seen == [(tid, "claude-bpr", OPUS, "xhigh")]
     assert res.spawn_route_sources[tid].startswith("dispatch-fallback(capped pin")

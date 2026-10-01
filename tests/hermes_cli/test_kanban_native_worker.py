@@ -48,8 +48,9 @@ def _spawn(monkeypatch, tmp_path, lane_yaml: str, **task_over):
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.delenv("PYTHONPATH", raising=False)
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -63,7 +64,7 @@ def _spawn(monkeypatch, tmp_path, lane_yaml: str, **task_over):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    kb._default_spawn(_make_task(kb, **task_over), str(workspace))
+    kbd._default_spawn(_make_task(kb, **task_over), str(workspace))
     return captured
 
 
@@ -155,6 +156,7 @@ def _board_with_running_card(monkeypatch, tmp_path, lane_script: str, body: str)
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     monkeypatch.setenv("HERMES_PROFILE", "lane-worker")
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()

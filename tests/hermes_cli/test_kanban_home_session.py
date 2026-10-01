@@ -12,6 +12,9 @@ from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_graph as kbg
+from hermes_cli import kanban_db_notify as kbn
 
 HOME = "20260922_000000_home"
 OTHER = "20260922_111111_other"
@@ -529,7 +532,7 @@ _ROUND2 = {
     "link": (_ready, _link),
     "unlink": (_linked, _unlink),
     "specify": (_triage, lambda c, t: kb.specify_triage_task(c, t, body="spec")),
-    "decompose": (_triage, lambda c, t: kb.decompose_triage_task(
+    "decompose": (_triage, lambda c, t: kbg.decompose_triage_task(
         c, t, root_assignee="worker-a",
         children=[{"title": "c1", "assignee": "worker-b"}])),
 }
@@ -770,7 +773,7 @@ def test_dispatcher_tick_still_claims_stamped_card(kanban_home, monkeypatch):
     spawned = []
     with kb.connect_closing() as conn:
         tid = _ready(conn, session_id=OTHER)
-        kb.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
+        kbd.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
         assert kb.get_task(conn, tid).status == "running"
     assert spawned == [tid]
 
@@ -1259,7 +1262,7 @@ def test_takeover_notify_list_shows_taker_chat(kanban_home, monkeypatch):
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
                                foreign_ok="adopt"):
             assert kb.unblock_task(conn, tid)
-        subs = kb.list_notify_subs(conn, tid)
+        subs = kbn.list_notify_subs(conn, tid)
     assert [s["chat_id"] for s in subs] == ["1550"]
 
 
@@ -1443,7 +1446,7 @@ def test_refused_guarded_mutation_with_side_write_records_no_takeover(kanban_hom
 def _running_card(conn, *, session_id=HOME, chat="home-chat"):
     tid = kb.create_task(conn, title="card", assignee="worker-a",
                          session_id=session_id)
-    kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat)
+    kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat)
     # A claim held by another host: no local worker to signal.
     assert kb.claim_task(conn, tid, claimer="otherhost:4242")
     return tid
@@ -1462,7 +1465,7 @@ def test_reclaim_takeover_keeps_home_by_default(kanban_home):
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
         assert task.session_id == HOME
-        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid)] == ["home-chat"]
         (ev,) = _takeover_events(conn, tid)
         assert ev.payload["previous_session"] == HOME
         assert ev.payload["previous_home"] == [
@@ -1559,7 +1562,7 @@ def test_restore_without_taker_chat_keeps_every_sub(kanban_home, monkeypatch):
         assert rows[0]["remove_subs"] == [] and rows[0]["note"]
         assert mod.apply(conn, rows, sub_window=30) == 1
         assert kb.get_task(conn, tid).session_id == HOME
-        assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
+        assert {s["chat_id"] for s in kbn.list_notify_subs(conn, tid)} == {
             "home-chat", "taker-chat"}
         # With the taker named, only the taker's sub goes.
         tid2 = _historical_rehome(conn, monkeypatch)
@@ -1569,7 +1572,7 @@ def test_restore_without_taker_chat_keeps_every_sub(kanban_home, monkeypatch):
                 if r["task_id"] == tid2]
         assert mod.apply(conn, rows, sub_window=30,
                          taker_chats={("discord", "taker-chat", "")}) == 1
-        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid2)] == ["home-chat"]
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid2)] == ["home-chat"]
 
 
 def test_restore_rechecks_home_inside_apply(kanban_home, monkeypatch):
@@ -1599,7 +1602,7 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
                                foreign_ok="load", home="transfer"):
             assert kb.reclaim_task(conn, tid, reason="load")
         assert kb.get_task(conn, tid).session_id == OTHER
-        assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
+        assert {s["chat_id"] for s in kbn.list_notify_subs(conn, tid)} == {
             "home-chat", "taker-chat"}
     mod = _restore_mod()
     now = int(time.time())
@@ -1612,7 +1615,7 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
             {"platform": "discord", "chat_id": "taker-chat", "thread_id": ""}]
         assert mod.apply(conn, rows, sub_window=30) == 1
         assert kb.get_task(conn, tid).session_id == HOME
-        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid)] == ["home-chat"]
         # Idempotent: the second pass skips (home no longer the taker's).
         again = mod.plan(conn, since=now - 60, until=now + 60,
                          by_session=None, sub_window=30)
@@ -1634,15 +1637,15 @@ def test_restore_never_removes_another_thread_of_the_taker_chat(kanban_home, mon
         (ev,) = _takeover_events(conn, tid)
         assert ev.payload["taker_chat"] == {
             "platform": "slack", "chat_id": "C1", "thread_id": "thread-A"}
-        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
+        kbn.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
                           thread_id="thread-A")
         # Another conversation, same chat, different thread, same window.
-        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
+        kbn.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
                           thread_id="thread-B")
         rows = mod.plan(conn, since=now - 60, until=now + 60,
                         by_session=None, sub_window=30)
         assert rows[0]["remove_subs"] == [
             {"platform": "slack", "chat_id": "C1", "thread_id": "thread-A"}]
         assert mod.apply(conn, rows, sub_window=30) == 1
-        left = {(s["chat_id"], s["thread_id"] or "") for s in kb.list_notify_subs(conn, tid)}
+        left = {(s["chat_id"], s["thread_id"] or "") for s in kbn.list_notify_subs(conn, tid)}
         assert ("C1", "thread-B") in left and ("C1", "thread-A") not in left

@@ -47,7 +47,7 @@ class RecordingAdapter:
 
 
 def make_agent(monkeypatch):
-    monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda *a, **kw: {})
     monkeypatch.setattr("run_agent.OpenAI", MagicMock())
     monkeypatch.setattr(
