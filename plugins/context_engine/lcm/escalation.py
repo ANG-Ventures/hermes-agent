@@ -317,6 +317,21 @@ def _summary_route_key(model: str | None) -> str:
     alias on any error.
     """
     alias = (model or "").strip()
+    resolved = _resolve_summary_route(alias)
+    if resolved is None:
+        return alias or _DEFAULT_ROUTE_KEY
+    label, _effective, resolved_model, base_url = resolved
+    return f"{alias or _DEFAULT_ROUTE_KEY}=>{label}|{resolved_model}|{base_url.rstrip('/').lower()}"
+
+
+def _resolve_summary_route(alias: str) -> tuple[str, str, str, str] | None:
+    """Resolve ``alias`` the way ``call_llm`` will for the compression task.
+
+    Returns ``(provider_label, effective_provider, model, base_url)`` where
+    ``provider_label`` is ``auto>{main}`` under ``auto`` and
+    ``effective_provider`` is the provider the request is actually sent to
+    (the live main provider under ``auto``). ``None`` when resolution fails.
+    """
     try:
         from agent import auxiliary_client as aux
 
@@ -332,9 +347,11 @@ def _summary_route_key(model: str | None) -> str:
         resolved_model = (resolved_model or "").strip()
         base_url = (base_url or "").strip()
         inherits_endpoint = provider in ("", "auto", "custom")
+        label = effective = provider
         if provider in ("", "auto"):
             main_provider = (aux._read_main_provider() or "").strip().lower()
-            provider = f"auto>{main_provider}" if main_provider else "auto"
+            label = f"auto>{main_provider}" if main_provider else "auto"
+            effective = main_provider
         if not resolved_model:
             resolved_model = (aux._read_main_model_for_aux() or "").strip()
         if not base_url and inherits_endpoint:
@@ -343,10 +360,36 @@ def _summary_route_key(model: str | None) -> str:
             # endpoint too. Two sessions on the same model name behind
             # different endpoints must not share a latch (t_f03a8117).
             base_url = (aux._read_main_base_url() or "").strip()
-        return f"{alias or _DEFAULT_ROUTE_KEY}=>{provider}|{resolved_model}|{base_url.rstrip('/').lower()}"
+        return label, effective, resolved_model, base_url
     except Exception:
         logger.debug("LCM summary route resolution failed for %r", alias, exc_info=True)
-        return alias or _DEFAULT_ROUTE_KEY
+        return None
+
+
+# t_5e0ae3b8: gemini-bridge drops the tail of prompts over ~200k chars.
+_GEMINI_BRIDGE_MAX_PROMPT_CHARS = 200_000
+
+
+def _summary_route_is_gemini_bridge(model: str | None) -> bool:
+    """True when ``model`` resolves to the gemini-bridge provider.
+
+    Keyed on the resolved provider, not the model name: a ``gemini-*`` model on
+    native Google or OpenRouter is not the bridge, and the empty task-default
+    route can still resolve to the bridge via ``auxiliary.compression`` or the
+    inherited main runtime (Prism a00c37d401fe / 4b75a60a0981 / 2e479b0e7f98).
+    """
+    try:
+        from agent.fork_ext.gemini_bridge_claims import is_gemini_bridge
+    except Exception:  # host without the fork's bridge registry
+        return False
+
+    alias = (model or "").strip()
+    resolved = _resolve_summary_route(alias)
+    if resolved is not None:
+        return is_gemini_bridge(resolved[1])
+    from .model_routing import parse_lcm_model_override
+
+    return is_gemini_bridge(parse_lcm_model_override(alias).provider)
 
 
 _SUMMARY_REFUSALS = SummaryRefusalLatch()
@@ -418,8 +461,14 @@ _META_REFUSAL_FIRST_PERSON_RE = re.compile(
     r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b",
     re.IGNORECASE,
 )
+# Own voice only (Prism a4d4880f61e5 / bf2945f56ab0): anchored at the start of
+# the reply's first sentence, subject ``safeguards`` bare or owned (``my`` /
+# ``<model>'s``), object deictic (``this`` / ``my``). A third-person report
+# ("The safeguards blocked the assistant's request; ...") is a summary.
 _META_REFUSAL_TAG_RE = re.compile(
-    r"\[cyber\]|\bsafeguards?\s+(?:flagged|blocked|interrupted)\s+(?:this|my|the)\b",
+    r"\[cyber\]"
+    r"|^(?:(?:sorry|unfortunately|but|so|okay|ok|understood)[,.!]?\s+)*"
+    r"(?:my\s+|[\w.-]+'s\s+)?safeguards?\s+(?:flagged|blocked|interrupted)\s+(?:this|my)\b",
     re.IGNORECASE,
 )
 
@@ -621,12 +670,13 @@ def _invoke_summary_llm_chain(
         # t_5e0ae3b8: gemini-bridge currently drops the tail of prompts over
         # ~200k chars. Never accept a partial-transcript "summary" from that
         # route; try luna/another configured route, then deterministic fallback.
-        if len(prompt) > 200_000 and any(
-            tag in candidate_model.lower() for tag in ("flash", "gemini")
+        if len(prompt) > _GEMINI_BRIDGE_MAX_PROMPT_CHARS and _summary_route_is_gemini_bridge(
+            candidate_model
         ):
             logger.warning(
-                "LCM summary skipping %s for >200k-char prompt: bridge may "
-                "truncate its tail (t_5e0ae3b8)", candidate_model,
+                "LCM summary skipping %s for >200k-char prompt: gemini-bridge "
+                "may truncate its tail (t_5e0ae3b8)",
+                candidate_model or _DEFAULT_ROUTE_KEY,
             )
             continue
         route_key = _summary_route_key(candidate_model) if segment_key else ""

@@ -436,7 +436,26 @@ def test_refusal_finish_reason_is_rejected(monkeypatch):
     assert calls == ["claude-sonnet-5-5", "luna"]
 
 
+def _pin_task_routes(monkeypatch, routes: dict, main_provider: str = "claude-bpr",
+                     task_provider: str = "auto") -> None:
+    """Compression routes: model -> provider; unlisted models use ``task_provider``."""
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux, "_resolve_task_provider_model",
+        lambda task=None, provider=None, model=None, **_: (
+            provider or routes.get(model or "", task_provider), model, None, None, None),
+    )
+    monkeypatch.setattr(aux, "_read_main_provider", lambda: main_provider)
+    monkeypatch.setattr(aux, "_read_main_model_for_aux", lambda: "main-model")
+    monkeypatch.setattr(aux, "_read_main_base_url", lambda: "")
+
+
+HUGE_TEXT = "user: " + ("long history " * 20_000)
+
+
 def test_huge_prompt_skips_flash_bridge_with_truncated_tail(monkeypatch):
+    _pin_task_routes(monkeypatch, {"gemini-3.8-flash-medium": "gemini-bridge"})
     seen = []
 
     def route(**kw):
@@ -519,3 +538,91 @@ def test_non_refusal_l3_has_no_marker_and_no_page(monkeypatch, pages):
     assert level == 3
     assert not summary.startswith(escalation.SUMMARY_UNAVAILABLE_MARKER)
     assert pages == []
+
+
+# --- t_bcd38cd1: the >200k guard keys on the RESOLVED route, not the model name ---
+
+
+def _huge(model: str = "", fallback_models=None):
+    return summarize_with_escalation(
+        text=HUGE_TEXT, source_tokens=100_000, token_budget=12_000,
+        model=model, fallback_models=fallback_models,
+    )
+
+
+@pytest.mark.parametrize("provider", ["gemini", "openrouter"])
+def test_huge_prompt_keeps_gemini_model_on_a_non_bridge_route(monkeypatch, provider):
+    """Prism a00c37d401fe / 4b75a60a0981 / 2e479b0e7f98: a gemini-* model on the
+    native Google or OpenRouter transport is not the bridge; summarize, no L3."""
+    _pin_task_routes(monkeypatch, {"gemini-3.8-flash-medium": provider})
+    seen = []
+
+    def route(**kw):
+        seen.append(kw.get("model"))
+        return _ok("A long-context summary")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    assert _huge("gemini-3.8-flash-medium") == ("A long-context summary", 1)
+    assert seen == ["gemini-3.8-flash-medium"]
+
+
+@pytest.mark.parametrize(
+    "task_provider,main_provider",
+    [("gemini-bridge", "claude-bpr"),   # auxiliary.compression -> bridge
+     ("auto", "gemini-bridge")],        # auto inherits the main runtime
+)
+def test_huge_prompt_skips_task_default_route_resolving_to_bridge(
+    monkeypatch, task_provider, main_provider,
+):
+    """summary_model="" never matched the name check, so a task-default route
+    on the bridge persisted a partial-transcript summary."""
+    _pin_task_routes(monkeypatch, {"gpt-6-luna-900k": "openai-codex"},
+                     main_provider=main_provider, task_provider=task_provider)
+    seen = []
+
+    def route(**kw):
+        seen.append(kw.get("model") or "<task-default>")
+        if not kw.get("model"):
+            return _ok("partial summary of the head only")
+        return _ok("A summary from luna")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    assert _huge("", ["gpt-6-luna-900k"]) == ("A summary from luna", 1)
+    assert seen == ["gpt-6-luna-900k"]
+
+
+def test_short_prompt_still_uses_the_bridge(monkeypatch):
+    _pin_task_routes(monkeypatch, {}, task_provider="gemini-bridge")
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", lambda **kw: _ok("bridge summary"))
+    assert _run() == ("bridge summary", 1)
+
+
+# --- t_bcd38cd1: the safeguard-tag branch matches the reply's own voice only ---
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Prism a4d4880f61e5 / bf2945f56ab0: third-person reports of an interruption.
+        "The safeguards blocked the assistant's request; the user switched to "
+        "deployment debugging.",
+        "The safeguards blocked the initial request; the user removed credentials "
+        "and the assistant completed the task.",
+        "User hit a block when safeguards flagged this relay probe; switched to config.",
+    ],
+)
+def test_third_person_safeguard_report_is_a_summary(reply):
+    assert not escalation._is_meta_refusal_reply(reply, 24000)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "claude-sonnet-5-5's safeguards flagged this message.",
+        "Sorry, my safeguards blocked this request, so I stopped here.",
+        "Safeguards interrupted my summary of this segment.",
+        "[cyber] summary withheld.",
+    ],
+)
+def test_own_voice_safeguard_reply_is_a_refusal(reply):
+    assert escalation._is_meta_refusal_reply(reply, 24000)
