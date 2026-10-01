@@ -10262,8 +10262,15 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    response_validator: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> Any:
-    """Run an auxiliary LLM request, applying the configured task limit."""
+    """Run an auxiliary LLM request, applying the configured task limit.
+
+    ``response_validator`` (non-stream only) classifies a returned response for the
+    attempt row: a non-empty return (e.g. ``"refusal"``) replaces ``outcome=ok``. It
+    only relabels telemetry; the response is still returned and never resent, so the
+    caller's refusal handling (LCM's SummaryRefusalLatch) stays the one decision point.
+    """
     # Attribution must not depend on the caller opting in: context engines call with no
     # ``route_info``, and they are precisely the callers whose compactions went
     # unattributable. Allocate one when absent so the recovery ladder always has somewhere
@@ -10332,6 +10339,14 @@ def call_llm(
             _record_aux_call_cost(response, route_info, streamed=True)
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         outcome = "ok"
+        if response_validator is not None and not stream:
+            try:
+                verdict = response_validator(response)
+            except Exception:
+                logger.debug("auxiliary response validator failed", exc_info=True)
+                verdict = None
+            if verdict:
+                outcome = str(verdict)
         _record_aux_call_cost(response, route_info, streamed=bool(stream))
         if not stream:
             from agent.aux_accounting import record_aux_api_call

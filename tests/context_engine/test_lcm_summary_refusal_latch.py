@@ -343,6 +343,41 @@ def test_node_946_meta_refusal_with_no_fallback_is_never_persisted(monkeypatch):
     assert len(calls) == 1  # L2 on the same segment is latched too
 
 
+def test_refusal_shaped_200_attempt_row_records_outcome_refusal(monkeypatch, caplog):
+    """t_3494b652: the real call_llm attempt row must say outcome=refusal for a
+    refusal-shaped 200, with the served provider/model, and agree with the LCM line.
+    The accepted fallback attempt keeps outcome=ok; the refused route is not resent."""
+    import logging
+
+    from agent import auxiliary_client
+    from agent.compression_duration_log import DURATION_EVENT
+
+    sent: list[str] = []
+
+    def impl(**kw):
+        model = kw.get("model") or ""
+        sent.append(model)
+        auxiliary_client._record_route_info(kw.get("route_info"), "claude-bpr", model)
+        if model == "claude-sonnet-5-5":
+            return _ok(NODE_946_REPLY)
+        return _ok("short summary of the segment")
+
+    monkeypatch.setattr(auxiliary_client, "_call_llm_impl", impl)
+    with caplog.at_level(logging.INFO):
+        summary, level = _run(model="claude-sonnet-5-5", fallback_models=["kimi-k3"])
+    assert (summary, level) == ("short summary of the segment", 1)
+    assert sent == ["claude-sonnet-5-5", "kimi-k3"]  # no same-route resend
+
+    messages = [r.getMessage() for r in caplog.records]
+    rows = [m for m in messages if DURATION_EVENT in m]
+    assert len(rows) == 2, rows
+    assert "outcome=refusal" in rows[0]
+    assert "provider=claude-bpr" in rows[0] and "model=claude-sonnet-5-5" in rows[0]
+    assert "outcome=ok" in rows[1] and "model=kimi-k3" in rows[1]
+    lcm = [m for m in messages if m.startswith("LCM summary outcome=refusal")]
+    assert len(lcm) == 1 and "model=claude-sonnet-5-5" in lcm[0]
+
+
 @pytest.mark.parametrize(
     "reply",
     [
