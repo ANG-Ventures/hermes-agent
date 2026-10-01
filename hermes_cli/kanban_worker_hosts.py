@@ -13,8 +13,11 @@ processes used 100% CPU in total (about 2.3% of a core each) out of 958%, so
 the load the gate protects against is the tools, not the loop.
 
 Eligibility is deliberately narrow: only ``scratch`` cards (their workspace is
-a plain directory, created at the same absolute path on the worker host) and
-only assignees on the host's ``profiles`` allowlist.
+a plain directory, created at the same absolute path on the worker host), only
+assignees on the host's ``profiles`` allowlist, and only cards that OPT IN with
+a body line that is exactly ``host:any``. Without the opt-in a card may depend
+on the dispatcher host (``~/.hermes``, launchd, ``~/.ssh``, local services) and
+would misbehave with its tools on another machine, so it stays local.
 
 Example::
 
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass, field
@@ -46,6 +50,16 @@ PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
 PLACED_EVENT = "worker_placed"
 
 _PROBE_TIMEOUT_SECONDS = 8
+
+# Card-level opt-in: a body line that is exactly ``host:any`` (case and
+# surrounding whitespace ignored). Line-anchored so prose that merely mentions
+# the marker does not opt a card in.
+HOST_ANY_RE = re.compile(r"^[ \t]*host:[ \t]*any[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def opted_in(body: Optional[str]) -> bool:
+    """True when the card body carries the ``host:any`` placement opt-in."""
+    return bool(body) and HOST_ANY_RE.search(body) is not None
 
 
 @dataclass(frozen=True)
@@ -151,8 +165,11 @@ class SpilloverPlan:
     def budget(self) -> int:
         return sum(self.slots.values())
 
-    def eligible(self, assignee: Optional[str], workspace_kind: Optional[str]) -> bool:
+    def eligible(self, assignee: Optional[str], workspace_kind: Optional[str],
+                 body: Optional[str] = None) -> bool:
         if (workspace_kind or "scratch") != "scratch" or not assignee:
+            return False
+        if not opted_in(body):
             return False
         return any(self.slots.get(n, 0) > 0 and assignee in h.profiles
                    for n, h in self.hosts.items())
