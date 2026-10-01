@@ -1675,16 +1675,16 @@ def test_sanitize_stubs_replayed_call_masked_by_historical_result():
 
     out = sanitize_api_messages(list(messages))
 
-    # The second run ends with a stub for the replayed call_old, inserted
-    # right after the fresh result and BEFORE any user turn.
+    # The second run carries a stub for the replayed call_old, inside the run
+    # (BEFORE any user turn) and in the declaring turn's tool_calls order.
     roles = [m["role"] for m in out]
     assert roles == ["user", "assistant", "tool", "user", "assistant",
                      "tool", "tool"]
     second_run = out[4:]
     assert [m["tool_call_id"] for m in second_run if m["role"] == "tool"] == [
-        "call_new", "call_old",
+        "call_old", "call_new",
     ]
-    stub = second_run[2]
+    stub = next(m for m in second_run[1:] if m.get("tool_call_id") == "call_old")
     assert stub["role"] == "tool"
     assert stub["tool_call_id"] == "call_old"
     assert "Result unavailable" in stub["content"]
