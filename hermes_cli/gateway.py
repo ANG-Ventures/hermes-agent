@@ -30,12 +30,12 @@ if os.name == "posix":
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + os.pathsep.join(sorted(_missing))
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-# Interpreter flags for every gateway launcher argv this module generates.
 # ``-P`` (Python 3.11+, the package floor) keeps the cwd off ``sys.path``, so
 # ``-m hermes_cli...`` imports the installed tree even when the service starts
 # from a checkout: a shadow ``hermes_cli/`` in the cwd is never imported, which
 # the in-process _guard_shadow_cwd() could not prevent (t_4853212d Prism r2).
-GATEWAY_SAFE_PATH_ARGS: tuple[str, ...] = ("-P",)
+# See _gateway_safe_path_args() for when it is emitted.
+_SAFE_PATH_FLAG = "-P"
 
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
 from gateway.status import terminate_pid
@@ -1178,7 +1178,7 @@ def find_windows_gateway_services(
 
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
-    args = [get_python_path(), *GATEWAY_SAFE_PATH_ARGS, "-m", "hermes_cli.main"]
+    args = [get_python_path(), *_gateway_safe_path_args(), "-m", "hermes_cli.main"]
     if profile != "default":
         args.extend(["--profile", profile])
     args.extend(["gateway", "run", "--replace"])
@@ -3943,7 +3943,7 @@ StartLimitIntervalSec=0
 Type={systemd_type}
 {systemd_watchdog_directives}User={username}
 Group={group_name}
-ExecStart={python_path} -P -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
+ExecStart={python_path}{_safe_path_exec_flag()} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
 Environment="HOME={home_dir}"
 Environment="USER={username}"
@@ -3984,7 +3984,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type={systemd_type}
-{systemd_watchdog_directives}ExecStart={python_path} -P -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
+{systemd_watchdog_directives}ExecStart={python_path}{_safe_path_exec_flag()} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
@@ -5083,7 +5083,7 @@ def _gateway_run_command() -> list[str]:
     Profile-aware: honors the active HERMES_HOME via `_profile_arg()` so the
     detached fallback launches into the same profile as the CLI invocation.
     """
-    cmd = [get_python_path(), *GATEWAY_SAFE_PATH_ARGS, "-m", "hermes_cli.main"]
+    cmd = [get_python_path(), *_gateway_safe_path_args(), "-m", "hermes_cli.main"]
     profile_arg = _profile_arg()
     if profile_arg:
         cmd.extend(profile_arg.split())
@@ -5121,7 +5121,7 @@ def _timestamped_stderr_gateway_command(
         inner = [part for part in inner if part != "--replace"]
     return [
         get_python_path(),
-        *GATEWAY_SAFE_PATH_ARGS,
+        *_gateway_safe_path_args(),
         "-m",
         "hermes_cli.stderr_timestamp",
         "--error-log",
@@ -6308,24 +6308,35 @@ def _shadow_cwd_reason(
     return None
 
 
-def _install_root_without_cwd(cwd: Path) -> Path | None:
+def _install_root_without_cwd(cwd: Path, *, ignore_pythonpath: bool = False) -> Path | None:
     """Return where ``hermes_cli`` resolves when the cwd is NOT on sys.path.
 
     That is the install a cwd checkout would shadow: an editable-install
     finder, site-packages, or a PYTHONPATH entry. None when nothing else
-    provides a regular ``hermes_cli`` package.
+    provides a regular ``hermes_cli`` package. ``ignore_pythonpath`` also
+    drops this process's PYTHONPATH entries (a generated service unit does
+    not inherit them).
     """
     import importlib.machinery
 
-    def _is_cwd(entry: str) -> bool:
+    dropped: set[Path] = {cwd}
+    if ignore_pythonpath:
+        for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+            if entry:
+                try:
+                    dropped.add(Path(entry).resolve())
+                except (OSError, RuntimeError):
+                    pass
+
+    def _dropped(entry: str) -> bool:
         if entry in ("", "."):
             return True
         try:
-            return Path(entry).resolve() == cwd
+            return Path(entry).resolve() in dropped
         except (OSError, RuntimeError):
             return False
 
-    path = [entry for entry in sys.path if not _is_cwd(entry)]
+    path = [entry for entry in sys.path if not _dropped(entry)]
     for finder in sys.meta_path:
         try:
             if finder is importlib.machinery.PathFinder:
@@ -6342,6 +6353,31 @@ def _install_root_without_cwd(cwd: Path) -> Path | None:
         except (OSError, RuntimeError):
             continue
     return None
+
+
+def _gateway_safe_path_args() -> tuple[str, ...]:
+    """Interpreter flags for every gateway launcher argv this module generates.
+
+    ``("-P",)`` when ``hermes_cli`` resolves to this install without the cwd
+    on ``sys.path`` (venv / editable / site-packages install; a PYTHONPATH
+    set at generation time is not inherited by the service, so it does not
+    count):
+    only then can a cwd checkout shadow it, and only then is ``-P`` safe. A
+    checkout-only deployment (system interpreter, no install, no PYTHONPATH)
+    imports the code from the cwd alone, so ``-P`` would break it, and there
+    is no other install to shadow (Prism r1 on #1618, t_c74955a3).
+    """
+    try:
+        root = PROJECT_ROOT.resolve()
+        cwd = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        return ()
+    installed = _install_root_without_cwd(cwd, ignore_pythonpath=True)
+    return (_SAFE_PATH_FLAG,) if installed == root else ()
+
+
+def _safe_path_exec_flag() -> str:
+    return "".join(f" {flag}" for flag in _gateway_safe_path_args())
 
 
 _UNSET = object()
