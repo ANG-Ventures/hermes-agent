@@ -1198,6 +1198,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--priority", type=int, default=None, metavar="N",
         help="Set the dispatch priority (higher first); records priority_set.",
     )
+    p_edit.add_argument(
+        "--skill", action="append", default=[], dest="skills", metavar="NAME",
+        help="Append a skill to force-load into the worker (repeatable; "
+             "applies from the next spawn). Records skills_set.",
+    )
+    p_edit.add_argument(
+        "--clear-skills", action="store_true", dest="clear_skills",
+        help="Empty the card's skill list (applied before any --skill).",
+    )
     _nw = p_edit.add_mutually_exclusive_group()
     _nw.add_argument(
         "--no-worker", action="store_const", const=True, dest="no_worker",
@@ -2853,6 +2862,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if (kb.is_milestone_qa_title(task.title)
+                and kb.MILESTONE_QA_SKILL not in (getattr(args, "skills", None) or [])):
+            print(
+                f"Added skill {kb.MILESTONE_QA_SKILL} ([milestone] QA cards run "
+                "Argus on the sdlc-review procedure)."
+            )
         if auto_subscribed:
             print(
                 "Subscribed the calling session for finish notifications "
@@ -5047,12 +5062,16 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     no_worker = getattr(args, "no_worker", None)
     new_priority = getattr(args, "priority", None)
     page = getattr(args, "page", None)
+    add_skills = list(getattr(args, "skills", None) or [])
+    clear_skills = bool(getattr(args, "clear_skills", False))
+    do_skills = bool(add_skills) or clear_skills
 
     if (not do_result and not do_model and not do_session and no_worker is None
-            and new_priority is None and page is None):
+            and new_priority is None and page is None and not do_skills):
         print(
             "kanban: nothing to edit (pass --result, --model, --clear-model, "
-            "--session, --priority, --no-worker, --worker-ok, --no-page or --page)",
+            "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
+            "--skill or --clear-skills)",
             file=sys.stderr,
         )
         return 2
@@ -5078,6 +5097,19 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 print(f"cannot edit {args.task_id} (unknown id)", file=sys.stderr)
                 return 1
             print(f"{args.task_id}: needs-input pager: " + ("on" if page else "off"))
+        if do_skills:
+            try:
+                skills = kb.set_task_skills(
+                    conn, args.task_id, add=add_skills, clear=clear_skills,
+                    operator=_profile_author(),
+                )
+            except ValueError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            if skills is None:
+                print(f"cannot edit {args.task_id} (unknown id)", file=sys.stderr)
+                return 1
+            print(f"{args.task_id}: skills: {', '.join(skills) or '(none)'}")
         if do_session:
             sid = None if new_session.strip().lower() in ("", "none") else new_session.strip()
             if not kb.set_task_session(conn, args.task_id, sid):

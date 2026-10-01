@@ -6939,6 +6939,62 @@ def near_duplicate_warning(conn: sqlite3.Connection, task_id: str) -> Optional[d
         return None
 
 
+def _normalize_skills(skills: Iterable[str]) -> list[str]:
+    """Strip, drop empties, dedupe (order kept); refuse commas and toolset names.
+
+    Shared by :func:`create_task` and :func:`set_task_skills` so ``create
+    --skill`` and ``edit --skill`` accept exactly the same names.
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    # Collect all toolset-name confusions up front so the user sees the
+    # whole list at once. Raising on the first hit is friendly when the
+    # input has one mistake, but agents that confuse skills with toolsets
+    # usually pass several at once (`skills=["web", "browser", "terminal"]`)
+    # and serial-correcting one per failure round-trips wastes tokens.
+    toolset_typos: list[str] = []
+    for s in skills:
+        if not s:
+            continue
+        name = str(s).strip()
+        if not name:
+            continue
+        if "," in name:
+            raise ValueError(
+                f"skill name cannot contain comma: {name!r} "
+                f"(pass a list of separate names instead of a comma-joined string)"
+            )
+        if name.casefold() in KNOWN_TOOLSET_NAMES:
+            toolset_typos.append(name)
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if toolset_typos:
+        quoted = ", ".join(repr(n) for n in toolset_typos)
+        noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+        raise ValueError(
+            f"{quoted} {noun}, not skill name(s). "
+            "Put toolsets in the assignee profile's `toolsets:` config "
+            "instead of per-task skills. Skills are named skill bundles "
+            "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
+            "capabilities (e.g. `web`, `browser`, `terminal`)."
+        )
+    return cleaned
+
+
+# A ``[milestone] QA`` card runs Argus on the sdlc-review procedure; the kernel
+# only force-loads that skill for review-lane spawns (off), so create attaches it
+# (kanban-review-lane-lint's "lack skill sdlc-review" finding, t_c9af70b6).
+MILESTONE_QA_TITLE_PREFIX = "[milestone] qa"
+MILESTONE_QA_SKILL = "sdlc-review"
+
+
+def is_milestone_qa_title(title: Optional[str]) -> bool:
+    return (title or "").strip().lower().startswith(MILESTONE_QA_TITLE_PREFIX)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -7224,43 +7280,14 @@ def create_task(
     # not here.
     skills_list: Optional[list[str]] = None
     if skills is not None:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        # Collect all toolset-name confusions up front so the user sees the
-        # whole list at once. Raising on the first hit is friendly when the
-        # input has one mistake, but agents that confuse skills with toolsets
-        # usually pass several at once (`skills=["web", "browser", "terminal"]`)
-        # and serial-correcting one per failure round-trips wastes tokens.
-        toolset_typos: list[str] = []
-        for s in skills:
-            if not s:
-                continue
-            name = str(s).strip()
-            if not name:
-                continue
-            if "," in name:
-                raise ValueError(
-                    f"skill name cannot contain comma: {name!r} "
-                    f"(pass a list of separate names instead of a comma-joined string)"
-                )
-            if name.casefold() in KNOWN_TOOLSET_NAMES:
-                toolset_typos.append(name)
-                continue
-            if name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(name)
-        if toolset_typos:
-            quoted = ", ".join(repr(n) for n in toolset_typos)
-            noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
-            raise ValueError(
-                f"{quoted} {noun}, not skill name(s). "
-                "Put toolsets in the assignee profile's `toolsets:` config "
-                "instead of per-task skills. Skills are named skill bundles "
-                "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
-                "capabilities (e.g. `web`, `browser`, `terminal`)."
-            )
-        skills_list = cleaned
+        skills_list = _normalize_skills(skills)
+    # Auto-attach sdlc-review to a ``[milestone] QA`` card (t_c9af70b6); the
+    # created event records it so the addition is never silent.
+    skills_auto_added: list[str] = []
+    if is_milestone_qa_title(title) and MILESTONE_QA_SKILL not in (skills_list or []):
+        skills_list = [*(skills_list or []), MILESTONE_QA_SKILL]
+        skills_auto_added.append(MILESTONE_QA_SKILL)
+
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -7514,6 +7541,8 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        **({"skills_auto_added": skills_auto_added}
+                           if skills_auto_added else {}),
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -17362,6 +17391,52 @@ def set_task_model(
         )
     return int(cur.rowcount or 0)
 
+
+
+def set_task_skills(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    add: Iterable[str] = (),
+    clear: bool = False,
+    operator: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Edit a card's force-loaded skills: ``clear`` empties the list first,
+    then ``add`` names are appended (validated + deduped like ``create
+    --skill``). Returns the new list, or ``None`` for an unknown id.
+
+    A change records ``skills_set`` ``{before, after, operator}``; a no-op
+    edit writes nothing. Takes effect on the card's next spawn.
+    """
+    added = _normalize_skills(add)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT skills FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        before: list[str] = []
+        if row["skills"]:
+            try:
+                parsed = json.loads(row["skills"])
+                if isinstance(parsed, list):
+                    before = [str(x) for x in parsed if x]
+            except Exception:
+                before = []
+        after = [] if clear else list(before)
+        after += [n for n in added if n not in after]
+        if after != before:
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(after) if after else None, task_id),
+            )
+            _append_event(
+                conn, task_id, "skills_set",
+                {"before": before, "after": after, "operator": operator},
+            )
+    if after != before:
+        notify_task_updated(conn, task_id, ("skills",))
+    return after
 
 @_home_session_guarded("priority")
 def set_task_priority(
