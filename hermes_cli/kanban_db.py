@@ -23083,13 +23083,14 @@ def _dispatch_once_locked(
     ready_rows = _drop_no_worker_rows(conn, ready_rows, result, dry_run=dry_run)
     if spillover is not None:
         # Only cards a worker host can take: scratch workspace + allowlisted
-        # assignee. Everything else waits for this host's gate to reopen.
+        # assignee + a ``host:any`` body line (per-card opt-in). Everything
+        # else waits for this host's gate to reopen.
         # Also: no task link in either direction (children read the
         # parent's scratch dir locally; a spilled card's files live on the
         # worker host) and no local workspace content (it is not on the host).
         ready_rows = [
             r for r in ready_rows
-            if spillover.eligible(r["assignee"], r["workspace_kind"])
+            if spillover.eligible(r["assignee"], r["workspace_kind"], r["body"])
             and not _kwh.local_workspace_has_content(r["workspace_path"])
             and conn.execute(
                 "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? "
