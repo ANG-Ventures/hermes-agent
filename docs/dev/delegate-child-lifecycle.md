@@ -203,7 +203,7 @@ Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
 A steer accepted after closure is impossible, for every producer: closure
 (`finish`/`stall`, or the normal path's completion) sets
 `accepting_steer=False` under the lock `steer_subagent` holds, and in the
-same critical section closes the child's ledger. A closed ledger refuses
+same critical section seals the child's ledger. A sealed ledger refuses
 every later `steer` (returns False, writes no entry, leaves the slot alone),
 so a direct `child.steer()` that never passes the registry is refused too.
 Example: a reaped grandchild's late thread nudging its already-persisted

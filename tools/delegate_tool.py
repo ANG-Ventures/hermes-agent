@@ -282,7 +282,7 @@ class _SteerLedger:
         self._slot: List[Tuple[str, Optional[List[int]]]] = []
         self._batches: List[Dict[str, Any]] = []
         self._write_failed = False
-        # Set by ``close`` at the child's linearization point. A closed
+        # Set by ``seal`` at the child's linearization point. A closed
         # ledger refuses every producer, including a direct ``child.steer()``
         # that never passes through the registry (Argus QA r2 C2).
         self._closed = False
@@ -359,7 +359,7 @@ class _SteerLedger:
             self._entries[seq]["state"] = "withdrawn"
             self._append({"op": "withdraw", "seq": seq})
 
-    def close(self) -> None:
+    def seal(self) -> None:
         """No steer is accepted from now on; open entries stay as they are."""
         with self._lock:
             self._closed = True
@@ -572,7 +572,7 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
         # producers that bypass ``steer_subagent`` (Argus QA r2 C2).
         ledger = _steer_ledger_of(agent)
         if ledger is not None:
-            ledger.close()
+            ledger.seal()
         record = _active_subagents.get(subagent_id)
         if record is None or record.get("agent") is not agent:
             return None
