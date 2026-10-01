@@ -1178,7 +1178,8 @@ def find_windows_gateway_services(
 
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
-    args = [get_python_path(), *_gateway_safe_path_args(), "-m", "hermes_cli.main"]
+    python = get_python_path()
+    args = [python, *_gateway_safe_path_args(python), "-m", "hermes_cli.main"]
     if profile != "default":
         args.extend(["--profile", profile])
     args.extend(["gateway", "run", "--replace"])
@@ -3943,7 +3944,7 @@ StartLimitIntervalSec=0
 Type={systemd_type}
 {systemd_watchdog_directives}User={username}
 Group={group_name}
-ExecStart={python_path}{_safe_path_exec_flag()} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
+ExecStart={python_path}{_safe_path_exec_flag(python_path)} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
 Environment="HOME={home_dir}"
 Environment="USER={username}"
@@ -3984,7 +3985,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type={systemd_type}
-{systemd_watchdog_directives}ExecStart={python_path}{_safe_path_exec_flag()} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
+{systemd_watchdog_directives}ExecStart={python_path}{_safe_path_exec_flag(python_path)} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
@@ -5083,7 +5084,8 @@ def _gateway_run_command() -> list[str]:
     Profile-aware: honors the active HERMES_HOME via `_profile_arg()` so the
     detached fallback launches into the same profile as the CLI invocation.
     """
-    cmd = [get_python_path(), *_gateway_safe_path_args(), "-m", "hermes_cli.main"]
+    python = get_python_path()
+    cmd = [python, *_gateway_safe_path_args(python), "-m", "hermes_cli.main"]
     profile_arg = _profile_arg()
     if profile_arg:
         cmd.extend(profile_arg.split())
@@ -5119,9 +5121,10 @@ def _timestamped_stderr_gateway_command(
         inner = [*inner, "--external-supervisor"]
     if external_supervisor and "--replace" in inner:
         inner = [part for part in inner if part != "--replace"]
+    python = get_python_path()
     return [
-        get_python_path(),
-        *_gateway_safe_path_args(),
+        python,
+        *_gateway_safe_path_args(python),
         "-m",
         "hermes_cli.stderr_timestamp",
         "--error-log",
@@ -6308,31 +6311,20 @@ def _shadow_cwd_reason(
     return None
 
 
-def _install_root_without_cwd(cwd: Path, *, ignore_pythonpath: bool = False) -> Path | None:
+def _install_root_without_cwd(cwd: Path) -> Path | None:
     """Return where ``hermes_cli`` resolves when the cwd is NOT on sys.path.
 
     That is the install a cwd checkout would shadow: an editable-install
     finder, site-packages, or a PYTHONPATH entry. None when nothing else
-    provides a regular ``hermes_cli`` package. ``ignore_pythonpath`` also
-    drops this process's PYTHONPATH entries (a generated service unit does
-    not inherit them).
+    provides a regular ``hermes_cli`` package.
     """
     import importlib.machinery
-
-    dropped: set[Path] = {cwd}
-    if ignore_pythonpath:
-        for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
-            if entry:
-                try:
-                    dropped.add(Path(entry).resolve())
-                except (OSError, RuntimeError):
-                    pass
 
     def _dropped(entry: str) -> bool:
         if entry in ("", "."):
             return True
         try:
-            return Path(entry).resolve() in dropped
+            return Path(entry).resolve() == cwd
         except (OSError, RuntimeError):
             return False
 
@@ -6355,29 +6347,66 @@ def _install_root_without_cwd(cwd: Path, *, ignore_pythonpath: bool = False) -> 
     return None
 
 
-def _gateway_safe_path_args() -> tuple[str, ...]:
+_LAUNCHER_PROBE = (
+    "import importlib.util as u\n"
+    "s = u.find_spec('hermes_cli')\n"
+    "print(s.origin if s is not None and s.origin else '')\n"
+)
+
+
+def _launcher_install_root(python: str) -> Path | None:
+    """Where ``python -P -m hermes_cli...`` would import ``hermes_cli`` from.
+
+    Probes the LAUNCH interpreter in a child with ``-P``, no PYTHONPATH and a
+    neutral cwd: the startup environment a generated service gets, without
+    the script-dir / cwd / PYTHONPATH entries this process may carry (Prism
+    r2 on #1618). None when it has no installed ``hermes_cli`` or the probe
+    fails.
+    """
+    import tempfile
+
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    neutral = Path(tempfile.gettempdir()).resolve()
+    try:
+        proc = subprocess.run(
+            [python, "-P", "-c", _LAUNCHER_PROBE],
+            cwd=str(neutral),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    origin = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not origin:
+        return None
+    try:
+        return Path(origin).resolve().parent.parent
+    except (OSError, RuntimeError):
+        return None
+
+
+def _gateway_safe_path_args(python: str | None = None) -> tuple[str, ...]:
     """Interpreter flags for every gateway launcher argv this module generates.
 
-    ``("-P",)`` when ``hermes_cli`` resolves to this install without the cwd
-    on ``sys.path`` (venv / editable / site-packages install; a PYTHONPATH
-    set at generation time is not inherited by the service, so it does not
-    count):
-    only then can a cwd checkout shadow it, and only then is ``-P`` safe. A
-    checkout-only deployment (system interpreter, no install, no PYTHONPATH)
-    imports the code from the cwd alone, so ``-P`` would break it, and there
-    is no other install to shadow (Prism r1 on #1618, t_c74955a3).
+    ``("-P",)`` only when the launch interpreter imports THIS install with no
+    cwd on ``sys.path`` (venv / editable / site-packages install): only then
+    can a cwd checkout shadow it, and only then is ``-P`` safe. A
+    checkout-only deployment (system interpreter, no install) imports the
+    code from the cwd alone, so ``-P`` would break it, and there is no other
+    install to shadow (Prism r1/r2 on #1618, t_c74955a3).
     """
     try:
         root = PROJECT_ROOT.resolve()
-        cwd = Path.cwd().resolve()
     except (OSError, RuntimeError):
         return ()
-    installed = _install_root_without_cwd(cwd, ignore_pythonpath=True)
+    installed = _launcher_install_root(python or get_python_path())
     return (_SAFE_PATH_FLAG,) if installed == root else ()
 
 
-def _safe_path_exec_flag() -> str:
-    return "".join(f" {flag}" for flag in _gateway_safe_path_args())
+def _safe_path_exec_flag(python: str | None = None) -> str:
+    return "".join(f" {flag}" for flag in _gateway_safe_path_args(python))
 
 
 _UNSET = object()

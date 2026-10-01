@@ -102,7 +102,7 @@ def test_launcher_argvs_keep_cwd_off_sys_path(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway_cli, "_profile_arg", lambda *a, **k: "")
     # an installed tree (venv / editable): the only case a cwd can shadow
     monkeypatch.setattr(
-        gateway_cli, "_install_root_without_cwd", lambda *a, **k: gateway_cli.PROJECT_ROOT
+        gateway_cli, "_launcher_install_root", lambda *a, **k: gateway_cli.PROJECT_ROOT
     )
     argvs = [
         gateway_cli._gateway_run_command(),
@@ -210,7 +210,7 @@ def test_launcher_argv_never_executes_real_shadow_package(tmp_path, monkeypatch)
     monkeypatch.setattr(gateway_cli, "get_python_path", lambda: sys.executable)
     monkeypatch.setattr(gateway_cli, "_profile_arg", lambda *a, **k: "")
     monkeypatch.setattr(
-        gateway_cli, "_install_root_without_cwd", lambda *a, **k: gateway_cli.PROJECT_ROOT
+        gateway_cli, "_launcher_install_root", lambda *a, **k: gateway_cli.PROJECT_ROOT
     )
     argv = gateway_cli._gateway_run_command()
     argv = [a for a in argv if a != "--replace"]
@@ -234,46 +234,18 @@ def _checkout_only_deploy(tmp_path: Path, marker: Path) -> Path:
     return deploy
 
 
-def _isolate_to_stdlib(monkeypatch, deploy: Path) -> None:
-    """This process as a system interpreter with no hermes install."""
-    import importlib.machinery
-    import sysconfig
-
-    stdlib = {sysconfig.get_paths()[k] for k in ("stdlib", "platstdlib")}
-    monkeypatch.setattr(
-        gateway_cli.sys, "path", [""] + [p for p in sys.path if p in stdlib or p.endswith(".zip")]
-    )
-    monkeypatch.setattr(
-        gateway_cli.sys,
-        "meta_path",
-        [
-            f
-            for f in sys.meta_path
-            if f
-            in (
-                importlib.machinery.BuiltinImporter,
-                importlib.machinery.FrozenImporter,
-                importlib.machinery.PathFinder,
-            )
-        ],
-    )
-    monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", deploy)
-    monkeypatch.chdir(deploy)
-    monkeypatch.delenv("PYTHONPATH", raising=False)
-
-
 def test_checkout_only_deploy_launcher_runs_without_pythonpath(tmp_path, monkeypatch):
-    """Prism r1 on #1618 (Checkout startup): a deployed checkout with a system
-    interpreter, no install and no PYTHONPATH gets a launcher argv that still
-    imports it. The subprocess gets no injected PYTHONPATH and no site (-S)."""
+    """Prism r1 on #1618 (Checkout startup): a deployed checkout whose launch
+    interpreter has no hermes install gets a launcher argv that still imports
+    it. The subprocess gets no injected PYTHONPATH."""
     marker = tmp_path / "marker"
     deploy = _checkout_only_deploy(tmp_path, marker)
-    _isolate_to_stdlib(monkeypatch, deploy)
-    flags = gateway_cli._gateway_safe_path_args()
+    monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", deploy)
+    flags = gateway_cli._gateway_safe_path_args(sys.executable)
     assert flags == ()
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     proc = subprocess.run(
-        [sys.executable, "-S", *flags, "-m", "hermes_cli.main"],
+        [sys.executable, *flags, "-m", "hermes_cli.main"],
         cwd=deploy, env=env, capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -295,27 +267,46 @@ def test_unconditional_safe_path_flag_breaks_checkout_only_deploy(tmp_path):
 
 def test_safe_path_flag_emitted_only_for_this_install(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        gateway_cli, "_install_root_without_cwd", lambda *a, **k: gateway_cli.PROJECT_ROOT
+        gateway_cli, "_launcher_install_root", lambda *a, **k: gateway_cli.PROJECT_ROOT
     )
-    assert gateway_cli._gateway_safe_path_args() == ("-P",)
-    monkeypatch.setattr(gateway_cli, "_install_root_without_cwd", lambda *a, **k: None)
-    assert gateway_cli._gateway_safe_path_args() == ()
+    assert gateway_cli._gateway_safe_path_args("/py") == ("-P",)
+    monkeypatch.setattr(gateway_cli, "_launcher_install_root", lambda *a, **k: None)
+    assert gateway_cli._gateway_safe_path_args("/py") == ()
     monkeypatch.setattr(
-        gateway_cli, "_install_root_without_cwd", lambda *a, **k: tmp_path / "other"
+        gateway_cli, "_launcher_install_root", lambda *a, **k: tmp_path / "other"
     )
-    assert gateway_cli._gateway_safe_path_args() == ()
+    assert gateway_cli._gateway_safe_path_args("/py") == ()
 
 
-def test_install_probe_ignores_generation_time_pythonpath(tmp_path, monkeypatch):
-    """A PYTHONPATH set while generating the unit is not inherited by the
-    service, so it must not make the probe emit -P."""
+def test_probe_ignores_this_process_script_dir_and_pythonpath(tmp_path, monkeypatch):
+    """Prism r2 on #1618 (Incorrect detection): a checkout on THIS process's
+    sys.path (script dir) or PYTHONPATH is not inherited by the service, so it
+    must not make the launcher emit -P."""
     marker = tmp_path / "marker"
     deploy = _checkout_only_deploy(tmp_path, marker)
-    _isolate_to_stdlib(monkeypatch, deploy)
-    other = tmp_path / "pp"
-    (other / "hermes_cli").mkdir(parents=True)
-    (other / "hermes_cli" / "__init__.py").write_text("")
-    monkeypatch.setenv("PYTHONPATH", str(other))
-    monkeypatch.setattr(gateway_cli.sys, "path", gateway_cli.sys.path + [str(other)])
-    assert gateway_cli._install_root_without_cwd(deploy.resolve()) == other.resolve()
-    assert gateway_cli._install_root_without_cwd(deploy.resolve(), ignore_pythonpath=True) is None
+    monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", deploy)
+    monkeypatch.setattr(gateway_cli.sys, "path", [str(deploy)] + sys.path)
+    monkeypatch.setenv("PYTHONPATH", str(deploy))
+    monkeypatch.chdir(tmp_path)
+    assert gateway_cli._gateway_safe_path_args(sys.executable) == ()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX wrapper interpreter")
+def test_probe_detects_real_install_of_this_tree(tmp_path, monkeypatch):
+    """Positive arm: an interpreter whose startup environment provides THIS
+    tree (simulated install via a wrapper) gets -P, and the -P launcher still
+    imports it from a neutral cwd."""
+    marker = tmp_path / "marker"
+    deploy = _checkout_only_deploy(tmp_path, marker)
+    wrapper = tmp_path / "py"
+    wrapper.write_text(f'#!/bin/sh\nPYTHONPATH={deploy} exec {sys.executable} "$@"\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", deploy)
+    flags = gateway_cli._gateway_safe_path_args(str(wrapper))
+    assert flags == ("-P",)
+    proc = subprocess.run(
+        [str(wrapper), *flags, "-m", "hermes_cli.main"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert marker.read_text() == "deploy ran"
