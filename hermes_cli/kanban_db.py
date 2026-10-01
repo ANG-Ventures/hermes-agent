@@ -6995,6 +6995,28 @@ def is_milestone_qa_title(title: Optional[str]) -> bool:
     return (title or "").strip().lower().startswith(MILESTONE_QA_TITLE_PREFIX)
 
 
+def max_event_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT MAX(id) FROM task_events").fetchone()
+    return int(row[0] or 0)
+
+
+def created_skills_auto_added(
+    conn: sqlite3.Connection, task_id: str, *, after_event_id: int = 0,
+) -> list[str]:
+    """Skills ``create_task`` auto-attached to this card, read from its
+    created event; ``after_event_id`` ignores a created event at or below
+    that id (an idempotent hit returning an older card)."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "AND id > ? ORDER BY id LIMIT 1", (task_id, after_event_id),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except Exception:
+        return []
+    return list(payload.get("skills_auto_added") or [])
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,

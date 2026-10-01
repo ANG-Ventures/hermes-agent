@@ -2813,6 +2813,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         args.session = home_flag
     try:
         with kb.connect_closing() as conn:
+            _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
                 title=args.title,
@@ -2853,6 +2854,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 force_reason=getattr(args, "force_reason", None),
             )
             task = kb.get_task(conn, task_id)
+            # Notice only when THIS call created the card and auto-added the
+            # skill: an idempotent hit returns an older card whose created
+            # event predates the watermark taken before the call.
+            auto_added = bool(kb.created_skills_auto_added(
+                conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     except ValueError as exc:
@@ -2862,11 +2868,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
-        # Read the stored row, not the title: an idempotent hit on a legacy
-        # card never gets the skill, and " sdlc-review " normalizes to it.
-        asked = {str(x).strip() for x in (getattr(args, "skills", None) or [])}
-        if (kb.MILESTONE_QA_SKILL in (task.skills or [])
-                and kb.MILESTONE_QA_SKILL not in asked):
+        if auto_added:
             print(
                 f"Added skill {kb.MILESTONE_QA_SKILL} ([milestone] QA cards run "
                 "Argus on the sdlc-review procedure)."

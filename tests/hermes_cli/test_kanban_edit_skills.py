@@ -136,6 +136,17 @@ def test_idempotent_hit_on_legacy_card_no_false_notice(kanban_home):
     assert _skills(tid) == []
 
 
+def test_idempotent_hit_on_card_with_skill_no_false_notice(kanban_home):
+    for i, (title, skill) in enumerate(
+        (("[milestone] QA: had", ""), ("plain had", " --skill sdlc-review"))
+    ):
+        first = kc.run_slash(f"create '{title}' --assignee argus --idempotency-key k{i}{skill}")
+        tid = _created_id(first)
+        again = kc.run_slash(f"create '{title}' --assignee argus --idempotency-key k{i}")
+        assert _created_id(again) == tid
+        assert "Added skill" not in again, title
+
+
 def test_create_other_titles_untouched(kanban_home):
     for title in ("plain", "[milestone] build x", "fix [milestone] QA wording"):
         with kb.connect() as conn:
