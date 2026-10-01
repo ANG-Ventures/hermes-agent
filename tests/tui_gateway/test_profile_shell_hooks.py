@@ -95,3 +95,28 @@ def test_identical_hook_registers_once_per_home(tmp_path, monkeypatch):
     finally:
         plugins._reset_plugin_managers_for_tests()
         shell_hooks.reset_for_tests()
+
+
+def test_hook_subprocess_sees_the_session_profile_home(tmp_path, monkeypatch):
+    """The override is a ContextVar; the hook child must get it as its env home."""
+    from agent import shell_hooks
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch = tmp_path / "launch"
+    session_home = tmp_path / "session"
+    launch.mkdir()
+    session_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    script = tmp_path / "echo_home.py"
+    script.write_text(
+        "import json, os\nprint(json.dumps({'decision': 'block', 'reason': os.environ['HERMES_HOME']}))\n",
+        encoding="utf-8",
+    )
+    spec = shell_hooks.ShellHookSpec(
+        event="pre_tool_call", command=shlex.join([sys.executable, str(script)]))
+    assert '"reason": "%s"' % launch in shell_hooks._spawn_once(spec, "{}")["stdout"]
+    token = set_hermes_home_override(str(session_home))
+    try:
+        assert '"reason": "%s"' % session_home in shell_hooks._spawn_once(spec, "{}")["stdout"]
+    finally:
+        reset_hermes_home_override(token)

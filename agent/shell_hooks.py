@@ -655,6 +655,15 @@ def _spawn_once(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     _popen_kwargs: Dict[str, Any] = (
         {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     )
+    # A multi-profile host (dashboard) binds the session's profile home through
+    # a ContextVar override, which a child process cannot see. Hand the hook
+    # that home explicitly so it reads/writes the session profile's policy and
+    # state, not the launch profile's (t_e5708887).
+    from hermes_constants import get_hermes_home_override as _home_override
+
+    _override_home = _home_override()
+    if _override_home:
+        _popen_kwargs["env"] = {**os.environ, "HERMES_HOME": _override_home}
     try:
         proc = subprocess.Popen(
             argv,
