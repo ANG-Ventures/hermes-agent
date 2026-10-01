@@ -1353,6 +1353,24 @@ def board_dir(board: Optional[str] = None) -> Path:
     return boards_root() / slug
 
 
+def board_state_dir(board: Optional[str] = None) -> Path:
+    """Directory for a board's dispatcher latch files (rate-limit circuit, budget pause).
+
+    ``default`` -> ``<root>/kanban/``; every other board -> :func:`board_dir`.
+    Writing ``default``'s latches into ``boards/default/`` minted that dir on a
+    host whose default DB lives at ``<root>/kanban.db``. A create-mode sqlite
+    connect on ``boards/default/kanban.db`` then left a 0-byte phantom board DB
+    instead of failing, and enumerators failed closed on it for 24h
+    (2026-09-18, 09-27, 09-29). Without the dir that connect cannot create a
+    file.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    slug = resolve_board_alias(slug) or slug
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban"
+    return board_dir(slug)
+
+
 def board_exists(board: Optional[str] = None) -> bool:
     """Return True if the board has persisted metadata or a DB on disk.
 
@@ -17545,7 +17563,7 @@ def _notify_rate_limit_circuit(
     try:
         from hermes_cli import kanban_budget as _kbudget
 
-        marker = board_dir(board) / _RATE_LIMIT_CIRCUIT_MARKER
+        marker = board_state_dir(board) / _RATE_LIMIT_CIRCUIT_MARKER
         try:
             seen = json.loads(marker.read_text(encoding="utf-8"))
         except Exception:
@@ -22874,7 +22892,7 @@ def _dispatch_once_locked(
             if _kbudget.evaluate_board_budget(
                 board,
                 kanban_db_path(board=board),
-                board_dir(board),
+                board_state_dir(board),
                 cache=budget_cache,
             ):
                 result.budget_paused = True

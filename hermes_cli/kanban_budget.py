@@ -497,7 +497,7 @@ def board_budget_report(board: Optional[str] = None, *, home=None) -> list[dict]
     for slug in slugs:
         with kb.enumerating_boards():
             db_path = kb.kanban_db_path(slug)
-            bdir = kb.board_dir(slug)
+            bdir = kb.board_state_dir(slug)
         try:
             spend = board_spend_usd(
                 db_path, window_hours=window, home=home, cache=cache,
