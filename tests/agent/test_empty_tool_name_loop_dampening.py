@@ -347,6 +347,46 @@ def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
 
 
 
+def test_mixed_batch_wire_tool_results_follow_tool_calls_order(agent_env):
+    """The next request carries the batch's tool results in tool_calls order.
+
+    The mixed-batch path appends the invalid call's error result before the
+    valid calls execute, so the in-memory run is [call_1, call_0, call_2].
+    The claude-bpr native result relay 400s on that shape ("received tool
+    results out of tool_calls order"; bg-review forks 2026-09-24/25).
+    """
+    agent, handler = agent_env
+    agent.valid_tool_names = agent.valid_tool_names | {"todo"}
+    handler.response_queue.append(_batch_tc_resp(
+        [
+            ("todo", '{"todos": [{"id": "1", "content": "a", "status": "pending"}]}'),
+            ("not_a_real_tool", "{}"),
+            ("todo", "{}"),
+        ]
+    ))
+    handler.response_queue.append(_text_resp("done"))
+
+    agent.run_conversation("track work", conversation_history=[], task_id="t")
+
+    # The request after the tool batch (earlier captures may be probes).
+    wire = next(
+        r["messages"] for r in handler.captured_requests
+        if any(m.get("role") == "tool" for m in r.get("messages", []))
+    )
+    idx = next(
+        i for i, m in enumerate(wire)
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    call_ids = [tc["id"] for tc in wire[idx]["tool_calls"]]
+    run = []
+    for m in wire[idx + 1:]:
+        if m.get("role") != "tool":
+            break
+        run.append(m.get("tool_call_id"))
+    assert call_ids == ["call_0", "call_1", "call_2"]
+    assert run == call_ids
+
+
 def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     """Invalid-tool 3-strike partial must not leave a durable tool→user tail (#48879 class).
 

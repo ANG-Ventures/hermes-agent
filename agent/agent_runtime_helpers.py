@@ -4377,6 +4377,56 @@ def _classify_tool_call_orphans(messages: List[Dict[str, Any]]):
     return surviving_call_ids, result_call_ids, orphaned_results, missing_tool_calls
 
 
+def order_tool_results_by_call_index(
+    messages: List[Dict[str, Any]],
+) -> tuple:
+    """Sort each tool-result run into its assistant turn's tool_calls order.
+
+    A "run" is the contiguous block of ``role == "tool"`` messages directly
+    after an assistant message carrying ``tool_calls``. Matching is
+    variant-aware (same alias policy as the pairing pass). Unmatched results
+    keep their relative order after the matched ones. Returns
+    ``(messages, reordered_run_count)``; the input list and its dicts are
+    never mutated, and an already-ordered transcript comes back as the same
+    list object.
+    """
+    out: Optional[List[Dict[str, Any]]] = None
+    reordered = 0
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        if not (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and msg.get("tool_calls")
+        ):
+            i += 1
+            continue
+        call_variants = [tool_call_id_variants(tc) for tc in msg.get("tool_calls") or []]
+        j = i + 1
+        while j < n and isinstance(messages[j], dict) and messages[j].get("role") == "tool":
+            j += 1
+        run = messages[i + 1:j]
+        if len(run) > 1:
+            def _key(item):
+                pos, result = item
+                variants = tool_result_id_variants(result.get("tool_call_id"))
+                for idx, cv in enumerate(call_variants):
+                    if cv and variants & cv:
+                        return (idx, pos)
+                return (len(call_variants), pos)
+
+            ordered = [r for _pos, r in sorted(enumerate(run), key=_key)]
+            if any(a is not b for a, b in zip(ordered, run)):
+                if out is None:
+                    out = list(messages)
+                out[i + 1:j] = ordered
+                reordered += 1
+        i = j
+    return (out if out is not None else messages), reordered
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -4613,6 +4663,23 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: added %d stub tool result(s) for "
             "positionally unanswered tool call(s)",
             added_stubs,
+        )
+
+    # --- Order each tool-result run by its assistant turn's tool_calls ---
+    # Results must follow the declaring turn in tool_calls order. The
+    # claude-bpr native result relay fails closed on any other order (400
+    # "received tool results out of tool_calls order"), and every producer
+    # does not guarantee it: the mixed-batch invalid-tool path in
+    # conversation_loop appends the invalid calls' error results BEFORE the
+    # valid calls execute, and the stub flush above emits in sorted-id order.
+    # Live 2026-09-24/25 on bg-review forks (whose inherited tools[] include
+    # names outside their valid set). Per-call copy only; persisted history
+    # is untouched.
+    messages, reordered_runs = order_tool_results_by_call_index(messages)
+    if reordered_runs:
+        _ra().logger.debug(
+            "Pre-call sanitizer: reordered %d tool-result run(s) into tool_calls order",
+            reordered_runs,
         )
 
     # 3. Deduplicate tool_call_ids. Strict providers (DeepSeek) reject a
