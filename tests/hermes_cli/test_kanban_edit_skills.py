@@ -118,6 +118,24 @@ def test_create_milestone_qa_explicit_skill_not_duplicated(kanban_home):
     assert "skills_auto_added" not in _events(tid, "created")[0]
 
 
+def test_create_milestone_qa_whitespace_skill_no_false_notice(kanban_home):
+    out = kc.run_slash("create '[milestone] QA: z' --assignee argus --skill ' sdlc-review '")
+    assert "Added skill" not in out
+    assert _skills(_created_id(out)) == ["sdlc-review"]
+
+
+def test_idempotent_hit_on_legacy_card_no_false_notice(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="[milestone] QA: old", assignee="argus",
+                             idempotency_key="k1")
+        conn.execute("UPDATE tasks SET skills = NULL WHERE id = ?", (tid,))
+        conn.commit()
+    out = kc.run_slash("create '[milestone] QA: old' --assignee argus --idempotency-key k1")
+    assert _created_id(out) == tid
+    assert "Added skill" not in out
+    assert _skills(tid) == []
+
+
 def test_create_other_titles_untouched(kanban_home):
     for title in ("plain", "[milestone] build x", "fix [milestone] QA wording"):
         with kb.connect() as conn:

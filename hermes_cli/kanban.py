@@ -2862,8 +2862,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
-        if (kb.is_milestone_qa_title(task.title)
-                and kb.MILESTONE_QA_SKILL not in (getattr(args, "skills", None) or [])):
+        # Read the stored row, not the title: an idempotent hit on a legacy
+        # card never gets the skill, and " sdlc-review " normalizes to it.
+        asked = {str(x).strip() for x in (getattr(args, "skills", None) or [])}
+        if (kb.MILESTONE_QA_SKILL in (task.skills or [])
+                and kb.MILESTONE_QA_SKILL not in asked):
             print(
                 f"Added skill {kb.MILESTONE_QA_SKILL} ([milestone] QA cards run "
                 "Argus on the sdlc-review procedure)."
