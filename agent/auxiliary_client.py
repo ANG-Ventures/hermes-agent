@@ -6325,6 +6325,11 @@ def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     return None
 
 
+def _context_probe_api_key(api_key: Any) -> str:
+    """String key for a context-length probe; a callable key yields ""."""
+    return api_key if isinstance(api_key, str) else ""
+
+
 def _candidate_context_window(
     provider: str,
     model: str,
@@ -6477,7 +6482,7 @@ def _try_configured_fallback_chain(
                     fb_provider,
                     resolved_model,
                     base_url=str(entry.get("base_url") or ""),
-                    api_key=_fallback_entry_api_key(entry) or "",
+                    api_key=_context_probe_api_key(_fallback_entry_api_key(entry)),
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -6534,6 +6539,11 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     """
     from hermes_cli.fallback_config import resolve_entry_api_key
 
+    inline = entry.get("api_key") if isinstance(entry, dict) else None
+    if callable(inline) and not isinstance(inline, str):
+        # Inherited from a main runtime (Entra ID token provider): pass the
+        # callable through, as Step 1 of _resolve_auto_route does.
+        return inline
     return resolve_entry_api_key(entry)
 
 
@@ -6592,9 +6602,11 @@ def resolve_auto_chain_entry(
     session is running on", read at CALL time from ``main_runtime`` (or the
     context-local runtime when the caller passed none). The returned entry
     carries the main provider + model, so labels, telemetry and the
-    failed-route skip all see the concrete route, never ``auto``. Credentials
-    resolve through the provider exactly as the main-agent safety net
-    (:func:`_try_main_agent_model_fallback`) does.
+    failed-route skip all see the concrete route, never ``auto``. The
+    runtime's ``base_url`` / ``api_key`` / ``api_mode`` (a session-specific
+    endpoint or pinned key) are inherited via :func:`_main_runtime_route`,
+    the same translation the main aux route uses; the entry's non-route keys
+    (``timeout``, fast-lane controls) are kept.
 
     Returns ``None`` (the rung is skipped) when there is no live main runtime,
     or the runtime itself is ``auto`` / incomplete. A model-less ``auto``
@@ -6605,14 +6617,32 @@ def resolve_auto_chain_entry(
     runtime = _normalize_main_runtime(main_runtime)
     provider = str(runtime.get("provider") or "").strip().lower()
     model = str(runtime.get("model") or "").strip()
+    base_url = str(runtime.get("base_url") or "")
+    api_key = runtime.get("api_key") or ""
+    api_mode = str(runtime.get("api_mode") or "")
     if provider == "moa":
         provider, model = _resolve_moa_aggregator(model)
         provider = str(provider or "").strip().lower()
         model = str(model or "").strip()
+        # The MoA facade's base_url/api_key are not the aggregator's route
+        # (same rule as Step 1 of _resolve_auto_route).
+        base_url, api_key, api_mode = "", "", ""
     if not provider or not model or provider == AUTO_CHAIN_PROVIDER:
         return None
     resolved = {k: v for k, v in entry.items() if k not in _AUTO_CHAIN_ROUTE_KEYS}
-    resolved.update(provider=provider, model=model)
+    # The session's endpoint and key come with its provider/model, through
+    # the same translation Step 1 uses, so ``auto`` reaches the session's
+    # main route rather than the provider's defaults.
+    route_provider, route_base_url, route_api_key = _main_runtime_route(
+        provider, base_url, api_key,
+    )
+    resolved.update(provider=route_provider, model=model)
+    if route_base_url:
+        resolved["base_url"] = route_base_url
+    if route_api_key:
+        resolved["api_key"] = route_api_key
+    if api_mode:
+        resolved["api_mode"] = api_mode
     return resolved
 
 
@@ -6733,7 +6763,7 @@ def _select_main_fallback_entry(
                     fb_provider,
                     resolved_model or fb_model,
                     base_url=str(entry.get("base_url") or ""),
-                    api_key=_fallback_entry_api_key(entry) or "",
+                    api_key=_context_probe_api_key(_fallback_entry_api_key(entry)),
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -6776,6 +6806,66 @@ def _resolve_single_provider(
         explicit_api_key=api_key,
     )
     return client
+
+
+def _main_runtime_route(
+    main_provider: str,
+    runtime_base_url: str,
+    runtime_api_key: Any,
+) -> Tuple[str, Optional[str], Any]:
+    """Explicit route for the live main runtime: (provider, base_url, api_key).
+
+    THE one translation from a main runtime (provider + session endpoint +
+    session key) to ``resolve_provider_client`` arguments. Shared by Step 1 of
+    :func:`_resolve_auto_route` and the ``{provider: auto}`` fallback rung
+    (:func:`resolve_auto_chain_entry`), so a session on a custom endpoint or
+    a session-pinned key reaches the same backend through either path.
+    """
+    resolved_provider = main_provider
+    explicit_base_url = runtime_base_url or None
+    explicit_api_key = None
+    if runtime_base_url and main_provider == "custom":
+        # Anonymous custom endpoint (OPENAI_BASE_URL / config.model.base_url)
+        # — pass through with explicit base_url + api_key.
+        resolved_provider = "custom"
+        explicit_base_url = runtime_base_url
+        explicit_api_key = runtime_api_key or None
+    elif main_provider.startswith("custom:"):
+        # Named custom provider (custom_providers / providers dict entry).
+        _has_named_entry = False
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+            _has_named_entry = _get_named_custom_provider(main_provider) is not None
+        except ImportError:
+            pass
+        if _has_named_entry:
+            # KEEP the full ``custom:<name>`` so resolve_provider_client
+            # lands in the named-custom-provider arm — that arm honours the
+            # entry's api_mode (e.g. anthropic_messages →
+            # AnthropicAuxiliaryClient, avoiding the /anthropic→/v1 rewrite
+            # that 404s against proxies like Palantir Foundry's Anthropic
+            # surface).  Do NOT collapse to plain "custom"; that path
+            # strips /anthropic and routes through OpenAI chat.completions.
+            # base_url and api_key come from the named entry itself, so
+            # leave the explicit_* overrides unset.
+            resolved_provider = main_provider
+            explicit_base_url = None
+        elif runtime_base_url:
+            # Config-less named custom provider (#34777): the entry only
+            # exists in the live runtime, so collapse to the anonymous
+            # custom arm with the runtime endpoint + key.
+            resolved_provider = "custom"
+            explicit_base_url = runtime_base_url
+            explicit_api_key = runtime_api_key or None
+        elif runtime_api_key:
+            explicit_api_key = runtime_api_key
+    elif runtime_api_key:
+        # Pin auxiliary to the same api_key as the active main chat session
+        # so that a working key is reused instead of re-selecting from the pool
+        # (which might pick a different, potentially exhausted key).
+        explicit_api_key = runtime_api_key
+    return resolved_provider, explicit_base_url, explicit_api_key
+
 
 def _resolve_auto_route(
     main_runtime: Optional[Dict[str, Any]] = None,
@@ -6886,49 +6976,9 @@ def _resolve_auto_route(
 
     if (main_provider and main_model
             and main_provider not in {"auto", ""}):
-        resolved_provider = main_provider
-        explicit_base_url = runtime_base_url or None
-        explicit_api_key = None
-        if runtime_base_url and main_provider == "custom":
-            # Anonymous custom endpoint (OPENAI_BASE_URL / config.model.base_url)
-            # — pass through with explicit base_url + api_key.
-            resolved_provider = "custom"
-            explicit_base_url = runtime_base_url
-            explicit_api_key = runtime_api_key or None
-        elif main_provider.startswith("custom:"):
-            # Named custom provider (custom_providers / providers dict entry).
-            _has_named_entry = False
-            try:
-                from hermes_cli.runtime_provider import _get_named_custom_provider
-                _has_named_entry = _get_named_custom_provider(main_provider) is not None
-            except ImportError:
-                pass
-            if _has_named_entry:
-                # KEEP the full ``custom:<name>`` so resolve_provider_client
-                # lands in the named-custom-provider arm — that arm honours the
-                # entry's api_mode (e.g. anthropic_messages →
-                # AnthropicAuxiliaryClient, avoiding the /anthropic→/v1 rewrite
-                # that 404s against proxies like Palantir Foundry's Anthropic
-                # surface).  Do NOT collapse to plain "custom"; that path
-                # strips /anthropic and routes through OpenAI chat.completions.
-                # base_url and api_key come from the named entry itself, so
-                # leave the explicit_* overrides unset.
-                resolved_provider = main_provider
-                explicit_base_url = None
-            elif runtime_base_url:
-                # Config-less named custom provider (#34777): the entry only
-                # exists in the live runtime, so collapse to the anonymous
-                # custom arm with the runtime endpoint + key.
-                resolved_provider = "custom"
-                explicit_base_url = runtime_base_url
-                explicit_api_key = runtime_api_key or None
-            elif runtime_api_key:
-                explicit_api_key = runtime_api_key
-        elif runtime_api_key:
-            # Pin auxiliary to the same api_key as the active main chat session
-            # so that a working key is reused instead of re-selecting from the pool
-            # (which might pick a different, potentially exhausted key).
-            explicit_api_key = runtime_api_key
+        resolved_provider, explicit_base_url, explicit_api_key = _main_runtime_route(
+            main_provider, runtime_base_url, runtime_api_key,
+        )
         # Skip Step-1 if the main provider was recently 402'd. The unhealthy
         # cache TTL bounds how long we bypass it, so a topped-up account
         # recovers automatically. If we tried Step-1 anyway, every aux call
