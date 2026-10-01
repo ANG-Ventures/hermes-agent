@@ -6253,6 +6253,119 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
     sys.exit(1)
 
 
+SHADOW_CWD_ALLOW_ENV = "HERMES_ALLOW_SHADOW_CWD"
+# Exit code for the shadow-cwd refusal. Deliberately NOT 0 or 75 (the
+# token-crash / stale-code relaunch code) and not 78 (fatal config: systemd's
+# RestartPreventExitStatus would stop retrying). A plain failure lets launchd
+# KeepAlive / systemd Restart=always relaunch from the unit's configured cwd.
+GATEWAY_SHADOW_CWD_EXIT_CODE = 1
+
+
+def _shadow_cwd_forbidden_roots() -> list[Path]:
+    from hermes_constants import get_default_hermes_root
+
+    roots = [Path("/Volumes/fleet-scratch")]
+    try:
+        roots.append(get_default_hermes_root() / "kanban" / "workspaces")
+    except Exception:
+        logger.debug("shadow-cwd guard: fleet root probe failed", exc_info=True)
+    return roots
+
+
+def _shadow_cwd_reason(
+    path: str | os.PathLike,
+    *,
+    package_root: Path | None = None,
+    forbidden_roots: list[Path] | None = None,
+) -> str | None:
+    """Return why ``path`` would shadow the installed package, else None.
+
+    A gateway whose ``sys.path[0]`` or cwd is a kanban workspace, a fleet
+    scratch slice, or any other checkout with a top-level ``hermes_cli/`` can
+    import unreviewed code instead of the deployed tree.
+    """
+    try:
+        resolved = Path(path or ".").resolve()
+    except (OSError, RuntimeError):
+        return None
+    root = (package_root or PROJECT_ROOT).resolve()
+    for forbidden in forbidden_roots if forbidden_roots is not None else _shadow_cwd_forbidden_roots():
+        try:
+            forbidden = forbidden.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved == forbidden or forbidden in resolved.parents:
+            return f"{resolved} is under {forbidden}"
+    if resolved != root and (resolved / "hermes_cli").is_dir():
+        return f"{resolved} has a top-level hermes_cli/ that is not the install root {root}"
+    return None
+
+
+def _shadow_import_reason(
+    cwd: str,
+    *,
+    package_root: Path | None = None,
+    prefix: str | None = None,
+) -> str | None:
+    """Return why the RUNNING code looks loaded from a shadow cwd, else None.
+
+    Under ``python -m hermes_cli.main`` the cwd is ``sys.path[0]``, so a
+    checkout in the cwd is imported instead of the install and becomes
+    ``PROJECT_ROOT`` itself (the ``hermes_cli/`` check then passes). Flag that
+    case unless the interpreter's own environment lives inside that tree (a
+    checkout running its own venv, as in CI or a dev clone).
+    """
+    try:
+        root = (package_root or PROJECT_ROOT).resolve()
+        here = Path(cwd).resolve()
+        env = Path(prefix if prefix is not None else sys.prefix).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if here != root:
+        return None
+    if env == root or root in env.parents:
+        return None
+    return (
+        f"{root} is the imported code tree (loaded from the cwd), "
+        f"but the interpreter environment {env} is not inside it"
+    )
+
+
+def _guard_shadow_cwd() -> None:
+    """Refuse ``gateway run`` from a cwd/sys.path[0] that shadows the install."""
+    if _truthy_env(os.getenv(SHADOW_CWD_ALLOW_ENV)):
+        return
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    candidates = [("sys.path[0]", (sys.path[0] if sys.path else "") or cwd), ("cwd", cwd)]
+    refused = False
+    for label, candidate in candidates:
+        if not candidate:
+            continue
+        reason = _shadow_cwd_reason(candidate)
+        if reason is None:
+            continue
+        refused = True
+        logger.error("Refusing gateway start: %s %s", label, reason)
+        print_error(f"Refusing to start the gateway: {label} {reason}.")
+    if cwd:
+        reason = _shadow_import_reason(cwd)
+        if reason is not None:
+            refused = True
+            logger.error("Refusing gateway start: %s", reason)
+            print_error(f"Refusing to start the gateway: {reason}.")
+    if refused:
+        print(
+            "  A gateway started from a worker workspace or checkout can import\n"
+            "  that tree's code instead of the deployed install. Start it from the\n"
+            "  service's WorkingDirectory (launchd/systemd relaunch does this).\n"
+            f"  Set {SHADOW_CWD_ALLOW_ENV}=1 only for hermetic test rigs."
+        )
+        sys.exit(GATEWAY_SHADOW_CWD_EXIT_CODE)
+
+
 def _guard_official_docker_root_gateway() -> None:
     """Refuse gateway startup when the official Docker privilege drop was bypassed."""
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
@@ -6292,6 +6405,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
     """
+    _guard_shadow_cwd()
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
