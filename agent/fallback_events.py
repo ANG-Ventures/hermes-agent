@@ -325,10 +325,20 @@ def _scrub_leaves(obj: Any, depth: int = 0) -> Any:
 def _dead_letter_body(raw: Any) -> str:
     """Scrubbed body, cut to DEAD_LETTER_BODY_MAX only after scrubbing."""
     if isinstance(raw, (dict, list)):
-        text = json.dumps(_scrub_leaves(raw), ensure_ascii=False, default=str)
-    else:
-        text = str(raw or "")
-    return _scrub_dead_letter(text)[:DEAD_LETTER_BODY_MAX]
+        # Per leaf, never redact_sensitive_text over json.dumps output (it can
+        # eat JSON syntax; tests/agent/test_redact_json_leaf.py). _scrub_leaves
+        # runs both scrubbers on every string; redact_sensitive_json adds the
+        # key rule ("password": "..." masked whole). Fails CLOSED ("").
+        try:
+            from agent.redact import redact_sensitive_json
+
+            leaves = redact_sensitive_json(
+                _scrub_leaves(raw), force=True, redact_url_credentials=True)
+            serialized = json.dumps(leaves, ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001
+            return ""
+        return _cut_unterminated_key(serialized)[:DEAD_LETTER_BODY_MAX]
+    return _scrub_dead_letter(str(raw or ""))[:DEAD_LETTER_BODY_MAX]
 
 
 def dead_letter_path() -> Any:
