@@ -13,7 +13,7 @@ runs when the main provider has no working client.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 
 
@@ -173,7 +173,8 @@ class TestResolveAutoMainFirst:
         assert client is task_client
         assert model == "task-free-model"
         mock_task_chain.assert_called_once_with(
-            "title_generation", "nvidia", reason="main provider unavailable")
+            "title_generation", "nvidia", reason="main provider unavailable",
+            main_runtime=ANY)
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 
