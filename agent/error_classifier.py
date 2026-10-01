@@ -43,6 +43,19 @@ class FailoverReason(enum.Enum):
     # Distinct from `auth` (a stale token refresh CAN fix) and from `billing`
     # (credit exhaustion on an otherwise-entitled account). See #2026-08-08.
     account_blocked = "account_blocked"
+    # Anthropic 400 "Third-party apps now draw from your extra usage, not your
+    # plan limits": Anthropic will not bill this request against plan limits.
+    # Deterministic for the route that got it (claude-apr 2026-09-30: session
+    # 45a33cbb, sub-vps-15 x claude-fable-5-1, refused 14:01, 14:19 and 14:29
+    # with an identical body), so retrying the same route is waste. Scope is
+    # seat x model x request shape: on 09-29/30 the same body came from 15
+    # different seats on claude-opus-5-5 (kanban workers), so it is not proof
+    # that one seat is bad. Fall back; never rotate (the credential is valid).
+    # Not ``account_blocked``/``auth``: those print "authentication failed"
+    # guidance and claim the whole account is unusable, while this seat still
+    # serves other models. Not ``billing``: there is no credit to top up on a
+    # plan seat and the credential pool must not bench the key for an hour.
+    extra_usage_only = "extra_usage_only"
 
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
@@ -204,6 +217,14 @@ class ClassifiedError:
 
 
 # ── Provider-specific patterns ──────────────────────────────────────────
+
+# Anthropic's plan-classification refusal (HTTP 400 invalid_request_error).
+# Matched before billing ("out of extra usage" is a different body) and before
+# the generic 400 -> format_error bucket that used to swallow it.
+_EXTRA_USAGE_ONLY_PATTERNS = (
+    "third-party apps now draw from your extra usage",
+    "third-party apps now draw from extra usage",
+)
 
 # Patterns that indicate billing exhaustion (not transient rate limit)
 _BILLING_PATTERNS = [
@@ -1350,6 +1371,17 @@ def classify_api_error(
     if any(p in error_msg for p in _ACCOUNT_BLOCKED_PATTERNS):
         return _result(
             FailoverReason.account_blocked,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
+    # Seat/model-scoped plan refusal ("Third-party apps now draw from your
+    # extra usage"). Same shape as account_blocked minus the auth semantics:
+    # fall back on the first hit, never retry the same route, never rotate.
+    if any(p in error_msg for p in _EXTRA_USAGE_ONLY_PATTERNS):
+        return _result(
+            FailoverReason.extra_usage_only,
             retryable=False,
             should_rotate_credential=False,
             should_fallback=True,

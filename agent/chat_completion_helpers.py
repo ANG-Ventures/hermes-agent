@@ -3306,6 +3306,7 @@ _FALLBACK_REASON_LABELS = {
     "auth": "auth refresh",
     "auth_permanent": "auth failed",
     "account_blocked": "account blocked",
+    "extra_usage_only": "sub refused plan billing",
     "model_not_found": "model unavailable",
     "body_too_large": "request body too large",
     "payload_too_large": "payload too large",
@@ -4690,6 +4691,15 @@ def try_activate_fallback(
             # Sticky writer (§4.2; B1 guard inside), then the row. The row is
             # built now and written AFTER the announce so it carries the
             # notice_text (§4.8); a failed announce still writes it.
+            # Same-error re-failover backoff (t_7f2ced0d): reads the pending
+            # error before build_row consumes it. A return that re-failed with
+            # the identical error benches the primary for the doubled window.
+            _same_err = _fw.same_error_on_failover(agent, failing=(old_provider, old_model))
+            if _same_err.get("same_err_backoff_s"):
+                agent._rate_limited_until = max(
+                    getattr(agent, "_rate_limited_until", 0) or 0,
+                    time.monotonic() + float(_same_err["same_err_backoff_s"]),
+                )
             _cool = None
             _rl_until = getattr(agent, "_rate_limited_until", 0) or 0
             if _rl_until:
@@ -4705,7 +4715,7 @@ def try_activate_fallback(
                     from_provider=old_provider, from_model=old_model,
                     to_provider=fb_provider, to_model=fb_model,
                     reason=reason, error_context=error_context,
-                    cooldown_s=_cool, extra=_policy_extra,
+                    cooldown_s=_cool, extra={**(_policy_extra or {}), **_same_err},
                 )
             except Exception:
                 logger.warning("fallback ledger row build failed", exc_info=True)

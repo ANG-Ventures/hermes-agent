@@ -983,6 +983,8 @@ def normalize_hop(raw: Optional[str]) -> Optional[str]:
 
 # claude-pool deploy-drain 503 (t_4349cf26): decided AT the relay, no seat.
 RELAY_DRAIN_CAUSE = "relay draining for deploy"
+# Anthropic 400 "Third-party apps now draw from your extra usage" (t_7f2ced0d).
+THIRD_PARTY_CAUSE = "plan billing refused (extra usage only)"
 
 
 def _cause_phrase(row: Mapping[str, Any]) -> str:
@@ -1025,6 +1027,8 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         if weekly:
             return "weekly limit"
         return "model quota exhausted" if cls == "quota_model" else "seat quota exhausted"
+    if cls == "auth" and "third-party apps" in t:
+        return THIRD_PARTY_CAUSE
     return {
         "rate_upstream": "account rate limit",
         "refusal": "content policy refusal",
@@ -1100,6 +1104,10 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     never omitted or guessed.
     """
     row = fill_pin_evidence(row)
+    return _cause_body(row, seat_names, tz) + same_error_rider(row, seat_names=seat_names, tz=tz)
+
+
+def _cause_body(row: Mapping[str, Any], seat_names: bool, tz: Optional[_dt.tzinfo]) -> str:
     prefix, window = _count_window(row, tz)
     if _plain_provider(row):
         # The banner ends after the vendor's words when there are any (Ace,
@@ -1116,6 +1124,83 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
             return f"{prefix}{cause} (at the relay), {window}"
         return f"{prefix}relay busy: all subs at capacity (at the relay), {window}"
     return f"{prefix}{cause} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+
+
+# ── same-error re-failover backoff (t_7f2ced0d) ───────────────────────────
+# A primary return whose first call fails with the SAME normalized error
+# (``fallback_events.err_hash``) as the failover that preceded it learned
+# nothing new and paid a cold cache write on the fallback. Measured
+# 2026-09-30, session 20260929_140138_45a33cbb: apr/fable -> bpr/opus at
+# 14:01:40, 14:19:43 and 14:29:58, each one 2-3 s after a turn-boundary
+# return, same 400 on sub-vps-15 each time.
+#
+# Re-failover counts as "the same" when it lands within this many seconds of
+# the return. Measured return -> re-failover gaps were 2-3 s (pre-stream 400);
+# 60 s also covers a slow first byte without catching a genuinely new episode.
+SAME_ERR_RETURN_WINDOW_S = 60.0
+# First backoff. Today's recovery cadence is one try per user turn: measured
+# returns came 18 min (14:01 -> 14:19) and 10 min (14:19 -> 14:29) apart, so
+# 20 min doubles the shortest observed window and skips at least one return.
+SAME_ERR_BACKOFF_BASE_S = 20 * MIN
+# Ceiling. The same 400 on the same session was seen 09-29 14:02 and again
+# 09-30 13:41-14:29, so this condition outlives any doubling; 4 h (the
+# legacy unattributed-backoff ceiling in try_activate_fallback) still probes
+# a few times a day so a fixed seat or a relay rebind is found the same day.
+SAME_ERR_BACKOFF_CEILING_S = 4 * HOUR
+
+
+def same_error_backoff(prev: Optional[Mapping[str, Any]], *, err_hash: Optional[str],
+                       now: float, last_return_ts: Optional[float],
+                       seat: Optional[str] = None,
+                       route: Tuple[Any, Any] = ("", "")) -> Dict[str, Any]:
+    """Next same-error episode for a failover of ``route`` with ``err_hash``.
+
+    ``prev`` is the episode the previous PRIMARY failover left (``{}``/None if
+    none). Returns ``{route, err_hash, ts, seat, repeats, backoff_s, prev_ts,
+    prev_seat}``: ``backoff_s`` is None unless this failover repeats ``prev``'s
+    route AND hash within :data:`SAME_ERR_RETURN_WINDOW_S` of a primary
+    return, in which case it is ``min(BASE * 2**(repeats-1), CEILING)`` and
+    ``prev_ts`` / ``prev_seat`` name the earlier failure for the rider. Pure.
+    """
+    prev = dict(prev or {})
+    route_l = list(_norm_pm(*route))
+    repeat = bool(
+        err_hash and prev.get("err_hash") == err_hash
+        and list(prev.get("route") or ()) == route_l
+        and last_return_ts is not None
+        and isinstance(prev.get("ts"), (int, float)) and prev["ts"] <= last_return_ts
+        and 0.0 <= now - float(last_return_ts) <= SAME_ERR_RETURN_WINDOW_S)
+    repeats = int(prev.get("repeats") or 0) + 1 if repeat else 0
+    backoff = (min(SAME_ERR_BACKOFF_BASE_S * (2 ** (repeats - 1)), SAME_ERR_BACKOFF_CEILING_S)
+               if repeat else None)
+    return {
+        "route": route_l, "err_hash": err_hash, "ts": now,
+        "seat": (seat or prev.get("seat")) if repeat else seat,
+        "repeats": repeats, "backoff_s": backoff,
+        "prev_ts": prev.get("ts") if repeat else None,
+        "prev_seat": prev.get("seat") if repeat else None,
+    }
+
+
+def _dur(s: float) -> str:
+    s = int(round(s))
+    if s < HOUR:
+        return f"{max(1, s // 60)}m"
+    h, m = divmod(s // 60, 60)
+    return f"{h}h{m:02d}m" if m else f"{h}h"
+
+
+def same_error_rider(row: Mapping[str, Any], *, seat_names: bool = True,
+                     tz: Optional[_dt.tzinfo] = None) -> str:
+    """``; same error as 14:19:43 on sub-vps-15; backing off to 40m`` when the
+    row carries a same-error backoff, else ''."""
+    backoff, prev_ts = row.get("same_err_backoff_s"), row.get("same_err_prev_ts")
+    if not isinstance(backoff, (int, float)) or not isinstance(prev_ts, (int, float)):
+        return ""
+    seat = row.get("same_err_prev_seat") or row.get("seat")
+    where = f" on {seat if seat_names else 'a sub'}" if seat and seat != "unknown" else ""
+    return (f"; same error as {_hms(prev_ts, tz).strftime('%H:%M:%S')}{where}; "
+            f"backing off to {_dur(backoff)}")
 
 
 _VENDOR_NAMES = {"openrouter": "OpenRouter", "openai-codex": "OpenAI", "openai": "OpenAI",
