@@ -9559,6 +9559,13 @@ def _make_agent(
         pass
 
     cfg = _load_cfg()
+    # Agent creation already holds the session's profile scope, unlike serve
+    # startup: register that profile's config.yaml shell hooks on its own
+    # plugin manager (idempotent per home). Without this, serve/dashboard and
+    # the TUI stdio backend ran every turn with no shell hooks (t_e5708887).
+    from agent.shell_hooks import register_from_config
+
+    register_from_config(cfg)
     from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
 
     system_prompt = resolve_ephemeral_system_prompt_from_config(cfg)
