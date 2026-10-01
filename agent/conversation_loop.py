@@ -4472,6 +4472,12 @@ def run_conversation(
                     # response is not classified here, so let the failover
                     # resolve to the honest "connection issue" floor rather than
                     # fabricate a reason. (2026-07-12 reason-threading sweep.)
+                    # Dead-letter evidence only (t_b2e9ef12); class unchanged.
+                    from agent import fallback_events as _fbe_floor
+
+                    _fbe_floor.stash_response_failure(
+                        agent, "invalid_response", response,
+                        detail=", ".join(error_details), elapsed_s=api_duration)
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -4549,6 +4555,11 @@ def run_conversation(
                         # Floor site (by design, no reason=): invalid-response
                         # exhaustion carries no classification here → "connection
                         # issue" floor. (2026-07-12 reason-threading sweep.)
+                        from agent import fallback_events as _fbe_floor
+
+                        _fbe_floor.stash_response_failure(
+                            agent, "invalid_response_exhausted", response,
+                            detail=", ".join(error_details), elapsed_s=api_duration)
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -6099,7 +6110,10 @@ def run_conversation(
                 # failover, cleared by the next successful call. Never raises.
                 from agent import fallback_events as _fbe
 
-                _fbe.stash_api_error(agent, api_error, status_code, error_context)
+                # elapsed_s: since this call's FIRST attempt (api_start_time
+                # is set once per call, before the retry loop).
+                _fbe.stash_api_error(agent, api_error, status_code, error_context,
+                                     elapsed_s=time.time() - api_start_time)
                 # Stamp the quota window (5h vs 7d) so the failover announce can
                 # name WHICH limit bound. Consumed once by _quota_window_suffix;
                 # only set when the provider actually told us, so non-Anthropic
@@ -9952,6 +9966,11 @@ def run_conversation(
                         # Floor site (by design, no reason=): repeated empty
                         # responses aren't classified here → "connection issue"
                         # floor. (2026-07-12 reason-threading sweep.)
+                        from agent import fallback_events as _fbe_floor
+
+                        _fbe_floor.stash_response_failure(
+                            agent, "empty_response", response,
+                            detail=f"finish_reason={finish_reason}")
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)

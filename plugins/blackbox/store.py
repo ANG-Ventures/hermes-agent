@@ -1460,6 +1460,8 @@ _FALLBACK_EVENT_COLUMNS = (
     "warm_window_s", "warm_eligible", "warm_refusal_arm", "warm_gate",
     # t_90d3bd12: box contention behind a "warm_seat: bound box full" refusal.
     "bound_box_free", "warm_box_free",
+    # t_b2e9ef12: what a no-status / rejected-response failover died of.
+    "exc_name", "socket_cause", "floor_site",
 )
 # Additive columns on fallback_events (Phase 2 + warm-seat P3); migrated per column.
 _FALLBACK_EVENT_PHASE2_COLUMNS = (
@@ -1471,6 +1473,7 @@ _FALLBACK_EVENT_PHASE2_COLUMNS = (
     ("warm_age_s", "REAL"), ("warm_window_s", "REAL"), ("warm_eligible", "INT"),
     ("warm_refusal_arm", "INT"), ("warm_gate", "TEXT"),
     ("bound_box_free", "INT"), ("warm_box_free", "INT"),
+    ("exc_name", "TEXT"), ("socket_cause", "TEXT"), ("floor_site", "TEXT"),
 )
 FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused", "sticky_resume")
 
