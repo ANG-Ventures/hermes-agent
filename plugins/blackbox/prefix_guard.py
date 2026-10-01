@@ -58,9 +58,37 @@ def _strip_cache_control(node: Any) -> Any:
     return node
 
 
+def _collapse_marker_wrap(node: Any) -> Any:
+    """Fold a lone ``[{"type": "text", "text": X}]`` message content back to ``X``.
+
+    The breakpoint decorator (``agent.prompt_caching._apply_cache_marker``)
+    wraps a string ``content`` into one text part to carry ``cache_control``.
+    Once the message leaves the rolling breakpoint window it goes out as the
+    bare string again: same text, 25 bytes of wrapper less (t_29abfaf6: 2602
+    OpenRouter kimi-k3 rows). Both forms are one text block to the provider,
+    so after the marker is stripped the wrapper is marker residue too.
+    """
+    if isinstance(node, dict):
+        out = {k: _collapse_marker_wrap(v) for k, v in node.items()}
+        content = out.get("content")
+        if (
+            isinstance(content, list)
+            and len(content) == 1
+            and isinstance(content[0], dict)
+            and set(content[0]) == {"type", "text"}
+            and content[0]["type"] == "text"
+            and isinstance(content[0]["text"], str)
+        ):
+            out["content"] = content[0]["text"]
+        return out
+    if isinstance(node, (list, tuple)):
+        return [_collapse_marker_wrap(v) for v in node]
+    return node
+
+
 def _canonical_bytes(obj: Any) -> bytes:
     return json.dumps(
-        _strip_cache_control(obj), sort_keys=True, separators=(",", ":"),
+        _collapse_marker_wrap(_strip_cache_control(obj)), sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, default=str,
     ).encode("utf-8", "surrogatepass")
 
