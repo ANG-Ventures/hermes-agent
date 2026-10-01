@@ -365,6 +365,12 @@ def test_meta_refusal_detector_hits(reply):
         "and decided to add a meta-refusal detector.\nExpand for details about: "
         "relay debugging",
         "Assistant renamed config.yaml keys; user approved. Expand for details about: rename",
+        # Prism d4968847c2b5: a short summary that QUOTES or reports a refusal.
+        'Assistant said "I cannot provide a summary"; the user switched to relay '
+        "configuration. Expand for details about: relay configuration",
+        "Assistant replied \u201cI won't redo that summary\u201d and the user narrowed "
+        "the scope to the relay config.",
+        "The assistant said I can't summarize the signing material; user removed it.",
     ],
 )
 def test_meta_refusal_detector_misses_real_summaries(reply):
@@ -381,23 +387,29 @@ def test_long_reply_with_refusal_quote_is_accepted(monkeypatch):
     assert not escalation._is_meta_refusal_reply(body, 1200)
 
 
-def test_tiny_output_for_huge_input_falls_through_without_refusal_words(monkeypatch):
+def test_tiny_output_for_huge_input_without_refusal_phrasing_is_accepted(monkeypatch):
+    """Ratio alone never rejects (Apollo 2026-09-30): it would also latch a
+    budget-dependent length miss across L1/L2 (Prism eb6459fd5d4e)."""
     seen = []
 
     def route(**kw):
         seen.append(kw.get("model"))
-        if kw.get("model") == "claude-sonnet-5-5":
-            return _ok("Understood. Please give me a narrower topic.")
-        return _ok("- Decision one\n" * 400)
+        return _ok("Decision: keep sonnet primary; flash ruled out.")
 
     monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
     summary, level = summarize_with_escalation(
         text=SEGMENT, source_tokens=100_000, token_budget=12_000,
         model="claude-sonnet-5-5", fallback_models=["luna"],
     )
-    assert level == 1
-    assert summary.startswith("- Decision one")
-    assert seen == ["claude-sonnet-5-5", "luna"]
+    assert (summary, level) == ("Decision: keep sonnet primary; flash ruled out.", 1)
+    assert seen == ["claude-sonnet-5-5"]
+
+
+def test_refusal_phrasing_in_long_reply_is_accepted(monkeypatch):
+    """Phrasing alone never rejects either: a long reply is a summary."""
+    long_reply = "I can't summarize every tool call, so here are the decisions.\n" + (
+        "- kept decision detail\n" * 400)
+    assert not escalation._is_meta_refusal_reply(long_reply, 1200)
 
 
 def test_short_summary_of_short_input_remains_valid(monkeypatch):
@@ -439,9 +451,5 @@ def test_huge_prompt_skips_flash_bridge_with_truncated_tail(monkeypatch):
         token_budget=12_000, model="sonnet",
         fallback_models=["gemini-3.8-flash-medium", "gpt-6-luna-900k"],
     )
-    # The luna output itself is too small for the large-input ratio gate, so
-    # it is correctly not committed either. What matters here: flash saw no
-    # truncated prompt and the next route was attempted.
-    assert seen[:2] == ["sonnet", "gpt-6-luna-900k"]
-    assert "gemini-3.8-flash-medium" not in seen
-    assert summary != NODE_946_REPLY
+    assert seen == ["sonnet", "gpt-6-luna-900k"]
+    assert (summary, level) == ("A summary from luna", 1)

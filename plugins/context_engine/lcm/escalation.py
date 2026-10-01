@@ -382,22 +382,41 @@ def _sanitize_reasoning_summary(text: str) -> str:
 # instead of summarizing (LCM node 946 on claude-sonnet-5-5, 2/2 replays, ~140
 # tokens against a 12,000 budget): "Understood. I won't redo that summary, even
 # in a different wording. I can't tell which part tripped the classifier...".
-# It is shorter than the source, so the length gate alone accepts it. Detect it
-# by BOTH first-person refusal/classifier phrasing near the start AND a reply
-# far below the requested budget: a real summary that merely mentions a
-# classifier or quotes a refusal is long and third-person.
-_META_REFUSAL_SCAN_CHARS = 300
+# It is shorter than the source, so the length gate alone accepts it. Both
+# signals are required, never either alone: the reply's OWN first sentence
+# (quoted spans removed, a bare "Understood."/"Okay." lead-in skipped) opens
+# with first-person refusal phrasing or carries a safeguard tag, AND the reply
+# is tiny relative to the requested budget. A summary that quotes or reports a
+# refusal ('Assistant said "I cannot ..."') is third-person and not a refusal.
 _META_REFUSAL_MAX_TOKENS_FLOOR = 256
 _META_REFUSAL_BUDGET_FRACTION = 0.05
-_META_REFUSAL_RE = re.compile(
-    r"\bI\s*(?:won't|will\s+not|can't|cannot|can\s+not|am\s+unable\s+to|'m\s+unable\s+to"
+_META_REFUSAL_QUOTED_RE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d|`[^`\n]*`')
+_META_REFUSAL_SENTENCE_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+_META_REFUSAL_FIRST_PERSON_RE = re.compile(
+    r"(?:(?:sorry|unfortunately|but|so|okay|ok|understood)[,.!]?\s+)*"
+    r"I\s*(?:won't|will\s+not|can't|cannot|can\s+not|am\s+unable\s+to|'m\s+unable\s+to"
     r"|am\s+not\s+able\s+to|'m\s+not\s+able\s+to|shouldn't|must\s+decline\s+to)\s+"
     r"(?:\w+\s+){0,6}?(?:redo|re-?summari[sz]e|summari[sz]e|continue|reproduce|rewrite|"
-    r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b"
-    r"|\[cyber\]"
-    r"|\bsafeguards?\s+(?:flagged|blocked|interrupted)\s+(?:this|my|the)\b",
+    r"repeat|help\s+with|complete|provide|tell\s+which\s+part\s+(?:tripped|triggered))\b",
     re.IGNORECASE,
 )
+_META_REFUSAL_TAG_RE = re.compile(
+    r"\[cyber\]|\bsafeguards?\s+(?:flagged|blocked|interrupted)\s+(?:this|my|the)\b",
+    re.IGNORECASE,
+)
+
+
+def _meta_refusal_own_first_sentence(text: str) -> str:
+    """First sentence in the reply's own voice: quotes removed, bare acks skipped."""
+    own = _META_REFUSAL_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
+    for sentence in _META_REFUSAL_SENTENCE_RE.split(own):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence.split()) <= 2 and not _META_REFUSAL_TAG_RE.search(sentence):
+            continue  # "Understood." / "Okay." lead-in
+        return sentence
+    return ""
 
 
 def _is_meta_refusal_reply(content: str, max_tokens: int) -> bool:
@@ -408,7 +427,11 @@ def _is_meta_refusal_reply(content: str, max_tokens: int) -> bool:
     ceiling = max(_META_REFUSAL_MAX_TOKENS_FLOOR, int(max_tokens * _META_REFUSAL_BUDGET_FRACTION))
     if count_tokens(text) > ceiling:
         return False
-    return bool(_META_REFUSAL_RE.search(text[:_META_REFUSAL_SCAN_CHARS]))
+    sentence = _meta_refusal_own_first_sentence(text)
+    return bool(
+        _META_REFUSAL_FIRST_PERSON_RE.match(sentence)
+        or _META_REFUSAL_TAG_RE.search(sentence)
+    )
 
 
 def _call_llm_for_summary(prompt: str, max_tokens: int,
@@ -569,8 +592,6 @@ def _invoke_summary_llm_chain(
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
     segment_key: str | None = None,
-    source_tokens: int | None = None,
-    target_tokens: int | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -633,19 +654,6 @@ def _invoke_summary_llm_chain(
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
             result = None
-        if result and source_tokens and target_tokens and source_tokens >= 50_000:
-            # A 140-token "summary" of ~400k input is not a compression
-            # success, even if it avoids the known refusal words. Keep this
-            # gate off small inputs whose genuine summaries may be tiny.
-            if count_tokens(result) < max(128, int(target_tokens * 0.02)):
-                logger.warning(
-                    "LCM summary outcome=refusal model=%s: output far below "
-                    "target (%d vs %d tokens)",
-                    candidate_model or "<default>", count_tokens(result), target_tokens,
-                )
-                if segment_key:
-                    _SUMMARY_REFUSALS.record(route_key, segment_key)
-                continue
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
@@ -887,8 +895,6 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
-        source_tokens=source_tokens,
-        target_tokens=token_budget,
     )
 
     if l1_result:
@@ -910,8 +916,6 @@ def summarize_with_escalation(
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
         segment_key=segment_key,
-        source_tokens=source_tokens,
-        target_tokens=l2_budget,
     )
 
     if l2_result:
