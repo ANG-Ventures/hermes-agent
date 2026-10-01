@@ -5831,7 +5831,7 @@ def _fallback_destination(
     model = fb_model
 
     entry = _fallback_chain_entry(task, fb_label)
-    if entry is not None:
+    if entry is not None and not _is_auto_chain_entry(entry):
         return _fallback_destination_from_entry(entry, fb_client, fb_model)
 
     return _complete_fallback_destination(provider, base_url, api_mode, model)
@@ -5910,6 +5910,10 @@ def _call_fallback_candidate_sync(
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
     fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    if _is_auto_chain_entry(fallback_entry):
+        fallback_entry = dict(
+            fallback_entry, provider=destination.provider, model=destination.model,
+        )
     fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
         task,
         actual_provider=destination.provider,
@@ -6369,6 +6373,7 @@ def _try_configured_fallback_chain(
     reason: str = "error",
     failed_model: Optional[str] = None,
     skip_indices: Optional[set[int]] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -6394,6 +6399,12 @@ def _try_configured_fallback_chain(
       provider skipped — the shared credentials/account behind every model
       on that provider are broken, so a sibling can't help and the
       main-agent-model safety net should be reached instead.
+
+    An entry spelled ``{provider: auto}`` is the session's own main model
+    (:func:`resolve_auto_chain_entry`, resolved from ``main_runtime`` at call
+    time). It is skipped when there is no live main runtime, and by the
+    normal failed-route check when the main model IS the route that just
+    failed (e.g. the session runs on the same Sonnet that refused).
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -6432,6 +6443,11 @@ def _try_configured_fallback_chain(
             continue
         if not isinstance(entry, dict):
             continue
+        if _is_auto_chain_entry(entry):
+            entry = resolve_auto_chain_entry(entry, main_runtime)
+            if entry is None:
+                tried.append(f"fallback_chain[{i}](auto: no live main runtime)")
+                continue
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
@@ -6488,6 +6504,7 @@ def _try_configured_fallback_chain(
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try task fallback_chain when an explicit aux provider cannot build.
 
@@ -6504,6 +6521,7 @@ def _try_configured_fallback_for_unavailable_client(
         task,
         explicit,
         reason="provider unavailable",
+        main_runtime=main_runtime,
     )
 
 
@@ -6543,6 +6561,101 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
         except Exception:
             pass
     return client, resolved_model
+
+
+AUTO_CHAIN_PROVIDER = "auto"
+
+# Entry keys that name a route or its credentials. An ``auto`` entry takes all
+# of them from the live main runtime; anything else (``timeout``, fast-lane
+# controls, ...) is kept from the entry itself.
+_AUTO_CHAIN_ROUTE_KEYS = frozenset({
+    "provider", "model", "base_url", "api_key", "api_key_env", "key_env",
+    "api_mode", "transport",
+})
+
+
+def _is_auto_chain_entry(entry: Any) -> bool:
+    """True for a ``fallback_chain`` entry spelled ``{provider: auto}``."""
+    return (
+        isinstance(entry, dict)
+        and str(entry.get("provider") or "").strip().lower() == AUTO_CHAIN_PROVIDER
+    )
+
+
+def resolve_auto_chain_entry(
+    entry: Dict[str, Any],
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a ``{provider: auto}`` chain entry to the session's main model.
+
+    ``auto`` in ``auxiliary.<task>.fallback_chain`` means "the model this
+    session is running on", read at CALL time from ``main_runtime`` (or the
+    context-local runtime when the caller passed none). The returned entry
+    carries the main provider + model, so labels, telemetry and the
+    failed-route skip all see the concrete route, never ``auto``. Credentials
+    resolve through the provider exactly as the main-agent safety net
+    (:func:`_try_main_agent_model_fallback`) does.
+
+    Returns ``None`` (the rung is skipped) when there is no live main runtime,
+    or the runtime itself is ``auto`` / incomplete. A model-less ``auto``
+    entry would otherwise be silently dropped by :func:`_resolve_fallback_entry`.
+    """
+    if not _is_auto_chain_entry(entry):
+        return entry if isinstance(entry, dict) else None
+    runtime = _normalize_main_runtime(main_runtime)
+    provider = str(runtime.get("provider") or "").strip().lower()
+    model = str(runtime.get("model") or "").strip()
+    if provider == "moa":
+        provider, model = _resolve_moa_aggregator(model)
+        provider = str(provider or "").strip().lower()
+        model = str(model or "").strip()
+    if not provider or not model or provider == AUTO_CHAIN_PROVIDER:
+        return None
+    resolved = {k: v for k, v in entry.items() if k not in _AUTO_CHAIN_ROUTE_KEYS}
+    resolved.update(provider=provider, model=model)
+    return resolved
+
+
+def resolve_task_fallback_chain(
+    task: str,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """``auxiliary.<task>.fallback_chain`` as ``(index, entry)`` with ``auto`` resolved.
+
+    For readers that pin a chain route themselves instead of walking it
+    through :func:`_try_configured_fallback_chain` (compression refusal
+    re-send, compression stall retry). An ``auto`` entry becomes the
+    session's main model, and is DROPPED when there is no live main runtime
+    or when it resolves to the task's own configured primary
+    (``auxiliary.<task>.provider``/``model``): re-sending to the route that
+    just refused or stalled would only repeat the failure. Indices are the
+    configured positions, so labels stay ``fallback_chain[<i>]``.
+    """
+    task_config = _get_auxiliary_task_config(task) if task else {}
+    chain = task_config.get("fallback_chain")
+    if not isinstance(chain, list):
+        return []
+    primary = (
+        str(task_config.get("provider") or "").strip().lower(),
+        str(task_config.get("model") or "").strip().lower(),
+    )
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    for index, entry in enumerate(chain):
+        if not isinstance(entry, dict):
+            continue
+        if _is_auto_chain_entry(entry):
+            resolved = resolve_auto_chain_entry(entry, main_runtime)
+            if resolved is None:
+                continue
+            ident = (
+                str(resolved.get("provider") or "").lower(),
+                str(resolved.get("model") or "").lower(),
+            )
+            if ident == primary:
+                continue
+            entry = resolved
+        out.append((index, entry))
+    return out
 
 
 def _try_main_fallback_chain(
@@ -6844,7 +6957,8 @@ def _resolve_auto_route(
     # for users who have not declared a fallback policy.
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-            task, main_provider or "auto", reason="main provider unavailable")
+            task, main_provider or "auto", reason="main provider unavailable",
+            main_runtime=main_runtime)
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
@@ -10667,7 +10781,7 @@ def _call_llm_impl(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, main_runtime=main_runtime,
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
@@ -11287,7 +11401,7 @@ def _call_llm_impl(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model, main_runtime=main_runtime)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -11297,7 +11411,7 @@ def _call_llm_impl(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model, main_runtime=main_runtime)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
@@ -11326,7 +11440,8 @@ def _call_llm_impl(
                     while True:
                         next_client, next_model, next_label = _try_configured_fallback_chain(
                             task, resolved_provider or "auto", reason="context length exceeded",
-                            failed_model=_chain_failed_model, skip_indices=skipped_indices)
+                            failed_model=_chain_failed_model, skip_indices=skipped_indices,
+                            main_runtime=main_runtime)
                         if next_client is None:
                             break
                         skipped_indices.add(int(next_label.split("[", 1)[1].split("]", 1)[0]))
@@ -11622,7 +11737,7 @@ async def _async_call_llm_impl(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, main_runtime=main_runtime,
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
@@ -12084,7 +12199,7 @@ async def _async_call_llm_impl(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model, main_runtime=main_runtime)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -12094,7 +12209,7 @@ async def _async_call_llm_impl(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model, main_runtime=main_runtime)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
@@ -12126,7 +12241,8 @@ async def _async_call_llm_impl(
                     while True:
                         next_client, next_model, next_label = _try_configured_fallback_chain(
                             task, resolved_provider or "auto", reason="context length exceeded",
-                            failed_model=_chain_failed_model, skip_indices=skipped_indices)
+                            failed_model=_chain_failed_model, skip_indices=skipped_indices,
+                            main_runtime=main_runtime)
                         if next_client is None:
                             break
                         skipped_indices.add(int(next_label.split("[", 1)[1].split("]", 1)[0]))

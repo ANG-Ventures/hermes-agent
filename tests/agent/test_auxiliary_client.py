@@ -1899,6 +1899,7 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "ollama-cloud",
             reason="provider unavailable",
+            main_runtime={},
         )
 
 
