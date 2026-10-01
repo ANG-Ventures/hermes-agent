@@ -17093,6 +17093,42 @@ def set_task_model(
     return int(cur.rowcount or 0)
 
 
+@_home_session_guarded("priority")
+def set_task_priority(
+    conn: sqlite3.Connection,
+    task_id: str,
+    priority: int,
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[int]]:
+    """Set a card's dispatch priority (higher dispatches first).
+
+    Returns ``(ok, old_priority)``; ``(False, None)`` for an unknown id (a
+    tuple so the home-session guard reads success from ``ok``, not from an
+    old priority of 0). A change records a ``priority_set`` event
+    ``{old, new, actor}``; setting the current value is a silent no-op.
+    """
+    new = int(priority)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT priority FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, None
+        old = int(row["priority"] or 0)
+        if old == new:
+            return True, old
+        conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ?", (new, task_id)
+        )
+        payload: dict = {"old": old, "new": new}
+        if actor:
+            payload["actor"] = actor
+        _append_event(conn, task_id, "priority_set", payload)
+    notify_task_updated(conn, task_id, ("priority",))
+    return True, old
+
+
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:

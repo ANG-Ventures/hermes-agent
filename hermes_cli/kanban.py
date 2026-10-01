@@ -1141,6 +1141,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "in the task event log. An unbound claim authorises THIS "
                                  "completion only: a later reclamation will not reuse it.")
 
+    p_prio = sub.add_parser(
+        "priority",
+        help="Set a task's dispatch priority (higher dispatches first among "
+             "ready cards; ties go oldest-first). Records a priority_set "
+             "event with actor + old/new. Same as edit --priority.",
+    )
+    p_prio.add_argument("task_id")
+    p_prio.add_argument("priority", type=int, help="New priority (integer, default 0)")
+
     p_edit = sub.add_parser(
         "edit",
         aliases=["update"],
@@ -1184,6 +1193,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         metavar="SESSION_ID",
         help="(Re)stamp the card's home session ('none' = unstamped).",
+    )
+    p_edit.add_argument(
+        "--priority", type=int, default=None, metavar="N",
+        help="Set the dispatch priority (higher first); records priority_set.",
     )
     _nw = p_edit.add_mutually_exclusive_group()
     _nw.add_argument(
@@ -1989,6 +2002,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "priority": _cmd_priority,
             "lane-model": _cmd_lane_model,
             "pins":     _cmd_pins,
             "reclaim":  _cmd_reclaim,
@@ -2108,7 +2122,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 # home card's lease (the assignee / its dispatched worker stay exempt).
 _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
-    "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
+    "reclaim", "set-model", "priority", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
     "request-changes", "link", "unlink", "specify", "decompose", "workspace",
 })
@@ -3227,6 +3241,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if guard_line:
         print(f"  guard:     {guard_line}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if task.priority:
+        print(f"  priority:  {task.priority}")
     if task.no_worker:
         print("  dispatch:  operator-only")
     print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
@@ -4968,6 +4984,22 @@ def _draft_override_of(conn, tid: str, after_event_id):
         return None
 
 
+def _set_priority(conn, task_id: str, priority: int) -> bool:
+    ok, old = kb.set_task_priority(
+        conn, task_id, priority, actor=_profile_author(),
+    )
+    if not ok:
+        print(f"cannot set priority on {task_id} (unknown id)", file=sys.stderr)
+        return False
+    print(f"{task_id}: priority {old} -> {priority}")
+    return True
+
+
+def _cmd_priority(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        return 0 if _set_priority(conn, args.task_id, args.priority) else 1
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     metadata = None
@@ -5000,17 +5032,21 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     new_session = getattr(args, "session", None)
     do_session = new_session is not None
     no_worker = getattr(args, "no_worker", None)
+    new_priority = getattr(args, "priority", None)
 
-    if not do_result and not do_model and not do_session and no_worker is None:
+    if (not do_result and not do_model and not do_session and no_worker is None
+            and new_priority is None):
         print(
             "kanban: nothing to edit (pass --result, --model, --clear-model, "
-            "--session, --no-worker or --worker-ok)",
+            "--session, --priority, --no-worker or --worker-ok)",
             file=sys.stderr,
         )
         return 2
 
     rc = 0
     with kb.connect_closing() as conn:
+        if new_priority is not None and not _set_priority(conn, args.task_id, new_priority):
+            return 1
         if no_worker is not None:
             if not kb.set_no_worker(
                 conn, args.task_id, no_worker, operator=_profile_author(),
@@ -6016,8 +6052,22 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             + ("no new workers this tick" if res.memory_pressure == "critical"
                else "at most 1 new worker this tick")
         )
+    prios: dict = {}
+    if res.spawned:
+        try:
+            with kb.connect_closing() as _pc:
+                ids = [t for t, _w, _s in res.spawned]
+                prios = {
+                    r["id"]: r["priority"] for r in _pc.execute(
+                        f"SELECT id, priority FROM tasks WHERE id IN "
+                        f"({','.join('?' * len(ids))})", ids,
+                    )
+                }
+        except Exception:
+            prios = {}
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
+        prio_part = f" prio={prios[tid]}" if prios.get(tid) else ""
         route = res.spawn_routes.get(tid, "unknown/unknown")
         source = res.spawn_route_sources.get(tid)
         # source= names WHICH layer chose the route (card / lane window /
@@ -6026,7 +6076,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         source_part = f" source={source}" if source else ""
         print(
             f"  - {tid}  ->  {who}  @ {ws or '-'}  route={route}{source_part} "
-            f"kind={route_kind(route)}{tag}"
+            f"kind={route_kind(route)}{prio_part}{tag}"
         )
     successors = getattr(res, "expired_lane_successors", None) or {}
     for lane, route in getattr(res, "expired_lane_models", []) or []:
