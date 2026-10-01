@@ -1884,7 +1884,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 metavar="WHO: WHY",
                 help="Operator profiles (apollo/default, aegis) applying a "
                      "relayed human decision to a foreign card; records an "
-                     "operator_override event, posts no comment.",
+                     "operator_override event (status/timing verbs also post "
+                     "a FOREIGN CHANGE comment; cite the ruling as "
+                     "'msg <discord id>').",
             )
     _intermix_optional_positionals(kanban_parser)
     return kanban_parser
