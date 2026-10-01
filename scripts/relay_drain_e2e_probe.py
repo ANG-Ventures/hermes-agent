@@ -44,6 +44,7 @@ Reference run 2026-09-30 18:12-18:28 PT (t_df1df8bb, seat sub-vps-13, relay 4eb9
            the relay that is draining", 0 rows.
 Registers nothing on a schedule: it is an operator instrument for drain-contract changes.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -52,6 +53,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -74,8 +76,21 @@ RELAY_HOME_LINKS = ("var/subs-portal/site/subs.json",)
 # Relay ports in use on the Studio (claude_pool_relay FOREIGN_STUDIO_PORTS +
 # 18810/18811/18816 relays, measured 2026-09-30). 18897 was free.
 DEFAULT_PORT = 18897
-PROMPT = "Reply with exactly the text DRAIN-PROBE-OK and nothing else. Do not use tools."
-ANNOUNCE_RX = re.compile(r"Fallback activated|provider overloaded|unclassified error|fell back to|switched to", re.I)
+# Never bind or admin a production relay port (apr 18810, bpr 18811, dlr 18816,
+# apx-0 18801, cliproxyapi 18812/18813, caddy 18814, 18820).
+REFUSED_PORTS = frozenset({18801, 18810, 18811, 18812, 18813, 18814, 18816, 18820})
+# --out is only ever deleted when it carries this marker (written at creation).
+OUT_MARKER = ".relay-drain-probe-out"
+# The drain refusal body token (claude_pool_relay.DEPLOY_DRAIN_ERROR): the only
+# accepted evidence that a turn met the drain, never a bare 503.
+DRAIN_TOKEN = "draining-for-deploy"
+PROMPT = (
+    "Reply with exactly the text DRAIN-PROBE-OK and nothing else. Do not use tools."
+)
+ANNOUNCE_RX = re.compile(
+    r"Fallback activated|provider overloaded|unclassified error|fell back to|switched to",
+    re.I,
+)
 SUB0_KEYS = {"local", "sub-0", "0"}
 
 
@@ -85,23 +100,33 @@ def log(msg: str) -> None:
 
 def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"X-Pool-Admin": "relay-drain-e2e-probe",
-                                          "Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "X-Pool-Admin": "relay-drain-e2e-probe",
+            "Content-Type": "application/json",
+        },
+    )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 
 
 def one_seat_registry(seat_label_prefix: str, dest: Path) -> None:
-    d = json.loads(PROD_REGISTRY.read_text())
+    d = json.loads(PROD_REGISTRY.read_text(encoding="utf-8"))
     subs = d["subs"]
-    keep = [s for s in subs if str(s.get("label", "")).split(" ")[0] == seat_label_prefix]
+    keep = [
+        s for s in subs if str(s.get("label", "")).split(" ")[0] == seat_label_prefix
+    ]
     if len(keep) != 1:
-        raise SystemExit(f"seat {seat_label_prefix!r}: {len(keep)} registry rows, need 1")
+        raise SystemExit(
+            f"seat {seat_label_prefix!r}: {len(keep)} registry rows, need 1"
+        )
     if seat_label_prefix in SUB0_KEYS or "Mac Studio" in str(keep[0].get("label")):
         raise SystemExit("refusing sub 0 (Ace's own seat)")
     d["subs"] = keep
-    dest.write_text(json.dumps(d, indent=2))
+    dest.write_text(json.dumps(d, indent=2), encoding="utf-8")
     dest.chmod(0o600)
 
 
@@ -122,39 +147,88 @@ class ScratchRelay:
             # error_class_v2 off = the drain 503 as it was before claude-pool #180
             # (bare body, no class/hop/cause): the 2026-09-30 13:03 wire.
             rp = self.home / "config/claude-router.json"
-            cfg = json.loads(rp.read_text()) if rp.exists() else {}
+            cfg = json.loads(rp.read_text(encoding="utf-8")) if rp.exists() else {}
             cfg["error_class_v2"] = v2 == "on"
             rp.parent.mkdir(parents=True, exist_ok=True)
-            rp.write_text(json.dumps(cfg, indent=2))
+            rp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         for rel in RELAY_HOME_LINKS:
             src = USER_HOME / ".hermes" / rel
             if src.exists():
                 (self.home / rel).parent.mkdir(parents=True, exist_ok=True)
                 (self.home / rel).symlink_to(src)
-        self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("KANBAN", "HERMES", "HERMES"))}
+        self.env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("KANBAN", "HERMES", "HERMES"))
+        }
         self.env[HOME_ENV] = str(self.home)
 
     @property
     def base(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    def port_in_use(self) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            sk.settimeout(1.0)
+            return sk.connect_ex(("127.0.0.1", self.port)) == 0
+
+    def _serve_started_by(self, pid: int) -> bool:
+        """The listener is ours only once OUR process logged serve_start on our
+        port; a healthy endpoint alone can be a foreign relay."""
+        return any(
+            e.get("event") == "serve_start"
+            and e.get("pid") == pid
+            and e.get("port") == self.port
+            for e in relay_events(self.log_path)
+        )
+
     def start(self, wait_s: float = 60.0) -> None:
+        if self.port in REFUSED_PORTS:
+            raise SystemExit(f"refusing production relay port {self.port}")
+        if self.port_in_use():
+            raise SystemExit(
+                f"port {self.port} already has a listener; pick a free --port"
+            )
         self.launches += 1
         out = open(self.workdir / f"relay.stdout.{self.launches}.log", "ab")
         self.proc = subprocess.Popen(
-            [str(DEPLOY_RELAY_PY), str(DEPLOY_RELAY), "--pool", "bpr", "--host", "127.0.0.1",
-             "--port", str(self.port), "--registry", str(self.registry),
-             "--cache-dir", str(self.cache), "--log", str(self.log_path)],
-            cwd=str(DEPLOY_RELAY.parent), env=self.env, stdout=out, stderr=subprocess.STDOUT)
+            [
+                str(DEPLOY_RELAY_PY),
+                str(DEPLOY_RELAY),
+                "--pool",
+                "bpr",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.port),
+                "--registry",
+                str(self.registry),
+                "--cache-dir",
+                str(self.cache),
+                "--log",
+                str(self.log_path),
+            ],
+            cwd=str(DEPLOY_RELAY.parent),
+            env=self.env,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+        )
         deadline = time.time() + wait_s
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise SystemExit(f"scratch relay exited rc={self.proc.returncode}; see {out.name}")
+                raise SystemExit(
+                    f"scratch relay exited rc={self.proc.returncode}; see {out.name}"
+                )
             try:
                 h = http("GET", self.base + "/health")
-                if h.get("status") == "ok" and h.get("eligible_count", 0) >= 1:
-                    log(f"scratch relay up pid={self.proc.pid} eligible={h.get('eligible_keys')}")
+                if (
+                    h.get("status") == "ok"
+                    and h.get("eligible_count", 0) >= 1
+                    and self._serve_started_by(self.proc.pid)
+                ):
+                    log(
+                        f"scratch relay up pid={self.proc.pid} eligible={h.get('eligible_keys')}"
+                    )
                     return
             except Exception:
                 pass
@@ -162,8 +236,14 @@ class ScratchRelay:
         raise SystemExit("scratch relay never reported an eligible seat")
 
     def admin(self, action: str, **body) -> dict:
+        if self.proc is None or self.proc.poll() is not None:
+            raise SystemExit(
+                f"{action}: the scratch relay is not running; refusing to admin the port"
+            )
         r = http("POST", self.base + f"/admin/pool/{action}", body)
-        log(f"{action} -> draining={r.get('draining_for_deploy')} inflight={r.get('inflight')}")
+        log(
+            f"{action} -> draining={r.get('draining_for_deploy')} inflight={r.get('inflight')}"
+        )
         return r
 
     def stop(self, timeout: float = 90.0) -> None:
@@ -176,34 +256,61 @@ class ScratchRelay:
                 self.proc.wait()
 
 
-def scratch_home(workdir: Path, port: int, model: str, fallback_model: str,
-                 drain_wait_s: float | None) -> Path:
+def scratch_home(
+    workdir: Path,
+    port: int,
+    model: str,
+    fallback_model: str,
+    drain_wait_s: float | None,
+) -> Path:
     home = workdir / "home"
     (home / "logs").mkdir(parents=True, exist_ok=True)
     (home / "state").mkdir(parents=True, exist_ok=True)
     cfg = [
-        "model:", "  provider: claude-bpr", f"  default: {model}",
-        "fallback_providers:", "- provider: claude-bpr", f"  model: {fallback_model}",
-        "plugins:", "  enabled:", "    - blackbox", "  disabled: []",
+        "model:",
+        "  provider: claude-bpr",
+        f"  default: {model}",
+        "fallback_providers:",
+        "- provider: claude-bpr",
+        f"  model: {fallback_model}",
+        "plugins:",
+        "  enabled:",
+        "    - blackbox",
+        "  disabled: []",
         # Blackbox is the fallback_events ledger; without its block it records nothing.
-        "blackbox:", "  enabled: true", "  alerts_enabled: false",
-        "toolsets: []", "memory:", "  memory_enabled: false", "  user_profile_enabled: false",
+        "blackbox:",
+        "  enabled: true",
+        "  alerts_enabled: false",
+        "toolsets: []",
+        "memory:",
+        "  memory_enabled: false",
+        "  user_profile_enabled: false",
     ]
     if drain_wait_s is not None:
         cfg += ["fallback:", f"  relay_drain_wait_s: {drain_wait_s}"]
-    (home / "config.yaml").write_text("\n".join(cfg) + "\n")
+    (home / "config.yaml").write_text("\n".join(cfg) + "\n", encoding="utf-8")
     # Only the relay bearer is copied (0600, scratch, never printed or committed).
-    key = [ln for ln in PROD_ENV.read_text().splitlines() if ln.startswith("CLAUDE_BPP_KEY=")]
+    key = [
+        ln
+        for ln in PROD_ENV.read_text(encoding="utf-8").splitlines()
+        if ln.startswith("CLAUDE_BPP_KEY=")
+    ]
     envf = home / ".env"
-    envf.write_text("\n".join(key + [f"CLAUDE_BPP_BASE_URL=http://127.0.0.1:{port}/v1"]) + "\n")
+    envf.write_text(
+        "\n".join(key + [f"CLAUDE_BPP_BASE_URL=http://127.0.0.1:{port}/v1"]) + "\n",
+        encoding="utf-8",
+    )
     envf.chmod(0o600)
     (home / "plugins").symlink_to(PROD_PLUGINS)
     return home
 
 
 def agent_env(home: Path, tree: Path, port: int) -> dict:
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("KANBAN", "HERMES", "HERMES"))}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("KANBAN", "HERMES", "HERMES"))
+    }
     env[HOME_ENV] = str(home)
     env["CLAUDE_BPP_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
     env["PYTHONPATH"] = str(tree)
@@ -219,11 +326,21 @@ def tree_python(tree: Path) -> Path:
 
 
 def confirm_tree(tree: Path, env: dict) -> str:
-    code = ("import agent.error_classifier as m, agent.conversation_loop as c;"
-            "print(m.__file__);print(c.__file__);"
-            "print('relay_draining' in m.FailoverReason.__members__)")
-    out = subprocess.run([str(tree_python(tree)), "-c", code], cwd=str(tree), env=env,
-                         capture_output=True, text=True, timeout=120)
+    code = (
+        "import agent.error_classifier as m, agent.conversation_loop as c;"
+        "print(m.__file__);print(c.__file__);"
+        "print('relay_draining' in m.FailoverReason.__members__)"
+    )
+    out = subprocess.run(
+        [str(tree_python(tree)), "-c", code],
+        cwd=str(tree),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
     if out.returncode:
         raise SystemExit(f"tree import failed: {out.stderr[-800:]}")
     lines = out.stdout.split()
@@ -237,7 +354,7 @@ def confirm_tree(tree: Path, env: dict) -> str:
 def relay_events(path: Path) -> list[dict]:
     rows = []
     if path.exists():
-        for ln in path.read_text(errors="replace").splitlines():
+        for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
             i = ln.find("{")
             if i < 0:
                 continue
@@ -259,11 +376,15 @@ def ledger_rows(home: Path) -> tuple[list[tuple], list[tuple]]:
         return [], [("<no turns.db: blackbox did not record>",)]
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        calls = con.execute("select provider, model, http_status, sub_key from turn_api_calls "
-                            "order by ts").fetchall()
-        return calls, con.execute("select kind, from_provider, from_model, to_provider, to_model, "
-                                  "reason, trigger_class, http_status, notice_text from fallback_events "
-                                  "order by id").fetchall()
+        calls = con.execute(
+            "select provider, model, http_status, sub_key from turn_api_calls "
+            "order by ts"
+        ).fetchall()
+        return calls, con.execute(
+            "select kind, from_provider, from_model, to_provider, to_model, "
+            "reason, trigger_class, http_status, notice_text from fallback_events "
+            "order by id"
+        ).fetchall()
     except sqlite3.OperationalError as e:
         return [], [(f"<{e}>",)]
     finally:
@@ -271,11 +392,17 @@ def ledger_rows(home: Path) -> tuple[list[tuple], list[tuple]]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--runtime-tree", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--mode", choices=("drain", "restart"), default="drain")
-    ap.add_argument("--seat", default="sub-vps-13", help="the ONE worker seat the scratch relay serves")
+    ap.add_argument(
+        "--seat",
+        default="sub-vps-13",
+        help="the ONE worker seat the scratch relay serves",
+    )
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--model", default="claude-fable-5-1")
     ap.add_argument("--fallback-model", default="claude-opus-5-5")
@@ -293,10 +420,18 @@ def main() -> int:
     # first drain 503, so the next Retry-After (15 s) retry lands inside the
     # relaunch gap and exercises the loopback-restart wait, not just the drain.
     ap.add_argument("--restart-offset", type=float, default=10.0)
-    ap.add_argument("--restart-gap", type=float, default=8.0,
-                    help="relaunch delay; > Retry-After - offset so a retry hits the gap")
-    ap.add_argument("--relay-drain-wait-s", type=float, default=None,
-                    help="override fallback.relay_drain_wait_s in the scratch home")
+    ap.add_argument(
+        "--restart-gap",
+        type=float,
+        default=8.0,
+        help="relaunch delay; > Retry-After - offset so a retry hits the gap",
+    )
+    ap.add_argument(
+        "--relay-drain-wait-s",
+        type=float,
+        default=None,
+        help="override fallback.relay_drain_wait_s in the scratch home",
+    )
     ap.add_argument("--turn-timeout", type=float, default=600.0)
     # Hold the drain for the whole turn (undrain only after it ends). On a
     # pre-fix tree the fable->opus failover lands on the same draining relay, so
@@ -304,9 +439,15 @@ def main() -> int:
     # fallback.relay_drain_wait_s (150 s) and then fails with no same-provider
     # fallback: use --relay-drain-wait-s to shorten it.
     ap.add_argument("--hold-drain", action="store_true")
-    ap.add_argument("--relay-v2", choices=("live", "on", "off"), default="live",
-                    help="scratch relay error_class_v2: live config, or forced on/off")
-    ap.add_argument("--expect-failover", action="store_true", help="negative control (pre-fix tree)")
+    ap.add_argument(
+        "--relay-v2",
+        choices=("live", "on", "off"),
+        default="live",
+        help="scratch relay error_class_v2: live config, or forced on/off",
+    )
+    ap.add_argument(
+        "--expect-failover", action="store_true", help="negative control (pre-fix tree)"
+    )
     a = ap.parse_args()
     if a.hold_drain:
         a.drain_ttl = max(a.drain_ttl, int(min(a.turn_timeout + 60, 600)))
@@ -315,13 +456,27 @@ def main() -> int:
     live = (USER_HOME / ".hermes/runtime/hermes-agent").resolve()
     work = a.out.resolve()
     if work.exists():
+        if not work.is_dir() or a.out.is_symlink():
+            raise SystemExit(
+                f"--out {work} exists and is not a plain directory; refusing"
+            )
+        if any(work.iterdir()) and not (work / OUT_MARKER).is_file():
+            raise SystemExit(
+                f"--out {work} is non-empty and not a previous probe output "
+                f"(no {OUT_MARKER}); refusing to delete it"
+            )
         shutil.rmtree(work)
     work.mkdir(parents=True)
+    (work / OUT_MARKER).write_text(
+        "relay_drain_e2e_probe output dir\n", encoding="utf-8"
+    )
     registry = work / "registry.json"
     one_seat_registry(a.seat, registry)
     home = scratch_home(work, a.port, a.model, a.fallback_model, a.relay_drain_wait_s)
     env = agent_env(home, tree, a.port)
-    log(f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) home={home}")
+    log(
+        f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) home={home}"
+    )
     fixed = confirm_tree(tree, env)
 
     relay = ScratchRelay(a.port, work, registry, v2=a.relay_v2)
@@ -330,12 +485,22 @@ def main() -> int:
     # The real CLI one-shot path. oneshot.run_oneshot() calls
     # logging.disable(CRITICAL), which empties agent.log; the driver no-ops that
     # one call so the drain wait / failover lines land in the scratch agent.log.
-    driver = ("import logging, sys; logging.disable = lambda *a, **k: None; "
-              "sys.argv = ['hermes'] + sys.argv[1:]; "
-              "from hermes_cli.main import main; sys.exit(main())")
+    driver = (
+        "import logging, sys; logging.disable = lambda *a, **k: None; "
+        "sys.argv = ['hermes'] + sys.argv[1:]; "
+        "from hermes_cli.main import main; sys.exit(main())"
+    )
     usage_p = work / "usage.json"
-    cmd = [str(tree_python(tree)), "-c", driver, "-z", PROMPT, "--yolo",
-           "--usage-file", str(usage_p)]
+    cmd = [
+        str(tree_python(tree)),
+        "-c",
+        driver,
+        "-z",
+        PROMPT,
+        "--yolo",
+        "--usage-file",
+        str(usage_p),
+    ]
     t0 = time.monotonic()
     drained = undrained = restarted = False
     drain_window: dict = {}
@@ -346,8 +511,14 @@ def main() -> int:
             relay.admin("deploy-drain", ttl_s=a.drain_ttl)
             stamp("drain")
             drained = True
-        turn = subprocess.Popen(cmd, cwd=str(tree), env=env, stdin=subprocess.DEVNULL,
-                                stdout=open(stdout_p, "wb"), stderr=open(stderr_p, "wb"))
+        turn = subprocess.Popen(
+            cmd,
+            cwd=str(tree),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=open(stdout_p, "wb"),
+            stderr=open(stderr_p, "wb"),
+        )
         log(f"turn started pid={turn.pid} mode={a.mode}")
         while turn.poll() is None:
             el = time.monotonic() - t0
@@ -359,17 +530,31 @@ def main() -> int:
                 relay.admin("deploy-drain", ttl_s=a.drain_ttl)
                 stamp("drain")
                 drained = True
-            if a.mode == "drain" and not a.hold_drain and not undrained and el >= a.undrain_at:
+            if (
+                a.mode == "drain"
+                and not a.hold_drain
+                and not undrained
+                and el >= a.undrain_at
+            ):
                 relay.admin("deploy-undrain")
                 stamp("undrain")
                 undrained = True
             if a.mode == "restart" and first_503 is None:
                 al = home / "logs" / "agent.log"
-                if al.exists() and re.search(r"draining-for-deploy|\b503\b", al.read_text(errors="replace")):
+                if al.exists() and re.search(
+                    DRAIN_TOKEN,
+                    al.read_text(encoding="utf-8", errors="replace"),
+                ):
                     first_503 = el
-                    log(f"turn met the drain at +{el:.1f}s; SIGTERM at +{el + a.restart_offset:.1f}s")
-            if a.mode == "restart" and not restarted and first_503 is not None \
-                    and el >= first_503 + a.restart_offset:
+                    log(
+                        f"turn met the drain at +{el:.1f}s; SIGTERM at +{el + a.restart_offset:.1f}s"
+                    )
+            if (
+                a.mode == "restart"
+                and not restarted
+                and first_503 is not None
+                and el >= first_503 + a.restart_offset
+            ):
                 log("SIGTERM scratch relay (graceful drain-then-exit)")
                 stamp("sigterm")
                 relay.stop()
@@ -387,64 +572,115 @@ def main() -> int:
     finally:
         relay.stop()
 
-    out_txt = stdout_p.read_text(errors="replace")
-    err_txt = stderr_p.read_text(errors="replace")
+    out_txt = stdout_p.read_text(encoding="utf-8", errors="replace")
+    err_txt = stderr_p.read_text(encoding="utf-8", errors="replace")
     events = relay_events(relay.log_path)
     picks = [e for e in events if e.get("event") == "pick"]
-    seats_served = sorted({e.get("chosen") for e in events if e.get("event") == "ok" and e.get("chosen")})
+    seats_served = sorted({
+        e.get("chosen") for e in events if e.get("event") == "ok" and e.get("chosen")
+    })
     models_picked = [e.get("model") for e in picks]
-    serve_start = [{"pid": e.get("pid"), "error_class_v2": e.get("error_class_v2"), "ts": e["_ts"]}
-                   for e in events if e.get("event") == "serve_start"]
+    serve_start = [
+        {"pid": e.get("pid"), "error_class_v2": e.get("error_class_v2"), "ts": e["_ts"]}
+        for e in events
+        if e.get("event") == "serve_start"
+    ]
     try:
-        usage = json.loads(usage_p.read_text())
+        usage = json.loads(usage_p.read_text(encoding="utf-8"))
     except Exception:
         usage = None
     route_log = home / "state" / "model-route-changes.log"
-    route_rows = route_log.read_text().splitlines() if route_log.exists() else []
+    route_rows = (
+        route_log.read_text(encoding="utf-8").splitlines() if route_log.exists() else []
+    )
     failover_rows = [r for r in route_rows if "failover" in r.lower()]
     ledger_calls, ledger = ledger_rows(home)
     announces = sorted({m.group(0) for m in ANNOUNCE_RX.finditer(out_txt + err_txt)})
     agent_log = home / "logs" / "agent.log"
-    agent_lines = agent_log.read_text(errors="replace").splitlines() if agent_log.exists() else []
-    excerpt = [ln for ln in agent_lines if re.search(
-        r"drain|Retry-After|retry_after|overloaded|fallback|Fallback|503|relay|failover", ln)]
+    agent_lines = (
+        agent_log.read_text(encoding="utf-8", errors="replace").splitlines()
+        if agent_log.exists()
+        else []
+    )
+    excerpt = [
+        ln
+        for ln in agent_lines
+        if re.search(
+            r"drain|Retry-After|retry_after|overloaded|fallback|Fallback|503|relay|failover",
+            ln,
+        )
+    ]
     # The relay does not log its drain refusals, so the turn's own log is the
-    # evidence that it met the drain (503 draining-for-deploy on either tree).
-    met = [ln for ln in agent_lines if re.search(r"draining|deploy|\b503\b", ln)]
+    # evidence that it met the drain: the refusal body token, never a bare 503.
+    met = [ln for ln in agent_lines if DRAIN_TOKEN in ln]
+    gap_recovered = [
+        ln for ln in agent_lines if re.search(r"local relay \S+ back after", ln)
+    ]
 
     report = {
-        "mode": a.mode, "tree": str(tree), "tree_has_relay_draining": fixed,
-        "seat": a.seat, "turn_rc": rc, "wall_s": round(wall, 1),
+        "mode": a.mode,
+        "tree": str(tree),
+        "tree_has_relay_draining": fixed,
+        "seat": a.seat,
+        "turn_rc": rc,
+        "wall_s": round(wall, 1),
         "stdout_tail": out_txt.strip()[-300:],
         "completed_ok": rc == 0 and "DRAIN-PROBE-OK" in out_txt,
-        "relay_launches": relay.launches, "relay_events": len(events),
-        "relay_serve_start": serve_start, "seats_served": seats_served,
-        "models_picked": models_picked, "first_pick_ts": picks[0]["_ts"] if picks else None,
+        "relay_launches": relay.launches,
+        "relay_events": len(events),
+        "relay_serve_start": serve_start,
+        "seats_served": seats_served,
+        "models_picked": models_picked,
+        "first_pick_ts": picks[0]["_ts"] if picks else None,
         "drain_window": drain_window,
-        "usage": {k: usage.get(k) for k in ("model", "provider", "api_calls")} if isinstance(usage, dict) else None,
+        "usage": {k: usage.get(k) for k in ("model", "provider", "api_calls")}
+        if isinstance(usage, dict)
+        else None,
         "agent_log_drain_hits": len(met),
-        "route_changes": route_rows, "failover_rows": len(failover_rows),
+        "restarted": restarted,
+        "listener_gap_recoveries": len(gap_recovered),
+        "route_changes": route_rows,
+        "failover_rows": len(failover_rows),
         "blackbox_api_calls": [list(r) for r in ledger_calls],
         "fallback_events": [list(r) for r in ledger],
         "announces": announces,
         "agent_log_excerpt": excerpt[-60:],
     }
-    (work / "report.json").write_text(json.dumps(report, indent=2))
-    print(json.dumps({k: v for k, v in report.items() if k != "agent_log_excerpt"}, indent=2))
+    (work / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(
+        json.dumps(
+            {k: v for k, v in report.items() if k != "agent_log_excerpt"}, indent=2
+        )
+    )
     print("--- agent.log excerpt ---")
     print("\n".join(excerpt[-60:]))
 
     ledger_real = [r for r in ledger if not str(r[0]).startswith("<")]
-    ledger_live = bool(ledger_calls) and not any(str(r[0]).startswith("<") for r in ledger)
+    ledger_live = bool(ledger_calls) and not any(
+        str(r[0]).startswith("<") for r in ledger
+    )
     ledger_clean = ledger_live and not ledger_real
     if not met:
         log("INCONCLUSIVE: the turn never met the drain")
         return 2
+    if a.mode == "restart" and not (restarted and gap_recovered):
+        log(
+            "INCONCLUSIVE: restart mode needs the relay restart AND a listener-gap recovery"
+        )
+        return 2
     if a.expect_failover:
         ok = bool(failover_rows) and bool(ledger_real)
     else:
-        ok = report["completed_ok"] and not failover_rows and ledger_clean and not announces
-    log(("PASS" if ok else "FAIL") + (" (negative control: failover expected)" if a.expect_failover else ""))
+        ok = (
+            report["completed_ok"]
+            and not failover_rows
+            and ledger_clean
+            and not announces
+        )
+    log(
+        ("PASS" if ok else "FAIL")
+        + (" (negative control: failover expected)" if a.expect_failover else "")
+    )
     return 0 if ok else 1
 
 
