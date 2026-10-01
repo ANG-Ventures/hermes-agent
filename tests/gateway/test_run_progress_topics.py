@@ -896,7 +896,7 @@ class QueuedMediaAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         if type(self).calls == 1:
             final_response = f"first response\nMEDIA:{type(self).media_path}"
