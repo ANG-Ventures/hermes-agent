@@ -2908,6 +2908,9 @@ def run_conversation(
                     except Exception:
                         pass
             if _injected:
+                from agent.agent_runtime_helpers import note_steer_delivered
+
+                note_steer_delivered(agent, _pre_api_steer)
                 logger.info(
                     "Delivered /steer to agent (pre-API, tool msg index %d) (%d chars)",
                     _si,

@@ -5429,10 +5429,28 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+    note_steer_delivered(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars)",
         len(steer_text),
     )
+
+
+def note_steer_delivered(agent, text) -> None:
+    """Tell the agent's steer delivery sink that *text* reached the transcript.
+
+    Call it ONLY after the text was written into a message the model will
+    read. delegate_task sets ``_steer_delivery_sink`` on its children (their
+    per-child steer ledger); it is the one thing that settles an accepted
+    steer, so the paths that merely empty ``_pending_steer`` cannot lose one.
+    """
+    sink = getattr(agent, "_steer_delivery_sink", None)
+    if not callable(sink):
+        return
+    try:
+        sink(text)
+    except Exception:
+        _ra().logger.debug("steer delivery sink failed", exc_info=True)
 
 
 
@@ -5526,6 +5544,7 @@ __all__ = [
     "cleanup_dead_connections",
     "extract_api_error_context",
     "apply_pending_steer_to_tool_results",
+    "note_steer_delivered",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 import weakref
 
 import pytest
@@ -81,7 +82,9 @@ class _Agent:
         self._delegate_depth = depth
         self._delegate_role = "leaf"
         self.model = "test/model"
-        self.session_id = f"sess-{sid or 'root'}"
+        # A unique root id: late threads of an earlier test can record after
+        # it ended, and late results are owned by this session id.
+        self.session_id = f"sess-{sid or 'root-' + uuid.uuid4().hex[:8]}"
         self._api_calls = api_calls
         self._behavior = behavior
         self.frozen_activity_ts = None  # set -> activity never advances (hung)

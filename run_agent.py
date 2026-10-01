@@ -470,6 +470,29 @@ class SwapOutcome(enum.Enum):
     MISSING_CREDENTIAL = "missing_credential"
 
 
+def _close_delegated_child(child: Any, reason: str) -> bool:
+    """Hand a delegate_task child to its owner's teardown door, if it has one.
+
+    delegate_task stamps ``_owner_teardown`` on every child it runs. That door
+    defers the close while the child's run or any of its turns is live, so a
+    parent's close()/release_clients() can never close a SessionDB under a
+    running child turn (docs/dev/delegate-child-lifecycle.md, I2). Read from
+    the instance dict: a Mock child must not invent a door. Returns True when
+    the door took the child.
+    """
+    try:
+        door = vars(child).get("_owner_teardown")
+    except TypeError:
+        door = None
+    if not callable(door):
+        return False
+    try:
+        door(reason)
+    except Exception:
+        logger.debug("delegated child teardown door failed", exc_info=True)
+    return True
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -4977,6 +5000,8 @@ class AIAgent:
                 children = list(self._active_children)
                 self._active_children.clear()
             for child in children:
+                if _close_delegated_child(child, "parent_release_clients"):
+                    continue
                 try:
                     child.release_clients()
                 except Exception:
@@ -5077,6 +5102,8 @@ class AIAgent:
                 children = list(self._active_children)
                 self._active_children.clear()
             for child in children:
+                if _close_delegated_child(child, "parent_close"):
+                    continue
                 try:
                     child.close()
                 except Exception:

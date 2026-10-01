@@ -197,7 +197,8 @@ def test_stalled_retry_drains_the_correction_turn_and_keeps_first_turn_steer(
                 "final_response": "not json",
                 "completed": True,
                 "api_calls": 3,
-                "pending_steer": "use the staging db",
+                # The finalizer drains the accepted steer into its result.
+                "pending_steer": self._drain_pending_steer(),
             }
         # Correction turn: no activity until interrupted, then unwinds
         # cooperatively (persisting takes a moment) before returning.
@@ -213,6 +214,7 @@ def test_stalled_retry_drains_the_correction_turn_and_keeps_first_turn_steer(
     child.close = lambda: order.append("close")
     entry = delegate_tool._run_single_child(0, "drain goal", child, parent)
     assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
+    assert delegate_tool.steer_subagent("sa-0-drain", "use the staging db") is True
     release.set()
 
     assert _wait_until(lambda: _late_results(parent), timeout=10.0)

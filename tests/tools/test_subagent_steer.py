@@ -175,16 +175,23 @@ class TestMissedSteerRetention:
             mock_child.model = "test-model"
             mock_child.session_prompt_tokens = 0
             mock_child.session_completion_tokens = 0
-            mock_child.run_conversation.return_value = {
-                "final_response": "done",
-                "completed": True,
-                "interrupted": False,
-                "api_calls": 1,
-                "messages": [],
-                # The finalizer's undelivered-steer hand-back
-                # (turn_finalizer.py "pending_steer").
-                "pending_steer": "focus on pricing instead",
-            }
+            def _turn(**_kw):
+                # Accepted mid-turn, never delivered; the finalizer hands the
+                # text back as "pending_steer". The ledger, not that field,
+                # is what names it missed.
+                from tools.delegate_tool import steer_subagent
+
+                assert steer_subagent(mock_child._subagent_id, "focus on pricing instead")
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                    "pending_steer": "focus on pricing instead",
+                }
+
+            mock_child.run_conversation.side_effect = _turn
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="race test", parent_agent=parent))

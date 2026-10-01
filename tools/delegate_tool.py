@@ -241,13 +241,141 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
             _retain_recent_subagent(record)
 
 
+class _SteerLedger:
+    """Per-child append-only record of every steer ``steer_subagent`` accepted.
+
+    The I1 mechanism (docs/dev/delegate-child-lifecycle.md). An entry is
+    appended under the registry lock BEFORE the text reaches the child's
+    pending slot, and the only thing that ever marks it is its consumer: the
+    agent loop calls ``deliver`` (via ``_steer_delivery_sink``) after it has
+    actually written the text into a tool result. Nothing else clears an
+    entry, so the paths that empty the child's in-memory slot (the
+    finalizer's drain, ``clear_interrupt``, an interrupted early return, the
+    closure drain) cannot drop one. ``missed()`` is "accepted and never
+    delivered", in acceptance order, duplicates kept.
+
+    Durable copy: one JSON line per operation, appended to a file in the
+    owning profile's delegation live dir (resolved on the spawning thread).
+    Memory stays authoritative; a failed write is logged, never raised.
+    """
+
+    def __init__(self, path: Any = None) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._entries: List[Dict[str, Any]] = []
+        self._write_failed = False
+
+    @classmethod
+    def for_child(cls, child: Any, subagent_id: str) -> "_SteerLedger":
+        path = None
+        try:
+            from pathlib import Path
+            import uuid as _uuid
+
+            transcript = getattr(child, "_live_transcript_path", None)
+            if isinstance(transcript, str) and transcript:
+                path = Path(transcript).with_suffix(".steer.jsonl")
+            else:
+                from tools.delegation_live_log import live_transcript_root
+
+                # A dir per child, so the live-dir retention prune covers it.
+                path = (
+                    live_transcript_root()
+                    / f"steer_{subagent_id}_{_uuid.uuid4().hex[:8]}"
+                    / "steer.jsonl"
+                )
+        except Exception:
+            logger.debug("steer ledger path unresolved for %s", subagent_id, exc_info=True)
+        ledger = cls(path)
+        try:
+            child._steer_ledger = ledger
+            child._steer_delivery_sink = ledger.deliver
+        except Exception:
+            logger.debug("could not attach steer ledger to %s", subagent_id, exc_info=True)
+        return ledger
+
+    def _append(self, op: Dict[str, Any]) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({**op, "ts": time.time()}, ensure_ascii=False) + "\n")
+        except Exception:
+            if not self._write_failed:
+                self._write_failed = True
+                logger.warning(
+                    "steer ledger %s not writable; in-memory only", self.path, exc_info=True
+                )
+
+    def accept(self, text: str) -> int:
+        with self._lock:
+            seq = len(self._entries)
+            self._entries.append({"seq": seq, "text": text.strip(), "state": "accepted"})
+            self._append({"op": "accept", "seq": seq, "text": text.strip()})
+            return seq
+
+    def withdraw(self, seq: int) -> None:
+        """The child refused the text after the entry was written."""
+        with self._lock:
+            self._entries[seq]["state"] = "withdrawn"
+            self._append({"op": "withdraw", "seq": seq})
+
+    def deliver(self, text: Any) -> None:
+        """Consumer: *text* was written into the child's transcript.
+
+        The agent concatenates pending steers with newlines and may put a
+        drained batch back behind newer text, so entries are matched by
+        content, longest first, each consuming its own span of *text*.
+        """
+        if not isinstance(text, str) or not text:
+            return
+        with self._lock:
+            remaining = text
+            open_ = [e for e in self._entries if e["state"] == "accepted" and e["text"]]
+            for e in sorted(open_, key=lambda e: (-len(e["text"]), e["seq"])):
+                i = remaining.find(e["text"])
+                if i < 0:
+                    continue
+                e["state"] = "delivered"
+                remaining = remaining[:i] + "\0" * len(e["text"]) + remaining[i + len(e["text"]):]
+                self._append({"op": "deliver", "seq": e["seq"]})
+
+    def missed(self) -> Optional[str]:
+        with self._lock:
+            return "\n".join(e["text"] for e in self._entries if e["state"] == "accepted") or None
+
+    def counts(self) -> Dict[str, int]:
+        with self._lock:
+            out = {"accepted": 0, "delivered": 0, "withdrawn": 0}
+            for e in self._entries:
+                out[e["state"]] += 1
+            return out
+
+
+def _steer_ledger_of(child: Any) -> Optional[_SteerLedger]:
+    ledger = getattr(child, "_steer_ledger", None)
+    return ledger if isinstance(ledger, _SteerLedger) else None
+
+
+def _close_and_read_missed(subagent_id: Optional[str], child: Any) -> Optional[str]:
+    """Close steer acceptance, then read what was accepted and never delivered."""
+    if not subagent_id:
+        return None
+    _close_subagent_steering(subagent_id, child)
+    ledger = _steer_ledger_of(child)
+    return ledger.missed() if ledger is not None else None
+
+
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
-    """Atomically close steer acceptance and drain its final durable artifact.
+    """Atomically close steer acceptance and empty the child's pending slot.
 
     ``steer_subagent`` holds the same registry lock through ``agent.steer``.
-    Therefore either acceptance wins and this drain sees its exact text, or
-    closure wins and the caller is rejected. Exact agent identity prevents a
+    Therefore either acceptance wins (and its ledger entry exists) or closure
+    wins and the caller is rejected. Exact agent identity prevents a
     finishing child with a recycled public id from closing its replacement.
+    Missed steer is read from the child's ``_SteerLedger``, not from the
+    drained text this returns.
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
@@ -308,9 +436,9 @@ def steer_subagent(
     empty text. ``owner_session_id=None`` deliberately preserves the internal
     in-process helper contract; gateway callers must pass exact authority.
 
-    Acceptance and completion are linearized by the registry lock. If
-    acceptance wins but no delivery boundary remains, ``_run_single_child``
-    drains the exact text into the completion entry as ``missed_steer``.
+    Acceptance and completion are linearized by the registry lock. Every
+    accepted text is first written to the child's ``_SteerLedger``; any entry
+    the child never delivers is reported as ``missed_steer`` (I1).
     """
     if not text or not text.strip():
         return False
@@ -330,11 +458,18 @@ def steer_subagent(
         agent = record.get("agent")
         if agent is None:
             return False
+        # Ledger first: the child may deliver the text the moment it lands
+        # in its slot, and the delivery must find its entry.
+        ledger = record.get("steer_ledger")
+        seq = ledger.accept(text) if isinstance(ledger, _SteerLedger) else None
         try:
-            return bool(agent.steer(text))
+            accepted = bool(agent.steer(text))
         except Exception as exc:
             logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
-            return False
+            accepted = False
+        if not accepted and seq is not None:
+            ledger.withdraw(seq)
+        return accepted
 
 
 def _capture_gateway_steer_authority(
@@ -373,6 +508,7 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_transport",
                     "owner_session_record",
                     "accepting_steer",
+                    "steer_ledger",
                 }
             }
             for r in _active_subagents.values()
@@ -3001,10 +3137,10 @@ class _ChildLifecycle:
     """The late-path child lifecycle as an explicit state machine.
 
     Design of record: docs/dev/delegate-child-lifecycle.md. ``fire`` is the
-    only way to change state and performs each edge's side effects; the
-    steer ledger collects every accepted-but-unconsumed steer (I1). One lock
-    serializes transitions and ledger access across the owner, the late
-    thread and the live turn's exit callback.
+    only way to change state. Accepted steer lives in the child's
+    ``_SteerLedger`` (I1) and teardown goes through ``_teardown`` (I2); the
+    machine only records where the late thread is and how many correction
+    turns it started (I3: the count is written into the one record).
     """
 
     STATES = (
@@ -3040,71 +3176,38 @@ class _ChildLifecycle:
         # The turn currently (or last) running off the late thread; None
         # when the last turn ran inline on the late thread itself.
         self.live: Any = None
+        self.ledger = _steer_ledger_of(child) or _SteerLedger(None)
+        self.corrections = 0
         self._lock = threading.RLock()
-        self._steer: List[str] = []
-        self._harvested: set = set()
 
     def fire(self, event: str, *, live: Any = None) -> str:
         with self._lock:
             nxt = self.EDGES.get((self.state, event))
             if nxt is None:
                 raise IllegalTransition(f"{self.state} --{event}--> (no such edge)")
-            if event == "teardown" and self.live is not None and not self.live.done():
-                raise IllegalTransition("teardown while a turn of this child is live")
             if event == "correct":
                 self.live = live
+                self.corrections += 1
             if event in ("finish", "stall") and self.subagent_id:
-                # Linearization point: close acceptance, keep what won.
-                self.add_steer(_close_subagent_steering(self.subagent_id, self.child))
+                # Linearization point: no steer is accepted after this.
+                _close_subagent_steering(self.subagent_id, self.child)
             self.state = nxt
             self.history.append(nxt)
             return nxt
 
-    def add_steer(self, text: Any) -> bool:
-        """Ledger an accepted-but-unconsumed steer. True if it was new."""
-        if not (isinstance(text, str) and text.strip()):
-            return False
-        with self._lock:
-            if text in self._steer:
-                return False
-            self._steer.append(text)
-            return True
-
-    def mark_harvested(self, future: Any) -> None:
-        with self._lock:
-            self._harvested.add(id(future))
-
-    def take_result_steer(self, future: Any, result: Dict[str, Any]) -> None:
-        """Source 2/3: a finished turn's finalizer-drained steer."""
-        with self._lock:
-            if future is not None:
-                self._harvested.add(id(future))
-            self.add_steer(result.pop("pending_steer", None))
-
-    def harvest(self, future: Any) -> bool:
-        """Source 4: read a finished turn's steer exactly once per future."""
-        if future is None or not future.done():
-            return False
-        with self._lock:
-            if id(future) in self._harvested:
-                return False
-            self._harvested.add(id(future))
-        try:
-            raw = future.result(timeout=0)
-        except BaseException:
-            return False
-        if not isinstance(raw, dict):
-            return False
-        return self.add_steer(raw.get("pending_steer"))
-
     @property
     def missed_steer(self) -> Optional[str]:
-        with self._lock:
-            return "\n".join(self._steer) or None
+        return self.ledger.missed()
 
 
 def _with_missed_steer(entry: Dict[str, Any], summary: str, pending: Optional[str]) -> None:
-    """Report *pending* on *entry* as missed_steer, with a summary note."""
+    """Report *pending* on *entry* as missed_steer, with a summary note.
+
+    Idempotent over *summary* (the un-annotated text), so an amendment can
+    re-derive both fields, including removing them.
+    """
+    entry.pop("missed_steer", None)
+    entry["summary"] = summary or None
     if not (isinstance(pending, str) and pending.strip()):
         return
     entry["missed_steer"] = pending
@@ -3476,11 +3579,12 @@ def _apply_output_schema(
             if run_turn is not None:
                 retry_result = run_turn(build_retry_message(schema_errors))
             else:
-                retry_result = child.run_conversation(
-                    user_message=build_retry_message(schema_errors),
-                    task_id=child_task_id,
-                    stream_callback=stream_callback,
-                )
+                with _inline_turn(child):
+                    retry_result = child.run_conversation(
+                        user_message=build_retry_message(schema_errors),
+                        task_id=child_task_id,
+                        stream_callback=stream_callback,
+                    )
         except _LateTurnStalled:
             raise
         except Exception as retry_exc:
@@ -3504,14 +3608,6 @@ def _apply_output_schema(
                 result.get("messages"), list
             ):
                 result["messages"] = result["messages"] + retry_messages
-            retry_pending = retry_result.get("pending_steer")
-            if isinstance(retry_pending, str) and retry_pending.strip():
-                prior = result.get("pending_steer")
-                result["pending_steer"] = (
-                    f"{prior}\n{retry_pending}"
-                    if isinstance(prior, str) and prior
-                    else retry_pending
-                )
             schema_valid, schema_errors = validate_output(retry_text, output_schema)
     return schema_valid, schema_errors, retries
 
@@ -3598,15 +3694,13 @@ def _start_late_completion(
                         stream_callback=stream_callback,
                     )
                 args = (message,)
-            fut = executor.submit(contextvars.copy_context().run, call, *args)
+            fut = _submit_turn(executor, child, contextvars.copy_context().run, call, *args)
             lc.fire("correct", live=fut)
             outcome, raw = _supervise_child_future(
                 fut, child, float(ceiling or 0.0), wall_deadline
             )
             if outcome != "done":
                 raise _LateTurnStalled(outcome)
-            # _apply_output_schema merges this turn's pending_steer.
-            lc.mark_harvested(fut)
             return raw
         finally:
             executor.shutdown(wait=False)
@@ -3616,13 +3710,14 @@ def _start_late_completion(
             return _supervised_turn(message)
         # No ceiling: the turn runs inline on the late thread.
         lc.fire("correct", live=None)
-        if child_turn is not None:
-            return child_turn(message)
-        return child.run_conversation(
-            user_message=message,
-            task_id=child_task_id,
-            stream_callback=stream_callback,
-        )
+        with _inline_turn(child):
+            if child_turn is not None:
+                return child_turn(message)
+            return child.run_conversation(
+                user_message=message,
+                task_id=child_task_id,
+                stream_callback=stream_callback,
+            )
 
     def _late() -> None:
         error: Optional[str] = None
@@ -3641,9 +3736,6 @@ def _start_late_completion(
             result = raw if isinstance(raw, dict) else {}
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-        if stop is None:
-            # Ledger source 2, before anything can rebuild `result`.
-            lc.take_result_steer(child_future, result)
 
         schema_valid: Optional[bool] = None
         schema_errors: List[str] = []
@@ -3660,11 +3752,10 @@ def _start_late_completion(
                 )
             except _LateTurnStalled as stalled:
                 stop = f"retry_{stalled.reason}"
-                schema_retries = 1
             except Exception:
                 logger.warning("late schema validation failed", exc_info=True)
-            # Ledger source 3: the finished correction turn's steer.
-            lc.add_steer(result.pop("pending_steer", None))
+        # I3: the attempt count is the machine's, not a local's.
+        schema_retries = lc.corrections
         hung = stop is not None
 
         if hung:
@@ -3677,7 +3768,7 @@ def _start_late_completion(
                 )
             else:
                 why = f"no progress for {ceiling}s"
-            lc.fire("stall")  # closes steering (ledger source 1)
+            lc.fire("stall")  # closes steering
             try:
                 if not request_hard_interrupt(
                     child, f"Subagent stopped: {why}"
@@ -3688,16 +3779,15 @@ def _start_late_completion(
             _reap_subtree(child, "hung")
             live = lc.live
             if live is not None:
-                # Bounded drain of the turn that is actually running; its
-                # finalizer's steer (ledger source 4) goes into the first
-                # write when it exits in time.
+                # Bounded drain of the turn that is actually running, so a
+                # turn that unwinds promptly is reported settled.
                 try:
                     live.result(timeout=_LATE_STOP_DRAIN_SECONDS)
                 except BaseException:
                     pass
-                lc.harvest(live)
-                # Its finalizer may yet return steer it already drained;
-                # the exit callback amends the record if so (I1 caveat).
+                # Still live: it may yet deliver a ledgered steer, so the
+                # record can over-report missed_steer until it exits; the
+                # exit callback then amends it.
                 turn_outlived_drain = not live.done()
             api_calls = 0
             try:
@@ -3732,7 +3822,7 @@ def _start_late_completion(
                 max_wall,
             )
         else:
-            lc.fire("finish")  # closes steering (ledger source 1)
+            lc.fire("finish")  # closes steering
         pending_steer = lc.missed_steer
         summary = str(result.get("final_response") or "")
         if hung:
@@ -3873,73 +3963,46 @@ def _start_late_completion(
             handle.absorbed,
         )
 
-        # One post-persist path for every live turn (I1 source 4 + I2):
-        # runs now if the turn already exited, else when it exits.
+        # Post-persist (I1 + I2). Teardown goes through the one door, which
+        # closes now or, while a turn of this child is live, when it exits.
+        # A record written while the turn was live is re-derived from the
+        # ledger once it exits: the fate of every accepted steer is then
+        # known, whether the turn returned or raised.
         live = lc.live
         exit_ctx = contextvars.copy_context()
 
-        def _after_live_exit(fut: Any) -> None:
+        def _settle(_fut: Any) -> None:
             try:
-                new_steer = lc.harvest(fut)
-                if new_steer or entry.get("steer_fate_unknown"):
-                    # The turn exited: its steer fate is now known either way.
+                if entry.get("steer_fate_unknown"):
                     lc.fire("amend")
-                    pending = lc.missed_steer
                     entry.pop("steer_fate_unknown", None)
-                    _with_missed_steer(entry, summary, pending)
-                    amended = _record_late_result(
-                        handle, entry, child=child, parent_agent=parent_agent
-                    )
+                    before = entry.get("missed_steer")
+                    _with_missed_steer(entry, summary, lc.missed_steer)
+                    _record_late_result(handle, entry, child=child, parent_agent=parent_agent)
                     handle.entry = entry
-                if new_steer:
-                    logger.warning(
-                        "delegate_task late result %s amended: steer returned "
-                        "by a turn that exited after the result was recorded",
-                        late_id,
-                    )
-                    # Sent even when absorbed: the unit's event already went.
-                    steer_parent = getattr(parent_agent, "steer", None)
-                    if callable(steer_parent):
-                        try:
-                            steer_parent(
-                                f"[delegate_task late result amended] subagent "
-                                f"{subagent_id} (task {task_index}): steer did not "
-                                f"land: {pending}"
-                                + (f" Result: {amended}." if amended else "")
-                            )
-                        except Exception as exc:
-                            logger.debug("late amendment steer failed: %s", exc)
+                    if entry.get("missed_steer") != before:
+                        logger.info(
+                            "delegate_task late result %s amended: the turn delivered "
+                            "steer after the result was recorded",
+                            late_id,
+                        )
             except Exception:
                 logger.warning("late steer amendment failed", exc_info=True)
             finally:
-                if fut is not None and deferred:
-                    _count_deferred_teardown(-1)
-                try:
-                    _close_child_persistence(child)
-                except Exception:
-                    logger.debug("late child teardown failed", exc_info=True)
                 try:
                     lc.fire("teardown")
                 except IllegalTransition:
                     logger.warning("late child teardown out of order", exc_info=True)
 
-        deferred = live is not None and not live.done()
-        if deferred:
-            waiting = _count_deferred_teardown(1)
-            logger.warning(
-                "delegate_task late child %s: turn still running after the stop "
-                "drain; persistence teardown deferred until it exits "
-                "(deferred teardowns: %d)",
-                subagent_id,
-                waiting,
-            )
+        _teardown(child, "late_persisted", owner=True)
         if live is None:
-            exit_ctx.copy().run(_after_live_exit, None)
+            exit_ctx.copy().run(_settle, None)
         else:
             # A fresh copy per run: this callback may run right here (turn
             # already done) or on the worker thread, never in a context
             # that is already entered.
-            live.add_done_callback(lambda f: exit_ctx.copy().run(_after_live_exit, f))
+            live.add_done_callback(lambda f: exit_ctx.copy().run(_settle, f))
+
 
     # A bare Thread starts with an EMPTY context: run _late in a copy of the
     # spawning thread's context so profile-scoped state (the context-local
@@ -4165,6 +4228,8 @@ def _run_single_child(
         _delegation_id = getattr(child, "_delegation_id", None)
         _register_subagent(
             {
+                # I1: every steer accepted for this child is ledgered here.
+                "steer_ledger": _SteerLedger.for_child(child, _subagent_id),
                 "subagent_id": _subagent_id,
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
                 "depth": _tui_depth,
@@ -4243,6 +4308,10 @@ def _run_single_child(
     # child is NOT stopped, the owner returns TIMED_OUT_RUNNING, and the
     # late-completion thread owns the registry/lease/close cleanup below.
     _detached = [False]
+    # I2: the run holds the child; parent-driven closes defer until the run
+    # (or, once detached, the late thread) releases it via _teardown.
+    _attach_owner_teardown(child)
+    _hold_run(child)
 
     try:
         _heartbeat_thread.start()
@@ -4391,7 +4460,9 @@ def _run_single_child(
                 _clear_child_cron_session(_cron_token)
 
         _child_context = contextvars.copy_context()
-        _child_future = _timeout_executor.submit(
+        _child_future = _submit_turn(
+            _timeout_executor,
+            child,
             _child_context.run,
             _run_with_thread_capture,
         )
@@ -4437,11 +4508,9 @@ def _run_single_child(
                         )
                     return _tor_entry
             # No consumer boundary remains once this owner stops waiting for
-            # the child. Close acceptance before any completion callback and
-            # retain steer text that won the race with this failure/timeout.
-            _late_pending_steer = (
-                _close_subagent_steering(_subagent_id, child) if _subagent_id else None
-            )
+            # the child. Close acceptance before any completion callback; the
+            # ledger names every accepted steer that was not delivered.
+            _late_pending_steer = _close_and_read_missed(_subagent_id, child)
             # Signal the child to stop so its thread can exit cleanly.
             try:
                 interrupted = child is not None and request_hard_interrupt(child)
@@ -4575,18 +4644,8 @@ def _run_single_child(
 
         # Linearization boundary for registry steering. From this point on the
         # child cannot consume another steer. Closing under the registry lock
-        # either rejects a concurrent caller or drains every previously accepted
-        # exact text into the result before callbacks/result assembly can run.
-        _late_pending_steer = (
-            _close_subagent_steering(_subagent_id, child) if _subagent_id else None
-        )
-        if _late_pending_steer:
-            _existing_pending = result.get("pending_steer")
-            result["pending_steer"] = (
-                f"{_existing_pending}\n{_late_pending_steer}"
-                if isinstance(_existing_pending, str) and _existing_pending
-                else _late_pending_steer
-            )
+        # rejects any later caller; the ledger holds every earlier one.
+        _missed_steer = _close_and_read_missed(_subagent_id, child)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, "_flush"):
@@ -4735,13 +4794,10 @@ def _run_single_child(
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
 
-        # A steer that queued after the child's final assistant turn had no
-        # tool batch left to drain into.  The finalizer hands the undelivered
-        # text back (turn_finalizer.py "pending_steer"); retain it here so the
-        # parent sees the steer was MISSED rather than silently absorbed —
-        # steer_subagent() returning True means "queued", and this is where a
-        # queued-but-never-delivered steer gets named.
-        _missed_steer = result.get("pending_steer")
+        # steer_subagent() returning True means "queued". Every queued steer
+        # the child never wrote into a tool result is named here as MISSED
+        # rather than silently absorbed (the ledger, not the finalizer's
+        # "pending_steer", is the source: other paths empty that slot).
         if isinstance(_missed_steer, str) and _missed_steer.strip():
             entry["missed_steer"] = _missed_steer
             _miss_note = (
@@ -4848,9 +4904,7 @@ def _run_single_child(
         return entry
 
     except Exception as exc:
-        _late_pending_steer = (
-            _close_subagent_steering(_subagent_id, child) if _subagent_id else None
-        )
+        _late_pending_steer = _close_and_read_missed(_subagent_id, child)
         _reap_subtree(child, "error")
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
@@ -4925,7 +4979,7 @@ def _release_child_resources(
     two halves separately (docs/dev/delegate-child-lifecycle.md, I2).
     """
     _release_child_handles(child, parent_agent, _subagent_id, child_pool, leased_cred_id)
-    _close_child_persistence(child)
+    _teardown(child, "run_end", owner=True)
 
 
 def _release_child_handles(
@@ -4965,8 +5019,8 @@ def _release_child_handles(
 def _close_child_persistence(child: Any) -> None:
     """Close the child's SessionDB/tool resources and its relay session.
 
-    Never while a turn of the child is live: the late path defers this to
-    the live turn's exit.
+    Only the teardown door (``_teardown`` / ``_release_hold``) calls this,
+    and never while the child's run or a turn of it is live (I2).
     """
     # Close tool resources (terminal sandboxes, browser daemons,
     # background processes, httpx clients) so subagent subprocesses
@@ -4993,6 +5047,136 @@ def _close_child_persistence(child: Any) -> None:
             runtime.unregister_subagent({"child_session_id": child_session_id})
     except Exception:
         logger.debug("Failed to close child Relay session after delegation")
+
+
+# ---------------------------------------------------------------------------
+# I2: the one teardown door (docs/dev/delegate-child-lifecycle.md).
+#
+# Every close of a delegated child's persistence -- delegate_task's own run
+# end, the late path, a parent's AIAgent.close()/release_clients() reaching
+# it through ``_owner_teardown``, an ancestor's recursive close -- calls
+# ``_teardown``. It refuses (defers, logged) while the child is held: by the
+# run that owns it (``_hold_run``, released by the owner's own teardown) or
+# by any live turn (``_submit_turn`` / ``_inline_turn``). The deferred close
+# runs once, when the last hold goes, in a copy of the requester's context.
+# tests/tools/test_delegate_teardown_door.py fails if a new call site closes
+# a child outside this door.
+# ---------------------------------------------------------------------------
+_door_lock = threading.Lock()
+_door: "weakref.WeakKeyDictionary[Any, Dict[str, Any]]" = weakref.WeakKeyDictionary()
+
+
+_door_strong: Dict[int, Tuple[Any, Dict[str, Any]]] = {}
+
+
+def _door_slot(child: Any) -> Dict[str, Any]:
+    try:
+        slot = _door.get(child)
+    except TypeError:  # not weak-referenceable: keep it strongly
+        slot = _door_strong.get(id(child), (None, None))[1]
+    if slot is None:
+        slot = {"run": False, "turns": 0, "pending": None, "closed": False}
+        try:
+            _door[child] = slot
+        except TypeError:
+            _door_strong[id(child)] = (child, slot)
+    return slot
+
+
+def _hold_run(child: Any) -> None:
+    """The run that owns *child* holds it until it calls ``_teardown(owner=True)``."""
+    with _door_lock:
+        _door_slot(child)["run"] = True
+
+
+def _release_hold(child: Any, *, run: bool = False, turn: bool = False) -> None:
+    with _door_lock:
+        slot = _door_slot(child)
+        if run:
+            slot["run"] = False
+        if turn:
+            slot["turns"] = max(0, slot["turns"] - 1)
+        if slot["run"] or slot["turns"] or slot["pending"] is None or slot["closed"]:
+            return
+        reason, ctx = slot["pending"]
+        slot["pending"] = None
+        slot["closed"] = True
+    waiting = _count_deferred_teardown(-1)
+    logger.info(
+        "delegate_task deferred teardown of %s runs now (%s; still deferred: %d)",
+        getattr(child, "_subagent_id", None),
+        reason,
+        waiting,
+    )
+    ctx.run(_close_child_persistence, child)
+
+
+def _submit_turn(executor: Any, child: Any, fn: Any, *args: Any) -> Any:
+    """Submit one child turn; the child is held from submit until it exits."""
+    with _door_lock:
+        _door_slot(child)["turns"] += 1
+    try:
+        fut = executor.submit(fn, *args)
+    except BaseException:
+        _release_hold(child, turn=True)
+        raise
+    fut.add_done_callback(lambda _f: _release_hold(child, turn=True))
+    return fut
+
+
+class _inline_turn:
+    """Hold *child* for a turn that runs on the calling thread."""
+
+    def __init__(self, child: Any) -> None:
+        self.child = child
+
+    def __enter__(self) -> None:
+        with _door_lock:
+            _door_slot(self.child)["turns"] += 1
+
+    def __exit__(self, *exc: Any) -> None:
+        _release_hold(self.child, turn=True)
+
+
+def _teardown(child: Any, reason: str, *, owner: bool = False) -> bool:
+    """The only door to closing a delegated child. True if it closed now.
+
+    ``owner=True`` is the run's own end (it releases the run hold first).
+    Idempotent: a second request after the close is a no-op.
+    """
+    with _door_lock:
+        slot = _door_slot(child)
+        if owner:
+            slot["run"] = False
+        if slot["closed"]:
+            return False
+        if slot["run"] or slot["turns"]:
+            if slot["pending"] is None:
+                slot["pending"] = (reason, contextvars.copy_context())
+                waiting = _count_deferred_teardown(1)
+                logger.warning(
+                    "delegate_task teardown of %s (%s) deferred: %s; it runs when "
+                    "the child is released (deferred teardowns: %d)",
+                    getattr(child, "_subagent_id", None),
+                    reason,
+                    f"{slot['turns']} live turn(s)" if slot["turns"] else "its run is active",
+                    waiting,
+                )
+            return False
+        slot["closed"] = True
+        if slot["pending"] is not None:
+            slot["pending"] = None
+            _count_deferred_teardown(-1)
+    _close_child_persistence(child)
+    return True
+
+
+def _attach_owner_teardown(child: Any) -> None:
+    """Route parent-driven closes (AIAgent.close / release_clients) to the door."""
+    try:
+        child._owner_teardown = lambda reason="parent_close": _teardown(child, reason)
+    except Exception:
+        logger.debug("could not attach the teardown door", exc_info=True)
 
 
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
