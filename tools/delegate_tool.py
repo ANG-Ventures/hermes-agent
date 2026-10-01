@@ -282,6 +282,10 @@ class _SteerLedger:
         self._slot: List[Tuple[str, Optional[List[int]]]] = []
         self._batches: List[Dict[str, Any]] = []
         self._write_failed = False
+        # Set by ``seal`` at the child's linearization point. A closed
+        # ledger refuses every producer, including a direct ``child.steer()``
+        # that never passes through the registry (Argus QA r2 C2).
+        self._closed = False
 
     @classmethod
     def for_child(cls, child: Any, subagent_id: str) -> "_SteerLedger":
@@ -355,11 +359,24 @@ class _SteerLedger:
             self._entries[seq]["state"] = "withdrawn"
             self._append({"op": "withdraw", "seq": seq})
 
+    def seal(self) -> None:
+        """No steer is accepted from now on; open entries stay as they are."""
+        with self._lock:
+            self._closed = True
+
     def steer_via(self, orig: Any, text: Any) -> bool:
-        """The child's ``steer``: ledger entry first, then the real slot."""
+        """The child's ``steer``: ledger entry first, then the real slot.
+
+        Refused (False, no entry, slot untouched) once the ledger is closed:
+        the child's record is final, so an accepted text could be neither
+        delivered nor reported.
+        """
         if not isinstance(text, str) or not text.strip():
             return bool(orig(text))
         with self._lock:
+            if self._closed:
+                logger.debug("steer refused: the child's steering is closed")
+                return False
             seq = self.accept(text)
             try:
                 ok = bool(orig(text))
@@ -550,6 +567,12 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     drained text this returns.
     """
     with _active_subagents_lock:
+        # The ledger is the agent's own, so close it even when the registry
+        # entry is gone or recycled: this also refuses direct ``agent.steer()``
+        # producers that bypass ``steer_subagent`` (Argus QA r2 C2).
+        ledger = _steer_ledger_of(agent)
+        if ledger is not None:
+            ledger.seal()
         record = _active_subagents.get(subagent_id)
         if record is None or record.get("agent") is not agent:
             return None

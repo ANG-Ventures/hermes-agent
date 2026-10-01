@@ -213,6 +213,65 @@ def test_late_returned_api_failure_is_failed_and_reaps_subtree(fleet_home, monke
     assert (rec["status"], rec["exit_reason"]) == ("failed", "error")
 
 
+def test_reaped_grandchild_late_nudge_into_closed_orchestrator_is_refused(
+    fleet_home, monkeypatch
+):
+    """I1 for the direct ``child.steer()`` producer (Argus QA r2 C2).
+
+    The orchestrator 400s after timed_out_running; its record is persisted
+    and its live FOREVER grandchild is reaped. The grandchild's own late
+    thread then nudges the orchestrator with ``parent_agent.steer(...)``.
+    That orchestrator's steering is closed, so the ledgered steer must be
+    refused: no ``accept`` that no record reports.
+    """
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+    parent = _Agent(None, depth=0)
+    box = {}
+    release = threading.Event()
+
+    def _spawn_wait_then_400(self):
+        box["g"], box["t"] = _spawn_grandchild(self, "sa-0-gc1")
+        release.wait(10)
+        return _failed_return()
+
+    child = _Agent("sa-0-orch", parent=parent, behavior=_spawn_wait_then_400)
+    entry = delegate_tool._run_single_child(0, "orch", child, parent)
+    assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING
+    # The grandchild went late too, so its late thread is the nudger.
+    assert _wait_until(lambda: any(
+        h for h in list(delegate_tool._late_handles) if "sa-0-gc1" in h
+    ))
+    ledger = child._steer_ledger
+    release.set()
+
+    late_dir = fleet_home / "cache" / "delegation" / "late"
+    assert _wait_until(lambda: any(late_dir.glob("late-sa-0-gc1-*.json"))), (
+        "grandchild late record never written"
+    )
+    assert box["g"].stopped.wait(5)
+    box["t"].join(5)
+    assert _wait_until(lambda: not _registered("sa-0-orch", "sa-0-gc1"))
+    orch_rec = json.loads(next(late_dir.glob("late-sa-0-orch-*.json")).read_text())
+    orch_rec = orch_rec.get("entry", orch_rec)
+    assert (orch_rec["status"], orch_rec["exit_reason"]) == ("failed", "error")
+
+    # The grandchild's nudge reached the orchestrator's steer wrapper ...
+    time.sleep(0.3)
+    nudges = [t for t in child.steered if "[delegate_task late result]" in t]
+    # ... and was refused: nothing accepted after closure, so the record's
+    # missed_steer (absent) equals accepted - delivered (empty).
+    counts = ledger.counts()
+    assert counts["accepted"] == 0, (counts, ledger.missed())
+    assert nudges == [], "a closed orchestrator took the late nudge into its slot"
+    assert "missed_steer" not in orch_rec
+    assert "steer_fate_unknown" not in orch_rec
+    if ledger.path is not None and ledger.path.exists():
+        ops = [json.loads(l)["op"] for l in ledger.path.read_text().splitlines()]
+        assert "accept" not in ops, ops
+
+
 def test_completed_child_leaves_its_running_grandchild_alone(fleet_home, monkeypatch):
     """Positive control: a legitimate completion is not a failure; no reap."""
     from tools import delegate_tool

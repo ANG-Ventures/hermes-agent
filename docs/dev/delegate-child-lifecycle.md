@@ -205,9 +205,15 @@ Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
   transcript line (#1595 r1 d066). Memory is authoritative and unredacted; a
   failed write is logged once at WARNING.
 
-A steer accepted after closure is impossible: closure (`finish`/`stall`, or
-the normal path's completion) sets `accepting_steer=False` under the lock
-`steer_subagent` holds.
+A steer accepted after closure is impossible, for every producer: closure
+(`finish`/`stall`, or the normal path's completion) sets
+`accepting_steer=False` under the lock `steer_subagent` holds, and in the
+same critical section seals the child's ledger. A sealed ledger refuses
+every later `steer` (returns False, writes no entry, leaves the slot alone),
+so a direct `child.steer()` that never passes the registry is refused too.
+Example: a reaped grandchild's late thread nudging its already-persisted
+orchestrator gets `nudged=False`; before this it was accepted and neither
+delivered nor reported (Argus QA r2 C2, t_c72adf5b).
 
 `steer_fate_unknown: true` now means the record was written while a turn of
 the child was still live. That turn may still deliver a ledgered steer, so
