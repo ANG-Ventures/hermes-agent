@@ -177,6 +177,41 @@ def test_operator_requeue_releases_the_hold_early(kanban_home, clock):
         assert kb.check_respawn_guard(conn, newer) != "overlap_hold"
 
 
+def test_later_overlap_on_a_held_card_does_not_release_its_hold(kanban_home, clock):
+    """Prism P1 00beb1de4c64 (#1600 @5cfd5466): a third card matching the
+    held one appends an informational overlap_detected event (no hold_until)
+    to it. The hold must survive that event until its own deadline."""
+    with kb.connect_closing() as conn:
+        ids = _replay(conn, clock, ["t_f1437191", "t_d979a494"])
+        held = ids["t_d979a494"]
+        born = CARDS["t_d979a494"]["created_at"]
+        clock["now"] = born + 60
+        assert kb.check_respawn_guard(conn, held) == "overlap_hold"
+
+        card = CARDS["t_f1437191"]
+        clock["now"] = born + 120
+        third = kb.create_task(
+            conn, title=card["title"], body=card["body"], assignee="daedalus",
+            session_id=card["session_id"], session_explicit=True,
+            duplicate_guard=True, force_reason="third mint of the same incident",
+        )
+        # Precondition: the held card's NEWEST overlap event is informational.
+        newest = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1", (held, kov.OVERLAP_EVENT),
+        ).fetchone()
+        assert third in {o["id"] for o in json.loads(newest["payload"])["overlaps"]}
+        assert "hold_until" not in json.loads(newest["payload"])
+
+        clock["now"] = born + 180
+        assert kov.overlap_hold_until(conn, held, ("requeued",)) == born + kov.OVERLAP_HOLD_SECONDS
+        assert kb.check_respawn_guard(conn, held) == "overlap_hold"
+        # Requeue after the hold still releases it early.
+        with kb.write_txn(conn):
+            kb._append_event(conn, held, "requeued", {"by": "apollo"})
+        assert kb.check_respawn_guard(conn, held) != "overlap_hold"
+
+
 def test_score_pair_features_on_the_live_rows():
     f = {k: kov.features(v["title"], v["body"]) for k, v in CARDS.items()}
     score, reasons = kov.score_pair(f["t_f1437191"], f["t_d979a494"])

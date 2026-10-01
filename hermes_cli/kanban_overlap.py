@@ -315,21 +315,28 @@ def record_overlaps(conn, task_id: str, hits: list[dict], *, now: int, append_ev
 
 def overlap_hold_until(conn, task_id: str, requeue_kinds: Iterable[str]) -> Optional[int]:
     """``hold_until`` of the card's newest overlap hold, unless an operator
-    requeue verb landed after it (the session decided: run it)."""
+    requeue verb landed after it (the session decided: run it).
+
+    Only hold-bearing events count. A held card that a later card matches
+    gets an informational ``overlap_detected`` event (no ``hold_until``);
+    that event must not mask the hold (Prism P1 00beb1de4c64)."""
     import json
 
-    row = conn.execute(
+    row = None
+    until = None
+    for cand in conn.execute(
         "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (task_id, OVERLAP_EVENT),
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        until = json.loads(row["payload"] or "{}").get("hold_until")
-    except (TypeError, ValueError, AttributeError):
-        return None
-    if not isinstance(until, (int, float)):
+    ):
+        try:
+            value = json.loads(cand["payload"] or "{}").get("hold_until")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            row, until = cand, value
+            break
+    if row is None or until is None:
         return None
     kinds = tuple(requeue_kinds)
     if kinds:
