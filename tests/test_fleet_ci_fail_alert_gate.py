@@ -661,8 +661,13 @@ def test_probe_bench_wave_red_is_silent_without_api_calls(tmp_path):
     assert got["route"] == "none" and got["_curl"] == ""
 
 
+def _prior_probe(run_id, title, *, actor="Kyzcreig", branch="main", created=_NOW):
+    return {"id": run_id, "created_at": created, "display_title": title,
+            "actor": {"login": actor}, "head_branch": branch}
+
+
 def test_probe_second_red_of_same_wave_is_silent(tmp_path):
-    prior = [{"id": 499, "created_at": _NOW, "display_title": "placement probe hand1 #1"}]
+    prior = [_prior_probe(499, "placement probe hand1 #1")]
     got = _probe_route(tmp_path, prior=prior)
     assert got["route"] == "none" and "already paged (run 499)" in got["_stdout"]
 
@@ -682,3 +687,21 @@ def test_probe_dedupe_api_error_fails_loud(tmp_path):
 def test_probe_red_on_worker_branch_stays_silent(tmp_path):
     got = _probe_route(tmp_path, branch="ci/placement-no-checkout-t_eb230c34", prior=[])
     assert got["route"] == "none"
+
+
+# FleetReview #1482 (189d887c7b25): dedupe must only count prior reds that THIS
+# route paged. A bot bench red or a worker-branch red of the same wave was
+# silent, so it must not suppress the first paging-eligible red of that wave.
+@pytest.mark.parametrize("prior_run", [
+    _prior_probe(499, "placement probe hand1 #1", actor="ang-fleet-workers[bot]"),
+    _prior_probe(499, "placement probe hand1 #1", branch="ci/placement-no-checkout-t_eb230c34"),
+    {"id": 499, "created_at": _NOW, "display_title": "placement probe hand1 #1"},  # no actor/branch
+])
+def test_probe_prior_red_that_never_paged_does_not_suppress(tmp_path, prior_run):
+    got = _probe_route(tmp_path, prior=[prior_run])
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_probe_prior_lookup_is_scoped_to_default_branch(tmp_path):
+    got = _probe_route(tmp_path, prior=[])
+    assert "branch=main" in got["_curl"]
