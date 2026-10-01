@@ -95,6 +95,7 @@ NOTIONAL_ANTHROPIC_PROVIDERS = frozenset({
     "claude-bridge",
     "claude-apr",
     "claude-alr",  # the apr relay under its a-local name (t_4c1a9bee)
+    "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf",  # its harness faces (t_ee99d1cd)
     "claude-bpr",
 })
 
