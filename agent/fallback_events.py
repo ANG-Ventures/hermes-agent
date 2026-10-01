@@ -403,7 +403,9 @@ def note_unclassified(row: Optional[Dict[str, Any]], rendered: str,
             # t_b2e9ef12 (additive): what the classifier had no name for.
             "socket_cause": ev.get("socket_cause"),
             "exc_chain": [str(n) for n in (ev.get("exc_chain") or ())],
-            "endpoint": ev.get("endpoint"),
+            # host:port by construction (_endpoint); scrubbed anyway (defence in depth).
+            "endpoint": (_scrub_dead_letter(str(ev["endpoint"])) or None)
+            if ev.get("endpoint") else None,
             "elapsed_s": ev.get("elapsed_s"),
             "floor": {str(k): (_scrub_dead_letter(v) if isinstance(v, str) else v)
                       for k, v in (ev.get("floor") or {}).items()},
@@ -485,7 +487,9 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
         content = getattr(response, "content", None)
         floor = {
             "site": str(site),
-            "detail": (str(detail)[:200] if detail else None),
+            # Scrub the WHOLE detail before the cut: a cut that lands between a
+            # URL password and its '@' would hide it from the redactor.
+            "detail": (_scrub_dead_letter(str(detail))[:200] or None) if detail else None,
             "stop_reason": getattr(response, "stop_reason", None)
             if response is not None else None,
             "content_blocks": len(content) if isinstance(content, list) else None,

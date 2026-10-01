@@ -254,3 +254,32 @@ def test_legacy_null_row_still_gets_a_cause():
 def test_stash_response_failure_never_raises():
     fbe.stash_response_failure(object(), "invalid_response", object())  # no attrs
     fbe.stash_response_failure(None, "x")
+
+
+def test_floor_detail_scrubbed_before_cut(_home, monkeypatch):
+    """Prism r1: a URL password whose '@' falls past the 200-char cut must not
+    survive into the dead-letter row."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_events_ledger import _agent, _patch_resolver
+
+    pw = "opaque-pw-" + "4242xyz"
+    prefix = "x" * (200 - len("https://alice:") - len(pw))
+    detail = f"{prefix}https://alice:{pw}@host.test/v1 failed"
+    assert detail.index("@") >= 200  # the cut lands before the '@'
+    _patch_resolver(monkeypatch)
+    a = _agent()
+    fbe.stash_response_failure(a, "invalid_response", _Resp(), detail=detail)
+    assert try_activate_fallback(a) is True
+    d = _dead(_home)[0]
+    assert pw not in d["floor"]["detail"]
+    assert pw not in str(d)
+
+
+def test_endpoint_carries_no_userinfo_or_query():
+    """Prism r1: the endpoint is host:port only, never URL userinfo/query."""
+    import httpx
+
+    pw = "opaque-pw-" + "9191abc"
+    req = httpx.Request("POST", f"https://alice:{pw}@relay.test:18801/v1/messages?key={pw}")
+    err = httpx.ConnectError("refused", request=req)
+    assert fbe._endpoint(err) == "relay.test:18801"
