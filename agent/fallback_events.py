@@ -74,6 +74,11 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # reaps it, so the route is unavailable for this session, not a bad request
     # and not quota (t_693aa2e5: 145 rows/7d rendered "unclassified error").
     ("pool_pressure", ("replayed history no longer matches",)),
+    # claude-pool box capacity / interactive-session startup (503s, t_0ff05041).
+    # Ahead of conn so "startup deadline" never drifts into a timeout needle.
+    ("pool_pressure", ("no free interactive session slot",
+                       "cli children concurrently",
+                       "did not become ready before the startup deadline")),
     # Pool-wide exhaustion for every model is still pool-wide quota.
     ("quota_model", ("no eligible sub",)),
     ("conn", ("upstream connect timed out", "upstream unreachable",
