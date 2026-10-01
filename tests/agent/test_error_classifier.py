@@ -65,7 +65,7 @@ class TestFailoverReason:
             "decode_error",
             "context_overflow", "body_too_large", "payload_too_large", "image_too_large",
             "image_corrupt",
-            "model_not_found", "format_error",
+            "model_not_found", "endpoint_not_found", "format_error",
             "malformed_conversation",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
@@ -784,6 +784,59 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="nvidia", model="my-local-nim")
         assert result.reason == FailoverReason.unknown
         assert result.retryable is True
+
+    @staticmethod
+    def _express_404():
+        """Real openai.NotFoundError carrying Express's default 404 page."""
+        import httpx
+        import openai
+
+        body = (
+            '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            "<title>Error</title>\n</head>\n<body>\n"
+            "<pre>Cannot POST /chat/completions</pre>\n</body>\n</html>\n"
+        )
+        req = httpx.Request("POST", "http://relay.example:3556/chat/completions")
+        resp = httpx.Response(404, request=req, text=body)
+        return openai.NotFoundError(
+            f"Error code: 404 - {body!r}", response=resp, body=body
+        )
+
+    def test_404_express_missing_route_is_endpoint_not_found(self, monkeypatch):
+        """t_3f927c6b: a base_url missing /v1 hits Express's 'Cannot POST'.
+
+        Pin plugins publish ``<pin>/<model>`` catalogue ids, so the prefix
+        heuristic claims a dropped vendor prefix for every bare 404 on a
+        claude-* pin. Simulate that catalogue; the route-naming body must win.
+        """
+        import hermes_cli.model_normalize as mn
+
+        monkeypatch.setattr(
+            mn, "suggest_prefixed_model_id", lambda p, m: f"{p}/{m}"
+        )
+        result = classify_api_error(
+            self._express_404(), provider="claude-bpx-9", model="claude-fable-5-1"
+        )
+        assert result.reason == FailoverReason.endpoint_not_found
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_404_express_missing_route_beats_real_prefix_catalogue(self):
+        """Same with a real catalogue hit (nvidia, #78796 shape)."""
+        result = classify_api_error(
+            self._express_404(), provider="nvidia", model="nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.endpoint_not_found
+
+    def test_endpoint_not_found_announce_is_not_model_unavailable(self):
+        from agent.chat_completion_helpers import (
+            _FALLBACK_REASON_LABELS,
+            _fallback_reason_text,
+        )
+
+        label = _FALLBACK_REASON_LABELS["endpoint_not_found"]
+        assert "model" not in label and "base_url" in label
+        assert "model" not in _fallback_reason_text(FailoverReason.endpoint_not_found)
 
     # ── Provider policy-block (OpenRouter privacy/guardrail) ──
 

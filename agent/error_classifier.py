@@ -130,6 +130,12 @@ class FailoverReason(enum.Enum):
 
     # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    # The 404 names a missing HTTP ROUTE, not a model: an Express-style
+    # "Cannot POST /chat/completions" page means base_url points at a server
+    # that has no such path (e.g. a relay base_url missing its /v1). Config
+    # fault, deterministic: fail over at once, and never call it a missing
+    # model (t_3f927c6b).
+    endpoint_not_found = "endpoint_not_found"
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
 
@@ -657,6 +663,13 @@ _MODEL_NOT_FOUND_PATTERNS = [
     # instead of automatically failing over.  See PR #58446.
     "no endpoints found that support tool use",
 ]
+
+
+# Express's default 404 page ("<pre>Cannot POST /chat/completions</pre>") names
+# the missing ROUTE. Matched on the lowercased error text.
+_MISSING_ROUTE_RE = re.compile(
+    r"\bcannot (?:get|post|put|patch|delete|head|options) /"
+)
 
 
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
@@ -1844,6 +1857,18 @@ def _classify_by_status(
         if any(p in error_msg for p in _MODEL_NOT_FOUND_PATTERNS):
             return result_fn(
                 FailoverReason.model_not_found,
+                retryable=False,
+                should_fallback=True,
+            )
+        # The body names a missing HTTP route (Express default 404 page), so
+        # the URL is wrong, not the model. Must run before the prefix
+        # heuristic: model-provider pin plugins publish "<pin>/<model>"
+        # catalogue ids, which made every bare 404 on a claude-* pin look
+        # like a dropped vendor prefix and announce "model unavailable"
+        # (t_3f927c6b). No retry: the route stays missing.
+        if _MISSING_ROUTE_RE.search(error_msg):
+            return result_fn(
+                FailoverReason.endpoint_not_found,
                 retryable=False,
                 should_fallback=True,
             )
