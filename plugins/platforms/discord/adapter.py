@@ -126,6 +126,62 @@ _DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES = 5
 # every slash command — not just the overflow ones. We keep the desired set
 # at or below this limit at registration time.
 _DISCORD_MAX_APP_COMMANDS = 100
+# ``discord.slash_commands`` — per-profile scope of this bot's native slash menu.
+#
+# Every Hermes gateway registers its full command set with Discord, so a
+# second Hermes bot in a guild doubles the ``/`` picker. That is why the
+# break-glass/secondary bots were kept out of the guild entirely (Ace
+# 2026-09-30). The knob:
+#   all    (default)  register everything — unchanged behavior
+#   none              register nothing; on every connect DELETE this app's
+#                     existing global + guild commands, so a re-invited bot
+#                     adds ZERO picker entries
+#   [a, b] / "a,b"    register only the named commands (e.g. status, stop)
+# In ``none``/list mode, ``!<command>`` typed as text is accepted as the
+# gateway command (``!status`` → ``/status``) so the bot stays usable without
+# a picker entry.
+_SLASH_SCOPE_ALL = "all"
+_SLASH_SCOPE_NONE = "none"
+_SLASH_SCOPE_LIST = "list"
+_SLASH_SCOPE_ALL_WORDS = frozenset({"all", "*", "true", "yes", "on"})
+_SLASH_SCOPE_NONE_WORDS = frozenset({"none", "off", "false", "no"})
+_DISCORD_PREFIX_COMMAND_RE = re.compile(r"^!([A-Za-z0-9][\w-]{0,31})(?=\s|$)")
+
+
+def _normalize_slash_scope_name(name: Any) -> str:
+    return str(name or "").strip().lstrip("/").lower().replace("_", "-")
+
+
+def _parse_slash_command_scope(raw: Any) -> tuple:
+    """Parse ``discord.slash_commands`` into ``(mode, allowlist)``.
+
+    ``None`` / ``True`` / ``""`` / ``all`` → ``all``; ``False`` / ``none`` /
+    an empty list → ``none``; a list or comma-separated string → ``list``.
+    Anything else falls back to ``all`` (today's behavior) with a warning.
+    """
+    if raw is None or raw is True:
+        return _SLASH_SCOPE_ALL, frozenset()
+    if raw is False:
+        return _SLASH_SCOPE_NONE, frozenset()
+    if isinstance(raw, str):
+        word = raw.strip().lower()
+        if not word or word in _SLASH_SCOPE_ALL_WORDS:
+            return _SLASH_SCOPE_ALL, frozenset()
+        if word in _SLASH_SCOPE_NONE_WORDS:
+            return _SLASH_SCOPE_NONE, frozenset()
+        items: Any = raw.split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = raw
+    else:
+        logger.warning(
+            "Invalid discord.slash_commands=%r (want all | none | list of names); using 'all'",
+            raw,
+        )
+        return _SLASH_SCOPE_ALL, frozenset()
+    names = frozenset(n for n in (_normalize_slash_scope_name(i) for i in items) if n)
+    if not names:
+        return _SLASH_SCOPE_NONE, frozenset()
+    return _SLASH_SCOPE_LIST, names
 _DISCORD_SELECT_FIELD_LIMIT = 100
 # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
 _DISCORD_SELECT_MAX_OPTIONS = 25
@@ -1619,7 +1675,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
-        self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        (
+            self._slash_command_scope,
+            self._slash_command_allowlist,
+        ) = _parse_slash_command_scope(self.config.extra.get("slash_commands", True))
+        self._slash_commands: bool = self._slash_command_scope != _SLASH_SCOPE_NONE
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
@@ -2796,7 +2856,12 @@ class DiscordAdapter(BasePlatformAdapter):
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _command_sync_skip_reason(
-        self, app_id: Any, fingerprint: str, *, bypass_rate_limit_wait: bool = False
+        self,
+        app_id: Any,
+        fingerprint: str,
+        *,
+        bypass_rate_limit_wait: bool = False,
+        bypass_fingerprint: bool = False,
     ) -> Optional[str]:
         """Why this sync should stand down, or None to proceed.
 
@@ -2833,7 +2898,8 @@ class DiscordAdapter(BasePlatformAdapter):
         last_success_at = float(entry.get("last_success_at") or 0)
         last_attempt_at = float(entry.get("last_attempt_at") or 0)
         if (
-            entry.get("fingerprint") == fingerprint
+            not bypass_fingerprint
+            and entry.get("fingerprint") == fingerprint
             and last_success_at
             and last_success_at >= last_attempt_at
         ):
@@ -3148,19 +3214,30 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         try:
             sync_policy = self._get_discord_command_sync_policy()
-            if sync_policy == "off":
+            if sync_policy == "off" and self._slash_scope_mode() == _SLASH_SCOPE_ALL:
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
                 return
+
+            # A restricted scope (discord.slash_commands: none | list) reconciles
+            # on EVERY connect: stale commands can reappear out of band (a
+            # re-invited bot, an older build), and the fingerprint only tracks
+            # what we want, not what Discord holds.
+            restricted_scope = self._slash_scope_mode() != _SLASH_SCOPE_ALL
+            app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
 
             if sync_policy == "bulk":
                 synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
                 logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
+                if restricted_scope:
+                    await self._prune_stale_guild_slash_commands(app_id)
                 return
 
-            app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
             fingerprint = self._desired_command_sync_fingerprint()
             skip_reason = self._command_sync_skip_reason(
-                app_id, fingerprint, bypass_rate_limit_wait=is_rate_limit_retry
+                app_id,
+                fingerprint,
+                bypass_rate_limit_wait=is_rate_limit_retry,
+                bypass_fingerprint=restricted_scope,
             )
             if skip_reason:
                 logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
@@ -3218,6 +3295,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 summary["created"],
                 summary["deleted"],
             )
+            if restricted_scope:
+                await self._prune_stale_guild_slash_commands(app_id)
             # Verify Discord actually holds what we asked for. A "successful"
             # sync is not proof the registry matches the tree.
             await self._check_command_registry_drift()
@@ -4070,7 +4149,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # recreate and the desired set fits under Discord's hard cap. Pure
         # description/option patches stay on per-command edits (cheaper, and
         # they carry no vacate risk).
-        if (to_create or to_recreate) and len(desired_payloads) <= _DISCORD_MAX_APP_COMMANDS:
+        # A restricted scope (discord.slash_commands: none | list) typically
+        # drops dozens of commands at once; one PUT does that in a single
+        # request instead of N rate-limited per-command deletes.
+        restricted_prune = bool(obsolete_keys) and self._slash_scope_mode() != _SLASH_SCOPE_ALL
+        if (to_create or to_recreate or restricted_prune) and len(desired_payloads) <= _DISCORD_MAX_APP_COMMANDS:
             bulk_sync = getattr(tree, "sync", None)
             if bulk_sync is not None:
                 await bulk_sync()
@@ -7253,6 +7336,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 dropped_over_cap,
             )
 
+        # Per-profile scope (discord.slash_commands): drop everything outside
+        # the allowlist AFTER all registration paths ran, so built-ins, the
+        # COMMAND_REGISTRY auto-registration, plugin commands and /skill are
+        # all filtered by one rule.
+        self._apply_slash_command_scope(tree)
+
         # Optional defense-in-depth: hide every slash command from non-admin
         # guild members in Discord's slash picker. Server-side authorization
         # (``_check_slash_authorization``) is the actual gate; this is purely
@@ -7263,6 +7352,108 @@ class DiscordAdapter(BasePlatformAdapter):
             "true", "1", "yes", "on",
         }:
             self._apply_owner_only_visibility(tree)
+
+    def _slash_scope_mode(self) -> str:
+        return getattr(self, "_slash_command_scope", _SLASH_SCOPE_ALL)
+
+    def _apply_slash_command_scope(self, tree) -> None:
+        """Remove every registered command outside ``discord.slash_commands``."""
+        mode = self._slash_scope_mode()
+        if mode == _SLASH_SCOPE_ALL:
+            return
+        allow = getattr(self, "_slash_command_allowlist", frozenset()) if mode == _SLASH_SCOPE_LIST else frozenset()
+        kept: List[str] = []
+        removed = 0
+        for cmd in list(tree.get_commands()):
+            name = getattr(cmd, "name", "")
+            if _normalize_slash_scope_name(name) in allow:
+                kept.append(name)
+                continue
+            kwargs = {}
+            cmd_type = getattr(cmd, "type", None)
+            if cmd_type is not None:
+                kwargs["type"] = cmd_type
+            try:
+                tree.remove_command(name, **kwargs)
+                removed += 1
+            except Exception as e:
+                logger.warning("[%s] Could not drop slash command %r: %s", self.name, name, e)
+        unknown = sorted(allow - {_normalize_slash_scope_name(n) for n in kept})
+        logger.info(
+            "[%s] discord.slash_commands=%s: kept %s, dropped %d",
+            self.name,
+            mode,
+            sorted(kept) or "nothing",
+            removed,
+        )
+        if unknown:
+            logger.warning(
+                "[%s] discord.slash_commands names match no registered command: %s",
+                self.name,
+                unknown,
+            )
+
+    async def _prune_stale_guild_slash_commands(self, app_id: Any) -> int:
+        """Clear this app's GUILD-scoped commands in every guild it is in.
+
+        Hermes only ever registers GLOBAL commands, so any guild-scoped entry
+        for this app is stale (an older build, a manual registration) and would
+        still show in that guild's picker. Runs only for a restricted scope
+        (``none`` / list), on every connect. One atomic PUT [] per guild, and
+        only when the guild actually holds commands.
+        """
+        client = self._client
+        if not client or not app_id:
+            return 0
+        tree = client.tree
+        http = client.http
+        cleared = 0
+        for guild in list(getattr(client, "guilds", None) or []):
+            try:
+                existing = await tree.fetch_commands(guild=guild)
+                if not existing:
+                    continue
+                await http.bulk_upsert_guild_commands(app_id, guild.id, [])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[%s] Could not clear guild-scoped slash commands in guild %s: %s",
+                    self.name,
+                    getattr(guild, "id", "?"),
+                    e,
+                )
+                raise
+            cleared += len(existing)
+            logger.info(
+                "[%s] Cleared %d stale guild-scoped slash command(s) in guild %s (discord.slash_commands=%s)",
+                self.name,
+                len(existing),
+                guild.id,
+                self._slash_scope_mode(),
+            )
+        return cleared
+
+    def _rewrite_prefix_command(self, text: str) -> str:
+        """``!status`` → ``/status`` when this bot's slash menu is restricted.
+
+        Only a name the gateway actually dispatches is rewritten, so ordinary
+        text starting with ``!`` is untouched. Inactive under ``all``.
+        """
+        if self._slash_scope_mode() == _SLASH_SCOPE_ALL or not text:
+            return text
+        match = _DISCORD_PREFIX_COMMAND_RE.match(text)
+        if not match:
+            return text
+        name = match.group(1).lower()
+        try:
+            from hermes_cli.commands import is_gateway_known_command
+
+            if not is_gateway_known_command(name):
+                return text
+        except Exception:
+            return text
+        return "/" + name + text[match.end():]
 
     def _apply_owner_only_visibility(self, tree) -> None:
         """Set default_member_permissions=0 on every registered slash command.
@@ -9770,6 +9961,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        prefixed_command = self._rewrite_prefix_command(normalized_content)
+        if prefixed_command != normalized_content:
+            normalized_content = prefixed_command
+            message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -12115,6 +12310,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+    # discord.slash_commands (all | none | list) is per profile: seed extra,
+    # never process-global env, so a multiplexed profile keeps its own scope.
+    if "slash_commands" in discord_cfg:
+        seeded_extra["slash_commands"] = discord_cfg["slash_commands"]
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)

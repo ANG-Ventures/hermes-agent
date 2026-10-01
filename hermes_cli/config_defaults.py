@@ -2649,6 +2649,11 @@ DEFAULT_CONFIG = {
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
         },
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
+        # Native slash-menu scope for THIS bot: "all" (default) | "none" | list of
+        # names (e.g. ["status", "stop"]). "none" registers nothing and deletes this
+        # app's existing global + guild commands on every connect, so a second bot
+        # in a guild adds zero "/" picker entries; "!status" text still works.
+        "slash_commands": "all",
         # Discord Gateway transport health. These settings inspect the active
         # WebSocket's ready/open/heartbeat state; they never use Discord REST as
         # proof that Gateway events are still arriving. Set any value to 0 to
