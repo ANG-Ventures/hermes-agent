@@ -1317,6 +1317,25 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="deepseek-pricing-2026-07",
     ),
     # Google Gemini
+    # gemini-4-argon: launch announcement 2026-09-30 (blog.google; not yet on
+    # ai.google.dev/pricing or models.dev at pre-stage time). $2 in / $10 out /
+    # $0.10 cached input (95% off) per 1M. These are INTRODUCTORY rates: $4 / $20
+    # after the intro period (end date unannounced, so no superseded_at yet; the
+    # reprice sweep adds it when Google names the date). No cache-write price, same
+    # as every sibling Gemini row (Google bills no explicit cache write).
+    # Bridge ids gemini-4-argon-{low,medium,high} resolve here via
+    # _strip_gemini_effort_suffix.
+    (
+        "google",
+        "gemini-4-argon",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        source="official_docs_snapshot",
+        source_url="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/",
+        pricing_version="google-gemini-4-argon-intro-2026-09-30",
+    ),
     # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
     # These are the launch rates Google lists "through December 31, 2026"; the
     # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027". Both are

@@ -642,6 +642,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     "gpt-4.1": 1047576,
     "gpt-4": 128000,
     # Google
+    # Gemini 4 Argon (announced 2026-09-30): "1 million token limit" and a 1M
+    # output limit (up from 64K), per blog.google. Explicit row so it does not
+    # inherit the 1,048,576 "gemini" catch-all; the substring match also covers
+    # the gemini-bridge ids gemini-4-argon-{low,medium,high}. This table has no
+    # output-limit column, so the 1M output cap is not encoded here.
+    "gemini-4-argon": 1_000_000,
     "gemini": 1048576,
     # Gemma (open models served via AI Studio)
     "gemma-4": 256000,  # Gemma 4 family
