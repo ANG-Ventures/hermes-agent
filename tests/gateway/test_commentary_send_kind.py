@@ -1,7 +1,7 @@
 """Interim commentary is marked as COMMENTARY end-to-end (t_784a01bd).
 
-Adapters that cap split deliveries (Discord) collapse commentary to a single
-message, so the marker has to be set on BOTH commentary lanes:
+The marker is set on BOTH commentary lanes (adapters no longer shorten
+commentary, t_9b9322a1, but the tag stays for routing/telemetry):
 
 * the stream consumer's ``_send_commentary`` (streaming turns), and
 * ``gateway/run.py``'s ``_interim_assistant_cb`` direct send (non-streaming

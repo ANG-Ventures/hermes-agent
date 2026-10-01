@@ -15,7 +15,8 @@ Invariants pinned here:
 (a) a capped final reply always ENDS with its real last chunk;
 (b) the elision notice is present and states how many messages were elided;
 (c) never more than ``MAX_SPLIT_MESSAGES`` messages per logical response;
-(d) an interim commentary send is ONE message, never the truncation notice;
+(d) interim commentary takes the same split + tail-preserving cap path as a
+    final reply (t_9b9322a1 dropped the one-message collapse);
 (e) chunk indicators on the delivered set are consistent (no ``(1/12)``
     next to ``(8/12)`` when only 7 content chunks were delivered).
 """
@@ -165,25 +166,42 @@ class TestSendCap:
         _assert_tags_consistent(sends)
 
     @pytest.mark.asyncio
-    async def test_interim_commentary_is_one_message(self, monkeypatch, tmp_path):
-        """(d) The measured 2026-09-29 case: a 12-chunk narration block."""
+    async def test_interim_commentary_uses_normal_split_no_marker(self, monkeypatch, tmp_path):
+        """(d) Commentary is split like any reply (t_9b9322a1): a 3-chunk
+        narration arrives as 3 messages, nothing elided, no footer."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         adapter = _make_adapter()
         sends = self._wire(adapter)
-        content = _huge_content(22_000)
-        assert len(adapter.truncate_message(content, MAX)) >= 12
+        content = _huge_content(5_000)
+        expected = adapter.truncate_message(content, MAX)
+        assert len(expected) == 3
 
         result = await adapter.send(
             "555", content, metadata=mark_commentary_send(None)
         )
 
         assert result.success is True
-        assert len(sends) == 1
-        assert NOTICE not in sends[0]
-        assert sends[0].endswith("(continued in session log)")
-        assert _TAG.search(sends[0]) is None
-        assert len(sends[0]) <= MAX
-        assert sends[0].startswith("word-0-")
+        assert sends == expected
+        assert not any("continued in session log" in s for s in sends)
+        assert "FINAL-CONCLUSION-SENTINEL" in sends[-1]
+
+    @pytest.mark.asyncio
+    async def test_long_interim_commentary_gets_the_tail_preserving_cap(self, monkeypatch, tmp_path):
+        """A 12-chunk narration is capped like a final reply: head + notice
+        + tail, never more than ``MAX_SPLIT_MESSAGES``."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = self._wire(adapter)
+        content = _huge_content(22_000)
+        assert len(adapter.truncate_message(content, MAX)) >= 12
+
+        await adapter.send("555", content, metadata=mark_commentary_send(None))
+
+        assert len(sends) == CAP
+        assert "FINAL-CONCLUSION-SENTINEL" in sends[-1]
+        assert sum(NOTICE in s for s in sends) == 1
+        assert not any("continued in session log" in s for s in sends)
+        _assert_tags_consistent(sends)
 
     @pytest.mark.asyncio
     async def test_short_commentary_is_untouched(self, monkeypatch, tmp_path):
@@ -197,9 +215,8 @@ class TestSendCap:
 
     @pytest.mark.asyncio
     async def test_other_interim_sends_are_not_collapsed(self, monkeypatch, tmp_path):
-        """Heartbeats / approval fallbacks are marked ``_interim_send`` too;
-        only COMMENTARY collapses to one message — a plain-text approval
-        prompt must never lose its tail."""
+        """Heartbeats / approval fallbacks (``_interim_send``) keep their
+        tail under the cap — a plain-text approval prompt must never lose it."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         adapter = _make_adapter()
         sends = self._wire(adapter)
