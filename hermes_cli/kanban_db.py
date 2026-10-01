@@ -5443,7 +5443,8 @@ class MutationActor:
     foreign_ok: Optional[str] = None
     surface: str = "cli"  # "cli" | "tool" -- only shapes the refusal hint
     # ``--operator "<who: why>"``: an operator profile applying a relayed
-    # human decision. Recorded as an ``operator_override`` event, no comment.
+    # human decision. Recorded as an ``operator_override`` event; on a
+    # status/timing verb also a FOREIGN CHANGE comment (FOREIGN_CHANGE_ACTIONS).
     operator: Optional[str] = None
     # What a ``--takeover`` does to the card's home: ``"keep"`` (--keep-home),
     # ``"transfer"`` (--transfer-home), or None = the verb's default (see
@@ -6148,6 +6149,129 @@ def authorize_pending_operator_gate(conn: sqlite3.Connection) -> None:
             pass
 
 
+# Status/timing verbs whose ``--operator`` / ``--takeover`` on a foreign card
+# must announce itself (FOREIGN CHANGE comment + ``foreign_change`` event) and
+# yield to a NEWER human ruling the home session holds (t_4b826d5c: on
+# 09-30 21:58 one operator session re-parked another session's cards against
+# Ace's later ruling, and the home session learned of it 10 minutes later).
+FOREIGN_CHANGE_ACTIONS: frozenset[str] = frozenset({
+    "schedule", "unblock", "block", "triage-resolve", "reassign", "assign",
+    "priority",
+})
+# A cited human ruling: ``msg <discord message id>`` (snowflakes grow with time).
+_RULING_MSG_RE = re.compile(r"\bmsg\s+(\d{18,20})\b")
+# A home-session comment that relays a human ruling.
+_HOME_RULING_COMMENT_RE = re.compile(r"APOLLO\b.*\bACE\b|--operator", re.S)
+
+
+def ruling_msg_id(text: Optional[str]) -> Optional[int]:
+    """Newest ``msg <id>`` cited in ``text``, or ``None``."""
+    ids = [int(m) for m in _RULING_MSG_RE.findall(text or "")]
+    return max(ids) if ids else None
+
+
+def home_ruling_msg_id(
+    conn: sqlite3.Connection, task_id: str, home: str
+) -> Optional[int]:
+    """Newest Discord msg id the HOME session cited on this card: its
+    ``APOLLO … ACE …`` / ``--operator`` comments and its own
+    ``operator_override`` events. ``None`` when it cited none."""
+    sids = set(home_ids(home)) | {home}
+    refs = {derive_session_ref(s) for s in sids}
+    best: Optional[int] = None
+    for r in conn.execute(
+        "SELECT body, session_ref FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ):
+        if r["session_ref"] in refs and _HOME_RULING_COMMENT_RE.search(r["body"] or ""):
+            mid = ruling_msg_id(r["body"])
+            if mid is not None and (best is None or mid > best):
+                best = mid
+    for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'operator_override'",
+        (task_id,),
+    ):
+        try:
+            p = json.loads(r["payload"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(p, dict) or not (set(p.get("by_sessions") or ()) & sids):
+            continue
+        mid = ruling_msg_id(str(p.get("reason") or ""))
+        if mid is not None and (best is None or mid > best):
+            best = mid
+    return best
+
+
+def _origin_channel(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    for line in ((row["body"] if row else "") or "").splitlines():
+        if line.startswith("origin:"):
+            return line[len("origin:"):].split("·")[0].strip() or "the home chat"
+    return "the home chat"
+
+
+def _check_ruling_precedence(
+    conn: sqlite3.Connection, task_id: str, action: str, home: str,
+    reason: Optional[str],
+) -> None:
+    """Refuse a foreign status/timing override that would overturn a NEWER
+    human ruling held by the card's home session. No id on the home side =
+    allowed (status quo); the change is still announced."""
+    if action not in FOREIGN_CHANGE_ACTIONS:
+        return
+    home_msg = home_ruling_msg_id(conn, task_id, home)
+    if home_msg is None:
+        return
+    cited = ruling_msg_id(reason)
+    if cited is not None and cited >= home_msg:
+        return
+    raise ForeignSessionMutationError(
+        f"refused {action} on {task_id}: home session holds a newer human "
+        f"ruling (msg {home_msg}); re-home with --takeover or ask in "
+        f"{_origin_channel(conn, task_id)}. "
+        + (f"You cited msg {cited}. " if cited is not None
+           else "You cited no msg id. ")
+        + f"Re-home: hermes kanban update {task_id} --session <yours> "
+        f"--takeover \"<reason>\"."
+    )
+
+
+def _announce_foreign_change(
+    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor,
+    home: Optional[str],
+) -> None:
+    """``FOREIGN CHANGE by <session> (<reason>)`` comment + ``foreign_change``
+    event, so the home session sees a foreign status/timing change on its next
+    overview instead of discovering it by accident."""
+    if action not in FOREIGN_CHANGE_ACTIONS:
+        return
+    sess = ", ".join(actor.session_ids) or "no-session"
+    reason = actor.operator or actor.foreign_ok or ""
+    with write_txn(conn, allow_nested=True):
+        _append_event(conn, task_id, "foreign_change", {
+            "action": action,
+            "via": "--operator" if actor.operator else "--takeover",
+            "reason": reason,
+            "cited_msg": (str(ruling_msg_id(reason))
+                          if ruling_msg_id(reason) is not None else None),
+            "by_sessions": list(actor.session_ids),
+            "by_profile": actor.profile,
+            "home": home,
+        })
+    try:
+        session_ref = (derive_session_ref(actor.session_ids[0])
+                       if actor.session_ids else None)
+    except Exception:
+        session_ref = None
+    add_comment(
+        conn, task_id, author=actor.profile or "user",
+        body=f"FOREIGN CHANGE by {sess} ({reason}) [{action}]",
+        session_ref=session_ref,
+    )
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -6222,8 +6346,10 @@ def check_home_session(
                 f"refused {action} on {task_id}: --operator needs "
                 f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
             )
+        _check_ruling_precedence(conn, task_id, action, home, actor.operator)
         return actor
     if actor.foreign_ok:
+        _check_ruling_precedence(conn, task_id, action, home, actor.foreign_ok)
         return actor
     if home_guard_mode() == "warn":
         print(
@@ -6240,7 +6366,7 @@ def check_home_session(
     operator_hint = (
         f" An operator profile ({', '.join(sorted(OPERATOR_PROFILES))}) "
         f"applying a relayed human decision uses --operator \"<who: why>\" "
-        f"instead (recorded as an operator_override event, pages nothing)."
+        f"instead (recorded as an operator_override event; status/timing verbs also post a FOREIGN CHANGE comment)."
         if actor.surface == "cli" else ""
     )
     if is_unhomed(home):
@@ -6350,7 +6476,9 @@ def record_foreign_action(
     """Append the audit comment for an overridden foreign-session mutation.
 
     An ``--operator`` override records an ``operator_override`` event only:
-    no comment, so nothing pages the home session.
+    no takeover comment. A status/timing verb (:data:`FOREIGN_CHANGE_ACTIONS`)
+    additionally posts the FOREIGN CHANGE comment + ``foreign_change`` event,
+    for ``--operator`` and ``--takeover`` alike, so the home session is told.
 
     ``home_before`` is the home read BEFORE the guarded mutation ran; the
     mutation itself may have re-stamped ``tasks.session_id`` (``update
@@ -6396,6 +6524,7 @@ def record_foreign_action(
                     "home": prev_home,
                 },
             )
+        _announce_foreign_change(conn, task_id, action, actor, prev_home)
         return None
     new_home = (
         actor.session_ids[0]
@@ -6457,6 +6586,7 @@ def record_foreign_action(
         ),
         session_ref=session_ref,
     )
+    _announce_foreign_change(conn, task_id, action, actor, prev_home)
     if new_home and subscribe:
         _subscribe_new_home(conn, task_id)
     return new_home
