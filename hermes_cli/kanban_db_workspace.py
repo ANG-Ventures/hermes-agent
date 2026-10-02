@@ -69,11 +69,12 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         p_abs = p.resolve(strict=False)
     except OSError:
         return False, None
-    roots: list[tuple[Path, Optional[str]]] = []
+    # (resolved root, board, root as spelled)
+    roots: list[tuple[Path, Optional[str], Path]] = []
     override = _kb._kanban_path_override("HERMES_KANBAN_WORKSPACES_ROOT")
     if override:
         try:
-            roots.append((Path(override).expanduser().resolve(strict=False), None))
+            roots.append((Path(override).expanduser().resolve(strict=False), None, Path(override).expanduser()))
         except OSError:
             pass
     try:
@@ -92,12 +93,14 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         configured = None
     if home is not None:
         try:
-            roots.append(((home / "kanban" / "workspaces").resolve(strict=False), _kb.DEFAULT_BOARD))
+            roots.append(((home / "kanban" / "workspaces").resolve(strict=False), _kb.DEFAULT_BOARD,
+                          home / "kanban" / "workspaces"))
         except OSError:
             pass
         if configured is not None:
             try:
-                roots.append(((configured / _kb.DEFAULT_BOARD).resolve(strict=False), _kb.DEFAULT_BOARD))
+                roots.append(((configured / _kb.DEFAULT_BOARD).resolve(strict=False), _kb.DEFAULT_BOARD,
+                              configured / _kb.DEFAULT_BOARD))
             except OSError:
                 pass
         try:
@@ -116,16 +119,17 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                 except OSError:
                     continue
                 try:
-                    roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
+                    roots.append(((entry / "workspaces").resolve(strict=False), entry.name, entry / "workspaces"))
                 except OSError:
                     continue
                 if configured is not None and entry.name != _kb.DEFAULT_BOARD:
                     try:
-                        roots.append(((configured / entry.name).resolve(strict=False), entry.name))
+                        roots.append(((configured / entry.name).resolve(strict=False), entry.name, configured / entry.name))
                     except OSError:
                         continue
     memo: dict = {}
-    for root, board in roots:
+    p_lex = _lexical_path(p.expanduser())
+    for root, board, root_spelled in roots:
         try:
             # Spelling-blind (card t_ee808d83 round 3): a DB row can store a
             # scratch path in another case/firmlink spelling, and a literal
@@ -134,11 +138,42 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
             # root itself, in any spelling, is never managed.
             if _kb._same_path(p_abs, root, memo):
                 continue
-            if _kb._same_tree(p_abs, root, memo):
+            if _kb._same_tree(p_abs, root, memo) and _reached_through_root(p_lex, root_spelled, memo):
                 return True, board
         except ValueError:
             continue
     return False, None
+
+
+def _reached_through_root(p_lex: Path, root_spelled: Path, memo: dict) -> bool:
+    """Upstream #28818 (symlinked root): *p* must also be spelled THROUGH a managed
+    root, not merely resolve under it. When the workspaces root is a symlink to a
+    broad directory, every path in the link target resolves "under" the root, so a
+    scratch task naming such a path directly would be rmtree'd.
+
+    Walk *p*'s lexical ancestors (symlinks NOT followed) looking for the root's own
+    directory entry: the same lstat identity as the root as spelled (the symlink
+    itself when the root is a link), or, through a differently-spelled ancestor
+    path, the same resolved identity with no symlink hop. Identity, not string,
+    comparison keeps the fork's case/firmlink spelling-blindness (t_ee808d83).
+    """
+    try:
+        root_l = os.lstat(root_spelled)
+    except OSError:
+        return False
+    root_is_link = os.path.islink(root_spelled)
+    current = p_lex
+    while current != current.parent:
+        current = current.parent
+        try:
+            st = os.lstat(current)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (root_l.st_dev, root_l.st_ino):
+            return True
+        if not root_is_link and not os.path.islink(current) and _kb._same_path(current, root_spelled, memo):
+            return True
+    return False
 
 
 def _scratch_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[Path]:

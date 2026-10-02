@@ -3801,7 +3801,8 @@ def _seed_task_with_open_pr(conn, kb_mod, monkeypatch, now):
     worker = kb_mod.claim_task(conn, task_id)
     assert worker is not None
     kb_mod.add_comment(conn, task_id, "alice", "checkpoint: https://github.com/o/r/pull/9")
-    assert kb_mod.check_respawn_guard(conn, task_id) == "active_pr"
+    from hermes_cli import kanban_db_dispatch as _kbd
+    assert _kbd.check_respawn_guard(conn, task_id) == "active_pr"
     return task_id, worker
 
 
