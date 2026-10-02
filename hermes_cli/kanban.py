@@ -1594,6 +1594,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Shorthand for --delivery-mode notify+wake. Wake is opt-in only: "
              "each wake is a full agent turn that queues the human's messages.",
     )
+    p_nsub.add_argument(
+        "--also",
+        action="store_true",
+        help="Add this chat even when another live chat already subscribes to "
+             "the card. Default: one subscriber chat per card and platform; a "
+             "live owner is kept and a dead (24 h idle) one is replaced.",
+    )
 
     p_nlist = sub.add_parser(
         "notify-list",
@@ -1639,6 +1646,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "not just the active board",
     )
     p_nrepair.add_argument("--json", action="store_true")
+    p_nrepair.add_argument(
+        "--dedupe", action="store_true",
+        help="Instead of the identity backfill: list cards with more than one "
+             "subscription per platform, keep the card's home-session chat "
+             "(else the oldest), drop the rest. Dry-run unless --apply.",
+    )
+    p_nrepair.add_argument(
+        "--apply", action="store_true",
+        help="With --dedupe: delete the extra subscriptions.",
+    )
 
     # --- log ---
     p_log = sub.add_parser(
@@ -6641,7 +6658,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         # signature (kanban_db.add_notify_sub now accepts chat_type +
         # delivery_metadata), so the adaptation is retired and this is a
         # plain upstream-form call again.
-        kb.add_notify_sub(
+        outcome = kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
             chat_type=args.chat_type,
@@ -6652,8 +6669,20 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
                 getattr(args, "delivery_mode", None)
                 or ("notify+wake" if getattr(args, "wake", False) else None)
             ),
+            also=bool(getattr(args, "also", False)),
         )
-    print(f"Subscribed {args.platform}:{args.chat_id}"
+        if outcome == "kept":
+            owners = [
+                s for s in kb.list_notify_subs(conn, args.task_id)
+                if str(s.get("platform") or "").lower() == args.platform.lower()
+            ]
+            owner = owners[0] if owners else {}
+            print(f"subscription kept: {owner.get('platform')}:{owner.get('chat_id')} "
+                  f"owns {args.task_id} (live session); not subscribing "
+                  f"{args.platform}:{args.chat_id}. Pass --also to add a second chat.")
+            return 0
+    verb = "Re-homed" if outcome == "rehomed" else "Subscribed"
+    print(f"{verb} {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
     return 0
@@ -6824,6 +6853,8 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
     two sessions. Evidence comes from the gateway routing index; a chat with no
     unambiguous identity is reported and left untouched.
     """
+    if getattr(args, "dedupe", False):
+        return _cmd_notify_repair_dedupe(args)
     index = _routing_participant_index()
     evidence_unavailable = index is None
     try:
@@ -6977,6 +7008,53 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
             thr = f":{row['thread_id']}" if row.get("thread_id") else ""
             print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
                   f"  [{row['action']}]")
+    return 0
+
+
+def _cmd_notify_repair_dedupe(args: argparse.Namespace) -> int:
+    """``notify-repair --dedupe [--apply] [--all-boards] [--json]`` (t_484a3c72).
+
+    One subscriber chat per card and platform. Lists every card with more
+    than one; keeps the home-session chat (else the oldest row) and drops the
+    rest when ``--apply`` is given.
+    """
+    apply = bool(getattr(args, "apply", False))
+    if getattr(args, "all_boards", False):
+        slugs = [
+            str(m.get("slug") or "").strip()
+            for m in kb.enumerating_each(kb.list_boards())
+        ]
+        slugs = [s for s in slugs if s]
+    else:
+        slugs = [None]
+    rows: list[dict] = []
+    for slug in slugs:
+        try:
+            ctx = (kb.connect_closing(board=slug) if slug is not None
+                   else kb.connect_closing())
+            with ctx as conn:
+                for r in kb.dedupe_notify_subs(conn, apply=apply):
+                    if slug is not None:
+                        r["board"] = slug
+                    rows.append(r)
+        except Exception as exc:
+            print(f"  (board {slug!r}: skipped — {exc})", file=sys.stderr)
+    dropped = sum(len(r["dropped"]) for r in rows)
+    if getattr(args, "json", False):
+        print(json.dumps({"apply": apply, "cards": len(rows), "dropped": dropped,
+                          "rows": rows}, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("notify-repair --dedupe: every card has one subscriber chat per platform.")
+        return 0
+    verb = "dropped" if apply else "would drop"
+    print(f"notify-repair --dedupe: {len(rows)} card(s) with >1 subscriber chat; "
+          f"{verb} {dropped} subscription(s)" + ("" if apply else " (dry run; --apply to write)"))
+    for r in rows:
+        board = f"[{r['board']}] " if r.get("board") else ""
+        gone = ", ".join(f"{d['platform']}:{d['chat_id']}" for d in r["dropped"])
+        print(f"  {board}{r['task_id']}  keep {r['kept']['platform']}:{r['kept']['chat_id']}"
+              f" ({r['reason']})  {verb} {gone}")
     return 0
 
 

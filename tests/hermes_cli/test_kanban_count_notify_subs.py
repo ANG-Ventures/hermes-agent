@@ -43,12 +43,14 @@ def test_optional_filters_narrow_count_without_changing_unfiltered_count(kanban_
     try:
         tid = kb.create_task(conn, title="t", assignee="w")
         kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="session-1")
+        # Several subscribers on one card need also=True (t_484a3c72).
         kb.add_notify_sub(
             conn,
             task_id=tid,
             platform="TUI",
             chat_id="session-2",
             thread_id="thread-2",
+            also=True,
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="session-1"
