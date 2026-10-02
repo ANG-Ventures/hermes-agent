@@ -12,6 +12,7 @@ from typing import NamedTuple
 # Fallback OpenRouter snapshot used when the live catalog is unavailable, as
 # ``(model_id, description shown in menus)``. ``:free`` SKUs are described "free".
 _OPENROUTER_DESCRIPTIONS = {
+    "anthropic/claude-opus-5.5-fast": "2x price, higher output speed",
     "anthropic/claude-opus-5-fast": "2x price, higher output speed",
     "anthropic/claude-opus-4.8-fast": "2x price, higher output speed",
     "deepseek/deepseek-v4-pro-0813": "dated snapshot of v4-pro",
@@ -31,6 +32,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     (mid, _OPENROUTER_DESCRIPTIONS.get(mid, "free" if mid.endswith(":free") else ""))
     for mid in (
         "anthropic/claude-fable-5.1", "anthropic/claude-fable-5", "anthropic/claude-opus-5.5",
+        "anthropic/claude-opus-5.5-fast",  # fork #910: the dedicated fast SKU (OpenRouter-only)
         "anthropic/claude-opus-5", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.8-fast",
         "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4.5", "openai/gpt-6-astra",
         "openai/gpt-6-astra-fast", "openai/gpt-6-astra-flex", "openai/gpt-6-astra-pro", "openai/gpt-6-astra-pro-fast",
@@ -57,7 +59,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 # OpenRouter entries the Nous Portal does not carry (routing/fast variants, free tier —
 # ``stealth/union-alpha`` is a $0 stealth SKU without the ``:free`` suffix).
 _OPENROUTER_ONLY = {
-    "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4.8-fast", "meta/muse-spark-1.2",
+    "anthropic/claude-opus-5.5-fast", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4.8-fast", "meta/muse-spark-1.2",
     "meta/muse-spark-1.2-contributor", "meta/muse-spark-1.3", "meta/muse-spark-1.3-contributor", "openrouter/pareto-code",
     "stealth/union-alpha",
 }
@@ -402,7 +404,11 @@ def sync_plugin_provider_catalog() -> int:
 
 _PROVIDER_LABELS: dict[str, str] = {p.slug: p.label for p in CANONICAL_PROVIDERS}
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
-sync_plugin_provider_catalog()
+# Fork: NO import-time ``sync_plugin_provider_catalog()`` — ``list_providers()`` imports every
+# model-provider plugin, and plugins import ``hermes_cli.models`` surfaces at their own import time,
+# so discovery here runs against a partially initialised ``hermes_cli.models`` (circular import;
+# tests/hermes_cli/test_lazy_canonical_providers.py). ``hermes_cli.models`` extends the catalog
+# lazily on first read; ``providers._sync_auth_registry`` calls the sync above after discovery.
 
 
 # ---------------------------------------------------------------------------

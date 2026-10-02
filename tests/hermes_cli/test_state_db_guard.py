@@ -92,7 +92,6 @@ class TestPreUpdateBackupIntegrityGuard:
     @pytest.fixture()
     def hermes_home(self, tmp_path, monkeypatch):
         from pathlib import Path
-        import sys
 
         root = tmp_path / ".hermes"
         root.mkdir()
@@ -104,10 +103,12 @@ class TestPreUpdateBackupIntegrityGuard:
         conn.close()
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        for mod in list(sys.modules.keys()):
-            if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
-                del sys.modules[mod]
-        return root
+        # Fresh import of the config layer under the temp HERMES_HOME, restored on teardown
+        # (the fork's sys_modules leak gate fails a purge that is not put back).
+        from tests.sys_modules_leak_gate import purged_modules
+
+        with purged_modules(lambda mod: mod.startswith("hermes_cli.config") or mod == "hermes_constants"):
+            yield root
 
     def test_healthy_db_stays_quiet(self, hermes_home, capsys):
         from argparse import Namespace

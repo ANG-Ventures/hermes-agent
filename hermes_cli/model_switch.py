@@ -1897,7 +1897,7 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
     """COMMON PATH part 2: normalize the model name for the target provider, validate it, and
     accept config-declared models the remote catalog lacks."""
     from hermes_cli.models_local import _get_ollama_request_headers
-    from hermes_cli.models_validate import validate_requested_model
+    from hermes_cli import models as _models_facade  # validate_requested_model is a patch seam there
     st.new_model = _resolve_named_custom_model_id(st.new_model, st.target_provider, st.custom_providers)
     st.new_model = normalize_model_for_provider(st.new_model, st.target_provider)
 
@@ -1932,7 +1932,7 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
         if not st.probe_catalog:
             # Re-resolution of an already-accepted route: no live probe.
             raise _SkipCatalogProbe
-        validation = validate_requested_model(
+        validation = _models_facade._validate_requested_model_seam()(
             st.new_model, validate_as, api_key=st.api_key, base_url=st.base_url,
             api_mode=st.api_mode or None, headers=headers)
     except _SkipCatalogProbe:

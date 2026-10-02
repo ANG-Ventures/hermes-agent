@@ -164,7 +164,8 @@ def test_fail_open_ticker_uses_the_same_profile_gate(ticker_env, gateway, monkey
     web_server._start_desktop_cron_ticker(threading.Event(), interval=0)
 
     kwargs = started["kwargs"]
-    assert set(kwargs) == {"interval", "profile_homes", "profile_gate"}
+    # Fork: the in-process ticker also carries the Desktop dispatch gate (``can_dispatch``, #1373).
+    assert set(kwargs) == {"interval", "profile_homes", "profile_gate", "can_dispatch"}
     [(name, own_home)] = kwargs["profile_homes"]()
     assert own_home == home
     gate = kwargs["profile_gate"]

@@ -4088,6 +4088,12 @@ def delegate_task(
     if audit_reason:
         logger.info("flagship override: delegate_task model=%s provider=%s reason=%s", model, provider, audit_reason)
 
+    # Shared metrics (upstream _run_batch contract): one hermes.delegation.run row per
+    # delegate_task call, emitted by the last joined unit; task_list is the call key.
+    from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, finish_delegation_unit
+
+    begin_delegation_run(task_list, subagents=len(children), depth=depth + 1)
+
     def _execute_and_aggregate(
         *, honor_parent_interrupt: bool = True, join_late: bool = False
     ) -> dict:
@@ -4293,6 +4299,7 @@ def delegate_task(
                 if _idx < len(live_paths):
                     entry["live_transcript"] = live_paths[_idx]
         update_manifest_statuses(live_deleg_id, results)
+        finish_delegation_unit(task_list, results, background=not honor_parent_interrupt)
 
         combined: Dict[str, Any] = {
             "results": results,

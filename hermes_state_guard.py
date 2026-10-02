@@ -10,11 +10,6 @@ import weakref
 from pathlib import Path
 from typing import Any, Optional
 
-try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
-    import psutil
-except ImportError:  # pragma: no cover - stripped/scaffold installs only
-    psutil = None  # type: ignore[assignment]
-
 # Field evidence: pytest fixture rows landed in the production state.db and a
 # pytest-spawned child flipped the journal mode under the live WAL writer.
 
@@ -56,70 +51,17 @@ def _real_platform_state_root() -> Optional[Path]:
 # under Hermes test : isolation", and it inherits into subprocess children by default — so a : child that
 # received the patched ``HERMES_HOME`` also received the marker, : and a child that resolves a production DB
 # while carrying it is, by : definition, an isolation escape (#82770).
-_TEST_ISOLATION_MARKER_ENV = "HERMES_TEST_ISOLATION"
-
-
-def _running_under_pytest() -> bool:
-    """True when this process (or a parent test process) is a pytest run."""
-    return bool(
-        os.environ.get("PYTEST_CURRENT_TEST")
-        or os.environ.get("PYTEST_VERSION")
-        or os.environ.get(_TEST_ISOLATION_MARKER_ENV)
-    )
-
-
-#: pytest launcher names, matched against each argv token's *basename* so
-#: ``/tmp/pytest-of-dev/...`` paths cannot false-positive.
-_PYTEST_LAUNCHER_NAMES = frozenset({"pytest", "py.test", "pytest.exe", "py.test.exe"})
-
-#: Memoised ancestry answer: the tree above us doesn't change; keep the hot path free.
-_PYTEST_ANCESTOR: Optional[bool] = None
-
-
-def _process_looks_like_pytest(proc: Any) -> bool:
-    """True when *proc*'s command line is a pytest invocation. Unreadable cmdline
-    => not pytest: guessing the other way would refuse production opens."""
-    try:
-        cmdline = proc.cmdline() or []
-    except Exception:
-        return False
-    for arg in cmdline:
-        try:
-            # Split on both separators on every host so the answer is platform-independent.
-            name = str(arg).strip('"').strip("'").replace("\\", "/").rsplit("/", 1)[-1].lower()
-        except Exception:
-            continue
-        if name in _PYTEST_LAUNCHER_NAMES:
-            return True
-    return False
-
-
-def _has_pytest_ancestor() -> bool:
-    """True when an ancestor process is a pytest run: a child spawned with a
-    rebuilt env loses PYTEST_* and the HERMES_HOME redirect together, ancestry
-    survives that. Fails open without psutil / on walk errors.
-
-    ``_running_under_pytest`` reads ``PYTEST_*`` env vars, which a child spawned with a rebuilt environment
-    loses at the same moment it loses the ``HERMES_HOME`` redirect: that child aims at the production DB
-    *and* disarms the guard in one step (#82770). Ancestry is the one test-context signal that survives an
-    env rebuild, so it backs the env check up.
-    """
-    global _PYTEST_ANCESTOR
-    if _PYTEST_ANCESTOR is not None:
-        return _PYTEST_ANCESTOR
-    found = False
-    if psutil is not None:
-        try:
-            found = any(_process_looks_like_pytest(p) for p in psutil.Process().parents())
-        except Exception:
-            found = False
-    _PYTEST_ANCESTOR = found
-    return found
-
-
-def _in_test_context() -> bool:
-    """Test run by environment or ancestry (memoised; env checked first)."""
-    return _running_under_pytest() or _has_pytest_ancestor()
+# One definition of the test-context predicate, in the leaf module ``hermes_test_context`` (no
+# dependency graph: ``hermes_state`` -> ``agent.redact`` snapshots its toggle at import). Re-exported
+# here so the guard, ``hermes_state`` and ``managed_scope`` all bind the SAME function
+# (tests/hermes_cli/test_managed_scope_test_context.py).
+from hermes_test_context import (  # noqa: E402,F401
+    _TEST_ISOLATION_MARKER_ENV,
+    _has_pytest_ancestor,
+    _in_test_context,
+    _process_looks_like_pytest,
+    _running_under_pytest,
+)
 
 
 def _is_production_state_db(resolved: Path, root: Path) -> bool:

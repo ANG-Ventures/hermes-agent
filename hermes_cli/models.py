@@ -54,6 +54,22 @@ from hermes_cli.models_catalog_static import (
 from hermes_cli.models_reasoning_caps import (
     _OPENROUTER_CATALOG_URL,
     _seed_reasoning_caps)
+# Fork facade re-export: ``validate_requested_model`` moved to ``models_validate`` upstream; fork
+# callers and tests import / patch it on ``hermes_cli.models`` too. ``model_switch`` resolves
+# through ``_validate_requested_model_seam`` so a patch on EITHER module intercepts.
+from hermes_cli.models_validate import validate_requested_model  # noqa: F401
+_VALIDATE_REQUESTED_MODEL_ORIGINAL = validate_requested_model
+
+
+def _validate_requested_model_seam():
+    """The live ``validate_requested_model``: a facade patch (``hermes_cli.models.*``) wins over
+    the unpatched sibling, else the sibling (``hermes_cli.models_validate.*``, also patchable)."""
+    from hermes_cli import models_validate as _mv
+
+    facade = globals().get("validate_requested_model")
+    if facade is not _VALIDATE_REQUESTED_MODEL_ORIGINAL:
+        return facade
+    return _mv.validate_requested_model
 from hermes_cli.models_local import (
     _OLLAMA_LOCAL_MODELS_CACHE,
     _OLLAMA_LOCAL_MODELS_CACHE_TTL,
@@ -1396,6 +1412,7 @@ def resolve_fast_mode_capability(
     provider: Optional[str],
     api_mode: Optional[str],
     tier: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> FastModeCapability:
     """Resolve Fast support from the complete transport contract.
 
@@ -1407,11 +1424,27 @@ def resolve_fast_mode_capability(
     ``tier`` is the session's ``agent.service_tier``. ``None`` / ``"priority"``
     resolve the Priority/Fast contracts below; ``"ultrafast"`` resolves the
     OpenAI Ultrafast contract and never falls back to another tier.
+
+    ``base_url`` (optional) is the live runtime endpoint: a first-party provider
+    id pointed at a proxy host (``provider=openai``, ``base_url=https://proxy/v1``)
+    fails closed too (``_fast_mode_route_supported``), so the per-request
+    ``agent.fast_mode`` window and the TUI session gate share this one verdict.
     """
     normalized_provider = normalize_provider(provider)
     normalized_mode = str(api_mode or "").strip().lower()
     base = _fast_model_base(model)
     route = f"{normalized_provider}/{base or '<unset>'}"
+
+    if base_url and not _fast_mode_route_supported(model, provider, base_url):
+        return FastModeCapability(
+            supported=False,
+            family="unsupported",
+            request_overrides={},
+            reason=(
+                f"`{route}` is served from `{base_url}`, not the first-party endpoint "
+                "that bills for fast mode; requests will use normal speed."
+            ),
+        )
 
     normalized_tier = str(tier or "").strip().lower()
     if normalized_tier == "ultrafast":
@@ -1578,6 +1611,7 @@ def resolve_fast_mode_capability_for_configured_route(
     provider: Optional[str],
     api_mode: Optional[str],
     tier: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> FastModeCapability:
     """Resolve Fast support for a configured route whose provider may be unpinned.
 
@@ -1594,7 +1628,7 @@ def resolve_fast_mode_capability_for_configured_route(
     """
     if str(provider or "").strip().lower() not in _UNRESOLVED_PROVIDERS:
         return resolve_fast_mode_capability(
-            model=model, provider=provider, api_mode=api_mode, tier=tier
+            model=model, provider=provider, api_mode=api_mode, tier=tier, base_url=base_url
         )
     if str(tier or "").strip().lower() == "ultrafast" and model_supports_ultrafast(model):
         # Ultrafast models are documented on the native OpenAI Responses route.

@@ -811,16 +811,22 @@ class GatewayModelCommandsMixin:
         (persists agent.service_tier, parity with /model)."""
         from agent.fast_mode import service_tier_word
         from gateway.run import _load_gateway_config, _resolve_gateway_model
-        from hermes_cli.models import model_supports_fast_mode, model_supports_ultrafast
+        from hermes_cli.models import resolve_fast_mode_capability_for_configured_route
 
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
         session_key = self._session_key_for_source(event.source)
         self._service_tier = self._resolve_session_service_tier(session_key=session_key)
-        model = _resolve_gateway_model(_load_gateway_config())
-        if not model_supports_fast_mode(model):
+        user_config = _load_gateway_config()
+        model = _resolve_gateway_model(user_config)
+        # Fork: route-aware verdict (an unpinned provider resolves against the model's native route);
+        # the model-only wrapper is banned from call sites (tests/cli/test_fast_route_capability.py).
+        _, provider, api_mode = self._configured_route_identity(user_config)
+        if not resolve_fast_mode_capability_for_configured_route(
+                model=model, provider=provider, api_mode=api_mode).supported:
             return t("gateway.fast.not_supported")
-        ultrafast = model_supports_ultrafast(model)
+        ultrafast = resolve_fast_mode_capability_for_configured_route(
+            model=model, provider=provider, api_mode=api_mode, tier="ultrafast").supported
         if args == "ultrafast" and not ultrafast:
             return t("gateway.fast.ultrafast_not_supported", model=model)
         if args and args != "status":

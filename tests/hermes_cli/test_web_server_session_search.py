@@ -238,7 +238,7 @@ def test_desktop_session_search_ranks_title_matches_before_content_matches(monke
     _FakeTitleSessionDB.opened_read_only = None
     monkeypatch.setattr("hermes_state.SessionDB", _FakeTitleSessionDB)
 
-    response = asyncio.run(web_server.search_sessions(q="portal", limit=5))
+    response = asyncio.run(_rt_sessions.search_sessions(q="portal", limit=5))
 
     results = response["results"]
     assert [r["session_id"] for r in results] == ["titled_session", "content_only"]

@@ -87,7 +87,10 @@ class TestDictModelAliases:
 
     def _load_with(self, monkeypatch, cfg):
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
-        return model_switch._load_direct_aliases()
+        # Fork (#83612): ``_load_direct_aliases`` returns ``(merged, ok)``.
+        aliases, ok = model_switch._load_direct_aliases()
+        assert ok is True
+        return aliases
 
     def test_dict_entry_with_explicit_provider(self, monkeypatch):
         cfg = {

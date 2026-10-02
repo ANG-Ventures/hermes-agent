@@ -87,7 +87,7 @@ def dock_launch() -> Optional[Tuple[str, str]]:
 
 
 def dock_argv(exe: str, user_data_dir: str, *, sandbox_bypass: Optional[bool] = None) -> list[str]:
-    """Command the dock's Browser icon runs. ``--remote-debugging-port=0`` makes a human-started
+    """Command the dock's Browser icon runs. A zero remote-debugging port makes a human-started
     instance attachable (Chromium writes the chosen port to ``<user-data-dir>/DevToolsActivePort``);
     first-run / default-browser dialogs would sit between the human and the bot's tabs."""
     # --test-type hides the "Chrome for Testing is only for automated testing" and unsupported-flag
@@ -98,8 +98,11 @@ def dock_argv(exe: str, user_data_dir: str, *, sandbox_bypass: Optional[bool] = 
     from tools.browser_tool_session import CHROMIUM_SANDBOX_BYPASS_ARGS, _needs_chromium_sandbox_bypass
     # The profile is persistent by design (logins survive handoffs); its HTTP cache is not worth a
     # gateway's disk: uncapped it grows for months toward a hosted instance's 6 GB.
+    # fork: every detached Chromium launch carries the Keychain-modal suppressors (tests/cli/
+    # test_chrome_launcher_keychain_guard.py) — no-ops on Linux, where the dock lives.
     return [exe, f"--user-data-dir={user_data_dir}", "--remote-debugging-port=0", "--no-first-run",
             "--no-default-browser-check", "--test-type", f"--disk-cache-size={DISK_CACHE_BYTES}",
+            "--password-store=basic", "--use-mock-keychain",
             *(CHROMIUM_SANDBOX_BYPASS_ARGS if (_needs_chromium_sandbox_bypass() if sandbox_bypass is None
                                               else sandbox_bypass) else ())]
 

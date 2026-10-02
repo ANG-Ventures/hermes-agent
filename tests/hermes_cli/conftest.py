@@ -128,6 +128,10 @@ def _no_stale_module_purge(request, monkeypatch):
     """
     if "purge" in request.node.fspath.basename:
         return
+    if request.node.get_closest_marker("real_concurrent_gate"):
+        # Same opt-out as the concurrent-instances stub above: a test asserting that the frozen
+        # updater surface resolves to the REAL objects must see the real purge too.
+        return
     try:
         from hermes_cli import main as _cli_main
     except Exception:

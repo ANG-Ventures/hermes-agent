@@ -6,15 +6,27 @@
 registry window (#102123). ``providers._sync_auth_registry`` now re-admits into both snapshots.
 """
 
+import pytest
+
+from hermes_cli import provider_seam
 from providers import register_provider
 from providers.base import ProviderProfile
+
+
+@pytest.fixture
+def scoped_registry():
+    """Undo the late registration: the fork registry is additive (no item deletion), so the
+    only way to unregister is to restore the pre-test generation."""
+    generation = provider_seam.current()
+    yield
+    provider_seam._restore(generation)
 
 
 def _profile(name: str) -> ProviderProfile:
     return ProviderProfile(name=name, display_name=name, description="late plugin (direct API)")
 
 
-def test_late_registered_provider_reaches_picker_catalog(monkeypatch):
+def test_late_registered_provider_reaches_picker_catalog(monkeypatch, scoped_registry):
     import hermes_cli.models_catalog_static as catalog
     from hermes_cli.models import list_available_providers
 
@@ -29,7 +41,6 @@ def test_late_registered_provider_reaches_picker_catalog(monkeypatch):
 
     import providers as registry
     registry.list_providers()  # discovery done: a registration now is a post-discovery one
-    monkeypatch.setitem(registry._REGISTRY, slug, _profile(slug))  # keeps the registry scoped
     register_provider(_profile(slug))
 
     assert slug in {r["id"] for r in list_available_providers()}

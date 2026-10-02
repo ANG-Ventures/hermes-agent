@@ -602,9 +602,17 @@ def resolve_codex_runtime_credentials(
         # transaction (agent/codex_owner.py). Never from a read-only caller: the owner path may
         # refresh and persist.
         from agent.codex_owner import resolve_runtime
-        owned = resolve_runtime(
-            force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
-            refresh_skew_seconds=refresh_skew_seconds)
+        try:
+            owned = resolve_runtime(
+                force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+                refresh_skew_seconds=refresh_skew_seconds)
+        except AuthError as exc:
+            # A singleton mirrored into the pool without a refresh token is the #68004 recovery
+            # shape (expired access token, no refresh): fall through to the legacy read so the
+            # Codex CLI import ladder below can repair it; every other owner verdict is final.
+            if exc.code != "codex_auth_missing_refresh_token":
+                raise
+            owned = None
         if owned is not None:
             return owned
     read_error: Optional[AuthError] = None

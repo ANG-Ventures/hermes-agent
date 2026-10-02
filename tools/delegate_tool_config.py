@@ -420,6 +420,18 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     None values, child inherits everything. ``request_overrides`` is honored on every branch. Raises ValueError
     with a user-facing message."""
     values = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
+    # Fork: `delegation.model` is a user-supplied model string like any other entry point — a config
+    # `model.aliases` key (``grok``) or a ``provider/model`` pair must resolve here, or the raw word is
+    # handed to the child's provider, 400s, and the fallback chain silently serves a different
+    # provider AND model (measured 2026-09-18). Resolved at READ time (the config file is the user's);
+    # an explicit `delegation.provider` still wins (tests/hermes_cli/test_model_alias_entry_points.py).
+    if values["model"]:
+        try:
+            from hermes_cli.model_switch import resolve_model_pair_for_storage
+
+            values["model"], values["provider"] = resolve_model_pair_for_storage(values["model"], values["provider"])
+        except Exception:  # pragma: no cover - never block a dispatch
+            logger.debug("delegation.model alias resolution failed for %r", cfg.get("model"), exc_info=True)
     values["api_mode"] = str(cfg.get("api_mode") or "").strip().lower() or None
     explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
