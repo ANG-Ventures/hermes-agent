@@ -21,11 +21,11 @@ def isolated_external_auth_stores(tmp_path, monkeypatch):
 
 
 def _rows():
+    # No exhaustion cooldown on the rows: the fork's Codex owner store refuses to force-refresh a
+    # benched row (``_require_usable``) instead of using the refresh to clear its block.
     return [dict(id=f"row{i}", label=f"account{i}", source="manual:device_code",
                  auth_type="oauth", access_token=f"fixture-access-{i}",
-                 refresh_token=f"fixture-refresh-{i}", priority=i,
-                 last_status="exhausted", last_status_at=time.time(),
-                 last_error_code=429, last_error_reset_at=time.time()+3600)
+                 refresh_token=f"fixture-refresh-{i}", priority=i)
             for i in range(2)]
 
 
@@ -73,12 +73,16 @@ def test_refresh_uses_target_grant_and_preserves_sibling(monkeypatch, status):
             assert target.get("last_error_reset_at") is None
             assert target["last_status"] == "ok"
         else:
-            # Manual grants remain in the pool on failure; only singleton-seeded grants are removed
-            # by the quarantine. A transient 503 benches the row ('exhausted'); a terminal 401
-            # invalid_grant marks it 'dead' so it leaves rotation until re-auth instead of
-            # replaying the dead token every TTL.
-            assert target["last_status"] == ("dead" if status == 401 else "exhausted")
+            # Fork contract (agent/codex_owner, #673): a non-429 failure never claims the single-use
+            # grant was or was not consumed — the row keeps its stored pair on disk and the owner's
+            # receipt fences it (loaded as dead / codex_refresh_uncertain) until a new grant.
+            from agent import codex_owner
+            from agent.credential_pool import load_pool
             assert target["access_token"] == before[1]["access_token"]
+            assert target["refresh_token"] == before[1]["refresh_token"]
+            fenced = next(e for e in load_pool("openai-codex")._entries if e.id == "row1")
+            assert fenced.last_status == "dead" and fenced.last_error_reason == "codex_refresh_uncertain"
+            assert codex_owner._receipt(codex_owner.resolve_owner(), fenced).exists()
     finally:
         server.shutdown()
         worker.join(timeout=5)

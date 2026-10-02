@@ -334,12 +334,15 @@ def _current(pool, entry):
 
     store = auth._load_auth_store(pool._auth_owner)
     matches = [r for r in _rows(store) if r.get("id") == entry.id]
-    if len(matches) != 1 or matches[0].get("source") != entry.source:
+    # Compare the hydrated source, not the raw column: a row written without ``source`` (profile
+    # rows seeded by hand, upstream fixtures) loads as SOURCE_MANUAL on both sides and is the same
+    # generation, not a replaced row.
+    current = PooledCredential.from_dict(PROVIDER, matches[0]) if len(matches) == 1 else None
+    if current is None or current.source != entry.source:
         raise _error(
             "Codex credential was removed or replaced; reload the pool.",
             "codex_row_removed",
         )
-    current = PooledCredential.from_dict(PROVIDER, matches[0])
     if _receipt(pool._auth_owner, current).exists():
         raise _error(
             "Codex refresh outcome is uncertain; authenticate a new grant at its owner."
