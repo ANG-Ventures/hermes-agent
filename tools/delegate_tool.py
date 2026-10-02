@@ -586,7 +586,10 @@ def _classify_child_outcome(result: Dict[str, Any]) -> Tuple[str, str]:
     summary = str(result.get("final_response") or "")
     if result.get("interrupted"):
         return "interrupted", "interrupted"
-    if result.get("failed"):
+    # Upstream (child_run._build_result_entry): a non-empty ``error`` with the ``failed`` key
+    # absent (legacy/partial result dicts) is still a failure — never report a provider
+    # rejection as "max_iterations"; that is only truthful for real budget exhaustion.
+    if result.get("failed") or result.get("error"):
         return "failed", "error"
     if summary and summary.strip() != "(empty)":
         return "completed", ("completed" if result.get("completed", False) else "max_iterations")
@@ -2226,7 +2229,30 @@ def _run_single_child(
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
             try:
-                leased_entry = child_pool.current()
+                # Upstream #68237 (child_run._lease_child_credential): resolve the leased entry by
+                # id — the pool is shared with the parent/siblings, so current() is a mutable cursor
+                # that may already point at someone else's pick — and the bound entry must serve the
+                # child's endpoint: on a mixed same-provider pool the least-leased pick may target
+                # another host, so it is released and an endpoint-matching entry is leased by id.
+                # Pools without a list-returning entries() (legacy adapters) fall back to current().
+                from agent.credential_pool import credential_pool_entry_serves_endpoint as _entry_serves_endpoint
+                _entries_fn = getattr(child_pool, "entries", None)
+                _entries = _entries_fn() if callable(_entries_fn) else None
+                if isinstance(_entries, list):
+                    _base_url = getattr(child, "base_url", None)
+                    leased_entry = next((e for e in _entries if getattr(e, "id", None) == leased_cred_id), None)
+                    if not _entry_serves_endpoint(leased_entry, _base_url):
+                        child_pool.release_lease(leased_cred_id)
+                        leased_entry = next(
+                            (e for e in _entries
+                             if getattr(e, "last_status", None) != "dead" and _entry_serves_endpoint(e, _base_url)),
+                            None,
+                        )
+                        leased_cred_id = (
+                            child_pool.acquire_lease(leased_entry.id) if leased_entry is not None else None
+                        )
+                else:
+                    leased_entry = child_pool.current()
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
                     outcome = child._swap_credential(leased_entry)
                     # ``_swap_credential`` refuses to install a keyless client and
@@ -2947,6 +2973,11 @@ def _run_single_child(
         )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+            # Upstream: the classified reason from the child loop (e.g. "rate_limit", "billing",
+            # "server_error") lets the parent tell a quota wall from a task error without parsing prose.
+            _failure_reason = result.get("failure_reason")
+            if isinstance(_failure_reason, str) and _failure_reason:
+                entry["failure_reason"] = _failure_reason
             # Same reap as the raise path below: a child that fails by
             # RETURNING must not leave its live subtree running.
             _reap_subtree(child, "error")
@@ -2959,6 +2990,15 @@ def _run_single_child(
                 entry["schema_retries"] = _schema_retries
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
+            # Upstream (child_run._build_child_entry): a still-violating final answer is NOT
+            # discarded — the parent gets the raw text plus a note that it is unvalidated.
+            if _schema_valid is False and entry.get("status") == "completed" and entry.get("summary"):
+                entry["schema_note"] = (
+                    "Final answer does not satisfy the declared output_schema"
+                    + (" (after 1 retry)" if _schema_retries else "")
+                    + "; `summary` is the child's raw, UNVALIDATED final text — extract what you need "
+                    "from it yourself (see schema_errors) rather than re-running the task."
+                )
 
         # steer_subagent() returning True means "queued". Every queued steer
         # the child never wrote into a tool result is named here as MISSED
@@ -3964,6 +4004,10 @@ def delegate_task(
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context, model=creds.get("model"), provider=creds.get("provider")
     )
+    # Upstream 0cb996d977: announce the batch tag once so interleaved ``[set N · i/n]`` lines
+    # from several fan-outs on one console stay attributable.
+    _announce_batch(parent_agent, n_tasks, live_deleg_id)
+    _batch_tag = format_batch_tag(live_deleg_id, parent_agent)
 
     recovery_max_spawn_raw = recovery_execution.get("max_spawn_depth")
     recovery_max_spawn = (
@@ -4248,7 +4292,8 @@ def delegate_task(
                             else "✗"
                         )
                         remaining = n_tasks - completed_count
-                        completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                        _slot = f"{_batch_tag} · {idx+1}/{n_tasks}" if _batch_tag else f"{idx+1}/{n_tasks}"
+                        completion_line = f"{icon} [{_slot}] {label}  ({dur}s)"
                         if spinner_ref:
                             try:
                                 spinner_ref.print_above(completion_line)
@@ -4531,6 +4576,12 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            # Upstream (#116000): persist the live-transcript locators on the unit's row before any
+            # worker starts, so an owner death replays the recovered event WITH the transcript tails
+            # the parent needs to continue. live_paths omits failed writers.
+            task_transcripts={str(_ti): str(live_writers[_ti].path) for _ti in range(len(live_writers))
+                              if live_writers[_ti] is not None
+                              and getattr(live_writers[_ti], "path", None) is not None},
         )
 
         if (

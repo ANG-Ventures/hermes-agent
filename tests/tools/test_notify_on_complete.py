@@ -202,7 +202,9 @@ class TestTerminalSchema:
                 "exit_code": 0, "output": "Reply from mini:\ntail"}
         cut = format_process_notification({**base, "output_cut": 3000})
         assert "3000" in cut and "proc_abc" in cut
-        assert cut.endswith("Reply from mini:\ntail]")
+        # Fork: every completion carries the NO_REPLY silence hint after the output.
+        from tools.process_registry import COMPLETION_SILENCE_HINT
+        assert cut.endswith(f"Reply from mini:\ntail\n{COMPLETION_SILENCE_HINT}]")
         assert "cut" not in format_process_notification(base)
 
 

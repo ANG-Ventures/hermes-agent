@@ -209,10 +209,14 @@ def _make_mock_parent(depth=0):
         self.assertIn(f"up to {_get_max_concurrent_children()}", _blob)
 
 class TestChildSystemPrompt(unittest.TestCase):
+    # Upstream 0aa178736a (parity 2026-10-01): the goal is the child's FIRST USER TURN
+    # (_run_single_child -> run_conversation(user_message=goal)), not part of the system
+    # prompt — sending OAuth Anthropic the same task in both roles duplicated it.
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("YOUR TASK", prompt)
+        self.assertNotIn("Fix the tests", prompt)
+        self.assertNotIn("YOUR TASK", prompt)
+        self.assertIn("focused subagent", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
     def test_empty_context_ignored(self):
@@ -221,7 +225,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 
     def test_goal_with_context(self):
         prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
-        self.assertIn("Fix the tests", prompt)
+        self.assertNotIn("Fix the tests", prompt)
         self.assertIn("CONTEXT", prompt)
         self.assertIn("assertion failed", prompt)
 
@@ -656,8 +660,10 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # Upstream #81267: the dedicated-handle registry keys handles by the
+                # RESOLVED path (symlinked /tmp on macOS), so compare canonical paths.
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    Path(child_db.db_path).resolve(), Path(parent_db.db_path).resolve()
                 )
             finally:
                 if child_db is not None:
@@ -1670,7 +1676,9 @@ class TestBlockedTools(unittest.TestCase):
         self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "cronjob"]:
+        # Upstream e16ad33a9d renamed the registry entry cronjob -> cronjob_manage (the fork's
+        # tool_executor still canonicalizes the legacy "cronjob" alias to it).
+        for tool in ["delegate_task", "clarify", "memory", "send_message", "cronjob_manage"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):
@@ -2032,7 +2040,10 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             _make_mock_parent(depth=0),
         )
         self.assertEqual(creds["request_overrides"], {"extra_body": {"store": False}})
-        self.assertEqual(creds["max_output_tokens"], 3072)
+        # Upstream fd3565deec removed the per-child output cap (R07: converged on upstream;
+        # _build_child_agent's override_max_tokens kwarg is accepted but inert) — the bundle
+        # no longer carries it, matching the sibling base_url-branch assertions above.
+        self.assertNotIn("max_output_tokens", creds)
 
     def test_registered_custom_endpoint_stamps_lane_name(self):
         """AC1: a REGISTERED custom endpoint records provider='custom:<name>'
@@ -2235,7 +2246,9 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["base_url"], "http://localhost:11434/v1")
-            self.assertEqual(kwargs["api_key"], "ollama")
+            # Upstream #90009 (52705fba6c): the live client's key travels WITH its URL — pairing
+            # the live endpoint with the stale surface key built an instant, non-retryable 401.
+            self.assertEqual(kwargs["api_key"], "no-key-required")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2517,6 +2530,9 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
     def test_build_child_agent_assigns_parent_pool_when_shared(self):
         parent = _make_mock_parent()
         mock_pool = MagicMock()
+        # Upstream #68237: pools are provider/endpoint-scoped; a bare MagicMock's auto
+        # ``provider`` attribute would never match the parent's provider.
+        mock_pool.provider = parent.provider
         parent._credential_pool = mock_pool
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -3643,7 +3659,10 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             "Deep work", role="orchestrator",
             max_spawn_depth=3, child_depth=1,
         )
-        self.assertIn("can themselves be orchestrators", prompt)
+        # Upstream wording (9dfbde19db, pinned by tests/tools/test_delegate_depth_prompt.py):
+        # the note must not teach a model-controlled role knob that no longer exists.
+        self.assertIn("can themselves delegate because depth remains", prompt)
+        self.assertNotIn("orchestrators or leaves", prompt)
 
 
 class TestOrchestratorEndToEnd(unittest.TestCase):

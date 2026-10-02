@@ -995,6 +995,15 @@ def _grouped_fanout(monkeypatch, tasks, gates):
     return json.loads(dt.delegate_task(tasks=tasks, background=True, parent_agent=parent))
 
 
+_R07_UNIT_PIN = pytest.mark.xfail(
+    strict=False,
+    reason="PINNED-UPSTREAM-CONTRACT (parity 2026-10-01, R07-delegate POLICY-DIVERGENCE): per-task completion "
+    "units / `group` / crash-mid-unit child records (upstream 028fe2c4c8, c5594ec4b3, #116000) live in upstream's "
+    "_Batch/_run_batch (delegate_tool_dispatch), which is imported but NOT on the fork hot path — fork delegate_task "
+    "runs a split call as ONE unit (ledger docs/sync/review/ledger-2026-10-01/R07-delegate.md).",
+)
+
+@_R07_UNIT_PIN
 def test_ungrouped_task_completes_alone_and_group_completes_together(monkeypatch):
     """With delegation.independent_completions on, a finished ungrouped task must not wait for its siblings;
     tasks sharing a `group` must."""
@@ -1097,6 +1106,7 @@ def test_units_beyond_slot_count_still_start_and_are_not_stalled_while_queued(mo
     release.set()
 
 
+@_R07_UNIT_PIN
 def test_child_finished_before_crash_is_recovered_with_its_result(tmp_path):
     """Real-import E2E: a 2-task group unit whose owner dies mid-run replays the finished child's real result
     and marks only the unfinished sibling unknown — a crash costs the stragglers, never the finished work."""
@@ -1139,6 +1149,7 @@ print(json.dumps(q.get_nowait(), sort_keys=True))
     assert "done: fast member" in format_process_notification(evt)
 
 
+@_R07_UNIT_PIN
 def test_one_child_unit_keeps_its_finished_child_when_the_owner_dies(tmp_path):
     """#116000: a detached unit with exactly ONE child had NO durable record of that child at all — only the
     multi-child join path called ``record_unit_child`` — so an owner death (OOM-kill / orphaning) anywhere in the

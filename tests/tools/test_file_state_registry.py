@@ -281,7 +281,10 @@ class FileToolsIntegrationTests(unittest.TestCase):
     def test_sibling_agent_write_refuses_patch(self):
         p = self._write_seed("shared2.txt", "alpha\n")
         json.loads(read_file_tool(path=p, task_id="agentA"))
-        json.loads(write_file_tool(path=p, content="beta\n", task_id="agentB"))
+        # Upstream #65604: a whole-file overwrite of content the task never read is refused,
+        # so the sibling reads first (same adaptation as the handler test above).
+        self.assertNotIn("error", json.loads(read_file_tool(path=p, task_id="agentB")))
+        self.assertNotIn("error", json.loads(write_file_tool(path=p, content="beta\n", task_id="agentB")))
         res = json.loads(patch_tool(mode="replace", path=p, old_string="beta", new_string="gamma",
                                     task_id="agentA"))
         self.assertTrue(res.get("sibling_write_blocked"), res)
@@ -291,7 +294,8 @@ class FileToolsIntegrationTests(unittest.TestCase):
     def test_sibling_conflict_respects_kill_switch(self):
         p = self._write_seed("shared3.txt")
         json.loads(read_file_tool(path=p, task_id="agentA"))
-        json.loads(write_file_tool(path=p, content="B\n", task_id="agentB"))
+        self.assertNotIn("error", json.loads(read_file_tool(path=p, task_id="agentB")))  # #65604 read-before-write
+        self.assertNotIn("error", json.loads(write_file_tool(path=p, content="B\n", task_id="agentB")))
         p = os.path.realpath(p)  # the registry keys on the resolved path
         self.assertTrue(file_state.sibling_write_conflict("agentA", p))
         os.environ["HERMES_DISABLE_FILE_STATE_GUARD"] = "1"

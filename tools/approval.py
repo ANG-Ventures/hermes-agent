@@ -320,12 +320,6 @@ def is_current_session_yolo_enabled() -> bool:
     return is_session_yolo_enabled(get_current_session_key(default=""))
 
 
-def _yolo_active() -> bool:
-    """CLI ``--yolo`` (process-scoped, frozen at import) or gateway ``/yolo``
-    (session-scoped). Hardline / deny-rule floors run BEFORE this everywhere."""
-    return _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
-
-
 def _permanent_set() -> set:
     """The permanent allowlist that governs the ACTIVE profile. Unscoped (single-profile process,
     or the multiplexer's own launch profile) → the module-level set tests and the CLI seed. A routed
@@ -482,11 +476,17 @@ def save_permanent_allowlist(patterns: set):
 
 # --- Bypass check (yolo / mode=off) ---------------------------------------------------------------------------------
 
+def _get_approval_mode() -> str:
+    """Facade read of ``approvals.mode`` — delegates late so a patch on EITHER
+    ``tools.approval._get_approval_mode`` or ``tools.approval_context._get_approval_mode`` takes."""
+    return approval_context._get_approval_mode()
+
+
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Canonical three-source bypass check: process ``--yolo`` (frozen at import), the
     session-scoped gateway ``/yolo`` toggle, ``approvals.mode: off``. Pure bypass
     sub-expression only — hardline blocklist / permanent allowlist are the caller's job."""
-    return (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or approval_context._get_approval_mode() == "off")
+    return _YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or _get_approval_mode() == "off"
 
 
 def is_approval_bypass_active() -> bool:
@@ -970,7 +970,7 @@ def _run_approval_gate(
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    if is_approval_bypass_active():
         return _approved()
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
@@ -1086,7 +1086,7 @@ def check_dangerous_command(command: str, env_type: str,
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
-    if _yolo_active():
+    if is_approval_bypass_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
         return _approved()
@@ -1184,8 +1184,8 @@ def check_all_command_guards(command: str, env_type: str,
     if prepared is not None:
         return prepared
 
-    approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
+    approval_mode = _get_approval_mode()
+    if is_approval_bypass_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
         return _approved()
@@ -1262,8 +1262,8 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         return _approved()
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _approved()
-    approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
+    approval_mode = _get_approval_mode()
+    if is_approval_bypass_active():
         return _approved()
 
     # (-q clears the presence flags, but its unattended context resolves first anyway.)

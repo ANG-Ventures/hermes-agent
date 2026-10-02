@@ -35,7 +35,9 @@ class _HangingSyncProvider:
                          ids=["async", "sync-to-thread"])
 def test_hanging_provider_returns_per_url_timeout_errors(monkeypatch, provider):
     monkeypatch.setattr(wte, "_extract_timeout_seconds", lambda: 0.2)
-    monkeypatch.setattr(wte, "_rescue_eligible", lambda p: False)
+    # The dispatcher reads the rescue hooks through the tools.web_tools facade (the fork's patch seam).
+    import tools.web_tools as wt
+    monkeypatch.setattr(wt, "_rescue_eligible", lambda p: False)
     urls = ["https://example.com/a", "https://example.com/b"]
     results = asyncio.run(wte._dispatch_extract(provider, urls, None))
     assert [r["url"] for r in results] == urls

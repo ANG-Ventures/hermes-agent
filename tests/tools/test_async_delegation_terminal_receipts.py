@@ -63,7 +63,7 @@ def dispatch(monkeypatch, *, batch=False, result=None, native=False, session_key
         dispatched = ad.dispatch_async_delegation_batch(goals=["receipt"], **kwargs)
     else:
         dispatched = ad.dispatch_async_delegation(goal="receipt", **kwargs)
-    assert dispatched["status"] == "dispatched"
+    assert dispatched["status"] == "dispatched", dispatched
     return dispatched["delegation_id"], workers.pop(), result
 
 

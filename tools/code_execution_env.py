@@ -167,7 +167,28 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
             if key in scoped:
                 scrubbed[key] = scoped[key]
-    return delegated_child_subprocess_env(scrubbed)
+    scrubbed = delegated_child_subprocess_env(scrubbed)
+    _inject_session_id(scrubbed, source_env)
+    return scrubbed
+
+
+def _inject_session_id(scrubbed, source_env):
+    """Fork (#636/C3): bridge the live ``HERMES_SESSION_ID`` into the sandbox child's env.
+
+    A per-turn identity, not user shell state, so deliberately NOT in ``_HERMES_CHILD_ALLOWED`` —
+    passing it by exact name would copy it out of ``os.environ``, the wrong source inside the gateway
+    (last-writer-wins across concurrent sessions). Sandbox scripts shell out to ``hermes kanban comment``
+    etc., which resolve provenance from their own env; without this bridge those writes land with NULL
+    provenance while the same in-process tool call is attributed correctly. Fail-open: unresolvable ⇒ the
+    var is REMOVED (an inherited process-global would be exactly the foreign-identity leak). The resolver
+    stays on the facade so tests/callers patch ``tools.code_execution_tool._resolved_session_id``."""
+    from tools.code_execution_tool import _resolved_session_id
+    resolved = _resolved_session_id(source_env)
+    if resolved:
+        scrubbed["HERMES_SESSION_ID"] = resolved
+    else:
+        scrubbed.pop("HERMES_SESSION_ID", None)
+    return scrubbed
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,

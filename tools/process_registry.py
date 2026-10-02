@@ -39,7 +39,9 @@ from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional
 
 from hermes_cli.config import get_hermes_home
 
-from tools.process_registry_notifications import COMPLETION_SILENCE_HINT, format_process_notification  # noqa: F401 (re-export)
+from tools.process_registry_notifications import (  # noqa: F401 — re-exports (COMPLETION_SILENCE_HINT; _format_async_delegation: fork facade)
+    COMPLETION_SILENCE_HINT, _format_async_delegation, format_process_notification,
+)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 
@@ -1620,9 +1622,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
-            self._finish_reader(
-                session, decoder, _append_chunk, "Process",
-                session.process.wait, lambda: session.process.returncode)
+            if session.process is None:
+                # Fork: no Popen handle to wait on or reap — this is NOT an exit. Record the
+                # unknown status (``_move_to_finished`` classifies it ``handle-lost``) instead
+                # of dying with AttributeError and leaving the session running forever.
+                logger.warning("Process handle lost for %s: Popen handle is missing", session.id)
+                session.stdout_closed = True
+                self._finish_exited(session, None)
+            else:
+                self._finish_reader(
+                    session, decoder, _append_chunk, "Process",
+                    session.process.wait, lambda: session.process.returncode)
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
@@ -1946,7 +1956,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """
         proc = session.process
         if proc is not None:
-            for stream in (proc.stdout, proc.stderr, proc.stdin):
+            # getattr: fork test doubles / adapter handles are Popen-SHAPED, not Popen.
+            for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None), getattr(proc, "stdin", None)):
                 if stream is not None:
                     with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
                         stream.close()

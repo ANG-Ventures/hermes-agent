@@ -132,9 +132,12 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 def _parse_timeout(raw: Any) -> Optional[float]:
-    """Seconds → None (<= 0 disables) or max(30, value). Raises on non-numeric."""
+    """Seconds → None (<= 0 disables) or max(floor, value). Raises on non-numeric. Fork (7ff750b798):
+    the floor is ``_CHILD_TIMEOUT_FLOOR_S`` (60 s = 2x the tool-activity heartbeat) — a 30 s cap expired
+    before the first heartbeat tick and hard-stopped live leaves mid-tool."""
+    from tools.delegate_tool import _CHILD_TIMEOUT_FLOOR_S
     parsed = float(raw)
-    return None if parsed <= 0 else max(30.0, parsed)
+    return None if parsed <= 0 else max(_CHILD_TIMEOUT_FLOOR_S, parsed)
 
 def _get_child_timeout() -> Optional[float]:
     """Inactivity cap for one child (seconds of NO progress), or None (default: no cap). Failures should come from
@@ -142,7 +145,7 @@ def _get_child_timeout() -> Optional[float]:
     progress — a completed call, a tool change, an activity-clock tick — so a slow provider serving multi-minute
     completions never loses a live child, and a child frozen for the whole window is still caught. A configured
     value pre-empts nothing the heartbeat staleness monitor would not also catch. delegation.child_timeout_seconds
-    > 0 opts in (floor 30 s); 0 or negative disables. Env fallback: DELEGATION_CHILD_TIMEOUT_SECONDS."""
+    > 0 opts in (floor _CHILD_TIMEOUT_FLOOR_S); 0 or negative disables. Env fallback: DELEGATION_CHILD_TIMEOUT_SECONDS."""
     return _knob(
         "child_timeout_seconds", "DELEGATION_CHILD_TIMEOUT_SECONDS", _parse_timeout, DEFAULT_CHILD_TIMEOUT,
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
@@ -256,8 +259,14 @@ def _resolve_child_credential_pool(
     if not effective_provider:
         return parent_pool
     parent_provider = getattr(parent_agent, "provider", None) or ""
+    # Fork: ``custom:<name>`` is the lane-attributed spelling of the same custom runtime (stamped by
+    # _direct_endpoint_credentials for a REGISTERED endpoint so the turn ledger names the relay). It
+    # must resolve to exactly the pool bare ``custom`` does — the branch keys on endpoint identity,
+    # not the provider string — so both spellings take the custom branch, on both sides.
+    _is_custom = effective_provider == "custom" or effective_provider.startswith("custom:")
+    _parent_is_custom = parent_provider == "custom" or parent_provider.startswith("custom:")
     try:
-        if effective_provider == "custom":
+        if _is_custom:
             from agent.credential_pool import get_custom_provider_pool_key
             child_key = get_custom_provider_pool_key(effective_base_url, provider_name=effective_requested_provider)
             if child_key is None:
@@ -265,7 +274,7 @@ def _resolve_child_credential_pool(
             parent_key = get_custom_provider_pool_key(
                 getattr(parent_agent, "base_url", None), provider_name=getattr(parent_agent, "requested_provider", None),
             )
-            if parent_pool is not None and parent_provider == "custom" and parent_key is not None and parent_key == child_key:
+            if parent_pool is not None and _parent_is_custom and parent_key is not None and parent_key == child_key:
                 return parent_pool
             return _loaded_pool(child_key)
         if parent_pool is not None and effective_provider == parent_provider:
@@ -348,6 +357,21 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
     if v["api_mode"] in _EXPLICIT_API_MODES or (v["api_mode"] and v["api_mode"] in registered_api_modes()):
         api_mode = v["api_mode"]
 
+    # Fork lane attribution: a raw delegation.base_url collapses every custom endpoint to bare "custom",
+    # so the blackbox turn ledger cannot tell which relay a turn used and agent.usage_pricing has no
+    # predicate for bare "custom" (billing_mode="unknown"). A REGISTERED custom_providers entry already
+    # has an identity for pool routing (get_custom_provider_pool_key -> "custom:<name>"); reuse it so the
+    # recorded provider names the lane. Labeling only: the pool key is derived from base_url and
+    # _resolve_child_credential_pool accepts both spellings. An UNREGISTERED base_url keeps bare "custom".
+    if provider == "custom":
+        try:
+            from agent.credential_pool import get_custom_provider_pool_key
+            _lane_key = get_custom_provider_pool_key(v["base_url"])
+            if _lane_key:
+                provider = _lane_key
+        except Exception as exc:
+            logger.debug("Could not resolve custom provider lane for '%s': %s", v["base_url"], exc)
+
     # Preserve the configured provider's request personality on an explicit endpoint.
     request_overrides = None
     if v["provider"]:
@@ -355,7 +379,18 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
             from hermes_cli.runtime_provider import resolve_runtime_provider
             runtime = resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
             request_overrides = dict(runtime.get("request_overrides") or {}) or None
-
+            # Fork 6998c783ca: the configured base_url IS the named provider's own endpoint (e.g.
+            # claude-bpr + http://127.0.0.1:18811/v1 — what restart recovery replays): keep the
+            # provider's identity. The bare "custom" collapse drops the provider profile, and with
+            # it the stateful-relay routing key, so every child call reached the bridge keyless ->
+            # sub hops + a fresh CLI session per call (t_9fdac10c).
+            _rt_provider = str(runtime.get("provider") or "").strip()
+            _rt_base = str(runtime.get("base_url") or "").strip().rstrip("/")
+            if (_rt_provider and _rt_provider != "custom" and _rt_base
+                    and _rt_base == v["base_url"].strip().rstrip("/")):
+                provider = _rt_provider
+                if v["api_mode"] not in _EXPLICIT_API_MODES and runtime.get("api_mode"):
+                    api_mode = runtime.get("api_mode")
         except Exception as exc:
             logger.debug(
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",

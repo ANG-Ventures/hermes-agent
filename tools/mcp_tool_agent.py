@@ -282,11 +282,19 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     / ``name_set`` (never the live agent attributes), mirroring ``agent_init``'s post-build
     injection. Idempotent and fail-soft. Returns the context-engine routing names THIS rebuild
     appended: a name already owned by a registry/plugin tool is not claimed, matching agent_init."""
+    from agent.memory_manager import normalize_tool_schema  # fork #47707: providers may return the WRAPPED form
+
     def _add(schema) -> bool:
-        name = schema.get("name", "") if isinstance(schema, dict) else ""
-        if not name or name in name_set:
+        # Read the name off the normalized schema, not the wrapper: the LCM engine returns
+        # {"type": "function", "function": {...}} and a wrapper read silently dropped every
+        # lcm_* tool on the first between-turns refresh (fork, 2026-07-18).
+        normalized = normalize_tool_schema(schema)
+        if normalized is None:
             return False
-        tools_list.append({"type": "function", "function": schema})
+        name = normalized["name"]
+        if name in name_set:
+            return False
+        tools_list.append({"type": "function", "function": normalized})
         name_set.add(name)
         return True
 
@@ -315,7 +323,10 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         get_schemas = _schema_getter("context_compressor", "get_tool_schemas")
         if (enabled is None or "context_engine" in enabled) and get_schemas is not None:
             # Claim the routing name only when WE appended the schema.
-            staged_engine_names.update(s["name"] for s in get_schemas() if _add(s))
+            for _schema in get_schemas():
+                _normalized = normalize_tool_schema(_schema)
+                if _normalized is not None and _add(_schema):
+                    staged_engine_names.add(_normalized["name"])
     except Exception:
         logger.debug("Context-engine tool re-injection skipped", exc_info=True)
     return staged_engine_names

@@ -141,7 +141,10 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     secret = "sk-" + "D" * 48
-    kt._handle_complete({"result": f"finished with key={secret}"})
+    # Fork receipt gate: prose alone is refused, so carry a structured receipt so the
+    # completion actually lands and the scrubbed result is what gets stored.
+    kt._handle_complete({"result": f"finished with key={secret}",
+                         "metadata": {"findings": ["redaction fixture"]}})
     conn = kbc.connect()
     try:
         run = kb.latest_run(conn, worker_env)

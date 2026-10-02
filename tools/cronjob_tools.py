@@ -205,7 +205,7 @@ from cron.jobs import (
     resume_job,
     trigger_job,
     update_job)
-from tools.cronjob_prompt_scan import _scan_cron_prompt
+from tools.cronjob_prompt_scan import _CRON_THREAT_PATTERNS, _scan_cron_prompt  # noqa: F401 — patterns: fork facade re-export
 from tools.cronjob_job_args import (
     _apply_continuity,
     _canonical_skills,
