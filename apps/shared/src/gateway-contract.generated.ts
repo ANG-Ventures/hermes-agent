@@ -3131,6 +3131,7 @@ export interface SessionListRow {
   message_count?: number
   live_message_count?: number | null
   source?: string
+  pinned?: boolean
 }
 export interface SessionMostRecentParams {
   profile?: string | null

@@ -212,7 +212,8 @@ class TestLoadTranscriptReroutes:
         assert db is not None
         monkeypatch.setattr(db, "get_compression_tip", lambda _session_id: None)
 
-        def _malformed(_session_id, *, repair_alternation):
+        def _malformed(_session_id, *, repair_alternation, include_timestamp=False):
+            # fork F01: the transcript read asks for timestamps (include_timestamp=True)
             assert repair_alternation is True
             raise RuntimeError("database disk image is malformed")
 
