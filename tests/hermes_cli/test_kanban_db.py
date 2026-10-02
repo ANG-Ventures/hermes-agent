@@ -2165,7 +2165,7 @@ def test_respawn_guard_ignores_status_after_pr_comment(kanban_home, monkeypatch)
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="Dependency", assignee="alice")
-        assert kb.complete_task(conn, parent_id)
+        assert kb.complete_task(conn, parent_id, summary="done")
         task_id = kb.create_task(
             conn, title="PR on invalidated premise", assignee="alice", parents=[parent_id],
         )
@@ -2194,7 +2194,7 @@ def test_respawn_guard_still_defers_open_pr_after_dependency_promotion(
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="Dependency", assignee="alice")
-        assert kb.complete_task(conn, parent_id)
+        assert kb.complete_task(conn, parent_id, summary="done")
         task_id = kb.create_task(
             conn, title="PR awaiting dependency", assignee="alice", parents=[parent_id],
         )
@@ -2214,7 +2214,7 @@ def test_respawn_guard_still_defers_open_pr_after_dependency_promotion(
 
         # Parent completion calls recompute_ready, just like a dispatch tick.
         # This automatic promotion is not a request to amend the child's PR.
-        assert kb.complete_task(conn, parent_id)
+        assert kb.complete_task(conn, parent_id, summary="done")
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "ready"
         promoted = next(e for e in kb.list_events(conn, task_id) if e.kind == "promoted")
@@ -3854,13 +3854,13 @@ def test_dependency_wait_promoted_resumes_open_pr_once(kanban_home, all_assignee
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
         assert kb.claim_task(conn, child)
         kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
         assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
         assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         assert kb.get_task(conn, child).status == "ready"
         spawned = []
         result = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
@@ -3876,14 +3876,14 @@ def test_dependency_wait_ordinary_comment_after_block_resumes_same_pr(kanban_hom
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
         assert kb.claim_task(conn, child)
         kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
         assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
         assert kb.block_task(conn, child, reason="resume", kind="dependency")
         kb.add_comment(conn, child, "alice", "Waiting for parent; no new PR")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         spawned = []
         kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
         assert child in spawned
@@ -3893,14 +3893,14 @@ def test_dependency_wait_before_newer_pr_comment_does_not_resume(kanban_home, mo
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
         assert kb.claim_task(conn, child)
         kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
         assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
         assert kb.block_task(conn, child, reason="resume", kind="dependency")
         kb.add_comment(conn, child, "alice", "newer https://github.com/o/r/pull/10")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         assert kbd.check_respawn_guard(conn, child) == "active_pr"
 
 
@@ -4009,19 +4009,19 @@ def test_dependency_intent_not_reused_after_second_automatic_promotion(kanban_ho
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
         assert kb.claim_task(conn, child)
         kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
         assert kb.reopen_task(conn, parent, actor="qa", reason="first parent rework") == (True, None)
         assert kb.block_task(conn, child, reason="resume after parent", kind="dependency")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         first = []
         kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (first.append(task.id) or 99999999))
         assert child in first
         assert plugin_api._set_status_direct(conn, parent, "todo")
         assert kb.recompute_ready(conn) >= 1
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         assert kb.get_task(conn, child).status == "ready"
         assert kbd.check_respawn_guard(conn, child) == "active_pr"
         second = []
@@ -4108,7 +4108,7 @@ def test_historical_pr_dependency_wait_resumes_despite_unmappable_comment_event(
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
         assert kb.claim_task(conn, child)
         if inline_before:
@@ -4127,7 +4127,7 @@ def test_historical_pr_dependency_wait_resumes_despite_unmappable_comment_event(
         assert kb.reopen_task(conn, parent, actor="qa", reason="rework") == (True, None)
         clock["now"] += 2
         assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
-        assert kb.complete_task(conn, parent)
+        assert kb.complete_task(conn, parent, summary="done")
         spawned = []
         kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
         assert child in spawned
