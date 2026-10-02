@@ -794,7 +794,6 @@ import re as _re
 # Writers of tasks.status/assignee/priority/session_id or dispatch-intent
 # events that are NOT guarded, each with the reason it is execution lane.
 EXECUTION_LANE = {
-    "_migrate_add_optional_columns": "schema migration at connect time",
     "record_foreign_action": (
         "callers: _home_session_guarded's wrapper ONLY, after check_home_session "
         "returned an explicit --takeover/foreign_ok override for this card and "
@@ -834,6 +833,27 @@ EXECUTION_LANE = {
         "card (the regex hit is the WHERE status='running'); it cannot "
         "change status, assignee, priority or the claim"),
     "release_stale_claims": "reaper",
+    # Upstream sibling-module writers the facade-only scan never saw (2026-10-01 sync).
+    "_backfill_legacy_inflight_runs": (
+        "callers: kanban_db_connect._migrate_add_optional_columns (schema "
+        "migration at connect time); rewrites legacy run rows, no chat path"),
+    "inherit_creator_origin": (
+        "callers: create_task / decompose child insert, inside the creation txn; "
+        "COALESCEs session_id onto the NEW card only, never re-homes an existing one"),
+    "_reclaim_dead_workers": (
+        "upstream dispatcher-tick helper (kanban_db_dispatch); no CLI verb, tool "
+        "or slash path calls it"),
+    "_apply_default_assignee": (
+        "upstream dispatcher-tick helper (kanban_db_dispatch): assigns "
+        "kanban.default_assignee to unassigned ready cards; no CLI verb, tool or "
+        "slash path calls it"),
+    # Upstream extracted these bodies into private helpers (2026-10-01 sync).
+    # The guard sits on the public caller, so the helper is reached only after
+    # check_home_session already passed (or from the reaper lane).
+    "_claim_and_open_run": "callers: claim_task only (@_home_session_guarded('claim'))",
+    "_extend_live_stale_claim": "callers: release_stale_claims only (reaper)",
+    "_request_review_txn": (
+        "callers: request_review only (@_home_session_guarded('request-review'))"),
     "invalidate_descendants_for_parent_reopen": "cascade of a (guarded) reopen",
     "_release_claim_for_workspace_refusal": "dispatcher spawn refusal",
     "_refuse_reclaim_unproven_death": "reaper",
@@ -862,9 +882,28 @@ def _writers():
     # Slice pre-split lines instead of ast.get_source_segment: that call
     # re-splits the whole ~1 MB kanban_db.py once per function (quadratic),
     # which cost ~70s per scan and pushed this file past the CI per-file wall.
-    src = _module_src(kb)
-    lines = src.split("\n")
+    # The facade AND every kanban_db_* sibling: upstream moved writers
+    # (dispatch/reclaim/heartbeat) into siblings, and a facade-only scan let
+    # them escape the guard check entirely (2026-10-01 parity sync).
+    import importlib
+    import pkgutil
+
+    import hermes_cli as _pkg
+
+    mods = [kb] + [
+        importlib.import_module(f"hermes_cli.{m.name}")
+        for m in pkgutil.iter_modules(_pkg.__path__)
+        if m.name.startswith("kanban_db_")
+    ]
     out = {}
+    for _mod in mods:
+        _scan_writers(_mod, out)
+    return out
+
+
+def _scan_writers(mod, out):
+    src = _module_src(mod)
+    lines = src.split("\n")
     for node in _ast.parse(src).body:
         if not isinstance(node, _ast.FunctionDef):
             continue
@@ -882,12 +921,12 @@ def _writers():
             "UPDATE tasks" in seg and _DYNAMIC_WRITE.search(seg)
         ):
             out[node.name] = node
-    return out
 
 
 def _is_guarded(node):
     return any(
-        isinstance(d, _ast.Call) and getattr(d.func, "id", "") == "_home_session_guarded"
+        isinstance(d, _ast.Call)
+        and (getattr(d.func, "id", "") or getattr(d.func, "attr", "")) == "_home_session_guarded"
         for d in node.decorator_list
     )
 
@@ -921,7 +960,15 @@ def test_every_cli_verb_reaching_a_guarded_writer_binds_the_actor():
     src = _module_src(kc)
     tree = _ast.parse(src)
     funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
-    table = _re.search(r"handlers = \{(.*?)\}", src, _re.S).group(1)
+    # Upstream moved verb bodies into kanban_ops / kanban_boards (re-imported by kanban.py).
+    from hermes_cli import kanban_boards as _kbo, kanban_ops as _kop
+    for _m in (_kop, _kbo):
+        for _n in _ast.parse(_module_src(_m)).body:
+            if isinstance(_n, _ast.FunctionDef):
+                funcs.setdefault(_n.name, _n)
+    # The verb table was `handlers = {...}` inside main(); upstream hoisted it to
+    # module-level `_HANDLERS = {...}`. Accept either; a miss must fail, not pass.
+    table = _re.search(r"(?:_HANDLERS|handlers) = \{(.*?)\}", src, _re.S).group(1)
     verbs = dict(_re.findall(r'"([\w-]+)":\s*(_cmd_\w+)', table))
 
     def reach(fn, seen):
@@ -954,8 +1001,14 @@ def test_every_tool_reaching_a_guarded_writer_binds_the_actor():
     src = _module_src(kt)
     tree = _ast.parse(src)
     handlers = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+    # Registration moved from per-tool `registry.register(handler=...)` calls to
+    # the `_TOOLS` tuple: `("kanban_x", SCHEMA, handler_or_wrapped, emoji)`.
     wrapped = set(_re.findall(r"handler=_with_mutation_actor\((\w+)\)", src))
+    wrapped |= set(_re.findall(r"_SCHEMA,\s*_with_mutation_actor\((\w+)\)", src))
     registered = set(_re.findall(r"handler=(?:_with_mutation_actor\()?(\w+)", src))
+    registered |= set(_re.findall(r"_SCHEMA,\s*(?:_with_mutation_actor\()?(_handle_\w+)", src))
+    registered.discard("_handler")
+    assert len(registered) >= 10, f"tool registration scan found {sorted(registered)}"
     missing = []
     for name in sorted(registered):
         node = handlers.get(name)

@@ -171,6 +171,7 @@ def decompose_triage_task(
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
+        child_ids: list[str] = []
         for idx, child in enumerate(children):
             new_id = _kb._new_task_id()
             title = child["title"].strip()
@@ -228,17 +229,17 @@ def decompose_triage_task(
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
             _kb._inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
-            _kb.child_ids.append(new_id)
+            child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
-                parent_id, child_id = _kb.child_ids[p_idx], _kb.child_ids[idx]
+                parent_id, child_id = child_ids[p_idx], child_ids[idx]
                 _link(conn, parent_id, child_id)
                 _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
-        for cid in _kb.child_ids:
+        for cid in child_ids:
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                 "VALUES (?, ?)",
@@ -263,18 +264,18 @@ def decompose_triage_task(
         if author and author.strip():
             _insert_comment(
                 conn, task_id, author.strip(),
-                "Decomposed into " + ", ".join(_kb.child_ids)
+                "Decomposed into " + ", ".join(child_ids)
                 + ". Root will wake when all children complete.",
                 now,
             )
         _append_event(
-            conn, task_id, "decomposed", {"child_ids": _kb.child_ids, "root_assignee": root_assignee},
+            conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
         )
     # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
     # children in ``todo`` for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
-    return _kb.child_ids
+    return child_ids
 
 
 def _insert_decomposed_child(

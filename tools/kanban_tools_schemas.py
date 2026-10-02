@@ -534,3 +534,226 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+
+# ── fork parameters (2026-10-01 parity sync) ───────────────────────────────
+# Upstream extracted these schemas from tools/kanban_tools.py; the fork-only
+# parameters (premise-satisfied closes, draft override, survivor claims,
+# home-session foreign_ok, link kinds, per-card routing, byte-exact attach)
+# did not come across, so the model could not send them although the
+# handlers accept them (kanban_tools._UNDECLARED_ARGS). Property text is
+# fork/main's, verbatim.
+_FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'type': 'boolean',
+                                'description': 'Flat view. By default, when this session has a '
+                                               'home, only its own cards are returned in full '
+                                               "under `tasks` and other sessions' cards are "
+                                               'collapsed under `other_sessions`.'}},
+ 'KANBAN_COMPLETE_SCHEMA': {'superseded_by': {'type': 'string',
+                                              'description': 'Evidence pointer for a card whose '
+                                                             'premise was ALREADY SATISFIED before '
+                                                             'you got to it — the card id, PR url, '
+                                                             'or commit sha that did the work '
+                                                             '(e.g. "t_0c5ac29a -> #889"). Closes '
+                                                             'the task done with outcome '
+                                                             '``superseded`` and requires no '
+                                                             '``summary``/``result``: the pointer '
+                                                             'IS the evidence, and there is no '
+                                                             'artifact to hand off. Only use it '
+                                                             'after you VERIFIED the premise '
+                                                             'against current main — and never '
+                                                             'with an empty value, which is '
+                                                             'refused. Leave it unset for ordinary '
+                                                             'work.'},
+                            'draft_ok': {'type': 'string',
+                                         'description': 'Only when completion was refused because '
+                                                        'the handoff names a DRAFT PR that is '
+                                                        'INTENTIONALLY left open, e.g. a CI '
+                                                        'vehicle for an upstream PR: the reason. '
+                                                        'Recorded as an audited '
+                                                        'completion_draft_override event; the '
+                                                        'draft is not routed to review. Empty is '
+                                                        'refused.'},
+                            'survivor_pr': {'type': ['string', 'array'],
+                                            'items': {'type': 'string'},
+                                            'description': 'Only when completion already REFUSED '
+                                                           'with ``survivor_unavailable``: name '
+                                                           'the pull request that holds this '
+                                                           "task's implementation, as "
+                                                           '``owner/repo#123`` or its github.com '
+                                                           'URL. The kernel verifies it against '
+                                                           'the remote (it must exist and be OPEN '
+                                                           'or MERGED) and records it as the '
+                                                           'durable survivor; an unverifiable '
+                                                           'claim still refuses. This is the '
+                                                           '``--survivor-pr`` escape hatch that '
+                                                           'error names. Pass a LIST when more '
+                                                           'than one recorded repository vanished, '
+                                                           'qualifying every claim as '
+                                                           '``<workspace-relative-repo>=owner/repo#123`` '
+                                                           '— each vanished repository needs its '
+                                                           'own claim, an unqualified one stands '
+                                                           'only for a single lost repository, and '
+                                                           'a claim naming a repository still on '
+                                                           'disk is refused. Never pass it '
+                                                           'speculatively — it authorises deleting '
+                                                           'a workspace whose work is not pushed.'},
+                            'survivor_ref': {'type': ['string', 'array'],
+                                             'items': {'type': 'string'},
+                                             'description': 'Alternative to ``survivor_pr`` when '
+                                                            'the work landed on a branch or tag '
+                                                            'rather than a PR: '
+                                                            '``<repo-url>#<sha>``. The SHA must be '
+                                                            'a current branch/tag tip on that '
+                                                            'remote or the completion still '
+                                                            'refuses. Use a clean clone URL — a '
+                                                            'URL carrying credentials is rejected, '
+                                                            'and is redacted before the rejection '
+                                                            'is echoed or logged. Repeatable as a '
+                                                            'list with the same '
+                                                            '``<workspace-relative-repo>=<claim>`` '
+                                                            'qualifier as ``survivor_pr``.'},
+                            'foreign_ok': {'type': 'string',
+                                           'description': "Only when the card's home session is "
+                                                          'ANOTHER session and you are not its '
+                                                          'assignee: the reason you must act on it '
+                                                          'anyway. The action is then allowed and '
+                                                          'the reason is posted as a comment the '
+                                                          'home session sees. Omit otherwise -- '
+                                                          'prefer kanban_comment on foreign '
+                                                          'cards.'}},
+ 'KANBAN_BLOCK_SCHEMA': {'foreign_ok': {'type': 'string',
+                                        'description': "Only when the card's home session is "
+                                                       'ANOTHER session and you are not its '
+                                                       'assignee: the reason you must act on it '
+                                                       'anyway. The action is then allowed and the '
+                                                       'reason is posted as a comment the home '
+                                                       'session sees. Omit otherwise -- prefer '
+                                                       'kanban_comment on foreign cards.'}},
+ 'KANBAN_REQUEST_REVIEW_SCHEMA': {'foreign_ok': {'type': 'string',
+                                                 'description': "Only when the card's home session "
+                                                                'is ANOTHER session and you are '
+                                                                'not its assignee: the reason you '
+                                                                'must act on it anyway. The action '
+                                                                'is then allowed and the reason is '
+                                                                'posted as a comment the home '
+                                                                'session sees. Omit otherwise -- '
+                                                                'prefer kanban_comment on foreign '
+                                                                'cards.'}},
+ 'KANBAN_REQUEST_CHANGES_SCHEMA': {'coverage': {'type': 'string',
+                                                'description': 'Optional review_coverage JSON '
+                                                               'object. Recorded on the review run '
+                                                               'in the same transaction as the '
+                                                               'verdict; required when sending '
+                                                               'back a card parked in review with '
+                                                               'no active review run.'},
+                                   'foreign_ok': {'type': 'string',
+                                                  'description': "Only when the card's home "
+                                                                 'session is ANOTHER session and '
+                                                                 'you are not its assignee: the '
+                                                                 'reason you must act on it '
+                                                                 'anyway. The action is then '
+                                                                 'allowed and the reason is posted '
+                                                                 'as a comment the home session '
+                                                                 'sees. Omit otherwise -- prefer '
+                                                                 'kanban_comment on foreign '
+                                                                 'cards.'}},
+ 'KANBAN_ATTACH_SCHEMA': {'path': {'type': 'string',
+                                   'description': 'Absolute path of the file to attach, on the '
+                                                  'machine running the agent. Read byte-exact; no '
+                                                  'encoding needed. Pass this OR content_base64, '
+                                                  'not both.'},
+                          'expected_sha256': {'type': 'string',
+                                              'description': 'SHA-256 hex digest of the original '
+                                                             'bytes. Required with content_base64; '
+                                                             'optional with path. A mismatch '
+                                                             'stores nothing.'}},
+ 'KANBAN_CREATE_SCHEMA': {'parents_kind': {'type': 'string',
+                                           'enum': ['blocks', 'derived-from'],
+                                           'description': 'Semantics for every parent edge. '
+                                                          "'blocks' (default) = real dependency, "
+                                                          "this task waits. 'derived-from' = "
+                                                          'provenance only: the parent DISCOVERED '
+                                                          'this work (audit/survey/investigation '
+                                                          'filing remediation) and the new task is '
+                                                          'dispatchable immediately. Use it '
+                                                          'whenever you are recording WHERE work '
+                                                          'came from rather than what it must wait '
+                                                          'for — a DEPLOY must never be gated on a '
+                                                          'DISCOVERY.'},
+                          'force_reason': {'type': 'string',
+                                           'description': 'Near-duplicate override. Creation is '
+                                                          'refused when a non-archived card with '
+                                                          'the same title (and >=0.8 title+body '
+                                                          'similarity) was created in the last '
+                                                          '24h; pass why this is not a duplicate '
+                                                          'to file anyway (recorded on the card).'},
+                          'wake': {'type': 'boolean',
+                                   'description': 'Only with a gateway auto-subscription: also '
+                                                  "WAKE this chat's agent (a full turn) on "
+                                                  'terminal events instead of just posting the '
+                                                  'passive notification line. Defaults to false — '
+                                                  "wakes queue the human's messages, so opt in "
+                                                  'only when this session must act on the result.'},
+                          'model_override': {'type': 'string',
+                                             'description': 'Per-task model override. Pins the '
+                                                            'dispatched worker to this model '
+                                                            '(passed as `hermes -m MODEL`) instead '
+                                                            "of the assignee profile's default "
+                                                            'model. Use this to run one task on a '
+                                                            'stronger/cheaper model without '
+                                                            'cloning a whole profile. Omit to use '
+                                                            'the profile default.'},
+                          'reasoning_effort': {'type': 'string',
+                                               'enum': ['',
+                                                        'none',
+                                                        'minimal',
+                                                        'low',
+                                                        'medium',
+                                                        'high',
+                                                        'xhigh',
+                                                        'max',
+                                                        'ultra'],
+                                               'description': "Pin the dispatched worker's "
+                                                              'reasoning effort for this task. Use '
+                                                              "'none' to disable reasoning. Omit "
+                                                              'or pass an empty value to inherit '
+                                                              'the assignee profile default.'}},
+ 'KANBAN_UNBLOCK_SCHEMA': {'foreign_ok': {'type': 'string',
+                                          'description': "Only when the card's home session is "
+                                                         'ANOTHER session and you are not its '
+                                                         'assignee: the reason you must act on it '
+                                                         'anyway. The action is then allowed and '
+                                                         'the reason is posted as a comment the '
+                                                         'home session sees. Omit otherwise -- '
+                                                         'prefer kanban_comment on foreign '
+                                                         'cards.'}},
+ 'KANBAN_LINK_SCHEMA': {'kind': {'type': 'string',
+                                 'enum': ['blocks', 'derived-from'],
+                                 'description': "Edge semantics. 'blocks' (default) = real "
+                                                "dependency, the child waits. 'derived-from' = "
+                                                'provenance only, the child is independently '
+                                                'dispatchable. A DEPLOY must never be gated on a '
+                                                'DISCOVERY. Re-linking an existing pair updates '
+                                                'its kind.'},
+                        'foreign_ok': {'type': 'string',
+                                       'description': "Only when the card's home session is "
+                                                      'ANOTHER session and you are not its '
+                                                      'assignee: the reason you must act on it '
+                                                      'anyway. The action is then allowed and the '
+                                                      'reason is posted as a comment the home '
+                                                      'session sees. Omit otherwise -- prefer '
+                                                      'kanban_comment on foreign cards.'}}}
+# fork/main makes kanban_attach take EITHER path OR content_base64+filename.
+_FORK_REQUIRED: dict[str, list[str]] = {'KANBAN_ATTACH_SCHEMA': []}
+
+
+def _apply_fork_properties() -> None:
+    for _name, _props in _FORK_PROPERTIES.items():
+        _params = globals()[_name]["parameters"]
+        for _key, _spec in _props.items():
+            _params["properties"].setdefault(_key, _spec)
+        if _name in _FORK_REQUIRED:
+            _params["required"] = list(_FORK_REQUIRED[_name])
+
+
+_apply_fork_properties()
