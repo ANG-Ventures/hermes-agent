@@ -48,6 +48,10 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return self._consumed
 
+    def suppress_completion(self, session, replay):
+        # Production ProcessRegistry API the merged watcher calls: these doubles never suppress.
+        return False
+
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     """Create a GatewayRunner with a fake config for the given mode."""
@@ -638,7 +642,7 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
     }
     result = await runner._inject_watch_notification("[SYSTEM: subagent finished]", evt)
 
-    assert result == "delivered"
+    assert result is True
     api_adapter.handle_message.assert_not_awaited()
     # Same presentation contract as the push path: leading SYSTEM prefix intact, machine-origin
     # footer appended — this text becomes a role=user turn on the stateless surface too.
@@ -674,7 +678,7 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
         "origin_session_id": "raw-origin-sid",
     }
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
-    assert result == "delivered"
+    assert result is True
     assert posts == ["raw-origin-sid"]
 
 

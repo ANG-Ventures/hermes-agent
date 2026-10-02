@@ -368,7 +368,10 @@ def test_t7_interrupted_mutating_tool_result_is_not_completion():
                 "id": 3,
                 "role": "tool",
                 "tool_call_id": "call-1",
-                "content": "[Command interrupted] exit_code: 130 (interrupt)",
+                # Real executor shape (tools/environments, exit 130): the marker is the LAST line of
+                # the output. The merged is_interrupted_tool_result requires that shape so a result
+                # merely quoting the marker is not misread as a killed run (upstream f296652a662).
+                "content": json.dumps({"output": "partial output\n[Command interrupted]", "exit_code": 130}),
             },
             {
                 "id": 4,

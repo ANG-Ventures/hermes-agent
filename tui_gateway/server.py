@@ -5145,6 +5145,17 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None) -> bool:
+    # Shared-checkout admission (fork C6, #1035): a maintenance update holding the gate defers the turn
+    # instead of starting it; the client is told to resend. Checked FIRST, before the ownership/liveness
+    # admission below claims the session lease, opens an inflight turn or touches the agent: a frozen
+    # continuation must be refused with no partial-admission side effects (fork ordering).
+    _gate = _checkout_gate_ref
+    if _gate is not None and (_refusal := _gate.check(internal=True)) is not None:
+        with session["history_lock"]:
+            session["running"] = False
+        logger.info("deferring turn for %s: %s", sid, _refusal.reason)
+        _emit("error", sid, {"message": "Paused for a maintenance update; this turn was not started — resend shortly."})
+        return False
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -5158,15 +5169,6 @@ def _run_prompt_submit(
     if admitted is None:
         return False
     images, agent = admitted
-    # Shared-checkout admission (fork C6, #1035): a maintenance update holding the gate defers the turn
-    # instead of starting it; the client is told to resend.
-    _gate = _checkout_gate_ref
-    if _gate is not None and (_refusal := _gate.check(internal=True)) is not None:
-        with session["history_lock"]:
-            session["running"] = False
-        logger.info("deferring turn for %s: %s", sid, _refusal.reason)
-        _emit("error", sid, {"message": "Paused for a maintenance update; this turn was not started — resend shortly."})
-        return False
     from gateway.warning_notifications import diagnostic_turn_muted
     from agent.notification_presentation import notification_config_snapshot
     with _session_profile_runtime_scope(session):

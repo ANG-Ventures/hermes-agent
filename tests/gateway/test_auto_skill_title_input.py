@@ -55,6 +55,9 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
     runner._consume_pending_native_image_paths = lambda key: []
     runner._adapter_for_source = lambda source: None
     runner._bind_adapter_run_generation = lambda *args: None
+    # Fork stop-during-pre-flight gate: the turn only starts when its run generation is still
+    # current for the session key; register generation 1 as this bare runner's live run.
+    runner._session_run_generation[entry.session_key] = 1
     async def propagate_error(exc, *args):
         raise exc
     runner._hmwa_agent_error_reply = propagate_error

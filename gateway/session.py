@@ -1460,22 +1460,30 @@ class SessionStore(
             if entry is None:
                 return
             pin_key = self._chat_pin_key(session_key)
+        data, generation = {}, 0
+        with self._lock:
+            if self._entries.get(session_key) is not entry:
+                return
+            changed = entry.model_override != cleaned
+            if changed:
+                data, generation = self._snapshot_routing_locked()
+                # Snapshot reconciliation may replace the entry after database recovery.
+                entry = self._entries[session_key]
+                data[session_key] = replace(entry, model_override=cleaned).to_dict()
+        if changed:
+            # Publish only after persistence so a failed clear remains retryable. Under the fork's
+            # _StoreLock a write issued inside ``_lock`` is DEFERRED to lock release (t_cc8533d1),
+            # so it runs here, outside the lock, for its failure to precede the publish — and
+            # precede the chat pin below, which would otherwise record a clear that never landed.
+            self._persist_routing_data(data, generation)
         if pin_key and (override is None or sanitize_model_override_identity(override)):
             # chat-model-pins.sqlite3 write: outside ``_lock`` (t_cc8533d1).
             from gateway.chat_model_pins import ChatModelPins
             ChatModelPins(self.sessions_dir).set(*pin_key, override)
-        with self._lock:
-            if self._entries.get(session_key) is not entry:
-                return
-            if entry.model_override == cleaned:
-                return
-            # Publish only after persistence so a failed clear remains retryable.
-            data, generation = self._snapshot_routing_locked()
-            # Snapshot reconciliation may replace the entry after database recovery.
-            entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
-            self._persist_routing_data(data, generation)
-            entry.model_override = cleaned
+        if changed:
+            with self._lock:
+                if self._entries.get(session_key) is entry:
+                    entry.model_override = cleaned
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

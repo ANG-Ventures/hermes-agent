@@ -92,6 +92,12 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Fork: native slash-interaction echo handoff. Set True by an adapter that owns an OPEN,
+    # already-deferred platform interaction it answers itself (Discord native slash commands); the
+    # inline command-dispatch paths then hand the reply back through ``deferred_reply_text`` instead
+    # of publishing a second public message. Adapters that never defer leave it False.
+    suppress_public_echo: bool = False
+    deferred_reply_text: Optional[str] = None
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

@@ -49,11 +49,20 @@ def isolated_registry(tmp_path, monkeypatch):
     return registry
 
 
+class _LendingStore(SimpleNamespace):
+    """Upstream #98573: the runner BORROWS ``session_store._db``; lend the active scope's registry handle."""
+
+    @property
+    def _db(self):
+        from hermes_state_registry import acquire
+        return acquire()
+
+
 def _runner(adapter, *, origins=None):
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
-    runner.session_store = SimpleNamespace(
+    runner.session_store = _LendingStore(
         _ensure_loaded=lambda: None,
         _entries=origins or {},
     )
@@ -132,9 +141,9 @@ def test_json_outbox_delivery_is_not_replayed_after_restart(
     assert ad.get_durable_delegation(event["delegation_id"]) is None
     assert ad.enqueue_pending_outbox(current_boot_id="boot-one", profile_home=tmp_path) == 1
     queued = isolated_registry.completion_queue.get_nowait()
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
-    assert asyncio.run(runner._deliver_completion_notification("finished", queued)) == "delivered"
+    assert asyncio.run(runner._deliver_completion_notification("finished", queued)) is True
     adapter.handle_message.assert_awaited_once()
     assert _json_outbox_states(tmp_path) == ["delivered"]
     assert ad.enqueue_pending_outbox(current_boot_id="boot-two", profile_home=tmp_path) == 0
@@ -146,8 +155,8 @@ def test_coalesced_json_outbox_siblings_are_all_acknowledged(tmp_path, isolated_
 
     events = [_async_event("deleg_primary"), _async_event("deleg_sibling")]
     _seed_json_outbox(events, tmp_path)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
-    assert asyncio.run(_runner(adapter)._deliver_async_delegation_group(events)) == "delivered"
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    assert asyncio.run(_runner(adapter)._deliver_async_delegation_group(events)) is True
     adapter.handle_message.assert_awaited_once()
     delivered = adapter.handle_message.call_args.args[0].text
     assert "deleg_primary" in delivered and "deleg_sibling" in delivered
@@ -158,11 +167,11 @@ def test_coalesced_json_outbox_siblings_are_all_acknowledged(tmp_path, isolated_
 def test_json_outbox_temporary_failure_remains_retryable(tmp_path):
     event = _async_event()
     _seed_json_outbox([event], tmp_path)
-    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=[RuntimeError("offline"), None]))
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=[RuntimeError("offline"), None]))
     runner = _runner(adapter)
-    assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "temporary"
+    assert asyncio.run(runner._deliver_completion_notification("finished", event)) is False
     assert _json_outbox_states(tmp_path) == ["pending"]
-    assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "delivered"
+    assert asyncio.run(runner._deliver_completion_notification("finished", event)) is True
     assert adapter.handle_message.await_count == 2
     assert _json_outbox_states(tmp_path) == ["delivered"]
 
@@ -178,10 +187,12 @@ def test_json_outbox_drop_requires_proven_terminal_target(tmp_path, monkeypatch,
     else:
         event["session_key"] = ""
     _seed_json_outbox([event], tmp_path)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
-    assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "dropped"
+    # Merged vocabulary: a proven-terminal target is None (dropped with a durable receipt); a
+    # consumer with no route for the event is False (retryable, outbox stays pending).
+    assert asyncio.run(runner._deliver_completion_notification("finished", event)) is (None if gone_parent else False)
     adapter.handle_message.assert_not_awaited()
     assert _json_outbox_states(tmp_path) == ["dropped" if gone_parent else "pending"]
     # This consumer lacking a route is not proof no future consumer can deliver.
@@ -193,7 +204,7 @@ def test_json_outbox_drop_requires_proven_terminal_target(tmp_path, monkeypatch,
 def test_json_outbox_transient_pinned_lookup_failure_retries(tmp_path, monkeypatch):
     event = dict(_async_event(), parent_session_id="parent")
     _seed_json_outbox([event], tmp_path)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     live = {"ended_at": None}
     runner._session_db = SimpleNamespace(
@@ -203,10 +214,10 @@ def test_json_outbox_transient_pinned_lookup_failure_retries(tmp_path, monkeypat
     monkeypatch.setattr(runner, "_async_session_store", SimpleNamespace(
         get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="other")),
     ), raising=False)
-    assert asyncio.run(runner._deliver_completion_notification("done", event)) == "temporary"
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) is False
     adapter.handle_message.assert_not_awaited()
     assert _json_outbox_states(tmp_path) == ["pending"]
-    assert asyncio.run(runner._deliver_completion_notification("done", event)) == "delivered"
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
     adapter.handle_message.assert_awaited_once()
     assert _json_outbox_states(tmp_path) == ["delivered"]
 
@@ -228,9 +239,9 @@ def test_accepted_completion_retries_receipt_without_reinjection(tmp_path, monke
         return original(*args, **kwargs)
 
     monkeypatch.setattr(ad, "acknowledge_outbox_event", receipt)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
-    assert asyncio.run(runner._deliver_completion_notification("done", event)) == "delivered"
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
     assert asyncio.run(runner._deliver_completion_notification("done", event)) is None
     adapter.handle_message.assert_awaited_once()
     assert len(attempts) == (3 if persistent else 2)
@@ -266,17 +277,17 @@ def test_completion_lifecycle_uses_producer_profile(tmp_path, monkeypatch, batch
     with gateway_run._profile_runtime_scope(secondary):
         for event in events:
             _persist_pending_completion(event)
-    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
     runner._session_db_pinned = gateway_run._SESSION_DB_UNPINNED
     runner._session_db_handles = {}
     runner._session_db_handles_lock = threading.Lock()
     injected_homes = []
 
-    async def inject(*args):
+    async def inject(*args, **kwargs):
         injected_homes.append(get_hermes_home())
         if injection_fails == "raise":
             raise RuntimeError("injection failed")
-        return "temporary" if injection_fails else "delivered"
+        return False if injection_fails else True
 
     monkeypatch.setattr(runner, "_inject_watch_notification", inject)
     try:
@@ -285,7 +296,7 @@ def test_completion_lifecycle_uses_producer_profile(tmp_path, monkeypatch, batch
             with pytest.raises(RuntimeError, match="injection failed"):
                 asyncio.run(operation)
         else:
-            assert asyncio.run(operation) == ("temporary" if injection_fails else "delivered")
+            assert asyncio.run(operation) == (False if injection_fails else True)
         assert injected_homes == [secondary]
         assert get_hermes_home() == root
         assert _json_outbox_states(secondary) == ["pending" if injection_fails else "delivered"] * len(events)
@@ -306,13 +317,13 @@ def test_async_completion_batch_key_separates_producer_profiles():
 
 
 def test_completion_dedup_keeps_profiles_and_generations_distinct(tmp_path):
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     for name, generation in [("root", 1), ("secondary", 1), ("secondary", 2)]:
         home = tmp_path / name
         event = dict(_async_event(), event_id=f"deleg_duplicate:terminal:g{generation}", attempt_generation=generation)
         _seed_json_outbox([event], home)
-        assert asyncio.run(runner._deliver_completion_notification("done", event)) == "delivered"
+        assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
         assert _json_outbox_states(home) == ["delivered"]
     assert adapter.handle_message.await_count == 3
 
@@ -342,7 +353,7 @@ def test_false_claim_reconciles_only_matching_terminal_receipt(tmp_path, state, 
     elif state == "parked":
         with ad._DB_LOCK, ad._transaction() as conn:
             conn.execute("UPDATE async_delegations SET delivery_state='parked' WHERE delegation_id=?", (event["delegation_id"],))
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     if consumer == "gateway":
         assert asyncio.run(_runner(adapter)._deliver_completion_notification("done", event)) is None
     else:
@@ -368,9 +379,9 @@ def test_coalesced_receipt_failures_are_independent(tmp_path, monkeypatch, caplo
         return original(event_id, **kwargs)
 
     monkeypatch.setattr(ad, "acknowledge_outbox_event", receipt)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
-    assert asyncio.run(runner._deliver_async_delegation_group(events)) == "delivered"
+    assert asyncio.run(runner._deliver_async_delegation_group(events)) is True
     assert asyncio.run(runner._deliver_async_delegation_group(events)) is None
     adapter.handle_message.assert_awaited_once()
     assert [attempts[event["event_id"]] for event in events] == [2, 3, 2]
@@ -401,7 +412,7 @@ def test_cancelling_receipt_wait_does_not_undo_accepted_delivery(tmp_path, monke
             finished.set()
 
     monkeypatch.setattr(ad, "acknowledge_outbox_event", receipt)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
 
     async def exercise():
@@ -448,7 +459,7 @@ def test_terminal_receipt_failure_is_retryable_without_losing_sqlite_claim(tmp_p
     event = dict(_async_event(), parent_session_id="closed-parent")
     _seed_json_outbox([event], tmp_path)
     _persist_pending_completion(event)
-    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
     monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
 
     def unavailable(*args, **kwargs):
@@ -472,7 +483,7 @@ def test_json_receipts_run_off_the_gateway_event_loop(mode, tmp_path, monkeypatc
     if mode == "terminal":
         events[0]["parent_session_id"] = "closed-parent"
     _seed_json_outbox(events, tmp_path)
-    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
     if mode == "terminal":
         monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
     original = ad.acknowledge_outbox_event
@@ -488,7 +499,7 @@ def test_json_receipts_run_off_the_gateway_event_loop(mode, tmp_path, monkeypatc
         result = asyncio.run(runner._deliver_async_delegation_group(events))
     else:
         result = asyncio.run(runner._deliver_completion_notification("done", events[0]))
-    assert result == ("dropped" if mode == "terminal" else "delivered")
+    assert result == (None if mode == "terminal" else True)
     assert len(receipt_threads) == len(events)
     assert all(thread != loop_thread for thread in receipt_threads)
 
@@ -595,7 +606,7 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
 
     # 2026-07-15 parity merge: completion delivery now returns explicit
     # outcome strings; "delivered" is the successful adapter-acceptance state.
-    assert sorted(asyncio.run(_exercise()), key=str) == [None, "delivered"]
+    assert sorted(asyncio.run(_exercise()), key=str) == [None, True]
     adapter.handle_message.assert_awaited_once()
 
 
@@ -667,7 +678,7 @@ def test_sqlite_acceptance_is_delivered_and_never_restored(monkeypatch, isolated
             assert row is not None
             assert row["delivery_state"] == "pending"
 
-    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=accept))
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=accept))
     runner = _runner(adapter)
     _stop_after_sleeps(monkeypatch, runner, count=2)
     asyncio.run(runner._async_delegation_watcher(interval=0))
@@ -691,12 +702,12 @@ def test_sqlite_session_switch_is_dropped_not_falsely_acknowledged():
     event["completed_at"] = time.time()
     event["parent_session_id"] = "closed-parent"
     _persist_pending_completion(event)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={
         "id": "closed-parent", "ended_at": time.time(), "end_reason": "session_switch",
     }))
-    assert asyncio.run(runner._deliver_completion_notification("completion", event)) == "dropped"
+    assert asyncio.run(runner._deliver_completion_notification("completion", event)) is None
     adapter.handle_message.assert_not_awaited()
     row = ad.get_durable_delegation(event["delegation_id"])
     assert row is not None
