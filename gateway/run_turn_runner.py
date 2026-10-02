@@ -943,7 +943,7 @@ class TurnRunner:
         """
         from gateway.run import (
             _is_model_route_change_status, _prepare_gateway_status_message,
-            _redact_gateway_user_facing_secrets, _send_or_update_status_coro, safe_schedule_threadsafe,
+            _redact_gateway_user_facing_secrets, _send_or_update_status_coro,
         )
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
@@ -1011,13 +1011,14 @@ class TurnRunner:
             self._track_progress_result(res)
 
         def present():
-            fut = safe_schedule_threadsafe(
+            # Through the runner's ``_schedule`` seam (upstream's shape; tests patch it), not a
+            # direct safe_schedule_threadsafe.
+            fut = self._schedule(
                 _send_or_update_status_coro(
                     adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata,
                     durable=is_route_change,
                 ),
-                ctx._loop_for_step, logger=logger,
-                log_message=f"status_callback ({event_type}) scheduling error",
+                f"status_callback ({event_type}) scheduling error",
             )
             if fut is None:
                 _warn_route_drop("schedule_failed")
