@@ -191,6 +191,9 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     ok = json.loads(kt._handle_complete({
         "summary": "retry without claims",
         "created_cards": [],
+        # The fixture pins HERMES_KANBAN_RUN_ID, so this is a dispatcher-owned
+        # completion and the #1621 receipt gate applies.
+        "metadata": {"tests_run": 1},
     }))
     assert ok.get("ok") is True
 
@@ -307,7 +310,8 @@ def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
     with kbc.connect() as conn:
         run_id = kb.get_task(conn, worker_env).current_run_id
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    out = json.loads(kt._handle_complete({"summary": "bound worker done"}))
+    out = json.loads(kt._handle_complete({"summary": "bound worker done",
+                                           "metadata": {"tests_run": 1}}))  # #1621 receipt
     assert out.get("ok") is True
     with kbc.connect() as conn:
         assert kb.get_task(conn, worker_env).status == "done"
@@ -793,6 +797,15 @@ def test_create_tool_stamps_session_and_origin(worker_env, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "20260924_000000_toolsess")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#ops")
+    # Upstream 3c33231096: provenance is stamped only for a session that exists
+    # in this profile's state.db (phantom session ids are rejected).
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+    _db = SessionDB(db_path=get_hermes_home() / "state.db")
+    try:
+        _db.create_session(session_id="20260924_000000_toolsess", source="discord")
+    finally:
+        _db.close()
     d = json.loads(kt._handle_create({"title": "tool card", "assignee": "peer",
                                       "body": "work"}))
     assert d["ok"] is True
