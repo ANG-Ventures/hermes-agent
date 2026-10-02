@@ -45,11 +45,14 @@ def _recording_judge(seen):
 
 
 def test_cli_gate_transport_failure_fails_open_but_genuine_verdict_rejects():
+    # The fork's CLI gate is wired through the shared goals.kanban_handoff_rejection
+    # policy and returns the rejection reason (None = handoff allowed) rather than
+    # upstream's (verdict, reason) tuple; a claim-less caller fails open on a
+    # transport failure.
     with _aux_client(), patch("hermes_cli.goals.judge_goal", return_value=_TRANSPORT_FAILED):
-        assert kanban_cli._goal_mode_handoff_rejection(_task(), "evidence") == ("done", None)
+        assert kanban_cli._goal_mode_handoff_rejection(_task(), "evidence") is None
     with _aux_client(), patch("hermes_cli.goals.judge_goal", return_value=_GENUINE_CONTINUE):
-        assert kanban_cli._goal_mode_handoff_rejection(_task(), "evidence") == (
-            "continue", "goal not met yet")
+        assert kanban_cli._goal_mode_handoff_rejection(_task(), "evidence") == "goal not met yet"
 
 
 def test_tool_gate_transport_failure_fails_open_but_genuine_verdict_rejects():
@@ -65,7 +68,7 @@ def test_cli_gate_binds_per_task_affinity_scope():
     """Headless judge call runs under kanban:<task_id>; a bound scope is kept."""
     seen = []
     with _aux_client(), patch("hermes_cli.goals.judge_goal", side_effect=_recording_judge(seen)):
-        assert kanban_cli._goal_mode_handoff_rejection(_task("task-9"), "ev") == ("done", None)
+        assert kanban_cli._goal_mode_handoff_rejection(_task("task-9"), "ev") is None
     assert seen == ["kanban:task-9"]
     assert get_affinity_scope() is None
 
