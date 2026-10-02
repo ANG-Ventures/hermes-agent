@@ -55,13 +55,26 @@ class Refs:
     base: str
 
 
+def _nearest_release_tag() -> str:
+    """Release N-1: the nearest release tag of HEAD, or of HEAD~1 when HEAD is itself that tag.
+
+    Fork: on a parity-merge ref HEAD~1 is the fork's pre-sync main, whose nearest tag can be
+    months old with a lockfile current uv no longer resolves; HEAD (the merge) reaches upstream's
+    latest release. On linear history this equals ``describe HEAD~1``.
+    """
+    match = ("describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0")
+    tag = I.git(*match, "HEAD", cwd=H.WORKTREE)
+    if I.git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE) == I.git("rev-parse", "HEAD", cwd=H.WORKTREE):
+        tag = I.git(*match, "HEAD~1", cwd=H.WORKTREE)
+    return tag
+
+
 @functools.cache
 def refs() -> Refs:
     """HEAD and release N-1, resolved on first use (collection runs no git)."""
     head = I.head_sha()
     try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or I.git(
-            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", "HEAD~1", cwd=H.WORKTREE)
+        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _nearest_release_tag()
         return Refs(head, tag, I.git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
     except AssertionError:  # shallow checkout without tags
         return Refs(head, "", "")

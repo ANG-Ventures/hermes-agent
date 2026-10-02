@@ -167,7 +167,10 @@ def card_status(inst: X.Install, tid: str) -> str:
 
 
 def create_card(inst: X.Install, title: str) -> str:
-    cp = inst.cli("kanban", "create", title, "--assignee", "default", "--json", timeout=120)
+    # Fork: `kanban create` refuses an unhomed card (t_09fea045). The sandboxed install has no
+    # session, so opt in through the suite-compat env; N-1 builds without the refusal ignore it.
+    cp = inst.cli("kanban", "create", title, "--assignee", "default", "--json", timeout=120,
+                  env={**inst.env, "HERMES_KANBAN_ALLOW_UNHOMED_CREATE": "1"})
     assert cp.returncode == 0, "kanban create failed\n" + H.describe(cp)
     return json.loads(cp.stdout[cp.stdout.index("{"):])["id"]
 
