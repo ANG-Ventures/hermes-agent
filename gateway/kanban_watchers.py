@@ -2866,7 +2866,12 @@ class GatewayKanbanWatchersMixin:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+            # The guard class lives in ``kanban_db_connect`` since upstream's
+            # extraction; the facade no longer re-exports it, and a missing
+            # attribute here silently disarmed the quarantine (every tick
+            # logged a traceback instead of pausing the board).
+            from hermes_cli import kanban_db_connect as _kbc
+            corrupt_guard_error = getattr(_kbc, "KanbanDbCorruptError", None)
             if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
                 return True
             if not isinstance(exc, sqlite3.DatabaseError):

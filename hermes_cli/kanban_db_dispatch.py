@@ -708,11 +708,14 @@ def _terminate_reclaimed_worker(
         return info
 
     verified_alive_at: Optional[float] = None
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
-        info["liveness_unprovable"] = True
-        info["needs_attention"] = True
+        if _kb._pid_alive(pid):
+            info["liveness_unprovable"] = True
+            info["needs_attention"] = True
+        else:
+            info["terminated"] = True
         return info
     if started_at is not None and started_at != UNVERIFIED_WORKER_FINGERPRINT \
             and _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
@@ -832,8 +835,15 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     alive = _worker_alive(pid, fingerprint)
     termination = None
     if alive:
-        termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
+        # The fork's termination contract needs the recorded run's owner window
+        # (identity before any signal, t_0ae83825); the closed run row is the
+        # run that recorded this pid. Without it the call raised TypeError,
+        # the per-row guard swallowed it, and no terminal worker was ever reaped.
+        termination = _kb._terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint,
+            owner_window=_kb._worker_owner_window(conn, row["task_id"], pid, row["id"]),
+            conn=conn, task_id=row["task_id"], run_id=row["id"],
+        )
         if not termination["terminated"]:
             return  # still alive: try again next tick
     with _kb.write_txn(conn):
@@ -993,7 +1003,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # SIGTERM then SIGKILL (5 s grace) through the shared helper, so the
         # owner-identity check guards this path too (t_0ae83825): a recycled
         # PID is never signalled and proves the recorded worker gone.
-        termination = _terminate_reclaimed_worker(
+        termination = _kb._terminate_reclaimed_worker(
             pid, row["claim_lock"], signal_fn=signal_fn,
             started_at=_kb._row_get(row, "worker_started_at"),
             owner_window=_kb._worker_owner_window(conn, tid, pid, row["current_run_id"]),
@@ -1052,7 +1062,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 _kb._append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
                 timed_out.append(tid)
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -1121,7 +1130,7 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
+        termination = _kb._terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
             run_id=row["current_run_id"],
             owner_window=_kb._worker_owner_window(conn, tid, pid, row["current_run_id"]),
@@ -1949,6 +1958,16 @@ def detect_crashed_workers(
                 stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
+
+            # Upstream #88603 / #46593: a clean exit or a crash carries the
+            # worker's own last output so the board and the retry worker see
+            # WHY instead of a bare label; a rate-limited / infra requeue and a
+            # cohort death do not need it.
+            if not rate_limited_exit and not cohort_death:
+                worker_output = _worker_final_output(row["id"], board=board)
+                if worker_output:
+                    error_text += f" Worker's last output: {worker_output!r}"
+                    event_payload["worker_output"] = worker_output
 
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status

@@ -277,7 +277,8 @@ def test_recycled_holder_dashboard_move(conn):
 
 def test_recycled_holder_parent_reopen_invalidation(conn):
     parent = kb.create_task(conn, title="parent", assignee="planner")
-    assert kb.complete_task(conn, parent)
+    # Upstream #117483: a completion must carry evidence (result/summary).
+    assert kb.complete_task(conn, parent, result="done")
     tid, holder, _ = _card(conn, recycled=True, parents=[parent])
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
@@ -354,7 +355,8 @@ def test_genuine_worker_dashboard_move_signalled(conn):
 
 def test_genuine_worker_parent_reopen_signalled(conn):
     parent = kb.create_task(conn, title="parent", assignee="planner")
-    assert kb.complete_task(conn, parent)
+    # Upstream #117483: a completion must carry evidence (result/summary).
+    assert kb.complete_task(conn, parent, result="done")
     tid, holder, _ = _card(conn, recycled=False, parents=[parent])
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))

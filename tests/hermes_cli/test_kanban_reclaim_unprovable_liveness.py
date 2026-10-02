@@ -559,6 +559,11 @@ def test_timeout_survivor_keeps_claim_and_rejects_a_second_claim(conn, monkeypat
     assert first is not None
     kbd._set_worker_pid(conn, tid, 424242)
     old_run = first.current_run_id
+    # 424242 is synthetic: upstream's spawn fingerprint capture fails for it
+    # and stamps UNVERIFIED, which is never signalled by contract (#99558).
+    # Pin the legacy (pre-fingerprint) row shape so the timeout path signals
+    # and the survivor guard under test is what decides.
+    conn.execute("UPDATE tasks SET worker_started_at=NULL WHERE id=?", (tid,))
     conn.execute("UPDATE task_runs SET started_at=? WHERE id=?",
                  (int(time.time()) - 500, old_run))
     conn.commit()

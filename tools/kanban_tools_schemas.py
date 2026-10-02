@@ -219,8 +219,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "the whole diff; the reviewer has the board and the PR."
         )),
         "reviewer": _prop("string", (
-                "Optional reviewer profile. When provided, the task is "
-                "reassigned to that profile before review dispatch."
+                "Reviewer profile to reassign the task to before review "
+                "dispatch. Must be a REAL installed profile (the fleet "
+                "verifier is 'argus') or the explicit sentinel 'human' / "
+                "'human:<name>' for a deliberate human lane. A "
+                "placeholder like 'reviewer' is refused — such a card can "
+                "never be spawned and would wait forever. Omit to use "
+                "config kanban.review_assignee."
         )),
         "metadata": {
             "type": "object",

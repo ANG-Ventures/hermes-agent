@@ -72,8 +72,8 @@ import json
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
-with kb.connect() as conn:
-    result = kb.dispatch_once(conn, dry_run=True)
+with kbc.connect() as conn:
+    result = kbd.dispatch_once(conn, dry_run=True)
 print(json.dumps({'skipped': result.skipped_locked, 'holder': result.lock_holder}))
 """
     with kbc._dispatch_tick_lock(kb.kanban_db_path()) as held:

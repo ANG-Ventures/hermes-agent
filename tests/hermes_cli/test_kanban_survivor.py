@@ -369,7 +369,8 @@ def test_deferred_parent_capture_includes_later_edits(board):
     assert kb.complete_task(board, tid)
     assert ws.exists()
     (repo / "code.py").write_text("second = True\n")
-    assert kb.complete_task(board, child)
+    # Upstream #117483: a completion must carry evidence (result/summary).
+    assert kb.complete_task(board, child, result="done")
     assert not ws.exists()
     attachments = kb.list_attachments(board, tid)
     assert len(attachments) == 4  # two patch/manifest versions

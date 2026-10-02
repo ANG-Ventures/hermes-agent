@@ -20,10 +20,16 @@ def test_review_unknown_argument_rejects_before_handoff(tmp_path, monkeypatch):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title='review payload', assignee='builder', workspace_kind='scratch')
         assert kb.claim_task(conn, tid) is not None
+        run_id = kb._current_run_id(conn, tid)
         workspace = kb.workspaces_root() / tid
         workspace.mkdir(parents=True)
         conn.execute('UPDATE tasks SET workspace_path=? WHERE id=?', (str(workspace), tid))
         conn.commit()
+    # Fork contract: a card running under a live claim is only handed to review
+    # by its owning worker (expected_run_id) or an explicit operator force; act
+    # as the dispatcher-owned worker so the unknown-argument gate is what decides.
+    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run_id))
     artifact = workspace / 'result.txt'
     artifact.write_text('verified result', encoding='utf-8')
     result = json.loads(registry.dispatch('kanban_request_review', {
