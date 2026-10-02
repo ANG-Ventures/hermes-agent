@@ -99,12 +99,13 @@ def _repo_root() -> Path:
 # ``tests/gateway/test_weixin_state_write_off_loop.py`` rather than via this
 # baseline.  Do not read "absent from REACHABLE_BASELINE" as "off the loop".
 REACHABLE_BASELINE = frozenset({
-    # Re-frozen 2026-10-02 (parity sync 2026-10-01, CI6-M1-gatewayb): 7 -> 16 keys. Upstream
+    # Re-frozen 2026-10-02 (parity sync 2026-10-01, CI6-M1-gatewayb): 7 -> 15 keys. Upstream
     # split gateway/run.py into run_*.py so the (module, coroutine) keys moved, and it added
     # modules the fork never had (api_server_room_grants, host_rendezvous.publish_record, the
     # run_shutdown exit-state persist, the --replace takeover marker). Measured with this
-    # test's own walker: fork/main c14e059f8f2 = 7 sites, lane head = 16; every entry below
-    # is upstream's pre-existing shape, none is a fork chain newly reaching a sink. The two
+    # test's own walker: fork/main c14e059f8f2 = 7 sites, lane head = 15 (16 before the
+    # upstream-new _replay_pending_planned_restart_notification marker write was offloaded);
+    # every entry below is upstream's pre-existing shape, none a fork chain newly reaching a sink. The two
     # gateway/session.py chains this gate exists for (per-turn + startup alias migration)
     # are ABSENT and pinned by test_no_session_persistence_chain_reaches_the_loop. The
     # fork/main entries that vanished did so legitimately: `_handle_message -> atomic_replace`
@@ -121,7 +122,6 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run_adapters.py _install_reconnected_adapter -> os.fsync",
     "gateway/run_adapters.py _run_secondary_profile_reconnect -> os.fsync",
     "gateway/run_adapters.py _start_secondary_profile_adapters -> atomic_json_write",
-    "gateway/run_notifications.py _replay_pending_planned_restart_notification -> atomic_json_write",
     "gateway/run_profile_reconcile.py _apply_profile_changes -> atomic_json_write",
     "gateway/run_profile_reconcile.py apply -> atomic_json_write",
     "gateway/run_shutdown.py _finalize_shutdown_agents -> atomic_json_write",

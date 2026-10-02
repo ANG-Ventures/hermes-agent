@@ -1004,7 +1004,8 @@ class GatewayNotificationsMixin:
             if not path.exists():
                 return
             try:
-                data = json.loads(path.read_text(encoding="utf-8-sig"))
+                # Boot-path marker read + rewrite: small, but never on the loop (fsync tail).
+                data = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8-sig"))
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.
@@ -1019,7 +1020,7 @@ class GatewayNotificationsMixin:
                     path.unlink(missing_ok=True)
                     return
                 data["delivered_targets"] = [list(target) for target in delivered]
-                atomic_json_write(path, data, indent=None)
+                await asyncio.to_thread(atomic_json_write, path, data, indent=None)
             except Exception:
                 logger.warning("Planned-restart notification remains pending", exc_info=True)
 
