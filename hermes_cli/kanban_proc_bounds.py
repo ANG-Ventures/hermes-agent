@@ -201,8 +201,7 @@ def census_worker_trees(
     # pid -> (sid, ppid, birth) for every same-uid process, for the walk.
     table: dict[int, tuple[Optional[int], int, Optional[float]]] = {}
     sid_hits: list[tuple[int, int, str]] = []
-    for proc in psutil.process_iter(
-            ["pid", "ppid", "uids", "name", "cmdline", "create_time"]):
+    for proc in psutil.process_iter(["pid", "ppid", "uids", "name", "create_time"]):
         info = proc.info
         pid = info.get("pid") or 0
         uids = info.get("uids")
@@ -224,7 +223,7 @@ def census_worker_trees(
         if env.get("HERMES_KANBAN_TASK") is None:
             # Linux Chrome erases its environ window; its profile path still
             # names the card (kb._cmdline_profile_cards).
-            cards = kb._cmdline_profile_cards(info.get("cmdline"))
+            cards = kb._cmdline_profile_cards(kb._safe_cmdline(proc))
             key = next((by_card[c] for c in cards if c in by_card), None)
             # The card names no run: a browser older than this run's worker
             # belongs to an earlier run of the card, not this one.

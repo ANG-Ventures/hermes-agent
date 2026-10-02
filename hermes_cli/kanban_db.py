@@ -19383,6 +19383,15 @@ def _cmdline_profile_cards(cmdline) -> set[str]:
     return out
 
 
+def _safe_cmdline(proc) -> list[str]:
+    """``proc.cmdline()``, or [] when unreadable. psutil on macOS can raise
+    ``SystemError`` (not a psutil.Error) for a process exiting mid-read."""
+    try:
+        return proc.cmdline() or []
+    except Exception:
+        return []
+
+
 def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
     """``(pid, pgid)`` of every live process whose ENVIRONMENT carries exactly
     this task+run identity, wherever it sits in the session tree. A process
@@ -19406,7 +19415,7 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
         my_sid = None
     want_task, want_run = str(task_id), str(run_id)
     found: list[tuple[int, int]] = []
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc in psutil.process_iter(["pid"]):
         pid = proc.info["pid"]
         if pid == me or pid <= 1:
             continue
@@ -19416,7 +19425,7 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             continue
         env_task = env.get("HERMES_KANBAN_TASK")
         if env_task is None:
-            if want_task not in _cmdline_profile_cards(proc.info.get("cmdline")):
+            if want_task not in _cmdline_profile_cards(_safe_cmdline(proc)):
                 continue
         elif env_task != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
             continue

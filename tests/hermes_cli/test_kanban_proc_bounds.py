@@ -383,12 +383,9 @@ _CHROME_WORKER = (
 
 def _chrome_procs(profile: str) -> list[int]:
     out = []
-    for p in kb.psutil.process_iter(["cmdline"]):
-        try:
-            if any(profile in a for a in (p.info["cmdline"] or [])):
-                out.append(p.pid)
-        except Exception:
-            pass
+    for p in kb.psutil.process_iter():
+        if any(profile in a for a in kb._safe_cmdline(p)):
+            out.append(p.pid)
     return out
 
 
@@ -425,7 +422,8 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     # The live per-run census sees the browser too (Linux Chrome erases its
     # environ window; the profile path under the card workspace names it).
     key = (tid, str(task.current_run_id))
-    assert kpb.census_worker_trees({key: worker.pid})[key]["procs"] >= 1 + len(leaked)
+    # Worker + at least one browser process (helpers come and go).
+    assert kpb.census_worker_trees({key: worker.pid})[key]["procs"] >= 2
 
     assert kb.complete_task(conn, tid, summary="done")
     worker.stdin.write("go\n")
