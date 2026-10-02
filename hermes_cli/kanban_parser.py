@@ -313,6 +313,10 @@ _SPECS = [
                   "low, medium, high, xhigh, max, or ultra). 'none' disables "
                   "thinking. Independent of --model; omit to inherit the "
                   "assignee profile default."),
+        _arg("--brain", default=None, dest="brain", metavar="LANE",
+             help="Per-card harness brain for a foreign-lane worker (cc-worker): "
+                  f"{kb.CARD_BRAIN_ALLOWED}. Overrides the profile's "
+                  "foreign_lane.brain for this card only; omit to inherit it."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -423,6 +427,17 @@ _SPECS = [
             _arg("--clear-effort", action="store_true", dest="clear_effort",
                  help="Clear the per-task reasoning effort — the worker falls back "
                       "to its profile's own agent.reasoning_effort."),
+        ),
+        _group(
+            _arg("--brain", default=None, dest="brain", metavar="LANE",
+                 help="Per-card harness brain for a foreign-lane worker (cc-worker): "
+                      f"{kb.CARD_BRAIN_ALLOWED}. Card > lane > profile "
+                      "foreign_lane.brain; applies on the next dispatch. Independent "
+                      "of the model: with --brain alone the model override is left "
+                      "untouched."),
+            _arg("--clear-brain", action="store_true", dest="clear_brain",
+                 help="Clear the per-card brain; the worker uses its profile's "
+                      "foreign_lane.brain."),
         ),
     ], help="Set or clear a task's model/provider/effort override (takes effect on the next dispatch)",
        description=(
@@ -742,6 +757,10 @@ _SPECS = [
         _arg("--wake", action="store_true",
              help="Shorthand for --delivery-mode notify+wake. Wake is opt-in only: "
                   "each wake is a full agent turn that queues the human's messages."),
+        _arg("--also", action="store_true",
+             help="Add this chat even when another live chat already subscribes to "
+                  "the card. Default: one subscriber chat per card and platform; a "
+                  "live owner is kept and a dead (24 h idle) one is replaced."),
     ], help="Subscribe a gateway source to a task's terminal events (used by /kanban subscribe in the gateway adapter)"),
     _cmd("notify-list", [_arg("task_id", nargs="?"), _json_flag()],
          help="List notification subscriptions (optionally for a single task)"),
@@ -750,6 +769,12 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Report what would change without writing"),
         _arg("--all-boards", action="store_true",
              help="Sweep every board DB (default + boards/*/kanban.db), not just the active board"),
+        _arg("--dedupe", action="store_true",
+             help="Instead of the identity backfill: list cards with more than one "
+                  "subscription per platform, keep the card's home-session chat "
+                  "(else the oldest), drop the rest. Dry-run unless --apply."),
+        _arg("--apply", action="store_true",
+             help="With --dedupe: delete the extra subscriptions."),
         _json_flag(),
     ], help="Backfill missing key identity on legacy notify subscriptions", description=(
         "Repairs legacy notify-sub rows missing user_id, user_id_alt, or scope_id. Without the "
