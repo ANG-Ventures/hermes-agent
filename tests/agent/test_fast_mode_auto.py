@@ -127,20 +127,22 @@ def test_fast_auto_and_cold_parse_and_slash_command(monkeypatch):
     cli_mod.HermesCLI._handle_fast_command(stub, "/fast cold")
     assert stub.service_tier == "cold"
 
-    # auto/cold do NOT pin a static override into the turn route
+    # auto/cold do NOT pin a static override into the turn route. Fork contract (L5 ruling,
+    # tests/hermes_cli/test_fast_command.py): with ANY tier set the route resolves to ``{}``,
+    # never None — None is reserved for "no tier at all".
     route_stub = SimpleNamespace(
         model="gpt-5.4", api_key="k", base_url="https://api.openai.com/v1", provider="openai",
         api_mode="chat_completions", acp_command=None, acp_args=[], _credential_pool=None,
         service_tier="auto",
     )
-    assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] is None
+    assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] == {}
     route_stub.service_tier = "priority"
     assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] == {
         "service_tier": "priority"
     }
     route_stub.base_url = "https://openrouter.ai/api/v1"
     route_stub.provider = "openrouter"
-    assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] is None
+    assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] == {}
 
 
 class _FastRateLimitError(Exception):

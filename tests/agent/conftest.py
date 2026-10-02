@@ -71,6 +71,12 @@ def _block_real_claude_keychain(request, monkeypatch):
     """Make anthropic_adapter see a non-Darwin platform by default so the
     macOS Keychain Claude-Code credential read can't fire.
 
+    Honours the same ``allow_macos_keychain`` opt-out as the suite-wide
+    ``_neutralize_macos_keychain_creds`` guard: a test that exercises the
+    Keychain parser/mirror under ``platforms("macos")`` with ``subprocess.run``
+    mocked needs the real platform answer (upstream's
+    ``TestFindClaudeCodeKeychainItem`` / mirror tests, 2026-10-01 parity sync).
+
     ``read_claude_code_credentials`` early-returns when
     ``platform.system() != "Darwin"``, so defaulting the adapter's view of
     the platform to "Linux" blocks the real ``security find-generic-password``

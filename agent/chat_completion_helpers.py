@@ -1855,6 +1855,9 @@ class _NonStreamWatchdogs:
     idle_timeout: float
     idle_requires_progress: bool
     progress_timeout: float = 0.0
+    # Fork: keepalive-only stall cutoff for requests OUTSIDE the implicit large-context policy
+    # (``progress_timeout`` is that policy's own first-progress budget). 0 = disabled.
+    progress_stall_timeout: float = 0.0
 
 
 def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs:
@@ -1897,6 +1900,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     ttfb_enabled = codex
     ttfb_explicit = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", -1.0) != -1.0
     ttfb_timeout = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    ttfb_scaled_for_large = False  # the large-request scale-up below must survive the fork coupling
     if ttfb_timeout <= 0:
         ttfb_enabled = False
     elif codex and not local:
@@ -1910,6 +1914,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
                 "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.", ttfb_timeout, idle_default,
                 f"{est_tokens:,}", disable_above)
             ttfb_timeout = idle_default
+            ttfb_scaled_for_large = True
         # Opt-in ceiling (0 = off): a 120s default here silently undid the scale-up above (#91621).
         ttfb_cap = env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
         if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
@@ -1931,18 +1936,64 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
         # High-effort thinking precedes the first event; the floor outranks the cap.
         ttfb_timeout = max(ttfb_timeout, effort_floor)
 
+    # Fork (07:00 cron stall): make sure the fast-reconnect no-event TTFB watchdog can actually
+    # fire BEFORE the blunt wall-clock stale timer. With the default cutoff (120s) >= the default
+    # stale timeout (90s) the stale detector always won first, so a wedged chatgpt.com socket
+    # burned the full stale timeout on every retry (90s x 3) before the fallback kicked in. Large
+    # requests are already scaled up above (they never hit this: small-context admission clears in
+    # seconds), so a ~40s cutoff reconnects 2-3x within the stale budget instead of waiting it out
+    # once. Clamp strictly below the stale timer; only ever LOWER the cutoff. Operators disable via
+    # HERMES_CODEX_TTFB_BELOW_STALE=0 or tune HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS.
+    # Scope (merged tree): chatgpt.com backend only, implicit default only (an operator's explicit
+    # HERMES_CODEX_TTFB_TIMEOUT_SECONDS is never rewritten), not local servers (#92302 grace), not
+    # large requests (their scale-up above is the point), and never below the high-effort silence
+    # floor (thinking precedes the first event).
+    if (ttfb_enabled and codex and openai_codex_backend and not local and not ttfb_explicit
+            and not ttfb_scaled_for_large and env_float("HERMES_CODEX_TTFB_BELOW_STALE", 1.0) > 0):
+        ttfb_fast = env_float("HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS", 40.0)
+        if stale_timeout != float("inf"):
+            ttfb_margin = env_float("HERMES_CODEX_TTFB_BELOW_STALE_MARGIN_SECONDS", 10.0)
+            ttfb_fast = min(ttfb_fast, max(stale_timeout - ttfb_margin, 5.0))
+        ttfb_fast = max(ttfb_fast, effort_floor)
+        if ttfb_fast > 0 and ttfb_timeout > ttfb_fast:
+            logger.info("Lowering codex no-event TTFB cutoff from %.0fs to %.0fs so it fires before the %.0fs "
+                "stale timer (fast reconnect instead of waiting out the stale timeout). Set "
+                "HERMES_CODEX_TTFB_BELOW_STALE=0 to disable or HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS to tune.",
+                ttfb_timeout, ttfb_fast, stale_timeout)
+            ttfb_timeout = ttfb_fast
+
     # An operator-set idle timeout keeps first-event semantics; only the implicit
     # default defers arming until model progress. Sentinel: env_float returns the
     # default for unset AND unparseable values, so both count as implicit.
     idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
     idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
     progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
+
+    # Fork progress-stall watchdog. The idle detector is satisfied by ANY SSE frame — including
+    # content-free keepalives — and chatgpt.com has a failure mode where it keeps the socket alive
+    # with keepalives but never emits a delta or completes: last_event_ts stays fresh forever and
+    # the call burned the full blunt stale timeout (observed 90s x 6 retries ~ 9 min before
+    # fallback). Kill "events flowing but zero forward progress" at the fast-reconnect cutoff
+    # instead. The implicit large-context policy above carries its own first-progress budget
+    # (``progress_timeout``), so this arm covers every other Codex request. Set
+    # HERMES_CODEX_PROGRESS_STALE_TIMEOUT_SECONDS=0 to disable or tune it directly; it defaults to the no-event
+    # cutoff (else the idle timeout) and never meets or exceeds the blunt stale timer.
+    progress_stall_timeout = 0.0
+    if codex and not progress_gated:
+        progress_stall_timeout = env_float(
+            "HERMES_CODEX_PROGRESS_STALE_TIMEOUT_SECONDS", ttfb_timeout if ttfb_enabled else idle_timeout)
+        if progress_stall_timeout <= 0:
+            progress_stall_timeout = 0.0
+        elif stale_timeout != float("inf"):
+            stall_margin = env_float("HERMES_CODEX_TTFB_BELOW_STALE_MARGIN_SECONDS", 10.0)
+            progress_stall_timeout = min(progress_stall_timeout, max(stale_timeout - stall_margin, 5.0))
     return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
         ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
         idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
         # A lifecycle frame proves transport liveness, not model progress. Bound that phase
         # from the physical-attempt start; events cannot restart the grace period.
-        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0)
+        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0,
+        progress_stall_timeout=progress_stall_timeout)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:

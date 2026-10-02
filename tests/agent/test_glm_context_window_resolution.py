@@ -1,6 +1,7 @@
 """GLM context windows: hyphenated relay slugs, provider-level custom overrides, and the aux feasibility
 check inherit the right window instead of the ``glm`` 202,752 catch-all (#97398, #98387, #89500)."""
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent import conversation_compression as cc
 from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS, get_model_context_length
@@ -9,7 +10,11 @@ from hermes_cli.config_providers import get_custom_provider_context_length
 
 def test_hyphenated_relay_slug_resolves_to_specific_catalog_entry():
     """``z-ai-glm-5-3`` must hit ``glm-5.3``, not the shorter ``glm`` family entry."""
-    assert get_model_context_length("z-ai-glm-5-3", provider="custom") == DEFAULT_CONTEXT_LENGTHS["glm-5.3"]
+    # The fork resolves unmapped (aggregator) providers through a cross-provider models.dev lookup
+    # BEFORE the hardcoded catalog; this test pins the catalog's hyphenated-slug matching, so keep
+    # the network step out of it.
+    with patch("agent.models_dev.lookup_models_dev_context_any_provider", return_value=None):
+        assert get_model_context_length("z-ai-glm-5-3", provider="custom") == DEFAULT_CONTEXT_LENGTHS["glm-5.3"]
     assert DEFAULT_CONTEXT_LENGTHS["glm-5.3"] > DEFAULT_CONTEXT_LENGTHS["glm"]
 
 

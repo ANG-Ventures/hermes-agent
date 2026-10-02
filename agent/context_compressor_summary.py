@@ -56,6 +56,10 @@ class SummaryDispatchMixin:
         }
         if _accepts_keyword_argument(self._generate_summary, "bypass_cooldown"):
             summary_kwargs["bypass_cooldown"] = bypass_cooldown
+        # An auto-derived focus quotes recent user turns, which enter the summarized window on
+        # later passes; it is not a separate request input for the safeguard-refusal latch
+        # (fork t_bf18e600; read by _refusal_focus in context_compressor).
+        self._summary_focus_is_auto = not focus_topic
         try:
             return self._generate_summary(turns_to_summarize, **summary_kwargs)
         except AuxiliaryExplicitCancellation:
@@ -71,3 +75,5 @@ class SummaryDispatchMixin:
                 self._previous_summary = scan.previous_summary_before
                 self._summary_has_user_turn = scan.has_user_turn_before
             raise
+        finally:
+            self._summary_focus_is_auto = False

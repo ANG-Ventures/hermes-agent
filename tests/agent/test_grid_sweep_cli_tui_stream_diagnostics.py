@@ -67,7 +67,9 @@ def test_invalid_config_int_print_honors_policy_log_always(tmp_path, monkeypatch
         agent_init._warn_invalid_config_int("model.context_length in config.yaml", "256K",
                                             "must be a plain integer", "auto-detection", agent=agent)
     err = capsys.readouterr().err
-    assert ("⚠ Invalid model.context_length" in err) is _visible(setting)
+    # The fork renders warnings with the emoji-presentation glyph (U+26A0 U+FE0F); match the base
+    # codepoint + text so either presentation satisfies the pin.
+    assert ("⚠" in err and "Invalid model.context_length" in err) is _visible(setting)
     assert any("Invalid model.context_length" in rec.getMessage() for rec in caplog.records)
 
 

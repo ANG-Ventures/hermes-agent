@@ -285,16 +285,32 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+# The Codex stale-timeout floor (and with it progress-phase arming) engages ABOVE 10k estimated
+# tokens. The fork prices payloads through the shared estimator (3.5 chars/token by default, not
+# upstream's chars/4), so the "just over" / "exactly at" fixtures are sized from the real estimator.
+_LARGE_FLOOR_TOKENS = 10_000
+
+
+def _input_with_est_tokens(target_tokens: int) -> str:
+    """Shortest ``x`` payload the request-context estimator prices at exactly *target_tokens*."""
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    chars = target_tokens * 3  # below any plausible divisor; walk up to the exact figure
+    while estimate_request_context_tokens({"model": "gpt-5.6-sol", "input": "x" * chars}) < target_tokens:
+        chars += 1
+    return "x" * chars
+
+
 @pytest.mark.parametrize(
-    ("provider", "base_url", "input_chars", "idle_env", "idle_enabled", "requires_progress"),
+    ("provider", "base_url", "over_floor", "idle_env", "idle_enabled", "requires_progress"),
     [
-        ("openai-codex", "https://chatgpt.com/backend-api/codex", 40_004, None, True, True),
-        ("openai-codex", "https://chatgpt.com/backend-api/codex", 40_004, "2", True, False),
-        ("openai-codex", "https://chatgpt.com/backend-api/codex", 40_000, None, True, False),
-        ("xai-oauth", "https://api.x.ai/v1", 40_004, None, True, False),
-        ("openai-codex", "https://chatgpt.com/backend-api/codex", 40_004, "", True, True),
-        ("openai-codex", "https://chatgpt.com/backend-api/codex", 40_004, "invalid", True, True),
-        ("openai-codex", "https://chatgpt.com/backend-api/codex", 40_004, "0", False, False),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", True, None, True, True),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", True, "2", True, False),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", False, None, True, False),
+        ("xai-oauth", "https://api.x.ai/v1", True, None, True, False),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", True, "", True, True),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", True, "invalid", True, True),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", True, "0", False, False),
     ],
 )
 def test_idle_phase_policy_is_narrow_and_preserves_operator_overrides(
@@ -302,7 +318,7 @@ def test_idle_phase_policy_is_narrow_and_preserves_operator_overrides(
     monkeypatch,
     provider,
     base_url,
-    input_chars,
+    over_floor,
     idle_env,
     idle_enabled,
     requires_progress,
@@ -318,11 +334,12 @@ def test_idle_phase_policy_is_narrow_and_preserves_operator_overrides(
     else:
         monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_env)
 
+    target_tokens = _LARGE_FLOOR_TOKENS + (1 if over_floor else 0)
     watchdogs = h._resolve_nonstream_watchdogs(
-        agent, {"model": "gpt-5.6-sol", "input": "x" * input_chars}
+        agent, {"model": "gpt-5.6-sol", "input": _input_with_est_tokens(target_tokens)}
     )
 
-    assert watchdogs.est_tokens == input_chars // 4
+    assert watchdogs.est_tokens == target_tokens
     assert watchdogs.idle_enabled is idle_enabled
     assert watchdogs.idle_requires_progress is requires_progress
     assert (watchdogs.progress_timeout > 0) is requires_progress
@@ -693,6 +710,24 @@ def test_ttfb_below_stale_coupling_disabled_via_env(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+def _stamp_codex_watchdog(*, progress: bool) -> None:
+    """Stamp the current attempt's watchdog state the way ``run_codex_stream._on_event`` does.
+
+    2026-10-01 parity sync: upstream moved the per-attempt markers off the agent
+    (``_codex_stream_last_event_ts`` / ``_last_progress_ts``) into a locked state object the
+    worker thread publishes via ``codex_runtime._codex_watchdog_state_var``.
+    """
+    from agent.codex_runtime import _codex_watchdog_state_var
+
+    state = _codex_watchdog_state_var.get()
+    assert state is not None, "fake stream must run on the worker thread that published the state"
+    now = time.time()
+    with state.lock:
+        state.last_event_ts = now
+        if progress:
+            state.last_progress_ts = now
+
+
 def test_progress_stall_kills_keepalive_only_stream(tmp_path, monkeypatch):
     """Regression for the keepalive-only hang on chatgpt.com/backend-api/codex.
 
@@ -731,7 +766,7 @@ def test_progress_stall_kills_keepalive_only_stream(tmp_path, monkeypatch):
         # _last_progress_ts (no delta / function_call / output_item / terminal).
         deadline = time.time() + 60
         while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
-            agent._codex_stream_last_event_ts = time.time()
+            _stamp_codex_watchdog(progress=False)
             time.sleep(1.0)
         raise RuntimeError("connection closed")
 
@@ -780,9 +815,7 @@ def test_progress_stall_does_not_kill_streaming_progress(tmp_path, monkeypatch):
         # Stream real progress (deltas) for ~8s — longer than the 4s fast cutoff —
         # then complete. Each delta stamps both event_ts and progress_ts.
         for _ in range(8):
-            now = time.time()
-            agent._codex_stream_last_event_ts = now
-            agent._codex_stream_last_progress_ts = now
+            _stamp_codex_watchdog(progress=True)
             time.sleep(1.0)
         return sentinel
 

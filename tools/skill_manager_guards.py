@@ -174,8 +174,10 @@ def _background_review_write_guard(
             f"are off-limits to autonomous maintenance. Ask the user to run `hermes curator "
             f"unpin {name}` if they want it changed.")
     try:
-        from agent.skill_utils import is_external_skill_path
-        if is_external_skill_path(skill_dir):
+        from agent.skill_utils import is_external_skill_path, is_shared_curatable_path
+        # Fork: a shared skills tree the operator opted INTO curation (skills.shared scope) is
+        # curator-owned sediment even though it is listed under external_dirs.
+        if is_external_skill_path(skill_dir) and not is_shared_curatable_path(skill_dir):
             return _refusal(
                 f"{refuse} skill '{name}': the skill lives in skills.external_dirs, which are "
                 f"externally owned and read-only to autonomous curation.")
@@ -189,6 +191,14 @@ def _background_review_write_guard(
             (skill_usage.is_bundled, "bundled")):
             if predicate(name):
                 return _refusal(f"{refuse} {label} skill '{name}'.")
+        # Fork: an in-scope shared skill is curatable by configuration (skills.shared), not by a
+        # per-skill `created_by: "agent"` record — the ownership check below does not apply to it.
+        try:
+            from agent.skill_utils import is_shared_curatable_path
+            if is_shared_curatable_path(skill_dir):
+                return None
+        except Exception:
+            logger.debug("shared-curatable check failed for %s", name, exc_info=True)
         # Not curator-managed (no `created_by: "agent"`) => user-owned. A MISSING
         # record and an explicit `created_by: null` must resolve IDENTICALLY (keying
         # on presence made the policy depend on the guard's own side effect: the
