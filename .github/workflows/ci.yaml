@@ -89,6 +89,13 @@ on:
 permissions:
   contents: read
   pull-requests: write # needed by lint (PR comment) + supply-chain review_status
+  # fork: tests.yml's tests-complete job (quarantine evidence gate) needs
+  # ``actions: read``; a reusable workflow can only hold what its caller
+  # grants, and GitHub fails the WHOLE graph at validation (startup_failure,
+  # 0 jobs) when a nested job asks for more. osv-scanner SARIF upload also
+  # needs these two. Dropped by the 2026-10-01 parity merge; restored.
+  actions: read
+  security-events: write
 
 # cancel-in-progress only ever applies to PR events. A push, a dispatch, and
 # above all a stable-release workflow_call run are never cancelled by a later
