@@ -82,7 +82,7 @@ class TestDirectAliasCredentialLoading:
         )
         from hermes_cli.model_switch import _load_direct_aliases
 
-        alias = _load_direct_aliases()["theta"]
+        alias = _load_direct_aliases()[0]["theta"]  # fork: (merged, ok)
         assert alias.api_key == "sk-literal"
         assert alias.key_env == "THETA_API_KEY"
 
@@ -117,7 +117,7 @@ class TestNestedModelAliasesCredentials:
         )
         from hermes_cli.model_switch import _load_direct_aliases
 
-        alias = _load_direct_aliases()["qwen-local"]
+        alias = _load_direct_aliases()[0]["qwen-local"]
         assert alias.key_env == "QWEN27B_KEY"
         assert alias.base_url == "http://192.168.1.50:8000/v1"
 
@@ -134,7 +134,7 @@ class TestNestedModelAliasesCredentials:
         )
         from hermes_cli.model_switch import _load_direct_aliases
 
-        assert _load_direct_aliases()["theta-nested"].api_key == "sk-literal"
+        assert _load_direct_aliases()[0]["theta-nested"].api_key == "sk-literal"
 
 
 class TestDirectAliasApiKeyHelper:

@@ -8,10 +8,17 @@ imported late here, never at module level).
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def _shell_quoted_source(install_record: dict) -> str:
+    """Recorded install source as ONE inert argv item for a copy-paste remedy (fork #1230 C4)."""
+    source = install_record.get("source")
+    return shlex.quote(str(source)) if source else "<source>"
 
 
 def _pc():
@@ -82,7 +89,7 @@ def cmd_update(name: str, *, interactive: bool = True) -> None:
             target,
             lambda rec: (
                 f"Plugin '{name}' is pinned to {rec.get('revision')}. To move it, run "
-                f"`hermes plugins install {escape(str(rec.get('source', '<source>')))} --force "
+                f"`hermes plugins install {escape(_shell_quoted_source(rec))} --force "
                 "--ref <40-character commit SHA>`."),
             lambda: f"Plugin '{name}' was not installed from git (no .git directory). Cannot update.",
             before_pull=lambda: console.print(f"[dim]Updating {name}...[/dim]"),
@@ -296,7 +303,7 @@ def dashboard_update_user_plugin(name: str, *, accept_capabilities: bool = False
             target,
             lambda rec: (
                 f"Plugin '{name}' is pinned to {rec.get('revision')}; "
-                f"run `hermes plugins install {rec.get('source', '<source>')} --force "
+                f"run `hermes plugins install {_shell_quoted_source(rec)} --force "
                 "--ref <40-character commit SHA>` to move it."),
             lambda: f"Plugin '{name}' is not a git checkout; cannot pull updates.")
     except catalog.RepinConsentRequired as exc:

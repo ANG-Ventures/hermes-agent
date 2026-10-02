@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-29T19:47:11Z",
+  "updated_at": "2026-10-02T19:45:57Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -23,6 +23,10 @@
         {
           "id": "anthropic/claude-opus-5.5",
           "description": ""
+        },
+        {
+          "id": "anthropic/claude-opus-5.5-fast",
+          "description": "2x price, higher output speed"
         },
         {
           "id": "anthropic/claude-opus-5",
@@ -280,14 +284,6 @@
         {
           "id": "stealth/space-bunny-alpha",
           "description": "free, stealth model"
-        },
-        {
-          "id": "anthropic/claude-opus-5-5-fast",
-          "description": "2x price, higher output speed"
-        },
-        {
-          "id": "x-ai/grok-4.5",
-          "description": ""
         }
       ]
     },
@@ -447,9 +443,6 @@
         },
         {
           "id": "stealth/space-bunny-alpha"
-        },
-        {
-          "id": "x-ai/grok-4.5"
         }
       ]
     }

@@ -147,7 +147,7 @@ def test_model_aliases_dict_entries_are_loaded(monkeypatch):
             }
         },
     )
-    aliases = model_switch._load_direct_aliases()
+    aliases, _ok = model_switch._load_direct_aliases()  # fork: ``(merged, ok)``
     assert aliases["localqwen"] == model_switch.DirectAlias(
         "qwen3.5:4b", "custom", "http://localhost:11434/v1"
     )

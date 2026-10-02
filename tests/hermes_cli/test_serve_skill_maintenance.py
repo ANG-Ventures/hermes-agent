@@ -23,6 +23,13 @@ async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatc
         "curator:\n  enabled: true\n  interval_hours: 168\n"
         "  min_idle_hours: 0.002\n  prune_builtins: false\n", encoding="utf-8")
     save_state({"last_run_at": "2020-01-01T00:00:00+00:00", "run_count": 0})
+    # The FIRST close in a process runs lifecycle.finalize_session -> plugins.discover_and_load()
+    # cold (measured 0.5-0.9s locally, 2.9s on a loaded CI shard). The ``idle_for < 2`` assertions
+    # below time the watermark, not plugin discovery: pay the cold path on a throwaway session first.
+    with gateway._sessions_lock:
+        gateway._sessions["warmup"] = {
+            "last_active": time.time(), "running": False, "profile_home": str(tmp_path)}
+    assert gateway._close_session_by_id("warmup", end_reason="tui_close")
     # Let the actual timer age past its idle threshold before recent activity.
     task = asyncio.create_task(_auto_archive_ticker_loop(interval_s=.05, initial_delay_s=8))
     try:

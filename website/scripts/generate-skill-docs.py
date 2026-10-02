@@ -751,13 +751,17 @@ def prune_stale_pages(written: set[Path]) -> int:
             if page.resolve() in written:
                 continue
             page.unlink()
+            # noqa: root-equality  page is an rglob("*.md") FILE under DOCS, never DOCS
+            # itself; unlink() cannot remove a directory.
             twin = ZH_HANS_DOCS / page.relative_to(DOCS)
             if twin.exists():
                 twin.unlink()
             pruned += 1
         # Mirror copies whose English page is already gone (a hand-deleted page).
+        # noqa: root-equality  SKILLS_PAGES is a fixed subdir of DOCS (constant, not DOCS).
         zh_kind = ZH_HANS_DOCS / SKILLS_PAGES.relative_to(DOCS) / kind
         for twin in sorted(zh_kind.rglob("*.md")) if zh_kind.exists() else []:
+            # noqa: root-equality  twin is an rglob("*.md") FILE; unlink() cannot remove a dir.
             if not (DOCS / twin.relative_to(ZH_HANS_DOCS)).exists():
                 twin.unlink()
                 pruned += 1

@@ -591,7 +591,9 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
             expected_run_id=claimed.current_run_id,
         )
         rclaim = kb.claim_review_task(conn, tid)
-        ok, implementer = kb.request_changes(
+        # Fork review-coverage gate: a rejection needs a current-run coverage record.
+        from tests.kanban_review_helpers import covered_request_changes
+        ok, implementer = covered_request_changes(
             conn, tid, reason="fix tests", expected_run_id=rclaim.current_run_id,
         )
         assert (ok, implementer) == (True, "dev")

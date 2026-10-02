@@ -3138,9 +3138,12 @@ def probe_api_models(
     if _neg_key is not None:
         _neg_seen = _probe_neg_cache.get(_neg_key)
         if _neg_seen is not None and (time.monotonic() - _neg_seen) < _PROBE_NEG_TTL:
+            # The entry only exists after every candidate timed out (below), so the
+            # cached verdict is an honest ``timeout`` — callers word the warning on it
+            # (fork: TestAnthropicMessagesWarningHonesty), never "no GET /v1/models".
             return _probe_result(
                 None, normalized.rstrip("/") + "/models", normalized,
-                alternate_base if alternate_base != normalized else None)
+                alternate_base if alternate_base != normalized else None, failure="timeout")
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{get_version_info().base_version}"

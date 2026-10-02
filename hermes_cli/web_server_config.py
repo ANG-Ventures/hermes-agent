@@ -7,6 +7,7 @@ from dataclasses import replace
 from fastapi import HTTPException
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from agent.model_metadata import is_local_endpoint
+from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     cfg_get,
@@ -148,9 +149,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "Fast mode: fast = always, auto = first N seconds of each turn, cold = first turn only",
         "", "normal", "fast", "auto", "cold",
     ),
+    # Fork (#359): derive from the one effort vocabulary, and offer ``none`` (reasoning off)
+    # like the generic reasoning_effort contract the PUT handler accepts.
     "delegation.reasoning_effort": _select(
         "Reasoning effort for delegated subagents",
-        "", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        "", "none", *VALID_REASONING_EFFORTS,
     ),
     "updates.non_interactive_local_changes": _select(
         "When the chat app / gateway updates Hermes (no terminal prompt), "

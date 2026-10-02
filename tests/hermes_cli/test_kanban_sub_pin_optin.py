@@ -299,7 +299,9 @@ def test_spawn_argv_carries_pinned_provider_model_and_effort(kanban_home, monkey
     workspace.mkdir(exist_ok=True)
     kbd._default_spawn(task, str(workspace))
     cmd = captured["cmd"]
-    assert cmd[cmd.index("-m") + 1] == OPUS
+    # The launcher is the interpreter-bound module form (upstream #111569: it must win over a
+    # PATH shim), so the FIRST ``-m`` is ``hermes_cli.main``; the model flag is the last one.
+    assert cmd[len(cmd) - cmd[::-1].index("-m")] == OPUS
     assert cmd[cmd.index("--provider") + 1] == "claude-bpx-24"
     assert cmd[cmd.index("--reasoning") + 1] == "xhigh"
 

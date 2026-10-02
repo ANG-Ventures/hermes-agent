@@ -83,8 +83,13 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     try:
         from agent.kanban_stop import build_kanban_stop_nudge
 
+        # ``tools`` (fork, 2026-09-17): HERMES_KANBAN_TASK is inherited by every child a
+        # worker spawns; a session that exposes no kanban terminal tool cannot satisfy the
+        # nudge, so the guard must not fire there (see build_kanban_stop_nudge).
         return build_kanban_stop_nudge(
-            messages=messages, attempts=getattr(agent, "_kanban_stop_nudges", 0)
+            messages=messages,
+            attempts=getattr(agent, "_kanban_stop_nudges", 0),
+            tools=getattr(agent, "tools", None),
         )
     except Exception:
         logger.debug("kanban stop-loop check failed", exc_info=True)

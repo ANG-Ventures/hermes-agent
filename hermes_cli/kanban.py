@@ -2296,6 +2296,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         f"{profile or '(unassigned)'}"
         + (" (claim reclaimed)" if reclaimed else "")
     )
+    return 0
 
 
 def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:

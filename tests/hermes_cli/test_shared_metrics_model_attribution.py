@@ -119,9 +119,20 @@ def test_user_provider_plugin_name_and_model_never_leave(direct_runtime, tmp_pat
     from hermes_cli.observability import shared_metrics_catalog as catalog, shared_metrics_setup as setup
     from providers import get_provider_profile
 
-    for mod, attr in ((auth, "PROVIDER_REGISTRY"), (auth_plugin_providers, "PLUGIN_MIRRORED_PROVIDERS"),
+    for mod, attr in ((auth_plugin_providers, "PLUGIN_MIRRORED_PROVIDERS"),
                       (mcs, "CANONICAL_PROVIDERS"), (mcs, "_canonical_slugs"), (mcs, "_PROVIDER_LABELS")):
         monkeypatch.setattr(mod, attr, type(getattr(mod, attr))(getattr(mod, attr)))  # no registry leak
+    # ``auth.PROVIDER_REGISTRY`` is a fork provider_seam facade (additive, not copyable by
+    # ``type(x)(x)``): undo the plugin's registration by restoring the pre-test generation.
+    from hermes_cli import provider_seam
+    _generation = provider_seam.current()
+    try:
+        _run_user_provider_plugin_case(auth, mcs, catalog, setup, get_provider_profile, tmp_path, monkeypatch)
+    finally:
+        provider_seam._restore(_generation)
+
+
+def _run_user_provider_plugin_case(auth, mcs, catalog, setup, get_provider_profile, tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
     plugin = home / "plugins" / "model-providers" / "acmecorp-internal"
     plugin.mkdir(parents=True)

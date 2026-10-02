@@ -422,10 +422,11 @@ def test_first_auto_heartbeat_is_not_dropped_on_a_freshly_booted_host(tmp_path):
         "os.environ['HERMES_KANBAN_TASK'] = 't_fresh'\n"
         "from tools import kanban_tools as kt\n"
         "calls = []\n"
-        "def _connect():\n"
+        # The board open is now the ``_board`` context manager (upstream); same seam.
+        "def _board(*a, **k):\n"
         "    calls.append('connect')\n"
         "    raise RuntimeError('stop after the limiter')\n"
-        "kt._connect = _connect\n"
+        "kt._board = _board\n"
         "kt.heartbeat_current_worker_from_env(progress_at=1000.0)\n"
         "print('CALLS', len(calls))\n"
     )
