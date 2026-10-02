@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (  # noqa: F401
-    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
+    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _drain_abandoned_child_transports,
+    _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (  # noqa: F401
@@ -2678,6 +2679,12 @@ def _run_single_child(
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             # This child is reported failed: no descendant may outlive that.
             _reap_subtree(child, "timeout" if is_timeout else "error")
+            if is_timeout and not _child_future.done():
+                # upstream #94248 (native half): the abandoned worker is typically parked in an
+                # OpenSSL read that the cooperative interrupt cannot unblock. shutdown() its pooled
+                # sockets (FD-safe from this thread) so the read settles and the worker unwinds;
+                # the close itself still waits on the teardown door (run_end, deferred).
+                _drain_abandoned_child_transports(child, _child_future)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",

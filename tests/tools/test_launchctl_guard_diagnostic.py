@@ -17,8 +17,13 @@ def test_bootstrap_rejection_does_not_invent_keepalive(tmp_path, monkeypatch):
         "RunAtLoad": False,
         "StartCalendarInterval": {"Hour": 9, "Minute": 0},
     }))
+    # Fork contract (test_lifecycle_guard_bootstrap_existing_plist): bootstrapping a plist that is
+    # ALREADY on disk and is not a gateway job is allowed — launchd reads its Label, so the label is
+    # a fact, not a claim. The label-independent rejection this diagnostic is about applies to a
+    # path launchd would read only AFTER the command runs: bootstrap it through a staged copy.
+    staged = tmp_path / "staged" / "com.example.schedule.plist"
     blocked = gateway_lifecycle_block(
-        command=f"launchctl bootstrap gui/501 {plist}",
+        command=f"cp {plist} {staged} && launchctl bootstrap gui/501 {staged}",
         env=None, env_type="local", cwd=str(tmp_path), workdir=None,
         session_key="diagnostic-test",
     )

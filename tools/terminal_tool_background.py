@@ -87,13 +87,17 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty, persist_on_release: bool = False):
+           session_key, effective_pty, persist_on_release: bool = False,
+           durable_output: bool = False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
     if env_type == "local":
         return process_registry.spawn_local(
-            env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
+            env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
+            # Fork t_1191e078: file-backed output so a notify child survives a gateway
+            # restart and still reports; a plain background spawn stays in-memory.
+            durable_output=durable_output, **common)
     return process_registry.spawn_via_env(env=env, **common)
 
 
@@ -169,6 +173,7 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
+            durable_output=bool(notify_on_complete),
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}

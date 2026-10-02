@@ -121,7 +121,8 @@ _NAME_RULE = "Use lowercase letters, numbers, hyphens, dots, and underscores."
 def _check_identifier(value: str, label: str, invalid: str) -> Optional[str]:
     if len(value) > MAX_NAME_LENGTH:
         return f"{label} exceeds {MAX_NAME_LENGTH} characters."
-    return None if VALID_NAME_RE.match(value) else invalid
+    # fullmatch, not match: `$` accepts a trailing newline (fork AC10, "foo\n" is not a name).
+    return None if VALID_NAME_RE.fullmatch(value) else invalid
 
 
 def _validate_name(name: str) -> Optional[str]:

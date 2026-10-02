@@ -603,7 +603,6 @@ def cron_status():
 
     print()
     _print_active_jobs_summary(list_jobs(include_disabled=False))
-    _print_vanished_job_warning()
     print()
 
 
@@ -611,6 +610,7 @@ def _print_active_jobs_summary(jobs) -> None:
     """Print the '<N> active job(s)' + next-run line shared by every status path."""
     if not jobs:
         print("  No active jobs")
+        _print_vanished_job_warning()
         return
     from cron.jobs import _parse_aware
 
@@ -646,6 +646,8 @@ def _print_active_jobs_summary(jobs) -> None:
             print(f"    {j.get('id', '?')}  {j.get('name', '(unnamed)')}: {_dispatch_kind_label(d.get('kind'))}, "
                   f"scheduled {d.get('scheduled_at', '?')}, ran {d.get('dispatched_at', '?')} "
                   + color(f"({late_by} late)", Colors.YELLOW))
+    # Fork: the vanished-job guard rides every status path (built-in ticker AND external provider).
+    _print_vanished_job_warning()
 
 
 def _scripts_dir_for_cron() -> Path:

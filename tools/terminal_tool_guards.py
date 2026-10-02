@@ -103,14 +103,16 @@ _FOREGROUND_GUIDANCE = (
         _SHELL_LEVEL_BACKGROUND_RE.search,
         "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
         "Re-send WITHOUT the wrapper as terminal(command=\"<cmd>\", background=true, "
-        "notify_on_complete=true) so Hermes tracks the process, then run readiness "
-        "checks and tests in separate commands.",
+        ") so Hermes tracks the process, then collect a bounded job's result with "
+        "process(action=\"wait\", timeout=...) and run readiness checks and tests "
+        "in separate commands.",
     ),
     (
         lambda s: _INLINE_BACKGROUND_AMP_RE.search(s) or _TRAILING_BACKGROUND_AMP_RE.search(s),
         "Foreground command uses '&' backgrounding. Re-send WITHOUT the '&' as "
-        "terminal(command=\"<cmd>\", background=true) — add notify_on_complete=true "
-        "for bounded jobs — then run health checks and tests in follow-up terminal calls.",
+        "terminal(command=\"<cmd>\", background=true) — for bounded jobs collect the "
+        "result with process(action=\"wait\", timeout=...) — then run health checks "
+        "and tests in follow-up terminal calls.",
     ),
     (
         lambda s: any(p.search(s) for p in _LONG_LIVED_FOREGROUND_PATTERNS),

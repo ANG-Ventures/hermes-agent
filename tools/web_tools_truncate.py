@@ -182,11 +182,25 @@ def _truncate_results(results: List[dict], char_limit: int, debug_call_data: dic
 
 
 def _trim_results(results: List[dict]) -> List[dict]:
-    """Keep only url/title/content/error per entry (+ blocked_by_policy when present)."""
+    """Keep only url/title/content/error per entry (+ blocked_by_policy when present).
+
+    Fork: the vendor-identity keys (``served_by`` / ``fallback_from``, #1516) survive the trim so
+    the model sees which vendor served a page, and a ``local-pdf`` entry keeps its whole metadata
+    (pages / bytes / warning)."""
+    def _meta(r: dict) -> dict:
+        meta = r.get("metadata")
+        if not isinstance(meta, dict):
+            return {}
+        if meta.get("served_by") == "local-pdf":
+            return {"metadata": meta}
+        kept = {k: meta[k] for k in ("served_by", "fallback_from") if k in meta}
+        return {"metadata": kept} if kept else {}
+
     return [
         {
             "url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", ""),
             "error": r.get("error"),
+            **_meta(r),
             **({"blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
         }
         for r in results

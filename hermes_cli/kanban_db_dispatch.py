@@ -401,7 +401,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``infra_unavailable`` / ``nonzero_exit``) or the signal number (for
     ``signaled``), or ``None`` for ``unknown``.
     """
-    entry = _recent_worker_exits.get(int(pid))
+    # Read through the kanban_db facade: ``_record_worker_returncode`` writes to
+    # ``kanban_db._recent_worker_exits`` (the name tests patch), and a rebound dict
+    # there must be the one classified here (test_windows_native_support).
+    entry = _kb._recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     code, _ = entry
@@ -5563,6 +5566,12 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # This is the grant boundary: the dispatcher assigned this new worker's task. A dispatcher
+    # launched from an agent's shell carries the delegate_task descendant fence itself; the
+    # worker it grants a task to must not (an inherited marker fences the worker's own
+    # heartbeat + handoff — upstream, test_dispatcher_grants_only_the_assigned_worker_scope).
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    env.pop(DELEGATED_CHILD_ENV_MARKER, None)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -5740,7 +5749,7 @@ def _default_spawn(
     finally:
         log_f.close()  # the child owns its inherited descriptor
     with _kb._worker_processes_lock:
-        _recent_worker_exits.pop(proc.pid, None)
+        _kb._recent_worker_exits.pop(proc.pid, None)
         _kb._worker_processes[proc.pid] = proc
     _kb._register_worker_identity(proc.pid, task.id, task.current_run_id, spawned_at)
     return proc.pid

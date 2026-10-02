@@ -373,9 +373,17 @@ def test_dispatcher_grants_only_the_assigned_worker_scope(tmp_path, monkeypatch)
     root = str(Path(__file__).resolve().parents[2])
     worker.write_text(
         f"#!{sys.executable}\nimport sys, os, json;sys.path.insert(0, {root!r})\n"
+        # Fork: the dispatcher's grant is a single-use `pending` HERMES_KANBAN_OWNER_PID sentinel
+        # that the spawned CLI binds to its own pid at boot (hermes_cli.main); a fixture that imports
+        # the tools directly must claim it the same way, or it is an unowned inheriting child.
+        "from agent.delegation_context import claim_kanban_worker_authority\n"
+        "claim_kanban_worker_authority()\n"
         "from tools.kanban_tools import _handle_complete, heartbeat_current_worker_from_env\n"
         "beat=heartbeat_current_worker_from_env()\n"
-        f"result=json.loads(_handle_complete({{'summary':'assigned worker'}}));result['beat']=beat\n"
+        # Fork receipt gate (kanban_receipt, t_e21aa11c): a dispatcher-owned handoff needs
+        # structured evidence, not prose alone.
+        "result=json.loads(_handle_complete({'summary':'assigned worker',"
+        " 'metadata': {'verified': 'positive control'}}));result['beat']=beat\n"
         f"open({str(output)!r}, 'w').write(json.dumps(result))\n"
     )
     worker.chmod(0o700)
