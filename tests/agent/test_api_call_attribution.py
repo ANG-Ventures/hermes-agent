@@ -117,6 +117,7 @@ def test_429_then_200_records_zero_token_error_then_success(recorded):
         ("claude-apx-7", "claude-apx-7"),
         ("claude-bpx-12", "claude-bpx-12"),
         ("gemini-bridge", "gemini"),
+        ("openrouter", "openrouter"),
     ],
 )
 def test_pinned_provider_records_constant_identity(recorded, provider, sub_key):
@@ -563,3 +564,31 @@ def test_response_identity_never_echoes_through_real_request_builder(recorded, m
             name.lower().startswith("x-pool-")
             for name in mutated.get("extra_headers", {})
         )
+
+
+# ---- t_f2fc31f6: aux rows carry the sub the wire named ---------------------
+
+@pytest.mark.parametrize(
+    ("provider", "headers", "sub_key"),
+    [
+        ("claude-alr", {"x-pool-served-by": "sub-vps-7"}, "sub-vps-7"),  # relay named the seat
+        ("claude-bpr", {"x-pool-served-by": "sub-vps-2"}, "sub-vps-2"),
+        ("claude-alr", {}, None),                    # no wire evidence: never a guess
+        ("gemini-bridge", {}, "gemini"),             # single-account lanes: pinned key
+        ("openrouter", {}, "openrouter"),
+        ("openai-codex", {}, None),                  # aux does not run on the agent's credential
+    ],
+)
+def test_aux_row_stamps_sub_key_from_wire_or_pin(recorded, provider, headers, sub_key):
+    agent = SimpleNamespace(_current_turn_id="t", api_key="not-a-jwt")
+    cch._emit_aux_api_call_record(agent, "t", task="compression", provider=provider, model="m",
+                                  usage=None, api_mode="anthropic_messages", pool_headers=headers)
+    assert recorded[0]["sub_key"] == sub_key
+    assert recorded[0]["attribution"] == "aux:compression"
+
+
+def test_aux_row_without_pool_headers_kwarg_stays_backward_compatible(recorded):
+    agent = SimpleNamespace(_current_turn_id="t")
+    cch._emit_aux_api_call_record(agent, "t", task="vision", provider="claude-alr", model="m",
+                                  usage=None, api_mode="chat_completions")
+    assert recorded[0]["sub_key"] is None
