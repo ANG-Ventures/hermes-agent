@@ -80,6 +80,10 @@ jobs:
             # Upstream's windows-latest-32-arm-core lane is not added for the same reason.
             runner: windows-latest
             marker: windows
+            # fork 2026-10-01: ``timeout-minutes`` above reads ``matrix.timeout``; GitHub's
+            # workflow validator fails the whole CI graph (startup_failure, 0 jobs) when no
+            # matrix entry defines the property. Upstream's dropped arm lane was the only one.
+            timeout: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
