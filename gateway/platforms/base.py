@@ -2919,9 +2919,32 @@ class BasePlatformAdapter(ABC):
         cancelled-acquire drain in :meth:`_acquire_platform_lock_async` knows
         exactly which lock the worker thread took and must release THAT one
         regardless of adapter state, so it comes through here.
+
+        On a running loop the unlink is queued on ``gateway.status``'s ordered
+        lane instead of running inline: adapter teardown (``disconnect()``)
+        and the cancel drain are coroutines, and the read + unlink held the
+        loop for 10s+ under GIL contention (t_1fd05a3a, telegram disconnect).
+        The queued job re-checks, under the pair's critical section, that no
+        acquisition was recorded after this release was authorised: a retry
+        connect in this same PID re-writes the same lock file, and an unlink
+        that ran after it would delete that live lock.
         """
-        from gateway.status import release_scoped_lock
-        release_scoped_lock(scope, identity)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            from gateway.status import release_scoped_lock
+            release_scoped_lock(scope, identity)
+            return
+
+        def _release() -> None:
+            with _platform_lock_key_lock(scope, identity):
+                if _platform_lock_holder_count(scope, identity):
+                    return
+                from gateway.status import release_scoped_lock
+                release_scoped_lock(scope, identity)
+
+        from gateway.status import submit_runtime_status_job
+        submit_runtime_status_job(_release)
 
     # Plugin handler factories wired on the live native client: ``(plugin, qualname)`` keys, reset when
     # the native client is rebuilt. ``None`` = ``connect()`` has not wired yet (class defaults so

@@ -211,38 +211,16 @@ def test_rejected_billed_response_files_floor_site(_home, monkeypatch):
                                detail="response.content invalid (not a non-empty list)",
                                elapsed_s=16.4)
     assert try_activate_fallback(a) is True
-    dead = _dead(_home)
-    assert len(dead) == 1
-    d = dead[0]
-    assert d["cause"] == "invalid_response"
-    assert d["floor"] == {
-        "site": "invalid_response",
-        "detail": "response.content invalid (not a non-empty list)",
-        "stop_reason": "tool_use", "content_blocks": 0, "output_tokens": 706,
-        "route_id": "5b9217ed061747d29e79488f7b7f30c8", "served_by": "sub-vps-20",
-    }
-    assert d["elapsed_s"] == 16.4
-    assert _rows(_home)[0]["floor_site"] == "invalid_response"
-    # Inert on routing: the row's class and the rendered rider are unchanged.
-    assert d["trigger_class"] == "unclassified" and d["http_status"] is None
-    assert "unclassified error" in d["rendered"]
-
-
-def test_floor_stash_does_not_change_the_rider(_home, monkeypatch):
-    """Same failover with and without the floor stash renders the same text."""
-    from agent.chat_completion_helpers import try_activate_fallback
-    from tests.agent.test_fallback_events_ledger import _agent, _patch_resolver
-
-    _patch_resolver(monkeypatch)
-    a = _agent()
-    assert try_activate_fallback(a) is True
-    bare = _rows(_home)[-1]["notice_text"]
-    b = _agent()
-    fbe.stash_response_failure(b, "empty_response", _Resp())
-    assert try_activate_fallback(b) is True
-    with_floor = _rows(_home)[-1]["notice_text"]
-    strip = lambda t: t.rsplit(",", 1)[0]  # drop the HH:MM:SS window
-    assert strip(bare) == strip(with_floor)
+    # t_d35beb85: the floor NAMES the class now, so the announce renders no
+    # floor branch and nothing reaches the dead-letter ledger.
+    assert _dead(_home) == []
+    r = _rows(_home)[0]
+    assert r["floor_site"] == "invalid_response"
+    assert r["trigger_class"] == "provider_invalid_response" and r["class_source"] == "floor"
+    assert r["seat"] == "sub-vps-20"
+    assert r["route_id"] == "5b9217ed061747d29e79488f7b7f30c8"
+    assert r["err_hash"] == fbe.floor_err_hash(
+        {"site": "invalid_response", "stop_reason": "tool_use", "content_blocks": 0})
 
 
 def test_legacy_null_row_still_gets_a_cause():
@@ -269,10 +247,10 @@ def test_floor_detail_scrubbed_before_cut(_home, monkeypatch):
     _patch_resolver(monkeypatch)
     a = _agent()
     fbe.stash_response_failure(a, "invalid_response", _Resp(), detail=detail)
+    floor = a._pending_fallback_error["floor"]
+    assert pw not in floor["detail"]
     assert try_activate_fallback(a) is True
-    d = _dead(_home)[0]
-    assert pw not in d["floor"]["detail"]
-    assert pw not in str(d)
+    assert pw not in str(_rows(_home)[0])
 
 
 def test_endpoint_carries_no_userinfo_or_query():
@@ -283,3 +261,159 @@ def test_endpoint_carries_no_userinfo_or_query():
     req = httpx.Request("POST", f"https://alice:{pw}@relay.test:18801/v1/messages?key={pw}")
     err = httpx.ConnectError("refused", request=req)
     assert fbe._endpoint(err) == "relay.test:18801"
+
+
+# ── t_d35beb85: the empty tool_use 200 names its cause, hop and seat ─────
+
+_LIVE_ROWS = [
+    # (stamp, session tail, output_tokens, served_by, route_id) — the three
+    # 2026-10-01/02 claude-alr rows in state/fallback-unclassified.jsonl.
+    ("10-01 13:50", "1d72a62e", 302, "sub-vps-20", "5b9217ed061747d29e79488f7b7f30c8"),
+    ("10-01 23:11", "52aefa", 377, "sub-vps-1", None),
+    ("10-02 08:33", "c4d68f1b", 462, "sub-vps-2", "9ed7daf6460344d4b0e3f9f0bbcd2888"),
+]
+
+
+def _live_resp(out, served_by, route_id):
+    usage = type("U", (), {"output_tokens": out})()
+    ph = {"x-pool-served-by": served_by}
+    if route_id:
+        ph["x-pool-route-id"] = route_id
+    return type("R", (), {"content": [], "stop_reason": "tool_use", "usage": usage,
+                          "pool_headers": ph})()
+
+
+def _alr_agent():
+    import agent.auxiliary_client as ac
+    from tests.agent.test_route_change_sink_e2e import _fake_agent
+
+    ac.set_runtime_main("claude-alr", "claude-fable-5-1",
+                        base_url="http://127.0.0.1:18801/anthropic",
+                        api_key="primary-key", api_mode="anthropic_messages")
+    a = _fake_agent(model="claude-fable-5-1", provider="claude-alr",
+                    base_url="http://127.0.0.1:18801/anthropic",
+                    api_mode="anthropic_messages")
+    a._fallback_chain = [{"provider": "claude-btpr", "model": "claude-fable-5-1"}]
+    a.fallback_model = list(a._fallback_chain)
+    a.session_id = "20260929_141542_c4d68f1b"
+    a._current_turn_id = f"{a.session_id}:{a.session_id}:t1"
+    return a
+
+
+@pytest.mark.parametrize("stamp,sess,out,seat,route", _LIVE_ROWS)
+def test_live_empty_tool_use_row_renders_named_rider(_home, monkeypatch, stamp, sess, out,
+                                                     seat, route):
+    """Replay of the live rows through the real failover + renderer: the
+    exact cause/hop/sub text, never "unclassified" / "hop unknown"."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    fbe.stash_response_failure(a, "invalid_response", _live_resp(out, seat, route),
+                               detail="response.content invalid (not a non-empty list)",
+                               elapsed_s=7.19)
+    assert try_activate_fallback(a) is True
+    r = _rows(_home)[0]
+    want = (f"empty response (stop_reason=tool_use, 0 content blocks, {out} out)"
+            f" · hop=relay-200 · sub={seat}")
+    rider = r["notice_text"].split(" — ", 1)[1].rsplit(",", 1)[0]
+    assert rider == want, r["notice_text"]
+    assert "claude-alr/claude-fable-5-1 → claude-btpr/claude-fable-5-1" in r["notice_text"]
+    for banned in ("unclassified", "hop unknown", "sub unknown"):
+        assert banned not in r["notice_text"]
+    assert r["trigger_class"] == "provider_invalid_response"
+    assert _dead(_home) == []  # named class: not a sentinel miss
+
+
+def test_rider_never_hop_sub_unknown_when_served_by_present():
+    """Negative: with floor.served_by present the (hop unknown, sub unknown)
+    floor never renders, whatever else is missing."""
+    from agent import fallback_policy as fp
+
+    for prov in ("claude-alr", "claude-apr", "custom:claude-alr", "something-else"):
+        row = {"trigger_class": "provider_invalid_response", "from_provider": prov,
+               "floor": {"site": "invalid_response", "served_by": "sub-vps-2"},
+               "ts": 1790959999.0}
+        text, floors = fp.cause_rider_with_floors(row)
+        assert "hop unknown" not in text and "sub unknown" not in text, text
+        assert "sub=sub-vps-2" in text and floors == ()
+
+
+def test_floor_err_hash_keys_on_shape_not_tokens():
+    a = {"site": "invalid_response", "stop_reason": "tool_use", "content_blocks": 0,
+         "output_tokens": 302, "served_by": "sub-vps-20"}
+    b = dict(a, output_tokens=462, served_by="sub-vps-2", route_id="x")
+    assert fbe.floor_err_hash(a) == fbe.floor_err_hash(b)
+    assert fbe.floor_err_hash(a) != fbe.floor_err_hash(dict(a, stop_reason="end_turn"))
+    assert fbe.floor_err_hash(a) != fbe.floor_err_hash(dict(a, content_blocks=None))
+    assert fbe.floor_err_hash({}) is None
+
+
+def test_text_or_status_evidence_still_wins_over_floor():
+    """The floor only names a call that had no http/exc/text class."""
+    floor = {"site": "invalid_response"}
+    assert fbe.classify_trigger(text="rate limit", floor=floor)[0] == "rate_upstream"
+    assert fbe.classify_trigger(http_status=500, floor=floor)[0] == "unclassified"
+    assert fbe.classify_trigger(floor=floor) == ("provider_invalid_response", "floor")
+    assert fbe.classify_trigger() == ("unclassified", "text")
+
+
+def test_empty_tool_use_floor_shape():
+    R = lambda **k: type("R", (), k)()
+    assert fbe.empty_tool_use_floor(R(stop_reason="tool_use", content=[]))
+    assert not fbe.empty_tool_use_floor(R(stop_reason="tool_use", content=None))
+    assert not fbe.empty_tool_use_floor(R(stop_reason="end_turn", content=[]))
+    assert not fbe.empty_tool_use_floor(None)
+    assert not fbe.empty_tool_use_floor(R(choices=[]))  # chat-completions shapes keep eager fallback
+
+
+def test_invalid_response_count_row(_home):
+    a = _alr_agent()
+    resp = _live_resp(462, "sub-vps-2", "9ed7daf6460344d4b0e3f9f0bbcd2888")
+    fbe.stash_response_failure(a, "invalid_response", resp)
+    floor = a._pending_fallback_error["floor"]
+    ok = type("R", (), {"usage": type("U", (), {"cache_read_input_tokens": 231000})()})()
+    assert fbe.record_invalid_response(a, floor, "retry_ok", response=ok)
+    line = (_home / "state" / "model-route-changes.log").read_text().splitlines()[-1]
+    tok = dict(t.split("=", 1) for t in line.split()[2:])
+    assert line.split()[1] == "invalid_response"
+    assert tok["class"] == "provider_invalid_response" and tok["retry_outcome"] == "retry_ok"
+    assert tok["served_by"] == "sub-vps-2" and tok["route_id"] == "9ed7daf6460344d4b0e3f9f0bbcd2888"
+    assert tok["content_blocks"] == "0" and tok["output_tokens"] == "462"
+    assert tok["cache_read"] == "231000" and tok["err_hash"] == fbe.floor_err_hash(floor)
+    # The failover/recovery sink regex (fallback-cache-report SINK_RE) skips it.
+    import re
+    assert not re.match(r"^(\S+) (failover|recovery) (\S+) -> (\S+)", line)
+
+
+def test_repeat_floor_skips_same_provider_entries(_home, monkeypatch):
+    """retry_same: the failover skips an entry on the failing provider (a
+    model swap on alr) and lands on a different transport."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    a._fallback_chain = [{"provider": "claude-alr", "model": "claude-opus-5-5"},
+                         {"provider": "claude-btpr", "model": "claude-fable-5-1"}]
+    a.fallback_model = list(a._fallback_chain)
+    from agent.chat_completion_helpers import try_activate_fallback as _taf
+    a._try_activate_fallback = lambda *x, **k: _taf(a, *x, **k)
+    fbe.stash_response_failure(a, "invalid_response", _live_resp(462, "sub-vps-2", None),
+                               repeat=True)
+    assert try_activate_fallback(a) is True
+    assert (a.provider, a.model) == ("claude-btpr", "claude-fable-5-1")
+
+
+def test_non_repeat_floor_keeps_same_provider_entries(_home, monkeypatch):
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    a._fallback_chain = [{"provider": "claude-alr", "model": "claude-opus-5-5"}]
+    a.fallback_model = list(a._fallback_chain)
+    fbe.stash_response_failure(a, "invalid_response", _live_resp(462, "sub-vps-2", None))
+    assert try_activate_fallback(a) is True
+    assert (a.provider, a.model) == ("claude-alr", "claude-opus-5-5")

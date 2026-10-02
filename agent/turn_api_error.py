@@ -95,6 +95,11 @@ def handle_api_error(
     from agent import fallback_events as _fbe
     _fbe.stash_api_error(agent, api_error, status_code, error_context,
                          elapsed_s=time.time() - api_start_time)
+    if _retry.invalid_response_retry_floor is not None:
+        # t_d35beb85: the empty-tool_use retry raised instead; its own error now drives the
+        # normal error path.
+        _fbe.record_invalid_response(agent, _retry.invalid_response_retry_floor, "retry_error")
+        _retry.invalid_response_retry_floor = None
     # Stamp the quota window (5h vs 7d) so the failover announce can name WHICH limit bound.
     # Consumed once by _quota_window_suffix; only set when the provider actually told us.
     if isinstance(error_context, dict) and error_context.get("quota_window"):

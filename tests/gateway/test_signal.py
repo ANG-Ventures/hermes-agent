@@ -95,6 +95,10 @@ class TestSignalConnectCleanup:
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("gateway.status.release_scoped_lock") as mock_release:
             result = await adapter.connect()
+            # Teardown queues the unlink on the ordered status lane (t_1fd05a3a).
+            from gateway.status import drain_runtime_status_lane
+
+            drain_runtime_status_lane()
 
         assert result is False
         mock_client.aclose.assert_awaited_once()

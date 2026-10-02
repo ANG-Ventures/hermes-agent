@@ -333,13 +333,15 @@ def test_pure_deletion_over_limit_captures_irreversible_patch(board, monkeypatch
 
 
 def test_added_bytes_are_never_cut_and_still_refuse_over_limit(board, monkeypatch, published_ok):
-    """Sibling: new content cannot be derived from any commit, so it is never cut."""
+    """Sibling: new content cannot be derived from any commit, so it is never cut. With the survivor
+    push refused too, the size refusal stands (t_f1c86daf's push is the only escape)."""
     tid, ws = _scratch(board, "real new work")
     repo = _dirty_repo(ws, {f"big{i}.bin": os.urandom(4000) for i in range(5)})
     for i in range(5):
         (repo / f"big{i}.bin").unlink()
     (repo / "new.py").write_bytes(os.urandom(6000))
     monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4000)
+    monkeypatch.setattr(survivor, "_push_oversize", lambda *a: (None, "push refused (test)"))
     with pytest.raises(survivor.SurvivorUnavailable, match="attachment limit"):
         kb.complete_task(board, tid, metadata={"changed_files": ["new.py"]})
     assert (repo / "new.py").exists()

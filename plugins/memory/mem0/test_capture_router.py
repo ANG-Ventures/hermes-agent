@@ -246,6 +246,28 @@ def test_fallback_leg_sends_claim_headers_primary_does_not():
     assert fb["Authorization"] == "Bearer s"
 
 
+def test_primary_leg_sends_fleet_caller_claim_for_the_turn_profile(monkeypatch):
+    """t_52ac3307: the codex primary (CLIProxyAPI :18812) carries X-Fleet-Caller with the turn's
+    profile (subs.ace claimed_agent); the gemini fallback does not (it has its own claims)."""
+    monkeypatch.delenv("HERMES_ATTRIBUTION_HEADER", raising=False)
+    seen = []
+    base = FakeHTTP(prefs_cands=[{"content": "x", "class": "preference"}], fail_primary=True)
+
+    def http(url, body, headers, timeout):
+        seen.append((url, dict(headers)))
+        return base(url, body, headers, timeout)
+
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    ext.extract("preference|ops_state prompt", "u", "a", profile="coder/x y")
+    primary = [h for u, h in seen if "18812" in u]
+    fallback = [h for u, h in seen if "18813" in u]
+    assert primary[-1]["X-Fleet-Caller"] == "harness=hermes;agent=coder-x-y;kind=aux;task=mem0-capture"
+    assert re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", "coder-x-y")
+    assert all("X-Fleet-Caller" not in h for h in fallback)
+    monkeypatch.setenv("HERMES_ATTRIBUTION_HEADER", "off")
+    assert cr.primary_claim_headers("coder") == {}
+
+
 def test_fallback_claim_headers_sanitize_and_never_raise(monkeypatch):
     import types, sys as _sys
     mod = types.ModuleType("fake_profiles")

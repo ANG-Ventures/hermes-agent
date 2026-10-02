@@ -1958,9 +1958,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+
+            # Register slash commands. Off the event loop: it builds the
+            # /skill catalog (~1000 skill paths of filesystem work), and on
+            # the loop thread that convoys with any GIL-busy thread into a
+            # loop wedge the liveness watchdog kills (t_620ba53d). Safe in a
+            # worker thread: the client is not started yet, so nothing else
+            # touches the command tree until this returns.
             if self._slash_commands:
-                # Registration walks the skill catalog on disk (#110707); keep the loop free.
                 await asyncio.to_thread(self._register_slash_commands)
+
+            # Start the bot in background
             self._disconnecting = False
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             self._bot_task.add_done_callback(self._handle_bot_task_done)

@@ -546,6 +546,85 @@ def _send_workspace_refusal_alert(board: str, summary: str) -> bool:
     return True
 
 
+def _send_proc_slot_alert(gate) -> bool:
+    """Page #alerts once when the load gate enters ``proc_paused``.
+
+    t_b660edb6: the Studio climbed to its per-uid process limit over 3 h
+    with load1 at 7-8 and nothing paged; at the limit every fork (hooks,
+    cron shells, this page's own subprocess) fails. The gate trips at
+    ``proc_pause_fraction`` of the limit, while a fork still works.
+    """
+    script = _alert_notify_script()
+    if script is None:
+        logger.error("kanban dispatcher: notify.py unavailable; process-slot page not delivered")
+        return False
+    from hermes_cli import kanban_load_gate as _klg
+
+    top = ", ".join(f"{name} x{n}" for name, n in _klg.top_user_proc_families(3))
+    message = (
+        "🛑 **Kanban dispatcher** · host running out of process slots\n"
+        f"{gate.last_reason}\n"
+        f"Top process names for this user: {top or 'unreadable'}\n"
+        "Spawns are paused. At the limit every fork() fails with EAGAIN "
+        "(hooks fail closed, cron shells die, the gateway watchdog exits). "
+        "Find the forker: `python3 fleet/exec-flight-recorder.py --grep . --since <now-30m>` "
+        "and count by ppid."
+    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(script), "--send", message,
+                "--channel", "discord", "--profile", "default", "--sev", "error",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: process-slot page failed")
+        return False
+    return proc.returncode == 0
+
+
+def _host_recovery_note(gate) -> Optional[str]:
+    """Requeue note when this tick's gate admits, else None (no requeue)."""
+    if not gate.host_recovered():
+        return None
+    l1 = "?" if gate.load1 is None else f"{gate.load1:.1f}"
+    return (
+        f"dispatcher load gate {gate.state}, load1={l1}, "
+        f"procs={gate.procs if gate.procs is not None else '?'}"
+        f"/{gate.proc_limit or '?'}"
+    )
+
+
+def _requeue_host_transient_on(conn, slug: str, note: Optional[str]) -> list:
+    """Unblock host-exhaustion ``transient`` cards on an OPEN board conn.
+
+    Runs on the dispatch tick's own connection (no extra board open; a
+    corrupt board already fails at connect). Errors are logged, never raised.
+    """
+    from hermes_cli import kanban_db as kb
+
+    if not note:
+        return []
+    try:
+        ids = kb.requeue_host_transient_blocks(conn, note=note)
+    except Exception:
+        # Never cost the board its dispatch tick.
+        logger.exception("kanban dispatcher: transient requeue failed on %s", slug)
+        return []
+    if ids:
+        logger.warning(
+            "kanban dispatcher [%s]: auto-requeued %d host-transient block(s) "
+            "after host recovery (%s): %s",
+            slug, len(ids), note, ", ".join(ids),
+        )
+    return ids
+
+
 def _observe_workspace_refusal_outages(notifier, results) -> int:
     """Process one full dispatcher tick; skipped boards do not imply recovery."""
     delivered = 0
@@ -1004,6 +1083,13 @@ def _resolve_lifecycle_channel() -> "Optional[tuple[str, str]]":
         return None
 
 
+def _resolve_lifecycle_digest_seconds() -> int:
+    """``kanban.lifecycle_digest_seconds``, read per notifier tick. Errors -> 0 (off)."""
+    from gateway.kanban_lifecycle_digest import resolve_digest_seconds
+
+    return resolve_digest_seconds()
+
+
 def _needs_input_cards(results, include_dependency: bool = False
                        ) -> tuple[list[tuple[str, dict]], set[str]]:
     """Probe each ticked board; only successful probes can prove a card unblocked."""
@@ -1425,6 +1511,12 @@ class GatewayKanbanWatchersMixin:
 
         lane_dedupe: LaneFailureDedupe = getattr(self, "_kanban_lane_dedupe", None) or LaneFailureDedupe()
         self._kanban_lane_dedupe = lane_dedupe
+        from gateway.kanban_lifecycle_digest import LifecycleDigest
+
+        lifecycle_digest: LifecycleDigest = (
+            getattr(self, "_kanban_lifecycle_digest", None) or LifecycleDigest()
+        )
+        self._kanban_lifecycle_digest = lifecycle_digest
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -1671,6 +1763,17 @@ class GatewayKanbanWatchersMixin:
 
                 deliveries = await asyncio.to_thread(_collect)
                 lifecycle_channel = _resolve_lifecycle_channel() if deliveries else None
+                # kanban.lifecycle_digest_seconds (t_d62bd921): batch routed lines.
+                _digest_window = (
+                    _resolve_lifecycle_digest_seconds() if lifecycle_channel else 0
+                )
+                # (board, task, event id, channel) already posted to the
+                # lifecycle channel; bounded, survives across ticks so a
+                # rewound sibling sub cannot re-post the same receipt.
+                lifecycle_sent = getattr(self, "_kanban_lifecycle_sent", None)
+                if lifecycle_sent is None:
+                    lifecycle_sent = {}
+                    self._kanban_lifecycle_sent = lifecycle_sent
                 # One message per failure event, one per lane-wide cause.
                 lane_dedupe.plan(deliveries)
                 for d in deliveries:
@@ -1937,6 +2040,17 @@ class GatewayKanbanWatchersMixin:
                                 metadata = {}
                             else:
                                 _routed = None
+                        if _routed is not None:
+                            # Receipts land in exactly one place (t_484a3c72):
+                            # a card with several subscribers routes the same
+                            # event to the log channel once, not once per sub.
+                            _lc_key = (board_slug or "", sub["task_id"], ev.id, _routed)
+                            if _lc_key in lifecycle_sent:
+                                logger.debug(
+                                    "kanban notifier: %s event %s for %s already in the lifecycle channel",
+                                    kind, ev.id, sub["task_id"],
+                                )
+                                continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -1976,13 +2090,22 @@ class GatewayKanbanWatchersMixin:
                         # failure instead of burning MAX_SEND_FAILURES ticks.
                         _target_gone = False
                         try:
-                            # Pings and artifact uploads read the SUBSCRIBER
-                            # profile's media policy / display language, not the
-                            # launch profile's (upstream 284d220ba4).
                             async with _served_profile_scope(self, plat, sub, sub_profile):
-                                _send_res = await send_adapter.send(
-                                    send_chat_id, msg, metadata=metadata,
-                                )
+                                if _routed is not None and _digest_window > 0:
+                                    # Held for the lifecycle digest: the line is
+                                    # recorded, so the event counts as delivered
+                                    # (cursor, wake and failure counter unchanged).
+                                    lifecycle_digest.add(
+                                        _routed, send_adapter, msg, _digest_window, time.time(),
+                                    )
+                                    _send_res = None
+                                else:
+                                    # Pings and artifact uploads read the SUBSCRIBER
+                                    # profile's media policy / display language, not the
+                                    # launch profile's (upstream 284d220ba4).
+                                    _send_res = await send_adapter.send(
+                                        send_chat_id, msg, metadata=metadata,
+                                    )
                                 # A SendResult(success=False) without an exception
                                 # (returned by push-capable adapters on a genuine
                                 # transient failure) must count as a FAILED
@@ -2005,6 +2128,10 @@ class GatewayKanbanWatchersMixin:
                                     kind, sub["task_id"], platform_str, send_chat_id, board_slug,
                                 )
                                 _sent_event_ids.add(ev.id)
+                                if _routed is not None:
+                                    lifecycle_sent[_lc_key] = None
+                                    while len(lifecycle_sent) > 4096:
+                                        lifecycle_sent.pop(next(iter(lifecycle_sent)))
                                 # After delivering the text notification, surface
                                 # any artifact paths the worker referenced in
                                 # ``kanban_complete(summary=..., artifacts=[...])``
@@ -2415,9 +2542,19 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+            if len(lifecycle_digest):
+                try:
+                    await lifecycle_digest.flush(time.time())
+                except Exception as exc:
+                    logger.warning("kanban lifecycle digest flush failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
+                    if len(lifecycle_digest):
+                        try:
+                            await lifecycle_digest.flush(time.time(), force=True)
+                        except Exception:
+                            pass
                     return
                 await asyncio.sleep(1)
 
@@ -2841,8 +2978,15 @@ class GatewayKanbanWatchersMixin:
                 running = _klg_mod.count_running_workers()
             return load_gate.admit_now(running=running)
 
+        _proc_paged = {"episode": False}
+
         def _finish_gate_tick(spawned: int) -> None:
             load_gate.finish_tick(spawned, logger=logger)
+            if load_gate.state != "proc_paused":
+                _proc_paged["episode"] = False
+            elif not _proc_paged["episode"]:
+                # A failed send stays unpaged, so the next tick retries.
+                _proc_paged["episode"] = _send_proc_slot_alert(load_gate)
 
         # Round-robin cursor for the per-board allowance split and the
         # wall-clock start of each board's current zero-spawn streak while
@@ -2912,7 +3056,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -2947,6 +3091,7 @@ class GatewayKanbanWatchersMixin:
                 disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
+                _requeue_host_transient_on(conn, slug, requeue_note)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -3028,6 +3173,9 @@ class GatewayKanbanWatchersMixin:
             # (t_f78d1938: consumed in fixed board order, default first, the
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
             _allowance, _spawn_paused = _sample_spawn_pause()
+            # Host-exhaustion transient blocks clear when the host does
+            # (t_b660edb6); requeued inside each board's dispatch tick.
+            _requeue_note = _host_recovery_note(load_gate)
             _tick_spawned = 0
             _demand: list[tuple[str, int]] = []
             if _allowance is not None and not _spawn_paused:
@@ -3094,6 +3242,7 @@ class GatewayKanbanWatchersMixin:
                 res = _tick_once_for_board(
                     slug, budget_cache, _paused,
                     None if _paused else _limit,
+                    requeue_note=_requeue_note,
                 )
                 out.append((slug, res))
                 _n = len(getattr(res, "spawned", None) or []) if res is not None else 0

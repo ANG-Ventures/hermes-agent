@@ -1603,6 +1603,11 @@ def _historical_rehome(conn, monkeypatch):
     with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
                            foreign_ok="load", home="transfer"):
         assert kb.reclaim_task(conn, tid, reason="load")
+    # Pre-fix shape: the takeover ADDED the taker's chat next to the home's.
+    # One-subscriber-per-card (t_484a3c72) no longer writes it, so the
+    # historical row is written explicitly.
+    kb.add_notify_sub(conn, task_id=tid, platform="discord",
+                      chat_id="taker-chat", also=True)
     ev = _takeover_events(conn, tid)[0]
     payload = {k: v for k, v in ev.payload.items()
                if k not in ("previous_home", "taker_chat")}
@@ -1663,6 +1668,9 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
                                foreign_ok="load", home="transfer"):
             assert kb.reclaim_task(conn, tid, reason="load")
         assert kb.get_task(conn, tid).session_id == OTHER
+        # Pre-fix shape (see _historical_rehome).
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord",
+                          chat_id="taker-chat", also=True)
         assert {s["chat_id"] for s in kbn.list_notify_subs(conn, tid)} == {
             "home-chat", "taker-chat"}
     mod = _restore_mod()
@@ -1702,7 +1710,7 @@ def test_restore_never_removes_another_thread_of_the_taker_chat(kanban_home, mon
                           thread_id="thread-A")
         # Another conversation, same chat, different thread, same window.
         kbn.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
-                          thread_id="thread-B")
+                          thread_id="thread-B", also=True)
         rows = mod.plan(conn, since=now - 60, until=now + 60,
                         by_session=None, sub_window=30)
         assert rows[0]["remove_subs"] == [

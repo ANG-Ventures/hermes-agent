@@ -211,10 +211,40 @@ def test_normal_mode_installs_no_preexec_fn(fresh_home, monkeypatch):
     monkeypatch.setattr(
         kb, "worker_cpu_priority_config", lambda cfg=None: ("normal", 0)
     )
+    # The process-count preexec (t_368e9873) is independent of priority.
+    from hermes_cli import kanban_proc_bounds as kpb
+    monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: None)
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_normal")
     assert captured.get("preexec_fn") is None, (
         "'normal' must leave the child at inherited priority"
     )
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork"), reason="POSIX preexec only"
+)
+def test_spawn_preexec_lowers_nproc_in_a_real_child(fresh_home, monkeypatch):
+    """The preexec _default_spawn hands Popen also lowers RLIMIT_NPROC
+    (t_368e9873), even with priority at 'normal'."""
+    resource = pytest.importorskip("resource")
+    soft = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+    if soft != resource.RLIM_INFINITY and soft <= 777:
+        pytest.skip("inherited limit already at/below the probe value")
+    monkeypatch.setattr(
+        kb, "worker_cpu_priority_config", lambda cfg=None: ("normal", 0)
+    )
+    from hermes_cli import kanban_proc_bounds as kpb
+    monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: 777)
+    captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_nproc")
+    hook = captured.get("preexec_fn")
+    assert hook is not None
+    monkeypatch.undo()  # real Popen again for the probe child
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import resource;print(resource.getrlimit(resource.RLIMIT_NPROC)[0])"],
+        preexec_fn=hook, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert out == "777"
 
 
 def test_config_yaml_knob_reaches_the_resolver(fresh_home, monkeypatch):

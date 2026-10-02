@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -204,27 +205,46 @@ def _iter_gateway_skills(platform: str):
         disabled = get_disabled_skill_names(platform=platform)
     except Exception:
         disabled = set()
-    hub_dir = (SKILLS_DIR / ".hub").resolve()
-    roots = [SKILLS_DIR.resolve()]
+    # Only the roots are realpath'd (a handful of syscalls). Each skill path is matched
+    # LEXICALLY first and resolve()d only on a miss: this runs on the gateway event-loop thread
+    # (Discord connect and /reload-skills), and ~1000 per-skill realpath walks are ~6000
+    # lstat() calls, each of which drops the GIL. With a busy thread holding the GIL (a kanban
+    # dispatcher tick), every re-acquire waits out the switch interval: measured 0.05s alone ->
+    # ~210s contended, which tripped the 120s loop-liveness watchdog on every boot
+    # (2026-10-01/02, t_620ba53d).
+    def _both(p) -> list:
+        lexical = Path(os.path.abspath(os.fspath(p)))
+        resolved = Path(p).resolve()
+        return [lexical] if resolved == lexical else [lexical, resolved]
+
+    hub_dirs = _both(SKILLS_DIR / ".hub")
+    roots = _both(SKILLS_DIR)
     for getter in (get_external_skills_dirs, get_project_skills_dirs):
         try:
             for d in getter():
                 try:
-                    roots.append(Path(d).resolve())
+                    roots.extend(_both(d))
                 except Exception:
                     continue
         except Exception:
             pass
+
+    def _match_root(sp):
+        return next((r for r in roots if sp.is_relative_to(r)), None)
+
     skill_cmds = get_skill_commands()
     for cmd_key in sorted(skill_cmds):
         info = skill_cmds[cmd_key]
         skill_path = info.get("skill_md_path", "")
         if not skill_path:
             continue
-        sp = Path(skill_path).resolve()
-        if sp.is_relative_to(hub_dir):
+        sp = Path(os.path.abspath(os.fspath(skill_path)))
+        root = _match_root(sp)
+        if root is None:
+            sp = Path(skill_path).resolve()
+            root = _match_root(sp)
+        if any(sp.is_relative_to(h) for h in hub_dirs):
             continue
-        root = next((r for r in roots if sp.is_relative_to(r)), None)
         if root is None or info.get("name", "") in disabled:
             continue
         yield cmd_key, info, sp.parent.relative_to(root).parts

@@ -453,6 +453,7 @@ async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock(monkeypatch)
         None, worker_finished.wait, 10
     ), "the acquire worker never finished"
 
+    status.drain_runtime_status_lane()
     assert held == set(), (
         "a cancelled acquire left the machine-global scoped lock held by an "
         f"orphaned worker thread: {held}. Every later connect will fail "
@@ -642,6 +643,7 @@ async def test_a_second_cancel_during_the_drain_still_does_not_orphan_the_lock(
         None, worker_finished.wait, 10
     ), "the acquire worker never finished"
 
+    status.drain_runtime_status_lane()
     assert held == set(), (
         "a second cancellation abandoned the drain, so the worker thread took "
         f"the machine-global scoped lock with no owner left to release it: {held}"
@@ -721,6 +723,8 @@ async def test_the_drain_does_not_release_while_a_sibling_acquisition_is_live(
         "permanently pinned and no later release of it can ever fire"
     )
     retry._release_platform_lock()
+    # On a running loop the unlink is queued on the ordered status lane.
+    status.drain_runtime_status_lane()
     assert held == set(), (
         "the live holder's own teardown could not release the lock, because a "
         "drained acquisition was still on record"
@@ -845,6 +849,7 @@ async def test_the_drain_releases_even_when_an_unrelated_connect_churned_the_pai
     other = _adapter()
     assert other._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
     other._release_platform_lock()
+    status.drain_runtime_status_lane()
     assert held == set()
 
     task.cancel()
@@ -858,6 +863,7 @@ async def test_the_drain_releases_even_when_an_unrelated_connect_churned_the_pai
     for _ in range(20):
         await asyncio.sleep(0.01)
 
+    status.drain_runtime_status_lane()
     assert held == set(), (
         "the drain refused to release a lock its own worker took, because an "
         f"unrelated connect had churned the same pair: {held}. Every later "
@@ -923,6 +929,7 @@ async def test_teardown_after_a_cancelled_acquire_does_not_release_twice(
     ), "the acquire worker never finished"
     for _ in range(20):
         await asyncio.sleep(0.01)
+    status.drain_runtime_status_lane()
     assert held == set(), "the drain should have released its own lock"
 
     # A retry connect now legitimately holds the machine-global pair ...

@@ -3712,6 +3712,21 @@ def try_activate_fallback(
                 fb_provider, fb_model,
             )
             continue
+        # t_d35beb85: an empty tool_use 200 that repeated after its same-route
+        # retry is provider-wide for this turn; a model swap on the same provider
+        # is never the answer (2026-09-30). Fail over to a different transport.
+        try:
+            from agent import fallback_events as _fbe_rep
+
+            _floor_repeat = _fbe_rep.pending_floor_repeat(agent)
+        except Exception:
+            _floor_repeat = False
+        if _floor_repeat and _same_provider_entry(agent, fb):
+            logger.warning(
+                "Fallback skip: %s/%s is on the provider that repeated an empty tool_use response",
+                fb_provider, fb_model,
+            )
+            continue
 
         _switch_snapshot = None
         try:

@@ -70,6 +70,12 @@ class TurnRetryState:
     # bounded by ``fallback.relay_drain_wait_s``.
     relay_drain_started_at: float | None = None
 
+    # ── Same-route retry of an empty tool_use 200 (t_d35beb85) ───────────
+    # The floor evidence of the rejected response while its one same-route
+    # retry is in flight; None otherwise. ``..._done`` caps it at one retry.
+    invalid_response_retry_floor: dict | None = None
+    invalid_response_retry_done: bool = False
+
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False

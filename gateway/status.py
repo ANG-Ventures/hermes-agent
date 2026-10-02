@@ -1487,19 +1487,19 @@ def _fence_runtime_status_lane() -> None:
         _RUNTIME_STATUS_LANE.submit(lambda: None).result()
 
 
-def submit_runtime_status_write(**kwargs: Any) -> None:
-    """Queue a runtime-status write on the ordered lane without blocking.
+def submit_runtime_status_job(fn: Callable[[], Any]) -> None:
+    """Run ``fn`` on the ordered runtime-status lane without blocking.
 
-    The non-terminal off-loop path (``GatewayRunner._dispatch_runtime_status_write``):
-    the caller returns immediately and the write runs on the lane in submission
-    order.  Best-effort -- a failed status write must never disrupt a turn.
+    For event-loop callers whose job is gateway-state file I/O (the adapter
+    health write, the platform scoped-lock release).  Jobs run one at a time in
+    submission order; a direct ``write_runtime_status`` fences them.  If the
+    executor refuses the job (interpreter shutdown) ``fn`` runs inline so the
+    work is not silently dropped.  ``fn`` owns its own error handling.
     """
     def _run() -> None:
         _RUNTIME_STATUS_LANE_LOCAL.in_lane = True
         try:
-            # Module-global lookup, not a direct call: existing tests monkeypatch
-            # ``gateway.status.write_runtime_status`` as a spy and must observe it.
-            globals()["write_runtime_status"](**kwargs)
+            fn()
         except Exception:
             pass
         finally:
@@ -1508,9 +1508,29 @@ def submit_runtime_status_write(**kwargs: Any) -> None:
     try:
         _RUNTIME_STATUS_LANE.submit(_run)
     except Exception:
-        # Executor refused the job (shutdown): inline so the update is not dropped.
+        # Executor refused the job (shutdown): inline so the work is not dropped.
         with contextlib.suppress(Exception):
-            globals()["write_runtime_status"](**kwargs)
+            fn()
+
+
+def drain_runtime_status_lane() -> None:
+    """Block until every job already queued on the ordered lane has run."""
+    _fence_runtime_status_lane()
+
+
+def submit_runtime_status_write(**kwargs: Any) -> None:
+    """Queue a runtime-status write on the ordered lane without blocking.
+
+    The non-terminal off-loop path (``GatewayRunner._dispatch_runtime_status_write``):
+    the caller returns immediately and the write runs on the lane in submission
+    order.  Best-effort -- a failed status write must never disrupt a turn.
+    """
+    def _write() -> None:
+        # Module-global lookup, not a direct call: existing tests monkeypatch
+        # ``gateway.status.write_runtime_status`` as a spy and must observe it.
+        globals()["write_runtime_status"](**kwargs)
+
+    submit_runtime_status_job(_write)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:

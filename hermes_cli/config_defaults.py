@@ -2261,6 +2261,22 @@ DEFAULT_CONFIG = {
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
         "worker_cpu_priority": "background",
+        # Process bounds for worker trees (t_368e9873). A scratch bench that
+        # re-spawned itself 18,818 times on 2026-10-01 filled the uid's
+        # process table (10,340 / 10,666) and every fork on the host failed.
+        # worker_nproc_limit: RLIMIT_NPROC for the worker tree. It counts the
+        # whole uid, so "auto" (75% of the inherited limit, 8,000 on macOS
+        # default 10,666) keeps 25% of slots for gateways and launchd jobs.
+        # Healthy uid totals measured p99 1,815, max 5,516. 0 = off.
+        "worker_nproc_limit": "auto",
+        # worker_max_procs_per_run: a running worker whose tree (session +
+        # env-tagged escapees) exceeds this is terminated, reaped and blocked
+        # capability on the next dispatcher tick. 256 = 3 x measured p99 (74)
+        # of live per-run tree sizes, rounded up. 0 = off; minimum 32.
+        "worker_max_procs_per_run": 256,
+        # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
+        # the historical 2 MiB + one-backup behavior; long-running workers can
+        # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
@@ -2336,6 +2352,13 @@ DEFAULT_CONFIG = {
             "cpu_corroborate": True,
             "cpu_busy_pause": 0.70,
             "worker_cpu_cost": 1.0,
+            # t_b660edb6: pause spawns (state proc_paused, #alerts page) at
+            # proc_pause_fraction of this uid's process limit (RLIMIT_NPROC,
+            # or proc_limit when set); resume below proc_resume_fraction.
+            # At the limit every fork() fails with EAGAIN.
+            "proc_pause_fraction": 0.80,
+            "proc_resume_fraction": 0.65,
+            "proc_limit": None,
         },
         # Reviewer↔implementer round cap. A "round" is one changes_requested
         # verdict; once a card has collected this many, the next request for
@@ -2356,6 +2379,9 @@ DEFAULT_CONFIG = {
         # subscriber. A needs_input block on a priority >= 100 card stays put.
         # Empty = post in the subscriber's chat.
         "lifecycle_channel": "",
+        # Seconds to batch lifecycle_channel lines into one digest post
+        # (0 = one post per line). The wake is never delayed.
+        "lifecycle_digest_seconds": 0,
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.

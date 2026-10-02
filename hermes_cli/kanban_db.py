@@ -216,6 +216,52 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
         return value
     allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
     raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
+
+
+# Per-card harness brain (t_a8f335c5): the Claude lane a foreign-lane worker
+# (cc-worker) dials through, normally the profile-wide ``foreign_lane.brain``.
+# Stored in the full (``f``) lane grammar; the lane runner
+# (skills-shared/coding/kanban-foreign-lane/scripts/harness_model.py) maps it to
+# its internal id and re-validates it at spawn. Pre-v2 internal ids are
+# accepted and stored in the f spelling. Bare ``clr`` / ``clx-N`` are the SLIM
+# harness since 2026-10-01 (t_faf5af7b) and are refused by name.
+CARD_BRAIN_ALLOWED = (
+    "clrf | clxf-<N> | dtlrf | dtlxf-<N> | alrf | cliproxy:<model> | openrouter:<model>"
+)
+_CARD_BRAIN_ALIASES = {"cpr-cli": "clrf", "dtlr": "dtlrf", "alrf": "alrf", "clrf": "clrf", "dtlrf": "dtlrf"}
+_CARD_BRAIN_MODEL_RE = re.compile(r"(cliproxy|openrouter):([A-Za-z0-9][A-Za-z0-9._/-]*)")
+
+
+def normalize_card_brain(brain: Optional[str]) -> Optional[str]:
+    """Validate a per-card brain against the allowlist; return its stored form.
+
+    Empty / None / ``none`` / ``-`` means "no card brain" (NULL: the profile's
+    ``foreign_lane.brain`` applies). Anything outside the allowlist raises
+    ``ValueError`` naming the allowed values, so a typo never silently falls
+    back to the profile's lane.
+    """
+    value = str(brain or "").strip()
+    if value.lower() in ("", "none", "-", "null"):
+        return None
+    low = value.lower()
+    if low in _CARD_BRAIN_ALIASES:
+        return _CARD_BRAIN_ALIASES[low]
+    m = re.fullmatch(r"(clxf|cpx-cli|dtlxf|dtlx)[-:](\d+)", low)
+    if m:
+        family = "clxf" if m.group(1) in ("clxf", "cpx-cli") else "dtlxf"
+        return f"{family}-{int(m.group(2))}"
+    m = _CARD_BRAIN_MODEL_RE.fullmatch(value)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    if low in ("clr", "clx") or re.fullmatch(r"clx[-:]\d+", low):
+        full = low.replace("clr", "clrf").replace("clx", "clxf")
+        raise ValueError(
+            f"brain {value!r} is the SLIM harness since 2026-10-01 (t_faf5af7b); "
+            f"a coding worker needs the full harness: use {full}"
+        )
+    raise ValueError(f"brain must be one of {CARD_BRAIN_ALLOWED}, got {value!r}")
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
@@ -2093,6 +2139,10 @@ class Task:
     # Deliberate single-sub pin (``--pin-sub "<reason>"``, t_957ca870). Set only when
     # ``provider_override`` is one claude-bpx-N / claude-apx-N sub. ``pin_sub_fallback`` lets a
     # capped pinned sub fall back to its family pool; the default is to WAIT for the sub.
+    # Per-card harness brain for a foreign-lane worker (t_a8f335c5), stored in
+    # the f lane grammar (normalize_card_brain). NULL = the profile's
+    # ``foreign_lane.brain``.
+    brain: Optional[str] = None
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
     # ``(model, provider)`` the card ROW pinned when this Task was claimed
@@ -2346,6 +2396,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Per-card harness brain for a foreign-lane worker (t_a8f335c5), f lane
+    -- grammar (clrf, clxf-N, dtlrf, ...). NULL = profile foreign_lane.brain.
+    brain                TEXT,
     -- Deliberate single-sub pin (t_957ca870): the operator's --pin-sub reason
     -- when provider_override is claude-bpx-N / claude-apx-N. NULL = no pin.
     pin_sub_reason       TEXT,
@@ -5191,6 +5244,7 @@ def create_task(
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    brain: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     goal_mode: bool = False,
@@ -5274,6 +5328,7 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    brain = normalize_card_brain(brain)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
@@ -5589,8 +5644,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, brain
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -5619,6 +5674,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         completion_contract,
+                        brain,
                     ),
                 )
                 for pid in parents:
@@ -5652,6 +5708,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **({"brain": brain} if brain else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -5823,20 +5880,45 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
-    conn.execute(
-        f"""
-        INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-             scope_id, chat_type, notifier_profile, delivery_mode,
-             delivery_metadata, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
-               scope_id, COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
-          FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
-        """,
-        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
-    )
+    # One subscriber chat per card (t_484a3c72): a parent's chat joins only
+    # when the child has no live subscriber on that platform yet. Decided per
+    # parent row, oldest first, so a child of two parents in two chats ends up
+    # with one of them, not both.
+    for prow in conn.execute(
+        f"SELECT * FROM kanban_notify_subs WHERE task_id IN ({placeholders})"
+        " ORDER BY created_at, rowid",
+        parent_ids,
+    ).fetchall():
+        decision, others = _notify_sub_admission(
+            conn, task_id=child_id, platform=prow["platform"],
+            chat_id=prow["chat_id"], thread_id=prow["thread_id"] or "",
+            notifier_profile=prow["notifier_profile"],
+        )
+        if decision == "keep":
+            _log_sub_kept(child_id, others, prow["chat_id"])
+            continue
+        if decision == "replace":
+            _drop_notify_subs(conn, others)
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+                 scope_id, chat_type, notifier_profile, delivery_mode,
+                 delivery_metadata, created_at, last_event_id)
+            SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
+                   scope_id, COALESCE(chat_type, 'dm'), notifier_profile,
+                   COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+              FROM kanban_notify_subs
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (
+                child_id,
+                int(created_at if created_at is not None else time.time()),
+                cursor,
+                prow["task_id"], prow["platform"], prow["chat_id"],
+                prow["thread_id"] or "",
+            ),
+        )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -6393,6 +6475,45 @@ def _set_reasoning_effort_locked(
     return True
 
 
+def set_card_brain(
+    conn: sqlite3.Connection,
+    task_id: str,
+    brain: Optional[str],
+) -> bool:
+    """Set (or clear) the per-card harness brain (t_a8f335c5).
+
+    ``brain=None`` (or empty / ``none``) clears it: the worker uses its
+    profile's ``foreign_lane.brain``. Independent of the model and effort
+    overrides, applies on the NEXT dispatch, and records ``brain_set`` (the
+    same event ledger and actor stamp as ``reasoning_effort_set``).
+    """
+    brain = normalize_card_brain(brain)
+    with write_txn(conn):
+        if not _set_card_brain_locked(conn, task_id, brain):
+            return False
+    notify_task_updated(conn, task_id, ("brain",))
+    return True
+
+
+def _set_card_brain_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    brain: Optional[str],
+) -> bool:
+    """Write one card brain. MUST already be inside a ``write_txn``; ``brain``
+    must already have passed :func:`normalize_card_brain`."""
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(f"cannot set brain on archived task {task_id}")
+    conn.execute("UPDATE tasks SET brain = ? WHERE id = ?", (brain, task_id))
+    _append_event(conn, task_id, "brain_set", {"brain": brain})
+    return True
+
+
 @dataclass
 class BatchRouteWrite:
     """One card's requested route/effort change inside a batch."""
@@ -6405,6 +6526,9 @@ class BatchRouteWrite:
     audit_comment_body: Optional[str] = None
     touch_effort: bool = False
     effort: Optional[str] = None
+    # Per-card harness brain (``--brain`` / ``--clear-brain``, t_a8f335c5).
+    touch_brain: bool = False
+    brain: Optional[str] = None
     # Deliberate single-sub pin (``--pin-sub``); only with ``touch_model``.
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
@@ -6533,6 +6657,8 @@ def apply_batch_route_writes(
                 pin_sub_fallback=write.pin_sub_fallback,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
+        if write.touch_brain:
+            write.brain = normalize_card_brain(write.brain)
         prepared.append((write, model, provider, effort))
 
     # Home-session guard for every card in the batch, before the writer lock:
@@ -6573,6 +6699,10 @@ def apply_batch_route_writes(
                 if not _set_reasoning_effort_locked(conn, write.task_id, effort):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("reasoning_effort",)
+            if write.touch_brain:
+                if not _set_card_brain_locked(conn, write.task_id, write.brain):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("brain",)
             if changed:
                 written.append(write.task_id)
                 fields[write.task_id] = changed
@@ -12989,6 +13119,69 @@ def unblock_task(
         return True
 
 
+# A ``transient`` block whose reason names HOST resource exhaustion (out of
+# process slots, fork EAGAIN, load over the gate) clears when the host does,
+# not when a human looks. t_b660edb6: t_5ea5bcd0 blocked "Studio is out of
+# process slots ... Requeue once the host recovers" at 02:06 and sat 7h50m
+# after the host recovered (02:10) until Apollo unblocked it by hand.
+# Transient blocks for anything else (time gates, a lander, a judge error)
+# are NOT host conditions and stay put: requeueing those every healthy tick
+# would just walk them into the recurrence breaker.
+HOST_TRANSIENT_REASON_RE = re.compile(
+    r"EAGAIN|Resource temporarily unavailable|BlockingIOError|Errno 35"
+    r"|process slots|out of process|maxprocperuid|fork\(?\)?:? "
+    r"(?:fails|failed|returns|Resource)|host_emergency|\bload1\b|host load",
+    re.IGNORECASE,
+)
+HOST_TRANSIENT_MIN_BLOCKED_SECONDS = 120
+
+
+def requeue_host_transient_blocks(
+    conn: sqlite3.Connection,
+    *,
+    note: str,
+    now: Optional[int] = None,
+    min_blocked_seconds: int = HOST_TRANSIENT_MIN_BLOCKED_SECONDS,
+) -> list[str]:
+    """Unblock ``transient`` cards blocked for host exhaustion; return ids.
+
+    The CALLER decides the host has recovered (the dispatcher's load gate is
+    admitting); this only selects which blocked cards that recovery clears:
+    ``status='blocked'``, ``block_kind='transient'``, latest ``blocked`` event
+    older than ``min_blocked_seconds`` whose reason matches
+    :data:`HOST_TRANSIENT_REASON_RE`. Each goes through :func:`unblock_task`
+    with a comment naming ``note`` in the same transaction, so the respawned
+    worker reads why it is running again.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT t.id AS id, "
+        "(SELECT e.payload FROM task_events e WHERE e.task_id = t.id "
+        " AND e.kind = 'blocked' ORDER BY e.id DESC LIMIT 1) AS payload, "
+        "(SELECT e.created_at FROM task_events e WHERE e.task_id = t.id "
+        " AND e.kind = 'blocked' ORDER BY e.id DESC LIMIT 1) AS blocked_at "
+        "FROM tasks t WHERE t.status = 'blocked' AND t.block_kind = 'transient'"
+    ).fetchall()
+    out: list[str] = []
+    for row in rows:
+        if row["blocked_at"] is None or now - int(row["blocked_at"]) < min_blocked_seconds:
+            continue
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        reason = str((payload or {}).get("reason") or "") if isinstance(payload, dict) else ""
+        if not HOST_TRANSIENT_REASON_RE.search(reason):
+            continue
+        body = (
+            f"auto-requeue: host recovered ({note}). This card was blocked "
+            f"kind=transient for a host condition: {reason[:300]}"
+        )
+        if unblock_task(conn, row["id"], comment=("kanban-dispatcher", body, None, None)):
+            out.append(row["id"])
+    return out
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Legacy verdict bypass retired: claim the review and request changes.
 
@@ -15501,9 +15694,51 @@ def _reap_worker_session(
     return len(signalled)
 
 
-def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
-    """``(pid, pgid)`` of every live process whose ENVIRONMENT carries exactly
-    this task+run identity, wherever it sits in the session tree.
+_CARD_ID_RE = re.compile(r"t_[0-9a-f]+")
+
+
+def _cmdline_profile_cards(cmdline) -> set[str]:
+    """Card ids named as a path component of a ``--user-data-dir`` argument.
+
+    Chrome on Linux rewrites its argv area for its process title, and the
+    kernel's ``/proc/<pid>/environ`` window sits right after argv, so every
+    Chrome process reads back an environment WITHOUT the run identity
+    (measured on ACE-AI: 0 of 11 chrome processes kept
+    ``HERMES_KANBAN_TASK``; their ``cat`` helpers did). A browser profile
+    under the card workspace (``.../workspaces/<card>/...`` or
+    ``<repo>/.worktrees/<card>/...``) still names the card in its argv.
+    """
+    out: set[str] = set()
+    args = list(cmdline or [])
+    for i, arg in enumerate(args):
+        if arg.startswith("--user-data-dir="):
+            path = arg.split("=", 1)[1]
+        elif arg == "--user-data-dir" and i + 1 < len(args):
+            path = args[i + 1]
+        else:
+            continue
+        out.update(c for c in path.replace("\\", "/").split("/") if _CARD_ID_RE.fullmatch(c))
+    return out
+
+
+def _safe_cmdline(proc) -> list[str]:
+    """``proc.cmdline()``, or [] when unreadable. psutil on macOS can raise
+    ``SystemError`` (not a psutil.Error) for a process exiting mid-read."""
+    try:
+        return proc.cmdline() or []
+    except Exception:
+        return []
+
+
+def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int, bool]]:
+    """``(pid, pgid, by_env)`` of every live process whose ENVIRONMENT carries
+    exactly this task+run identity, wherever it sits in the session tree
+    (``by_env`` True). A process
+    with no run identity in its environment also matches when its
+    ``--user-data-dir`` names the card (:func:`_cmdline_profile_cards`):
+    Linux Chrome erases its own environment window (``by_env`` False: the
+    path proves the process, not its process group). Callers bound every
+    match by the run's birth window, which tells runs of one card apart.
 
     A worker's children inherit its environment. One class of child
     ``setsid()``s into a NEW session on purpose (the browser-use harness
@@ -15526,9 +15761,13 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             continue
         try:
             env = proc.environ()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+        except Exception:  # psutil on macOS: SystemError for a process exiting mid-read
             continue
-        if env.get("HERMES_KANBAN_TASK") != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
+        env_task = env.get("HERMES_KANBAN_TASK")
+        if env_task is None:
+            if want_task not in _cmdline_profile_cards(_safe_cmdline(proc)):
+                continue
+        elif env_task != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
             continue
         try:
             if my_sid is not None and os.getsid(pid) == my_sid:
@@ -15538,8 +15777,21 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             continue
         if pgid <= 1 or pgid == os.getpgid(0):
             continue
-        found.append((pid, pgid))
+        found.append((pid, pgid, env_task is not None))
     return found
+
+
+def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of :func:`_run_env_escapees_detailed`."""
+    return [(pid, pgid) for pid, pgid, _ in _run_env_escapees_detailed(task_id, run_id)]
+
+
+#: Lower-bound slack on a member's birth time. Linux psutil derives
+#: ``create_time`` from ``/proc/stat`` ``btime``, an INTEGER second, so a
+#: process can read as born up to 1 s before it was (ACE-AI: btime fraction
+#: 0.0855 s, child births read 0.093 s early). Same slack as
+#: :func:`_session_owned_by_run`.
+_BIRTH_SLACK_SECONDS = 1.0
 
 
 def _reap_run_env_escapees(
@@ -15562,34 +15814,68 @@ def _reap_run_env_escapees(
         return 0
     if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
         return 0
-    lo, hi = float(born_after), float(born_before)
-    targets: dict[int, int] = {}
-    for pid, pgid in _run_env_escapees(task_id, run_id):
+    lo, hi = float(born_after) - _BIRTH_SLACK_SECONDS, float(born_before)
+    matched: list[tuple[int, int, bool]] = []
+    for pid, pgid, by_env in _run_env_escapees_detailed(task_id, run_id):
         born = _member_birth(pid)
         if born is None or not (lo <= born <= hi):
             continue
-        targets[pgid] = pid
-    if not targets:
+        matched.append((pid, pgid, by_env))
+    if not matched:
         return 0
-    for pgid in sorted(targets):
-        try:
-            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
-        except OSError:
-            pass
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and any(_pid_alive(p) for p in targets.values()):
-        time.sleep(0.1)
-    for pgid, pid in targets.items():
-        if _pid_alive(pid):
+    # An env match proves the whole group (the run identity is inherited).
+    # A profile-path match proves only that process, unless its group leader
+    # is itself a match: an unrelated script could have launched the browser
+    # into the script's own group, and that group is not the run's.
+    matched_pids = {pid for pid, _, _ in matched}
+    targets: dict[int, int] = {}  # pgid -> witness pid (group kill)
+    for pid, pgid, by_env in matched:
+        if by_env or pgid in matched_pids:
+            targets[pgid] = pid
+    singles: dict[int, float] = {}  # pid -> birth (identity-checked kill)
+    for pid, pgid, by_env in matched:
+        if pgid not in targets:
+            born = _member_birth(pid)
+            if born is not None:
+                singles[pid] = born
+
+    def _same(pid: int, born: float) -> bool:
+        return _member_birth(pid) == born
+
+    def _signal(sig, groups: dict[int, int], procs: dict[int, float]) -> None:
+        for pgid in sorted(groups):
             try:
-                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
+                os.killpg(pgid, sig)  # windows-footgun: ok (POSIX-gated above)
             except OSError:
                 pass
-    _log.warning(
-        "kanban: reaped %d run-identified process group(s) that escaped worker session of %s run %s",
-        len(targets), task_id, run_id,
+        for pid, born in procs.items():
+            if _same(pid, born):
+                try:
+                    os.kill(pid, sig)  # windows-footgun: ok (POSIX-gated above)
+                except OSError:
+                    pass
+
+    reaped = len(targets) + len(singles)
+    if not reaped:
+        return 0
+    _signal(signal.SIGTERM, targets, singles)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and (
+        any(_pid_alive(p) for p in targets.values())
+        or any(_same(p, b) for p, b in singles.items())
+    ):
+        time.sleep(0.1)
+    _signal(
+        signal.SIGKILL,  # windows-footgun: ok (POSIX-gated above)
+        {g: p for g, p in targets.items() if _pid_alive(p)},
+        {p: b for p, b in singles.items() if _same(p, b)},
     )
-    return len(targets)
+    _log.warning(
+        "kanban: reaped %d run-identified process group(s) and %d profile-matched "
+        "process(es) that escaped worker session of %s run %s",
+        len(targets), len(singles), task_id, run_id,
+    )
+    return reaped
 
 
 #: TERM -> KILL grace for the exit-path and orphan-sweep reaps (t_446b6b99).
@@ -17948,6 +18234,8 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
     return argv
 _SHIM_MODEL_FAMILY_RANK = (("haiku", 1), ("sonnet", 2), ("opus", 3))
 SHIM_MODEL_CAPPED_FROM_ENV = "HERMES_KANBAN_SHIM_MODEL_CAPPED_FROM"
+# Per-card harness brain as claimed (t_a8f335c5); read by the lane runner.
+CARD_BRAIN_ENV = "HERMES_KANBAN_CARD_BRAIN"
 _SHIM_MODEL_ID_RE = re.compile(r"claude-(haiku|sonnet|opus)-\d[0-9a-z.-]*$")
 
 

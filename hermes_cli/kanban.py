@@ -198,6 +198,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
     d["reasoning_effort"] = t.reasoning_effort
+    d["brain"] = getattr(t, "brain", None)
     d["pin_sub_reason"] = getattr(t, "pin_sub_reason", None)
     d["pin_sub_fallback"] = bool(getattr(t, "pin_sub_fallback", False))
     d["unhomed"] = bool(getattr(t, "unhomed", False))
@@ -809,6 +810,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 flagship_override_reason=getattr(args, "allow_flagship", None),
                 flagship_override_author=args.created_by or _profile_author(),
                 reasoning_effort=getattr(args, "reasoning_effort", None),
+                brain=getattr(args, "brain", None),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
@@ -1234,6 +1236,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             _fb = "family pool" if task.pin_sub_fallback else "wait"
             field("pin", f"{_pin_badge(task)} (capped sub => {_fb})")
     field("reasoning", task.reasoning_effort or "inherit")
+    if getattr(task, "brain", None):
+        field("brain", task.brain)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -1627,6 +1631,20 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     model_given = model_given or bool(model) or bool(provider)
     effort = override.reasoning_effort if override else getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
+    clear_brain = bool(getattr(args, "clear_brain", False))
+    brain_arg = getattr(args, "brain", None)
+    touch_brain = clear_brain or brain_arg is not None
+    brain = None
+    if brain_arg is not None:
+        # Validate BEFORE any write: a typo'd brain must not half-apply.
+        try:
+            brain = kb.normalize_card_brain(brain_arg)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        if brain is None:
+            print("kanban: --brain needs a lane (use --clear-brain to unset)", file=sys.stderr)
+            return 2
     # --allow-flagship (main) and --firepower (alias) share dest=allow_flagship.
     firepower_reason = (
         override.firepower if override and override.firepower
@@ -1645,7 +1663,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     # "unchanged" here, not "clear"). Without either effort flag the
     # historical contract holds — a missing or 'none' positional clears the
     # model/provider override.
-    touch_model = model_given or (effort is None and not clear_effort)
+    touch_model = model_given or (effort is None and not clear_effort and not touch_brain)
     if provider and not touch_model:
         print("kanban: --provider requires a model", file=sys.stderr)
         return 2
@@ -1687,6 +1705,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if live and reclaim:
         print("kanban: --live and --reclaim are exclusive (--live keeps the "
               "running worker; --reclaim aborts it)", file=sys.stderr)
+        return 2
+    if live and touch_brain:
+        # The brain is the lane the harness process was launched through; a
+        # running harness cannot change it in place.
+        print("kanban: --brain applies on the next dispatch (drop --live, or "
+              "use --reclaim)", file=sys.stderr)
         return 2
     if live and (clear_effort or (touch_model and not model and not provider)):
         # A clear resolves through lane overrides / the capped-pool ladder at
@@ -1793,6 +1817,9 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 if effort is not None or clear_effort:
                     write.touch_effort = True
                     write.effort = None if clear_effort else effort
+                if touch_brain:
+                    write.touch_brain = True
+                    write.brain = None if clear_brain else brain
                 writes.append(write)
 
             written = set(kb.apply_batch_route_writes(
@@ -1888,6 +1915,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     if live_run is not None else "applies on next dispatch"
                 )
                 print(f"Set reasoning effort on {task_id}: {effort} ({when})")
+            if clear_brain:
+                print(f"Cleared brain on {task_id} (worker uses its profile's foreign_lane.brain)")
+            elif touch_brain:
+                print(f"Set brain on {task_id}: {brain} "
+                      f"({'reclaimed; redispatches now' if redispatched else 'applies on next dispatch'})")
             continue
         if touch_model and (model or provider):
             route = f"{provider}/{model or inherited_models[task_id]}" if provider else model
@@ -1901,6 +1933,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             print(f"{task_id}: effort=profile-default applies={applies}")
         elif effort is not None:
             print(f"{task_id}: effort={effort} applies={applies}")
+        if clear_brain:
+            print(f"{task_id}: brain=profile-default applies={applies}")
+        elif touch_brain:
+            print(f"{task_id}: brain={brain} applies={applies}")
     # Selector-chosen cards that stopped matching before the writer lock were
     # NOT written; name each one so the receipt covers every selected card.
     for task_id, why in skipped.items():
@@ -3759,7 +3795,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             return _err(f"no such task: {args.task_id}")
-        kbn.add_notify_sub(
+        outcome = kbn.add_notify_sub(
             conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
             chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
             user_id_alt=getattr(args, "user_id_alt", None),
@@ -3769,8 +3805,20 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
                 or ("notify+wake" if getattr(args, "wake", False) else None)
             ),
             delivery_metadata=delivery_metadata or None,
+            also=bool(getattr(args, "also", False)),
         )
-    print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
+        if outcome == "kept":
+            owners = [
+                s for s in kbn.list_notify_subs(conn, args.task_id)
+                if str(s.get("platform") or "").lower() == args.platform.lower()
+            ]
+            owner = owners[0] if owners else {}
+            print(f"subscription kept: {owner.get('platform')}:{owner.get('chat_id')} "
+                  f"owns {args.task_id} (live session); not subscribing "
+                  f"{args.platform}:{args.chat_id}. Pass --also to add a second chat.")
+            return 0
+    verb = "Re-homed" if outcome == "rehomed" else "Subscribed"
+    print(f"{verb} {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
     return 0
 
@@ -3932,6 +3980,8 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
     two sessions. Evidence comes from the gateway routing index; a chat with no
     unambiguous identity is reported and left untouched.
     """
+    if getattr(args, "dedupe", False):
+        return _cmd_notify_repair_dedupe(args)
     index = _routing_participant_index()
     evidence_unavailable = index is None
     try:
@@ -4086,6 +4136,68 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
             print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
                   f"  [{row['action']}]")
     return 0
+
+
+def _cmd_notify_repair_dedupe(args: argparse.Namespace) -> int:
+    """``notify-repair --dedupe [--apply] [--all-boards] [--json]`` (t_484a3c72).
+
+    One subscriber chat per card and platform. Lists every card with more
+    than one; keeps the home-session chat (else the oldest row) and drops the
+    rest when ``--apply`` is given.
+    """
+    apply = bool(getattr(args, "apply", False))
+    if getattr(args, "all_boards", False):
+        slugs = [
+            str(m.get("slug") or "").strip()
+            for m in kb.enumerating_each(kb.list_boards())
+        ]
+        slugs = [s for s in slugs if s]
+    else:
+        slugs = [None]
+    rows: list[dict] = []
+    # A board that could not be scanned is a FAILURE, not an all-clear: never
+    # print "every card has one subscriber" or exit 0 over it (Prism P1
+    # cf49dc4f0623, t_030662ba). The remaining boards are still scanned.
+    failed: list[dict] = []
+    for slug in slugs:
+        try:
+            ctx = (kb.connect_closing(board=slug) if slug is not None
+                   else kb.connect_closing())
+            with ctx as conn:
+                board_rows = kb.dedupe_notify_subs(conn, apply=apply)
+        except Exception as exc:
+            failed.append({"board": slug or "default",
+                           "error": f"{type(exc).__name__}: {exc}"})
+            print(f"notify-repair --dedupe: board {slug or 'default'!r} FAILED — "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
+        for r in board_rows:
+            if slug is not None:
+                r["board"] = slug
+            rows.append(r)
+    rc = 1 if failed else 0
+    dropped = sum(len(r["dropped"]) for r in rows)
+    if getattr(args, "json", False):
+        print(json.dumps({"apply": apply, "cards": len(rows), "dropped": dropped,
+                          "failed": failed, "rows": rows},
+                         indent=2, ensure_ascii=False))
+        return rc
+    if failed:
+        print(f"notify-repair --dedupe: {len(failed)} board(s) FAILED to scan: "
+              + ", ".join(f["board"] for f in failed))
+    if not rows:
+        if not failed:
+            print("notify-repair --dedupe: every card has one subscriber chat per platform.")
+        return rc
+    verb = "dropped" if apply else "would drop"
+    print(f"notify-repair --dedupe: {len(rows)} card(s) with >1 subscriber chat; "
+          f"{verb} {dropped} subscription(s)" + ("" if apply else " (dry run; --apply to write)"))
+    for r in rows:
+        board = f"[{r['board']}] " if r.get("board") else ""
+        gone = ", ".join(f"{d['platform']}:{d['chat_id']}" for d in r["dropped"])
+        print(f"  {board}{r['task_id']}  keep {r['kept']['platform']}:{r['kept']['chat_id']}"
+              f" ({r['reason']})  {verb} {gone}")
+        return rc
 
 
 def _cmd_log(args: argparse.Namespace) -> int:

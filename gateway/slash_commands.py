@@ -1403,8 +1403,16 @@ class GatewaySlashCommandsMixin(
             # error). Adapters without refresh_skill_group are skipped; the in-process reload suffices.
             for adapter in list(self.adapters.values()):
                 refresh = getattr(adapter, "refresh_skill_group", None)
+                if not callable(refresh):
+                    continue
                 try:
-                    maybe = refresh() if callable(refresh) else None
+                    if inspect.iscoroutinefunction(refresh):
+                        maybe = refresh()
+                    else:
+                        # Sync refreshes rescan the skill catalog on disk;
+                        # keep that filesystem work off the event loop
+                        # (t_620ba53d).
+                        maybe = await asyncio.to_thread(refresh)
                     if inspect.isawaitable(maybe):
                         await maybe
                 except Exception as exc:

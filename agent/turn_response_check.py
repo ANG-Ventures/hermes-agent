@@ -149,6 +149,14 @@ def check_api_response(
             return _verdict(_iv.action, _iv.result)
 
     agent._turn_received_provider_response = True
+    if _retry.invalid_response_retry_floor is not None:
+        # t_d35beb85: the same-route retry of an empty tool_use 200 came back valid
+        # (cache_read ~= prompt => it was warm).
+        from agent import fallback_events as _fbe_ok
+
+        _fbe_ok.record_invalid_response(
+            agent, _retry.invalid_response_retry_floor, "retry_ok", response=response)
+        _retry.invalid_response_retry_floor = None
     finish_reason = _derive_finish_reason(agent, response, messages)
     from hermes_cli.observability.shared_metrics_harness import record_reply_finish
     record_reply_finish(agent, response, finish_reason)
@@ -285,13 +293,46 @@ def retry_invalid_response(
             return _verdict("continue")
     retry_count += 1
 
-    # Eager fallback: empty/malformed responses often mean rate limiting.
-    if agent._fallback_index < len(agent._fallback_chain):
-        agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
-    # Dead-letter evidence only (fork #1613, t_b2e9ef12); class unchanged.
     from agent import fallback_events as _fbe_floor
+
+    # t_d35beb85: a billed 200 with stop_reason=tool_use and an EMPTY content list is a
+    # transient empty body from the same model (17x/24 h on claude-alr, 6 seats). Retry it
+    # ONCE on the same route (warm cache) before failing over; every other invalid shape
+    # keeps the eager fallback.
+    _ir_prev = _retry.invalid_response_retry_floor
     _fbe_floor.stash_response_failure(
         agent, "invalid_response", response, detail=", ".join(error_details), elapsed_s=api_duration)
+    _ir_floor = dict(((getattr(agent, "_pending_fallback_error", None) or {}).get("floor")) or {})
+    if (_ir_prev is None and not _retry.invalid_response_retry_done
+            and _fbe_floor.empty_tool_use_floor(response)):
+        _retry.invalid_response_retry_floor = _ir_floor
+        _retry.invalid_response_retry_done = True
+        agent._buffer_status("⚠️ Empty tool_use response — retrying once on the same route...")
+        _ir_end = time.time() + _fbe_floor.INVALID_RETRY_BACKOFF_S
+        while time.time() < _ir_end and not agent._interrupt_requested:
+            time.sleep(0.1)
+        # The retry is free of the retry budget: with agent.api_max_retries=1 it must still
+        # happen, and it must not leave the while loop with an invalid response in hand.
+        retry_count -= 1
+        return _verdict("continue")  # same provider/route; the loop-top checkpoint handles a stop
+    if _ir_prev is not None:
+        # The retry came back invalid too. Same shape (same err_hash) => provider-wide for
+        # this turn: the failover skips entries on this provider.
+        _ir_same = _fbe_floor.floor_err_hash(_ir_floor) == _fbe_floor.floor_err_hash(_ir_prev)
+        _retry.invalid_response_retry_floor = None
+        _fbe_floor.record_invalid_response(agent, _ir_prev, "retry_same" if _ir_same else "retry_other")
+        if _ir_same:
+            _fbe_floor.stash_response_failure(
+                agent, "invalid_response", response, detail=", ".join(error_details),
+                elapsed_s=api_duration, repeat=True)
+    elif _ir_floor.get("site") and agent._fallback_index < len(agent._fallback_chain):
+        _fbe_floor.record_invalid_response(agent, _ir_floor, "fallback")
+
+    # Eager fallback: an empty/malformed response (other than the retried shape above)
+    # switches to fallback at once. No FailoverReason is fabricated; the stashed floor
+    # names the class (provider_invalid_response) for the ledger and rider.
+    if agent._fallback_index < len(agent._fallback_chain):
+        agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
     if agent._try_activate_fallback():
         active_system_prompt = _arm_fallback_restart(
             agent, api_messages, active_system_prompt, _retry)

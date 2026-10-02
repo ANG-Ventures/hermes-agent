@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import hashlib
 import importlib.metadata
 import inspect
@@ -1778,12 +1779,32 @@ _published_tui_host_lock = threading.Lock()
 
 
 def _plugin_home_key() -> Path:
-    """Resolved active Hermes home — the key for per-profile plugin managers (plugins capture the
-    home at registration, so a process serving several profiles cannot share one manager)."""
+    """Return the profile/home key for process-global plugin state.
+
+    Plugins are discovered from ``get_hermes_home() / "plugins"`` and some
+    plugins (notably context engines such as hermes-lcm) capture that home
+    at registration time for profile-scoped storage. A long-lived process
+    can temporarily switch Hermes home (env var *or* the context-local
+    ``set_hermes_home_override()``) while serving another profile, so the
+    plugin manager must be scoped to the active Hermes home instead of
+    being one process-wide singleton.
+
+    The realpath is memoised per lexical home: this runs on every
+    ``has_hook`` / ``invoke_hook`` (event-loop hot path), and ``resolve()`` is
+    one ``lstat`` per path component.  Each of those drops the GIL, so under a
+    GIL-busy thread the walk held the gateway loop for 30s (t_1fd05a3a,
+    Discord ``on_thread_create`` -> ``has_hook``, 2026-10-01 23:54:29).
+    """
+    home = get_hermes_home().expanduser()
+    return _resolve_plugin_home(str(home))
+
+
+@functools.lru_cache(maxsize=64)
+def _resolve_plugin_home(home: str) -> Path:
     try:
-        return get_hermes_home().expanduser().resolve()
+        return Path(home).resolve()
     except Exception:
-        return get_hermes_home().expanduser()
+        return Path(home)
 
 
 def _clear_plugin_submodules(manager: Optional[PluginManager]) -> None:

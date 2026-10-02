@@ -152,3 +152,168 @@ def test_lifecycle_channel_target_rules():
     assert lifecycle_channel_target(ch, "blocked", {"kind": "capability"}, T()) == ch
     assert lifecycle_channel_target(ch, "crashed", {}, T()) is None
     assert lifecycle_channel_target(None, "completed", {}, T()) is None
+
+
+# --- kanban.lifecycle_digest_seconds (t_d62bd921) ------------------------------------------
+
+
+def _set_digest(value):
+    path = get_hermes_home() / "config.yaml"
+    cfg = yaml.safe_load(path.read_text()) if path.exists() else {}
+    cfg = cfg or {}
+    cfg.setdefault("kanban", {})["lifecycle_digest_seconds"] = value
+    path.write_text(yaml.safe_dump(cfg))
+
+
+def _three(conn):
+    a = _card(conn)
+    kb.complete_task(conn, a, summary="one")
+    b = _card(conn)
+    kb.request_review(conn, b, summary="two", force=True)
+    c = _card(conn)
+    kb.block_task(conn, c, reason="three", kind="dependency")
+    return a, b, c
+
+
+def _run_digest(tmp_path, monkeypatch, window, make, clock):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "lc.db"))
+    kb.init_db()
+    _set_channel(f"telegram:{LOG}")
+    _set_digest(window)
+    with kb.connect_closing() as conn:
+        ids = make(conn)
+    adapter = RecordingAdapter()
+    runner = _runner(adapter)
+    import gateway.kanban_watchers as kw
+
+    monkeypatch.setattr(kw.time, "time", lambda: clock[0])
+    asyncio.run(_tick(monkeypatch, runner))
+    return ids, adapter, runner
+
+
+def test_digest_batches_routed_lines_into_one_post(tmp_path, monkeypatch):  # mutant: digest-bypass
+    clock = [1000.0]
+    (a, b, c), adapter, runner = _run_digest(tmp_path, monkeypatch, 900, _three, clock)
+    # Held, not posted; each subscriber still woken for its own card.
+    assert adapter.sent == [], adapter.sent
+    assert len(adapter.handled) == 3, "wakes are never delayed by the digest"
+    assert len(runner._kanban_lifecycle_digest) == 3
+    # Window elapses: one message carrying all three transitions.
+    clock[0] += 900
+    asyncio.run(runner._kanban_lifecycle_digest.flush(clock[0]))
+    assert [m["chat_id"] for m in adapter.sent] == [LOG]
+    text = adapter.sent[0]["text"]
+    assert "3 transition(s)" in text and "family=digest:kanban-lifecycle" in text
+    assert f"{a} done" in text and "ready for review" in text and f"{c} blocked" in text
+
+
+def test_digest_not_due_before_window(tmp_path, monkeypatch):
+    clock = [1000.0]
+    _ids, adapter, runner = _run_digest(tmp_path, monkeypatch, 900, _three, clock)
+    asyncio.run(runner._kanban_lifecycle_digest.flush(clock[0] + 899))
+    assert adapter.sent == []
+
+
+def test_digest_zero_keeps_one_post_per_line(tmp_path, monkeypatch):
+    clock = [1000.0]
+    _ids, adapter, runner = _run_digest(tmp_path, monkeypatch, 0, _three, clock)
+    assert [m["chat_id"] for m in adapter.sent] == [LOG, LOG, LOG]
+    assert len(runner._kanban_lifecycle_digest) == 0
+
+
+def test_digest_never_holds_origin_lines(tmp_path, monkeypatch):
+    def make(conn):
+        tid = _card(conn)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "stalled", {"progress_age_seconds": 900})
+        hi = _card(conn, priority=100)
+        kb.block_task(conn, hi, reason="need a ruling", kind="needs_input")
+        return tid, hi
+
+    clock = [1000.0]
+    _ids, adapter, runner = _run_digest(tmp_path, monkeypatch, 900, make, clock)
+    assert [m["chat_id"] for m in adapter.sent] == ["origin", "origin"]
+    assert len(runner._kanban_lifecycle_digest) == 0
+
+
+def test_digest_failed_send_keeps_batch_for_next_tick():
+    from gateway.kanban_lifecycle_digest import LifecycleDigest
+
+    class Flaky:
+        def __init__(self):
+            self.fail, self.sent = True, []
+
+        async def send(self, chat_id, text, metadata=None):
+            if self.fail:
+                raise RuntimeError("503")
+            self.sent.append(text)
+
+    ad = Flaky()
+    dg = LifecycleDigest()
+    dg.add(("discord", "L"), ad, "✔ [default] @w Kanban t_1 done — x", 60, 0.0)
+    dg.add(("discord", "L"), ad, "👀 [default] @w Kanban t_2 ready for review — y", 60, 1.0)
+    assert asyncio.run(dg.flush(61.0)) == 0 and len(dg) == 2
+    ad.fail = False
+    assert asyncio.run(dg.flush(62.0)) == 1 and len(dg) == 0
+    assert "2 transition(s)" in ad.sent[0]
+
+
+def test_digest_single_line_posts_unchanged_and_bad_config_is_off():
+    from gateway.kanban_lifecycle_digest import parse_digest_seconds, render
+
+    line = "✔ [default] @w Kanban t_1 done — x\nhandoff"
+    assert render([line]) == line
+    assert [parse_digest_seconds(v) for v in (None, "", "abc", -5, 0, "900", 900)] == [0, 0, 0, 0, 0, 900, 900]
+
+
+def _second_sub(conn, tid, chat):
+    """A legacy/--also second subscriber row, written raw so the test does not
+    depend on the admission rule it sits next to."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id,"
+            " user_id, chat_type, delivery_mode, created_at, last_event_id)"
+            " VALUES (?, 'telegram', ?, '', 'u2', 'group', 'notify', 0,"
+            " (SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?))",
+            (tid, chat, tid),
+        )
+
+
+def test_multi_subscriber_card_posts_one_receipt(tmp_path, monkeypatch):
+    """t_484a3c72: a card with two subscriber chats posted its done line to the
+    lifecycle channel twice. Receipts land in exactly one place."""
+    def make(conn):
+        tid = _card(conn, mode="notify")
+        _second_sub(conn, tid, "other-chat")
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, adapter = _run(tmp_path, monkeypatch, f"telegram:{LOG}", make)
+    done = [m for m in adapter.sent if tid in m["text"] and " done" in m["text"]]
+    assert [m["chat_id"] for m in done] == [LOG], adapter.sent
+
+
+def test_subscriber_that_is_the_lifecycle_channel_gets_one_line(tmp_path, monkeypatch):
+    def make(conn):
+        tid = _card(conn, mode="notify")
+        _second_sub(conn, tid, LOG)
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, adapter = _run(tmp_path, monkeypatch, f"telegram:{LOG}", make)
+    assert [m["chat_id"] for m in adapter.sent if tid in m["text"]] == [LOG], adapter.sent
+
+
+def test_multi_subscriber_card_digests_one_line(tmp_path, monkeypatch):
+    """t_484a3c72 x t_d62bd921: with the digest on, a two-subscriber card adds
+    its done line to the batch once."""
+    def make(conn):
+        tid = _card(conn, mode="notify")
+        _second_sub(conn, tid, "other-chat")
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    clock = [1000.0]
+    tid, adapter, runner = _run_digest(tmp_path, monkeypatch, 900, make, clock)
+    assert adapter.sent == []
+    assert len(runner._kanban_lifecycle_digest) == 1

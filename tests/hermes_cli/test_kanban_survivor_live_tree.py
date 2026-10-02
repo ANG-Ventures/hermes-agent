@@ -834,15 +834,38 @@ def test_landed_cleanup_rechecks_live_reachability(board, tmp_path):
 
 
 def test_diff_collision_over_attachment_limit_holds_workspace(board, tmp_path, monkeypatch):
-    """A matching patch-id cannot bypass the cap by claiming a durable ref."""
+    """A matching patch-id cannot bypass the cap by claiming a durable ref: with the survivor push
+    refused, the size refusal stands and nothing is deleted."""
+    import hermes_cli.kanban_survivor as survivor_mod
+
     tid = kb.create_task(board, title="oversized divergent work")
     ws, _, _, _ = divergent_history(tmp_path)
     kbw.set_workspace_path(board, tid, ws)
     monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
-    with pytest.raises(ValueError, match="exceeds attachment limit"):
+    monkeypatch.setattr(survivor_mod, "_push_oversize", lambda *a: (None, "push refused (test)"))
+    with pytest.raises(ValueError, match="exceeds attachment limit.*push refused"):
         kb.complete_task(board, tid, metadata={"changed_files": ["unpublished.py"]})
     assert kb.get_task(board, tid).status != "done"
     assert (ws / "unpublished.py").read_text() == "secret_work = 1\n"
+
+
+def test_over_attachment_limit_stores_pushed_ref_not_body(board, tmp_path, monkeypatch):
+    """t_f1c86daf: an over-limit artifact is pushed as one commit and the REF is recorded; the pushed
+    commit holds the bytes no published ref held (unpublished.py), read back from the remote."""
+    tid = kb.create_task(board, title="oversized divergent work, pushable")
+    ws, _, _, mirror = divergent_history(tmp_path)
+    kb.set_workspace_path(board, tid, ws)
+    (ws / "untracked_note.md").write_text("only on disk\n")
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["unpublished.py"]})
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["kind"] == "ref"
+    ref = saved["refs"][0]
+    assert (ref["matched_by"], ref["branch"]) == ("oversize-push", f"kanban-survivor/{tid}")
+    assert git(mirror, "rev-parse", f"refs/heads/kanban-survivor/{tid}") == ref["sha"]
+    assert git(mirror, "show", f"{ref['sha']}:unpublished.py") == "secret_work = 1"
+    assert git(mirror, "show", f"{ref['sha']}:untracked_note.md") == "only on disk"
+    assert not any(a.filename.endswith((".bundle", ".patch")) for a in kb.list_attachments(board, tid))
 
 
 def stored_survivor(conn, tid):
