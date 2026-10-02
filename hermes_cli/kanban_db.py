@@ -19656,7 +19656,7 @@ def _reap_run_env_escapees(
     ):
         time.sleep(0.1)
     _signal(
-        signal.SIGKILL,
+        signal.SIGKILL,  # windows-footgun: ok (POSIX-gated above)
         {g: p for g, p in targets.items() if _pid_alive(p)},
         {p: b for p, b in singles.items() if _same(p, b)},
     )
