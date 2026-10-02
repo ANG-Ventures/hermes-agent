@@ -73,8 +73,10 @@ async def test_stop_ends_background_delegations_of_the_session(monkeypatch, sess
         await runner._interrupt_and_clear_session(key, source, interrupt_reason="stop", invalidation_reason="stop_command")
     else:
         reply = await runner._handle_stop_command(MessageEvent(text="/stop", message_type=MessageType.TEXT, source=source))
-        # The chat is told something WAS stopped, not "No active task to stop."
-        assert "Stopped" in str(getattr(reply, "text", reply))
+        # The chat is told something is being stopped, not "No active task to stop." (The fork's
+        # catalog words it present-progressive — test_stop_honest_wording.py — so pin the key.)
+        from agent.i18n import t
+        assert str(getattr(reply, "text", reply)) == t("gateway.stop.stopped")
 
     stop_fn.assert_called_once()
     other_fn.assert_not_called()  # another chat's background work is untouched

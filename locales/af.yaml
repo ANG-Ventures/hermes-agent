@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Begin 'n nuwe gesprek"
+        arg_name: "Optional title for the new session"
         followup: "Nuwe gesprek begin~"
       reset:
         description: "Herstel jou Hermes-sessie"
+        arg_name: "Optional title for the new session"
         followup: "Sessie herstel~"
       model:
         description: "Wys of verander die model"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Word herhaal~"
       undo:
         description: "Verwyder die laaste uitruiling"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Wys Hermes-sessiestatus"
         followup: "Status gestuur~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Wat om te plan. Laat leeg om uit die gesprek af te lei."
       compress:
         description: "Pers gesprekskonteks saam"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Stel of wys die sessietitel"
         arg_name: "Sessietitel. Laat leeg om die huidige te wys."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Sessienaam om te hervat. Laat leeg om sessies te lys."
       usage:
         description: "Wys tokengebruik vir hierdie sessie"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Wys beskikbare opdragte"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Aantal dae om te ontleed (verstek: 7)"
       reload_skills:

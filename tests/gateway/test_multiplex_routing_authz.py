@@ -7,6 +7,7 @@ exercises the real resolvers (no patched predicates).
 import asyncio
 import threading
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -50,6 +51,14 @@ def mux(tmp_path, monkeypatch):
         monkeypatch.delenv(key, raising=False)
     prev = secret_scope.is_multiplex_active()
     secret_scope.set_multiplex_active(True)
+    # The fork's hermetic conftest pins ``hermes_state.DEFAULT_DB_PATH`` at one sandbox store whenever
+    # hermes_state is already imported (it is: ``gateway.session`` imports it), and that pin WINS over
+    # the profile scope inside ``_default_db_path()``. Restore the import-time sentinel so a scoped
+    # ``_session_db`` resolves the serving profile's state.db (same idiom as
+    # test_housekeeping_profile_scope.py); the sentinel must still resolve inside the sandbox.
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    assert Path(hermes_state._default_db_path()).is_relative_to(tmp_path)
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)

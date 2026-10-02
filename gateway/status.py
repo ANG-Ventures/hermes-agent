@@ -2,6 +2,7 @@
 home/profile) that tell whether the gateway daemon is running."""
 
 import asyncio
+import concurrent.futures
 import contextlib
 import copy
 import hashlib
@@ -1431,7 +1432,10 @@ def write_runtime_status(
     ``wait_timeout`` bounds how long the caller waits for durable persistence.
     A timed-out update remains queued for the single background writer.
     Keyword ``fields`` are those of ``_prepare_runtime_status_update``.
+    FENCES the ordered lane first: any write queued before this call lands before
+    this one does.
     """
+    _fence_runtime_status_lane()
     with _runtime_status_state_lock:
         path, payload, previous_payload = _prepare_runtime_status_update(
             reload_existing=reload_existing, **fields)
@@ -1441,6 +1445,11 @@ def write_runtime_status(
     # timed-out update is still written by the background writer, so its transition happened.
     _emit_runtime_status_transition(previous_payload, payload)
     return writer.wait(generation, timeout=wait_timeout)
+
+
+def write_runtime_status_locked(**kwargs: Any) -> None:
+    """Backward-compatible alias for the serialized public writer (fork call sites)."""
+    write_runtime_status(**kwargs)
 
 
 def publish_runtime_status(**fields: Any) -> int:
@@ -1456,15 +1465,52 @@ def publish_runtime_status(**fields: Any) -> int:
     return generation
 
 
-def submit_runtime_status_write(**kwargs: Any) -> None:
-    """Queue a runtime-status write without blocking (fork call site in ``gateway/run.py``).
+# Ordered off-loop lane for the per-turn status writes (fork, #817).  Lives HERE,
+# not on ``GatewayRunner``, so no public lifecycle writer can bypass it: the direct
+# ``startup_failed`` writers in ``gateway/run.py``, the adapters' health writer and
+# ``session_db_recovery`` all call ``write_runtime_status``, which fences the lane
+# first -- a direct terminal write can never be overtaken by an older deferred one.
+_RUNTIME_STATUS_LANE = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="gateway-runtime-status")
+_RUNTIME_STATUS_LANE_LOCAL = threading.local()
 
-    The ordered single-writer lane this once fronted is now ``_RuntimeStatusWriter``;
-    ``publish_runtime_status`` is the same non-blocking, ordered, merge-safe path.
-    Best-effort -- a failed status write must never disrupt a turn.
+
+def _fence_runtime_status_lane() -> None:
+    """Block until every write already queued on the ordered lane has run.
+
+    Skipped when already ON the lane: ordering is inherent there, and fencing from
+    inside the single worker would deadlock on itself.
     """
+    if getattr(_RUNTIME_STATUS_LANE_LOCAL, "in_lane", False):
+        return
     with contextlib.suppress(Exception):
-        publish_runtime_status(**kwargs)
+        _RUNTIME_STATUS_LANE.submit(lambda: None).result()
+
+
+def submit_runtime_status_write(**kwargs: Any) -> None:
+    """Queue a runtime-status write on the ordered lane without blocking.
+
+    The non-terminal off-loop path (``GatewayRunner._dispatch_runtime_status_write``):
+    the caller returns immediately and the write runs on the lane in submission
+    order.  Best-effort -- a failed status write must never disrupt a turn.
+    """
+    def _run() -> None:
+        _RUNTIME_STATUS_LANE_LOCAL.in_lane = True
+        try:
+            # Module-global lookup, not a direct call: existing tests monkeypatch
+            # ``gateway.status.write_runtime_status`` as a spy and must observe it.
+            globals()["write_runtime_status"](**kwargs)
+        except Exception:
+            pass
+        finally:
+            _RUNTIME_STATUS_LANE_LOCAL.in_lane = False
+
+    try:
+        _RUNTIME_STATUS_LANE.submit(_run)
+    except Exception:
+        # Executor refused the job (shutdown): inline so the update is not dropped.
+        with contextlib.suppress(Exception):
+            globals()["write_runtime_status"](**kwargs)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:

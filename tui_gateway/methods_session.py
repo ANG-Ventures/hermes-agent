@@ -2015,6 +2015,18 @@ def _(rid, params: dict, session: dict) -> dict:
     return result
 
 
+@_session_method("session.redo", live=True)
+def _(rid, params: dict, session: dict) -> dict:
+    """Fork: re-activate the last ``n`` undone half-turns (DB-backed, see ``_redo_session_core``)."""
+    if session.get("running"):
+        return _err(rid, 4009, "session busy — /interrupt the current turn before /redo")
+    try:
+        n = int(params.get("n", params.get("count", 1)) or 1)
+    except (TypeError, ValueError):
+        return _err(rid, 4004, "redo: invalid count — use /redo or /redo N")
+    return _redo_session_core(rid, session, n)
+
+
 def _compute_host_ack_error(rid, ack: dict, code: int, default: str):
     """``_err`` for a ``control.error``/``error`` ack, else None."""
     if ack.get("type") in {"control.error", "error"}:

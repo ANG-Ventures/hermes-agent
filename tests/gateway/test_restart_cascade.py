@@ -525,16 +525,26 @@ def test_command_invokes_safe_restart_matcher(tmp_path, monkeypatch):
     assert m("echo hi | python3 safe-restart.py") is True
 
 
+def _gateway_turn_source() -> str:
+    """Concatenated source of the gateway turn pipeline. Upstream split ``gateway/run.py`` into
+    ``run_turn*.py`` siblings (the progress callback lives in ``run_turn_runner``, the post-turn
+    gate and the handler's finally in ``run_turn``); the guards below scan the whole pipeline so
+    a relocation cannot make them vacuous, and a duplicated call site in any sibling still trips."""
+    import inspect
+    import gateway.run as gr
+    import gateway.run_turn as grt
+    import gateway.run_turn_runner as grtr
+
+    return "\n".join(inspect.getsource(m) for m in (gr, grt, grtr))
+
+
 def test_c1_detection_present_in_real_progress_callback():
     """Guard the REAL code, not just the mirror: the progress_callback in
     gateway/run.py must contain the safe-restart.py → _session_initiated_restart
     detection. The live callback is a closure inside _run_agent (not unit-callable),
     so the behavioral test above uses a faithful mirror; this asserts the real
     branch exists so deleting it fails CI. RED: remove the C1 block → this fails."""
-    import inspect
-    import gateway.run as gr
-
-    src = inspect.getsource(gr)
+    src = _gateway_turn_source()
     # C1 is uniquely identified by the safe-restart matcher guarding the
     # initiated-restart flag in the tool-progress callback.
     assert "_command_invokes_safe_restart" in src, "C1 matcher missing from gateway/run.py"
@@ -787,10 +797,7 @@ def test_boot_id_present_and_not_pid_only_on_this_host(tmp_path, monkeypatch):
 def test_single_gate_call_site():
     """D-6: _apply_post_turn_resume_gate has exactly one call site (the clean-turn
     gate). A second site would need its own breadcrumb-consume reasoning."""
-    import inspect
-    import gateway.run as gr
-
-    src = inspect.getsource(gr)
+    src = _gateway_turn_source()
     # Direct call or offloaded via asyncio.to_thread(self._apply_..., key).
     # (t_7da6cadf: the offloaded call now also passes marked_at=..., FleetReview #1043.)
     n = src.count("self._apply_post_turn_resume_gate(session_key)") + src.count(
@@ -802,10 +809,7 @@ def test_single_gate_call_site():
 def test_finally_consume_present_in_handler():
     """D-6 defense: the handler's finally block must consume the breadcrumb so a
     gate-skip (exception/early-return) can't leak it within-boot."""
-    import inspect
-    import gateway.run as gr
-
-    src = inspect.getsource(gr)
+    src = _gateway_turn_source()
     assert "_consume_restart_initiated_breadcrumb(_sk_cleanup)" in src, (
         "finally-block defensive consume missing"
     )

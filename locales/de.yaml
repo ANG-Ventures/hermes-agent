@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Eine neue Konversation starten"
+        arg_name: "Optional title for the new session"
         followup: "Neue Konversation gestartet~"
       reset:
         description: "Ihre Hermes-Sitzung zurücksetzen"
+        arg_name: "Optional title for the new session"
         followup: "Sitzung zurückgesetzt~"
       model:
         description: "Modell anzeigen oder wechseln"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Wird wiederholt~"
       undo:
         description: "Den letzten Austausch entfernen"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Status der Hermes-Sitzung anzeigen"
         followup: "Status gesendet~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Was geplant werden soll. Leer lassen, um es aus der Konversation abzuleiten."
       compress:
         description: "Konversationskontext komprimieren"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Sitzungstitel festlegen oder anzeigen"
         arg_name: "Sitzungstitel. Leer lassen, um den aktuellen anzuzeigen."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Name der fortzusetzenden Sitzung. Leer lassen, um Sitzungen aufzulisten."
       usage:
         description: "Token-Verbrauch dieser Sitzung anzeigen"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Verfügbare Befehle anzeigen"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Anzahl der zu analysierenden Tage (Standard: 7)"
       reload_skills:

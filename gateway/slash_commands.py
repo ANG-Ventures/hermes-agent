@@ -3744,8 +3744,10 @@ class GatewaySlashCommandsMixin(
             switch_model as _switch_model, parse_model_switch_args,
             resolve_persist_behavior,
             list_authenticated_providers,
-            list_picker_providers,
         )
+        # From the source module (not model_switch's re-export) so tests patching
+        # ``hermes_cli.model_switch_providers.list_picker_providers`` intercept, as for upstream's sibling.
+        from hermes_cli.model_switch_providers import list_picker_providers
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
@@ -3925,6 +3927,11 @@ class GatewaySlashCommandsMixin(
                         max_models=50,
                         include_moa=True,
                         excluded_providers=excluded_provs,
+                        # #74003 (upstream): the chat /model reply is a READ path — cache-only
+                        # catalogs, and live-probe only the selected custom endpoint, like the GUI.
+                        non_blocking_catalogs=True,
+                        probe_custom_providers=False,
+                        probe_current_custom_provider=True,
                     )
                 except Exception:
                     providers = []

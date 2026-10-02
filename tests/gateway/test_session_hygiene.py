@@ -898,11 +898,11 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     StreamingCompressAgent.last_instance.close.assert_called_once()
 
     # Behavior witness 1: turn-hold expiry must NOT stamp the idle-timeout
-    # provenance or send the "no output" user message.
+    # provenance or send the idle-timeout user message.
+    from agent.i18n import t as _t
     sent_contents = [m["content"] for m in adapter.sent]
     assert not any(
-        "timed out" in c.lower() and "no output" in c.lower()
-        for c in sent_contents
+        c.startswith(_t("gateway.compress.hygiene_timeout")) for c in sent_contents
     ), f"turn-hold must not send idle-timeout message, got: {sent_contents}"
     assert any(
         "deferred" in c.lower() or "still streaming" in c.lower()
@@ -1084,12 +1084,13 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
     )
     assert runner._run_agent.await_count == 1
 
-    # Behavior witness: idle timeout MUST send the "no output" message.
+    # Behavior witness: idle timeout MUST send the timeout notice (upstream's plain-language
+    # catalog wording, `gateway.compress.hygiene_timeout`; the idle form carries the doctor hint).
+    from agent.i18n import t as _t
     sent_contents = [m["content"] for m in adapter.sent]
     assert any(
-        "timed out" in c.lower() and "no output" in c.lower()
-        for c in sent_contents
-    ), f"idle timeout must send 'no output' message, got: {sent_contents}"
+        c.startswith(_t("gateway.compress.hygiene_timeout")) for c in sent_contents
+    ), f"idle timeout must send the hygiene_timeout notice, got: {sent_contents}"
 
     # Behavior witness: idle timeout MUST advance the failure cooldown.
     # The gateway calls _hygiene_cooldown_for_failure + _record_hygiene_cooldown.
@@ -1774,8 +1775,9 @@ async def test_hygiene_abort_does_not_rewrite_or_announce(monkeypatch, tmp_path)
     runner.session_store.rewrite_transcript.assert_not_called()
     # No compaction announce on abort (gating + guard)
     assert not [s for s in adapter.sent if "Context compacted" in s["content"]]
-    # The existing abort warning IS still delivered
-    assert [s for s in adapter.sent if "compression aborted" in s["content"].lower()]
+    # The existing abort warning IS still delivered (upstream's plain-language catalog wording).
+    from agent.i18n import t as _t
+    assert [s for s in adapter.sent if s["content"] == _t("gateway.compress.hygiene_failed")]
 
 
 @pytest.mark.asyncio
@@ -2034,12 +2036,17 @@ async def test_repeated_hygiene_timeouts_escalate_to_a_loud_warning(monkeypatch,
     for n in range(3):
         assert await runner._handle_message(_event(n)) == "ok"
 
-    warnings = [s["content"] for s in adapter.sent if "compression" in s["content"].lower()]
+    from agent.i18n import t as _t
+    _quiet_lead = _t("gateway.compress.hygiene_timeout")
+    warnings = [
+        s["content"] for s in adapter.sent
+        if s["content"].startswith(_quiet_lead) or "compression" in s["content"].lower()
+    ]
     assert len(warnings) == 3
 
-    # First two: the benign per-occurrence line.
+    # First two: the benign per-occurrence line (upstream's plain-language catalog wording).
     for quiet in warnings[:2]:
-        assert "Context compression timed out" in quiet
+        assert quiet.startswith(_quiet_lead)
         assert "🚨" not in quiet
 
     # Third: loud, names the growth AND the knob — but still truthful about

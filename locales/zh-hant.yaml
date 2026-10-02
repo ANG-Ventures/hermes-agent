@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "開始新對話"
+        arg_name: "Optional title for the new session"
         followup: "已開始新對話～"
       reset:
         description: "重設你的 Hermes 工作階段"
+        arg_name: "Optional title for the new session"
         followup: "工作階段已重設～"
       model:
         description: "顯示或變更模型"
@@ -1155,6 +1157,7 @@ platform:
         followup: "重試中～"
       undo:
         description: "移除最後一輪對話"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "顯示 Hermes 工作階段狀態"
         followup: "狀態已送出～"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "要規劃的內容。留空則從對話推斷。"
       compress:
         description: "壓縮對話上下文"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "設定或顯示工作階段標題"
         arg_name: "工作階段標題。留空可顯示目前標題。"
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "要恢復的工作階段名稱。留空可列出工作階段。"
       usage:
         description: "顯示本工作階段的 token 用量"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "顯示可用指令"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "要分析的天數（預設：7）"
       reload_skills:

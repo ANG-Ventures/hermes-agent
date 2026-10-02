@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Tosaigh comhrá nua"
+        arg_name: "Optional title for the new session"
         followup: "Comhrá nua tosaithe~"
       reset:
         description: "Athshocraigh do sheisiún Hermes"
+        arg_name: "Optional title for the new session"
         followup: "Seisiún athshocraithe~"
       model:
         description: "Taispeáin nó athraigh an tsamhail"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Ag baint triail eile as~"
       undo:
         description: "Bain an malartú deireanach"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Taispeáin stádas an tseisiúin Hermes"
         followup: "Stádas seolta~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Cad atá le pleanáil. Fág folamh chun é a thuiscint ón gcomhrá."
       compress:
         description: "Dlúthaigh comhthéacs an chomhrá"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Socraigh nó taispeáin teideal an tseisiúin"
         arg_name: "Teideal an tseisiúin. Fág folamh chun an ceann reatha a thaispeáint."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Ainm an tseisiúin le hatosú. Fág folamh chun seisiúin a liostú."
       usage:
         description: "Taispeáin úsáid tokens don seisiún seo"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Taispeáin na horduithe atá ar fáil"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Líon na laethanta le hanailísiú (réamhshocrú: 7)"
       reload_skills:

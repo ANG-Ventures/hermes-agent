@@ -103,8 +103,10 @@ def test_real_sqlite_transcript_stays_on_old_session(tmp_path, monkeypatch):
     from hermes_state import SessionDB
 
     db = SessionDB(tmp_path / "state.db")
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+    # The store resolves its handle through hermes_state_registry.acquire() (not SessionDB()),
+    # so pin the test handle through the documented ``store._db`` door.
     session_store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    session_store._db = db
     old = session_store.get_or_create_session(_source())
     db.append_message(old.session_id, "user", "old transcript sentinel")
     old.model_override_identity = dict(MODEL_IDENTITY)
@@ -569,8 +571,13 @@ def test_gateway_config_parse_warning_does_not_log_source_snippet(
         "hermes_cli.config.get_config_path", lambda: tmp_path / "different.yaml"
     )
 
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+    # Upstream routes the broken-YAML warning through hermes_cli.config_read_errors (path + problem
+    # line only; the raw PyYAML context/snippet never reaches the log) instead of gateway.run's own
+    # ``error=<ExcType>`` line — the invariant under test is the same: loud, but no source text.
+    with caplog.at_level(logging.WARNING):
         assert gateway_run._load_gateway_config() == {}
 
-    assert "error=ParserError" in caplog.text
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "config.yaml" in r.getMessage()]
+    assert warnings, caplog.text
+    assert "formatting error" in warnings[0].getMessage()
     assert sentinel not in caplog.text

@@ -291,13 +291,15 @@ async def test_every_direct_terminal_writer_fences_the_ordered_lane(sandbox_home
     gate = threading.Event()
     occupied = threading.Event()
 
-    real = gwstatus._write_runtime_status_unlocked
+    # Spy on the merge step under the state lock: every writer (lane or direct)
+    # passes through it, in the order its write actually lands.
+    real = gwstatus._prepare_runtime_status_update
 
     def recording(**kwargs):
         order.append(str(kwargs.get("gateway_state") or kwargs.get("platform")))
         return real(**kwargs)
 
-    gwstatus._write_runtime_status_unlocked = recording  # type: ignore[assignment]
+    gwstatus._prepare_runtime_status_update = recording  # type: ignore[assignment]
     gwstatus._RUNTIME_STATUS_LANE.submit(lambda: (occupied.set(), gate.wait(10)))
     assert occupied.wait(5)
     try:
@@ -308,7 +310,7 @@ async def test_every_direct_terminal_writer_fences_the_ordered_lane(sandbox_home
     finally:
         gate.set()
         gwstatus._RUNTIME_STATUS_LANE.submit(lambda: None).result()
-        gwstatus._write_runtime_status_unlocked = real  # type: ignore[assignment]
+        gwstatus._prepare_runtime_status_update = real  # type: ignore[assignment]
 
     assert order == ["running", "stopped"], (
         f"the direct writer did not fence the queued lane work: {order}"

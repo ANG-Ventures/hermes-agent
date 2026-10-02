@@ -29,6 +29,12 @@ def test_record_async_runs_off_the_loop_thread(isolated_store, monkeypatch):
         return threading.get_ident()
 
     loop_thread = asyncio.run(go())
+    # The fork's record_async only ENQUEUES (a dedicated daemon writer thread drains the queue so
+    # adapter progress is never held on the filesystem); wait for that writer rather than racing it.
+    for _ in range(200):
+        if writer_thread:
+            break
+        time.sleep(0.01)
     assert writer_thread and writer_thread[0] != loop_thread
     assert rich_sent_store.lookup("chat", "42") == "hello"
 

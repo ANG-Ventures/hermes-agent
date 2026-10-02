@@ -414,6 +414,30 @@ def _set_toggle(rid, params, key, value, session):
     return _kv(rid, key, report(nv))
 
 
+def _set_footer(rid, params, key, value, session):
+    """Fork ``/footer``: ``display.runtime_footer.enabled`` on/off/toggle (read back by
+    ``_cfg_get_footer``). ``_load_cfg``/``_save_cfg`` deliberately, not ``_write_config_key``: the
+    footer tests pin those two seams."""
+    nv = str(value or "").strip().lower()
+    cfg = _load_cfg()
+    display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+    rf = display.get("runtime_footer") if isinstance(display.get("runtime_footer"), dict) else {}
+    current = bool(rf.get("enabled", False))
+    if nv in {"on", "enable", "true", "1"}:
+        enabled = True
+    elif nv in {"off", "disable", "false", "0"}:
+        enabled = False
+    elif nv in {"", "toggle"}:
+        enabled = not current
+    else:
+        return _err(rid, 4002, f"unknown footer value: {value}")
+    rf["enabled"] = enabled
+    display["runtime_footer"] = rf
+    cfg["display"] = display
+    _save_cfg(cfg)
+    return _kv(rid, key, "on" if enabled else "off")
+
+
 def _set_cwd(rid, params, key, value, session):
     raw = str(value or "").strip()
     if not raw:
@@ -476,7 +500,7 @@ _CONFIG_SETTERS = {
     "reasoning": _set_reasoning, "details_mode": _set_word, "thinking_mode": _set_word,
     "density": _set_toggle, "battery": _set_toggle, "theme": _set_word,
     "statusbar": _set_toggle, "mouse": _set_toggle, "indicator": _set_word, "voice.voice_chat_mode": _set_word,
-    "cwd": _set_cwd, "terminal.cwd": _set_cwd, "workdir": _set_cwd,
+    "cwd": _set_cwd, "terminal.cwd": _set_cwd, "workdir": _set_cwd, "footer": _set_footer,
     "prompt": _set_prompt, "personality": _set_personality, "skin": _set_skin}
 
 # Keys whose sessionless branch writes a different, wider scope than the session branch (config.yaml's

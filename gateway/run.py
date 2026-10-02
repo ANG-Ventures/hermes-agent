@@ -384,6 +384,12 @@ _GATEWAY_PROVIDER_POLICY_RE = re.compile(
 # ``returned 401.``) and must keep matching (#89401).
 _GATEWAY_AUTH_ERROR_RE = re.compile(
     r"(provider\s+authentication\s+failed|incorrect\s+api\s+key|invalid\s+api\s+key"
+    # Fork: credential-resolution / pool-exhaustion / unconfigured-fallback envelopes are auth
+    # failures too (a profile missing its provider credentials; test_telegram_noise_filter).
+    r"|could\s+not\s+resolve\s+authentication\s+method"
+    r"|expected\s+either\s+api_key\s+or\s+auth_token"
+    r"|no\s+(?:codex\s+oauth\s+token|available\s+entries)"
+    r"|provider\s+not\s+configured"
     r"|(?<![\d:,.])401(?!\d))",
     re.IGNORECASE)
 
@@ -5246,6 +5252,9 @@ class GatewayRunner(
         base_url: Optional[str]
         api_key: Optional[str]
         data: Any
+        # Fork: ``compression.hygiene_failure_alert_after`` — escalate to the loud repeated-failure
+        # alert on the Nth consecutive hygiene failure (0 = never). See agent/hygiene_timeout.py.
+        failure_alert_after: int = 3
 
     @dataclasses.dataclass
     class _HygieneAttempt:
@@ -11591,6 +11600,14 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         remove_pid_file()
         release_gateway_runtime_lock()
 
+    def _fence_lanes() -> None:
+        # os._exit skips shutdown_flush's atexit fences, and a queued durable write (transcript spool,
+        # pending flush, weixin cursor/credentials) that dies with the process is UNRECOVERABLE user data.
+        # The deadline-cancel path leaves a shielded write running with nobody awaiting it; this is the
+        # only thing that waits for it. Bounded at 10s; no-op when the lanes are empty or never created.
+        from gateway.shutdown_flush import fence_lanes_for_hard_exit
+        fence_lanes_for_hard_exit(timeout=10.0)
+
     def _mark_exited() -> None:
         # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
         # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
@@ -11605,7 +11622,7 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _fence_lanes, _mark_exited, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
 

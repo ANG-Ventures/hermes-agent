@@ -100,6 +100,13 @@ class SessionPersistenceMixin:
         try:
             if home is None:
                 return self._db
+            # A re-pointed ``hermes_state.DEFAULT_DB_PATH`` is already one process-wide store and
+            # is what ``_db`` resolves to (``_default_db_path``); honour the same pin here or the
+            # routing rewrite and the row reads/prunes land in two different files.
+            import hermes_state as _hs
+            override = getattr(_hs, "DEFAULT_DB_PATH", None)
+            if override is not None and override != getattr(_hs, "_IMPORT_DEFAULT_DB_PATH", None):
+                return self._open_session_db_for_active_scope(db_path=Path(override))
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
         except Exception:
             return None

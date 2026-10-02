@@ -1149,9 +1149,11 @@ platform:
     command:
       new:
         description: "Új beszélgetés indítása"
+        arg_name: "Optional title for the new session"
         followup: "Új beszélgetés indítva~"
       reset:
         description: "Hermes-munkameneted visszaállítása"
+        arg_name: "Optional title for the new session"
         followup: "Munkamenet visszaállítva~"
       model:
         description: "Modell megjelenítése vagy váltása"
@@ -1172,6 +1174,7 @@ platform:
         followup: "Újrapróbálom~"
       undo:
         description: "Utolsó üzenetváltás eltávolítása"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Munkamenet állapotának mutatása"
         followup: "Állapot elküldve~"
@@ -1186,6 +1189,7 @@ platform:
         arg_task: "Mit tervezzen. Üresen hagyva a beszélgetésből következteti ki."
       compress:
         description: "Beszélgetés kontextusának tömörítése"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Munkamenet címének beállítása/mutatása"
         arg_name: "Munkamenet címe. Üresen hagyva a jelenlegit mutatja."
@@ -1193,8 +1197,10 @@ platform:
         arg_name: "A folytatandó munkamenet neve. Üresen hagyva listázza a munkameneteket."
       usage:
         description: "Tokenhasználat megjelenítése ehhez a munkamenethez"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Elérhető parancsok megjelenítése"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Elemzendő napok száma (alapértelmezett: 7)"
       reload_skills:

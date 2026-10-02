@@ -24,7 +24,7 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
 )
@@ -738,6 +738,9 @@ class GatewayTurnMixin:
         hs.failure_cooldown_seconds = _knob(
             "hygiene_failure_cooldown_seconds", hs.failure_cooldown_seconds, float, allow_zero=True,
         )
+        with suppress(Exception):
+            from agent.hygiene_timeout import resolve_failure_alert_after
+            hs.failure_alert_after = resolve_failure_alert_after(_comp_cfg)
 
     async def _hmwa_hygiene_settings(self, source, session_key):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
@@ -748,7 +751,8 @@ class GatewayTurnMixin:
         from gateway.run import _load_gateway_config
         hs = self._HygieneSettings(
             model="anthropic/claude-sonnet-4.6", threshold_pct=0.85, compression_enabled=True,
-            hard_msg_limit=5000, timeout_seconds=30.0, total_ceiling_seconds=600.0,
+            hard_msg_limit=400,  # fork fleet default (matches config_defaults.py; upstream 5000)
+            timeout_seconds=30.0, total_ceiling_seconds=600.0,
             max_turn_hold_seconds=10.0, failure_cooldown_seconds=300.0, config_context_length=None,
             provider=None, base_url=None, api_key=None, data={},
         )
@@ -1076,7 +1080,7 @@ class GatewayTurnMixin:
         )
         raise
 
-    async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):
+    async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source, plan=None):
         """``except asyncio.TimeoutError`` body: cancel at the commit fence, record the failure
         cooldown, warn the user, and re-raise; returns the compressed transcript only when the
         worker crossed the commit boundary first."""
@@ -1126,15 +1130,40 @@ class GatewayTurnMixin:
                 "(total wait %.1fs, ceiling %.1fs); continuing without compression",
                 session_entry.session_id, fence.seconds_since_progress(), _hyg_elapsed, hs.total_ceiling_seconds,
             )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta,
-            _hygiene_compression_timeout_message(
-                total_exhausted=_hyg_total_exhausted, elapsed=_hyg_elapsed,
-                idle_timeout=hs.timeout_seconds, progress_observed=fence.progress_observed,
-            ),
-            "compression-timeout warning",
+        _timeout_msg = _hygiene_compression_timeout_message(
+            total_exhausted=_hyg_total_exhausted, elapsed=_hyg_elapsed,
+            idle_timeout=hs.timeout_seconds, progress_observed=fence.progress_observed,
         )
+        # Fork: a session that can never compress grows until it overflows the window. Per-occurrence
+        # this is benign; as a STREAK it is not, so stop whispering (compression.hygiene_failure_alert_after).
+        _timeout_msg = self._hmwa_hygiene_escalate_repeated_failure(
+            _timeout_msg, hs, session_entry.session_id, plan,
+        )
+        await self._hmwa_hygiene_notify(source, attempt.meta, _timeout_msg, "compression-timeout warning")
         raise
+
+    def _hmwa_hygiene_escalate_repeated_failure(self, message, hs, session_id, plan=None):
+        """Bump the per-session consecutive hygiene-failure streak; from the Nth failure on, replace
+        ``message`` with the loud repeated-failure alert that names the growth and the knob."""
+        try:
+            from agent.hygiene_timeout import format_repeated_failure_alert, should_alert_loudly
+            _hyg_streak = self._record_hygiene_compression_failure(session_id)
+            if should_alert_loudly(_hyg_streak, hs.failure_alert_after):
+                logger.error(
+                    "Session hygiene compression has failed %d consecutive times for session %s "
+                    "(%s msgs, ~%s tokens) — the transcript is growing unboundedly. Raise "
+                    "compression.hygiene_timeout_seconds or check auxiliary.compression health.",
+                    _hyg_streak, session_id,
+                    getattr(plan, "msg_count", "?"), getattr(plan, "approx_tokens", "?"),
+                )
+                return format_repeated_failure_alert(
+                    _hyg_streak, hs.timeout_seconds,
+                    message_count=getattr(plan, "msg_count", None),
+                    approx_tokens=getattr(plan, "approx_tokens", None),
+                )
+        except Exception as _esc_err:
+            logger.debug("hygiene repeated-failure escalation skipped: %s", _esc_err)
+        return message
 
     def _hmwa_hygiene_on_unwind(self, attempt, hs, session_entry, session_key):
         """``except BaseException`` body (caller re-raises): revoke commit admission BEFORE the host
@@ -1270,6 +1299,7 @@ class GatewayTurnMixin:
         ):
             await asyncio.to_thread(_reset_hygiene_failure_streak, self, session_key)
         if not _hyg_aborted and (_hyg_rotated or _hyg_in_place):
+            self._clear_hygiene_compression_failures(session_entry.session_id)
             # In-chat compaction announce (engine-aware, formatted from REAL gateway facts — NOT the
             # throwaway agent's filtered done-site view). Contentless on the channel rail for privacy.
             # Fires on ANY landed compaction (rotate OR in-place), never on the no-op preserve branch.
@@ -1302,7 +1332,10 @@ class GatewayTurnMixin:
                     getattr(_comp, "_last_summary_error", None) or t("gateway.shared.unknown_error"), force=True)
                 logger.warning("Session hygiene compression aborted: %s", _err)
                 await self._hmwa_hygiene_notify(
-                    source, attempt.meta, t("gateway.compress.hygiene_failed"), "compression-failure warning",
+                    source, attempt.meta,
+                    self._hmwa_hygiene_escalate_repeated_failure(
+                        t("gateway.compress.hygiene_failed"), hs, session_entry.session_id, plan),
+                    "compression-failure warning",
                 )
         # Configured aux model failed, recovered on the main model: only the user can fix that config.
         elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
@@ -1420,7 +1453,8 @@ class GatewayTurnMixin:
             except HygieneTurnHoldExceeded:
                 _compressed = await self._hmwa_hygiene_on_turn_hold(attempt, hs, session_entry, session_key, source)
             except asyncio.TimeoutError:
-                _compressed = await self._hmwa_hygiene_on_timeout(attempt, hs, session_entry, session_key, source)
+                _compressed = await self._hmwa_hygiene_on_timeout(
+                    attempt, hs, session_entry, session_key, source, plan=plan)
             except BaseException:
                 self._hmwa_hygiene_on_unwind(attempt, hs, session_entry, session_key)
                 raise
@@ -2409,6 +2443,16 @@ class GatewayTurnMixin:
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # Fork D-6 defense: a turn that ended via an exception/early-return BEFORE the clean-turn
+            # gate ran would leave its restart-initiator breadcrumb on disk for a later same-session
+            # turn to read. Consume (unlink) it here without recording a mark — a crashed turn made no
+            # loop progress to count. Idempotent: a no-op if the gate already consumed it.
+            try:
+                _sk_cleanup = locals().get("session_key")
+                if _sk_cleanup:
+                    self._consume_restart_initiated_breadcrumb(_sk_cleanup)
+            except Exception:
+                pass
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.
@@ -3831,6 +3875,28 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
+    def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str) -> None:
+        """Append a leftover /steer to the session's /queue overflow (behind the pending follow-up);
+        a leftover "/stop" or "/new" must never reach the agent."""
+        parts = text.strip().split(None, 1)
+        cmd_word = parts[0][1:].lower() if parts and parts[0].startswith("/") else ""
+        if cmd_word:
+            with suppress(Exception):
+                from hermes_cli.commands import resolve_command as _rc_leftover
+                if _rc_leftover(cmd_word):
+                    logger.info(
+                        "Discarding command '/%s' from leftover /steer — "
+                        "commands must not be passed as agent input", cmd_word,
+                    )
+                    return
+        self._session_state(session_key).conversation.queued_events.append(
+            MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+        )
+        logger.info(
+            "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
+            session_key, len(text),
+        )
+
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
     ) -> Tuple[Any, Optional[str]]:
@@ -3874,6 +3940,12 @@ class GatewayTurnMixin:
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+        elif result and result.get("pending_steer") and adapter and session_key:
+            # Fork (2026-09-29): a follow-up already owns the next turn. Queue the leftover steer
+            # behind it instead of dropping it — on the overflow tail, never the head slot (the
+            # depth-cap branch re-seats pending_event in the head slot and would overwrite it; the
+            # next drain promotes the overflow head). Same slash-command guard as the pending text.
+            self._queue_leftover_steer(result["pending_steer"], source, session_key)
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -3890,9 +3962,10 @@ class GatewayTurnMixin:
                         pending = None
 
         if self._draining and (pending_event or pending):
-            logger.info(
-                "Discarding pending follow-up for session %s during gateway %s",
-                session_key or "?", self._status_action_label(),
+            # Fork: never silently drop it (2026-09-23: 4 follow-ups lost). The draining process
+            # may not start a new turn, so spool it for the next boot's startup-restore replay.
+            await self._preserve_followup_across_restart(
+                session_key, pending_event, pending, source
             )
             pending_event = None
             pending = None
@@ -4117,6 +4190,15 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+
+            # Fork (2026-09-29): the follow-up is a NEW turn on the parent's slot — re-stamp the turn
+            # clock and ack debounce so a busy/steer ack reports this turn's elapsed, not the parent's.
+            # Only the key this run claimed (session_key): a different next_session_key with a live
+            # started_ts belongs to ANOTHER running turn, whose clock must not move.
+            _followup_state = self._peek_session_state(session_key) if session_key else None
+            if _followup_state is not None and _followup_state.turn.started_ts:
+                _followup_state.turn.started_ts = time.time()
+                _followup_state.turn.busy_ack_ts = 0.0
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,

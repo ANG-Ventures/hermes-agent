@@ -345,8 +345,9 @@ def test_telegram_final_response_maps_credential_resolution_errors():
 
     for raw in raw_envelopes:
         sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
-        assert "authentication failed" in sanitized.lower(), raw
-        assert "check the configured credentials" in sanitized.lower(), raw
+        # The auth reply (upstream's plain-language wording; same assertion as the sibling
+        # ``Provider authentication failed`` test above), not the generic retry message.
+        assert "sign-in" in sanitized.lower() and "/login" in sanitized, raw
         # The unhelpful generic message must NOT be what the user sees.
         assert "failed after retries" not in sanitized.lower(), raw
         # No raw provider envelope leaks through.

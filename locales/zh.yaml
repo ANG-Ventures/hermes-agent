@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "开始新对话"
+        arg_name: "Optional title for the new session"
         followup: "已开始新对话~"
       reset:
         description: "重置你的 Hermes 会话"
+        arg_name: "Optional title for the new session"
         followup: "会话已重置~"
       model:
         description: "查看或更改模型"
@@ -1155,6 +1157,7 @@ platform:
         followup: "正在重试~"
       undo:
         description: "删除最后一轮对话"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "查看 Hermes 会话状态"
         followup: "状态已发送~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "要规划的内容。留空则根据对话推断。"
       compress:
         description: "压缩对话上下文"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "设置或查看会话标题"
         arg_name: "会话标题。留空则查看当前标题。"
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "要恢复的会话名称。留空则列出会话。"
       usage:
         description: "查看本会话的 token 用量"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "查看可用命令"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "要分析的天数（默认：7）"
       reload_skills:

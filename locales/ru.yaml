@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Начать новый разговор"
+        arg_name: "Optional title for the new session"
         followup: "Новый разговор начат~"
       reset:
         description: "Сбросить ваш сеанс Hermes"
+        arg_name: "Optional title for the new session"
         followup: "Сеанс сброшен~"
       model:
         description: "Показать или сменить модель"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Повторяю~"
       undo:
         description: "Удалить последний обмен сообщениями"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Показать состояние сеанса Hermes"
         followup: "Состояние отправлено~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Что планировать. Оставьте пустым, чтобы вывести из разговора."
       compress:
         description: "Сжать контекст разговора"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Задать или показать название сеанса"
         arg_name: "Название сеанса. Оставьте пустым, чтобы показать текущее."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Имя сеанса для возобновления. Оставьте пустым, чтобы увидеть список сеансов."
       usage:
         description: "Показать расход токенов в этом сеансе"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Показать доступные команды"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Количество дней для анализа (по умолчанию: 7)"
       reload_skills:

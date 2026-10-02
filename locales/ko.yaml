@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "새 대화 시작"
+        arg_name: "Optional title for the new session"
         followup: "새 대화를 시작했어요~"
       reset:
         description: "Hermes 세션 초기화"
+        arg_name: "Optional title for the new session"
         followup: "세션을 초기화했어요~"
       model:
         description: "모델 보기 또는 변경"
@@ -1155,6 +1157,7 @@ platform:
         followup: "다시 시도하고 있어요~"
       undo:
         description: "마지막 대화 주고받기 제거"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Hermes 세션 상태 보기"
         followup: "상태를 보냈어요~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "계획할 내용. 비워 두면 대화에서 추론해요."
       compress:
         description: "대화 컨텍스트 압축"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "세션 제목 설정 또는 보기"
         arg_name: "세션 제목. 비워 두면 현재 제목을 보여줘요."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "재개할 세션 이름. 비워 두면 세션 목록을 보여줘요."
       usage:
         description: "이 세션의 토큰 사용량 보기"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "사용 가능한 명령 보기"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "분석할 일수 (기본값: 7)"
       reload_skills:

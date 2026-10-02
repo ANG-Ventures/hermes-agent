@@ -101,33 +101,33 @@ MIN_DERIVED_MODULES = 300
 # for burn-down on the follow-up card. The two /model coroutines this change
 # fixed (_finish_switch, _on_model_selected) and /reset are deliberately absent.
 REACHABLE_BASELINE = frozenset({
-    "gateway/platforms/api_server.py _handle_browser_control_ws -> httpx.get",
-    "gateway/platforms/api_server.py _handle_run_events -> httpx.get",
-    "gateway/platforms/api_server.py _handle_session_chat_stream -> httpx.get",
-    "gateway/platforms/api_server.py _handle_toolsets -> httpx.post",
-    "gateway/platforms/api_server.py _run_and_close -> urlopen",
-    "gateway/platforms/api_server.py _write_sse_chat_completion -> httpx.get",
-    "gateway/platforms/api_server.py _write_sse_responses -> httpx.get",
-    "gateway/platforms/base.py _process_message_background -> httpx.get",
-    "gateway/run.py _handle_message_with_agent_admitted -> urlopen",
-    "gateway/run.py _prepare_inbound_message_text -> urlopen",
-    "gateway/run.py _run_agent_admitted -> open_credentialed_url",
-    "gateway/run.py _run_background_task_inner -> urlopen",
-    "gateway/run.py start -> urlopen",
-    # _handle_btw_command: gone -- its runtime resolve is offloaded (t_515b7fce).
-    # _handle_compress_command_inner: gone -- _compress_context runs under
-    # _run_in_executor_with_context, which the walker now counts (t_7189c691).
-    "gateway/slash_commands.py _handle_merge_command -> httpx.get",
+    # Re-frozen 2026-10-02 (parity sync 2026-10-01, CI5-L3b): upstream split
+    # gateway/run.py into run_*.py / slash_commands_*.py and run_agent.py into
+    # agent/*_facade.py, so the (module, coroutine) keys moved and the walker --
+    # which reports ONE sink per coroutine, first DFS hit -- now terminates the
+    # same pre-existing chains at a different sink name (the old
+    # `run.py X -> urlopen` rows are the `run_turn.py X -> requests.get`
+    # rows below, via resolve_runtime_provider>_get_model_config>
+    # _auto_detect_local_model, present on fork/main too). Measured against
+    # fork/main c14e059f8f2: 17 sites before, 18 after; none newly reachable.
+    "gateway/platforms/api_server.py _handle_toolsets -> urlopen",
+    "gateway/platforms/api_server_runs.py _execute_run -> requests.get",
+    "gateway/run_inbound.py _enrich_inbound_images -> requests.get",
+    "gateway/run_inbound.py _inbound_model_context_length -> requests.get",
+    "gateway/run_startup.py _start_log_startup_environment -> open_credentialed_url",
+    "gateway/run_startup.py _start_recover_previous_run -> urlopen",
+    "gateway/run_turn.py _hmwa_check_persisted_route -> requests.get",
+    "gateway/run_turn.py _hmwa_hygiene_settings -> requests.get",
+    "gateway/run_turn.py _hmwa_run_session_hygiene -> requests.get",
+    "gateway/run_turn.py _run_background_task_inner -> requests.get",
+    "gateway/slash_commands.py _handle_merge_command -> requests.get",
+    "gateway/slash_commands.py _handle_status_command -> requests.get",
+    "gateway/slash_commands_goals.py _handle_refine_command -> requests.get",
+    "gateway/slash_commands_login.py _run_login -> urlopen",
+    "gateway/slash_commands_model.py _model_listing_reply -> requests.get",
+    "gateway/slash_commands_session.py _run_manual_compression -> requests.get",
+    "gateway/slash_commands_status.py _handle_status_command -> requests.get",
     "plugins/platforms/matrix/adapter.py send_model_picker -> requests.get",
-    # stop/_stop_impl -> requests.delete (camofox close) left 2026-09-28
-    # (t_e9ca7d13): false positive. It sits in the nested
-    # _kill_tool_subprocesses, which runs only via asyncio.to_thread; the
-    # walker no longer charges a nested def's body to its enclosing coroutine.
-    # Pre-existing; surfaced (not introduced) when function-local imports
-    # started shadowing same-file fallback defs (C5 #39): providers.get_label
-    # defaults to allow_network=True. Same shape as the matrix entry above.
-    "plugins/platforms/telegram/adapter.py _handle_model_picker_callback -> requests.get",
-    "plugins/platforms/telegram/adapter.py send_model_picker -> requests.get",
 })
 
 # Coroutines this change took off the network path. They must stay off it.
@@ -250,7 +250,7 @@ def test_compress_context_still_reaches_the_metadata_fetch():
     for key in index:
         by_name[key[1]].append(key)
     found = _search(
-        ("run_agent.py", "_compress_context"),
+        ("agent/compression_facade.py", "_compress_context"),
         index,
         by_name,
         (NETWORK_SINK_NAMES, NETWORK_SINK_DOTTED),
@@ -321,7 +321,8 @@ def test_switch_model_probe_off_opens_no_socket(monkeypatch):
     """
     import socket
 
-    from hermes_cli import model_switch, models
+    from hermes_cli import model_switch
+    from hermes_cli import models_validate as models
 
     attempts: list = []
 
