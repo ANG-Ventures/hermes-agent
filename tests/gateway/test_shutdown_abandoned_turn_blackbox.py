@@ -424,8 +424,14 @@ def test_loop_liveness_watchdog_exit_records_in_flight_turns(ledger, monkeypatch
     runner._snapshot_running_agents = lambda: {"k": live}
     assert _orphan_ids(ledger) == [tid], "precondition"
 
+    from agent import background_review as br
+
+    monkeypatch.setattr(br, "_review_exit_fence", threading.Event())
+    monkeypatch.setattr(br, "_live_review_agents", {})
     runner._record_abandoned_turns_before_watchdog_exit()
 
     assert _orphan_ids(ledger) == []
     assert _row(ledger, tid, "interrupted")[0] == 1
     assert HOOKS == ["on_turn_abandoned"]
+    # Prism #1631 P1: the watchdog snapshot fences review startup too.
+    assert br.background_reviews_fenced()

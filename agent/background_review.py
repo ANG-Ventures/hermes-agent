@@ -59,14 +59,43 @@ _review_exit_fence = threading.Event()
 
 
 def fence_background_reviews_and_snapshot() -> list:
-    """Refuse every review request not yet admitted, then snapshot live forks.
+    """Fence review startup for process exit and return the forks to record.
 
-    Both happen under the registry lock, so a fork is either in the snapshot
-    (registered before the fence) or sees the fence when it asks to start.
+    Under the registry lock: set the fence, then for every registered fork
+    either (a) it already published a turn id -> returned for the caller to
+    record as abandoned, or (b) it has not -> hard-interrupted, so the
+    ``_interrupt_requested`` flag (preserved by ``build_turn_context``) makes
+    its loop break before the first provider call. Admission
+    (:func:`admit_background_review`) checks the fence under the same lock, so
+    a fork is fenced, interrupted, or recordable; never none of the three
+    (Prism #1631 P1 ee348a545c82).
     """
     with _live_review_agents_lock:
         _review_exit_fence.set()
-        return list(_live_review_agents.values())
+        agents = list(_live_review_agents.values())
+    recordable = []
+    for review_agent in agents:
+        if getattr(review_agent, "_current_turn_id", None):
+            recordable.append(review_agent)
+            continue
+        try:
+            from agent.interrupt_compat import request_hard_interrupt
+
+            request_hard_interrupt(
+                review_agent, "process exiting", tool_reason="background review abandoned"
+            )
+        except Exception:
+            logger.debug("Failed to interrupt background review at exit", exc_info=True)
+    return recordable
+
+
+def admit_background_review(review_run: Optional["_BackgroundReviewRun"], review_agent: Any) -> bool:
+    """Admit a review request unless the exit fence is up (checked under the
+    registry lock that :func:`fence_background_reviews_and_snapshot` holds)."""
+    with _live_review_agents_lock:
+        if _review_exit_fence.is_set():
+            return False
+    return review_run is None or review_run.begin_request(review_agent)
 
 
 def background_reviews_fenced() -> bool:
@@ -1715,9 +1744,7 @@ def _run_review_in_thread(
                 pass
 
             try:
-                request_admitted = not background_reviews_fenced() and (
-                    review_run is None or review_run.begin_request(review_agent)
-                )
+                request_admitted = admit_background_review(review_run, review_agent)
                 _review_result = None
                 if request_admitted:
                     # Routed to a different model -> replay a digest (cache is cold

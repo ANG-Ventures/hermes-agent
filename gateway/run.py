@@ -14166,10 +14166,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         # Background review forks run on a daemon thread AFTER their parent's
         # turn finalized, so an idle parent is in none of the maps above.
+        # Fence first: a fork still being built must not start a provider call
+        # after this snapshot (Prism #1631 P1 fada22402223).
         try:
-            from agent.background_review import live_background_review_agents
+            from agent.background_review import fence_background_reviews_and_snapshot
 
-            agents.extend(live_background_review_agents())
+            agents.extend(fence_background_reviews_and_snapshot())
         except Exception:
             pass
         try:

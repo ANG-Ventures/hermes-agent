@@ -161,3 +161,23 @@ def test_cli_exit_fences_a_review_that_has_not_started_its_request(ledger):
     cli_mod._record_abandoned_review_turns("cli_exit")
     assert br.background_reviews_fenced()
     assert _run_review_fork() is False
+
+
+def test_registered_fork_without_a_turn_id_is_interrupted_not_skipped(ledger):
+    """Prism #1631 P1: a fork admitted before the fence but not yet past
+    build_turn_context (no _current_turn_id) is unrecordable; the exit snapshot
+    hard-interrupts it so its loop breaks before the first provider call."""
+    calls = []
+    fork = SimpleNamespace(
+        _current_turn_id=None,
+        hard_interrupt=lambda message=None, **_k: calls.append(message),
+    )
+    br._live_review_agents[id(fork)] = fork
+    recorded = SimpleNamespace(_current_turn_id=TID)
+    br._live_review_agents[id(recorded)] = recorded
+
+    out = br.fence_background_reviews_and_snapshot()
+
+    assert out == [recorded]
+    assert calls == ["process exiting"]
+    assert br.admit_background_review(None, fork) is False
