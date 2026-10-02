@@ -1125,7 +1125,7 @@ Two bounds hold a worker's process tree while the worker is alive. The reapers o
 
 Why both: on 2026-10-01 a scratch bench re-spawned itself 18,818 times over 3.5 h. It took the uid to 10,340 of 10,666 processes, and every fork on the host failed. On 2026-09-29 a worker's pytest leaked 153 headless Chromes. The per-run cap catches a runaway within about two ticks of crossing 256, at the storm's measured growth of about 120 procs/min. The nproc ceiling is the backstop if the dispatcher itself is wedged.
 
-Browsers a worker launches inherit its run env, so they are reaped with the card on every exit path. Point their `--user-data-dir` under the card workspace so the terminal-workspace orphan sweep can also attribute them by cwd.
+Browsers a worker launches inherit its run env, so they are reaped with the card on every exit path. Put their `--user-data-dir` under the card workspace. Chrome on Linux overwrites its own `/proc/<pid>/environ` window (measured on ACE-AI: 0 of 11 Chrome processes still showed `HERMES_KANBAN_TASK`), so a Chrome process with no run identity in its environment is attributed by the card id in its `--user-data-dir` path, bounded by the run's birth window. A Linux Chrome whose profile sits outside the card workspace is not reaped with the card.
 
 ### Drag-to-delete and bulk delete (dashboard)
 
