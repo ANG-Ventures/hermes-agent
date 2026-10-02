@@ -347,13 +347,19 @@ class TestInterruptVprintForceTrue:
 
 
 class TestAnthropicInterruptHandler:
-    """_interruptible_api_call must handle Anthropic mode when interrupted."""
+    """_interruptible_api_call must handle Anthropic mode when interrupted.
+
+    parity 2026-10-01: upstream extracted the request bodies out of the two entry points
+    into ``chat_completion_nonstream._NonStreamRequest`` (non-streaming) and
+    ``chat_completion_helpers._StreamingCall`` (streaming); the entry points are now thin
+    wrappers, so the branch is scanned where it moved.
+    """
 
     def test_interruptible_has_anthropic_branch(self):
         """The interrupt handler must check api_mode == 'anthropic_messages'."""
         import inspect
-        from agent.chat_completion_helpers import interruptible_api_call
-        source = inspect.getsource(interruptible_api_call)
+        from agent.chat_completion_nonstream import _NonStreamRequest
+        source = inspect.getsource(_NonStreamRequest)
         assert "anthropic_messages" in source, \
             "interruptible_api_call must handle Anthropic interrupt (api_mode check)"
 
@@ -368,8 +374,8 @@ class TestAnthropicInterruptHandler:
         rebuild or the per-request helper.
         """
         import inspect
-        from agent.chat_completion_helpers import interruptible_api_call
-        source = inspect.getsource(interruptible_api_call)
+        from agent.chat_completion_nonstream import _NonStreamRequest
+        source = inspect.getsource(_NonStreamRequest)
         assert (
             "build_anthropic_client" in source
             or "_create_request_anthropic_client" in source
@@ -378,8 +384,8 @@ class TestAnthropicInterruptHandler:
     def test_streaming_has_anthropic_branch(self):
         """_streaming_api_call must also handle Anthropic interrupt."""
         import inspect
-        from agent.chat_completion_helpers import interruptible_streaming_api_call
-        source = inspect.getsource(interruptible_streaming_api_call)
+        from agent.chat_completion_helpers import _StreamingCall
+        source = inspect.getsource(_StreamingCall)
         assert "anthropic_messages" in source, \
             "interruptible_streaming_api_call must handle Anthropic interrupt"
 

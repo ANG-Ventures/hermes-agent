@@ -22,6 +22,20 @@ from tests.run_agent._run_agent_helpers import (
 
 
 class TestHydrateTodoStore:
+    @staticmethod
+    def _assistant_todo_call(call_id="c1", name="todo", arguments="{}"):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        }
+
     def test_no_todo_in_history(self, agent):
         history = [
             {"role": "user", "content": "hello"},
@@ -124,8 +138,10 @@ class TestHandleMaxIterations:
         messages = [{"role": "user", "content": "do stuff"}]
         result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
-        assert "error" in result.lower()
-        assert "API down" in result
+        # Merged copy (agent/turn_failure_copy "max_iterations_no_summary"): the user gets the
+        # plain-language explanation + next step; the exception text stays in the warning log.
+        assert "ran out of steps" in result.lower()
+        assert "`continue`" in result
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -872,9 +888,11 @@ class TestRunConversation:
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent.compression_enabled = True
         empty_resp = _mock_response(
-            content=None,
+            # parity 2026-10-01: a clean "stop" with structured reasoning_content is promoted to
+            # the visible answer before the empty ladder (#111761); Ollama-style inline <think>
+            # content still routes through the thinking-prefill ladder this test pins.
+            content="<think>reasoning only</think>",
             finish_reason="stop",
-            reasoning_content="reasoning only",
         )
         prefill = [
             {"role": "user", "content": "old question"},
@@ -903,7 +921,10 @@ class TestRunConversation:
         # surfaces the reasoning text, clearly labelled. This test drives the
         # reasoning-only path, so assert the #34452 contract (not silent, not
         # "(empty)") against the message that path actually produces.
-        assert "produced only internal reasoning" in result["final_response"]
+        # Merged copy (agent/turn_failure_copy "reasoning_only"): the model's own last thoughts
+        # are surfaced, clearly labelled, instead of the fork's generic "No reply:" prefix.
+        assert "never wrote an answer" in result["final_response"]
+        assert "reasoning answer" in result["final_response"] or "reasoning only" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -911,9 +932,11 @@ class TestRunConversation:
         """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
-            content=None,
+            # parity 2026-10-01: a clean "stop" with structured reasoning_content is promoted to
+            # the visible answer before the empty ladder (#111761); Ollama-style inline <think>
+            # content still routes through the thinking-prefill ladder this test pins.
+            content="<think>structured reasoning answer</think>",
             finish_reason="stop",
-            reasoning_content="structured reasoning answer",
         )
         # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
         agent.client.chat.completions.create.side_effect = [empty_resp] * 6
@@ -929,16 +952,21 @@ class TestRunConversation:
         # Parity note (2026-08-08): reasoning-only terminal — see the sibling
         # test above. Upstream surfaces the model's own reasoning here
         # instead of the fork's generic "No reply:" prefix.
-        assert "produced only internal reasoning" in result["final_response"]
+        # Merged copy (agent/turn_failure_copy "reasoning_only"): the model's own last thoughts
+        # are surfaced, clearly labelled, instead of the fork's generic "No reply:" prefix.
+        assert "never wrote an answer" in result["final_response"]
+        assert "reasoning answer" in result["final_response"] or "reasoning only" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
         """When prefill continuation produces content, it becomes the final response."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
-            content=None,
+            # parity 2026-10-01: a clean "stop" with structured reasoning_content is promoted to
+            # the visible answer before the empty ladder (#111761); Ollama-style inline <think>
+            # content still routes through the thinking-prefill ladder this test pins.
+            content="<think>structured reasoning answer</think>",
             finish_reason="stop",
-            reasoning_content="structured reasoning answer",
         )
         content_resp = _mock_response(
             content="Here is the actual answer.",
@@ -964,6 +992,9 @@ class TestRunConversation:
         """Truly empty response (no content, no reasoning) retries 3 times then falls through to (empty)."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
+        # Legacy fixed 3-retry ladder (agent.empty_response_guard.enabled: false); the guard-on
+        # short-circuit after two identical empties is test_truly_empty_response_stops_after_repeated_empty.
+        agent._empty_guard_enabled = False
         empty_resp = _mock_response(content=None, finish_reason="stop")
         # 4 responses: 1 original + 3 nudge retries, all empty
         agent.client.chat.completions.create.side_effect = [
@@ -1083,6 +1114,7 @@ class TestRunConversation:
     def test_empty_response_emits_status_for_gateway(self, agent):
         """_emit_status is called during empty retries so gateway users see feedback."""
         self._setup_agent(agent)
+        agent._empty_guard_enabled = False  # legacy 3-retry ladder; guard-on path tested separately
         agent.base_url = "http://127.0.0.1:1234/v1"
 
         empty_resp = _mock_response(content=None, finish_reason="stop")
@@ -1729,7 +1761,8 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        # Merged copy (agent/turn_failure_copy): "cut off partway through" (finish_reason != length).
+        assert "cut off" in result["error"]
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
@@ -1771,7 +1804,7 @@ class TestRunConversation:
         assert result.get("partial") is True
         msgs = result.get("messages") or []
         assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        assert "cut off" in (msgs[-1].get("content") or "").lower()  # merged copy wording
         assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
 
     def test_length_truncated_tool_exhaustion_after_tool_batch_closes_tool_tail(self, agent):
@@ -1813,10 +1846,11 @@ class TestRunConversation:
             result = agent.run_conversation("write then hit length truncate")
 
         assert result.get("partial") is True
-        assert "truncated due to output length limit" in (result.get("error") or "")
+        # Merged copy: "cut off before it finished (it hit its output length limit)".
+        assert "output length limit" in (result.get("error") or "")
         msgs = result.get("messages") or []
         assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        assert "cut off" in (msgs[-1].get("content") or "").lower()  # merged copy wording
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its
@@ -2144,7 +2178,7 @@ class TestRetryExhaustion:
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "time", self._make_fast_time_mock()),
-            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0),  # read lazily by turn_recovery
         ):
             result = agent.run_conversation("hello")
         assert result.get("completed") is False, (
@@ -2206,7 +2240,7 @@ class TestRetryExhaustion:
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "time", self._make_fast_time_mock()),
-            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0),  # read lazily by turn_recovery
         ):
             result = agent.run_conversation("hello")
         assert result.get("completed") is False
@@ -2280,15 +2314,23 @@ class TestBudgetPressure:
 class TestDeadRetryCode:
     """Unreachable retry_count >= max_retries after raise must not exist."""
 
-    def test_no_unreachable_max_retries_after_backoff(self):
+    def test_no_unreachable_max_retries_after_backoff(self):  # noqa: source-proxy structural: one exhaustion guard per site
+        # parity 2026-10-01: upstream extracted the two guards out of run_conversation into the
+        # phase helpers that own each exhaustion site (API error / invalid response); the loop
+        # itself is now `while s.retry_count < s.max_retries`. Same invariant: exactly one
+        # reachable guard per site, none left dangling after a raise.
         import inspect
-        from agent.conversation_loop import run_conversation as _rc
-        source = inspect.getsource(_rc)
-        occurrences = source.count("if retry_count >= max_retries:")
-        assert occurrences == 2, (
-            f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
-            f"but found {occurrences}"
-        )
+        from agent.conversation_loop import _run_api_retry_loop
+        from agent.turn_api_error import settle_unrecovered_error
+        from agent.turn_response_check import retry_invalid_response
+
+        for fn in (settle_unrecovered_error, retry_invalid_response):
+            occurrences = inspect.getsource(fn).count("if retry_count >= max_retries:")
+            assert occurrences == 1, (
+                f"{fn.__name__}: expected 1 occurrence of 'if retry_count >= max_retries:' "
+                f"but found {occurrences}"
+            )
+        assert inspect.getsource(_run_api_retry_loop).count("if retry_count >= max_retries:") == 0
 
 
 class TestEmptySSEFrameTurnRecovery:

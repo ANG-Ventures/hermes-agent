@@ -157,6 +157,11 @@ from agent.session_persistence import (  # noqa: F401 - flush helpers re-exporte
     _persisted_content_projection,
     _tool_content_mutated_since_flush,
 )
+from agent.tool_dispatch_helpers import (  # noqa: F401 - parallel-batch helpers re-exported (fork tests)
+    _extract_parallel_scope_path,
+    _paths_overlap,
+    _should_parallelize_tool_batch,
+)
 from agent.compression_facade import CompressionFacadeMixin
 from agent.turn_facade import TurnFacadeMixin
 from agent.vision_message_prep import VisionMessagePrepMixin

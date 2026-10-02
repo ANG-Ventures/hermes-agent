@@ -545,7 +545,7 @@ class TestAnthropicCredentialRefresh:
         agent._anthropic_api_key = "sk-ant-oat01-same-token"
 
         with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-same-token"),
+            patch("agent.anthropic_credentials.resolve_anthropic_token", return_value="sk-ant-oat01-same-token"),
             patch("agent.anthropic_adapter.build_anthropic_client") as rebuild,
         ):
             assert agent._try_refresh_anthropic_client_credentials() is False
