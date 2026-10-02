@@ -152,7 +152,7 @@ def prepare_iteration(
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
     _pre_api_steer = agent._drain_pending_steer()
     if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer, current_turn_user_idx)
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -262,20 +262,26 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
-    """Append the steer marker as a standalone user row after the newest tool message; with no
-    tool message, put the text back so the post-tool-execution drain delivers it later."""
-    for _si in range(len(messages) - 1, -1, -1):
-        _sm = messages[_si]
-        if isinstance(_sm, dict) and _sm.get("role") == "tool":
-            from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
-            # Fork #1585/#1595: delivered only once a model reads it (delegate steer ledger settles
-            # on note_steer_consumed after the next response; agents without a sink note it now).
-            from agent.agent_runtime_helpers import note_steer_injected
-            note_steer_injected(agent, steer_text)
-            logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
-            return
+def _inject_steer_after_newest_tool_result(
+    agent: Any, messages: Any, steer_text: str, current_turn_user_idx: Any = None,
+) -> None:
+    """Append the steer marker as a standalone user row after the newest tool message of the
+    CURRENT turn; with none, put the text back so the post-tool-execution drain delivers it later.
+
+    Fork #1496 (2026-09-29): an unbounded scan reached the PREVIOUS turn's tool result on a turn's
+    first API call, burying the steer before the old final reply and the new user message (the
+    model never acted on it) and mutating cached history."""
+    from agent.conversation_loop import _current_turn_tail_tool_index
+    _si = _current_turn_tail_tool_index(messages, current_turn_user_idx)
+    if _si is not None:
+        from agent.prompt_builder import steer_user_row
+        messages.insert(_si + 1, steer_user_row(steer_text))
+        # Fork #1585/#1595: delivered only once a model reads it (delegate steer ledger settles
+        # on note_steer_consumed after the next response; agents without a sink note it now).
+        from agent.agent_runtime_helpers import note_steer_injected
+        note_steer_injected(agent, steer_text)
+        logger.info("Delivered /steer to agent (pre-API, after tool msg index %d) (%d chars)", _si, len(steer_text))
+        return
     from agent.agent_runtime_helpers import _requeue_pending_steer
     _requeue_pending_steer(agent, steer_text)
 

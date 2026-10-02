@@ -12,8 +12,10 @@ Contract pinned here, through the real ``AIAgent.run_conversation`` loop:
 1. First API call of a turn: no historical message is mutated; the steer stays
    pending and the first tool batch of THIS turn delivers it.
 2. A steer that arrives between iterations (after a tool batch of this turn)
-   is injected by the pre-API drain into THIS turn's newest tool result, with
-   an INFO ``Delivered /steer to agent (pre-API)`` log line.
+   is delivered by the pre-API drain as a standalone user row right after THIS
+   turn's newest tool result (upstream #110979 delivery shape; the tool row
+   itself is never rewritten), with an INFO ``Delivered /steer to agent
+   (pre-API`` log line.
 3. A turn that ends with no tool batch hands it back as
    ``result["pending_steer"]`` (the gateway delivers it as the next turn).
 """
@@ -106,6 +108,15 @@ def _content_text(content):
     return "".join(b.get("text", "") for b in content if isinstance(b, dict))
 
 
+def _steer_after_tool(api_messages, call_id):
+    """Text of the standalone steer user row that directly follows tool result *call_id*."""
+    for i, m in enumerate(api_messages):
+        if m.get("role") == "tool" and m.get("tool_call_id") == call_id:
+            nxt = api_messages[i + 1] if i + 1 < len(api_messages) else {}
+            return _content_text(nxt.get("content")) if nxt.get("role") == "user" else ""
+    return ""
+
+
 def _run(agent, responses, *, execute=None, step_callback=None):
     sent: list[list] = []
     queue = list(responses)
@@ -164,8 +175,9 @@ def test_first_api_call_never_injects_into_previous_turn_tool_result():
     # After this turn's first tool batch, the steer lands in THIS turn's result.
     second_call_tools = _tool_contents(sent[1])
     assert second_call_tools["old1"] == "old result"
-    assert STEER in second_call_tools["c1"]
-    assert STEER_MARKER_OPEN in second_call_tools["c1"]
+    assert second_call_tools["c1"] == "new result"  # the tool row is never rewritten
+    assert STEER in _steer_after_tool(sent[1], "c1")
+    assert STEER_MARKER_OPEN in _steer_after_tool(sent[1], "c1")
     assert not result.get("pending_steer")
 
 
@@ -218,7 +230,8 @@ def test_steer_between_iterations_injects_into_current_turn_tool():
     assert result["final_response"] == "done"
     tools = _tool_contents(sent[1])
     assert tools["old1"] == "old result"
-    assert STEER in tools["c1"]
+    assert tools["c1"] == "new result"
+    assert STEER in _steer_after_tool(sent[1], "c1")
     assert not result.get("pending_steer")
     assert any("Delivered /steer to agent (pre-API" in line for line in info_lines)
 
@@ -284,7 +297,8 @@ def test_steer_after_synthetic_mid_turn_nudge_still_injects_into_current_turn_to
     assert result["final_response"] == "done"
     tools = _tool_contents(sent[1])
     assert tools["old1"] == "old result"
-    assert STEER in tools["c1"]
+    assert tools["c1"] == "new result"
+    assert STEER in _steer_after_tool(sent[1], "c1")
     assert not result.get("pending_steer")
 
 
@@ -306,17 +320,16 @@ def test_turn_tail_tool_index_uses_turn_start_and_rejects_invalid_index():
     assert _current_turn_tail_tool_index(messages, 99) is None
 
 
-def test_pre_api_append_failure_puts_steer_back_instead_of_claiming_delivery():
-    """A current-turn tool result whose content cannot take a text block must
-    not swallow the steer: no INFO delivery line, and the steer is handed back
-    as pending_steer instead of vanishing."""
+def test_pre_api_drain_does_not_depend_on_tool_content_shape():
+    """Delivery is a standalone user row, so a current-turn tool result whose content cannot
+    take a text block no longer matters (the fork's append-into-content put-back path is gone
+    with upstream #110979): the steer is delivered, logged, and not left pending."""
     import agent.conversation_loop as conversation_loop
 
     agent = _make_agent()
 
     def _execute_bad_content(assistant_message, messages, effective_task_id, api_call_count=0):
         for tc in assistant_message.tool_calls:
-            # Truthy, non-str, non-iterable: list(content) raises.
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": 12345})
 
     def _step(api_call_count, prev_tools):
@@ -331,7 +344,7 @@ def test_pre_api_append_failure_puts_steer_back_instead_of_claiming_delivery():
         return real_info(msg, *args, **kwargs)
 
     with patch.object(conversation_loop.logger, "info", side_effect=_capture_info):
-        result, _sent = _run(
+        result, sent = _run(
             agent,
             [
                 _response(finish_reason="tool_calls", tool_calls=[_tool_call("c1")]),
@@ -341,5 +354,6 @@ def test_pre_api_append_failure_puts_steer_back_instead_of_claiming_delivery():
             step_callback=_step,
         )
 
-    assert not any("Delivered /steer to agent (pre-API" in line for line in info_lines)
-    assert result.get("pending_steer") == STEER
+    assert any("Delivered /steer to agent (pre-API" in line for line in info_lines)
+    assert STEER in _steer_after_tool(sent[1], "c1")
+    assert not result.get("pending_steer")
