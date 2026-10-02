@@ -488,6 +488,10 @@ class TestPatchReplacePostWriteVerification:
             if stdin_data is not None:  # write (atomic temp-file + mv script)
                 state["content"] = stdin_data
                 return {"output": "", "returncode": 0}
+            if command.startswith("cat "):
+                # Fork: write_file text-verifies the write (no sha256sum on this double) before
+                # patch_replace's own byte-exact verify — answer it so the patch verify is the one that fails.
+                return {"output": state["content"], "returncode": 0}
             if "base64 < " in command:  # byte-exact read
                 call_count["read"] += 1
                 # First read (initial fetch) succeeds; second read (verify) fails

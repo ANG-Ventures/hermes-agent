@@ -628,7 +628,7 @@ class TestAgentCannotSetModelPin:
         # clearing of a pin the caller never referenced).
         json.loads(
             registry.dispatch(
-                "cronjob",
+                "cronjob_manage",  # registry.dispatch takes the canonical name (alias mapping is executor-side)
                 {"action": "update", "job_id": job_id, "name": "renamed-again"},
             )
         )
