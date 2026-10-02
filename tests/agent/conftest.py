@@ -67,9 +67,15 @@ def _fast_retry_backoff(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _block_real_claude_keychain(monkeypatch):
+def _block_real_claude_keychain(request, monkeypatch):
     """Make anthropic_adapter see a non-Darwin platform by default so the
     macOS Keychain Claude-Code credential read can't fire.
+
+    Honours the same ``allow_macos_keychain`` opt-out as the suite-wide
+    ``_neutralize_macos_keychain_creds`` guard: a test that exercises the
+    Keychain parser/mirror under ``platforms("macos")`` with ``subprocess.run``
+    mocked needs the real platform answer (upstream's
+    ``TestFindClaudeCodeKeychainItem`` / mirror tests, 2026-10-01 parity sync).
 
     ``read_claude_code_credentials`` early-returns when
     ``platform.system() != "Darwin"``, so defaulting the adapter's view of
@@ -82,6 +88,8 @@ def _block_real_claude_keychain(monkeypatch):
     apply after this fixture and win, so this does not interfere with them.
     It only neutralises the ambient real-Keychain leak on a dev Mac.
     """
+    if request.node.get_closest_marker("allow_macos_keychain"):
+        return
     # Upstream moved the Keychain readers into agent.anthropic_credentials; patch the
     # module that actually calls platform.system() (a module-level ``import platform``
     # binds the stdlib module, so this patch is process-wide for the test).

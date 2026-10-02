@@ -89,11 +89,38 @@ def _linked_worktree(project: Path, tmp_path: Path) -> Path:
     return wt
 
 
+def _kanban_home(tmp_path: Path, monkeypatch) -> Path:
+    """Sandboxed kanban home for the fork's fail-closed workspace reclamation.
+
+    The fork never ``rmtree``s a workspace it cannot prove holds no work (kanban_survivor): teardown
+    needs a KNOWN OWNER row and a durable remote carrying every commit. The fixture's bare origin
+    lives under the temp root, which the survivor capture treats as non-durable by default, so the
+    temp roots are pinned elsewhere (same shape as tests/hermes_cli/test_kanban_worktree_teardown).
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_survivor
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kanban_survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+    kb.init_db()
+    return home
+
+
 # Production removal paths; each returns (root that goes away, sibling root that stays, remove()).
 def _kanban_worktree(project, tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_workspace as kbw
+    _kanban_home(tmp_path, monkeypatch)
     wt = _linked_worktree(project, tmp_path)
-    return wt, project, lambda: kbw._cleanup_worktree_workspace("t1", str(wt), "wt/t1")
+    # Register the finished card that owns this checkout (the fork refuses an unknown owner).
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="worktree owner", workspace_kind="worktree", workspace_path=str(wt))
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        conn.commit()
+    return wt, project, lambda: kbw._cleanup_worktree_workspace(tid, str(wt), "wt/t1")
 
 
 def _cli_worktree(project, tmp_path, monkeypatch):
@@ -118,17 +145,16 @@ def _kanban_scratch(project, tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_workspace as kbw
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    _kanban_home(tmp_path, monkeypatch)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="scratch")
         ws = kbw.resolve_workspace(kb.get_task(conn, tid))
         kbw.set_workspace_path(conn, tid, ws)
-    (ws / ".git").mkdir()  # the worker cloned a project into its scratch dir
-    _seed_project(ws)
+    # The worker cloned the (pushed-clean) project into its scratch dir. A bare ``.git`` directory
+    # is not a repository: the fork's survivor capture runs git in it, fails, and HOLDs the
+    # workspace instead of removing it.
+    ws.mkdir(parents=True, exist_ok=True)
+    _git("clone", "-q", str(tmp_path / "origin.git"), str(ws), cwd=tmp_path)
 
     def remove():
         with kbc.connect() as conn:

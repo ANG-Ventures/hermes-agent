@@ -2847,7 +2847,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         trigger math lives, shared by ``update_model`` and the switch guard's preview so the number the
         guard quotes is the number the compressor installs (#83450). Excludes the auxiliary-summariser
         ceiling, which the feasibility probe re-derives per runtime."""
-        base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_percent_for(model, provider), provider)
+        # getattr: ``__new__``-built doubles (tests) set only the fields the reset logic reads (fork tolerance).
+        base_percent = resolve_model_threshold(
+            model, getattr(self, "model_thresholds", None), self._config_percent_for(model, provider), provider)
         effective_percent = self._effective_threshold_percent(context_length, base_percent)
         threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
         cap = self._effective_threshold_cap(context_length)
@@ -2862,14 +2864,15 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         map then overrides on top (same precedence as __init__), so a mid-session fallback re-resolves the
         DESTINATION model's threshold instead of re-applying the old model's (2026-06-19 compaction-thrash
         fix; the Codex autoraise must survive an opus 1M -> gpt-5.5 272K fallback)."""
+        config_percent = getattr(self, "_config_threshold_percent", self.threshold_percent)
         if self._per_model_threshold_cfg is None and self._global_threshold_percent is None:
-            return self._config_threshold_percent
+            return config_percent
         from agent.auxiliary_client import resolve_compression_threshold
         return resolve_compression_threshold(
             self._per_model_threshold_cfg, model, provider,
             global_threshold=(
                 self._global_threshold_percent if self._global_threshold_percent is not None
-                else self._config_threshold_percent
+                else config_percent
             ),
             allow_codex_gpt55_autoraise=self._codex_gpt55_autoraise,
         )

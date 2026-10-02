@@ -218,6 +218,23 @@ class _NonStreamRequest:
             f"Codex stream produced no substantive model progress for {int(elapsed)}s "
             f"(progress threshold: {int(wd.progress_timeout)}s)")
 
+    def _progress_stall_kill(self, elapsed: float) -> None:
+        """Fork: events flowing (keepalives) but zero forward progress past the fast-reconnect
+        cutoff — kill so the retry loop reconnects instead of burning the blunt stale timeout."""
+        agent, wd = self.agent, self.wd
+        h.logger.warning("Codex stream emitted events but no forward progress for %.0fs "
+            "(threshold %.0fs, model=%s, context=~%s tokens). Backend is sending keepalives without "
+            "producing output. Killing connection so the retry loop can reconnect.",
+            elapsed, wd.progress_stall_timeout, self._model(), f"{wd.est_tokens:,}")
+        agent._buffer_diagnostic_status(
+            f"⚠️ Codex stream stalled with no progress for {int(elapsed)}s "
+            f"(keepalives only, model: {self._model()}). Reconnecting.")
+        self._abort_request("codex_progress_stall_kill")
+        agent._touch_activity(f"codex stream killed after {int(elapsed)}s with no forward progress")
+        self._await_worker_after_kill(
+            f"Codex stream emitted events but made no forward progress for {int(elapsed)}s "
+            f"(threshold: {int(wd.progress_stall_timeout)}s)")
+
     def _idle_kill(self, event_stale_elapsed: float) -> None:
         """SSE events stopped after the phase-specific idle arm point.
 
@@ -299,6 +316,13 @@ class _NonStreamRequest:
             if (self._pre_progress(last_event_ts, last_progress_ts)
                     and attempt_elapsed > wd.progress_timeout):
                 self._progress_kill(attempt_elapsed)
+                break
+            # Fork: keepalive-only stall outside the implicit large-context policy. Armed only once
+            # an event arrived, so it never races the no-event TTFB detector for the first byte.
+            stall_timeout = getattr(wd, "progress_stall_timeout", 0.0)  # hand-rolled doubles predate the field
+            if (stall_timeout > 0 and last_event_ts is not None and last_progress_ts is None
+                    and attempt_elapsed > stall_timeout):
+                self._progress_stall_kill(attempt_elapsed)
                 break
             idle_elapsed = now - last_event_ts if last_event_ts is not None else None
             if (retry_started_ts is None and wd.idle_enabled and idle_elapsed is not None

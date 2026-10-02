@@ -1174,6 +1174,7 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # one, so the offline path resolved 128K for a 1M model (#74263); the pairing is now tested.
     **dict.fromkeys((
         "anthropic.claude-fable-5", "anthropic.claude-fable", "anthropic.claude-sonnet-5", "anthropic.claude-opus-5",
+        "anthropic.claude-mythos-5",  # fork: Mythos 5 (1M, 128k out, 2026-06-09) sits in DEFAULT_CONTEXT_LENGTHS
         "anthropic.claude-opus-4-8", "anthropic.claude-opus-4-7",
         "anthropic.claude-opus-4-6", "anthropic.claude-sonnet-4-6",
     ), 1_000_000),
