@@ -93,6 +93,27 @@ def _spec(*, goal="continue the report", generation=0):
     }
 
 
+class _QueuedFuture:
+    """Future-shaped handle for executor doubles: the dispatch core registers a done callback
+    (upstream's backend-retirement reservation release), so a bare ``object()`` is rejected as
+    ``submission_failed``. Running the queued fn fires the callbacks so the reservation is released."""
+
+    def __init__(self):
+        self._callbacks = []
+
+    def add_done_callback(self, fn):
+        self._callbacks.append(fn)
+
+    def wrap(self, fn):
+        def run():
+            try:
+                return fn()
+            finally:
+                for cb in self._callbacks:
+                    cb(self)
+        return run
+
+
 def _dispatch(gate=None):
     gate = gate or threading.Event()
 
@@ -596,8 +617,9 @@ def test_dispatch_intent_is_durable_before_executor_submit(monkeypatch):
         def submit(self, fn):
             record = next(iter(_load()["records"].values()))
             assert record["attempt"]["submitted_at"] is None
-            queued.append(fn)
-            return object()
+            future = _QueuedFuture()
+            queued.append(future.wrap(fn))
+            return future
 
     monkeypatch.setattr(ad, "_get_executor", lambda workers: InspectingExecutor())
     result, _ = _dispatch()
@@ -614,8 +636,9 @@ def test_submission_telemetry_failure_cannot_trigger_inline_duplicate(monkeypatc
 
     class QueuingExecutor:
         def submit(self, fn):
-            queued.append(fn)
-            return object()
+            future = _QueuedFuture()
+            queued.append(future.wrap(fn))
+            return future
 
     monkeypatch.setattr(ad, "_get_executor", lambda workers: QueuingExecutor())
     monkeypatch.setattr(
