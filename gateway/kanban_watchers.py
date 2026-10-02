@@ -717,37 +717,41 @@ def _send_proc_slot_alert(gate) -> bool:
     return proc.returncode == 0
 
 
-def _requeue_host_transient_blocks(gate, boards, skip=()) -> "dict[str, list[str]]":
-    """Unblock host-exhaustion ``transient`` cards once the gate admits again."""
-    from hermes_cli import kanban_db as kb
-
+def _host_recovery_note(gate) -> Optional[str]:
+    """Requeue note when this tick's gate admits, else None (no requeue)."""
     if not gate.host_recovered():
-        return {}
+        return None
     l1 = "?" if gate.load1 is None else f"{gate.load1:.1f}"
-    note = (
+    return (
         f"dispatcher load gate {gate.state}, load1={l1}, "
         f"procs={gate.procs if gate.procs is not None else '?'}"
         f"/{gate.proc_limit or '?'}"
     )
-    out: dict = {}
-    for b in kb.enumerating_each(boards):
-        slug = b.get("slug") or kb.DEFAULT_BOARD
-        if slug in skip:
-            continue
-        try:
-            with kb.connect_closing(board=slug) as conn:
-                ids = kb.requeue_host_transient_blocks(conn, note=note)
-        except Exception:
-            logger.exception("kanban dispatcher: transient requeue failed on %s", slug)
-            continue
-        if ids:
-            out[slug] = ids
-            logger.warning(
-                "kanban dispatcher [%s]: auto-requeued %d host-transient block(s) "
-                "after host recovery (%s): %s",
-                slug, len(ids), note, ", ".join(ids),
-            )
-    return out
+
+
+def _requeue_host_transient_on(conn, slug: str, note: Optional[str]) -> list:
+    """Unblock host-exhaustion ``transient`` cards on an OPEN board conn.
+
+    Runs on the dispatch tick's own connection (no extra board open; a
+    corrupt board already fails at connect). Errors are logged, never raised.
+    """
+    from hermes_cli import kanban_db as kb
+
+    if not note:
+        return []
+    try:
+        ids = kb.requeue_host_transient_blocks(conn, note=note)
+    except Exception:
+        # Never cost the board its dispatch tick.
+        logger.exception("kanban dispatcher: transient requeue failed on %s", slug)
+        return []
+    if ids:
+        logger.warning(
+            "kanban dispatcher [%s]: auto-requeued %d host-transient block(s) "
+            "after host recovery (%s): %s",
+            slug, len(ids), note, ", ".join(ids),
+        )
+    return ids
 
 
 def _observe_workspace_refusal_outages(notifier, results) -> int:
@@ -3195,7 +3199,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -3230,6 +3234,7 @@ class GatewayKanbanWatchersMixin:
                 disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
+                _requeue_host_transient_on(conn, slug, requeue_note)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -3311,14 +3316,8 @@ class GatewayKanbanWatchersMixin:
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
             _allowance, _spawn_paused = _sample_spawn_pause()
             # Host-exhaustion transient blocks clear when the host does
-            # (t_b660edb6). Before the dispatch pass so they spawn this tick.
-            _requeue_host_transient_blocks(
-                load_gate, boards,
-                skip={
-                    slug for slug, (fp, at) in disabled_corrupt_boards.items()
-                    if time.monotonic() - at < CORRUPT_BOARD_RETRY_AFTER_SECONDS
-                },
-            )
+            # (t_b660edb6); requeued inside each board's dispatch tick.
+            _requeue_note = _host_recovery_note(load_gate)
             _tick_spawned = 0
             _demand: list[tuple[str, int]] = []
             if _allowance is not None and not _spawn_paused:
@@ -3385,6 +3384,7 @@ class GatewayKanbanWatchersMixin:
                 res = _tick_once_for_board(
                     slug, budget_cache, _paused,
                     None if _paused else _limit,
+                    requeue_note=_requeue_note,
                 )
                 out.append((slug, res))
                 _n = len(getattr(res, "spawned", None) or []) if res is not None else 0

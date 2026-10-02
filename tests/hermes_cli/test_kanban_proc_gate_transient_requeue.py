@@ -204,21 +204,32 @@ def test_requeue_keeps_recurrence_memory(kanban_home):
         assert kb.get_task(conn, tid).status == "triage"
 
 
-def test_dispatcher_requeue_runs_only_when_gate_admits(kanban_home, monkeypatch):
+def test_dispatcher_requeue_runs_only_when_gate_admits(kanban_home):
     from gateway import kanban_watchers as kw
 
     with kb.connect_closing() as conn:
         tid = _blocked(conn, EAGAIN_REASON)
-    boards = [{"slug": kb.DEFAULT_BOARD}]
 
     g = _gate()
     g.admit(7.0, now=0, procs=9000, proc_limit=10666)
-    assert kw._requeue_host_transient_blocks(g, boards) == {}
+    note = kw._host_recovery_note(g)
+    assert note is None
     with kb.connect_closing() as conn:
+        assert kw._requeue_host_transient_on(conn, "default", note) == []
         assert kb.get_task(conn, tid).status == "blocked"
 
     g.admit(7.0, now=60, procs=1448, proc_limit=10666)
-    out = kw._requeue_host_transient_blocks(g, boards)
-    assert out == {kb.DEFAULT_BOARD: [tid]}
+    note = kw._host_recovery_note(g)
+    assert note and "procs=1448/10666" in note
     with kb.connect_closing() as conn:
+        assert kw._requeue_host_transient_on(conn, "default", note) == [tid]
         assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_proc_gate_config_keys_are_declared_defaults():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    g = LoadGate(DEFAULT_CONFIG["kanban"]["dispatch_load_gate"], 32)
+    assert g.proc_pause_fraction == 0.80
+    assert g.proc_resume_fraction == 0.65
+    assert g.proc_limit_override is None

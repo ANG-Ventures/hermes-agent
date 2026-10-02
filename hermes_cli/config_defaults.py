@@ -3255,6 +3255,13 @@ DEFAULT_CONFIG = {
             "cpu_corroborate": True,
             "cpu_busy_pause": 0.70,
             "worker_cpu_cost": 1.0,
+            # t_b660edb6: pause spawns (state proc_paused, #alerts page) at
+            # proc_pause_fraction of this uid's process limit (RLIMIT_NPROC,
+            # or proc_limit when set); resume below proc_resume_fraction.
+            # At the limit every fork() fails with EAGAIN.
+            "proc_pause_fraction": 0.80,
+            "proc_resume_fraction": 0.65,
+            "proc_limit": None,
         },
         # Reviewer↔implementer round cap. A "round" is one changes_requested
         # verdict; once a card has collected this many, the next request for
