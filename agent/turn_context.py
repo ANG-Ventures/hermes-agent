@@ -23,6 +23,7 @@ from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
+from agent.message_sanitization import is_interrupt_close_row, provider_owns_transcript
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
 from agent.turn_handoff import consume_handoff_context
@@ -1355,7 +1356,14 @@ def build_api_messages(
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
 
     api_messages = []
+    # t_f40dc54a: a provider that keeps its own transcript (bridge relay over a resident CLI
+    # session) must not be sent the harness-authored interrupt-close row — it is a reply the
+    # provider never produced, and the relay's coherence gate answers it with a full-history
+    # re-mint. Looked up once per request; fail-open (row sent) on any error.
+    _omit_interrupt_close = provider_owns_transcript(agent.provider)
     for idx, msg in enumerate(canonical_messages):
+        if _omit_interrupt_close and is_interrupt_close_row(msg):
+            continue
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
         api_msg = _clone_message_for_send(msg)

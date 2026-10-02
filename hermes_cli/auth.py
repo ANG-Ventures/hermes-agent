@@ -829,6 +829,11 @@ def _file_lock(
                     pass
 
 
+def _auth_lock_path() -> Path:
+    """Lock file beside the profile auth store (fork facade symbol; tests pin it)."""
+    return _auth_file_path().with_suffix(".lock")
+
+
 @contextmanager
 def _auth_store_lock(
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS, *, target_path: Optional[Path] = None):
