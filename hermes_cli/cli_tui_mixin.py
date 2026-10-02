@@ -1428,7 +1428,7 @@ class CLITuiMixin:
         # newline as its own Enter key event; the buffer collapse in _tui_on_text_changed only
         # sees whole-chunk pastes. Text still arriving (<50 ms since the last change) means this
         # Enter is a line break inside one message, not a submit (#10994).
-        if time.monotonic() - getattr(self, "_tui_last_text_change", 0.0) < _RAPID_INPUT_ENTER_WINDOW_S:
+        if time.monotonic() - getattr(self, "_tui_last_text_change", float("-inf")) < _RAPID_INPUT_ENTER_WINDOW_S:
             buf.insert_text("\n")
             return
         text = raw_text.strip()

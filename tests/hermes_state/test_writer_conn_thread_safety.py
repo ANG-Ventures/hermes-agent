@@ -121,9 +121,19 @@ class TestConcurrentReadersDoNotRaceTheWriter:
 
 
 class TestSystemErrorTransactionBoundary:
-    """A bare SystemError must never replay an ambiguous write."""
+    """A bare SystemError must never replay an ambiguous write.
 
-    def test_matching_error_inside_callback_is_not_replayed(self, db):
+    Fork divergence (ANG-Ventures/hermes-agent, 2026-08-20 incident): the message-scoped
+    ``SystemError`` ("returned NULL without setting an exception") IS retried inside
+    ``_execute_write`` like locked/busy — the callback's transaction was rolled back, so
+    the identical write is replayed until the patience budget runs out, then propagates.
+    That contract is pinned by ``tests/state/test_writer_conn_thread_safety.py``
+    (``TestSystemErrorRetry``); here we keep upstream's shape and assert the fork's
+    outcome: a persistent matching error still propagates, after a bounded replay.
+    """
+
+    def test_matching_error_inside_callback_is_replayed_then_propagates(self, db, monkeypatch):
+        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.05)
         calls = {"n": 0}
 
         def broken(_conn):
@@ -135,7 +145,7 @@ class TestSystemErrorTransactionBoundary:
 
         with pytest.raises(SystemError, match="returned NULL"):
             db._execute_write(broken)
-        assert calls["n"] == 1
+        assert calls["n"] >= 2  # retried (fork), bounded by the patience budget
 
     def test_post_commit_maintenance_error_does_not_replay_message(
         self, db, monkeypatch

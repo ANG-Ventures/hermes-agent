@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import textwrap
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 from unittest.mock import patch
 
 import pytest
@@ -663,14 +663,34 @@ def _function_sources_by_qualname(source_path: Path) -> Dict[str, str]:
     return found
 
 
+def _state_module_paths() -> List[Path]:
+    """hermes_state.py plus every ``hermes_state_*`` sibling: upstream split SessionDB
+    into domain mixins (hermes_state_messages/_sessions/_maintenance/...), so the
+    production writers this contract pins now live across the family."""
+    root = Path(hermes_state.__file__).parent
+    return sorted(root.glob("hermes_state*.py"))
+
+
+def _state_function_sources() -> Dict[str, str]:
+    """``<module stem>:<qualname>`` -> source for every function in the family."""
+    found: Dict[str, str] = {}
+    for path in _state_module_paths():
+        for name, src in _function_sources_by_qualname(path).items():
+            found[f"{path.stem}:{name}"] = src
+    return found
+
+
 def _sessiondb_method_sources() -> Dict[str, str]:
-    source_path = Path(hermes_state.__file__)
-    prefix = "SessionDB."
-    return {
-        name[len(prefix):]: src
-        for name, src in _function_sources_by_qualname(source_path).items()
-        if name.startswith(prefix) and "." not in name[len(prefix):]
-    }
+    """Methods of SessionDB and of every ``*Mixin`` class it is assembled from, by bare name."""
+    out: Dict[str, str] = {}
+    for name, src in _state_function_sources().items():
+        qual = name.split(":", 1)[1]
+        if qual.count(".") != 1:
+            continue
+        cls, meth = qual.split(".")
+        if cls == "SessionDB" or cls.endswith("Mixin"):
+            out[meth] = src
+    return out
 
 
 def _sql_literal_text(node: ast.AST) -> str:
@@ -685,8 +705,20 @@ def _sql_literal_text(node: ast.AST) -> str:
     return ""
 
 
+def _parse_function_source(source: str) -> ast.AST:
+    """Parse one extracted function. ``textwrap.dedent`` is not enough: a method whose
+    body holds a multi-line string with lines shallower than the ``def`` stays indented
+    and fails to parse, so wrap it in a class-shaped shell instead."""
+    try:
+        return ast.parse(textwrap.dedent(source))
+    except (IndentationError, SyntaxError):
+        indent = len(source) - len(source.lstrip(" "))
+        shell = "".join(" " * (4 * level) + "if True:\n" for level in range(indent // 4))
+        return ast.parse(shell + source)
+
+
 def _parent_session_id_writer_count(source: str) -> int:
-    tree = ast.parse(textwrap.dedent(source))
+    tree = _parse_function_source(source)
     count = 0
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
         if not isinstance(call.func, ast.Attribute) or call.func.attr not in {
@@ -707,7 +739,7 @@ def _parent_session_id_writer_count(source: str) -> int:
 
 
 def _call_count(source: str, function_name: str) -> int:
-    tree = ast.parse(textwrap.dedent(source))
+    tree = _parse_function_source(source)
     count = 0
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
         if isinstance(call.func, ast.Name):
@@ -722,30 +754,30 @@ def _call_count(source: str, function_name: str) -> int:
 
 
 def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent():
-    all_functions = _function_sources_by_qualname(Path(hermes_state.__file__))
-    insert_functions = {
-        name: src
-        for name, src in all_functions.items()
-        if "INSERT INTO messages (" in src
-    }
-    assert insert_functions == {
-        "_db_opens_cleanly": insert_functions.get("_db_opens_cleanly"),
-        "SessionDB.append_message": insert_functions.get("SessionDB.append_message"),
-        "SessionDB._insert_message_rows": insert_functions.get("SessionDB._insert_message_rows"),
-        # Pure-SQL tail clone for the compression rotation/archive paths —
-        # re-inserts existing rows column-exactly; recomputes the denorm
+    all_functions = _state_function_sources()
+    # Upstream funnels append/batch/replace/compact/import through ONE prepared
+    # statement (``_INSERT_MESSAGE_SQL``); a writer that executes it is a message
+    # INSERT path exactly like an inline literal.
+    def _inserts(src: str) -> bool:
+        return "INSERT INTO messages (" in src or "execute(_INSERT_MESSAGE_SQL" in src
+
+    insert_functions = {name: src for name, src in all_functions.items() if _inserts(src)}
+    assert set(insert_functions) == {
+        # Repair probe, not a transcript writer (throwaway scratch copy).
+        "hermes_state_repair:_db_opens_cleanly",
+        # The statement itself (module constant) is not a function; its callers are:
+        "hermes_state_messages:SessionMessagesMixin.append_message",
+        "hermes_state_messages:SessionMessagesMixin.append_delegation_delivery",
+        "hermes_state_messages:SessionMessagesMixin._insert_message_rows",
+        # Pure-SQL tail clones for the compression rotation/archive paths —
+        # re-insert existing rows column-exactly; recompute the denorm
         # (strictly stronger than the monotonic bump) before returning.
-        "SessionDB._clone_message_tail_rows": insert_functions.get(
-            "SessionDB._clone_message_tail_rows"
-        ),
+        "hermes_state_messages:SessionMessagesMixin._clone_message_rows",
+        "hermes_state:SessionDB._clone_message_tail_rows",
     }
 
     methods = _sessiondb_method_sources()
-    inserting_methods = {
-        name: src
-        for name, src in methods.items()
-        if "INSERT INTO messages (" in src
-    }
+    inserting_methods = {name: src for name, src in methods.items() if _inserts(src)}
     assert inserting_methods, "source contract must see production message INSERTs"
     offenders = [
         name
@@ -769,7 +801,7 @@ def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent()
 
 
 def test_every_parent_session_id_writer_is_effective_last_active_adjacent():
-    all_functions = _function_sources_by_qualname(Path(hermes_state.__file__))
+    all_functions = _state_function_sources()
     writer_functions = {
         name: (src, _parent_session_id_writer_count(src))
         for name, src in all_functions.items()
@@ -782,7 +814,7 @@ def test_every_parent_session_id_writer_is_effective_last_active_adjacent():
         for name, (src, writer_count) in writer_functions.items()
         if _call_count(src, "_recompute_effective_last_active") < writer_count
         and not (
-            name == "_delete_delegate_children"
+            name.endswith(":_delete_delegate_children")
             and "orphaned_child_ids.extend" in src
         )
     ]
@@ -791,7 +823,7 @@ def test_every_parent_session_id_writer_is_effective_last_active_adjacent():
     delegate_delete_callers = {
         name: src
         for name, src in all_functions.items()
-        if name != "_delete_delegate_children"
+        if not name.endswith(":_delete_delegate_children")
         and _call_count(src, "_delete_delegate_children")
     }
     assert delegate_delete_callers, "source contract must see delegate-delete callers"

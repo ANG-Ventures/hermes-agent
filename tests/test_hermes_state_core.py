@@ -1825,9 +1825,13 @@ class TestSchemaInit:
         conn.executescript(SCHEMA_SQL)
         conn.execute("DELETE FROM schema_version")
         conn.execute("INSERT INTO schema_version (version) VALUES (9)")
+        # Titled: the v16 migration tags an untitled, short, tool-bearing, parentless
+        # session as an orphaned delegate child (``_delegate_from = '__orphaned__'``),
+        # and v30 excludes delegate transcripts from the trigram index entirely. This
+        # fixture is a real conversation, so it must stay trigram-eligible.
         conn.execute(
-            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
-            ("s1", "cli", 1000.0),
+            "INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)",
+            ("s1", "cli", 1000.0, "snapshot chat"),
         )
         conn.execute(
             "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "

@@ -28,7 +28,7 @@ logger = logging.getLogger("tools.terminal_tool")
 
 # Advisory disk-usage check; cached so the recursive scan doesn't run on
 # every command (a result up to 5 minutes stale is harmless).
-_disk_usage_cache: dict = {"timestamp": 0.0, "result": False}
+_disk_usage_cache: dict = {"timestamp": float("-inf"), "result": False}
 
 _DISK_USAGE_CACHE_TTL = 300.0  # seconds
 

@@ -67,7 +67,7 @@ def _fast_retry_backoff(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _block_real_claude_keychain(monkeypatch):
+def _block_real_claude_keychain(request, monkeypatch):
     """Make anthropic_adapter see a non-Darwin platform by default so the
     macOS Keychain Claude-Code credential read can't fire.
 
@@ -81,7 +81,14 @@ def _block_real_claude_keychain(monkeypatch):
     ``subprocess.run``) inside the test body — those context-manager patches
     apply after this fixture and win, so this does not interfere with them.
     It only neutralises the ambient real-Keychain leak on a dev Mac.
+
+    ``allow_macos_keychain`` (the same opt-out the suite-wide guard in
+    ``tests/conftest.py`` honours) leaves the platform alone: those modules mock
+    ``subprocess.run`` themselves and, under ``platforms("macos")``, prove the
+    Darwin branch on the host it exists for.
     """
+    if request.node.get_closest_marker("allow_macos_keychain"):
+        return
     # Upstream moved the Keychain readers into agent.anthropic_credentials; patch the
     # module that actually calls platform.system() (a module-level ``import platform``
     # binds the stdlib module, so this patch is process-wide for the test).

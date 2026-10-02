@@ -251,7 +251,7 @@ _CATALOG_URL = ("https://raw.githubusercontent.com/NousResearch/hermes-agent"
 _SCHEMA_VERSION = 1
 _REFRESH_TTL_S = 6 * 3600
 _refresh_lock = threading.Lock()
-_last_refresh_attempt = 0.0
+_last_refresh_attempt = float("-inf")
 
 
 def _asset_from(d: "dict | None") -> "AssetFile | None":

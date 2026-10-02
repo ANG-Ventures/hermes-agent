@@ -668,7 +668,7 @@ def _run_on_tty(argv: list[str], *, env: dict[str, str], cwd: Path, writable: li
     proc = subprocess.Popen(sandbox_argv(argv, writable=writable), env=env, cwd=str(cwd),
                             stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
     os.close(slave)
-    buf, last_eof, deadline = b"", 0.0, time.monotonic() + timeout
+    buf, last_eof, deadline = b"", float("-inf"), time.monotonic() + timeout
     try:
         while proc.poll() is None:
             if time.monotonic() > deadline:

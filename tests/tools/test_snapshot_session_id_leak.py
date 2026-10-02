@@ -105,14 +105,15 @@ def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
     from gateway.session_context import _VAR_MAP
 
-    scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER]
-    exports = "; ".join([f'export {n}="x"' for n in scoped] + ['export HERMES_HOME="/h"', 'export MYVAR="keep"'])
+    # Fork: HERMES_HOME is scoped too (fork #543; tests/tools/test_env_snapshot_session_leak.py) —
+    # a replayed snapshot must never repoint another session's agent home.
+    scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER, "HERMES_HOME"]
+    exports = "; ".join([f'export {n}="x"' for n in scoped] + ['export MYVAR="keep"'])
     out = subprocess.run(
         ["bash", "-c", f"{exports}; {_export_dump_excluding_session_vars('/dev/stdout')}"],
         capture_output=True, text=True, check=True).stdout
     leaked = [n for n in scoped if f"declare -x {n}=" in out]
     assert not leaked, f"persisted into the snapshot: {leaked}"
-    assert 'declare -x HERMES_HOME="/h"' in out
     assert 'declare -x MYVAR="keep"' in out
 
 

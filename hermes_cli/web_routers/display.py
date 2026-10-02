@@ -166,7 +166,7 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
 
     viewer_closed = asyncio.Event()
     activity_file = Path(profile_home) / "bot-desktop" / "activity"
-    stamped = {"at": 0.0}
+    stamped = {"at": float("-inf")}
 
     def _stamp_activity() -> None:
         # An attached viewer is use: the idle auto-stop must not take a screen someone is watching.

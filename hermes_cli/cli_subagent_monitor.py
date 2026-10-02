@@ -35,7 +35,7 @@ class SubagentMonitor:
         self.queued = []
         self.selected_id = None
         self._signature = None
-        self._last_poll = 0
+        self._last_poll = float("-inf")
         self.app = None
         self.opening = False
         self.collapsed = False

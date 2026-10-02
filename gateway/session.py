@@ -2254,34 +2254,6 @@ class SessionStore(
             self._save()
         return True
 
-    def _write_sessions_json_unlocked(self, data: Dict[str, Any]) -> None:
-        """Write the legacy sessions.json mirror of the routing index."""
-        import tempfile
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        sessions_file = self.sessions_dir / "sessions.json"
-
-        # Self-documenting sentinel so anyone who inspects this file directly
-        # understands what it is and where CLI/TUI sessions actually live. Keys
-        # starting with "_" are skipped on load (see _ensure_loaded_locked), so
-        # this never round-trips into a SessionEntry. Ordered first via a fresh
-        # dict so it renders at the top of the pretty-printed JSON.
-        data = {"_README": _SESSIONS_JSON_README, **data}
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self.sessions_dir), suffix=".tmp", prefix=".sessions_"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            atomic_replace(tmp_path, sessions_file)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError as e:
-                logger.debug("Could not remove temp file %s: %s", tmp_path, e)
-            raise
-
     def clear_stale_resume_pending(self, max_age_seconds: float) -> int:
         """Clear stale recovery markers without dropping session entries.
 

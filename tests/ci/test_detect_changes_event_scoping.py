@@ -156,9 +156,13 @@ def test_merge_group_core_batch_runs_full_matrix(tmp_path):
     )
     assert outputs["python"] == "true"
     assert outputs["python_prod"] == "true"
-    assert outputs["docker"] == "true"
-    assert outputs["nix"] == "true"
     assert outputs["scan"] == "true"
+    # The slow lanes follow their own paths (classify_changes: docker = docker
+    # meta / dependency manifests / PM / tests/docker, nix = flake + manifests);
+    # a core Python change no longer starts them on a PR or a queue candidate.
+    # Every push to main still runs them all (see ``test_classify_changes.py``).
+    assert outputs["docker"] == "false"
+    assert outputs["nix"] == "false"
     assert outputs["test_scope"] == "full"
 
 

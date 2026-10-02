@@ -90,7 +90,7 @@ def _check_circuit_breaker(server_name: str) -> Optional[str]:
     from tools.mcp_tool_scope import _resolve_server_key
     key = _resolve_server_key(server_name)
     failures = _core._server_error_counts.get(key, 0)
-    age = time.monotonic() - _core._server_breaker_opened_at.get(key, 0.0)
+    age = time.monotonic() - _core._server_breaker_opened_at.get(key, float("-inf"))
     if failures < _core._CIRCUIT_BREAKER_THRESHOLD or age >= _core._CIRCUIT_BREAKER_COOLDOWN_SEC:
         return None
     retry_in = max(1, int(_core._CIRCUIT_BREAKER_COOLDOWN_SEC - age))
