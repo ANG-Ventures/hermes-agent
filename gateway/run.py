@@ -11579,7 +11579,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                if drain_requested():
+                # Off the loop: the marker read is open+read+json of a file
+                # every second, and each of those syscalls waits out the GIL
+                # switch interval while another thread is busy (t_1fd05a3a,
+                # read_drain_request held the loop 10s+ on 2026-10-01).
+                if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an

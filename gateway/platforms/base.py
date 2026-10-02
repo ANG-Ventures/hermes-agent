@@ -4021,37 +4021,70 @@ class BasePlatformAdapter(ABC):
         Logging every failure would spam the log on reconnect loops, so this
         surfaces the first failure per (platform, context) at warning level and
         downgrades subsequent failures to debug.
+
+        OFF THE LOOP.  ``_set_fatal_error`` / ``_mark_connected`` /
+        ``_mark_disconnected`` are sync but are called from coroutines (the
+        Discord liveness sampler, Telegram's polling-error handler).  The write
+        is a read-merge-``atomic_json_write`` of ``gateway_state.json``; every
+        syscall in it drops the GIL, and with a GIL-busy thread alive each
+        re-acquire waits out the switch interval, so the write held the loop
+        for 10s+ (t_1fd05a3a, dump 2026-10-01 23:15:21).  On a running loop
+        the write is queued on ``gateway.status``'s ordered runtime-status lane
+        (the same lane the runner uses; a direct terminal write fences it).
+        Without a loop it stays inline.
         """
+        # Multiplexed secondary adapters share the process-level runtime
+        # status file with the primary adapter.  Their runner stamps a
+        # namespaced key (``<profile>:<platform>``) so one profile's fatal
+        # state cannot overwrite another profile's healthy entry.
         try:
-            from gateway.status import write_runtime_status
-            # Multiplexed secondary adapters share the process-level runtime
-            # status file with the primary adapter.  Their runner stamps a
-            # namespaced key (``<profile>:<platform>``) so one profile's fatal
-            # state cannot overwrite another profile's healthy entry.
             platform_key = (
                 getattr(self, "_runtime_status_platform_key", None)
                 or self.platform.value
             )
-            write_runtime_status(platform=platform_key, **kwargs)
+        except Exception:
+            platform_key = None
+
+        def _write() -> None:
+            try:
+                from gateway import status as _status
+
+                _status.write_runtime_status(platform=platform_key, **kwargs)
+            except Exception as exc:
+                self._log_runtime_status_write_failure(context, exc)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            _write()
+            return
+        try:
+            from gateway.status import submit_runtime_status_job
+
+            submit_runtime_status_job(_write)
         except Exception as exc:
-            # Use getattr so object.__new__(...) test harnesses that skip __init__
-            # don't blow up on attribute access.
-            logged = getattr(self, "_status_write_logged", None)
-            if logged is None:
-                logged = set()
-                try:
-                    self._status_write_logged = logged
-                except Exception:
-                    pass
-            key = (self.platform.value, context)
-            if key not in logged:
-                logger.warning(
-                    "Failed to write runtime status (%s) for %s: %s (further failures at debug level)",
-                    context, self.platform.value, exc,
-                )
-                logged.add(key)
-            else:
-                logger.debug("Failed to write runtime status (%s) for %s: %s", context, self.platform.value, exc)
+            self._log_runtime_status_write_failure(context, exc)
+
+    def _log_runtime_status_write_failure(self, context: str, exc: BaseException) -> None:
+        # Use getattr so object.__new__(...) test harnesses that skip __init__
+        # don't blow up on attribute access.
+        logged = getattr(self, "_status_write_logged", None)
+        if logged is None:
+            logged = set()
+            try:
+                self._status_write_logged = logged
+            except Exception:
+                pass
+        key = (self.platform.value, context)
+        if key not in logged:
+            logger.warning(
+                "Failed to write runtime status (%s) for %s: %s (further failures at debug level)",
+                context, self.platform.value, exc,
+            )
+            logged.add(key)
+        else:
+            logger.debug("Failed to write runtime status (%s) for %s: %s", context, self.platform.value, exc)
+
 
     async def _notify_fatal_error(self) -> None:
         handler = self._fatal_error_handler
@@ -4427,9 +4460,32 @@ class BasePlatformAdapter(ABC):
         cancelled-acquire drain in :meth:`_acquire_platform_lock_async` knows
         exactly which lock the worker thread took and must release THAT one
         regardless of adapter state, so it comes through here.
+
+        On a running loop the unlink is queued on ``gateway.status``'s ordered
+        lane instead of running inline: adapter teardown (``disconnect()``)
+        and the cancel drain are coroutines, and the read + unlink held the
+        loop for 10s+ under GIL contention (t_1fd05a3a, telegram disconnect).
+        The queued job re-checks, under the pair's critical section, that no
+        acquisition was recorded after this release was authorised: a retry
+        connect in this same PID re-writes the same lock file, and an unlink
+        that ran after it would delete that live lock.
         """
-        from gateway.status import release_scoped_lock
-        release_scoped_lock(scope, identity)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            from gateway.status import release_scoped_lock
+            release_scoped_lock(scope, identity)
+            return
+
+        def _release() -> None:
+            with _platform_lock_key_lock(scope, identity):
+                if _platform_lock_holder_count(scope, identity):
+                    return
+                from gateway.status import release_scoped_lock
+                release_scoped_lock(scope, identity)
+
+        from gateway.status import submit_runtime_status_job
+        submit_runtime_status_job(_release)
 
     def _wire_plugin_handlers(self, native: Any = None) -> None:
         """Invoke plugin-registered native handler factories for this platform.
