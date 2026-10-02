@@ -794,6 +794,19 @@ def _probe_codex_quota_restored(
     return result
 
 
+def _reserve_codex_quota_probe_slot(access_token: Any) -> None:
+    """A refresh POST for this stored token just failed (pool refresh path): hold the token's
+    probe-throttle slot so ``_refresh_expired_codex_probe_token`` does not re-POST the same
+    refresh token on the very next selection. The failed attempt IS the one attempt per interval
+    the probe budget allows; the cooldown itself is untouched."""
+    from hermes_cli.auth import _codex_quota_probe_cache
+    token = _stripped(access_token)
+    if not token:
+        return
+    with _codex_quota_probe_lock:
+        _codex_quota_probe_cache[_codex_quota_probe_cache_key(token)] = (time.monotonic(), None)
+
+
 def _refresh_expired_codex_probe_token(
     access_token: Any, refresh_token: Any, *,
     min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[Dict[str, Any]]:

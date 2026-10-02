@@ -388,6 +388,11 @@ def refresh(pool, entry, force):
                 pool._replace_entry(entry, current)
                 pool._owner_baseline[current.id] = _snapshot(current)
                 pool._mark_exhausted(current, 429)
+                # The failed POST spends this token's one refresh attempt per probe interval:
+                # the mid-cooldown pre-probe refresh (#89415) must not re-POST the same
+                # single-use refresh token on the very next selection.
+                from hermes_cli.auth_codex import _reserve_codex_quota_probe_slot
+                _reserve_codex_quota_probe_slot(current.access_token)
                 receipt.unlink()
                 _sync_dir(receipt.parent)
             raise
