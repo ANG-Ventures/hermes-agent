@@ -384,6 +384,12 @@ _GATEWAY_PROVIDER_POLICY_RE = re.compile(
 # ``returned 401.``) and must keep matching (#89401).
 _GATEWAY_AUTH_ERROR_RE = re.compile(
     r"(provider\s+authentication\s+failed|incorrect\s+api\s+key|invalid\s+api\s+key"
+    # Fork: credential-resolution / pool-exhaustion / unconfigured-fallback envelopes are auth
+    # failures too (a profile missing its provider credentials; test_telegram_noise_filter).
+    r"|could\s+not\s+resolve\s+authentication\s+method"
+    r"|expected\s+either\s+api_key\s+or\s+auth_token"
+    r"|no\s+(?:codex\s+oauth\s+token|available\s+entries)"
+    r"|provider\s+not\s+configured"
     r"|(?<![\d:,.])401(?!\d))",
     re.IGNORECASE)
 
