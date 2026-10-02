@@ -16,7 +16,9 @@ from pathlib import Path
 from gateway.auto_resume import describe_inflight_tool_calls
 from gateway.run import _build_resume_pending_message
 
-RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+# Upstream moved the per-turn dispatch (and this call site) out of gateway/run.py into
+# gateway/run_turn_runner.py.
+RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run_turn_runner.py"
 
 
 def _call(call_id, name, args):

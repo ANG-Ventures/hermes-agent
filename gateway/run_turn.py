@@ -24,7 +24,7 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
 )
@@ -3875,6 +3875,28 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
+    def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str) -> None:
+        """Append a leftover /steer to the session's /queue overflow (behind the pending follow-up);
+        a leftover "/stop" or "/new" must never reach the agent."""
+        parts = text.strip().split(None, 1)
+        cmd_word = parts[0][1:].lower() if parts and parts[0].startswith("/") else ""
+        if cmd_word:
+            with suppress(Exception):
+                from hermes_cli.commands import resolve_command as _rc_leftover
+                if _rc_leftover(cmd_word):
+                    logger.info(
+                        "Discarding command '/%s' from leftover /steer — "
+                        "commands must not be passed as agent input", cmd_word,
+                    )
+                    return
+        self._session_state(session_key).conversation.queued_events.append(
+            MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+        )
+        logger.info(
+            "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
+            session_key, len(text),
+        )
+
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
     ) -> Tuple[Any, Optional[str]]:
@@ -3918,6 +3940,12 @@ class GatewayTurnMixin:
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+        elif result and result.get("pending_steer") and adapter and session_key:
+            # Fork (2026-09-29): a follow-up already owns the next turn. Queue the leftover steer
+            # behind it instead of dropping it — on the overflow tail, never the head slot (the
+            # depth-cap branch re-seats pending_event in the head slot and would overwrite it; the
+            # next drain promotes the overflow head). Same slash-command guard as the pending text.
+            self._queue_leftover_steer(result["pending_steer"], source, session_key)
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -4162,6 +4190,15 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+
+            # Fork (2026-09-29): the follow-up is a NEW turn on the parent's slot — re-stamp the turn
+            # clock and ack debounce so a busy/steer ack reports this turn's elapsed, not the parent's.
+            # Only the key this run claimed (session_key): a different next_session_key with a live
+            # started_ts belongs to ANOTHER running turn, whose clock must not move.
+            _followup_state = self._peek_session_state(session_key) if session_key else None
+            if _followup_state is not None and _followup_state.turn.started_ts:
+                _followup_state.turn.started_ts = time.time()
+                _followup_state.turn.busy_ack_ts = 0.0
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,

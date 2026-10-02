@@ -104,8 +104,9 @@ async def test_injection_path_primes_before_handle_message():
         "status": "completed",
     }
     result = await runner._inject_watch_notification("[done]", evt)
-    # Fork vocabulary: "delivered" == upstream's True (adapter acceptance).
-    assert result == "delivered"
+    # Upstream's True/False/None contract is the merged one (parity 2026-10-01, ledger F02c: the
+    # fork's "delivered"/"temporary"/"dropped" strings were superseded); True == adapter acceptance.
+    assert result is True
     assert calls and calls[0][0] == "prime", (
         f"injection path never primed the adapter (calls={calls}) — cold "
         "caches would bounce every post-restart reply at the egress guard"
