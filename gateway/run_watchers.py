@@ -66,6 +66,13 @@ class GatewaySessionWatchersMixin:
         # Prune stale SessionStore entries: the dict + sessions.json otherwise grow unbounded.
         prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)  # tests may omit
         if time.time() - prune_ts > _SESSION_STORE_PRUNE_INTERVAL:
+            # Fork: ``_clear_stale_resume_pending_flags`` reaps resume markers that
+            # outlive the owning conversation (hourly, same cadence as the prune).
+            from gateway.run import _clear_stale_resume_pending_flags
+            try:
+                await _clear_stale_resume_pending_flags(self.async_session_store)
+            except Exception as e:
+                logger.debug("Stale resume_pending clear failed: %s", e)
             try:
                 max_age = int(getattr(self.config, "session_store_max_age_days", 0) or 0)
                 if max_age > 0 and (n := await self.async_session_store.prune_old_entries(max_age)):
