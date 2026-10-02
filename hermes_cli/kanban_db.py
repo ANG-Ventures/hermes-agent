@@ -8086,20 +8086,21 @@ def _recorded_worker_alive(
 
 
 class _PendingTermination(tuple):
-    """A ``(worker_pid, claim_lock)`` pair plus its owner-identity window and
-    the recorded ``worker_started_at`` (upstream's pid-recycle witness).
+    """A ``(worker_pid, claim_lock, worker_started_at)`` triple (upstream's
+    pid-recycle witness rides in the tuple) plus the fork's owner-identity
+    window.
 
     Deferred (post-commit) terminations are drained after the run that
     recorded the pid has been closed, so the causal window is captured while
     the evidence is at hand. Compares and unpacks exactly like the plain
-    2-tuple callers already use.
+    3-tuple upstream callers use.
     """
 
     owner_window: tuple
     started_at: Optional[int]
 
     def __new__(cls, pid, claim_lock, owner_window=(None, None), started_at=None):
-        obj = super().__new__(cls, (pid, claim_lock))
+        obj = super().__new__(cls, (pid, claim_lock, started_at))
         obj.owner_window = tuple(owner_window)
         obj.started_at = started_at
         return obj
@@ -13084,7 +13085,7 @@ def invalidate_descendants_for_parent_reopen(
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.
         for entry in terminations:
-            pid, claim_lock = entry
+            pid, claim_lock = entry[0], entry[1]
             _terminate_reclaimed_worker(
                 pid, claim_lock, owner_window=_termination_window(entry),
                 started_at=getattr(entry, "started_at", None),
@@ -18900,6 +18901,14 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    # Fork facade re-exports: the dispatcher entry points lived here before
+    # upstream's kanban_db_dispatch split; fork tests and callers still reach
+    # them as ``kanban_db.dispatch_once`` etc.
+    check_respawn_guard,
+    detect_crashed_workers,
+    dispatch_once,
+    enforce_max_runtime,
+    has_spawnable_ready,
 )
 from hermes_cli.kanban_db_notify import (  # noqa: E402
     _decode_notify_delivery_metadata,

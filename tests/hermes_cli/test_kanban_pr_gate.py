@@ -938,8 +938,12 @@ def test_pr_already_resolved_for_this_card_is_not_resolved_again(
         assert [o.action for o in first] == ["unblocked"]
 
         kb.claim_task(conn, tid)
+        # A ``dependency`` block with no open parent is re-kinded to
+        # ``needs_input`` (42a778ab4b) and would count as a same-cause re-block
+        # after the first needs_input hold -> triage. Use a different sticky
+        # kind: the subject here is the spent PR, not the loop breaker.
         assert kb.block_task(
-            conn, tid, kind="dependency",
+            conn, tid, kind="capability",
             reason="o/r#7 is in; now waiting on sibling card t_deadbeef",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )

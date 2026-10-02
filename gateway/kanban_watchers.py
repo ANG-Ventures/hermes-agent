@@ -1993,9 +1993,12 @@ class GatewayKanbanWatchersMixin:
                             # uploads. ``extract_local_files`` finds bare
                             # absolute paths in the summary;
                             # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
+                            # them. Both handoff kinds stage files for exactly
+                            # this: a review-bound card's files exist so the
+                            # human sees them at handoff time (f3357b5031).
+                            # Retry exposure matches ``completed`` (the sub
+                            # cursor is rewound only when a send failed).
+                            if kind in ("completed", "review_requested"):
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=send_adapter,
