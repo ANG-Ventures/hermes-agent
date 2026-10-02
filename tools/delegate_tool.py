@@ -2677,6 +2677,12 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if is_timeout and not _child_future.done():
+                # upstream #94248 (native half): the abandoned worker is typically parked in an
+                # OpenSSL read that the cooperative interrupt cannot unblock. shutdown() its pooled
+                # sockets (FD-safe from this thread) so the read settles and the worker unwinds;
+                # the close itself still waits on the teardown door (run_end, deferred).
+                _drain_abandoned_child_transports(child, _child_future)
             # This child is reported failed: no descendant may outlive that.
             _reap_subtree(child, "timeout" if is_timeout else "error")
             duration = round(time.monotonic() - child_start, 2)
