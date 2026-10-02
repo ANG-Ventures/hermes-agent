@@ -351,8 +351,11 @@ class StreamFallbackMixin:
             # Interim: a stream-is-the-message adapter's seal-interception must not
             # turn this into draft(final=true), which would seal the live stream
             # with interim text and orphan the true final.
-            _md = self._metadata_for_send(final=False) or {}
-            _md["_interim_send"] = True
+            # Also declares the COMMENTARY kind (sets ``_interim_send`` too) so
+            # routing/telemetry can tell commentary from other interim sends
+            # (t_784a01bd); the relay adapter strips both before the wire.
+            from gateway.platforms.base import mark_commentary_send
+            _md = mark_commentary_send(self._metadata_for_send(final=False))
             # reply_to only for reply-anchored threading; Discord/Telegram use
             # thread_id metadata and reply_to on every commentary is spam.
             _plat = getattr(getattr(self.adapter, "platform", None), "value", None)

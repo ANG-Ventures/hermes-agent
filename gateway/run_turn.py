@@ -1386,14 +1386,18 @@ class GatewayTurnMixin:
         ``(agent, sync_session_db)``."""
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
         from run_agent import AIAgent
+        # Snapshot the session id BEFORE the awaits below: a /new or rotation can move
+        # session_entry.session_id meanwhile, and the detached agent must bind the session
+        # the hygiene plan was computed for (FleetReview #976).
+        _hyg_old_sid = session_entry.session_id
         try:
-            _hyg_session_row = await self._session_db.get_session(session_entry.session_id)
+            _hyg_session_row = await self._session_db.get_session(_hyg_old_sid)
         except Exception as exc:
             _hyg_session_row = None
             logger.warning(
                 "Session hygiene could not restore the system prompt for session %s: %s. "
                 "Preserving an empty prompt so the live turn rebuilds it with its "
-                "configured providers.", session_entry.session_id, exc, exc_info=True,
+                "configured providers.", _hyg_old_sid, exc, exc_info=True,
             )
         _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
         # With compression.checkpoint_required on, load the memory provider so the checkpoint exists
@@ -1404,12 +1408,17 @@ class GatewayTurnMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
-        _hyg_agent = AIAgent(
-            **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
-            skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
-            session_id=session_entry.session_id, session_db=_hyg_session_db,
-        )
-        _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
+        def _build_hyg_agent():
+            _a = AIAgent(
+                **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
+                skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
+                # The snapshot, never the live entry (#976).
+                session_id=_hyg_old_sid, session_db=_hyg_session_db,
+            )
+            _seed_hygiene_system_prompt(_a, _hyg_session_row)
+            return _a
+
+        _hyg_agent = _build_hyg_agent()
         # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
         # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
         # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
