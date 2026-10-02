@@ -431,6 +431,11 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         return _credential_bundle(
             values["model"], None, None, None, None,
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
+            # fork (#1523 b3cad0b7df): explicit tier keys survive _build_child_agent's re-gate of the
+            # parent-inherited tier onto a different delegation.model.
+            explicit_tier_overrides={
+                k: v for k, v in (explicit_request_overrides or {}).items() if k in ("service_tier", "speed")
+            } or None,
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
