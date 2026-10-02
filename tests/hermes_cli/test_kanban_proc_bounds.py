@@ -564,10 +564,13 @@ def test_census_skips_helpers_of_an_earlier_runs_browser(tmp_path):
     worker = subprocess.Popen([sys.executable, "-c", _SLEEP], env=_clean_env(),
                               start_new_session=True)
     _track(worker.pid)
+    time.sleep(0.1)
     old.stdin.write("go\n")
     old.stdin.flush()
     helper = int(old.stdout.readline())
     _track(helper)
-    assert kb._member_birth(helper) > kb._member_birth(worker.pid)
+    # Precondition: the helper alone passes the birth check (Linux births
+    # tick at 10 ms, so compare with >=).
+    assert kb._member_birth(helper) >= kb._member_birth(worker.pid)
     key = ("t_5a1a0003", "1")
     assert kpb.census_worker_trees({key: worker.pid})[key]["procs"] == 1  # the worker only
