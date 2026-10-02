@@ -1060,7 +1060,10 @@ def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``.
     ``stalling``/``finalizing`` are still live: evicting one makes the late runner return hit
     ``_finalize``'s missing-record path and silently drop a real result."""
-    completed = [(rid, r) for rid, r in _records.items() if r.get("status") not in _LIVE_STATES]
+    # Live states are always literal ``str``; a terminal status is runner data (fork guard: an unhashable
+    # or hostile ``__hash__`` status must not abort the prune — set membership would hash it).
+    completed = [(rid, r) for rid, r in _records.items()
+                 if not (type(r.get("status")) is str and r.get("status") in _LIVE_STATES)]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
         _records.pop(rid, None)
@@ -1291,7 +1294,12 @@ def _dispatch_admitted(
     retirement.acquire()
     try:
         future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
+        if future is not None:
+            future.add_done_callback(lambda _: retirement.release())
+        else:
+            # Fork test doubles hand back no future (they run the worker themselves later);
+            # nothing to track, so drop the worker reservation here instead of leaking it.
+            retirement.release()
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
         payload = None

@@ -39,7 +39,9 @@ from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional
 
 from hermes_cli.config import get_hermes_home
 
-from tools.process_registry_notifications import format_process_notification
+from tools.process_registry_notifications import (  # noqa: F401 — _format_async_delegation: fork facade re-export
+    _format_async_delegation, format_process_notification,
+)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 
