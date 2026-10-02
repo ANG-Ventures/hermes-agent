@@ -4448,7 +4448,25 @@ class GatewayTurnMixin:
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
-        turn_ctx._status_adapter = self._delivery_adapter_for(source)
+        _status_adapter = self._delivery_adapter_for(source)
+        turn_ctx._status_adapter = _status_adapter
+
+        def _current_status_adapter() -> Any:
+            """Late-bind the status/side-channel adapter at SEND time (fork, 2026-08-05 incident).
+
+            The adapter snapshotted at turn start can be REPLACED mid-turn by the platform reconnect
+            watcher (Discord ws ``ack_stale`` → ``self.adapters[platform]`` holds a NEW object); sends
+            through the stale object are silently dropped — a model-fallback announce generated 80s
+            after a reconnect never reached the channel. Re-resolve from the live registry per send;
+            fall back to the snapshot when live resolution fails (platform offline mid-reconnect).
+            """
+            try:
+                _live = self._delivery_adapter_for(source)
+            except Exception:
+                _live = None
+            return _live or _status_adapter
+
+        turn_ctx._current_status_adapter = _current_status_adapter
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
