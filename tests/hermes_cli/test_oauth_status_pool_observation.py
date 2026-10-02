@@ -223,7 +223,12 @@ def test_status_snapshot_leaves_the_auth_store_manifest_byte_identical(tmp_path,
     status = get_codex_auth_status()
 
     assert status["source"] == "hermes-auth-store"
-    assert {p.name: p.read_bytes() for p in home.iterdir() if p.is_file()} == manifest
+    # Fork (#673): Codex pools load at their explicit owner store under ``_auth_store_lock``, so a
+    # status read materialises the empty ``auth.lock`` sidecar; it must still rewrite no byte of
+    # ``auth.json`` or any other file.
+    after = {p.name: p.read_bytes() for p in home.iterdir() if p.is_file()}
+    assert after.pop("auth.lock", b"") == b""
+    assert after == manifest
 
 
 def test_model_picker_catalog_never_refreshes_the_stored_codex_login(tmp_path, monkeypatch):
