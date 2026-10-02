@@ -168,8 +168,9 @@ def test_every_loop_that_closes_active_children_goes_through_the_door():
             continue
         loops += l
         bad += b
-    # AIAgent.close() and AIAgent.release_clients() today.
-    assert sum(1 for l in loops if l.startswith("run_agent.py:")) >= 2, loops
+    # AIAgent._close_active_children(soft=) today — upstream 477a9b46e3c folded the
+    # close()/release_clients() loops into that one shared helper (parity 2026-10-01).
+    assert sum(1 for l in loops if l.startswith("run_agent.py:")) >= 1, loops
     assert not bad, bad
 
 
