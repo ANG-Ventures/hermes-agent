@@ -148,21 +148,25 @@ def test_cleanup_retries_worktree_removal_once(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A brief Windows directory-handle delay gets one safe retry."""
+    # The fork removes worktrees through ``kanban_survivor.remove_workspace_dir``
+    # (survivor capture first), which keeps upstream's single handle-release
+    # retry but issues the ``git worktree remove`` through its own ``_git``.
+    from hermes_cli import kanban_survivor
     wt = _make_worktree(repo, "t_retry112425")
-    real_git = kbw._git
+    real_git = kanban_survivor._git
     attempts = 0
 
-    def delayed_remove(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
+    def delayed_remove(repo_root, *args, **kwargs) -> subprocess.CompletedProcess:
         nonlocal attempts
         if args[:2] == ("worktree", "remove"):
             attempts += 1
             if attempts == 1:
                 return subprocess.CompletedProcess(
-                    ["git", *args], 1, stderr="Permission denied: handle pending"
+                    ["git", *args], 1, stdout=b"", stderr=b"Permission denied: handle pending"
                 )
-        return real_git(repo_root, *args, timeout=timeout)
+        return real_git(repo_root, *args, **kwargs)
 
-    monkeypatch.setattr(kbw, "_git", delayed_remove)
+    monkeypatch.setattr(kanban_survivor, "_git", delayed_remove)
     monkeypatch.setattr(kbw.time, "sleep", lambda _delay: None)
     kbw._cleanup_worktree_workspace("t_retry112425", str(wt))
 

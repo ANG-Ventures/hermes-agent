@@ -3417,12 +3417,14 @@ def _resolve_birth_session(
     parents: Iterable[str],
     *,
     explicit: bool = False,
+    creator_task_id: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """THE home a new card is born with, plus the ``origin:`` line it inherits.
 
     0. ``explicit`` (the caller NAMED the session, e.g. ``create --session``):
        that session wins over every parent.
-    1. The first homed parent, then the card the creating kanban worker run
+    1. The first homed parent, then the ``creator_task_id`` (durable lineage
+       without a dependency edge), then the card the creating kanban worker run
        was dispatched for: fan-out belongs to the HUMAN home of its lineage.
        A parent's CURRENT home wins over a defaulted ``session_id`` -- so after
        a ``--takeover`` re-home, children follow the new home.
@@ -3437,7 +3439,12 @@ def _resolve_birth_session(
         sid = str(session_id).strip() if session_id else ""
         return (sid or UNHOMED_SESSION), None
     worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    for tid in (*(parents or ()), *((worker_tid,) if worker_tid else ())):
+    creator_tid = (str(creator_task_id).strip() if creator_task_id else "")
+    for tid in (
+        *(parents or ()),
+        *((creator_tid,) if creator_tid else ()),
+        *((worker_tid,) if worker_tid else ()),
+    ):
         row = conn.execute(
             "SELECT session_id, body FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
@@ -5316,7 +5323,8 @@ def create_task(
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
     requested_session_id, unstamped_body = session_id, body
     birth = _resolve_birth_session(
-        conn, session_id, parents, explicit=session_explicit
+        conn, session_id, parents, explicit=session_explicit,
+        creator_task_id=creator_task_id,
     )
     session_id, inherited_origin = birth
     # ``require_home`` (the ``hermes kanban create`` CLI): a caller with NO
@@ -5421,7 +5429,8 @@ def create_task(
                 # home the child is born with. Re-resolve under the lock,
                 # BEFORE every check that reads the final home or body.
                 rebirth = _resolve_birth_session(
-                    conn, requested_session_id, parents, explicit=session_explicit
+                    conn, requested_session_id, parents, explicit=session_explicit,
+                    creator_task_id=creator_task_id,
                 )
                 if rebirth != birth:
                     birth = rebirth
@@ -8056,6 +8065,21 @@ def _recorded_worker_alive(
     alive -- fail closed, never release beside a possible owner.
     """
     if not _pid_alive(pid):
+        return False
+    # Upstream's spawn-time fingerprint (``worker_started_at``) is a second
+    # identity witness: a live PID that no longer matches it is a stranger
+    # (post-reboot recycle), never extended or signalled. The UNVERIFIED
+    # marker and a legacy NULL row carry no verdict and fall through to the
+    # owner window.
+    row = conn.execute(
+        "SELECT worker_started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    started_at = row["worker_started_at"] if row is not None else None
+    if (
+        started_at is not None
+        and started_at != UNVERIFIED_WORKER_FINGERPRINT
+        and _pid_recycled(pid, started_at)
+    ):
         return False
     window = _worker_owner_window(conn, task_id, pid, run_id)
     return _owner_identity(int(pid), *window) != "recycled"
@@ -11968,7 +11992,14 @@ def request_review(
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
-    metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    # A completion the fork auto-routed here already promoted + staged the
+    # prose-named scratch files (``_stage_routed_scratch_artifacts`` stamps
+    # ``routed_artifacts``); re-scanning the same prose would copy each file a
+    # second time (``name_1.ext``) and attach it twice.
+    if not (isinstance(metadata, dict) and metadata.get("routed_artifacts")):
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=None,
+        )
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
@@ -18861,10 +18892,12 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _RESPAWN_GUARD_PR_URL_RE,
     _RESPAWN_GUARD_PR_WINDOW,
     _STALE_HEARTBEAT_GAP_SECONDS,
+    UNVERIFIED_WORKER_FINGERPRINT,
     _classify_worker_exit,
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
+    _pid_recycled,
     _recent_worker_exits,
     _record_task_failure,
     _terminate_reclaimed_worker,

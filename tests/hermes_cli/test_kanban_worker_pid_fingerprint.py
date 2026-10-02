@@ -136,9 +136,16 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert kb.release_stale_claims(conn, signal_fn=sig) == 0
     assert killed == []
     assert kb.get_task(conn, tid).status == "running"
-    # An explicit operator reclaim releases the claim (human override) but still sends nothing.
-    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is True
+    # Fork contract (#921, fail closed on unprovable liveness): an operator
+    # request alone is not proof of death. The reclaim is REFUSED (claim held,
+    # ``reclaim_refused`` + needs_attention), and still nothing is signalled.
+    # Upstream releases here; the fork's guard is deliberately stricter.
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is False
     assert killed == []
+    assert kb.get_task(conn, tid).status == "running"
+    refused = [e.payload for e in kb.list_events(conn, tid) if e.kind == "reclaim_refused"]
+    assert refused and refused[-1]["reason"] == "liveness_unprovable"
+    assert refused[-1]["signal_refused"] is True
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.
     tid2 = kb.create_task(conn, title="job2", assignee="worker")

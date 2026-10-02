@@ -1019,7 +1019,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     async def _sleep(_delay):
         return None
 
+    # The dispatcher reaches the board through both spellings: the extracted
+    # ``kanban_db_connect.connect`` (``connect_closing`` and sibling modules)
+    # and the ``kanban_db`` facade re-export (the gateway tick). Count both.
     monkeypatch.setattr(_kbc, "connect", _connect)
+    monkeypatch.setattr(_kb, "connect", _connect)
     monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 

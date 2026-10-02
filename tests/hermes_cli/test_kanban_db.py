@@ -430,13 +430,26 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="never spawned", assignee="a")
         host = kb._claimer_id().split(":", 1)[0]
+        # Fork contract (#921 / t_09180e10): a pid-less host-local claim is
+        # released only once its claimer is provably dead AND the launch bound
+        # has passed (an unstamped orphan could still be spawning). Model that:
+        # a real exited claimer pid, and the claim aged past the bound.
+        dead = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+        dead.wait(timeout=10)
         for expected in (1, 2):
-            kb.claim_task(conn, t, claimer=f"{host}:worker")
+            kb.claim_task(conn, t, claimer=f"{host}:{dead.pid}")
             # No _set_worker_pid: the claimer never spawned a worker.
+            old = int(time.time()) - kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS - 3600
             conn.execute(
-                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
-                (int(time.time()) - 3600, t),
+                "UPDATE tasks SET claim_expires = ?, started_at = ? WHERE id = ?",
+                (int(time.time()) - 3600, old, t),
             )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old, t),
+            )
+            conn.commit()
             assert kb.release_stale_claims(
                 conn, signal_fn=lambda _p, _s: None, failure_limit=2,
             ) == 1
@@ -776,6 +789,7 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home, 
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
 
+@pytest.mark.platforms("linux")
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -784,7 +798,12 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     real dispatcher accounting, ``consecutive_failures`` stays put, the breaker
     never parks the card as a bare ``blocked``, the run is tagged
     ``infrastructure`` and the guard spaces the retries. A control spawn
-    failure on the same card still counts."""
+    failure on the same card still counts.
+
+    Linux-only by construction: ``restart_safe_gateway_child_argv`` returns
+    ``in_process`` before the systemd probes on any other OS, so the real
+    boundary cannot refuse there (the spawn stub's ``unreachable`` would then
+    be booked as an ordinary failure)."""
     import tools.process_registry as process_registry
 
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
@@ -4640,7 +4659,9 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
     worker process, not just null ``worker_pid`` in the DB (#76196: a worker
     kept running past its own archive and could still push/complete work
     against a task nothing tracks anymore). The termination outcome is
-    auditable via the ``archive_worker_termination`` event."""
+    auditable via the ``archive_worker_terminated`` event (the fork's name for
+    upstream's ``archive_worker_termination``; the fork's archive path also
+    carries the owner-window verdict and ``workspace_kept``)."""
     import json
 
     with kbc.connect() as conn:
@@ -4661,7 +4682,7 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
 
         row = conn.execute(
             "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'archive_worker_termination'",
+            "WHERE task_id = ? AND kind = 'archive_worker_terminated'",
             (t,),
         ).fetchone()
         payload = json.loads(row["payload"])
@@ -4685,7 +4706,7 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
         assert signalled == []
         row = conn.execute(
             "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND kind = 'archive_worker_termination'",
+            "WHERE task_id = ? AND kind = 'archive_worker_terminated'",
             (t,),
         ).fetchone()
         assert row is None

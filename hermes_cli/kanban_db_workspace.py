@@ -54,8 +54,19 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
     )
 
 
-def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
-    return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+def _has_active_children(conn: Optional[sqlite3.Connection], task_id: str) -> bool:
+    """Fail closed if a linked child still needs its parent's handoff."""
+    if conn is None:
+        try:
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing() as own:
+                return _has_active_children(own, task_id)
+        except Exception:
+            return True
+    try:
+        return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+    except sqlite3.Error:
+        return True
 
 
 def _lexical_path(path: Path | str) -> Path:

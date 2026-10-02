@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from hermes_cli import kanban_review_schema as _review_schema
+
 _DESC_TASK_ID_DEFAULT = (
     "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env "
     "(the task the dispatcher spawned you to work on)."
@@ -219,8 +221,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "the whole diff; the reviewer has the board and the PR."
         )),
         "reviewer": _prop("string", (
-                "Optional reviewer profile. When provided, the task is "
-                "reassigned to that profile before review dispatch."
+                "Reviewer profile to reassign the task to before review "
+                "dispatch. Must be a REAL installed profile (the fleet "
+                "verifier is 'argus') or the explicit sentinel 'human' / "
+                "'human:<name>' for a deliberate human lane. A "
+                "placeholder like 'reviewer' is refused — such a card can "
+                "never be spawned and would wait forever. Omit to use "
+                "config kanban.review_assignee."
         )),
         "metadata": {
             "type": "object",
@@ -259,7 +266,11 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
         "implementer with concrete required changes. This closes the review "
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
-        "review column; use kanban_block only for a genuine external blocker."
+        "review column. First post a current-run review_coverage JSON comment "
+        f"with lenses ({_review_schema.lens_list_text()}) and "
+        f"{_review_schema.coverage_fields_text().split(', ', 1)[1]}. "
+        "If a lens cannot run, use kanban_block(kind=capability), not "
+        "partial review."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),

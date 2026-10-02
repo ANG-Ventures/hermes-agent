@@ -231,9 +231,11 @@ def test_manual_unblock_clears_wake_stamp(kanban_home: Path) -> None:
 
 
 def test_promote_refusal_names_the_scheduled_exit(kanban_home: Path) -> None:
+    # ``force=`` was retired with upstream #106195 (a forced promotion only
+    # reported a success the first claim reverted); the scheduled-exit hint
+    # is what this test pins.
     with kb.connect_closing() as conn:
         tid = _scheduled(conn)
-        for force in (False, True):
-            ok, err = kb.promote_task(conn, tid, actor="op", force=force)
-            assert not ok
-            assert "unblock" in err and "schedule" in err and "--now" in err
+        ok, err = kb.promote_task(conn, tid, actor="op")
+        assert not ok
+        assert "unblock" in err and "schedule" in err and "--now" in err

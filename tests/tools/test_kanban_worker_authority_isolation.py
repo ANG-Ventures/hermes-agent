@@ -53,7 +53,10 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
         )
         claim = kb.claim_task(conn, tid)
         assert claim is not None
-        run_id = claim.id
+        # The dispatcher pins the RUN id (``task_runs.id``), not the task id;
+        # upstream's run-identity guard (``_worker_guard``) refuses a worker
+        # whose HERMES_KANBAN_RUN_ID does not parse as its run.
+        run_id = claim.current_run_id
     finally:
         conn.close()
 
@@ -236,7 +239,10 @@ def test_genuine_dispatcher_worker_remains_authorized(monkeypatch, tmp_path):
     assert kt._default_task_id(None) == tid
     assert kt._enforce_worker_task_ownership(tid) is None
 
-    result = kt._handle_complete({"summary": "GENUINE-WORKER-HANDOFF"})
+    # Fork receipt gate (kanban_receipt, t_e21aa11c): a dispatcher-owned handoff
+    # needs structured evidence, not prose alone.
+    result = kt._handle_complete({"summary": "GENUINE-WORKER-HANDOFF",
+                                  "metadata": {"verified": "positive control"}})
     assert '"ok": true' in result
 
     conn = kb.connect()

@@ -33,7 +33,10 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
         subs = kn.list_notify_subs(conn, tid)
         assert len(subs) == 1 and subs[0]["delivery_mode"] == "wake"
         assert not conn.execute("SELECT 1 FROM task_links WHERE child_id = ?", (tid,)).fetchone()
-        # No ambient identity guessing in the storage API.
-        plain = kb.create_task(conn, title="plain", session_id="explicit")
+        # An explicitly NAMED session wins over any lineage. The fork's storage
+        # API deliberately homes a dispatched worker's fan-out on its human
+        # lineage (HERMES_KANBAN_TASK, t_09fea045); ``session_explicit`` is
+        # the fork's spelling of "the caller named it".
+        plain = kb.create_task(conn, title="plain", session_id="explicit", session_explicit=True)
         assert kb.get_task(conn, plain).session_id == "explicit"
         assert not kn.list_notify_subs(conn, plain)

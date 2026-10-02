@@ -51,7 +51,12 @@ def _completed_card_with_worker(conn, proc, *, ended_ago: int = 600) -> tuple[st
     kb.claim_task(conn, tid, claimer=kb._claimer_id())
     run_id = kb._current_run_id(conn, tid)
     kbd._set_worker_pid(conn, tid, proc.pid)
-    assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id) is True
+    # Fork receipt gate (kanban_receipt, t_e21aa11c): a dispatcher-owned
+    # handoff needs structured evidence, not prose alone.
+    assert kb.complete_task(
+        conn, tid, result="done", expected_run_id=run_id,
+        metadata={"verified": "reaper fixture"},
+    ) is True
     # Default: the run closed long enough ago that the reaper's grace window has passed.
     conn.execute("UPDATE task_runs SET ended_at = ended_at - ? WHERE id=?", (ended_ago, run_id))
     return tid, run_id
