@@ -89,12 +89,17 @@ def test_session_compress_reaches_supervisor_with_the_120_second_budget(monkeypa
 
     assert "error" not in resp, resp.get("error")
     assert resp["result"]["status"] == "compressed"
+    # Upstream #97948 replaced the fixed 120s with the config-derived budget (compression
+    # ceiling + slack, floored at 120s, capped under the desktop RPC timeout); the contract this
+    # test guards is that the REAL helper signature carries the budget through to the supervisor.
+    expected_timeout = server._compute_host_compress_wait_seconds()
+    assert expected_timeout >= 120.0
     assert controls == [
         {
             "sid": "compress-sid",
             "route_name": "session.compress",
             "wait": True,
-            "timeout": 120.0,
+            "timeout": expected_timeout,
         }
     ]
 
