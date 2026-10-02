@@ -19,7 +19,8 @@ class Agent(StatusOutputMixin):
     platform = "tui"
     _print_fn = None
 
-    def _touch_activity(self, *args):
+    def _touch_activity(self, *args, **kwargs):
+        # fork: wait notices are liveness, not progress (``progress=False``); accept the kwargs.
         pass
 
 

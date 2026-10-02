@@ -26233,6 +26233,18 @@
             "default": null,
             "title": "Voice Context"
           },
+          "system_context": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "System Context"
+          },
           "title_preview": {
             "anyOf": [
               {
@@ -30668,6 +30680,11 @@
             "default": "",
             "title": "Source",
             "type": "string"
+          },
+          "pinned": {
+            "default": false,
+            "title": "Pinned",
+            "type": "boolean"
           }
         },
         "required": [

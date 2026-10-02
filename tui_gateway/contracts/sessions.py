@@ -228,6 +228,8 @@ class SessionListRow(Result):
     message_count: int = 0
     live_message_count: int | None = None
     source: str = ""
+    # fork (#186, server-side pinned sessions): the stored pin flag rides every list row.
+    pinned: bool = False
 
 
 class SessionListResult(Result):

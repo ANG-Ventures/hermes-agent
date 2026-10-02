@@ -2616,6 +2616,7 @@ export interface PromptSubmitParams {
   queued?: boolean | null
   surface?: string | null
   voice_context?: string | null
+  system_context?: string | null
   title_preview?: string | null
   truncate_before_user_ordinal?: number | null
   truncate_before_row_id?: number | null
@@ -3131,6 +3132,7 @@ export interface SessionListRow {
   message_count?: number
   live_message_count?: number | null
   source?: string
+  pinned?: boolean
 }
 export interface SessionMostRecentParams {
   profile?: string | null
