@@ -4,6 +4,23 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _scoped_provider_registry():
+    """The fork provider registry is additive (provider_seam: no item deletion), so a
+    ``monkeypatch.setitem`` undo would raise at teardown; register directly and restore the
+    pre-test generation instead."""
+    from hermes_cli import provider_seam
+    # Snapshot after every seam-registered container exists: a generation taken before
+    # hermes_cli.models imported would drop _PROVIDER_MODELS/_PROVIDER_ALIASES on restore.
+    import providers  # noqa: F401
+    import hermes_cli.models  # noqa: F401
+    import hermes_cli.providers  # noqa: F401
+
+    generation = provider_seam.current()
+    yield
+    provider_seam._restore(generation)
+
+
 @pytest.mark.parametrize("live", [True, False])
 def test_setup_offers_registered_provider_catalog(monkeypatch, live):
     import providers
@@ -22,7 +39,7 @@ def test_setup_offers_registered_provider_catalog(monkeypatch, live):
         base_url="https://setup.example.invalid/v1",
         fallback_models=("declared-plugin-model",),
     )
-    monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
+    providers._REGISTRY[profile.name] = profile
     monkeypatch.setattr(auth, "PROVIDER_REGISTRY", dict(auth.PROVIDER_REGISTRY))
     # Mirror into the auth registry the way plugin discovery does; built from public types so the
     # helper is independent of the auth module's private mirroring function.
@@ -80,7 +97,7 @@ def test_setup_uses_profile_endpoint_and_headers(tmp_path, monkeypatch):
         name="scout-live-catalog", base_url=base + "/inference",
         models_url=base + "/catalog", default_headers={"X-Catalog-Contract": "present"},
     )
-    monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
+    providers._REGISTRY[profile.name] = profile
     monkeypatch.setattr(flows, "_models_dev_merged", lambda *_: [])
     try:
         result = flows._api_key_provider_model_list(
@@ -113,7 +130,7 @@ def test_setup_matches_picker_when_catalog_fetch_fails(monkeypatch):
         name="scout-down-catalog", auth_type="api_key", env_vars=("SCOUT_DOWN_TEST_KEY",),
         base_url="https://down.example.invalid/v1", fallback_models=("declared-a", "declared-b"),
     )
-    monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
+    providers._REGISTRY[profile.name] = profile
     monkeypatch.setattr(flows, "_models_dev_merged", lambda *_: [])
     monkeypatch.setattr(models, "_api_key_credentials", lambda *_: ("synthetic-test-key", ""))
 
@@ -137,7 +154,7 @@ def test_switch_validation_trusts_profile_owned_catalog(monkeypatch):
 
     profile = PlanProfile(name="scout-plan", auth_type="api_key", env_vars=("SCOUT_PLAN_TEST_KEY",),
                           base_url="https://plan.example.invalid/v1")
-    monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
+    providers._REGISTRY[profile.name] = profile
     monkeypatch.setattr(models, "_api_key_credentials", lambda *_: ("synthetic-test-key", ""))
     monkeypatch.setattr(models, "fetch_api_models", lambda *_a, **_k: ["other-vendor/model-a"])
 
@@ -162,8 +179,8 @@ def test_setup_keeps_curated_list_when_profile_catalog_is_down_and_declares_no_f
 
     profile = DownProfile(name="scout-curated-only", auth_type="api_key", env_vars=("SCOUT_CURATED_KEY",),
                           base_url="https://down.example.invalid/v1")
-    monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
-    monkeypatch.setitem(models._PROVIDER_MODELS, profile.name, ["curated-a", "curated-b"])
+    providers._REGISTRY[profile.name] = profile
+    models._PROVIDER_MODELS[profile.name] = ["curated-a", "curated-b"]  # undone by _scoped_provider_registry
     monkeypatch.setattr(flows, "_models_dev_merged", lambda *_: [])
 
     setup_rows = flows._api_key_provider_model_list(
