@@ -146,25 +146,41 @@ def test_no_response_returns_timeout_sentinel():
 
 
 # --- Multi-question batch ends on the first gateway non-answer (t_d3750098) ---
+#
+# Merged contract (upstream clarify_tool): ``callback(normalized) -> {"answers", "outcome",
+# "notice"?}``; the per-question loop and the non-answer decision live in the gateway's
+# ``TurnRunner._clarify_callback_sync``, which asks one card at a time through
+# ``_ask_clarify_question`` -> ``(response, answered)`` (the REAL producer below) and must stop at
+# the first card the user never answered instead of blocking the turn once per question.
 
 
-def _gateway_legacy_callback(calls, *, send_ok=True):
-    """A legacy (per-question) clarify callback driven by the REAL gateway
-    producer, the shape gateway/run.py's _clarify_callback_sync has."""
-    def cb(question, choices, multi_select=False):
-        calls.append(question)
+def _batch_runner(calls, *, send_ok=True, answers=None):
+    """A real TurnRunner whose per-card producer is driven by ``_clarify_send_then_wait``."""
+    from gateway.run_turn_runner import TurnRunner
+
+    runner = object.__new__(TurnRunner)
+    answers = iter(answers or [])
+
+    def ask(question, choices, multi_select, rearm=True):
+        calls.append(question.split("\n")[0])
+        scripted = next(answers, None)
+        if scripted is not None:
+            return scripted, True
         fut = MagicMock()
         fut.result.return_value = _Result(send_ok, None if send_ok else "down")
         clarify_mod = MagicMock()
         clarify_mod.get_clarify_timeout.return_value = 600
         clarify_mod.wait_for_response.return_value = None  # user never answered
-        # Upstream's producer returns ``(response, answered)``; the legacy
-        # per-question callback hands the tool only the response text.
-        response, _answered = _clarify_send_then_wait(
-            fut, clarify_id="cid", session_key="sk", clarify_mod=clarify_mod
-        )
-        return response
-    return cb
+        return _clarify_send_then_wait(fut, clarify_id="cid", session_key="sk", clarify_mod=clarify_mod)
+
+    runner._ask_clarify_question = ask
+    return runner
+
+
+def _ask(runner, questions):
+    import json
+    from tools.clarify_tool import clarify_tool
+    return json.loads(clarify_tool(questions, callback=runner._clarify_callback_sync))
 
 
 def test_batch_stops_on_first_gateway_timeout():
@@ -172,54 +188,32 @@ def test_batch_stops_on_first_gateway_timeout():
     in turn (5 x 600 s = 3003 s with the turn blocked) because the batch loop
     only recognised the CLI's TIMEOUT_RESPONSE, not the gateway's
     "[user did not respond within Nm]". One timeout must end the batch."""
-    import json
-    from tools.clarify_tool import clarify_tool
-
     calls = []
-    result = json.loads(clarify_tool(
-        "", questions=[{"question": f"Q{i}?"} for i in range(5)],
-        callback=_gateway_legacy_callback(calls),
-    ))
+    result = _ask(_batch_runner(calls), [{"question": f"Q{i}?"} for i in range(5)])
     assert calls == ["Q0?"]
-    assert result["timed_out"] is True
-    assert [r["user_response"] for r in result["responses"]] == [""] * 5
+    assert result["outcome"] == "timed_out"
+    assert result["notice"] == "[user did not respond within 10m]"
+    assert [r["user_response"] for r in result["responses"]] == [None] * 5
 
 
 def test_batch_stops_on_undeliverable_prompt():
-    import json
-    from tools.clarify_tool import clarify_tool
-
     calls = []
-    result = json.loads(clarify_tool(
-        "", questions=[{"question": "A?"}, {"question": "B?"}],
-        callback=_gateway_legacy_callback(calls, send_ok=False),
-    ))
+    result = _ask(_batch_runner(calls, send_ok=False), [{"question": "A?"}, {"question": "B?"}])
     assert calls == ["A?"]
-    assert result["timed_out"] is True
+    assert result["outcome"] == "undelivered"
+    assert result["notice"] == SENTINEL
 
 
 def test_batch_keeps_answer_that_merely_starts_like_a_sentinel():
-    """Only the exact producer sentinels end the batch. A typed answer that
-    begins with the same words is an answer (Prism P1 on #1510)."""
-    import json
-    from tools.clarify_tool import clarify_tool
-
-    answers = iter([
-        "The user did not provide a response to my email; send a reminder",
-        "[user did not respond within 10m] is what the old bot said",
-    ])
-    calls = []
-
-    def cb(question, choices, multi_select=False):
-        calls.append(question)
-        return next(answers)
-
-    result = json.loads(clarify_tool(
-        "", questions=[{"question": "A?"}, {"question": "B?"}], callback=cb,
-    ))
-    assert calls == ["A?", "B?"]
-    assert "timed_out" not in result
-    assert [r["user_response"] for r in result["responses"]] == [
+    """Only the producer's ``answered`` flag ends the batch. A typed answer that
+    begins with the same words as a sentinel is an answer (Prism P1 on #1510)."""
+    answers = [
         "The user did not provide a response to my email; send a reminder",
         "[user did not respond within 10m] is what the old bot said",
     ]
+    calls = []
+    result = _ask(_batch_runner(calls, answers=answers), [{"question": "A?"}, {"question": "B?"}])
+    assert calls == ["A?", "B?"]
+    assert result["outcome"] == "submitted"
+    assert "notice" not in result
+    assert [r["user_response"] for r in result["responses"]] == answers

@@ -143,7 +143,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._turn_count = 0
         # Author of the turn in flight, refreshed by on_turn_start.
         self._turn_author: dict[str, Any] = {}
-        # (config path, mtime_ns, size) -> identity_signature() values.
+        # (config path, sha256 of its bytes) -> identity_signature() values.
         self._identity_signature_memo: dict[tuple, dict[str, Any]] = {}
         # Injection audit. Off unless the logging key enables it: the record holds the user's representation.
         self._injection_log_path: Optional[str] = None
@@ -687,15 +687,14 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     def identity_signature(self) -> Dict[str, Any]:
         """Identity-mapping values from honcho.json that bust a cached gateway agent when they change.
 
-        Memoized on the file's mtime and size, so the per-message call is one stat. ``{}`` when the
-        config cannot be read."""
+        Memoized on the file's CONTENT digest, not its mtime/size: two writes inside one mtime tick
+        (coarse-granularity filesystems, e.g. Blacksmith CI runners) kept the same key and served a
+        stale signature, so a pinPeerName flip did not bust the agent cache. honcho.json is tiny;
+        hashing it is cheaper than parsing it. ``{}`` when the config cannot be read."""
         try:
             path = resolve_config_path()
-            try:
-                stat = path.stat()
-                memo_key = (str(path), stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                memo_key = (str(path), None, None)
+            digest = self._identity_config_digest(path)
+            memo_key = (str(path), digest)
             cached = self._identity_signature_memo.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -711,10 +710,22 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
                 "session_prefixing": [bool(cfg.session_peer_prefix), bool(cfg.session_ai_peer_prefix)],
                 "a2a_sessions": bool(cfg.a2a_sessions),
             }
-            self._identity_signature_memo = {memo_key: values}
+            # from_global_config re-reads the file: memoize only if it still holds the bytes the key
+            # was hashed from, or a writer racing between hash and parse would pin B's values under
+            # A's digest (fork C7 k102).
+            if self._identity_config_digest(path) == digest:
+                self._identity_signature_memo = {memo_key: values}
             return dict(values)
         except Exception:
             return {}
+
+    @staticmethod
+    def _identity_config_digest(path) -> Optional[str]:
+        import hashlib
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence, and record who wrote this turn: a shared session carries
