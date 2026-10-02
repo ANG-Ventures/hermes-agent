@@ -1084,6 +1084,55 @@ def _resolve_needs_input_pager_settings(load_config: Callable[[], Any]) -> "tupl
             bool(kcfg.get("needs_input_pager_dependency", False)))
 
 
+# Kinds whose passive line ``kanban.lifecycle_channel`` re-routes (t_f7bba206).
+# Failure lines (gave_up/crashed/timed_out/stalled), changes_requested and
+# triage routing stay in the subscriber's chat: they need a human.
+LIFECYCLE_CHANNEL_KINDS = frozenset({"completed", "review_requested", "blocked"})
+# A needs_input block on a card at or above this priority stays in the origin
+# chat (the needs-input pager pages there too).
+LIFECYCLE_CHANNEL_KEEP_PRIORITY = 100
+
+
+def parse_lifecycle_channel(value: Any) -> "Optional[tuple[str, str]]":
+    """``"platform:chat_id"`` -> ``(platform, chat_id)``; None when unset or malformed."""
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    platform, _, chat_id = value.strip().partition(":")
+    platform, chat_id = platform.strip().lower(), chat_id.strip()
+    if not platform or not chat_id:
+        return None
+    return platform, chat_id
+
+
+def lifecycle_channel_target(
+    channel: "Optional[tuple[str, str]]", kind: str, payload: Optional[dict], task: Any,
+) -> "Optional[tuple[str, str]]":
+    """Target for a done / ready-for-review / blocked line, or None to keep
+    the subscriber's own chat. A needs_input block on a priority >= 100 card
+    stays with the subscriber."""
+    if channel is None or kind not in LIFECYCLE_CHANNEL_KINDS:
+        return None
+    if kind == "blocked" and (payload or {}).get("kind") == "needs_input":
+        try:
+            priority = int(getattr(task, "priority", 0) or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        if priority >= LIFECYCLE_CHANNEL_KEEP_PRIORITY:
+            return None
+    return channel
+
+
+def _resolve_lifecycle_channel() -> "Optional[tuple[str, str]]":
+    """``kanban.lifecycle_channel``, read per notifier tick. Errors -> unset."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        kcfg = (load_config_readonly() or {}).get("kanban") or {}
+        return parse_lifecycle_channel(kcfg.get("lifecycle_channel") if isinstance(kcfg, dict) else None)
+    except Exception:
+        return None
+
+
 def _needs_input_cards(results, include_dependency: bool = False
                        ) -> tuple[list[tuple[str, dict]], set[str]]:
     """Probe each ticked board; only successful probes can prove a card unblocked."""
@@ -1756,6 +1805,7 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                lifecycle_channel = _resolve_lifecycle_channel() if deliveries else None
                 # One message per failure event, one per lane-wide cause.
                 lane_dedupe.plan(deliveries)
                 for d in deliveries:
@@ -2003,6 +2053,25 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        # kanban.lifecycle_channel (t_f7bba206): done / ready
+                        # for review / blocked lines go to a log channel; the
+                        # wake below still targets the subscriber.
+                        send_adapter, send_chat_id = adapter, sub["chat_id"]
+                        _routed = lifecycle_channel_target(
+                            lifecycle_channel, kind, ev.payload, task,
+                        )
+                        if _routed is not None:
+                            try:
+                                _routed_adapter = self._authorization_adapter(
+                                    _Platform(_routed[0]), sub_profile or None,
+                                )
+                            except ValueError:
+                                _routed_adapter = None
+                            if _routed_adapter is not None:
+                                send_adapter, send_chat_id = _routed_adapter, _routed[1]
+                                metadata = {}
+                            else:
+                                _routed = None
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -2042,8 +2111,8 @@ class GatewayKanbanWatchersMixin:
                         # failure instead of burning MAX_SEND_FAILURES ticks.
                         _target_gone = False
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            _send_res = await send_adapter.send(
+                                send_chat_id, msg, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -2053,7 +2122,9 @@ class GatewayKanbanWatchersMixin:
                             # None (or anything non-SendResult shaped) keep
                             # the legacy "no exception == delivered" contract.
                             if getattr(_send_res, "success", True) is False:
-                                _target_gone = (
+                                # A gone LOG channel must not drop the
+                                # subscriber's sub (its wake still matters).
+                                _target_gone = _routed is None and (
                                     getattr(_send_res, "error_kind", None) == "not_found"
                                 )
                                 raise RuntimeError(
@@ -2062,7 +2133,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                kind, sub["task_id"], platform_str, send_chat_id, board_slug,
                             )
                             _sent_event_ids.add(ev.id)
                             # After delivering the text notification, surface
@@ -2077,8 +2148,8 @@ class GatewayKanbanWatchersMixin:
                             if kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
+                                        adapter=send_adapter,
+                                        chat_id=send_chat_id,
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
