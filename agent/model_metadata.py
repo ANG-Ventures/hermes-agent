@@ -2310,6 +2310,16 @@ def _resolve_codex_oauth_context_length_with_source(model: str, access_token: st
     return _apply_verified_bump(hit[1], "fallback") if hit else (None, "")
 
 
+def _resolve_codex_oauth_context_length(
+    model: str, access_token: str = "", base_url: str = ""
+) -> Optional[int]:
+    """Resolve a Codex OAuth model's context length (compatibility wrapper, fork API)."""
+    context_length, _source = _resolve_codex_oauth_context_length_with_source(
+        model, access_token=access_token, base_url=base_url,
+    )
+    return context_length
+
+
 def provider_serves_codex_subscription(provider: Optional[str]) -> bool:
     """True when *provider* serves Codex-family slugs from a Codex subscription.
 

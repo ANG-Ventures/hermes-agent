@@ -109,9 +109,11 @@ def _seed(tmp_path, tail_rows, fold, follower):
         rows += [("user", f"bulk q {i} " + "q" * 80), ("assistant", f"bulk a {i} " + "a" * 80)]
     for role, content in [*rows, *tail_rows, ("assistant", REPLY)]:
         db.append_message(session_id, role, content)
-    # Production live dicts carry _row_id + timestamp (session flush stamps both).
+    # Production live dicts carry _row_id + timestamp (session flush stamps both). The fork gates
+    # ``timestamp`` behind ``include_timestamp`` (#107: byte-stable legacy shape, never a model
+    # payload / prompt-cache key); its production loaders opt in, so the fixture does too.
     messages = [
-        *db.get_messages_as_conversation(session_id, include_row_ids=True),
+        *db.get_messages_as_conversation(session_id, include_row_ids=True, include_timestamp=True),
         {"role": "user", "content": follower},
     ]
     assert isinstance(messages[-2].get("_row_id"), int) and messages[-2].get("timestamp") is not None
@@ -222,8 +224,18 @@ class TestEngineDropsReplyEndToEnd:
         # real turn and restore the dropped user turn behind the reply.
         fold = [{"role": "user", "content": SUMMARY_PREFIX + " earlier turns."}, *_tool_chain(*call_ids)]
         db, session_id, messages, agent = _seed(tmp_path, [], fold, FOLLOWER)
-        # The tool rounds already live after the new user turn; the engine keeps them.
+        # The tool rounds already live after the new user turn; the engine keeps them. They are
+        # also already on disk: the loop flushes the user turn and every tool round before a
+        # mid-turn compaction runs. That matters for the reused-id params — the fork's
+        # one-result-per-tool-call invariant (t_aace5343) rolls back a compaction that would
+        # INTRODUCE a duplicate active result, and only tolerates duplicates the live set
+        # already carried (llama.cpp's constant id lands in the DB one flush at a time).
         messages += fold[1:]
+        for row in messages[-len(fold):]:
+            db.append_message(
+                session_id, row["role"], row.get("content"),
+                tool_calls=row.get("tool_calls"), tool_call_id=row.get("tool_call_id"),
+            )
 
         with caplog.at_level("WARNING", logger="agent.conversation_compression_reply_anchor"):
             live, _ = self._compress_and_read(db, session_id, agent, messages, tail_role="tool")
