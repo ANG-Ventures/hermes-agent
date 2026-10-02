@@ -92,7 +92,10 @@ _PINNED_PROVIDER_KEYS = {
     "openrouter": "openrouter",
 }
 XAI_SUB_PREFIX_LEN = 8  # usage meter key = OIDC sub[:8] lowercase (registry.xai_key)
-_PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
+# Lane-grammar PINNED face x (plugins/model-providers/lane-names.json): one sub per N.
+# Mirrors hermes-home scripts/subs_data/registry.py _PINNED_LANE_RE (t_f2fc31f6:
+# claude-dtlx-N went live 2026-10-02 and recorded NULL under the old [ab]px form).
+_PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-(?:a|b[thsa]?|d[ths]?)[pl]x[fs]?-\d+$")
 _POOL_SUB_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _API_CALL_SEQ_INIT_LOCK = threading.Lock()
 _API_CALL_FAILURE_LOCK = threading.Lock()

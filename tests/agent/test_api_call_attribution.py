@@ -116,6 +116,8 @@ def test_429_then_200_records_zero_token_error_then_success(recorded):
     [
         ("claude-apx-7", "claude-apx-7"),
         ("claude-bpx-12", "claude-bpx-12"),
+        ("claude-dtlx-19", "claude-dtlx-19"),
+        ("claude-dtlxf-4", "claude-dtlxf-4"),
         ("gemini-bridge", "gemini"),
         ("openrouter", "openrouter"),
     ],
@@ -591,4 +593,10 @@ def test_aux_row_without_pool_headers_kwarg_stays_backward_compatible(recorded):
     agent = SimpleNamespace(_current_turn_id="t")
     cch._emit_aux_api_call_record(agent, "t", task="vision", provider="claude-alr", model="m",
                                   usage=None, api_mode="chat_completions")
+    assert recorded[0]["sub_key"] is None
+
+
+@pytest.mark.parametrize("provider", ["claude-alr", "claude-dtlr", "claude-cpx-3", "claude-apx", "claude-zpx-1"])
+def test_pooled_or_unpinned_lane_is_never_pinned(recorded, provider):
+    cch._record_successful_api_call(_agent("turn-np", provider), SimpleNamespace(usage=_usage(10, 5), pool_headers={}))
     assert recorded[0]["sub_key"] is None
