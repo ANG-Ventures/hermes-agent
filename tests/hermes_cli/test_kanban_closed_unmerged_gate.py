@@ -518,3 +518,133 @@ def test_e2e_legacy_routed_survivor_only_card_still_gated(board, no_survivor, mo
         monkeypatch.setattr(op, "_default_query", lambda: states(n5="CLOSED"))
         with pytest.raises(op.ClosedUnmergedPrError):
             kb.archive_task(conn, tid)
+
+
+# --- t_9aff2951: merged --survivor-pr + the closed PR's own CLOSED: <TOKEN> record --------------------------
+
+
+def merged(**by_number):
+    """query_fn stub where MERGED numbers carry a merge sha (``abc<n>def``)."""
+    def q(repo, n):
+        state = by_number.get(f"n{n}", op.NOT_FOUND)
+        return {"state": state, "merge_commit_sha": f"abc{n}def"} if state == "MERGED" else {"state": state}
+    return q
+
+
+SURVIVOR = "ANG-Ventures/r#9"
+
+
+def test_has_close_record_matches_the_contract_tokens_only():
+    assert op.has_close_record("CLOSED: RE-CARRIED-AS #9 -- folded into #9")
+    assert op.has_close_record("note\nCLOSED: SUPERSEDED-BY #9 -- landed via #9 (a56c889)")
+    assert op.has_close_record("CLOSED: DUPLICATE-OF #9 -- same change")
+    assert not op.has_close_record("CLOSED: CLEANUP -- not a contract token")
+    assert not op.has_close_record("closing, superseded by #9")
+    assert not op.has_close_record(None)
+
+
+def test_merged_survivor_plus_close_record_allows_done():
+    # t_3ec660ca shape: #5 closed with 'CLOSED: RE-CARRIED-AS #9', --survivor-pr #9 merged on default.
+    seen = []
+
+    def record(repo, n):
+        seen.append((repo, n))
+        return True
+    assert op.enforce_not_closed_unmerged(
+        "t_x", "done", metadata={"pr_url": PR_URL}, survivor_pr=SURVIVOR,
+        query_fn=merged(n5="CLOSED", n9="MERGED"), sha_check=lambda r, s: s == "abc9def",
+        close_record_fn=record) != []
+    assert seen == [("ANG-Ventures/r", 5)]
+
+
+def test_merged_survivor_without_close_record_refuses_and_names_the_pr():
+    with pytest.raises(op.ClosedUnmergedPrError) as exc:
+        op.enforce_not_closed_unmerged(
+            "t_x", "done", metadata={"pr_url": PR_URL}, survivor_pr=SURVIVOR,
+            query_fn=merged(n5="CLOSED", n9="MERGED"), sha_check=lambda r, s: True,
+            close_record_fn=lambda r, n: False)
+    msg = str(exc.value)
+    assert "ANG-Ventures/r#5 is CLOSED WITHOUT MERGE, so the work is not on the default branch" in msg
+    assert exc.value.untokened == ["ANG-Ventures/r#5"]
+    assert "does not cover ANG-Ventures/r#5" in msg and "CLOSED: <TOKEN>" in msg
+
+
+def test_close_record_unreadable_refuses():
+    with pytest.raises(op.ClosedUnmergedPrError) as exc:
+        op.enforce_not_closed_unmerged(
+            "t_x", "done", metadata={"pr_url": PR_URL}, survivor_pr=SURVIVOR,
+            query_fn=merged(n5="CLOSED", n9="MERGED"), sha_check=lambda r, s: True,
+            close_record_fn=lambda r, n: None)
+    assert exc.value.untokened == ["ANG-Ventures/r#5"]
+
+
+@pytest.mark.parametrize("n9,on_default", [("OPEN", True), ("CLOSED", True), ("MERGED", False)])
+def test_survivor_must_be_merged_on_default(n9, on_default):
+    with pytest.raises(op.ClosedUnmergedPrError) as exc:
+        op.enforce_not_closed_unmerged(
+            "t_x", "done", metadata={"pr_url": PR_URL}, survivor_pr=SURVIVOR,
+            query_fn=merged(n5="CLOSED", n9=n9), sha_check=lambda r, s: on_default,
+            close_record_fn=lambda r, n: True)
+    assert exc.value.untokened == []
+
+
+def test_close_record_without_survivor_still_refuses_done():
+    with pytest.raises(op.ClosedUnmergedPrError):
+        op.enforce_not_closed_unmerged(
+            "t_x", "done", metadata={"pr_url": PR_URL},
+            query_fn=merged(n5="CLOSED"), sha_check=lambda r, s: True,
+            close_record_fn=lambda r, n: True)
+
+
+def test_every_closed_pr_needs_its_own_close_record():
+    two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
+    with pytest.raises(op.ClosedUnmergedPrError) as exc:
+        op.enforce_not_closed_unmerged(
+            "t_x", "done", recorded=two, survivor_pr=SURVIVOR,
+            query_fn=merged(n5="CLOSED", n6="CLOSED", n9="MERGED"), sha_check=lambda r, s: True,
+            close_record_fn=lambda r, n: n == 5)
+    assert exc.value.untokened == ["ANG-Ventures/r#6"]
+
+
+def test_e2e_complete_with_merged_survivor_and_close_record(board, no_survivor, monkeypatch):
+    # t_60269760 shape: the card is blocked on its closed PR; the operator completes with --survivor-pr.
+    monkeypatch.setattr(op, "_default_query", lambda: merged(n5="CLOSED", n9="MERGED"))
+    monkeypatch.setattr(op, "_default_sha_check", lambda: (lambda r, s: True))
+    monkeypatch.setattr(op, "_default_close_record", lambda: (lambda r, n: True))
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        with pytest.raises(op.ClosedUnmergedPrError):  # no survivor named yet
+            kb.complete_task(conn, tid, summary="shipped", metadata={"pr_url": PR_URL}, expected_run_id=run)
+        assert kb.complete_task(conn, tid, summary="closing on the merged survivor",
+                                survivor_pr=SURVIVOR, metadata={"pr_url": PR_URL}, expected_run_id=run)
+        assert _status(conn, tid) == "done"
+
+
+def test_e2e_complete_with_merged_survivor_without_close_record_refused(board, no_survivor, monkeypatch):
+    monkeypatch.setattr(op, "_default_query", lambda: merged(n5="CLOSED", n9="MERGED"))
+    monkeypatch.setattr(op, "_default_sha_check", lambda: (lambda r, s: True))
+    monkeypatch.setattr(op, "_default_close_record", lambda: (lambda r, n: False))
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        with pytest.raises(op.ClosedUnmergedPrError) as exc:
+            kb.complete_task(conn, tid, summary="closing", survivor_pr=SURVIVOR,
+                             metadata={"pr_url": PR_URL}, expected_run_id=run)
+        assert "does not cover ANG-Ventures/r#5" in str(exc.value)
+        assert _status(conn, tid) == "running"
+
+
+def test_e2e_archive_with_merged_own_pr_and_close_record(board, no_survivor, monkeypatch):
+    # Archive has no --survivor-pr: a MERGED own PR of the card is the survivor.
+    with kb.connect() as conn:
+        tid2, run2 = _claimed(conn)
+        monkeypatch.setattr(op, "_default_query", lambda: merged(n5="MERGED", n9="MERGED"))
+        assert kb.complete_task(conn, tid2, summary="s", metadata={"pr_urls": [PR_URL, "ANG-Ventures/r#9"]},
+                                expected_run_id=run2)
+        monkeypatch.setattr(op, "_default_query", lambda: merged(n5="CLOSED", n9="MERGED"))
+        monkeypatch.setattr(op, "_default_sha_check", lambda: (lambda r, s: True))
+        monkeypatch.setattr(op, "_default_close_record", lambda: (lambda r, n: False))
+        with pytest.raises(op.ClosedUnmergedPrError):
+            kb.archive_task(conn, tid2)
+        monkeypatch.setattr(op, "_default_close_record", lambda: (lambda r, n: True))
+        assert kb.archive_task(conn, tid2)
+        assert _status(conn, tid2) == "archived"

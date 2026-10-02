@@ -268,10 +268,12 @@ _DECISION_RE = re.compile(r"\bCLOSED: (?:REJECTED|ABANDONED|THROWAWAY|STALE|DUPL
 class ClosedUnmergedPrError(ValueError):
     """A completion's own PR ref is closed without merge (or unreadable) and no superseder is named."""
 
-    def __init__(self, task_id: str, prs: list, unverified: Optional[list] = None, verb: str = "done"):
+    def __init__(self, task_id: str, prs: list, unverified: Optional[list] = None, verb: str = "done",
+                 untokened: Optional[list] = None, survivors: Optional[list] = None):
         self.task_id = task_id
         self.closed = list(prs)
         self.unverified = list(unverified or [])
+        self.untokened = list(untokened or [])
         self.prs = self.closed + self.unverified
         parts = [f"{verb} refused:"]
         if self.closed:
@@ -286,6 +288,13 @@ class ClosedUnmergedPrError(ValueError):
             if len(self.closed) > 1:
                 parts.append("Each closed PR needs its own token: name it before the token, e.g. "
                              "'owner/repo#5 SUPERSEDED-BY #9; owner/repo#6 RE-CARRIED-AS #10'.")
+        if self.untokened:
+            parts.append(
+                f"The merged survivor {', '.join(survivors or [])} does not cover "
+                f"{', '.join(self.untokened)}: {'it carries' if len(self.untokened) == 1 else 'they carry'} "
+                f"no 'CLOSED: <TOKEN> -- <reason>' close-reason comment on GitHub (or its comments could "
+                f"not be read). Close-record the PR with the contract line, then retry."
+            )
         if self.unverified:
             parts.append(
                 f"GitHub could not be read for {', '.join(self.unverified)}, so it is unknown whether the "
@@ -510,11 +519,83 @@ def recorded_pr_refs(metadata) -> list:
     return out
 
 
+# --------------------------------------------------------------------------- close-record + merged survivor
+# t_9aff2951 (2026-10-01): a closed-unmerged own PR whose OWN GitHub thread carries the sanctioned close record
+# (``CLOSED: <TOKEN> -- ...``, coding-guardrails/references/pr-close-reasons.md) is not lost work when the
+# card also names a MERGED survivor PR whose merge commit is on its repo's default branch. Without that record
+# the gate keeps refusing. Cases: t_3ec660ca (hermes-home#1957 RE-CARRIED-AS #2259) and t_60269760
+# (hermes-home#2350 SUPERSEDED-BY #2347) were unclosable by any verb.
+CLOSE_TOKENS = ("SUPERSEDED-BY", "DUPLICATE-OF", "REJECTED", "ABANDONED", "RE-CARRIED-AS", "THROWAWAY", "STALE")
+_CLOSE_RECORD_RE = re.compile(r"^\s*CLOSED: (?:" + "|".join(CLOSE_TOKENS) + r")\b", re.MULTILINE)
+CloseRecordFn = Callable[[str, int], Optional[bool]]
+
+
+def has_close_record(body) -> bool:
+    """Does one PR comment body carry the contract close-reason line?"""
+    return isinstance(body, str) and bool(_CLOSE_RECORD_RE.search(body))
+
+
+def pr_close_record(repo: str, number: int) -> Optional[bool]:
+    """True iff a comment on ``repo#number`` carries ``CLOSED: <TOKEN>``; None when GitHub cannot be read."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments?per_page=100",
+             "--jq", ".[].body | @json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=QUERY_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        try:
+            if has_close_record(json.loads(line)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _default_close_record() -> Optional[CloseRecordFn]:
+    """The real ``gh``-backed close-record reader, or None inside pytest (no live GitHub)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return pr_close_record
+
+
+def _default_sha_check() -> Optional[ShaCheckFn]:
+    """The real default-branch ancestry check, or None inside pytest (no live GitHub)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return sha_on_default
+
+
+def merged_survivors(refs, *, query_fn: Optional[QueryFn], sha_check: Optional[ShaCheckFn]) -> list:
+    """The subset of ``refs`` GitHub reports MERGED with a merge commit on the repo's default branch."""
+    if query_fn is None or sha_check is None:
+        return []
+    out = []
+    for ref in refs:
+        try:
+            payload = query_fn(ref.repo, ref.number)
+        except Exception as exc:
+            _log.warning("kanban closed-pr check: survivor %s lookup failed: %s", ref, exc)
+            continue
+        if not isinstance(payload, dict) or str(payload.get("state") or "").upper() != "MERGED":
+            continue
+        sha = str(payload.get("merge_commit_sha") or "")
+        if sha and sha_check(ref.repo, sha):
+            out.append(ref)
+    return out
+
+
 def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: Optional[dict] = None,
                                 survivor_pr=None, superseded_by: Optional[str] = None,
                                 query_fn: Optional[QueryFn] = None,
                                 sha_check: Optional[ShaCheckFn] = None,
-                                verb: str = "done", decision_texts=(), recorded=()) -> list:
+                                verb: str = "done", decision_texts=(), recorded=(),
+                                close_record_fn: Optional[CloseRecordFn] = None) -> list:
     """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
     the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
     work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
@@ -538,7 +619,28 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
     uncovered = [c for c in uncovered if not any(_decision_covers(c, t, sole=sole) for t in decision_texts)]
     if not uncovered:
         return closed
-    raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb)
+    # A merged survivor + the PR's own close record (t_9aff2951). ``done`` takes the survivor from
+    # ``--survivor-pr``; ``archive`` has no flag, so any of the card's own PRs that merged qualifies.
+    candidates = primary if verb == "archive" else split_fleet(extract_pr_refs(survivor_pr=survivor_pr))[0]
+    if sha_check is None:
+        sha_check = _default_sha_check()
+    survivors = merged_survivors(candidates, query_fn=query_fn or _default_query(), sha_check=sha_check)
+    untokened: list = []
+    if survivors:
+        if close_record_fn is None:
+            close_record_fn = _default_close_record()
+        for c in uncovered:
+            try:
+                ok = close_record_fn(c.repo, c.number) if close_record_fn is not None else None
+            except Exception as exc:
+                _log.warning("kanban closed-pr check: close record %s lookup failed: %s", c, exc)
+                ok = None
+            if not ok:
+                untokened.append(f"{c.repo}#{c.number}")
+        if not untokened:
+            return closed
+    raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb,
+                                untokened=untokened, survivors=[f"{r.repo}#{r.number}" for r in survivors])
 
 
 ROUTE_COMMENT = "survivor PR open; card closes on merged=true"
