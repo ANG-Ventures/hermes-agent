@@ -343,6 +343,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             pass
         print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
         detail = ""
+        _npm_bin = None
         try:  # Default 300s accommodates slow systems like an Unraid NAS.
             import pm
 
@@ -367,8 +368,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             print(f"[{self.name}] Failed to install dependencies: {e}")
             detail = f" ({e})"
+        # Fork: the manual remedy is a pasteable command — a bridge dir or npm path holding a space
+        # (or shell metacharacters) must survive the shell as one argument (tests/test_p2_backfill_remainder.py).
+        manual = f"cd {shlex.quote(str(bridge_dir))} && {shlex.quote(str(_npm_bin or 'npm'))} install"
         self._set_fatal_error("whatsapp_npm_install_failed", f"WhatsApp bridge npm install failed{detail}. "
-                              "Run `hermes whatsapp`, then restart `hermes gateway`.", retryable=False)
+                              f"Run `{manual}` manually (or `hermes whatsapp`), then restart `hermes gateway`.",
+                              retryable=False)
         return False
 
     def _attach_to_bridge(self, managed_process) -> None:

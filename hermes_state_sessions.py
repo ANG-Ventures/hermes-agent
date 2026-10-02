@@ -1000,16 +1000,7 @@ class SessionSessionsMixin:
         def _do(conn):
             params = (session_id, session_id)
             if archived:
-                cursor = conn.execute(
-                    _LINEAGE_CTE_SQL + """
-                    UPDATE sessions
-                    SET archived = 1, auto_archived = 0,
-                        ended_at = COALESCE(ended_at, ?),
-                        end_reason = COALESCE(end_reason, ?)
-                    WHERE id IN (SELECT id FROM lineage)
-                    """,
-                    (*params, time.time(), self.ARCHIVE_END_REASON),
-                )
+                return self._archive_lineage_rows(conn, session_id, auto_archived_sql="0")
             else:
                 cursor = conn.execute(
                     _LINEAGE_CTE_SQL + """
@@ -1024,30 +1015,51 @@ class SessionSessionsMixin:
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            if archived:
-                # Match on the mapped session_id, not on (scope, session_key): two profiles sharing
-                # one state.db produce the same key in different scopes for *different* sessions,
-                # and only this lineage's mapping is orphaned. json_valid guards the delete so one
-                # corrupt routing row cannot fail the archive.
-                conn.execute(
-                    _LINEAGE_CTE_SQL + """
-                    DELETE FROM gateway_routing
-                    WHERE json_valid(entry_json)
-                      AND json_extract(entry_json, '$.session_id') IN (SELECT id FROM lineage)
-                    """,
-                    params,
-                )
             return rowcount
         return self._execute_write(_do) > 0
 
+    def _archive_lineage_rows(self, conn, session_id: str, *, auto_archived_sql: str) -> int:
+        """The archive write shared by the deliberate archive and the idle sweep (fork contract:
+        archiving is ROUTING-affecting, see :meth:`set_session_archived`): hide the lineage, retire
+        still-live rows with ``end_reason = 'archived'``, drop the lineage's durable routing rows.
+        *auto_archived_sql* (trusted literal) is the provenance each path stamps."""
+        params = (session_id, session_id)
+        cursor = conn.execute(
+            _LINEAGE_CTE_SQL + f"""
+            UPDATE sessions
+            SET archived = 1, auto_archived = {auto_archived_sql},
+                ended_at = COALESCE(ended_at, ?),
+                end_reason = COALESCE(end_reason, ?)
+            WHERE id IN (SELECT id FROM lineage)
+            """,
+            (*params, time.time(), self.ARCHIVE_END_REASON),
+        )
+        rowcount = cursor.rowcount
+        if rowcount is None or rowcount < 0:
+            rowcount = conn.execute("SELECT changes()").fetchone()[0]
+        # Match on the mapped session_id, not on (scope, session_key): two profiles sharing
+        # one state.db produce the same key in different scopes for *different* sessions,
+        # and only this lineage's mapping is orphaned. json_valid guards the delete so one
+        # corrupt routing row cannot fail the archive.
+        conn.execute(
+            _LINEAGE_CTE_SQL + """
+            DELETE FROM gateway_routing
+            WHERE json_valid(entry_json)
+              AND json_extract(entry_json, '$.session_id') IN (SELECT id FROM lineage)
+            """,
+            params,
+        )
+        return rowcount
+
     def _auto_archive_lineage(self, session_id: str) -> bool:
-        """The idle sweep's archive: like :meth:`set_session_archived` but stamps
-        ``auto_archived`` on the rows IT hides. A row already archived keeps its provenance, so a
-        deliberately archived ancestor is never relabelled as sweep-owned (SQLite evaluates every
-        SET expression against the pre-update row)."""
-        return self._set_lineage_column(
-            "archived", session_id, 1,
-            extra_set_sql=", auto_archived = CASE WHEN archived = 0 THEN 1 ELSE auto_archived END")
+        """The idle sweep's archive: the same write as :meth:`set_session_archived` (so the sweep
+        also retires live rows and routing, never manufacturing routing orphans in bulk) but it
+        stamps ``auto_archived`` on the rows IT hides. A row already archived keeps its provenance,
+        so a deliberately archived ancestor is never relabelled as sweep-owned (SQLite evaluates
+        every SET expression against the pre-update row)."""
+        return self._execute_write(lambda conn: self._archive_lineage_rows(
+            conn, session_id,
+            auto_archived_sql="CASE WHEN archived = 0 THEN 1 ELSE auto_archived END")) > 0
 
     @staticmethod
     def _unarchive_auto_archived_lineage(conn, session_id: str) -> bool:

@@ -187,7 +187,7 @@ class CLILoopsMixin:
 
     def _record_model_friction(self, signal: str, turns: int = 1) -> None:
         # The TUI slash worker's shadow CLI has no metrics surface: tui_gateway counts what it executes.
-        if self._slash_metrics_surface:
+        if getattr(self, "_slash_metrics_surface", None):
             from hermes_cli.observability.shared_metrics_model import record_model_friction
             record_model_friction(
                 signal, session_id=getattr(self, "session_id", None), agent=getattr(self, "agent", None),

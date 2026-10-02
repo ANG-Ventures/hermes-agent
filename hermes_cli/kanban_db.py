@@ -453,6 +453,16 @@ RECLAIM_DEFER_GRACE_SECONDS = 120
 DEAD_CLAIMER_LAUNCH_BOUND_SECONDS = DEFAULT_CLAIM_TTL_SECONDS
 
 
+def _dead_claimer_launch_bound_seconds() -> int:
+    """The launch bound follows the CLAIM TTL: an operator who shortens the claim window
+    (``HERMES_KANBAN_CLAIM_TTL_SECONDS``, e.g. a chaos rig at 3 s) has said how long a claim may
+    hold without evidence; holding a dead claimer's pid-less claim for the 900 s default anyway
+    strands the card for 15 min past every tick that could have reclaimed it. Default unchanged."""
+    if os.environ.get("HERMES_KANBAN_CLAIM_TTL_SECONDS", "").strip():
+        return _resolve_claim_ttl_seconds()
+    return DEAD_CLAIMER_LAUNCH_BOUND_SECONDS
+
+
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     """Explicit ``ttl_seconds`` > ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` > default."""
     if ttl_seconds is not None:
@@ -15308,7 +15318,7 @@ def _dead_claimer_release_at(
     ).fetchone()
     if evidence is None:
         return (
-            int(run["started_at"]) + DEAD_CLAIMER_LAUNCH_BOUND_SECONDS,
+            int(run["started_at"]) + _dead_claimer_launch_bound_seconds(),
             "launch_bound",
             None,
         )

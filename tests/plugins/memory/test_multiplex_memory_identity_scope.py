@@ -73,6 +73,11 @@ def test_secondary_profile_memory_identity_never_inherits_default_environ(second
     assert honcho_client._env_base_url() is None
 
 
+@pytest.mark.skip(reason=(
+    "fork parity 2026-10-01: the fork retired upstream's mem0 OSS backend (plugins/memory/mem0/"
+    "_openai_llm.DirectOpenAILLM; docs/sync/review/mem0-resolution-decision.md) — the fork's "
+    "self-contained mem0 has no in-process LLM and reads no OPENAI_API_KEY, so the leak this pins "
+    "has no subject"))
 def test_mem0_oss_llm_never_borrows_default_profile_openai_key(secondary_profile):
     pytest.importorskip("mem0")
     from mem0.configs.llms.openai import OpenAIConfig

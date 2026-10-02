@@ -250,6 +250,10 @@ class _PushAdapter:
 
     async def handle_message(self, event: MessageEvent):
         self.replies.append(await self._runner._handle_message(event))
+        # Upstream admission receipt (bf1bf7515a): ``deliver_wake`` requires the adapter to stamp
+        # acceptance; the real BasePlatformAdapter does this in its own handle_message, which this
+        # double bypasses to call the runner directly.
+        event._gateway_accepted = True
 
 
 async def _human_turn(runner, message_id: str, text: str):

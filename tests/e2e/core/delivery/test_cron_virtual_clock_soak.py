@@ -580,7 +580,11 @@ def _run_scenario(sc: Scenario, soak_env) -> Dict[str, int]:
     tmp_path, hermes_home, monkeypatch = soak_env
     monkeypatch.setenv("TZ", sc.process_tz)
     time.tzset()
-    lines = ["platforms:", "  telegram:", "    enabled: true", "    token: fake-soak-token"]
+    # Fork (#1087): a never-dispatched one-shot inside ``cron.oneshot_catchup_s`` (default 6h) FIRES
+    # LATE after a restart; this oracle models the upstream contract (beyond ONESHOT_GRACE_SECONDS
+    # never fires), so pin the fork's documented opt-out (0 = the pre-#1087 behaviour).
+    lines = ["platforms:", "  telegram:", "    enabled: true", "    token: fake-soak-token",
+             "cron:", "  oneshot_catchup_s: 0"]
     if sc.hermes_tz:
         lines.insert(0, f"timezone: {sc.hermes_tz}")
     (hermes_home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -636,7 +640,8 @@ def test_two_replicas_contend_for_every_fire(soak_env):
     monkeypatch.setenv("TZ", "UTC")
     time.tzset()
     (hermes_home / "config.yaml").write_text(
-        "platforms:\n  telegram:\n    enabled: true\n    token: fake-soak-token\n", encoding="utf-8")
+        "platforms:\n  telegram:\n    enabled: true\n    token: fake-soak-token\n"
+        "cron:\n  oneshot_catchup_s: 0\n", encoding="utf-8")  # fork #1087 opt-out, see _run_scenario
     control = H.Control(tmp_path / "control").ensure()
     import cron.jobs as jobs
 

@@ -39,6 +39,13 @@ from hermes_state_common import (
 from hermes_state_common import (  # noqa: F401
     FTS_STORAGE_VERSION, MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _trigram_fts_config_enabled,
 )
+# Same for the repair helpers upstream split into hermes_state_repair: fork callers and tests
+# (tests/test_state_db_recover_hint_pasteable.py) reach them through this facade.
+from hermes_state_repair import (  # noqa: F401
+    _MAX_PERSISTENT_REPAIR_ATTEMPTS, _REPAIR_BACKUP_MIN_FREE_BYTES, _backup_db_file, _db_fingerprint,
+    _db_opens_cleanly, _persistent_repair_attempts_exhausted, _persistent_repair_exhausted_error,
+    _repair_ledger_path,
+)
 # Fork-only helpers consumed by the fork-only SessionDB methods below (hermes_state_ext is a
 # fork module: platform/channel session search + session-list denorm gate).
 from hermes_state_ext import (
@@ -2103,13 +2110,15 @@ class SessionDB(
     ) -> Tuple[List[str], List[str]]:
         if not parent_ids:
             return [], []
-        ph = _sql_placeholders(parent_ids)
-        children = [
-            row["id"] for row in conn.execute(
-                f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
-                parent_ids,
-            ).fetchall()
-        ]
+        from hermes_state_common import _id_chunks
+        # Chunked like every other IN-list over session ids: a bulk prune/delete hands this
+        # thousands of parents at once (SQLITE_LIMIT_VARIABLE_NUMBER, legacy ceiling 999).
+        children: List[str] = []
+        for chunk in _id_chunks(parent_ids):
+            children.extend(row["id"] for row in conn.execute(
+                f"SELECT id FROM sessions WHERE parent_session_id IN ({_sql_placeholders(chunk)})",
+                chunk,
+            ).fetchall())
         roots: List[str] = []
         for child_id in children:
             root_id = self._resolve_effective_last_active_root(conn, child_id)

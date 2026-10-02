@@ -55,6 +55,8 @@ KNOWN: dict[str, tuple[str, str]] = {
 # measure the decompose phase), no per-tick cap starvation, one HTTP request per aux attempt.
 GATEWAY_CONFIG = (
     "kanban:\n"
+    "  rate_limit_cooldown_seconds: 0\n"  # fork pins, see _helpers.KANBAN_FAST_CONFIG
+    "  receipt_gate: false\n"
     "  dispatch_interval_seconds: 1\n"
     "  max_spawn: 0\n"
     "  auto_decompose: true\n"

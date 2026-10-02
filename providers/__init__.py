@@ -276,21 +276,28 @@ def routed_model_rejects_vision_tool_messages(provider: str, model: str) -> bool
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name); the bound home's
     ``$HERMES_HOME`` plugins shadow process-wide profiles of the same name."""
-    global _PROVIDER_LIST_CACHE
     if not _discovered:
         _discover_providers()
     layer = _home_layer()
-    if _PROVIDER_LIST_CACHE is None:
+    # Fork (registry-pins v0.2): the process-wide list is memoised PER GENERATION on the
+    # seam snapshot, not in a module global — ``provider_seam.publish()`` swaps in a new
+    # generation whose memo starts empty, so a publisher can never serve a stale list and
+    # no seam lock is taken on the read path. (``_PROVIDER_LIST_CACHE`` is kept only as the
+    # legacy reset knob callers/tests clear; it is not consulted here.)
+    g = provider_seam.snapshot()
+    cache = g.providers_list
+    if cache is None:
         # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects.
-        # One committed generation: a registration racing this walk cannot tear it.
+        # One committed generation: a registration racing this walk cannot tear it; a
+        # racing filler computes the same tuple from the same frozen generation.
         seen: set[int] = set()
-        cache: list[ProviderProfile] = []
-        for profile in provider_seam.snapshot()._REGISTRY.values():
+        cache_list: list[ProviderProfile] = []
+        for profile in g._REGISTRY.values():
             if id(profile) not in seen:
                 seen.add(id(profile))
-                cache.append(profile)
-        _PROVIDER_LIST_CACHE = cache
-    result = [p for p in _PROVIDER_LIST_CACHE if p.name not in layer.registry]
+                cache_list.append(profile)
+        cache = g.providers_list = tuple(cache_list)
+    result = [p for p in cache if p.name not in layer.registry]
     result.extend({id(p): p for p in layer.registry.values()}.values())
     return result
 

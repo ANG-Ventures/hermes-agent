@@ -683,5 +683,25 @@
     "path": "tools/file_operations_lint.py",
     "symbol": "LintMixin._run_managed_node_linter",
     "kind": "bare_which"
+  },
+  {
+    "path": "gateway/run.py",
+    "symbol": "GatewayRunner._launch_systemd_restart_shortcut",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/vision_tools.py",
+    "symbol": "_ytdlp_available",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/web_pdf_local.py",
+    "symbol": "_extract_pdftotext",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/web_pdf_local.py",
+    "symbol": "local_extractor_available",
+    "kind": "bare_which"
   }
 ]

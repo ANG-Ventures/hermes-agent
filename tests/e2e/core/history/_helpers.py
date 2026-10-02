@@ -283,11 +283,20 @@ def assert_inputs_shown_once(inputs: list[str], display: list[dict], model: list
 
 
 def billed_usage(records: list[dict[str, Any]], kind: str = "main") -> dict[str, int]:
-    """What the fake provider reported for completed requests of ``kind``."""
+    """What the fake provider reported for completed requests of ``kind``.
+
+    Fork contract (agent/turn_usage.py, "count every completed provider attempt"): a stream the
+    provider served (HTTP 200, bytes delivered) and then closed cleanly WITHOUT a usage chunk
+    (``DropMidStream``) is still one api call with UNKNOWN (not zero) usage — the attempt is
+    recorded, its token buckets are not. Count the call; add no tokens."""
     tot = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
     for r in records:
         u = r.get("usage")
-        if r["kind"] != kind or not u:
+        if r["kind"] != kind:
+            continue
+        if not u:
+            if r.get("response") == "DropMidStream":
+                tot["calls"] += 1
             continue
         tot["calls"] += 1
         tot["prompt"] += u.get("prompt_tokens", 0)

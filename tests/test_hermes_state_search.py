@@ -2848,15 +2848,19 @@ class TestConcurrentWriteSafety:
         assert row["model"] == "original-model"
 
     def test_sqlite_timeout_is_at_least_30s(self, db):
-        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
-        # Access the underlying connection timeout via sqlite3 introspection.
-        # There is no public API, so we check the kwarg via the module default.
-        import inspect
+        """Transcript writes must wait >= 30s for CLI/gateway lock contention.
+
+        The writer connection deliberately keeps SQLite's busy handler short (1s) and
+        retries with jitter under a TIME-based patience budget (``_execute_write``), so the
+        contract lives in ``_TRANSCRIPT_WRITE_PATIENCE_S`` — not in a ``timeout=`` kwarg.
+        (The previous form grepped ``__init__``'s source for the digits "30", which only
+        ever matched a comment.)
+        """
         from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
-        assert "30" in src, (
-            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
+        assert _SessionDB._TRANSCRIPT_WRITE_PATIENCE_S >= 30, (
+            "transcript write patience should be at least 30s to handle CLI/gateway lock contention"
         )
+        assert db._TRANSCRIPT_WRITE_PATIENCE_S >= db._WRITE_PATIENCE_S > 0
 
 
 class TestAsyncDelegationsSchemaAgreement:
