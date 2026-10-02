@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 # ── §4.1 vocabulary (identical to Phase 1 fallback_events.TRIGGER_CLASSES) ──
 TRIGGER_CLASSES = (
     "conn", "pool_pressure", "quota_model", "quota_seat", "rate_upstream",
-    "refusal", "auth", "unclassified",
+    "refusal", "auth", "provider_invalid_response", "unclassified",
 )
+INVALID_RESPONSE_CLASS = "provider_invalid_response"
 # Classes the sticky writer arms (one clock: _sticky.until_epoch).
 STICKY_CLASSES = frozenset({"conn", "pool_pressure", "quota_seat", "quota_model"})
 # Classes that still reach apply_quota_gate / the legacy arm block. On a
@@ -1015,8 +1016,43 @@ BOX_CAPACITY_CAUSE = "relay box at session capacity"
 BOX_STARTUP_CAUSE = "relay session startup timed out"
 
 
+def invalid_response_cause(row: Mapping[str, Any]) -> str:
+    """``empty response (stop_reason=tool_use, 0 content blocks, 462 out)``
+    from a rejected billed response's floor evidence (t_d35beb85)."""
+    fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
+    blocks = fl.get("content_blocks")
+    parts = []
+    if fl.get("stop_reason"):
+        parts.append(f"stop_reason={fl['stop_reason']}")
+    if isinstance(blocks, int):
+        parts.append(f"{blocks} content block{'' if blocks == 1 else 's'}")
+    if isinstance(fl.get("output_tokens"), int):
+        parts.append(f"{fl['output_tokens']} out")
+    if not parts and fl.get("detail"):
+        parts.append(str(fl["detail"])[:80])
+    head = "empty response" if blocks == 0 else "invalid response"
+    return f"{head} ({', '.join(parts)})" if parts else head
+
+
+def _invalid_response_body(row: Mapping[str, Any], seat_names: bool) -> str:
+    """``<cause> · hop=relay-200 · sub=<seat>``: the relay ANSWERED 200 (the
+    fault is box/upstream side, not the relay hop) and named the seat in
+    ``x-pool-served-by``. Never ``(hop unknown, sub unknown)``."""
+    fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
+    prov = str(row.get("from_provider") or "").strip().lower()
+    if prov.startswith("custom:"):
+        prov = prov[len("custom:"):]
+    relayed = prov in RELAY_PROVIDERS or bool(fl.get("served_by") or fl.get("route_id"))
+    hop = "relay-200" if relayed else "200"
+    seat = row.get("seat") or fl.get("served_by")
+    sub = (str(seat) if seat_names else "a sub") if seat and seat != "unknown" else "unknown"
+    return f"{invalid_response_cause(row)} · hop={hop} · sub={sub}"
+
+
 def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
+    if cls == INVALID_RESPONSE_CLASS:
+        return invalid_response_cause(row)
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
     if cls == "conn":
         if "reset" in t:
@@ -1160,6 +1196,12 @@ def cause_rider_with_floors(row: Mapping[str, Any], *, seat_names: bool = True,
 def _cause_body(row: Mapping[str, Any], seat_names: bool,
                 tz: Optional[_dt.tzinfo]) -> Tuple[str, Tuple[str, ...]]:
     prefix, window = _count_window(row, tz)
+    _fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
+    if row.get("trigger_class") == INVALID_RESPONSE_CLASS and (
+            _fl.get("served_by") or not _plain_provider(row)):
+        # A pool seat answered the rejected 200 (x-pool-served-by): name it,
+        # whatever the provider label (t_d35beb85).
+        return f"{prefix}{_invalid_response_body(row, seat_names)}, {window}", ()
     if _plain_provider(row):
         # The banner ends after the vendor's words when there are any (Ace,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).

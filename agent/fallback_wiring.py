@@ -395,13 +395,16 @@ def same_error_on_failover(agent: Any, *, failing: Tuple[Any, Any],
             return {}
         now = time.time() if now is None else now
         pend = _pending(agent)
-        text = pend.get("text")
-        if not text:
+        # A rejected billed response has no text; its err_hash is the floor
+        # shape (site, stop_reason, content_blocks), t_d35beb85.
+        h = fbe.pending_err_hash(pend)
+        if not h:
             return {}
         headers = pend.get("headers") or {}
-        seat = fbe.relay_hop_seat(headers, pend.get("body"))[1] or fbe.served_by_seat(headers)
+        seat = (fbe.relay_hop_seat(headers, pend.get("body"))[1] or fbe.served_by_seat(headers)
+                or (pend.get("floor") or {}).get("served_by"))
         ep = fp.same_error_backoff(
-            getattr(agent, "_same_err_episode", None), err_hash=fbe.err_hash(text),
+            getattr(agent, "_same_err_episode", None), err_hash=h,
             now=now, last_return_ts=getattr(agent, "_last_primary_return_ts", None), seat=seat,
             route=failing)
         agent._same_err_episode = ep
