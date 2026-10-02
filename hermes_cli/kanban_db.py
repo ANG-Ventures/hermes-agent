@@ -12026,19 +12026,15 @@ def _request_review_txn(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+            "worker_started_at FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
         # Refuse to clear a live worker's claim without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True).
-        if (
-            expected_run_id is None
-            and not force
-            and trow["status"] == "running"
-            and trow["claim_lock"] is not None
-        ):
+        # (expected_run_id) or an explicit human override (force=True);
+        # the same fence as complete_task (_claim_is_live, #111764).
+        if expected_run_id is None and not force and _claim_is_live(trow):
             return _ret(
                 False,
                 "task is running under a live claim; pass expected_run_id "
