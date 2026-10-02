@@ -32,7 +32,10 @@ class _Cli(CLILoopsMixin):
 def test_idle_hook_queues_the_continuation_when_a_timed_barrier_has_elapsed(hermes_home):
     mgr = goals.GoalManager(session_id="resume-idle")
     mgr.set("finish the thing")
-    mgr.wait_for_seconds(1, reason="cooldown")
+    # A long barrier: the ``patch("cli._cprint")`` below imports ``cli`` cold, which on a loaded CI
+    # runner takes longer than a 1 s timer and queued the continuation on the FIRST check. The
+    # elapsed case is driven explicitly by rewinding ``waiting_until`` below.
+    mgr.wait_for_seconds(600, reason="cooldown")
     cli = _Cli(mgr)
     with patch("cli._cprint"), patch("cli._DIM", ""), patch("cli._RST", ""):
         cli._maybe_resume_parked_goal()
