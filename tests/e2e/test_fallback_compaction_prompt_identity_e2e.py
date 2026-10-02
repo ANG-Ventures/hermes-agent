@@ -149,6 +149,14 @@ def _runner(tmp_path, monkeypatch, url: str):
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    # parity 2026-10-01: the session DB must live in THIS home. The suite conftest pins
+    # ``hermes_state.DEFAULT_DB_PATH`` to its own sandbox, so the agent's db-derived home
+    # (``_agent_home``) was a second, never-ensured directory; upstream's ``skills.auto_load``
+    # prompt block (``build_auto_load_prompt`` -> ``load_config_readonly``) ensures that home
+    # mid-build, seeding its SOUL.md between the identity read and the context-files read,
+    # so the FIRST prompt and the compaction rebuild differed on a harness artifact.
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
 
     import agent.model_metadata as mm
     import gateway.run as gr

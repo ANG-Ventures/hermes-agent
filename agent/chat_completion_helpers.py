@@ -518,6 +518,17 @@ def _note_billed_response(agent: Any, response: Any) -> None:
 def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[dict] = None) -> None:
     if response is None or getattr(response, "_api_call_failure_recorded", False):
         return
+    # Idempotent per response object: upstream's streaming-5xx unmask probe obtains its
+    # response through ``interruptible_api_call`` (which records it) and then hands the SAME
+    # object back as the streaming call's result, where ``_StreamingCall.run`` records again.
+    # The fork bills every registered response (``_note_billed_response``), so the second
+    # pass double-counted the call in state.db (tests/e2e/core/history stream_faults).
+    if getattr(response, "_api_call_success_recorded", False):
+        return
+    try:
+        response._api_call_success_recorded = True
+    except Exception:
+        pass  # a frozen response type cannot carry the stamp; recording still proceeds
     # Registered BEFORE the pooled-header guard below: a response whose ledger
     # row cannot be attributed was still billed and must still be counted.
     _note_billed_response(agent, response)

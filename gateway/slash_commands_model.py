@@ -45,6 +45,18 @@ def _model_switch_skew_guard() -> Optional[str]:
     if not skew:
         return None
     boot_rev, disk_rev = skew
+    # Fork: ``model.stale_code_switch_guard: false`` disarms the refusal but detection still runs so
+    # a suppressed skew leaves a WARNING breadcrumb (a later stale-import crash otherwise looks
+    # causeless). Read through the facade: that is the seam tests and operators patch.
+    from gateway.slash_commands import _stale_code_switch_guard_enabled
+
+    if not _stale_code_switch_guard_enabled():
+        logger.warning(
+            "Model-switch stale-code guard DISABLED by config (model.stale_code_switch_guard=false): "
+            "allowing a switch with code skew boot=%s disk=%s — a stale-module ImportError is possible",
+            boot_rev, disk_rev,
+        )
+        return None
     return t(
         "gateway.model.error_prefix",
         error=t("gateway.model.err_skew", boot_rev=boot_rev, disk_rev=disk_rev),

@@ -84,14 +84,61 @@ def _live_system_guard(request, monkeypatch):
     # Capture the test process's existing children at fixture start —
     # any *new* children spawned by the test are also allowlisted via
     # the live psutil walk below. Static set keeps the fast path cheap.
+    #
+    # Fork hardening (#546 / t_24f73ced): the snapshot is taken LAZILY, on the first guarded
+    # signal, and keeps only children created before this fixture started: psutil's children()
+    # walks every pid on the host (~45-110 ms per test on a 1.1k-process Mac), and almost no test
+    # signals anything. Each entry keeps its create_time, so a recycled pid never matches.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
     except Exception:
         _psutil = None
-        _initial_children = set()
+    import time as _time
+    _fixture_started_at = _time.time()
+    _initial_children_memo = []
+
+    def _initial_children() -> dict:
+        if not _initial_children_memo:
+            snap = {}
+            if _psutil is not None:
+                try:
+                    for c in _psutil.Process(test_pid).children(recursive=True):
+                        try:
+                            created = c.create_time()
+                        except Exception:
+                            continue
+                        if created <= _fixture_started_at:
+                            snap[c.pid] = created
+                except Exception:
+                    snap = {}
+            _initial_children_memo.append(snap)
+        return _initial_children_memo[0]
+
+    def _is_initial_child(pid: int) -> bool:
+        created = _initial_children().get(pid)
+        if created is None:
+            return False
+        try:
+            return _psutil.Process(pid).create_time() == created
+        except _psutil.NoSuchProcess:
+            return True  # gone: the signal is a no-op
+        except _psutil.AccessDenied:
+            return False  # unverifiable identity: fail closed (C5 #71)
+        except Exception:
+            # Probe machinery broken (e.g. a test stubbed sys.modules["psutil"]),
+            # not evidence of a foreign process: trust the snapshot record.
+            return True
+    _spawned_children = {}
+
+    def _remember_spawned_child(pid: int) -> None:
+        """Remember a child even after it exits and is reparented under load."""
+        started_at = None
+        if _psutil is not None:
+            try:
+                started_at = _psutil.Process(pid).create_time()
+            except Exception:
+                pass
+        _spawned_children[pid] = started_at
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -102,15 +149,41 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid or _is_initial_child(pid):
             return True
+        if pid in _spawned_children:
+            if _psutil is None:
+                return True
+            try:
+                walker = _psutil.Process(pid)
+            except _psutil.NoSuchProcess:
+                # The recorded child is gone, so the signal is a no-op.
+                return True
+            except _psutil.AccessDenied:
+                # Exists but unverifiable: fail closed (C5 #71).
+                return False
+            except Exception:
+                # Probe machinery broken (e.g. a test stubbed
+                # sys.modules["psutil"]), not evidence of a foreign process:
+                # the pid is on our spawn record, so trust it.
+                return True
+            started_at = _spawned_children[pid]
+            if started_at is not None:
+                if walker.create_time() == started_at:
+                    return True
+                # PID was recycled onto a process the test did not spawn.
+                return False
+            # Without a recorded identity, retain the parent-chain check below.
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
+        except _psutil.NoSuchProcess:
             # Stale PID — kill would be a no-op anyway, allow it.
             return True
+        except Exception:
+            # Exists but unverifiable (AccessDenied): fail closed (C5 #71).
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
@@ -377,6 +450,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd, kwargs)
                 super().__init__(cmd, *args, **kwargs)
+                _remember_spawned_child(self.pid)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -449,11 +523,15 @@ def _live_system_guard(request, monkeypatch):
             _check_subprocess_cmd(
                 "asyncio.create_subprocess_exec", [program, *args], kwargs
             )
-            return await real_async_exec(program, *args, **kwargs)
+            proc = await real_async_exec(program, *args, **kwargs)
+            _remember_spawned_child(proc.pid)
+            return proc
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd, kwargs)
-            return await real_async_shell(cmd, *args, **kwargs)
+            proc = await real_async_shell(cmd, *args, **kwargs)
+            _remember_spawned_child(proc.pid)
+            return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(

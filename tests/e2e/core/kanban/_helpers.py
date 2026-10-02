@@ -101,6 +101,13 @@ class Board:
             # HOME's own state.db; the whole tree is under ``root`` (asserted below), so let workers
             # open their real session store.
             "HERMES_STATE_DB_GUARD_BYPASS": "1",
+            # Fork: `kanban create` refuses an unhomed card (t_09fea045). This harness has no
+            # session, and strips every HERMES_* var above (so the suite conftest's opt-in never
+            # reaches the child): opt in explicitly, as the upgrade e2e scenario does.
+            "HERMES_KANBAN_ALLOW_UNHOMED_CREATE": "1",
+            # Fork (t_4853212d): the gateway boot guard refuses a checkout under /Volumes/fleet-scratch;
+            # this rig IS a hermetic test rig (same opt-in the suite conftest sets in-process).
+            "HERMES_ALLOW_SHADOW_CWD": "1",
             **FAST_ENV, **self.env_extra,
         })
         assert env["HERMES_HOME"].startswith(str(self.root))

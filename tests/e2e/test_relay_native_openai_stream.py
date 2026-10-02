@@ -70,7 +70,9 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
 
     count_chunk = chat_completion_helpers._StreamingCall._count_chunk
 
-    def count_chunk_after_relay_finalizes(self, diag, chunk):
+    # Fork (#1617): ``_count_chunk`` takes ``heartbeat=`` for content-free keepalive chunks;
+    # forward it so the wrapper matches the real signature.
+    def count_chunk_after_relay_finalizes(self, diag, chunk, **kwargs):
         # Relay's producer is pumped by the consumer thread's OWN event loop (``ManagedLlmStream.
         # __next__`` -> ``run_until_complete``), so the finalizer can only start while that loop runs.
         # Blocking the consumer thread here and waiting for it therefore deadlocked whenever the loop
@@ -93,7 +95,7 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
 
             assert stream._loop.run_until_complete(finalizer_done()), "Relay's finalizer did not finish"
             assert relay_finalizer_started.is_set()
-        return count_chunk(self, diag, chunk)
+        return count_chunk(self, diag, chunk, **kwargs)
 
     monkeypatch.setattr(chat_completion_helpers._StreamingCall, "_count_chunk", count_chunk_after_relay_finalizes)
     lease.host.retain_managed_execution(consumer)

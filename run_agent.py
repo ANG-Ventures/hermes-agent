@@ -175,6 +175,9 @@ from agent.codex_responses_adapter import (
     _summarize_user_message_for_log,
 )
 from agent.tool_guardrails import ToolGuardrailDecision, append_toolguard_guidance, toolguard_synthetic_result
+# Re-exported for tests that monkeypatch this symbol on run_agent (fork seam; the retry
+# wait itself reads ``agent.retry_utils`` lazily, see agent/turn_recovery.py).
+from agent.retry_utils import jittered_backoff  # noqa: F401
 from hermes_cli.observability.shared_metrics_harness import record_guardrail_decision, record_guardrail_warnings
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens
 

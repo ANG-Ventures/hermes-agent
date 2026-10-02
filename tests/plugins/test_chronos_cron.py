@@ -136,8 +136,8 @@ def test_identity_rejection_hands_fires_to_the_builtin_ticker(temp_home, chronos
 
     fake.provision = rejected
     jobs = [
-        {"id": "a", "enabled": True, "next_run_at": "2026-06-18T12:00:00+00:00", "state": "scheduled"},
-        {"id": "b", "enabled": True, "next_run_at": "2026-06-18T12:05:00+00:00", "state": "scheduled"},
+        {"id": "a", "enabled": True, "next_run_at": _future(), "state": "scheduled"},
+        {"id": "b", "enabled": True, "next_run_at": _future(minutes=5), "state": "scheduled"},
     ]
     monkeypatch.setattr("cron.jobs.load_jobs", lambda: jobs)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: next(j for j in jobs if j["id"] == jid))
@@ -156,7 +156,7 @@ def test_identity_rejection_hands_fires_to_the_builtin_ticker(temp_home, chronos
     assert len(identity_msgs) == 1 and "built-in cron ticker" in identity_msgs[0]
 
     # Job creation and re-arms no longer reach NAS (and no longer fail the create).
-    prov.register_job({"id": "c", "next_run_at": "2026-06-18T12:10:00+00:00"})
+    prov.register_job({"id": "c", "next_run_at": _future(minutes=10)})
     prov.on_jobs_changed()
     assert calls == ["a"]
 
@@ -173,7 +173,7 @@ def test_transient_provision_failure_does_not_degrade(temp_home, chronos, monkey
         raise NasCronClientError("POST /api/agent-cron/provision returned 502: upstream", status=502)
 
     fake.provision = flaky
-    jobs = [{"id": "a", "enabled": True, "next_run_at": "2026-06-18T12:00:00+00:00", "state": "scheduled"}]
+    jobs = [{"id": "a", "enabled": True, "next_run_at": _future(), "state": "scheduled"}]
     monkeypatch.setattr("cron.jobs.load_jobs", lambda: jobs)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: jobs[0])
 

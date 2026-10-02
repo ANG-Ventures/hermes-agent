@@ -57,6 +57,10 @@ class _FakeStream:
         return False
 
     def __iter__(self):
+        # Upstream (c1281fff2a) requires ``message_stop`` before a native Anthropic stream is
+        # accepted; an eventless stream is a drop. A successful fake stream emits the stop.
+        if self._error is None and self._response is not None:
+            return iter((SimpleNamespace(type="message_stop"),))
         return iter(())
 
     def get_final_message(self):

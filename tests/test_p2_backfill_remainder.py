@@ -58,7 +58,10 @@ async def test_whatsapp_npm_remedy_quotes_bridge_dir():
     def _exists(path_obj):
         return not str(path_obj).endswith("node_modules")
 
+    # parity 2026-10-01: upstream's connect() admits node through PM (pm.ensure) before the
+    # preflight; stub both so the npm-install failure under test is the path that runs.
     with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+         patch("plugins.platforms.whatsapp.adapter.find_node_executable", return_value="/usr/bin/node"), \
          patch.object(Path, "exists", autospec=True, side_effect=_exists), \
          patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="x")), \
          patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
