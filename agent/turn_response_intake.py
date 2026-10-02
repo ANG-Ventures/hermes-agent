@@ -12,6 +12,7 @@ import logging
 import re
 from typing import Any, Dict, Optional
 
+from agent.confab_notice import confab_notice_status, should_announce_notice
 from agent.provider_projection import splice_provider_projection
 from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_truncation import (
@@ -28,13 +29,18 @@ class ResponseIntakeVerdict:
     """``action``: ``"fallthrough"`` (process ``assistant_message``), ``"continue"`` (retry the
     iteration: incomplete scratchpad / Codex continuation) or ``"return"`` (``result`` is the
     turn's result dict). ``assistant_message``/``finish_reason`` are the normalized outputs;
-    ``active_system_prompt`` is rebound after a Codex reasoning-only fallover (#67321)."""
+    ``active_system_prompt`` is rebound after a Codex reasoning-only fallover (#67321).
+    ``_confab_notice`` / ``_new_confab_notice`` (fork, agent/confab_notice.py): the validated
+    out-of-band notice this response carried and whether it was announced for the first time
+    this turn — read by ``finish_text_response`` for the tool-call re-prompt."""
 
     action: str
     assistant_message: Any
     finish_reason: Any
     result: Optional[Dict[str, Any]] = None
     active_system_prompt: Any = None
+    _confab_notice: Any = None
+    _new_confab_notice: Any = False
 
 
 def _coerce_content_text(raw: Any) -> str:
@@ -127,10 +133,25 @@ def normalize_model_response(
     assistant_message = normalize_response_for_agent(agent, response)
     finish_reason = assistant_message.finish_reason
 
+    # Out-of-band confab notice (fork): the provider caught and removed self-fabricated
+    # scaffold text from this reply. Tell the user NOW (CLI/TUI/gateway all receive
+    # _emit_status) — out of band must not mean invisible, because this signal is
+    # load-bearing for triage. Exactly one status per accepted notice PER TURN: the ledger
+    # stops a retry/fallback that re-normalizes the same response from emitting twice, and
+    # is evicted on turn change so a colliding or restarted provider request_id can never
+    # suppress a later turn's genuine warning. See agent/confab_notice.py.
+    _confab_notice = getattr(assistant_message, "confab_notice", None)
+    _new_confab_notice = bool(_confab_notice) and should_announce_notice(
+        agent, _confab_notice, turn_id
+    )
+    if _new_confab_notice:
+        agent._emit_status(confab_notice_status(_confab_notice["kind"]))
+
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ResponseIntakeVerdict:
         return ResponseIntakeVerdict(
             action=action, assistant_message=assistant_message, finish_reason=finish_reason,
             result=result, active_system_prompt=active_system_prompt,
+            _confab_notice=_confab_notice, _new_confab_notice=_new_confab_notice,
         )
 
     if assistant_message.content is not None and not isinstance(assistant_message.content, str):
