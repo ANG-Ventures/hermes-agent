@@ -19392,12 +19392,14 @@ def _safe_cmdline(proc) -> list[str]:
         return []
 
 
-def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
-    """``(pid, pgid)`` of every live process whose ENVIRONMENT carries exactly
-    this task+run identity, wherever it sits in the session tree. A process
+def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int, bool]]:
+    """``(pid, pgid, by_env)`` of every live process whose ENVIRONMENT carries
+    exactly this task+run identity, wherever it sits in the session tree
+    (``by_env`` True). A process
     with no run identity in its environment also matches when its
     ``--user-data-dir`` names the card (:func:`_cmdline_profile_cards`):
-    Linux Chrome erases its own environment window. Callers bound every
+    Linux Chrome erases its own environment window (``by_env`` False: the
+    path proves the process, not its process group). Callers bound every
     match by the run's birth window, which tells runs of one card apart.
 
     A worker's children inherit its environment. One class of child
@@ -19437,8 +19439,21 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             continue
         if pgid <= 1 or pgid == os.getpgid(0):
             continue
-        found.append((pid, pgid))
+        found.append((pid, pgid, env_task is not None))
     return found
+
+
+def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of :func:`_run_env_escapees_detailed`."""
+    return [(pid, pgid) for pid, pgid, _ in _run_env_escapees_detailed(task_id, run_id)]
+
+
+#: Lower-bound slack on a member's birth time. Linux psutil derives
+#: ``create_time`` from ``/proc/stat`` ``btime``, an INTEGER second, so a
+#: process can read as born up to 1 s before it was (ACE-AI: btime fraction
+#: 0.0855 s, child births read 0.093 s early). Same slack as
+#: :func:`_session_owned_by_run`.
+_BIRTH_SLACK_SECONDS = 1.0
 
 
 def _reap_run_env_escapees(
@@ -19461,34 +19476,68 @@ def _reap_run_env_escapees(
         return 0
     if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
         return 0
-    lo, hi = float(born_after), float(born_before)
-    targets: dict[int, int] = {}
-    for pid, pgid in _run_env_escapees(task_id, run_id):
+    lo, hi = float(born_after) - _BIRTH_SLACK_SECONDS, float(born_before)
+    matched: list[tuple[int, int, bool]] = []
+    for pid, pgid, by_env in _run_env_escapees_detailed(task_id, run_id):
         born = _member_birth(pid)
         if born is None or not (lo <= born <= hi):
             continue
-        targets[pgid] = pid
-    if not targets:
+        matched.append((pid, pgid, by_env))
+    if not matched:
         return 0
-    for pgid in sorted(targets):
-        try:
-            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
-        except OSError:
-            pass
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and any(_pid_alive(p) for p in targets.values()):
-        time.sleep(0.1)
-    for pgid, pid in targets.items():
-        if _pid_alive(pid):
+    # An env match proves the whole group (the run identity is inherited).
+    # A profile-path match proves only that process, unless its group leader
+    # is itself a match: an unrelated script could have launched the browser
+    # into the script's own group, and that group is not the run's.
+    matched_pids = {pid for pid, _, _ in matched}
+    targets: dict[int, int] = {}  # pgid -> witness pid (group kill)
+    for pid, pgid, by_env in matched:
+        if by_env or pgid in matched_pids:
+            targets[pgid] = pid
+    singles: dict[int, float] = {}  # pid -> birth (identity-checked kill)
+    for pid, pgid, by_env in matched:
+        if pgid not in targets:
+            born = _member_birth(pid)
+            if born is not None:
+                singles[pid] = born
+
+    def _same(pid: int, born: float) -> bool:
+        return _member_birth(pid) == born
+
+    def _signal(sig, groups: dict[int, int], procs: dict[int, float]) -> None:
+        for pgid in sorted(groups):
             try:
-                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
+                os.killpg(pgid, sig)  # windows-footgun: ok (POSIX-gated above)
             except OSError:
                 pass
-    _log.warning(
-        "kanban: reaped %d run-identified process group(s) that escaped worker session of %s run %s",
-        len(targets), task_id, run_id,
+        for pid, born in procs.items():
+            if _same(pid, born):
+                try:
+                    os.kill(pid, sig)  # windows-footgun: ok (POSIX-gated above)
+                except OSError:
+                    pass
+
+    reaped = len(targets) + len(singles)
+    if not reaped:
+        return 0
+    _signal(signal.SIGTERM, targets, singles)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and (
+        any(_pid_alive(p) for p in targets.values())
+        or any(_same(p, b) for p, b in singles.items())
+    ):
+        time.sleep(0.1)
+    _signal(
+        signal.SIGKILL,
+        {g: p for g, p in targets.items() if _pid_alive(p)},
+        {p: b for p, b in singles.items() if _same(p, b)},
     )
-    return len(targets)
+    _log.warning(
+        "kanban: reaped %d run-identified process group(s) and %d profile-matched "
+        "process(es) that escaped worker session of %s run %s",
+        len(targets), len(singles), task_id, run_id,
+    )
+    return reaped
 
 
 #: TERM -> KILL grace for the exit-path and orphan-sweep reaps (t_446b6b99).

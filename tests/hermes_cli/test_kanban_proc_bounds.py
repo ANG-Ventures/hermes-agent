@@ -30,7 +30,16 @@ pytestmark = [
     pytest.mark.live_system_guard_bypass,
 ]
 
-_STARTED: list[int] = []
+#: (pid, create_time) of every process a test started; teardown signals a pid
+#: only while it still has that birth time (never a recycled pid).
+_STARTED: list[tuple[int, float]] = []
+
+
+def _track(*pids: int) -> None:
+    for pid in pids:
+        born = kb._member_birth(pid)
+        if born is not None:
+            _STARTED.append((pid, born))
 
 
 def _gone(pid: int, timeout: float = 15.0) -> bool:
@@ -56,13 +65,14 @@ def conn(tmp_path, monkeypatch):
     kb.init_db()
     with kb.connect() as c:
         yield c
-    for pid in _STARTED:
+    for pid, born in _STARTED:
+        if kb._member_birth(pid) != born:
+            continue  # gone, or the pid now belongs to someone else
         try:
-            os.killpg(pid, 9)
-        except OSError:
-            pass
-        try:
-            os.kill(pid, 9)
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, 9)  # it leads its own group: the test made it
+            else:
+                os.kill(pid, 9)
         except OSError:
             pass
     _STARTED.clear()
@@ -81,19 +91,44 @@ resource = pytest.importorskip("resource")
         ("auto", (10666, 16000), 7999),        # 75% of the macOS default
         (None, (10666, 16000), 7999),          # unset == auto (via default)
         ("garbage", (10666, 16000), 7999),     # typo fails SAFE: guard stays on
-        (500, (10666, 16000), 500),
-        ("500", (10666, 16000), 500),
+        (600, (10666, 16000), 600),
+        ("600", (10666, 16000), 600),
+        (300, (10666, 16000), kpb.WORKER_NPROC_HEADROOM),  # floored above live count
         (20000, (10666, 16000), None),         # never RAISES the inherited limit
         (0, (10666, 16000), None),
         ("off", (10666, 16000), None),
         (False, (10666, 16000), None),
         ("auto", (resource.RLIM_INFINITY, resource.RLIM_INFINITY), None),
-        (300, (resource.RLIM_INFINITY, resource.RLIM_INFINITY), 300),
+        (700, (resource.RLIM_INFINITY, resource.RLIM_INFINITY), 700),
     ],
 )
 def test_resolve_worker_nproc_limit(raw, current, want):
     cfg = {} if raw is None else {"worker_nproc_limit": raw}
-    assert kpb.resolve_worker_nproc_limit(cfg, current=current) == want
+    assert kpb.resolve_worker_nproc_limit(cfg, current=current, uid_tasks=0) == want
+
+
+@pytest.mark.parametrize(
+    "raw, current, uid_tasks, want",
+    [
+        # Prism r2: soft 4096 with 3,200 uid threads -> 75% = 3,072 would
+        # sit BELOW the current count and EAGAIN every fork in the worker.
+        ("auto", (4096, 4096), 3200, 3200 + kpb.WORKER_NPROC_HEADROOM),
+        ("auto", (4096, 4096), 3700, None),     # floor reaches the limit: no ceiling
+        (500, (10666, 16000), 1250, 1250 + kpb.WORKER_NPROC_HEADROOM),
+        ("auto", (10666, 16000), 1250, 7999),   # healthy Studio: floor is inert
+        ("auto", (10666, 16000), None, None),   # unreadable count: fail open
+    ],
+)
+def test_nproc_limit_floors_above_current_uid_tasks(raw, current, uid_tasks, want, monkeypatch):
+    monkeypatch.setattr(kpb, "uid_task_count", lambda: None)
+    got = kpb.resolve_worker_nproc_limit(
+        {"worker_nproc_limit": raw}, current=current, uid_tasks=uid_tasks)
+    assert got == want
+
+
+def test_uid_task_count_counts_this_process():
+    n = kpb.uid_task_count()
+    assert n is not None and n >= 1
 
 
 @pytest.mark.parametrize(
@@ -226,9 +261,9 @@ def _spawn_worker(conn, tid: str, n: int) -> tuple[subprocess.Popen, list[int]]:
         [sys.executable, "-c", _WORKER, str(n)], stdout=subprocess.PIPE,
         text=True, env=env, start_new_session=True,
     )
-    _STARTED.append(worker.pid)
+    _track(worker.pid)
     kids = [int(x) for x in worker.stdout.readline().split()]
-    _STARTED.extend(kids)
+    _track(*kids)
     assert kb._set_worker_pid(conn, tid, worker.pid)
     return worker, kids
 
@@ -289,7 +324,7 @@ def test_failed_block_is_not_reported_as_capped(conn, monkeypatch):
     tid = kb.create_task(conn, title="runaway", assignee="worker")
     assert kb.claim_task(conn, tid) is not None
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    _STARTED.append(sleeper.pid)
+    _track(sleeper.pid)
     assert kb._set_worker_pid(conn, tid, sleeper.pid)
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
                         lambda *a, **k: {"terminated": True})
@@ -412,13 +447,13 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     kb._register_worker_identity(worker.pid, tid, task.current_run_id, spawned_at)
     assert kb._set_worker_pid(conn, tid, worker.pid)
     browser = int(worker.stdout.readline())
-    _STARTED.append(browser)
+    _track(browser)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline and len(_chrome_procs(profile)) < 2:
         time.sleep(0.2)
     leaked = _chrome_procs(profile)
     assert len(leaked) >= 2, "Chrome did not start its helpers; drill proves nothing"
-    _STARTED.extend(leaked)
+    _track(*leaked)
     # The live per-run census sees the browser too (Linux Chrome erases its
     # environ window; the profile path under the card workspace names it).
     key = (tid, str(task.current_run_id))
@@ -441,3 +476,98 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     while time.monotonic() < deadline and _chrome_procs(profile):
         time.sleep(0.2)
     assert _chrome_procs(profile) == [], "Chrome outlived its card"
+
+
+# ---------------------------------------------------------------------------
+# Prism round 2 / MQ run 37065736983
+# ---------------------------------------------------------------------------
+
+def _clean_env() -> dict:
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_TASK", None)
+    env.pop("HERMES_KANBAN_RUN_ID", None)
+    return env
+
+
+_SLEEP = "import time; time.sleep(60)"
+
+
+@pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
+def test_escapee_reap_tolerates_linux_birth_rounding():
+    """MQ run 37065736983: Linux psutil create_time = jiffies + INTEGER btime,
+    so a process can read as born up to 1 s before the run's spawn stamp. A
+    run-identified escapee that reads 0.9 s early is still the run's."""
+    env = dict(_clean_env(), HERMES_KANBAN_TASK="t_5a1a0001", HERMES_KANBAN_RUN_ID="11")
+    p = subprocess.Popen([sys.executable, "-c", _SLEEP], env=env, start_new_session=True)
+    _track(p.pid)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not kb._run_env_escapees("t_5a1a0001", 11):
+        time.sleep(0.05)
+    born = kb._member_birth(p.pid)
+    assert born is not None
+    n = kb._reap_run_env_escapees("t_5a1a0001", 11, born_after=born + 0.9,
+                                  born_before=time.time() + 1, grace=2.0)
+    assert n == 1
+    assert _gone(p.pid)
+
+
+_GROUP_SCRIPT = (
+    "import subprocess, sys\n"
+    "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',\n"
+    "                      '--user-data-dir=' + sys.argv[1]])\n"
+    "print(c.pid, flush=True)\n"
+    "import time; time.sleep(60)\n"
+)
+
+
+@pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
+def test_profile_match_kills_the_process_not_a_foreign_group(tmp_path):
+    """Prism round 2: a profile path proves the browser, not the group it
+    sits in. An unrelated script that launched it into its own group lives."""
+    profile = str(tmp_path / "ws" / "t_5a1a0002" / "chrome-profile")
+    script = subprocess.Popen([sys.executable, "-c", _GROUP_SCRIPT, profile],
+                              stdout=subprocess.PIPE, text=True, env=_clean_env(),
+                              start_new_session=True)
+    _track(script.pid)
+    child = int(script.stdout.readline())
+    _track(child)
+    assert os.getpgid(child) == script.pid
+    n = kb._reap_run_env_escapees("t_5a1a0002", 3, born_after=time.time() - 30,
+                                  born_before=time.time() + 1, grace=2.0)
+    assert n == 1
+    assert _gone(child), "profile-matched browser survived"
+    assert script.poll() is None, "the unrelated script's group was signalled"
+
+
+_OLD_BROWSER = (
+    "import subprocess, sys\n"
+    "sys.stdin.readline()\n"
+    "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',\n"
+    "                      '--user-data-dir=' + sys.argv[1]])\n"
+    "print(c.pid, flush=True)\n"
+    "import time; time.sleep(60)\n"
+)
+
+
+@pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
+def test_census_skips_helpers_of_an_earlier_runs_browser(tmp_path):
+    """Prism round 2: a browser from an earlier run of the card forks a new
+    profile-tagged helper after the current worker starts. The helper is born
+    inside the run, but its ancestor is not; it is not counted."""
+    profile = str(tmp_path / "ws" / "t_5a1a0003" / "chrome-profile")
+    old = subprocess.Popen([sys.executable, "-c", _OLD_BROWSER, profile,
+                            "--user-data-dir=" + profile],
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                           env=_clean_env(), start_new_session=True)
+    _track(old.pid)
+    time.sleep(1.6)
+    worker = subprocess.Popen([sys.executable, "-c", _SLEEP], env=_clean_env(),
+                              start_new_session=True)
+    _track(worker.pid)
+    old.stdin.write("go\n")
+    old.stdin.flush()
+    helper = int(old.stdout.readline())
+    _track(helper)
+    assert kb._member_birth(helper) > kb._member_birth(worker.pid)
+    key = ("t_5a1a0003", "1")
+    assert kpb.census_worker_trees({key: worker.pid})[key]["procs"] == 1  # the worker only

@@ -67,10 +67,40 @@ def _kanban_cfg(kanban_cfg: Optional[dict]) -> dict:
         return {}
 
 
+#: Slots a fresh worker tree is always left above the uid's CURRENT task
+#: count: 2 x the per-run cap (256), so a healthy worker can never be spawned
+#: into a ceiling it already sits on. RLIMIT_NPROC is uid-wide and on Linux
+#: counts threads (ACE-AI 2026-10-02: 260 procs, 2,629 threads), and
+#: ``setrlimit`` succeeds even below the current count, after which every
+#: fork in the worker fails EAGAIN.
+WORKER_NPROC_HEADROOM = 2 * DEFAULT_WORKER_MAX_PROCS_PER_RUN
+
+
+def uid_task_count() -> Optional[int]:
+    """What RLIMIT_NPROC is checked against for this uid right now: threads on
+    Linux, processes elsewhere. None when unreadable."""
+    if not hasattr(os, "getuid"):
+        return None
+    uid = os.getuid()  # windows-footgun: ok (hasattr-gated above)
+    linux = sys.platform.startswith("linux")
+    attrs = ["uids", "num_threads"] if linux else ["uids"]
+    n = 0
+    try:
+        for proc in psutil.process_iter(attrs):
+            uids = proc.info.get("uids")
+            if uids is None or uids.real != uid:
+                continue
+            n += (proc.info.get("num_threads") or 1) if linux else 1
+    except Exception:
+        return None
+    return n
+
+
 def resolve_worker_nproc_limit(
     kanban_cfg: Optional[dict] = None,
     *,
     current: Optional[tuple[int, int]] = None,
+    uid_tasks: Optional[int] = None,
 ) -> Optional[int]:
     """The RLIMIT_NPROC soft limit for a worker tree, or None (no change).
 
@@ -78,6 +108,9 @@ def resolve_worker_nproc_limit(
     soft limit; a positive int = that value; ``0``/``off``/``false`` = off.
     Never RAISES the inherited limit, and an unlimited inherited soft limit
     with ``auto`` leaves it alone (there is no ceiling to take 75% of).
+    The result is floored at the uid's current task count (``uid_tasks``,
+    read live when None) + :data:`WORKER_NPROC_HEADROOM`; if that floor
+    reaches the inherited limit, no ceiling is installed.
     """
     try:
         import resource
@@ -107,6 +140,11 @@ def resolve_worker_nproc_limit(
             want = int(soft * WORKER_NPROC_AUTO_FRACTION)
         if want <= 0:
             return None
+    if uid_tasks is None:
+        uid_tasks = uid_task_count()
+    if uid_tasks is None:
+        return None  # cannot prove the ceiling leaves the worker room
+    want = max(want, uid_tasks + WORKER_NPROC_HEADROOM)
     if soft != inf and want >= soft:
         return None
     return want
@@ -179,7 +217,9 @@ def census_worker_trees(
     of the session keep the env), or it has no run identity in its
     environment and its ``--user-data-dir`` names the card (Linux Chrome).
     Session members that are, or descend from, a process older than the
-    worker are a previous holder of a recycled sid and are not counted.
+    worker are a previous holder of a recycled sid and are not counted; the
+    same check applies to profile matches and their same-card ancestors (an
+    earlier run's browser).
     Same uid only; self excluded.
     Returns ``{key: {"procs": n, "top": [(name, n), ...]}}``.
     """
@@ -201,6 +241,7 @@ def census_worker_trees(
     # pid -> (sid, ppid, birth) for every same-uid process, for the walk.
     table: dict[int, tuple[Optional[int], int, Optional[float]]] = {}
     sid_hits: list[tuple[int, int, str]] = []
+    profile_hits: dict[int, tuple[tuple[str, str], str]] = {}
     for proc in psutil.process_iter(["pid", "ppid", "uids", "name", "create_time"]):
         info = proc.info
         pid = info.get("pid") or 0
@@ -222,17 +263,14 @@ def census_worker_trees(
             continue
         if env.get("HERMES_KANBAN_TASK") is None:
             # Linux Chrome erases its environ window; its profile path still
-            # names the card (kb._cmdline_profile_cards).
+            # names the card (kb._cmdline_profile_cards). Decided after the
+            # pass: the generation check needs the whole table.
             cards = kb._cmdline_profile_cards(kb._safe_cmdline(proc))
             key = next((by_card[c] for c in cards if c in by_card), None)
-            # The card names no run: a browser older than this run's worker
-            # belongs to an earlier run of the card, not this one.
-            lead = leader_birth.get(runs[key]) if key is not None else None
-            born = info.get("create_time")
-            if lead is not None and born is not None and born < lead - 1.0:
-                key = None
-        else:
-            key = (env.get("HERMES_KANBAN_TASK"), env.get("HERMES_KANBAN_RUN_ID"))
+            if key is not None:
+                profile_hits[pid] = (key, name)
+            continue
+        key = (env.get("HERMES_KANBAN_TASK"), env.get("HERMES_KANBAN_RUN_ID"))
         if key in members:
             members[key][name] += 1
 
@@ -254,6 +292,29 @@ def census_worker_trees(
     for pid, sid, name in sid_hits:
         if not _stale(pid, sid):
             members[by_sid[sid]][name] += 1
+
+    def _stale_profile(pid: int, key: tuple[str, str]) -> bool:
+        # The path names the card, not the run. A process older than this
+        # run's worker, or a descendant of a same-card profile process that
+        # is (an earlier run's browser forking new helpers), is not this run's.
+        lead = leader_birth.get(runs[key])
+        if lead is None:
+            return False
+        seen: set[int] = set()
+        while pid in table and pid not in seen:
+            seen.add(pid)
+            born = table[pid][2]
+            if born is not None and born < lead - 1.0:
+                return True
+            pid = table[pid][1]
+            hit = profile_hits.get(pid)
+            if hit is None or hit[0] != key:
+                return False
+        return False
+
+    for pid, (key, name) in profile_hits.items():
+        if not _stale_profile(pid, key):
+            members[key][name] += 1
     return {
         k: {"procs": sum(c.values()), "top": c.most_common(3)}
         for k, c in members.items()
