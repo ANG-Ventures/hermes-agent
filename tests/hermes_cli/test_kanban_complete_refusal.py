@@ -33,7 +33,8 @@ def test_already_done_names_who_and_when(kanban_home):
         t = kb.create_task(conn, title="x", assignee="daedalus")
         claimed = kb.claim_task(conn, t)
         assert claimed is not None
-        assert kb.complete_task(conn, t, summary="done", expected_run_id=claimed.current_run_id)
+        assert kb.complete_task(conn, t, summary="done", metadata={"tests_run": 1},
+                                expected_run_id=claimed.current_run_id)
         assert not kb.complete_task(conn, t, summary="again")
         msg = kb.explain_complete_refusal(conn, t)
     assert msg.startswith("already done by daedalus at 20"), msg
