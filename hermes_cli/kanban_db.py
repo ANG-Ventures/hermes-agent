@@ -420,7 +420,8 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers",
-    "ended_terminal_runs", "worker_leftovers_reaped", "orphans_reaped", "crashed", "stale", "timed_out", "auto_blocked", "rate_limited",
+    "ended_terminal_runs", "worker_leftovers_reaped", "orphans_reaped", "crashed", "stale", "timed_out", "process_capped",
+    "auto_blocked", "rate_limited",
     "infra_unavailable", "cohort_deaths", "auto_assigned_default", "respawn_guarded",
     "skipped_per_profile_capped", "skipped_unassigned", "skipped_nonspawnable",
 )
@@ -2213,6 +2214,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "brain",
 )
 
 
@@ -2643,6 +2645,45 @@ def format_dispatch_lock_skip(holder: dict) -> str:
         f"skipped: board dispatcher lock held by pid {holder.get('pid', 'unknown')} "
         f"for {age_text}; acquire site={holder.get('acquire_site', 'unknown')}"
     )
+
+
+class KanbanNonCanonicalBoardPathError(RuntimeError):
+    """Raised when :func:`connect` is handed ``<...>/kanban/boards/default/kanban.db``.
+
+    The ``default`` board's DB is ``<root>/kanban.db``; ``boards/default/`` is
+    never a board. ``connect()`` creates and initializes whatever it is given,
+    so a guessed path there minted a full-schema, zero-card phantom board
+    (2026-10-02 09:02:00, a cron agent's ``kb.connect(<root>/kanban/boards/
+    default/kanban.db)`` one-liner; card t_1462ab0d). Earlier shapes left a
+    0-byte file (2026-09-18, 09-27, 09-29). Refusing before the mkdir means the
+    wrong guess costs one traceback instead of a phantom that enumerators trip on.
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        super().__init__(
+            f"{db_path} is not a kanban board path: the default board lives at "
+            f"<root>/kanban.db (kanban_db_path('default')). Refusing to create "
+            f"or open a phantom board here."
+        )
+
+
+def _refuse_noncanonical_board_path(path: Path) -> None:
+    """Raise :class:`KanbanNonCanonicalBoardPathError` for ``kanban/boards/default/kanban.db``.
+
+    Structural (path shape only), so it holds under any root, pin or sandbox.
+    Judged on the RESOLVED target, not the spelling: a relative ``kanban.db``
+    from a ``boards/default`` cwd, a ``boards/default/../default/kanban.db``
+    and a symlinked parent all land on the same file (Prism d0894d0cbe77).
+    """
+    p = Path(path).expanduser().resolve(strict=False)
+    if (
+        p.name == "kanban.db"
+        and p.parent.name == DEFAULT_BOARD
+        and p.parent.parent.name == "boards"
+        and p.parent.parent.parent.name == "kanban"
+    ):
+        raise KanbanNonCanonicalBoardPathError(p)
 
 
 class KanbanDbNotABoardError(RuntimeError):
@@ -19214,5 +19255,12 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     has_spawnable_ready,
 )
 from hermes_cli.kanban_db_notify import (  # noqa: E402
+    NOTIFY_SUB_OWNER_LIVE_SECONDS,
     _decode_notify_delivery_metadata,
+    _drop_notify_subs,
+    _log_sub_kept,
+    _notify_sub_admission,
+    card_home_chat,
+    dedupe_notify_subs,
+    notify_chat_is_live,
 )

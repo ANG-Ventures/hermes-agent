@@ -731,6 +731,7 @@ def connect(
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
     _kb._assert_live_board_write_allowed(path)
+    _kb._refuse_noncanonical_board_path(path)  # before the mkdir (t_1462ab0d)
     from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a
@@ -848,6 +849,7 @@ def init_db(
             pass
         return path
     _kb._assert_live_board_write_allowed(path)  # before the mkdir, not after
+    _kb._refuse_noncanonical_board_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:
@@ -920,6 +922,9 @@ _LATER_TASK_COLUMNS = (
     # Deliberate single-sub pin (t_957ca870). NULL = no pin; existing rows had none.
     ("pin_sub_reason", "pin_sub_reason TEXT"),
     ("pin_sub_fallback", "pin_sub_fallback INTEGER NOT NULL DEFAULT 0"),
+    # Per-card harness brain (t_a8f335c5). NULL = the profile's foreign_lane.brain,
+    # which is what existing rows were getting.
+    ("brain", "brain TEXT"),
     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
