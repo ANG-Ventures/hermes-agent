@@ -644,14 +644,25 @@ class TestPreflightDeferral:
         assert compressor.should_compress_calibrated(96_000) is True
 
     def test_awaiting_real_usage_after_compaction_uses_compression_rough_pair(self, compressor):
+        """The first real reading after a compaction consumes the one-response latch; a rough
+        estimate over threshold then keeps deferring to the provider while the real reading fits
+        (upstream 0f4587e336f, adopted by the 2026-10-01 sync — see
+        ``test_switch_waits_for_new_provider_evidence``; it replaced the fork's
+        ``last_rough_tokens_when_real_prompt_fit`` (rough, real) projection baseline)."""
         compressor.threshold_tokens = 85_000
         compressor.last_compression_rough_tokens = 95_000
         compressor.awaiting_real_usage_after_compression = True
         compressor.last_prompt_tokens = 50_000
+        assert compressor.should_defer_preflight_to_real_usage(95_000) is True  # latch armed
         compressor.update_from_response({"prompt_tokens": 50_000, "completion_tokens": 1})
 
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 95_000
         assert compressor.awaiting_real_usage_after_compression is False
+        assert compressor.last_real_prompt_tokens == 50_000
+        # Real reading fits: rough pressure still defers to the provider's next count.
+        assert compressor.should_defer_preflight_to_real_usage(95_000) is True
+        # A real reading at/over the threshold is the evidence that stops deferring.
+        compressor.update_from_response({"prompt_tokens": 85_000, "completion_tokens": 1})
+        assert compressor.should_defer_preflight_to_real_usage(95_000) is False
 
     def test_resumes_normal_calibration_after_flag_cleared(self, compressor):
         compressor.threshold_tokens = 85_000
