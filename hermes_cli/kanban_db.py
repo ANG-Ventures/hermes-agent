@@ -19551,7 +19551,7 @@ def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int
             continue
         try:
             env = proc.environ()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+        except Exception:  # psutil on macOS: SystemError for a process exiting mid-read
             continue
         env_task = env.get("HERMES_KANBAN_TASK")
         if env_task is None:

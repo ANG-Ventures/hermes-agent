@@ -259,7 +259,7 @@ def census_worker_trees(
             continue
         try:
             env = proc.environ()
-        except (psutil.Error, OSError):
+        except Exception:  # psutil on macOS: SystemError for a process exiting mid-read
             continue
         if env.get("HERMES_KANBAN_TASK") is None:
             # Linux Chrome erases its environ window; its profile path still
