@@ -76,7 +76,7 @@ def _compact(msg: str) -> str:
 
 
 def render(lines: list[str], dropped: int = 0) -> str:
-    """One held line posts unchanged; two or more become ONE digest message (never split)."""
+    """One held line posts unchanged; two or more become ONE digest message that fits one post."""
     if len(lines) == 1 and not dropped:
         return lines[0]
     counts: dict[str, int] = {}
