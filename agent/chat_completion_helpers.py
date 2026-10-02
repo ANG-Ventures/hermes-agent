@@ -4127,7 +4127,8 @@ def _summary_text(agent, response, **normalize_kwargs) -> str:
         logger.warning("Iteration summary returned a router timeout shim; retrying")
         return ""
     normalized = agent._get_transport().normalize_response(response, **normalize_kwargs)
-    if normalized.tool_calls:
+    # getattr: transport doubles / minimal normalized shapes carry only ``content``.
+    if getattr(normalized, "tool_calls", None):
         # No summary path executes tool calls; log so a tool-only response that falls into the
         # empty-summary retry is diagnosable.
         logger.warning("Iteration summary emitted tool calls; discarding them")

@@ -255,6 +255,9 @@ def assemble_api_request(
     # delta estimate replaces the whole-history heuristic when the anchor is fresh.
     _anchored_pressure = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
     agent._request_pressure_anchored = _anchored_pressure is not None
+    # Keep the rough figure: the pre-API compaction gate applies the skew calibration to ROUGH
+    # input only; an anchored figure is already real (t_bd01a34b: real x skew false-fired at 49%).
+    agent._request_pressure_rough = request_pressure_tokens
     if _anchored_pressure is not None:
         request_pressure_tokens = _anchored_pressure
     else:

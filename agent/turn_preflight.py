@@ -13,7 +13,11 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import (
+    automatic_compaction_status_message,
+    should_compress_request as _should_compress_request,
+    trigger_compare_tokens_for as _trigger_compare_tokens_for,
+)
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
@@ -93,13 +97,22 @@ def run_preflight_compression(
     if _eligible:
         # Aux clamp must land before the first compaction fires on the main-window threshold (#114707).
         ensure_compression_feasibility_checked(agent, request_pressure_tokens)
+    # Fork P2: the gate compares the skew-CALIBRATED rough estimate (or the anchored real figure
+    # unscaled) and threads ``messages`` so the request is classified per content class.
+    messages = v.messages
+    _anchored_pressure = request_pressure_tokens if getattr(agent, "_request_pressure_anchored", False) else None
+    _rough_pressure_tokens = getattr(agent, "_request_pressure_rough", None)
+    if not isinstance(_rough_pressure_tokens, int) or isinstance(_rough_pressure_tokens, bool):
+        _rough_pressure_tokens = request_pressure_tokens
     if (
         _eligible
         and not _review_fork_first_request_pending(agent)
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
         and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight)
         and not _compression_cooldown
-        and compressor.should_compress(request_pressure_tokens)
+        and _should_compress_request(
+            compressor, _rough_pressure_tokens, messages, anchored_tokens=_anchored_pressure,
+        )
     ):
         # Managed local runtime: grow the context window before compressing (last
         # resort). Only for a llamacpp provider at the supervised base_url.
@@ -118,11 +131,16 @@ def run_preflight_compression(
         _clear_overflow_warn(agent)
         _threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
         _context_length = int(getattr(compressor, "context_length", 0) or 0)
+        # Print the figure the gate COMPARED (post-calibration / anchored) beside the raw
+        # inputs, so the logged inequality is true.
         logger.info(
-            "Pre-API compression: ~%s request tokens >= %s threshold "
-            "(context=%s, attempt=%s/%s)",
-            f"{request_pressure_tokens:,}",
+            "Pre-API compression: ~%s compared tokens >= %s threshold "
+            "(basis=%s, request=~%s, rough=~%s, context=%s, attempt=%s/%s)",
+            f"{_trigger_compare_tokens_for(compressor, _rough_pressure_tokens, messages, _anchored_pressure):,}",
             f"{_threshold:,}",
+            "anchored" if _anchored_pressure is not None else "rough",
+            f"{request_pressure_tokens:,}",
+            f"{_rough_pressure_tokens:,}",
             f"{_context_length:,}" if getattr(compressor, "context_length", 0) else "unknown",
             v.compression_attempts,
             max_compression_attempts,
