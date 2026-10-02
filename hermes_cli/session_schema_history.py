@@ -207,6 +207,32 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         ('28 2026-09-25T23:25Z 2941aadffa', (('+', 'compression_overload_streak', 'compression_recovery_deadline'),)),
         ('29 2026-09-27T00:29Z d75f29934b', (('+', 'created_source', 'source'),)),
         ('30 2026-09-28T00:00Z #117713', (('+', 'auto_archived', 'archived'),)),
+        # Fork (Kyzcreig/hermes-agent) columns, recorded at the 2026-10-01 parity merge in
+        # fork-commit order; appended here (never mid-list) per the module contract.
+        ('31 2026-04-30T20:17Z 5089c55e0b', (('+', 'effective_last_active', 'started_at'),)),
+        ('32 2026-06-05T14:40Z 445720afec', (
+            ('+', 'last_turn_input_tokens', 'cwd'),
+            ('+', 'last_turn_output_tokens', 'last_turn_input_tokens'),
+            ('+', 'last_turn_cache_read_tokens', 'last_turn_output_tokens'),
+            ('+', 'last_turn_cache_write_tokens', 'last_turn_cache_read_tokens'),
+            ('+', 'last_turn_reasoning_tokens', 'last_turn_cache_write_tokens'),
+        )),
+        ('33 2026-06-15T19:17Z 3109924754', (('+', 'redo_count', 'rewind_count'),)),
+        ('34 2026-07-10T14:38Z 1921a02047', (
+            ('+', 'compression_skew_history', 'compression_failure_error'),
+        )),
+        ('35 2026-09-23T17:15Z 2605de02cf', (
+            ('+', 'input_tokens_unknown', 'last_read_at'),
+            ('+', 'output_tokens_unknown', 'input_tokens_unknown'),
+            ('+', 'cache_read_tokens_unknown', 'output_tokens_unknown'),
+            ('+', 'cache_write_tokens_unknown', 'cache_read_tokens_unknown'),
+            ('+', 'usage_unknown', 'cache_write_tokens_unknown'),
+            ('+', 'last_turn_input_tokens_unknown', 'usage_unknown'),
+            ('+', 'last_turn_output_tokens_unknown', 'last_turn_input_tokens_unknown'),
+            ('+', 'last_turn_cache_read_tokens_unknown', 'last_turn_output_tokens_unknown'),
+            ('+', 'last_turn_cache_write_tokens_unknown', 'last_turn_cache_read_tokens_unknown'),
+            ('+', 'last_turn_usage_unknown', 'last_turn_cache_write_tokens_unknown'),
+        )),
         ),
     ),
     "messages": _TableHistory(
@@ -263,6 +289,14 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'cost_source', 'cost_status'),
         )),
         ('02 2026-07-16T11:23Z eb6aa03609', (('+', 'task', 'billing_mode'),)),
+        # Fork column set (see the sessions note above).
+        ('03 2026-09-23T17:15Z 2605de02cf', (
+            ('+', 'input_tokens_unknown', 'last_seen'),
+            ('+', 'output_tokens_unknown', 'input_tokens_unknown'),
+            ('+', 'cache_read_tokens_unknown', 'output_tokens_unknown'),
+            ('+', 'cache_write_tokens_unknown', 'cache_read_tokens_unknown'),
+            ('+', 'usage_unknown', 'cache_write_tokens_unknown'),
+        )),
         ),
     ),
 }

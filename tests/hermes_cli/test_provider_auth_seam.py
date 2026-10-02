@@ -69,6 +69,9 @@ def _rediscover() -> None:
 def install_provider(tmp_path, monkeypatch):
     """Write a model-provider plugin into an isolated HERMES_HOME and discover it."""
     installed: list[str] = []
+    from hermes_cli import provider_seam
+
+    generation = provider_seam.current()
 
     def _install(name: str = "fake-auth", *, with_handler: bool = True) -> Path:
         """Write (or rewrite) the fixture plugin and re-run discovery."""
@@ -90,14 +93,11 @@ def install_provider(tmp_path, monkeypatch):
 
     yield _install
 
-    # The provider registry is process-global: never leak the fixture profile.
+    # The provider registry is process-global: never leak the fixture profile. The fork
+    # registry is additive (no item deletion), so restore the pre-fixture generation.
     import providers as _pkg
 
-    for name in installed:
-        _pkg._REGISTRY.pop(name, None)
-        for alias, canonical in list(_pkg._ALIASES.items()):
-            if canonical == name:
-                _pkg._ALIASES.pop(alias, None)
+    provider_seam._restore(generation)
     _pkg._PROVIDER_LIST_CACHE = None
 
 
