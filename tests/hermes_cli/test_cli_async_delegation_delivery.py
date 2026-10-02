@@ -79,7 +79,14 @@ def test_cli_receipt_failure_preserves_accepted_input_and_siblings(monkeypatch, 
 
     monkeypatch.setattr("tools.async_delegation.complete_event_delivery", receipt)
     cli._drain_process_notifications("cli-idle")
-    assert list(cli._pending_input.queue) == ["first", "sibling"]
+    # Upstream's drain wraps completions in a ProcessNotificationBatch (rendered at turn start); the
+    # pinned contract is that a failed receipt drops neither the accepted input nor its sibling.
+    from tools.process_registry_notifications import ProcessNotificationBatch
+    queued = [
+        [text for _evt, text in item.notifications] if isinstance(item, ProcessNotificationBatch) else item
+        for item in cli._pending_input.queue
+    ]
+    assert queued == ["first", ["sibling"]]
     assert attempts.count(events[0]) == (2 if failures == 1 else 3)
     assert "receipt" in caplog.text.lower()
 
