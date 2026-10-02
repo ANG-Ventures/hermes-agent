@@ -1497,6 +1497,11 @@ class _LoopState:
     _llm_middleware_trace: Any = None
     api_duration: Any = None
     assistant_message: Any = None
+    # Fork (agent/confab_notice.py): out-of-band notice on this iteration's response, and
+    # whether it was announced for the first time this turn (set by normalize_model_response,
+    # read by finish_text_response).
+    _confab_notice: Any = None
+    _new_confab_notice: Any = False
 
 
 # _LoopState fields seeded from TurnContext (same name minus the leading underscore).
