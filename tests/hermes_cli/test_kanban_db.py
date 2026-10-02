@@ -725,7 +725,7 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
         assert kbd.check_respawn_guard(conn, tid) == expected
 
 
-def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
+def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home, monkeypatch):
     """A plain crash's captured stdout is context, not a diagnosis.
 
     ``_classify_dead_worker`` appends the worker's last output to the persisted
@@ -768,6 +768,10 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         )
         conn.commit()
 
+        # Fork: a blocker_auth failure is age-bound by the rate-limit cooldown
+        # (test_respawn_guard_blocker_auth_is_age_bound); read inside it.
+        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+        monkeypatch.setattr(kb.time, "time", lambda: 5_000_030)
         assert kbd.check_respawn_guard(conn, crashed_id) is None
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
@@ -4379,12 +4383,16 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
 
 
 def _seed_quota_failure(conn, *, now, error="HTTP 429: usage limit reached"):
-    """A task whose latest run crashed with a quota error stamped on the task."""
+    """A task whose latest run failed with a quota error stamped on the task.
+
+    ``spawn_failed``, not ``crashed``: upstream 3899401aa68 (#117097) treats a
+    crashed run's error as the worker's last OUTPUT (context, not a diagnosis),
+    so only a non-crash failure carries the blocker diagnosis these tests pin."""
     tid = kb.create_task(conn, title="quota-stale", assignee="a")
     kb.claim_task(conn, tid)
     run_id = kb.get_task(conn, tid).current_run_id
     conn.execute(
-        "UPDATE task_runs SET outcome='crashed', status='crashed', "
+        "UPDATE task_runs SET outcome='spawn_failed', status='failed', "
         "ended_at=?, error=? WHERE id=?",
         (now, error, run_id),
     )
