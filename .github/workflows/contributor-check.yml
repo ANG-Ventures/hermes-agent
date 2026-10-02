@@ -27,7 +27,7 @@ jobs:
           # hit HTTP 429 from the promisor remote, ejecting #1413 from the merge queue (t_2a6d0f40).
           sparse-checkout: |
             /contributors/
-            /scripts/release.py
+            /scripts/releases/authors_legacy.py
           sparse-checkout-cone-mode: false
 
       - name: Check for unmapped contributor emails
@@ -61,7 +61,10 @@ jobs:
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
-            if [ -f "contributors/emails/${email}" ]; then
+            # Case-insensitive: email domains are case-insensitive, and the
+            # case-collision gate forbids keeping case-variant sibling files.
+            if [ -f "contributors/emails/${email}" ] || \
+               ls contributors/emails/ | grep -qixF -- "$email"; then
               continue  # mapped via the contributors directory
             fi
 
