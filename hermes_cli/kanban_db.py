@@ -227,6 +227,50 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     )
 
 
+# Per-card harness brain (t_a8f335c5): the Claude lane a foreign-lane worker
+# (cc-worker) dials through, normally the profile-wide ``foreign_lane.brain``.
+# Stored in the full (``f``) lane grammar; the lane runner
+# (skills-shared/coding/kanban-foreign-lane/scripts/harness_model.py) maps it to
+# its internal id and re-validates it at spawn. Pre-v2 internal ids are
+# accepted and stored in the f spelling. Bare ``clr`` / ``clx-N`` are the SLIM
+# harness since 2026-10-01 (t_faf5af7b) and are refused by name.
+CARD_BRAIN_ALLOWED = (
+    "clrf | clxf-<N> | dtlrf | dtlxf-<N> | alrf | cliproxy:<model> | openrouter:<model>"
+)
+_CARD_BRAIN_ALIASES = {"cpr-cli": "clrf", "dtlr": "dtlrf", "alrf": "alrf", "clrf": "clrf", "dtlrf": "dtlrf"}
+_CARD_BRAIN_MODEL_RE = re.compile(r"(cliproxy|openrouter):([A-Za-z0-9][A-Za-z0-9._/-]*)")
+
+
+def normalize_card_brain(brain: Optional[str]) -> Optional[str]:
+    """Validate a per-card brain against the allowlist; return its stored form.
+
+    Empty / None / ``none`` / ``-`` means "no card brain" (NULL: the profile's
+    ``foreign_lane.brain`` applies). Anything outside the allowlist raises
+    ``ValueError`` naming the allowed values, so a typo never silently falls
+    back to the profile's lane.
+    """
+    value = str(brain or "").strip()
+    if value.lower() in ("", "none", "-", "null"):
+        return None
+    low = value.lower()
+    if low in _CARD_BRAIN_ALIASES:
+        return _CARD_BRAIN_ALIASES[low]
+    m = re.fullmatch(r"(clxf|cpx-cli|dtlxf|dtlx)[-:](\d+)", low)
+    if m:
+        family = "clxf" if m.group(1) in ("clxf", "cpx-cli") else "dtlxf"
+        return f"{family}-{int(m.group(2))}"
+    m = _CARD_BRAIN_MODEL_RE.fullmatch(value)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    if low in ("clr", "clx") or re.fullmatch(r"clx[-:]\d+", low):
+        full = low.replace("clr", "clrf").replace("clx", "clxf")
+        raise ValueError(
+            f"brain {value!r} is the SLIM harness since 2026-10-01 (t_faf5af7b); "
+            f"a coding worker needs the full harness: use {full}"
+        )
+    raise ValueError(f"brain must be one of {CARD_BRAIN_ALLOWED}, got {value!r}")
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -2304,6 +2348,10 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Per-card harness brain for a foreign-lane worker (t_a8f335c5), stored in
+    # the f lane grammar (normalize_card_brain). NULL = the profile's
+    # ``foreign_lane.brain``.
+    brain: Optional[str] = None
     # Deliberate single-sub pin (``--pin-sub "<reason>"``, t_957ca870). Set
     # only when ``provider_override`` is one claude-bpx-N / claude-apx-N sub.
     # ``pin_sub_fallback`` lets a capped pinned sub fall back to its family
@@ -2436,6 +2484,7 @@ class Task:
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
+            brain=row["brain"] if "brain" in keys and row["brain"] else None,
             pin_sub_reason=(
                 row["pin_sub_reason"]
                 if "pin_sub_reason" in keys and row["pin_sub_reason"]
@@ -2634,6 +2683,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Per-card harness brain for a foreign-lane worker (t_a8f335c5), f lane
+    -- grammar (clrf, clxf-N, dtlrf, ...). NULL = profile foreign_lane.brain.
+    brain                TEXT,
     -- Deliberate single-sub pin (t_957ca870): the operator's --pin-sub reason
     -- when provider_override is claude-bpx-N / claude-apx-N. NULL = no pin.
     pin_sub_reason       TEXT,
@@ -4493,6 +4545,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "pin_sub_fallback", "pin_sub_fallback INTEGER NOT NULL DEFAULT 0"
         )
+    if "brain" not in cols:
+        # Per-card harness brain (t_a8f335c5). NULL = the profile's
+        # foreign_lane.brain, which is what existing rows were getting.
+        _add_column_if_missing(conn, "tasks", "brain", "brain TEXT")
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -7111,6 +7167,7 @@ def create_task(
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    brain: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     goal_mode: bool = False,
@@ -7185,6 +7242,7 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    brain = normalize_card_brain(brain)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
@@ -7577,8 +7635,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, brain
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -7606,6 +7664,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        brain,
                     ),
                 )
                 for pid in parents:
@@ -7638,6 +7697,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **({"brain": brain} if brain else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -8387,6 +8447,45 @@ def _set_reasoning_effort_locked(
     return True
 
 
+def set_card_brain(
+    conn: sqlite3.Connection,
+    task_id: str,
+    brain: Optional[str],
+) -> bool:
+    """Set (or clear) the per-card harness brain (t_a8f335c5).
+
+    ``brain=None`` (or empty / ``none``) clears it: the worker uses its
+    profile's ``foreign_lane.brain``. Independent of the model and effort
+    overrides, applies on the NEXT dispatch, and records ``brain_set`` (the
+    same event ledger and actor stamp as ``reasoning_effort_set``).
+    """
+    brain = normalize_card_brain(brain)
+    with write_txn(conn):
+        if not _set_card_brain_locked(conn, task_id, brain):
+            return False
+    notify_task_updated(conn, task_id, ("brain",))
+    return True
+
+
+def _set_card_brain_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    brain: Optional[str],
+) -> bool:
+    """Write one card brain. MUST already be inside a ``write_txn``; ``brain``
+    must already have passed :func:`normalize_card_brain`."""
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(f"cannot set brain on archived task {task_id}")
+    conn.execute("UPDATE tasks SET brain = ? WHERE id = ?", (brain, task_id))
+    _append_event(conn, task_id, "brain_set", {"brain": brain})
+    return True
+
+
 @dataclass
 class BatchRouteWrite:
     """One card's requested route/effort change inside a batch."""
@@ -8399,6 +8498,9 @@ class BatchRouteWrite:
     audit_comment_body: Optional[str] = None
     touch_effort: bool = False
     effort: Optional[str] = None
+    # Per-card harness brain (``--brain`` / ``--clear-brain``, t_a8f335c5).
+    touch_brain: bool = False
+    brain: Optional[str] = None
     # Deliberate single-sub pin (``--pin-sub``); only with ``touch_model``.
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
@@ -8527,6 +8629,8 @@ def apply_batch_route_writes(
                 pin_sub_fallback=write.pin_sub_fallback,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
+        if write.touch_brain:
+            write.brain = normalize_card_brain(write.brain)
         prepared.append((write, model, provider, effort))
 
     # Home-session guard for every card in the batch, before the writer lock:
@@ -8567,6 +8671,10 @@ def apply_batch_route_writes(
                 if not _set_reasoning_effort_locked(conn, write.task_id, effort):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("reasoning_effort",)
+            if write.touch_brain:
+                if not _set_card_brain_locked(conn, write.task_id, write.brain):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("brain",)
             if changed:
                 written.append(write.task_id)
                 fields[write.task_id] = changed
@@ -25681,6 +25789,8 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
 
 _SHIM_MODEL_FAMILY_RANK = (("haiku", 1), ("sonnet", 2), ("opus", 3))
 SHIM_MODEL_CAPPED_FROM_ENV = "HERMES_KANBAN_SHIM_MODEL_CAPPED_FROM"
+# Per-card harness brain as claimed (t_a8f335c5); read by the lane runner.
+CARD_BRAIN_ENV = "HERMES_KANBAN_CARD_BRAIN"
 _SHIM_MODEL_ID_RE = re.compile(r"claude-(haiku|sonnet|opus)-\d[0-9a-z.-]*$")
 
 
@@ -25909,6 +26019,10 @@ def _default_spawn(
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    # The card's harness brain as claimed (t_a8f335c5; "" = none). The lane
+    # runner re-reads tasks.brain and stops ``model_diverged`` if it moved
+    # between this claim and its own read, as it does for model and effort.
+    env[CARD_BRAIN_ENV] = getattr(task, "brain", None) or ""
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
         from hermes_cli.kanban_worker_exit import exit_file

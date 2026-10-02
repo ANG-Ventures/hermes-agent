@@ -210,6 +210,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "reasoning_effort": t.reasoning_effort,
+        "brain": getattr(t, "brain", None),
         "pin_sub_reason": getattr(t, "pin_sub_reason", None),
         "pin_sub_fallback": bool(getattr(t, "pin_sub_fallback", False)),
         "session_id": t.session_id,
@@ -664,6 +665,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "thinking. Independent of --model; omit to inherit the "
              "assignee profile default.",
     )
+    p_create.add_argument(
+        "--brain", default=None, dest="brain", metavar="LANE",
+        help="Per-card harness brain for a foreign-lane worker (cc-worker): "
+             f"{kb.CARD_BRAIN_ALLOWED}. Overrides the profile's "
+             "foreign_lane.brain for this card only; omit to inherit it.",
+    )
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -898,6 +905,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--clear-effort", action="store_true", dest="clear_effort",
         help="Clear the per-task reasoning effort — the worker falls back "
              "to its profile's own agent.reasoning_effort.",
+    )
+    _brain_group = p_set_model.add_mutually_exclusive_group()
+    _brain_group.add_argument(
+        "--brain", default=None, dest="brain", metavar="LANE",
+        help="Per-card harness brain for a foreign-lane worker (cc-worker): "
+             f"{kb.CARD_BRAIN_ALLOWED}. Card > lane > profile "
+             "foreign_lane.brain; applies on the next dispatch. Independent "
+             "of the model: with --brain alone the model override is left "
+             "untouched.",
+    )
+    _brain_group.add_argument(
+        "--clear-brain", action="store_true", dest="clear_brain",
+        help="Clear the per-card brain; the worker uses its profile's "
+             "foreign_lane.brain.",
     )
 
     # --- lane-model (board-level, time-boxed routing) ---
@@ -2858,6 +2879,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 flagship_override_reason=getattr(args, "allow_flagship", None),
                 flagship_override_author=args.created_by or _profile_author(),
                 reasoning_effort=getattr(args, "reasoning_effort", None),
+                brain=getattr(args, "brain", None),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
@@ -3313,6 +3335,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             _fb = "family pool" if task.pin_sub_fallback else "wait"
             print(f"  pin:       {_pin_badge(task)} (capped sub => {_fb})")
     print(f"  reasoning: {task.reasoning_effort or 'inherit'}")
+    if getattr(task, "brain", None):
+        print(f"  brain:     {task.brain}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -3747,6 +3771,20 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     model_given = model_given or bool(model) or bool(provider)
     effort = override.reasoning_effort if override else getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
+    clear_brain = bool(getattr(args, "clear_brain", False))
+    brain_arg = getattr(args, "brain", None)
+    touch_brain = clear_brain or brain_arg is not None
+    brain = None
+    if brain_arg is not None:
+        # Validate BEFORE any write: a typo'd brain must not half-apply.
+        try:
+            brain = kb.normalize_card_brain(brain_arg)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        if brain is None:
+            print("kanban: --brain needs a lane (use --clear-brain to unset)", file=sys.stderr)
+            return 2
     # --allow-flagship (main) and --firepower (alias) share dest=allow_flagship.
     firepower_reason = (
         override.firepower if override and override.firepower
@@ -3765,7 +3803,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     # "unchanged" here, not "clear"). Without either effort flag the
     # historical contract holds — a missing or 'none' positional clears the
     # model/provider override.
-    touch_model = model_given or (effort is None and not clear_effort)
+    touch_model = model_given or (effort is None and not clear_effort and not touch_brain)
     if provider and not touch_model:
         print("kanban: --provider requires a model", file=sys.stderr)
         return 2
@@ -3807,6 +3845,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if live and reclaim:
         print("kanban: --live and --reclaim are exclusive (--live keeps the "
               "running worker; --reclaim aborts it)", file=sys.stderr)
+        return 2
+    if live and touch_brain:
+        # The brain is the lane the harness process was launched through; a
+        # running harness cannot change it in place.
+        print("kanban: --brain applies on the next dispatch (drop --live, or "
+              "use --reclaim)", file=sys.stderr)
         return 2
     if live and (clear_effort or (touch_model and not model and not provider)):
         # A clear resolves through lane overrides / the capped-pool ladder at
@@ -3913,6 +3957,9 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 if effort is not None or clear_effort:
                     write.touch_effort = True
                     write.effort = None if clear_effort else effort
+                if touch_brain:
+                    write.touch_brain = True
+                    write.brain = None if clear_brain else brain
                 writes.append(write)
 
             written = set(kb.apply_batch_route_writes(
@@ -4008,6 +4055,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     if live_run is not None else "applies on next dispatch"
                 )
                 print(f"Set reasoning effort on {task_id}: {effort} ({when})")
+            if clear_brain:
+                print(f"Cleared brain on {task_id} (worker uses its profile's foreign_lane.brain)")
+            elif touch_brain:
+                print(f"Set brain on {task_id}: {brain} "
+                      f"({'reclaimed; redispatches now' if redispatched else 'applies on next dispatch'})")
             continue
         if touch_model and (model or provider):
             route = f"{provider}/{model or inherited_models[task_id]}" if provider else model
@@ -4021,6 +4073,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             print(f"{task_id}: effort=profile-default applies={applies}")
         elif effort is not None:
             print(f"{task_id}: effort={effort} applies={applies}")
+        if clear_brain:
+            print(f"{task_id}: brain=profile-default applies={applies}")
+        elif touch_brain:
+            print(f"{task_id}: brain={brain} applies={applies}")
     # Selector-chosen cards that stopped matching before the writer lock were
     # NOT written; name each one so the receipt covers every selected card.
     for task_id, why in skipped.items():
