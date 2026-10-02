@@ -782,12 +782,15 @@ class CLISessionMixin:
         input buffer. Returns the number of turns undone (None when nothing changed).
         """
         from cli import logger
+        if self._session_db is None:
+            # Warm-less durable store (upstream contract): truncate the warm history by
+            # user turns — the half-turn core below needs a session row to rewind.
+            return self._undo_warm_only(n, prefill=prefill)
         if not self.session_id:
             print("(._.) No active session to undo.")
             return
         if (
             n == 1
-            and self._session_db is not None
             and self.conversation_history
             and self._undo_last_user_turn(prefill=prefill)
         ):
@@ -816,6 +819,47 @@ class CLISessionMixin:
         if prefill and isinstance(prefill_text, str):
             self._prefill_input_buffer(prefill_text)
         return half_turns
+
+    def _undo_warm_only(self, n: int, *, prefill: bool):
+        """Undo N user turns against the warm history alone (no SessionDB bound).
+
+        Upstream's ``undo_last`` shape without the durable rewind: discards everything from the
+        Nth-from-last *real* user turn onward (clamped to the oldest; compaction handoffs and
+        ephemeral scaffolding are not turns). Returns the number of user turns undone, None when
+        nothing changed.
+        """
+        if not self.conversation_history:
+            print(t("cli.session.undo_no_messages"))
+            return
+        n = max(n, 1)
+
+        from agent.context_compressor import history_before_user_originated_turn
+
+        warm_history = list(self.conversation_history)
+        user_indices = _user_turn_indices(warm_history)
+        if not user_indices:
+            print(t("cli.session.undo_no_user_message"))
+            return
+
+        turns_undone = min(n, len(user_indices))
+        cut_idx = user_indices[len(user_indices) - turns_undone]
+        removed_count = len(warm_history) - cut_idx
+        truncated, live_view = history_before_user_originated_turn(warm_history, cut_idx)
+        removed_text = self._undo_content_to_text(live_view.get("content"))
+
+        self._publish_truncated_history(truncated, invalidate_prompt=True)
+        _mm = getattr(self.agent, "_memory_manager", None)
+        if _mm is not None and self.session_id:
+            with contextlib.suppress(Exception):
+                _mm.on_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
+
+        key = "cli.session.undo_ok_one" if turns_undone == 1 else "cli.session.undo_ok_other"
+        print(t(key, count=turns_undone, messages=removed_count,
+                backup=f"{removed_text[:60]}{'...' if len(removed_text) > 60 else ''}"))
+        print(f"  {t('cli.session.undo_remaining', count=len(self.conversation_history))}")
+        if prefill and removed_text:
+            self._prefill_input_buffer(removed_text)
+        return turns_undone
 
     def _undo_last_user_turn(self, *, prefill: bool) -> bool:
         """Carrier-aware single-user-turn undo (upstream carrier-rewind contract).

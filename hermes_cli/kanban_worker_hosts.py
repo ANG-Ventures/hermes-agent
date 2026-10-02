@@ -121,7 +121,8 @@ def probe_load1(host: WorkerHost, runner: Callable = subprocess.run) -> Optional
     try:
         proc = runner(
             _ssh_argv(host, "cat /proc/loadavg"),
-            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_PROBE_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
@@ -250,7 +251,8 @@ def prepare_remote_workspace(host: WorkerHost, workspace: str,
     """Create the card's workspace at the same absolute path on the host."""
     proc = runner(
         _ssh_argv(host, f"mkdir -p -- {shlex.quote(workspace)}"),
-        capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=_PROBE_TIMEOUT_SECONDS,
         stdin=subprocess.DEVNULL,
     )
     if getattr(proc, "returncode", 1) != 0:
