@@ -348,10 +348,14 @@ def settle_unrecovered_error(
                 return _verdict("continue")
         # ``should_fallback=False`` marks a deterministic failure no other provider can fix (the
         # model's own malformed tool-call JSON, #12770; MoA preset/adapter faults, #55933): skip
-        # the cascade. An UNCLASSIFIED local ValueError/TypeError keeps its historical fallback;
-        # a recognised verdict that opts out wins even when the exception is a ValueError subclass.
-        _unclassified_local = is_local_validation_error and classified.reason == FailoverReason.unknown
-        if classified.should_fallback or _unclassified_local or shrink_spent or reasoning_spent:
+        # the cascade; a recognised verdict that opts out wins even when the exception is a
+        # ValueError subclass.
+        # fork POLICY (#195 / #605, parity 2026-10-01): a local request-build ValueError/TypeError
+        # is deterministic on every provider — the defect is the request we built — so the
+        # classifier's ``should_fallback`` is the only gate. Upstream 79007efc48 keeps a
+        # "historical fallback" for UNCLASSIFIED local errors; the fork rejected that walk
+        # (tests/run_agent/test_malformed_provider_stream_failover.py pins no fallback).
+        if classified.should_fallback or shrink_spent or reasoning_spent:
             # Announce the fallback only when a chain exists, else "trying fallback..." lies
             # before a silent abort.
             if agent._has_pending_fallback():

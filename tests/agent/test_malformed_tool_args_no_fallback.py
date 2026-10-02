@@ -78,8 +78,14 @@ def test_client_error_settlement_skips_fallback_when_classifier_says_so():
 
 def test_fallback_free_verdict_wins_over_local_valueerror_shape():
     """A recognised no-fallback verdict raised as a ValueError subclass (MoA preset missing,
-    #55933) must not sneak through the unclassified-local-error fallback allowance; a truly
-    unclassified ValueError keeps it."""
+    #55933) must not walk the chain.
+
+    fork POLICY (parity 2026-10-01): upstream 79007efc48 lets a truly UNCLASSIFIED local
+    ValueError keep a "historical fallback". The fork gates the client-error walk on the
+    classifier's ``should_fallback`` alone (#195) — a local request-build error is deterministic
+    on every provider — and pins that in
+    tests/run_agent/test_malformed_provider_stream_failover.py::test_request_serialization_valueerror_remains_nonretryable
+    (#605). Both halves here assert the fork contract."""
     from agent.errors import MoAPresetNotFoundError
 
     agent = _Agent()
@@ -89,5 +95,5 @@ def test_fallback_free_verdict_wins_over_local_valueerror_shape():
 
     agent = _Agent()
     verdict = _settle(agent, ValueError("some local bug"), "openai", None)
-    assert verdict.action == "break"
-    assert agent.activated == [True]
+    assert verdict.action == "return"
+    assert agent.activated == []
