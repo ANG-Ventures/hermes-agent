@@ -139,6 +139,11 @@ def _codex_jwt(account_id: str, sub: str = "user-1") -> str:
     return f"{_b64({'alg': 'none'})}.{_b64(claims)}.sig"
 
 
+def _rejected_refresh(*_a, **_k):
+    raise AuthError("refresh token rejected", provider="openai-codex", code="invalid_grant",
+                    relogin_required=True)
+
+
 def _seed_homes(tmp_path, monkeypatch, hermes_tokens, cli_tokens):
     hermes_home, codex_home = tmp_path / "hermes", tmp_path / "codex"
     hermes_home.mkdir()
@@ -155,14 +160,19 @@ def test_recovery_refuses_codex_cli_login_from_another_workspace(tmp_path, monke
     """#73667: a Codex Desktop/CLI login into ANOTHER ChatGPT workspace must not silently replace the
     Hermes credential it is supposed to repair — the store stays byte-identical and the log says why."""
     personal, team = _codex_jwt("acct-personal"), _codex_jwt("acct-team")
-    auth_file = _seed_homes(tmp_path, monkeypatch, {"access_token": personal},
+    tokens = {"access_token": personal, "refresh_token": "rt-personal"}
+    auth_file = _seed_homes(tmp_path, monkeypatch, tokens,
                             {"access_token": team, "refresh_token": "rt-team"})
     before = auth_file.read_bytes()
+    # Fork contract (#673): a singleton with an access_token is served by the Codex owner store
+    # before the singleton read, so the CLI recovery runs from the rejected-refresh path here.
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected_refresh)
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", _rejected_refresh)
 
     with caplog.at_level("WARNING", logger="hermes_cli.auth"), pytest.raises(AuthError) as info:
-        resolve_codex_runtime_credentials(refresh_if_expiring=False)
+        _refresh_codex_auth_tokens(dict(tokens), 5.0)
 
-    assert info.value.code == "codex_auth_missing_refresh_token"
+    assert info.value.code == "invalid_grant" and info.value.relogin_required
     assert auth_file.read_bytes() == before
     assert "different ChatGPT workspace" in caplog.text and team not in caplog.text
 
@@ -171,9 +181,12 @@ def test_recovery_does_not_overwrite_concurrent_reauth(tmp_path, monkeypatch):
     """#73667 (review): an explicit re-auth landing between the failed read and the recovery save must
     win — the save is a compare-and-swap on the observed access_token, not a blind overwrite."""
     personal, reauthed = _codex_jwt("acct-personal"), _codex_jwt("acct-personal", sub="user-1-fresh")
-    auth_file = _seed_homes(tmp_path, monkeypatch, {"access_token": personal},
+    tokens = {"access_token": personal, "refresh_token": "rt-stale"}
+    auth_file = _seed_homes(tmp_path, monkeypatch, tokens,
                             {"access_token": _codex_jwt("acct-personal"), "refresh_token": "rt-cli"})
     real_import = auth_codex._import_codex_cli_tokens
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected_refresh)
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", _rejected_refresh)
 
     def _import_racing_with_reauth():
         auth_codex._save_codex_tokens({"access_token": reauthed, "refresh_token": "rt-reauthed"})
@@ -183,7 +196,7 @@ def test_recovery_does_not_overwrite_concurrent_reauth(tmp_path, monkeypatch):
     monkeypatch.setattr(auth_codex, "_import_codex_cli_tokens", _import_racing_with_reauth)
 
     with pytest.raises(AuthError):
-        resolve_codex_runtime_credentials(refresh_if_expiring=False)
+        _refresh_codex_auth_tokens(dict(tokens), 5.0)
 
     tokens = json.loads(auth_file.read_text())["providers"]["openai-codex"]["tokens"]
     assert tokens == {"access_token": reauthed, "refresh_token": "rt-reauthed"}
