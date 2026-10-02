@@ -1553,7 +1553,12 @@ class SessionDB(
         # Publish the profile-level state first: readiness, /api/status and the session list
         # endpoints read it, and every other handle in this process refuses writes on it.
         mark_storage_corrupt(self.db_path, exc)
-        self._disable_close_time_checkpoint()
+        # Under the lock: every path here is lock-free (the _execute_write except arm,
+        # _raise_if_db_corrupt), and setconfig on the shared writer connection while
+        # another thread is mid-statement is the cross-thread race this handle's
+        # thread-safety audit exists for (tests/state/test_writer_conn_thread_safety.py).
+        with self._lock:
+            self._disable_close_time_checkpoint()
         logger.error(
             "state.db %s reported structural corruption outside the FTS "
             "indexes (%s); quarantining this handle: no further writes, no "
