@@ -325,6 +325,9 @@ def test_gateway_runner_liveness_guards_start_and_stop():
         # a starved gateway silently falls back to the exit-75 wedge path.
         starvation_load_factor=2.0,
         starvation_max_hold_s=900.0,
+        # The watchdog os._exits with no drain: in-flight turns are recorded
+        # first (r31 G).
+        pre_exit=runner._record_abandoned_turns_before_watchdog_exit,
     )
     assert runner._loop_floor_timer_handle is floor_timer
     assert runner._loop_liveness_watchdog is watchdog
@@ -425,3 +428,57 @@ def test_loop_scheduling_witness_is_served_by_the_loop_itself():
     assert "await asyncio.start_unix_server(" in body, (
         "the loop-scheduling witness socket is not armed by the loop task"
     )
+
+
+def test_loop_liveness_watchdog_runs_pre_exit_before_hard_exit():
+    """r31 G: the watchdog os._exit'd with an Apollo turn in flight and left its
+    turn_api_calls with no turns row. pre_exit (the gateway records abandoned
+    turns there) must run before the exit, and a wedged hook is bounded."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    order = []
+    done = threading.Event()
+
+    def _exit(code):
+        order.append(("exit", code))
+        done.set()
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical"),
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=_exit),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1,
+            pre_exit=lambda: order.append("pre_exit"),
+        )
+        assert done.wait(timeout=5.0)
+        handle.stop()
+        handle.join(timeout=2.0)
+    assert order[:2] == ["pre_exit", ("exit", 75)]
+
+
+def test_loop_liveness_watchdog_bounds_a_wedged_pre_exit():
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    release = threading.Event()
+    done = threading.Event()
+    codes = []
+
+    def _exit(code):
+        codes.append(code)
+        done.set()
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical"),
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=_exit),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1,
+            pre_exit=lambda: release.wait(10), pre_exit_timeout=0.2,
+        )
+        assert done.wait(timeout=5.0)
+        handle.stop()
+        handle.join(timeout=2.0)
+    release.set()
+    assert codes and codes[0] == 75
+

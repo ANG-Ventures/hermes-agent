@@ -14146,14 +14146,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # plugin can never eat the systemd stop window.
     _FINALIZE_TIMEOUT_S = 10.0
 
-    async def _emit_abandoned_turn_session_ends(
-        self, active_agents: Dict[str, Any]
-    ) -> None:
+    def _abandonable_agents(self, active_agents: Optional[Dict[str, Any]] = None) -> List[Any]:
+        """Every agent whose turn may still be in flight (the helper downstream
+        de-duplicates). Sync and lock-free so the loop-liveness watchdog can
+        call it from its own thread while the event loop is wedged."""
         # Drain-start snapshot PLUS whatever is running now: a pending
         # sentinel promoted to a real agent during the drain is only in the
-        # live map. The helper de-duplicates.
+        # live map.
         agents = [
-            a for a in active_agents.values() if a is not _AGENT_PENDING_SENTINEL
+            a for a in (active_agents or {}).values() if a is not _AGENT_PENDING_SENTINEL
         ]
         try:
             agents.extend(self._snapshot_running_agents().values())
@@ -14169,10 +14170,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         # Background review forks run on a daemon thread AFTER their parent's
         # turn finalized, so an idle parent is in none of the maps above.
+        # Fence first: a fork still being built must not start a provider call
+        # after this snapshot (Prism #1631 P1 fada22402223).
         try:
-            from agent.background_review import live_background_review_agents
+            from agent.background_review import fence_background_reviews_and_snapshot
 
-            agents.extend(live_background_review_agents())
+            agents.extend(fence_background_reviews_and_snapshot())
         except Exception:
             pass
         try:
@@ -14186,6 +14189,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         except Exception:
             pass
+        return agents
+
+    def _record_abandoned_turns_before_watchdog_exit(self) -> None:
+        """Loop-liveness watchdog pre-exit: the watchdog ``os._exit``s, so no
+        drain runs and every in-flight turn would keep its ``turn_api_calls``
+        with no ``turns`` row (Apollo 2026-10-01 23:38:35, turn ...:b8249399;
+        r31 G). Record them as abandoned first. Runs on the watchdog thread."""
+        from agent.turn_finalizer import emit_abandoned_session_ends
+
+        agents = self._abandonable_agents()
+        if agents:
+            emit_abandoned_session_ends(agents, "loop_liveness_watchdog")
+
+    async def _emit_abandoned_turn_session_ends(
+        self, active_agents: Dict[str, Any]
+    ) -> None:
+        agents = self._abandonable_agents(active_agents)
         if not agents:
             return
         reason = (
@@ -18149,6 +18169,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     max_strikes=int(strikes),
                     starvation_load_factor=float(starvation_factor),
                     starvation_max_hold_s=float(starvation_max_hold),
+                    pre_exit=self._record_abandoned_turns_before_watchdog_exit,
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)

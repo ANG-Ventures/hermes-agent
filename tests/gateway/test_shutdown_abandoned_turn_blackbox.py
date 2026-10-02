@@ -411,3 +411,27 @@ def test_late_call_after_the_real_row_does_not_resurrect_the_provisional_one(led
     _in_flight_call(tid, http_status=200, seq=1)
 
     assert _row(ledger, tid, "interrupted, final_text") == (0, "done")
+
+
+def test_loop_liveness_watchdog_exit_records_in_flight_turns(ledger, monkeypatch):
+    """r31 G: Apollo 2026-10-01 23:38:35 -- the loop-liveness watchdog
+    os._exit'd mid-turn (no drain), leaving ...:b8249399 with calls and no
+    turns row. The watchdog pre-exit hook records it without the event loop."""
+    tid = "20260927_135034_52aefa:1ad2ec88-e1ec-4391-affd-e0198584cd45:b8249399"
+    _in_flight_call(tid, http_status=200)
+    runner = _runner(monkeypatch)
+    live = _agent(tid)
+    runner._snapshot_running_agents = lambda: {"k": live}
+    assert _orphan_ids(ledger) == [tid], "precondition"
+
+    from agent import background_review as br
+
+    monkeypatch.setattr(br, "_review_exit_fence", threading.Event())
+    monkeypatch.setattr(br, "_live_review_agents", {})
+    runner._record_abandoned_turns_before_watchdog_exit()
+
+    assert _orphan_ids(ledger) == []
+    assert _row(ledger, tid, "interrupted")[0] == 1
+    assert HOOKS == ["on_turn_abandoned"]
+    # Prism #1631 P1: the watchdog snapshot fences review startup too.
+    assert br.background_reviews_fenced()

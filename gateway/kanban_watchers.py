@@ -917,6 +917,11 @@ class _GuardStuckNotifier:
         for board, item in cards:
             key = self._key(board, item)
             last = self._last_sent(key, item)
+            # An active_pr episode (card + PR) pages ONCE: the hold is correct and
+            # the verb does not change, so a 6h reminder restates the same page
+            # (Ace r31 G: house-voice t_82169667 paged 19:02, 02:39, 08:40).
+            if last is not None and "|active_pr|pr=" in key:
+                continue
             if last is not None and now - last < self._remind:
                 continue
             if time.monotonic() >= deadline:
@@ -1123,7 +1128,7 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     message = (
         f"🛑 **Kanban dispatcher** · {detail}\n"
         f"Board: `{board}` · Card: `{item['task_id']}`\n"
-        "-# Pages once per stuck episode (active_pr: per card + PR); reminder every 6h while it stays stuck."
+        "-# Pages once per stuck episode (active_pr: once per card + PR; other holds remind every 6h)."
     )
     try:
         proc = subprocess.run(
