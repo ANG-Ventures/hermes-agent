@@ -3988,21 +3988,55 @@ def _dispatch_once_locked(
     # full budget. "Spawnable" mirrors the review loop's own gate
     # (assigned + real profile) so a review column full of human-pulled
     # control-plane lanes doesn't permanently tax ready throughput.
-    def _any_spawnable_review() -> bool:
+    # Per-profile concurrency cap (#21582): when set, track how many
+    # workers each assignee already has in flight, and refuse to spawn
+    # when this would push that assignee past the cap. Prevents
+    # fan-out workloads from melting a single profile's local model /
+    # API quota / browser pool while leaving other profiles idle.
+    # Tasks blocked this way go to skipped_per_profile_capped (not
+    # skipped_unassigned — the operator-actionable signal is different:
+    # "this profile is busy, try again later" not "this needs routing").
+    # ``max_in_progress_per_profile`` is an int (one cap for all) or a mapping
+    # ``{default: N, <profile>: M}`` (see resolve_per_profile_cap). ``_per_profile_cap``
+    # stays as the "is any cap configured" sentinel; the per-assignee value is
+    # looked up through ``_cap_for``.
+    _per_profile_spec = max_in_progress_per_profile if (
+        isinstance(max_in_progress_per_profile, Mapping)
+        or (isinstance(max_in_progress_per_profile, int) and max_in_progress_per_profile > 0)
+    ) else None
+    _per_profile_cap = _per_profile_spec
+
+    def _cap_for(assignee: Optional[str]) -> Optional[int]:
+        return _kb.resolve_per_profile_cap(_per_profile_spec, assignee)
+
+    _per_profile_running: dict[str, int] = {}
+    if _per_profile_cap is not None:
+        for prow in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ):
+            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Resolved BEFORE the review reservation so the reservation can see which
+    # review rows the lane loop would refuse this tick (respawn guard,
+    # per-profile cap): such a row cannot use the reserved slot and must not
+    # starve the ready lane (``_any_spawnable_review``).
+    def _any_spawnable_review_this_tick() -> bool:
         if not review_rows:
             return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
+        if _per_profile_cap is None:
+            return _any_spawnable_review(conn, review_rows)
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            _any_spawnable_review(
+                conn, [row],
+                per_profile_cap=_cap_for(row["assignee"]),
+                per_profile_running=_per_profile_running,
+            )
+            for row in review_rows
         )
 
     ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review_this_tick():
         ready_budget = max(spawn_budget - 1, 0)
     # Lazily populated only when a ready card reaches the point where it would
     # actually spawn. A queue containing only unassigned, capped, guarded, or
@@ -4366,44 +4400,18 @@ def _dispatch_once_locked(
             )
         return True
 
-    # Per-profile concurrency cap (#21582): when set, track how many
-    # workers each assignee already has in flight, and refuse to spawn
-    # when this would push that assignee past the cap. Prevents
-    # fan-out workloads from melting a single profile's local model /
-    # API quota / browser pool while leaving other profiles idle.
-    # Tasks blocked this way go to skipped_per_profile_capped (not
-    # skipped_unassigned — the operator-actionable signal is different:
-    # "this profile is busy, try again later" not "this needs routing").
-    # ``max_in_progress_per_profile`` is an int (one cap for all) or a mapping
-    # ``{default: N, <profile>: M}`` (see resolve_per_profile_cap). ``_per_profile_cap``
-    # stays as the "is any cap configured" sentinel; the per-assignee value is
-    # looked up through ``_cap_for``.
-    _per_profile_spec = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, Mapping)
-        or (isinstance(max_in_progress_per_profile, int) and max_in_progress_per_profile > 0)
-    ) else None
-    _per_profile_cap = _per_profile_spec
-
-    def _cap_for(assignee: Optional[str]) -> Optional[int]:
-        return _kb.resolve_per_profile_cap(_per_profile_spec, assignee)
-
-    _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
+        # Same predicate as the spawn gate: ``kanban.dispatch_profiles``
+        # gated (#110995), so a default this home may not claim is never
+        # written onto an unassigned shared-board card.
         try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            _pe = _profile_exists_fn()
+            _default_assignee_resolved = _pe is None or bool(_pe(_default_assignee))
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the

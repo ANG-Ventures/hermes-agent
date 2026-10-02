@@ -125,17 +125,23 @@ def test_dependency_without_open_blocking_parent_stays_blocked(
 ) -> None:
     """An external wait must not re-spawn on every dispatcher tick."""
     with kb.connect_closing() as conn:
-        child = _running_task(conn, title="waiting on external PR")
+        # Build the edge BEFORE the child runs: a running child cannot be gated retroactively
+        # (link_tasks rejects it without the owning run id, upstream b95513df7c4).
+        parent = None
         if parent_state != "absent":
             parent = _running_task(conn, title="parent")
-            kb.link_tasks(
-                conn, parent_id=parent, child_id=child,
-                kind="derived-from" if parent_state == "derived-from" else "blocks",
-            )
             if parent_state != "derived-from":
                 assert kb.complete_task(conn, parent, result="done")
                 if parent_state == "archived":
                     assert kb.archive_task(conn, parent)
+        child_id = kb.create_task(conn, title="waiting on external PR", assignee="worker")
+        if parent is not None:
+            kb.link_tasks(
+                conn, parent_id=parent, child_id=child_id,
+                kind="derived-from" if parent_state == "derived-from" else "blocks",
+            )
+        _make_running_again(conn, child_id)
+        child = child_id
         before = [e.kind for e in kb.list_events(conn, child)]
         for _ in range(10):
             kb.block_task(conn, child, reason="PR not merged", kind="dependency")
@@ -144,7 +150,9 @@ def test_dependency_without_open_blocking_parent_stays_blocked(
             assert kb.claim_task(conn, child, claimer="worker") is None
         task = kb.get_task(conn, child)
         assert task.status == "blocked"
-        assert task.block_kind == "dependency"
+        # A dependency block with no open blocking parent is re-kinded to the sticky needs_input
+        # (upstream 42a778ab4bc; same verdict as test_dependency_block_with_terminal_parents_parks_then_escalates).
+        assert task.block_kind == "needs_input"
         assert task.block_recurrences == 1
         after = [e.kind for e in kb.list_events(conn, child)]
         assert after.count("promoted") == before.count("promoted")

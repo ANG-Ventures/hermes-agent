@@ -2675,7 +2675,8 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn
 
     def _judge(**kwargs):
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
-        affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
+        scope_id = task_id or getattr(task, "id", None)
+        affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{scope_id}")
         try:
             out = goals.judge_goal(**kwargs)
         finally:

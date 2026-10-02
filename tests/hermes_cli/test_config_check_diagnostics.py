@@ -27,8 +27,10 @@ def test_config_check_and_migrate_agree_on_stale_platform_toolsets(tmp_path, mon
     monkeypatch.setattr(plugins_mod, "get_portable_mcp_server_names_nowait", set)
     stale = _write_home(
         tmp_path / "stale",
+        # ``messaging`` (upstream's stale example) is a real fork toolset (send_message); use a
+        # name no side defines for the stale-builtin case.
         "platform_toolsets:\n"
-        "  cli: [hermes-cli, messaging, linear, ghost]\n"
+        "  cli: [hermes-cli, vanished, linear, ghost]\n"
         "  teams: [hermes-teams]\n"
         "mcp_servers:\n"
         "  linear:\n"
@@ -41,9 +43,9 @@ def test_config_check_and_migrate_agree_on_stale_platform_toolsets(tmp_path, mon
     # A malformed mcp_servers section must not crash the check.
     clean = _write_home(tmp_path / "clean", "platform_toolsets:\n  cli: [hermes-cli]\nmcp_servers: [a]\n")
 
-    for home, expected in ((stale, {"messaging", "ghost"}), (clean, set()), (stale, {"messaging", "ghost"})):
+    for home, expected in ((stale, {"vanished", "ghost"}), (clean, set()), (stale, {"vanished", "ghost"})):
         output = _check(home, monkeypatch, capsys)
-        for name in ("messaging", "ghost", "linear", "hermes-teams"):
+        for name in ("vanished", "ghost", "linear", "hermes-teams"):
             assert (f"unknown toolset '{name}'" in output) is (name in expected), (home.name, name)
 
         results = {"warnings": []}

@@ -166,7 +166,10 @@ def test_kanban_edit_updates_documented_task_fields(kanban_home):
         task = kb.get_task(conn, task_id)
         events = kb.list_events(conn, task_id)
     assert (task.title, task.body, task.priority) == ("new title", "new body", 70)
-    assert any(event.kind == "reprioritized" for event in events)
+    # The fork routes `edit --priority` through set_task_priority, which records
+    # the richer `priority_set` {old, new, actor} event (test_kanban_priority_verb
+    # pins it); upstream's bare `reprioritized` kind is not emitted on that path.
+    assert any(event.kind == "priority_set" for event in events)
 
 
 def test_worker_link_preserves_foreign_child_rules(kanban_home, monkeypatch):

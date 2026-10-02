@@ -157,21 +157,30 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 
 
 def test_created_with_initial_status_blocked_is_not_promoted_by_recompute_ready(kanban_home: Path) -> None:
-    """Verify a task created with initial_status='blocked' remains blocked when parents complete."""
+    """A PARENTLESS creation hold (initial_status='blocked') is the human-ops gate and stays blocked
+    across ticks. Fork #803: a creation hold backed by a real ``blocks`` edge auto-releases once every
+    such parent is terminal (it was gated on the parent, not on a human), so upstream's
+    stays-blocked-when-parents-complete expectation is the parentless case here."""
     with kbc.connect() as conn:
+        held_id = kb.create_task(conn, title="human-gated task", initial_status="blocked")
+        assert kb.get_task(conn, held_id).status == "blocked"
+
         parent_id = kb.create_task(conn, title="parent task")
         child_id = kb.create_task(
             conn, title="gated child task", parents=[parent_id], initial_status="blocked"
         )
         assert kb.get_task(conn, child_id).status == "blocked"
+        assert kb.recompute_ready(conn) == 0  # parent still open: both stay put
 
         # Complete parent task
         kb.claim_task(conn, parent_id)
         kb.complete_task(conn, parent_id, result="done")
         assert kb.get_task(conn, parent_id).status == "done"
 
-        # recompute_ready must NOT promote the blocked child task
-        promoted = kb.recompute_ready(conn)
-        assert promoted == 0
-        assert kb.get_task(conn, child_id).status == "blocked"
+        # The dependency-backed hold releases (complete_task's own recompute); the parentless hold
+        # never does, on this or any later tick.
+        assert kb.get_task(conn, child_id).status == "ready"
+        assert kb.get_task(conn, held_id).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held_id).status == "blocked"
 

@@ -445,7 +445,7 @@ class CLIAgentSetupMixin:
 
                     _rate_limited = is_rate_limited_auth_error(primary_exc)
                     record_worker_route_pin_refused(
-                        provider=self.requested_provider, model=self.model,
+                        provider=getattr(self, "requested_provider", None), model=getattr(self, "model", None),
                         reason=str(primary_exc), rate_limited=_rate_limited,
                         to_provider=_fb_provider, to_model=_fb_model,
                     )
@@ -471,11 +471,16 @@ class CLIAgentSetupMixin:
                 render_notification(
                     lambda: _cprint(t("cli.startup.switching_to_fallback", reason=_why, provider=_fb_provider, model=_fb_model)),
                     platform="cli")
-                record_worker_route_substitution(
-                    stage="auth", from_provider=self.requested_provider,
-                    from_model=self.model, to_provider=_fb_provider,
-                    to_model=_fb_model, reason=str(primary_exc),
-                )
+                # Fork telemetry (kanban route ledger): never let it veto a resolved fallback —
+                # upstream's tests build the mixin bare, with no requested_provider/model set.
+                try:
+                    record_worker_route_substitution(
+                        stage="auth", from_provider=getattr(self, "requested_provider", None),
+                        from_model=getattr(self, "model", None), to_provider=_fb_provider,
+                        to_model=_fb_model, reason=str(primary_exc),
+                    )
+                except Exception:
+                    logger.debug("worker route substitution record failed", exc_info=True)
                 self.requested_provider = _fb_provider
                 self.model = _fb_model
                 # reasoning_config follows the swap in _ensure_runtime_credentials (the only caller).

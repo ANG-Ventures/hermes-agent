@@ -449,12 +449,11 @@ def _codex_principal_identity(access_token: Any) -> Optional[Tuple[str, str]]:
     own subjects and quotas.
     """
     claims = _decode_jwt_claims(access_token)
-    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
-    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
+    account_id = auth_mod.get_codex_account_id(access_token)  # the one account-claim parser
     subject = claims.get("sub") if isinstance(claims, dict) else None
-    if not (isinstance(account_id, str) and account_id.strip() and isinstance(subject, str) and subject.strip()):
+    if not (account_id and isinstance(subject, str) and subject.strip()):
         return None
-    return account_id.strip(), subject.strip()
+    return account_id, subject.strip()
 
 
 def _codex_entry_tracks_singleton(entry: PooledCredential, singleton_tokens: Dict[str, Any]) -> bool:

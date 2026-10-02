@@ -306,7 +306,10 @@ class TestRotationNeverRewritesTheConversationModel:
         from agent.client_lifecycle import ClientLifecycleMixin
         agent = self._agent(model=anon_auth.GUEST_MODEL); agent.base_url = WELCOME
         ok = ClientLifecycleMixin._swap_credential(agent, SimpleNamespace(id="p2", runtime_api_key="key", runtime_base_url="https://inference-api.nousresearch.com/v1"))
-        assert ok is True and agent.model == anon_auth.GUEST_MODEL
+        # Fork contract: a successful swap returns the tri-state SwapOutcome.SWAPPED (truthy), not
+        # upstream's bare True; a refused route still returns False (asserted above).
+        from run_agent import SwapOutcome
+        assert ok is SwapOutcome.SWAPPED and agent.model == anon_auth.GUEST_MODEL
 
 
 class TestBootstrapIsTheOneCreator:

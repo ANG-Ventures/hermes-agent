@@ -168,11 +168,19 @@ def test_worker_sigterm_path_leaves_a_signal_receipt_before_exiting():
     """Source contract on cli.py's kanban SIGTERM branch: the receipt and the
     last-words line are written BEFORE os._exit — os._exit skips atexit, so
     anything after it (or only in atexit) never happens."""
-    src = (Path(__file__).resolve().parents[2] / "cli.py").read_text(encoding="utf-8")
+    # Upstream extracted the single-query signal handler from cli.py into
+    # hermes_cli/cli_single_query.py; the kanban branch now exits through the
+    # _kill_foreground_and_exit helper (SIGKILL the worker's process group, then
+    # os._exit(0)) instead of a bare os._exit(0) call.
+    src = (
+        Path(__file__).resolve().parents[2] / "hermes_cli" / "cli_single_query.py"
+    ).read_text(encoding="utf-8")
+    helper_start = src.index("def _kill_foreground_and_exit(")
+    assert "os._exit(0)" in src[helper_start:src.index("def _signal_handler_q(")]
     start = src.index("def _signal_handler_q(")
     end = src.index("raise KeyboardInterrupt()", start)
     handler = src[start:end]
     receipt_at = handler.index('write_exit_status(128 + int(signum), exit_class="signaled")')
     words_at = handler.index("[kanban-worker] pid")
-    exit_at = handler.rindex("os._exit(0)")
+    exit_at = handler.rindex("_kill_foreground_and_exit()")
     assert receipt_at < exit_at and words_at < exit_at

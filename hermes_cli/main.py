@@ -211,8 +211,10 @@ def _set_process_title() -> None:
     """
     # A dispatcher worker keeps its task id in the title: setproctitle
     # replaces argv, so task-scoped liveness guards would otherwise go blind.
+    # Format mirrors ``kanban_db.KANBAN_WORKER_PROCTITLE`` (not imported:
+    # startup hot path); the dispatcher exports ``HERMES_KANBAN_TASK``.
     title = "hermes"
-    kanban_task = (os.environ.get("HERMES_KANBAN_TASK_ID") or "").strip()
+    kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if kanban_task:
         title = f"hermes kanban-worker {kanban_task}"
     try:

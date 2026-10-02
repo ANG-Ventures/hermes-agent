@@ -984,7 +984,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
             terminations.extend(result["terminations"])
     for entry in terminations:
-        pid, claim_lock = entry
+        pid, claim_lock = entry[0], entry[1]
         kanban_db._terminate_reclaimed_worker(
             pid, claim_lock, owner_window=kanban_db._termination_window(entry),
             started_at=getattr(entry, "started_at", None))

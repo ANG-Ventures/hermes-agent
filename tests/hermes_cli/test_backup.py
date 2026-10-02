@@ -276,12 +276,14 @@ class TestShouldExclude:
         # A nested "cache" dir that is not the root cache/ is untouched.
         assert not _should_exclude(Path("skills/x/cache/forensic-thing/state.db"))
         assert not _should_exclude(Path("workspace/cache/notes.db"))
-        # Docs ABOUT the lane, and the breadcrumb left when an artifact is
-        # relocated, are ordinary FILES — the prefix matches ancestors only.
-        assert not _should_exclude(
+        # The breadcrumb left when an artifact is relocated is an ordinary FILE: the forensic
+        # prefix matches ancestors only. It still lives at the cache root, which upstream's
+        # regenerable-cache rule (see test_excludes_regenerable_cache_but_keeps_durable_artifacts)
+        # excludes along with catalogs/stamps — same verdict as ``cache/model_catalog.json``.
+        assert _should_exclude(
             Path("cache/forensic-native-snapshot-control-20260913.MOVED.txt")
         )
-        # Non-db content under the cache root is still archived.
+        # Durable content under the cache root is still archived (claude-usage = usage.ace ledger).
         assert not _should_exclude(Path("cache/claude-usage/summary.json"))
         # A top-level forensics tree outside cache/ is NOT in scope of this rule.
         assert not _should_exclude(Path("forensics-archive/box-1/report.md"))

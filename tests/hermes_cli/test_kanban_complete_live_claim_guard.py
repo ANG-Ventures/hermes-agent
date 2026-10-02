@@ -29,6 +29,10 @@ def conn(tmp_path, monkeypatch):
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     kb.init_db()
+    # The fork's receipt gate (t_e21aa11c) refuses a prose-only worker handoff
+    # (``expected_run_id`` set, no PR / survivor / metadata); it is not the
+    # subject here, so disarm it the way test_kanban_receipt_gate does.
+    monkeypatch.setattr(kb, "configured_receipt_gate", lambda: False)
     with kbc.connect() as c:
         yield c
 

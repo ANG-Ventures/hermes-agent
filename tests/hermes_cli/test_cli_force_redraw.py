@@ -51,6 +51,10 @@ def _patch_cli_terminal_size(monkeypatch, stub):
     swap the *name binding* inside the module under test instead, which is
     the only binding ``_install_resize_recovery`` resolves.
     """
+    # ``_install_resize_recovery`` lives in hermes_cli.cli_terminal_mixin (upstream's CLI
+    # decomposition) and resolves ITS module's ``shutil`` binding; ``cli`` keeps a facade import.
+    import hermes_cli.cli_terminal_mixin as terminal_mixin
+    monkeypatch.setattr(terminal_mixin, "shutil", _ShutilProxy(stub))
     monkeypatch.setattr(cli_mod, "shutil", _ShutilProxy(stub))
 
 

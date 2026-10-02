@@ -178,6 +178,13 @@ def _ranked_slugs(entries: object) -> List[str]:
     return _dedupe(slug for _, slug in sortable)
 
 
+def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
+    """Account header value for the per-account Codex model catalog (single parser in hermes_cli.auth)."""
+    from hermes_cli.auth import get_codex_account_id
+
+    return get_codex_account_id(access_token)
+
+
 def _fetch_models_from_api(access_token: str, base_url: Optional[str] = None) -> List[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority.
 

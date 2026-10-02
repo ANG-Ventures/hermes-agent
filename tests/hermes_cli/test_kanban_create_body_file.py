@@ -49,13 +49,26 @@ def _latest_body():
     return tasks[-1]
 
 
+def _body_after_origin(body: str) -> str:
+    """The fork prepends an ``origin:`` birth line + blank line to every created
+    body (kanban_db.stamp_origin_body; test_kanban_home_session pins it) and
+    strips the body's outer newlines in doing so. The --body-file contract under
+    test is that the bytes *after* that stamp are the file's, flags and all."""
+    assert kb.body_has_origin(body), body
+    head, _, rest = body.partition("\n\n")
+    assert head.startswith("origin:"), body
+    return rest
+
+
 def test_body_file_stores_body_verbatim_with_trailing_flags_intact(kanban_home, tmp_path, capsys):
     f = tmp_path / "body.md"
     f.write_text(BODY, encoding="utf-8")
     assert _create(["PROBE", "--body-file", str(f), "--assignee", "baxter", "--priority", "7"]) == 0
     capsys.readouterr()
     task = _latest_body()
-    assert (task.body, task.assignee, task.priority) == (BODY, "baxter", 7)
+    assert (_body_after_origin(task.body), task.assignee, task.priority) == (
+        BODY.strip("\n"), "baxter", 7,
+    )
     # --body and --body-file cannot both win; refuse instead of picking one.
     assert _create(["PROBE", "--body", "inline", "--body-file", str(f)]) == 2
 
@@ -63,4 +76,4 @@ def test_body_file_stores_body_verbatim_with_trailing_flags_intact(kanban_home, 
 def test_body_file_dash_reads_stdin(kanban_home, monkeypatch, capsys):
     assert _create(["PROBE", "--body-file", "-"], monkeypatch, stdin=BODY) == 0
     capsys.readouterr()
-    assert _latest_body().body == BODY
+    assert _body_after_origin(_latest_body().body) == BODY.strip("\n")

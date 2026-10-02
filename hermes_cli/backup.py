@@ -241,7 +241,8 @@ _EXCLUDED_BACKUP_ROOT_DIRS = frozenset({"browser_profiles"})
 # profiles with locked SQLite, tool-output spill) with durable artifacts nothing can rebuild: media
 # the gateway delivered to or received from the user (``gateway.platforms.base``'s media-delivery
 # subdirs) and the grounded-citations evidence ledger. Only these subdirs are archived.
-_KEPT_CACHE_SUBDIRS = {"images", "audio", "videos", "documents", "screenshots", "citations"}
+# ``claude-usage`` is the fleet's subscription-usage ledger (usage.ace), not a rebuildable cache.
+_KEPT_CACHE_SUBDIRS = {"images", "audio", "videos", "documents", "screenshots", "citations", "claude-usage"}
 
 
 def _in_excluded_root_dir(rel_path: Path) -> bool:
@@ -259,7 +260,13 @@ def _in_excluded_root_dir(rel_path: Path) -> bool:
 # shipping the live WAL/SHM/journal alongside would pair a fresh snapshot with stale sidecar
 # state and produce a torn restore on next open. They are regenerated on first connection.
 _SQLITE_SIDECAR_SUFFIXES = (".db-wal", ".db-shm", ".db-journal")
-_EXCLUDED_SUFFIXES = (".pyc", ".pyo", *_SQLITE_SIDECAR_SUFFIXES)
+# Disk images used as STAGING scratch by backup/sync lanes are containers for data whose real home
+# is elsewhere: archiving one duplicates that data and dwarfs the agent state the backup protects.
+# Live case (2026-08-09): ``var/subvps-staging.sparseimage``, a 42 GB case-sensitive APFS image
+# ``sub-vps-backup-pull.py`` attaches to stage rsync from the sub-VPS boxes (backed up by restic),
+# drove the Sunday full-tier bundle from ~15.8 GB to ~30 GB per agent and wedged the offsite lane.
+_DISK_IMAGE_SUFFIXES = (".sparseimage", ".sparsebundle", ".dmg")
+_EXCLUDED_SUFFIXES = (".pyc", ".pyo", *_SQLITE_SIDECAR_SUFFIXES, *_DISK_IMAGE_SUFFIXES)
 
 # File names to skip (runtime state that's meaningless on another machine)
 _EXCLUDED_NAMES = {".backup.lock", "gateway.pid", "cron.pid"}

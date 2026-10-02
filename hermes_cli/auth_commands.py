@@ -667,11 +667,18 @@ def auth_refresh_command(args) -> None:
             f"nous credential #{index} ({matched.label}) is not a refreshable OAuth "
             "credential: only the device_code singleton supports refresh. "
             "Reauthenticate with `hermes auth add nous --type oauth`.")
-    refreshed = pool.try_refresh_matching(credential_id=matched.id)
+    try:
+        refreshed = pool.try_refresh_matching(credential_id=matched.id)
+        failure = None
+    except auth_mod.AuthError as exc:
+        # The Codex owner store (agent/codex_owner) raises on a failed or uncertain refresh instead
+        # of returning None; surface it as the same user-facing outcome, not a traceback.
+        refreshed, failure = None, exc
     if refreshed is None:
         after = next((e for e in pool.entries() if e.id == matched.id), None)
         label = PROVIDER_REGISTRY[provider].name if provider in PROVIDER_REGISTRY else provider
         state = ("it was removed from the pool" if after is None
+                 else auth_mod.format_auth_error(failure) if failure is not None
                  else "the saved session is no longer valid")
         raise SystemExit(
             f"Could not renew the {label} sign-in for credential #{index} ({matched.label}); {state}. "
