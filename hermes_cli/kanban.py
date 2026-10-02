@@ -7084,25 +7084,40 @@ def _cmd_notify_repair_dedupe(args: argparse.Namespace) -> int:
     else:
         slugs = [None]
     rows: list[dict] = []
+    # A board that could not be scanned is a FAILURE, not an all-clear: never
+    # print "every card has one subscriber" or exit 0 over it (Prism P1
+    # cf49dc4f0623, t_030662ba). The remaining boards are still scanned.
+    failed: list[dict] = []
     for slug in slugs:
         try:
             ctx = (kb.connect_closing(board=slug) if slug is not None
                    else kb.connect_closing())
             with ctx as conn:
-                for r in kb.dedupe_notify_subs(conn, apply=apply):
-                    if slug is not None:
-                        r["board"] = slug
-                    rows.append(r)
+                board_rows = kb.dedupe_notify_subs(conn, apply=apply)
         except Exception as exc:
-            print(f"  (board {slug!r}: skipped — {exc})", file=sys.stderr)
+            failed.append({"board": slug or "default",
+                           "error": f"{type(exc).__name__}: {exc}"})
+            print(f"notify-repair --dedupe: board {slug or 'default'!r} FAILED — "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
+        for r in board_rows:
+            if slug is not None:
+                r["board"] = slug
+            rows.append(r)
+    rc = 1 if failed else 0
     dropped = sum(len(r["dropped"]) for r in rows)
     if getattr(args, "json", False):
         print(json.dumps({"apply": apply, "cards": len(rows), "dropped": dropped,
-                          "rows": rows}, indent=2, ensure_ascii=False))
-        return 0
+                          "failed": failed, "rows": rows},
+                         indent=2, ensure_ascii=False))
+        return rc
+    if failed:
+        print(f"notify-repair --dedupe: {len(failed)} board(s) FAILED to scan: "
+              + ", ".join(f["board"] for f in failed))
     if not rows:
-        print("notify-repair --dedupe: every card has one subscriber chat per platform.")
-        return 0
+        if not failed:
+            print("notify-repair --dedupe: every card has one subscriber chat per platform.")
+        return rc
     verb = "dropped" if apply else "would drop"
     print(f"notify-repair --dedupe: {len(rows)} card(s) with >1 subscriber chat; "
           f"{verb} {dropped} subscription(s)" + ("" if apply else " (dry run; --apply to write)"))
@@ -7111,7 +7126,7 @@ def _cmd_notify_repair_dedupe(args: argparse.Namespace) -> int:
         gone = ", ".join(f"{d['platform']}:{d['chat_id']}" for d in r["dropped"])
         print(f"  {board}{r['task_id']}  keep {r['kept']['platform']}:{r['kept']['chat_id']}"
               f" ({r['reason']})  {verb} {gone}")
-    return 0
+        return rc
 
 
 def _cmd_log(args: argparse.Namespace) -> int:
