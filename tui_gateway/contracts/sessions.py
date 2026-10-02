@@ -272,6 +272,7 @@ class SessionActiveItem(Result):
     started_at: float
     status: LiveSessionStatus
     title: str
+    pinned: bool = False  # fork (#186, server-side pinned sessions)
 
 
 class SessionActiveListResult(Result):
@@ -437,6 +438,10 @@ class SessionUndoParams(SessionParams):
 
 class SessionUndoResult(Result):
     removed: int
+    # fork (DB-backed undo/redo stack, undo_redo_stack): the half-turn ids rewound and the
+    # last user text handed back to the composer for editing.
+    rewound_ids: list[int] | None = None
+    prefill_text: str | None = None
 
 
 method("session.undo", params=SessionUndoParams, result=SessionUndoResult,

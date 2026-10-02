@@ -160,14 +160,19 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
+    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure.
+    Returns ``_run_prompt_submit``'s verdict: False when the session refused the turn (closing /
+    replaced) — the caller must then keep its durable copy (outbox receipt, kanban batch). Only an
+    explicit False is a refusal: a None return means "submitted" for callers (and test doubles) that
+    predate the boolean contract; reading it as a refusal would re-buffer an ALREADY-DELIVERED batch
+    and duplicate the notification on the next idle turn."""
     try:
         from gateway.warning_notifications import render_notification
         with _session_profile_runtime_scope(session):
             render_notification(lambda: _emit("message.start", sid), platform="tui",
                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        return _run_prompt_submit(rid, sid, session, text, **kwargs) is not False
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -454,10 +459,16 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         diagnostic = split and isinstance(pending[0], DiagnosticText)
         batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
         session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
+    accepted = False
     with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
+                                 "kanban notification dispatch failed",
+                                 **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    if not accepted:
+        # fork: the events are cursor-claimed and never re-queued — this buffer is the only copy. A refused
+        # turn (session closing / replaced) must keep the batch, not silently eat the notification.
+        with session["history_lock"]:
+            session["_kanban_pending"] = list(batch) + list(session.get("_kanban_pending") or [])
 
 
 def _background_notifications_off(session: dict) -> bool:
@@ -471,7 +482,8 @@ def _background_notifications_off(session: dict) -> bool:
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
     """Run the claimed (running=True) agent turn for one notification event."""
-    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+    from tools.async_delegation import (
+        claim_event_delivery, complete_event_delivery_with_retry, release_event_delivery)
     try:
         claim = claim_event_delivery(evt, "tui-poller")
     except Exception as exc:  # shared ledger busy/unreadable: the durable row stays pending and replays
@@ -497,11 +509,19 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        accepted = _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
         return
-    complete_event_delivery(evt, claim)
+    # fork: a REFUSED turn (session closing / replaced) keeps its durable receipt pending so the row
+    # replays to the live owner; an accepted turn's receipt failure is retried + logged, never allowed
+    # to reset the accepted turn (tests: refused_completion_submission_preserves_durable_receipt,
+    # completion_receipt_error_does_not_reset_accepted_turn).
+    if accepted:
+        complete_event_delivery_with_retry(evt, claim)
+    else:
+        release_event_delivery(evt, claim)
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -529,7 +549,16 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
                 "Dropping unowned %s notification (origin=%r key=%r) instead of delivering to session %s",
                 evt_type, origin, key, sid)
             if is_delegation:
-                from tools.async_delegation import return_completion_offer
+                from tools.async_delegation import note_event_delivery_attempt, return_completion_offer
+                # fork (Greptile P2 on #408): this drop happens BEFORE claim_event_delivery (the only
+                # other bumper), so advance delivery_attempts here or an orphan async_delegation never
+                # reaches the restore_undelivered_completions parking threshold and re-drops every boot.
+                if evt.get("delegation_id"):
+                    try:
+                        note_event_delivery_attempt(evt)
+                    except Exception:
+                        logger.warning("Could not record orphan delegation attempt: %s",
+                                       evt.get("delegation_id"), exc_info=True)
                 return_completion_offer(evt)
         elif is_delegation:
             deferred.append(evt)
@@ -572,7 +601,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
 
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
-    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+    from tools.async_delegation import (
+        claim_event_delivery, complete_event_delivery_with_retry, release_event_delivery)
 
     if not notifications:
         return
@@ -597,17 +627,19 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     if text is None:
         _notif_release_turn(session)
+    accepted = True
     try:
         if text is not None:
-            _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": batch.display_text(registry)})
+            accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                     "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                     display_metadata={"display_text": batch.display_text(registry)})
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return
     for event, _text, claim in claimed:
-        complete_event_delivery(event, claim)
+        # fork: refused turn -> receipts stay pending (see _notif_dispatch_event).
+        (complete_event_delivery_with_retry if accepted else release_event_delivery)(event, claim)
 
 
 def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):

@@ -3162,6 +3162,7 @@ export interface SessionActiveItem {
   started_at: number
   status: LiveSessionStatus
   title: string
+  pinned?: boolean
 }
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working' | 'streaming' | 'resuming'
 /** ``session_id`` is the STORED id. */
@@ -3296,6 +3297,8 @@ export interface SessionUndoParams {
 export type UndoIntent = 'retry' | 'undo'
 export interface SessionUndoResult {
   removed: number
+  rewound_ids?: number[] | null
+  prefill_text?: string | null
 }
 /** Fork: ``n`` (alias ``count``) half-turns to re-activate; default 1. */
 export interface SessionRedoParams {

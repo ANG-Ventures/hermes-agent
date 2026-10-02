@@ -122,6 +122,15 @@ def _set_model(rid, params, key, value, session):
         if session.get("running") or session.get("_compute_host_active"):
             return _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags)
         explicit_provider = parsed_flags.explicit_provider
+        # fork: a build already in flight (started, not ready, no error yet) must finish before we
+        # decide — if it fails, the failed-build recovery below has to replace it; switching against
+        # agent None while it runs would let it fail later with the stale overrides and no rebuild.
+        inflight_ready = session.get("agent_ready")
+        if (session.get("agent") is None and session.get("agent_error") is None
+                and session.get("agent_build_started") and inflight_ready is not None
+                and not inflight_ready.is_set()):
+            if not inflight_ready.wait(timeout=30.0):
+                return _err(rid, 5032, AGENT_STILL_STARTING)
         failed_agent_init = session.get("agent") is None and session.get("agent_error") is not None
         failed_ready = session.get("agent_ready") if failed_agent_init else None
         if failed_agent_init:
@@ -184,7 +193,10 @@ def _set_fast(rid, params, key, value, session):
         return _err(rid, 4002, f"unknown fast mode: {value}")
     overrides = None
     if nv in ("fast", "ultrafast"):
-        from hermes_cli.models import resolve_fast_mode_overrides
+        # fork: the route-gated capability verdict (provider + api_mode, inferred from config when the
+        # session has no agent yet) with its reason text — not upstream's model-only overrides gate.
+        from hermes_cli.models import resolve_fast_mode_capability
+        from hermes_cli.providers import infer_api_mode_from_provider
         if agent is not None:
             target_model = getattr(agent, "model", None)
         else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
@@ -192,11 +204,19 @@ def _set_fast(rid, params, key, value, session):
             target_model = (isinstance(session_override, dict) and session_override.get("model")) or _resolve_model()
         if not target_model:
             return _err(rid, 4002, "fast mode is not available without a selected model")
-        overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
-                                                base_url=getattr(agent, "base_url", None),
-                                                tier="ultrafast" if nv == "ultrafast" else None)
-        if overrides is None:
-            return _err(rid, 4002, f"{nv} mode is not available for this model")
+        model_cfg = _load_cfg().get("model") or {}
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        target_provider = getattr(agent, "provider", None) if agent is not None else model_cfg.get("provider")
+        target_api_mode = getattr(agent, "api_mode", None) if agent is not None else model_cfg.get("api_mode")
+        if not target_api_mode:
+            target_api_mode = infer_api_mode_from_provider(target_provider)
+        capability = resolve_fast_mode_capability(
+            model=target_model, provider=target_provider, api_mode=target_api_mode,
+            tier="ultrafast" if nv == "ultrafast" else "priority")
+        if not capability.supported:
+            return _err(rid, 4002, capability.reason or f"{nv} mode is not available for this route")
+        overrides = capability.request_overrides
     if session is not None:
         # Session-scoped like `reasoning` (global = `--global` / Settings → Model): writing config.yaml
         # here flipped fast mode for every surface. The create override survives rebuilds; "" pins normal.

@@ -28504,6 +28504,11 @@
           "title": {
             "title": "Title",
             "type": "string"
+          },
+          "pinned": {
+            "default": false,
+            "title": "Pinned",
+            "type": "boolean"
           }
         },
         "required": [
@@ -31802,6 +31807,33 @@
           "removed": {
             "title": "Removed",
             "type": "integer"
+          },
+          "rewound_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rewound Ids"
+          },
+          "prefill_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prefill Text"
           }
         },
         "required": [

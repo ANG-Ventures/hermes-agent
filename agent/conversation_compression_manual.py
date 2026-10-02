@@ -146,7 +146,15 @@ def compress_now(
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
     after_tokens = estimate_request_tokens(agent, compressed)
     summary = summarize_manual_compression(before, compressed, before_tokens, after_tokens, compression_state=compressor)
-    return CompressResult("compressed", before, list(compressed), before_tokens, after_tokens, request, summary=summary)
+    # Identity is a signal (fork): the compressor's lock-skip / no-op paths hand back the EXACT input list,
+    # and the TUI history commit keys on ``after_messages is <its input>`` to skip the swap and the
+    # write-fence version bump. ``before`` is our private copy, so map that identity back onto the
+    # caller's ``history`` object; otherwise normalise non-lists only and never copy a list.
+    if compressed is head and not tail and isinstance(history, list):
+        after = history
+    else:
+        after = compressed if isinstance(compressed, list) else list(compressed)
+    return CompressResult("compressed", before, after, before_tokens, after_tokens, request, summary=summary)
 
 
 def render_compress_result(result: CompressResult, *, prefix: str = "") -> List[str]:
