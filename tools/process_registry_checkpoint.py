@@ -100,7 +100,13 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
-                continue
+                    continue
+                if not entry.get("output_log"):
+                    continue
+                # A restart-durable spawn (fork, t_1191e078) that finished while no gateway was
+                # running: its log + exit file still hold the result, so adopt it below and let
+                # ``_refresh_detached_session`` finish it from the recorded exit instead of
+                # dropping the completion.
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             fields.update(
                 command=entry.get("command", "unknown"),
@@ -122,5 +128,8 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
+            if fate != "running":
+                # Durable spawn adopted past its death: finish it from the recorded exit now.
+                self._refresh_detached_session(session)
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered

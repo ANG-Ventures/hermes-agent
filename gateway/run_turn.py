@@ -4544,6 +4544,20 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        # Fork runtime net: a turn whose bound executor context disagrees with its call is
+        # reported before dispatch (a cross-session follow-up executing under a stale key).
+        from gateway.session_context import get_session_env
+        try:
+            expected_session_key = self._session_key_for_source(source)
+        except Exception:
+            expected_session_key = session_key
+        bound_session_key = get_session_env("HERMES_SESSION_KEY", "")
+        if expected_session_key and bound_session_key != expected_session_key:
+            logger.warning(
+                "Agent executor context mismatch: bound session %r, executing turn %r",
+                bound_session_key, expected_session_key,
+            )
+
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
