@@ -48,9 +48,19 @@ class Check:
         return f"[{mark}] {self.name} — {self.evidence}"
 
 
+def _lexical(path: Path) -> Path:
+    """Absolute form without touching the filesystem.
+
+    Live roots (``~/.hermes/plugins``) are only ever COMPARED against, never read: the test
+    suite's home-I/O guard (tests/home_io_guard.py) refuses even ``realpath`` under the real
+    home, so roots are normalised lexically and only the candidate path is resolved.
+    """
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def _path_is_relative_to(path: Path, parent: Path) -> bool:
     try:
-        path.resolve().relative_to(parent.resolve())
+        path.relative_to(parent)
         return True
     except ValueError:
         return False
@@ -75,7 +85,7 @@ def _hermes_roots() -> list[Path]:
     deduped: list[Path] = []
     seen: set[str] = set()
     for root in roots:
-        key = str(root.expanduser().resolve())
+        key = str(_lexical(root))
         if key not in seen:
             seen.add(key)
             deduped.append(Path(key))
@@ -83,7 +93,7 @@ def _hermes_roots() -> list[Path]:
 
 
 def _looks_temp_or_staging(path: Path) -> bool:
-    resolved = path.expanduser().resolve()
+    resolved = _lexical(path)
     if _path_is_relative_to(resolved, WORKTREE_ROOT / "staging"):
         return True
     components = {part.lower() for part in resolved.parts}
@@ -99,14 +109,28 @@ def _live_roots() -> list[Path]:
     return roots
 
 
-def _live_path_refusal(path: Path) -> str | None:
-    resolved = path.expanduser().resolve()
-    for root in _live_roots():
-        if _path_is_relative_to(resolved, root) or resolved == root.expanduser().resolve():
+def _refusal_for(resolved: Path, roots: list[Path]) -> str | None:
+    for root in roots:
+        if _path_is_relative_to(resolved, root):
             if _looks_temp_or_staging(resolved):
                 return None
-            return f"{resolved} is under live Hermes path {root.expanduser().resolve()}"
+            return f"{resolved} is under live Hermes path {root}"
     return None
+
+
+def _live_path_refusal(path: Path) -> str | None:
+    roots = [_lexical(root) for root in _live_roots()]
+    # Lexical form first: a path spelled under a live root is refused without probing it
+    # (resolving would stat the live tree). Only a path that is lexically clear is resolved,
+    # so a symlink into the live tree is still caught via its real form.
+    lexical = _lexical(path)
+    if any(_path_is_relative_to(lexical, root) for root in roots):
+        return _refusal_for(lexical, roots)
+    try:
+        resolved = lexical.resolve()
+    except OSError:
+        return None
+    return _refusal_for(resolved, roots)
 
 
 def _guard_isolated_profile(profile_dir: Path) -> None:

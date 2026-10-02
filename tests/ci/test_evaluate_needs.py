@@ -308,9 +308,11 @@ def test_e2e_desktop_exemption_matches_the_ci_yml_guard():
     ci_yml = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yaml"
     text = ci_yml.read_text(encoding="utf-8")
 
-    import yaml
+    # parity 2026-10-01: upstream dropped the pyyaml dependency (284dbaf5370, "unify
+    # YAML on ruamel"); hermes_yaml is the ruamel-backed safe_load every other test uses.
+    import hermes_yaml
 
-    job = yaml.safe_load(text)["jobs"].get("e2e-desktop")
+    job = hermes_yaml.safe_load(text)["jobs"].get("e2e-desktop")
     assert job, "could not locate the e2e-desktop job in ci.yml"
     cond = job.get("if")
     # Constant false in any spelling GitHub accepts (t_bc0052b9 replaced the
