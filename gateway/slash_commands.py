@@ -8919,7 +8919,13 @@ class GatewaySlashCommandsMixin:
                 if not callable(refresh):
                     continue
                 try:
-                    maybe = refresh()
+                    if inspect.iscoroutinefunction(refresh):
+                        maybe = refresh()
+                    else:
+                        # Sync refreshes rescan the skill catalog on disk;
+                        # keep that filesystem work off the event loop
+                        # (t_620ba53d).
+                        maybe = await asyncio.to_thread(refresh)
                     if inspect.isawaitable(maybe):
                         await maybe
                 except Exception as exc:
