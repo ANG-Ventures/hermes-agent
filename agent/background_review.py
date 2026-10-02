@@ -49,6 +49,30 @@ _live_review_agents: Dict[int, Any] = {}
 _live_review_agents_lock = threading.Lock()
 
 
+# Set once the host process starts exiting (CLI cleanup / signal). A fork still
+# being constructed when the exit path snapshots ``_live_review_agents`` is not
+# in that snapshot; without the fence it then made its first provider call
+# during interpreter shutdown and died with no ``turns`` row (daedalus
+# 2026-10-01 22:56/23:01/23:16, 10-02 00:19; daedalus-fable 09:38/09:54/09:57:
+# 7 of 8 blackbox orphans, r31 G).
+_review_exit_fence = threading.Event()
+
+
+def fence_background_reviews_and_snapshot() -> list:
+    """Refuse every review request not yet admitted, then snapshot live forks.
+
+    Both happen under the registry lock, so a fork is either in the snapshot
+    (registered before the fence) or sees the fence when it asks to start.
+    """
+    with _live_review_agents_lock:
+        _review_exit_fence.set()
+        return list(_live_review_agents.values())
+
+
+def background_reviews_fenced() -> bool:
+    return _review_exit_fence.is_set()
+
+
 def live_background_review_agents() -> list:
     """Snapshot of the review forks whose ``run_conversation`` may be in flight."""
     with _live_review_agents_lock:
@@ -1691,7 +1715,7 @@ def _run_review_in_thread(
                 pass
 
             try:
-                request_admitted = (
+                request_admitted = not background_reviews_fenced() and (
                     review_run is None or review_run.begin_request(review_agent)
                 )
                 _review_result = None

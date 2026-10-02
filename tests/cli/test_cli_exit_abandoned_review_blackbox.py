@@ -33,6 +33,7 @@ def ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(blackbox, "_provisional_turns", {})
     monkeypatch.setattr(cli_mod, "_handed_off_session_ids", set())
     monkeypatch.setattr(br, "_live_review_agents", {})
+    monkeypatch.setattr(br, "_review_exit_fence", threading.Event())
     store._connect().close()
     HOOKS.clear()
 
@@ -121,3 +122,42 @@ def test_review_turn_that_already_emitted_is_not_re_recorded(ledger, monkeypatch
     cli_mod._record_abandoned_review_turns("cli_exit")
 
     assert HOOKS == []
+
+
+
+
+def _run_review_fork():
+    """Run the review worker against a permissive parent; True when the fork's
+    ``run_conversation`` (its first provider call) was entered."""
+    from unittest.mock import MagicMock, patch
+
+    from tests.agent.test_background_review_tool_call_guard import _fake_parent
+
+    parent = MagicMock()
+    for key, value in vars(_fake_parent(MagicMock())).items():
+        setattr(parent, key, value)
+    parent._active_children = []
+    parent._background_review_agent = None
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.AIAgent") as mock_aiagent,
+        patch("tools.terminal_tool.set_approval_callback"),
+    ):
+        mock_aiagent.return_value.run_conversation.return_value = {"messages": []}
+        br._run_review_in_thread(parent, [{"role": "user", "content": "hi"}], "review", None)
+    return mock_aiagent.return_value.run_conversation.called
+
+
+def test_review_fork_runs_before_exit(ledger):
+    assert _run_review_fork() is True
+
+
+def test_cli_exit_fences_a_review_that_has_not_started_its_request(ledger):
+    """r31 G: 7 of 8 orphans were review forks still being BUILT when cleanup
+    snapshotted the registry; they then made their first provider call during
+    interpreter shutdown and died with no turns row. After the exit snapshot no
+    review request may be admitted."""
+    assert not br.background_reviews_fenced()
+    cli_mod._record_abandoned_review_turns("cli_exit")
+    assert br.background_reviews_fenced()
+    assert _run_review_fork() is False
