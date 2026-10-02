@@ -38,6 +38,10 @@ class _SslBlockedChild:
         self.close_while_blocked = False
         self.drain_calls: list[str] = []
         self.drain_threads: list[str] = []
+        # Frozen activity clock: the fork supervisor (#1535) keeps a child whose clock is unknown or
+        # advancing alive past the cap (``timed_out_running`` + late result); a child parked in an
+        # SSL read shows no progress for the whole cap, which is the timeout shape tested here.
+        self._activity_ts = time.time()
 
     def run_conversation(self, **_kwargs):
         # Models the worker blocked in ssl.read: only the FD-safe drain
@@ -58,7 +62,7 @@ class _SslBlockedChild:
         pass
 
     def get_activity_summary(self):
-        return {"api_call_count": 1}
+        return {"api_call_count": 1, "last_activity_ts": self._activity_ts}
 
     def _drain_transports_after_abandonment(self, *, reason: str) -> int:
         self.drain_calls.append(reason)

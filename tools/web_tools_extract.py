@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request
-from tools.web_tools_rescue import _rescue_eligible, _rescue_extract
+from tools.web_tools_rescue import _rescue_eligible, _rescue_extract  # noqa: F401  (re-exported; dispatch reads via tools.web_tools)
 
 logger = logging.getLogger("tools.web_tools")
 
@@ -146,15 +146,19 @@ def _extract_timeout_seconds() -> float:
         return _DEFAULT_EXTRACT_TIMEOUT_S
 
 
-async def _dispatch_extract(provider, fetch_urls: List[str], format: Optional[str]) -> List[dict]:
-    """Call ``provider.extract`` (async or sync-in-thread), with one-shot keyless rescue.
-
-    Rescue fires on a raised exception — including a dispatch timeout — or when the WHOLE batch
-    failed (backend outage, not per-page problems). Rescued batches are never cached.
-    """
+async def _breaker_extract(provider, fetch_urls: List[str], format: Optional[str], timeout: float) -> List[dict]:
+    """One ``provider.extract`` call (async or sync-in-thread) behind the 402/401 dead-backend
+    breaker (fork #1562) and the ``web.extract_timeout`` cap. An open breaker skips the network
+    call and returns a failed batch so the fallback chain / rescue serves the call without a
+    doomed round-trip. Per-URL errors can be a TARGET site's 401/402 (paywall/login), not the
+    vendor's billing/auth status: only an exception at the provider boundary trips the breaker."""
     import inspect
-    from tools.web_result_cache import extract_cache_put
-    timeout = _extract_timeout_seconds()
+    from tools import web_backend_breaker as _bb
+    from tools.web_tools import _load_web_config
+
+    until = _bb.open_until(provider.name)
+    if until:
+        return [_result_entry(u, _bb.skip_error(provider.name, until)) for u in fetch_urls]
     try:
         if inspect.iscoroutinefunction(provider.extract):
             coro = provider.extract(fetch_urls, format=format)
@@ -164,21 +168,86 @@ async def _dispatch_extract(provider, fetch_urls: List[str], format: Optional[st
             results = await asyncio.wait_for(coro, timeout=timeout)
         else:
             results = await coro
-    except asyncio.TimeoutError as exc:  # hanging backend — bounded, never a stalled tool call
+    except asyncio.TimeoutError:  # hanging backend — bounded, never a stalled tool call
         logger.warning("web_extract provider '%s' timed out after %.0fs for %d URL(s)",
                        provider.name, timeout, len(fetch_urls))
-        failed = [_result_entry(u, f"Extract timed out after {timeout:.0f}s via {provider.name}")
-                  for u in fetch_urls]
-        if not _rescue_eligible(provider):
-            return failed
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
-    except Exception as exc:  # noqa: BLE001 — candidate for rescue
-        if not _rescue_eligible(provider):
+        raise
+    except Exception as exc:
+        _bb.record_failure(provider.name, exc, cfg=_load_web_config())
+        raise
+    if results and any(not r.get("error") for r in results):
+        _bb.record_success(provider.name)
+    return results
+
+
+def _failed_extract_batch(results: list, urls: list) -> bool:
+    """Whole-batch failure (backend outage), excluding batches that are entirely policy refusals."""
+    from tools.web_tools_rescue import _policy_blocked_result
+    return (bool(results) and len(results) == len(urls)
+            and all(r.get("error") for r in results)
+            and not all(_policy_blocked_result(r) for r in results))
+
+
+async def _dispatch_extract(provider, fetch_urls: List[str], format: Optional[str]) -> List[dict]:
+    """Primary (behind the breaker) → configured keyed ``web.extract_fallbacks`` → one-shot keyless
+    rescue. Anything served by a non-primary vendor is stamped ``served_by`` / ``fallback_from``
+    and never cached under the primary vendor's key (fork #1516, #1562).
+
+    Fallback/rescue fires on a raised exception — including a dispatch timeout — or when the WHOLE
+    batch failed (backend outage, not per-page problems); policy-blocked pages never go to another
+    vendor.
+    """
+    from tools.web_result_cache import extract_cache_put
+    # Read the hooks through the ``tools.web_tools`` facade: that is the name callers and tests
+    # patch (``web_tools._rescue_extract`` / ``_rescue_eligible``); the search path does the same.
+    from tools.web_tools import _keyed_fallbacks, _load_web_config, _rescue_eligible, _rescue_extract
+    from tools.web_tools_rescue import _policy_blocked_result
+    timeout = _extract_timeout_seconds()
+
+    def _timeout_entries() -> List[dict]:
+        return [_result_entry(u, f"Extract timed out after {timeout:.0f}s via {current.name}")
+                for u in fetch_urls]
+
+    current = provider
+    try:
+        results = await _breaker_extract(current, fetch_urls, format, timeout)
+    except asyncio.TimeoutError:
+        results = _timeout_entries()
+        if not _load_web_config().get("extract_fallbacks") and not _rescue_eligible(current):
+            return results
+    except Exception as exc:  # noqa: BLE001 — candidate for fallback / rescue
+        if not _load_web_config().get("extract_fallbacks") and not _rescue_eligible(current):
             raise
-        failed = [_result_entry(u, str(exc)) for u in fetch_urls]
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
-    if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
+        results = [_result_entry(u, str(exc)) for u in fetch_urls]
+    for candidate in _keyed_fallbacks("extract", provider.name):
+        if not _failed_extract_batch(results, fetch_urls):
+            break
+        if any(_policy_blocked_result(r) for r in results):
+            break  # never route policy-blocked pages through another vendor
+        logger.info("web_extract backend '%s' failed all %d URL(s) (%s); trying keyed fallback '%s'",
+                    current.name, len(fetch_urls), str(results[0].get("error", ""))[:200], candidate.name)
+        current = candidate
+        try:
+            results = await _breaker_extract(current, fetch_urls, format, timeout)
+        except asyncio.TimeoutError:
+            results = _timeout_entries()
+        except Exception as exc:  # noqa: BLE001 — next keyed candidate
+            results = [_result_entry(u, str(exc)) for u in fetch_urls]
+    rescued = current is not provider  # never cache under the primary vendor's key
+    if rescued:
+        for r in results:
+            if not r.get("error"):
+                meta = r.get("metadata")
+                if not isinstance(meta, dict):
+                    meta = {}
+                    r["metadata"] = meta
+                meta.update(served_by=current.name, fallback_from=provider.name)
+    if (results and all(r.get("error") for r in results)
+            and (_failed_extract_batch(results, fetch_urls) or not _load_web_config().get("extract_fallbacks"))
+            and _rescue_eligible(current)):
+        return await asyncio.to_thread(_rescue_extract, current.name, fetch_urls, results)
+    if rescued:
+        return results
 
     # Cache each successful fetch under the REQUESTED url it reports as its own — never by list
     # position: providers omit failed URLs or return successes out of request order, and a positional

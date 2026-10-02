@@ -132,6 +132,7 @@ if not _loaded_env_paths:
 from agent.process_bootstrap import OpenAI  # noqa: F401
 from model_tools import (
     check_toolset_requirements,  # noqa: F401
+    get_tool_definitions,  # noqa: F401
     get_toolset_for_tool,
 )
 from tools.terminal_tool_lifecycle import cleanup_vm, get_active_env

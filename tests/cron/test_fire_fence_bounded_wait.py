@@ -40,8 +40,10 @@ def _claimed_running_job(tmp_path):
         claimed = jobs.claim_job_for_fire(created["id"], force=True, return_job=True)
     assert isinstance(claimed, dict)
     owner = claimed["fire_claim"]["by"]
-    sched._running_job_ids.add(created["id"])
-    sched._running_fire_owners[created["id"]] = {object(): (owner, profile_home)}
+    # In-flight state is keyed per (home, job id) since upstream cb647a018ff.
+    key = sched._inflight_key(created["id"], profile_home)
+    sched._running_job_ids.add(key)
+    sched._running_fire_owners[key] = {object(): (owner, profile_home)}
     return created["id"], owner, profile_home
 
 

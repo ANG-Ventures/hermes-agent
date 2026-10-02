@@ -106,13 +106,18 @@ def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     from gateway.session_context import _VAR_MAP
 
     scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER]
-    exports = "; ".join([f'export {n}="x"' for n in scoped] + ['export HERMES_HOME="/h"', 'export MYVAR="keep"'])
+    exports = "; ".join([f'export {n}="x"' for n in scoped]
+                        + ['export HERMES_HOME="/h"', 'export HERMES_HOME_BACKUP="/hb"', 'export MYVAR="keep"'])
     out = subprocess.run(
         ["bash", "-c", f"{exports}; {_export_dump_excluding_session_vars('/dev/stdout')}"],
         capture_output=True, text=True, check=True).stdout
     leaked = [n for n in scoped if f"declare -x {n}=" in out]
     assert not leaked, f"persisted into the snapshot: {leaked}"
-    assert 'declare -x HERMES_HOME="/h"' in out
+    # Fork #543: the snapshot is replayed in OTHER sessions, so a captured HERMES_HOME would
+    # repoint them at a foreign state.db / auth.json. Exact-name only: HERMES_HOME_BACKUP is a
+    # user var and survives (upstream's contract kept HERMES_HOME; the fork's guard wins).
+    assert 'declare -x HERMES_HOME="/h"' not in out
+    assert 'declare -x HERMES_HOME_BACKUP="/hb"' in out
     assert 'declare -x MYVAR="keep"' in out
 
 

@@ -1373,6 +1373,18 @@ def _plan_execution(
         # tighter inside a messaging-gateway turn (``terminal.gateway_max_foreground_timeout``).
         fg_max, gw_capped = _effective_foreground_max_timeout()
         if timeout and timeout > fg_max:
+            if gw_capped or _is_messaging_gateway_turn():
+                # Fork #1012: a messaging-gateway turn keeps the REFUSAL (whichever cap binds).
+                # Promotion to a tracked background process is for CLI/TUI/kanban turns; a chat
+                # user cannot Ctrl-C and must be told to background explicitly.
+                raise _Rejected(tool_error(
+                    f"Foreground timeout {timeout}s exceeds the maximum of "
+                    f"{fg_max}s for messaging-gateway sessions: while a "
+                    f"foreground call runs, this chat cannot answer new "
+                    f"messages. Use background=true and collect the result "
+                    f"with process(action='wait', timeout=...), or hand work "
+                    f"longer than ~10 min to a kanban card or cron job."
+                ))
             promoted = timeout
     effective_timeout = timeout or config["timeout"]
     if not background and promoted is None and gw_capped and effective_timeout > fg_max:

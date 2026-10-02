@@ -125,13 +125,15 @@ class TestSnapshotRealProfile:
         home = tmp_path / "hermes-home"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
         # _secure_file/_secure_dir deliberately no-op inside a container
-        # (hermes_cli.config._is_container -> /.dockerenv), a production
-        # carve-out for volume-mounted multi-UID setups. CI runs these tests
-        # inside a container on the self-hosted pool, so without this the
-        # assertion below measures the carve-out instead of the hardening and
-        # the files stay 0644. Pin the non-container branch: this test is
-        # about what the tightening does when it is in force.
-        monkeypatch.setattr("hermes_cli.config._is_container", lambda: False)
+        # (hermes_constants._container_or_chmod_skipped -> /.dockerenv), a
+        # production carve-out for volume-mounted multi-UID setups. CI runs
+        # these tests inside a container on the self-hosted pool, so without
+        # this the assertion below measures the carve-out instead of the
+        # hardening and the files stay 0644. Pin the non-container branch:
+        # this test is about what the tightening does when it is in force.
+        # (hermes_cli.config binds the name at import; patch where it is read.)
+        monkeypatch.setattr("hermes_cli.config._container_or_chmod_skipped", lambda: False)
+        monkeypatch.setattr("hermes_constants._container_or_chmod_skipped", lambda: False)
         old_umask = os.umask(0o022)  # the common default that produced 0644
         try:
             dst, err = bc.snapshot_real_profile("chrome", src=str(src))
@@ -161,7 +163,8 @@ class TestSnapshotRealProfile:
         # Same container carve-out as test_snapshot_files_are_owner_only: the
         # heal only runs when _secure_file is in force, which it is not inside
         # a container (CI on the self-hosted pool).
-        monkeypatch.setattr("hermes_cli.config._is_container", lambda: False)
+        monkeypatch.setattr("hermes_cli.config._container_or_chmod_skipped", lambda: False)
+        monkeypatch.setattr("hermes_constants._container_or_chmod_skipped", lambda: False)
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None and dst
         cookies = os.path.join(dst, "Default", "Cookies")

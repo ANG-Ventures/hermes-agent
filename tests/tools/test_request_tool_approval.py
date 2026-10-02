@@ -33,7 +33,7 @@ def _isolate_approval_state(monkeypatch):
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
     monkeypatch.setattr(approval, "is_session_yolo_enabled", lambda _k: False)
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False, raising=False)
-    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
     # No thread-registered CLI callback by default.
     monkeypatch.setattr(
         "tools.terminal_tool._get_approval_callback", lambda: None, raising=False

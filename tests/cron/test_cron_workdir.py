@@ -351,7 +351,8 @@ def test_build_job_prompt_inline_script_receives_configured_workdir(monkeypatch,
     workdir.mkdir()
     observed: dict = {}
 
-    def run_script(script_path, workdir=None, cancel_event=None, interpreter=None):
+    def run_script(script_path, workdir=None, cancel_event=None, interpreter=None, **_fork_kwargs):
+        # Fork passes the per-job script timeout/name/id (_job_script_kwargs) on this path too.
         observed["script_workdir"] = workdir
         return True, "collected data"
 

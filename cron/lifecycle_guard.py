@@ -674,6 +674,8 @@ def _profile_derived_self_names() -> set[str]:
     """
     try:
         from hermes_cli.gateway import (
+            _home_owns_bare_service_name,
+            _profile_name_from_home,
             get_hermes_home,
             get_launchd_label,
             get_service_name,
@@ -682,7 +684,12 @@ def _profile_derived_self_names() -> set[str]:
 
         home = Path(str(get_hermes_home())).resolve()
         default = Path(str(get_default_hermes_root())).resolve()
-        if home != default and home.parent != (default / "profiles").resolve():
+        # Same basis `_profile_suffix` uses: anything else gets the hash
+        # suffix, i.e. a fabricated identity — fail closed.
+        if not (
+            _home_owns_bare_service_name(home)
+            or _profile_name_from_home(home, default)
+        ):
             return set()
         names: set[str] = set()
         label = get_launchd_label()
@@ -2674,9 +2681,8 @@ def _contains_unsafe_gateway_action(
     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
     # oversized data file mentioned there otherwise fails closed as a "script".
     shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
-    referenced_command = shell_command + "\n" + "\n".join(
-        _mask_read_only_python_paths(body) for body in python_bodies
-    )
+    masked_bodies = [_mask_read_only_python_paths(body) for body in python_bodies]
+    referenced_command = shell_command + "\n" + "\n".join(masked_bodies)
 
     for payload in _iter_shell_command_payloads(shell_command):
         if recurse(payload, cwd, executed):
@@ -2690,7 +2696,20 @@ def _contains_unsafe_gateway_action(
         (path, executed) for path in _iter_referenced_shell_scripts(referenced_command, cwd=cwd)
     ]
     if shell_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        # Fork: a path `_mask_read_only_python_paths` removed is a file the body provably only
+        # READS as data (#1017/#1348) — its contents are never executed, so it is not even a
+        # mention. Everything else named in the raw command stays a mention candidate.
+        masked_away: set = set()
+        for body, masked in zip(python_bodies, masked_bodies):
+            if masked != body:
+                masked_away |= (
+                    set(_iter_referenced_shell_scripts(body, cwd=cwd))
+                    - set(_iter_referenced_shell_scripts(masked, cwd=cwd))
+                )
+        candidates += [
+            (path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)
+            if path not in masked_away
+        ]
 
     for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file

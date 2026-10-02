@@ -162,6 +162,11 @@ def _should_suppress_transient_failure_page(job: dict, error: str | None) -> boo
         return False
     if not _job_is_recurring(job):
         return False
+    if job.get("_quota_hold_seconds"):
+        # upstream #89376: the provider window is closed for a KNOWN duration and the job is about
+        # to be parked past it — it will not "re-fire next tick", so the one alert on entering the
+        # hold (hold_notice) is the operator's only signal. Never swallow it.
+        return False
     try:
         cfg = load_config()
         enabled = cfg.get("cron", {}).get("suppress_transient_failure_page", True)

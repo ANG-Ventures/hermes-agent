@@ -8,6 +8,7 @@ PYTHONPATH hygiene, UTF-8 forcing, TZ) cannot drift between them.
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 from typing import Dict
@@ -35,7 +36,47 @@ _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PASSW
 # while still inheriting HERMES_HOME.
 _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV", "HERMES_DELEGATED_CHILD_CONTEXT",
+    # Agent-process marker ("true"): the gh shim resolves the lane from the
+    # profile home only when it is present (t_45c11886).
+    "HERMES_AGENT",
 })
+
+# Git lane env from agent.process_env_files / gh-lane-env.sh (t_45c11886). The
+# generic scrub drops all of it (GIT_CONFIG_KEY_* and GIT_AUTHOR_* hit the KEY /
+# AUTH secret substrings), which sent sandbox git back to the global
+# ``gh auth git-credential`` helper and the operator's identity. Identity names
+# are not secrets; the GIT_CONFIG_* group passes only when EVERY key is a
+# credential helper (a command, never a secret value) -- anything else (e.g. an
+# http.extraheader carrying a token) drops the whole group.
+_GIT_IDENTITY_VARS = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                      "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
+_GIT_HELPER_KEY_RE = re.compile(r"^credential\.(?:\S+\.)?helper$")
+# A helper VALUE passes only as empty (list reset) or an absolute helper path
+# with plain word arguments (``!/path/gh auth git-credential``). Anything else
+# (shell snippets, ``password=...``, inline tokens) drops the group (C3 #1254).
+_GIT_HELPER_VALUE_RE = re.compile(r"^(?:!?/[\w./+-]+(?: [A-Za-z][A-Za-z-]*)*)?$")
+
+
+def _carry_git_lane_env(source_env, scrubbed):
+    for name in _GIT_IDENTITY_VARS:
+        if source_env.get(name):
+            scrubbed[name] = source_env[name]
+    try:
+        count = int(source_env.get("GIT_CONFIG_COUNT", ""))
+    except ValueError:
+        return scrubbed
+    if count <= 0 or count > 32:
+        return scrubbed
+    group = {"GIT_CONFIG_COUNT": str(count)}
+    for i in range(count):
+        key = source_env.get(f"GIT_CONFIG_KEY_{i}")
+        value = source_env.get(f"GIT_CONFIG_VALUE_{i}", "")
+        if key is None or not _GIT_HELPER_KEY_RE.match(key) or not _GIT_HELPER_VALUE_RE.match(value):
+            return scrubbed
+        group[f"GIT_CONFIG_KEY_{i}"] = key
+        group[f"GIT_CONFIG_VALUE_{i}"] = value
+    scrubbed.update(group)
+    return scrubbed
 
 # Windows-only: without these the CRT itself fails — socket.socket() raises
 # WinError 10106 (Winsock can't find mswsock.dll) and subprocess can't resolve
@@ -97,6 +138,22 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             "env_passthrough in the skill/config so it passes by explicit opt-in.",
             len(_dropped_hermes), ", ".join(sorted(_dropped_hermes)),
         )
+
+    # The git lane in os.environ belongs to the gateway's LAUNCH profile. A
+    # multiplexed secondary profile (context-local home) must not inherit its
+    # identity/credential helper or its home: point the child at the active
+    # profile's home and carry no lane (C3 #1254).
+    try:
+        from hermes_constants import get_hermes_home_override
+        _active_home = get_hermes_home_override()
+    except Exception:
+        _active_home = None
+    if _active_home and os.path.realpath(_active_home) != os.path.realpath(
+            source_env.get("HERMES_HOME") or os.devnull):
+        scrubbed["HERMES_HOME"] = _active_home
+    else:
+        _carry_git_lane_env(source_env, scrubbed)
+
     # delegate_task children are marked by a ContextVar, not os.environ, and the sandbox crosses
     # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
     # passthrough cannot re-grant a delegated child the parent's board mutation capability.
