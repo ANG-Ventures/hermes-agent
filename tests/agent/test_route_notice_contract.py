@@ -32,11 +32,12 @@ _CAUSE_TEXT = {
     "rate_upstream": "exceed your account's rate limit",
     "refusal": "content_policy_blocked",
     "auth": "OAuth access token has been revoked",
+    "provider_invalid_response": None,
     "unclassified": "weird thing",
 }
 _CAUSE_RE = re.compile(r"[a-zA-Z]{3,}")
-_HOP_RE = re.compile(r"(to the relay|at the relay|bridge|\(Anthropic [^)]+\)|proxy|CLI|hop unknown)")
-_SUB_RE = re.compile(r"(sub-vps-\d+|claude-[abc]px-\d+|all subs|sub unknown)")
+_HOP_RE = re.compile(r"(to the relay|at the relay|bridge|\(Anthropic [^)]+\)|proxy|CLI|hop unknown|hop=relay-200)")
+_SUB_RE = re.compile(r"(sub-vps-\d+|claude-[abc]px-\d+|all subs|sub unknown|sub=unknown)")
 _TIME_RE = re.compile(r"\d\d:\d\d:\d\d(-\d\d(:\d\d:\d\d)?)?$")
 _COUNT_RE = re.compile(r"^\d+x ")
 
@@ -63,6 +64,12 @@ def test_rider_carries_all_four_fields(cls, hop, seat, attempts):
         # Pool-wide relay refusal: the hop IS the relay and no seat exists (t_e17de574).
         assert rider.endswith(("relay busy: all subs at capacity (at the relay), 14:02:11",
                                "relay busy: all subs at capacity (at the relay), 14:02:11-19")), rider
+        return
+    if cls == "provider_invalid_response":
+        # t_d35beb85: a rejected billed 200 -> the relay answered, so the hop
+        # is known by construction; the seat comes from x-pool-served-by.
+        assert "hop unknown" not in rider and "hop=relay-200" in rider, rider
+        assert ("sub=sub-vps-9" if seat else "sub=unknown") in rider, rider
         return
     if hop is None:
         assert "hop unknown" in rider
