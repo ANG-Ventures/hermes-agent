@@ -46,9 +46,11 @@ class GatewayConfigLoadersMixin:
 
     @staticmethod
     def _cfg_str(section: str, key: str) -> str:
-        """``<section>.<key>`` from the gateway runtime config as a stripped string ("" when unset)."""
-        from gateway.run import _load_gateway_config
-        return str(cfg_get(_load_gateway_config(), section, key, default="") or "").strip()
+        """``<section>.<key>`` from the gateway runtime config as a stripped string ("" when unset).
+        Reads through ``_load_gateway_runtime_config`` (fork): the ``${VAR}``-expanded view, and the
+        seam fork tests patch (``patch.object(gateway_run, "_load_gateway_runtime_config", ...)``)."""
+        from gateway.run import _load_gateway_runtime_config
+        return str(cfg_get(_load_gateway_runtime_config(), section, key, default="") or "").strip()
 
     @classmethod
     def _env_or_cfg_str(cls, env_var: str, section: str, key: str) -> str:

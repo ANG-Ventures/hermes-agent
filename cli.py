@@ -1269,9 +1269,11 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         _base_word = cmd_lower.split()[0].lstrip("/")
         _cmd_def = _resolve_cmd(_base_word)
         canonical = _cmd_def.name if _cmd_def else _base_word
-        if not redispatch and self._slash_metrics_surface:
+        # getattr: fork tests drive process_command on bare namespace doubles (no class attrs).
+        metrics_surface = getattr(self, "_slash_metrics_surface", None)
+        if not redispatch and metrics_surface:
             from hermes_cli.observability.shared_metrics_events import record_slash_command
-            record_slash_command(command=canonical, surface=self._slash_metrics_surface)
+            record_slash_command(command=canonical, surface=metrics_surface)
 
         # Observer-only pre_command plugin hook (return values ignored; never raises).
         if _cmd_def is not None:
