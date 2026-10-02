@@ -29,7 +29,7 @@ parent._active_children = []
 parent._active_children_lock = None
 started = threading.Event()
 blocked = threading.Event()
-def child(**kw):
+def child(*a, **kw):  # fork _run_single_child passes (task_index, goal, child, parent) positionally
     started.set()
     blocked.wait(60)
 def build(**kw):
@@ -76,7 +76,10 @@ print(json.dumps([{"event": event, "message": format_process_notification(event)
                             text=True, capture_output=True, timeout=20)
     assert second.returncode == 0, second.stdout + second.stderr
     restored = json.loads(second.stdout.strip().splitlines()[-1])
-    assert len(restored) == (2 if split else 1)
+    # Fork contract (R07 POLICY-DIVERGENCE): a background call is ONE async unit regardless of
+    # delegation.independent_completions, so a split call recovers as one event carrying every
+    # task's transcript locator (upstream: one event per unit).
+    assert len(restored) == 1
     by_index = {}
     for item in restored:
         event = item['event']
@@ -85,7 +88,6 @@ print(json.dumps([{"event": event, "message": format_process_notification(event)
         assert "running" in item["message"]
         assert not event.get("summary")
         paths = event['task_transcripts']
-        assert len(paths) <= 1
         for index, path in paths.items():
             assert path in item['message']
             assert Path(path).name == f'task-{index}.log'

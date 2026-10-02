@@ -132,9 +132,12 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 def _parse_timeout(raw: Any) -> Optional[float]:
-    """Seconds → None (<= 0 disables) or max(30, value). Raises on non-numeric."""
+    """Seconds → None (<= 0 disables) or max(floor, value). Raises on non-numeric. Fork (7ff750b798):
+    the floor is ``_CHILD_TIMEOUT_FLOOR_S`` (60 s = 2x the tool-activity heartbeat) — a 30 s cap expired
+    before the first heartbeat tick and hard-stopped live leaves mid-tool."""
+    from tools.delegate_tool import _CHILD_TIMEOUT_FLOOR_S
     parsed = float(raw)
-    return None if parsed <= 0 else max(30.0, parsed)
+    return None if parsed <= 0 else max(_CHILD_TIMEOUT_FLOOR_S, parsed)
 
 def _get_child_timeout() -> Optional[float]:
     """Inactivity cap for one child (seconds of NO progress), or None (default: no cap). Failures should come from
@@ -142,7 +145,7 @@ def _get_child_timeout() -> Optional[float]:
     progress — a completed call, a tool change, an activity-clock tick — so a slow provider serving multi-minute
     completions never loses a live child, and a child frozen for the whole window is still caught. A configured
     value pre-empts nothing the heartbeat staleness monitor would not also catch. delegation.child_timeout_seconds
-    > 0 opts in (floor 30 s); 0 or negative disables. Env fallback: DELEGATION_CHILD_TIMEOUT_SECONDS."""
+    > 0 opts in (floor _CHILD_TIMEOUT_FLOOR_S); 0 or negative disables. Env fallback: DELEGATION_CHILD_TIMEOUT_SECONDS."""
     return _knob(
         "child_timeout_seconds", "DELEGATION_CHILD_TIMEOUT_SECONDS", _parse_timeout, DEFAULT_CHILD_TIMEOUT,
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
@@ -355,7 +358,18 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
             from hermes_cli.runtime_provider import resolve_runtime_provider
             runtime = resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
             request_overrides = dict(runtime.get("request_overrides") or {}) or None
-
+            # Fork 6998c783ca: the configured base_url IS the named provider's own endpoint (e.g.
+            # claude-bpr + http://127.0.0.1:18811/v1 — what restart recovery replays): keep the
+            # provider's identity. The bare "custom" collapse drops the provider profile, and with
+            # it the stateful-relay routing key, so every child call reached the bridge keyless ->
+            # sub hops + a fresh CLI session per call (t_9fdac10c).
+            _rt_provider = str(runtime.get("provider") or "").strip()
+            _rt_base = str(runtime.get("base_url") or "").strip().rstrip("/")
+            if (_rt_provider and _rt_provider != "custom" and _rt_base
+                    and _rt_base == v["base_url"].strip().rstrip("/")):
+                provider = _rt_provider
+                if v["api_mode"] not in _EXPLICIT_API_MODES and runtime.get("api_mode"):
+                    api_mode = runtime.get("api_mode")
         except Exception as exc:
             logger.debug(
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",

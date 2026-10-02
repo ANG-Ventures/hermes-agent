@@ -1,5 +1,12 @@
 """A child whose worker never returns after the heartbeat declares it stale must not hold
-the parent forever (#109749: sync delegation in a -Q one-shot kept the Bot Chat lease)."""
+the parent forever (#109749: sync delegation in a -Q one-shot kept the Bot Chat lease).
+
+Fork contract (R07 ruling: the fork ``_run_single_child`` is the hot path): the parent's
+heartbeat thread only stops touching the parent on a stale child; what ENDS the wait is the
+hang ceiling ``delegation.hung_child_seconds`` (#1599, ``_ChildHung``) — no progress anywhere
+in the child's subtree for that long is a ``timeout`` verdict with ``timeout_phase=no_progress``,
+independent of (and pre-empting) the configured wait budget.
+"""
 
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ def test_stale_heartbeat_ends_the_wait_without_a_configured_timeout(monkeypatch)
     monkeypatch.setattr(delegate_tool, "_HEARTBEAT_INTERVAL", 0.01)
     monkeypatch.setattr(delegate_tool, "_HEARTBEAT_STALE_CYCLES_IDLE", 2)
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(delegate_tool, "_get_hung_child_seconds", lambda: 0.2)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
     # Safety valve so an unfixed tree fails (status "completed") instead of hanging the suite.
     valve = threading.Timer(30.0, child.release.set)
@@ -58,13 +66,14 @@ def test_stale_heartbeat_ends_the_wait_without_a_configured_timeout(monkeypatch)
         child.release.set()
 
     assert entry["status"] == "timeout", entry
-    assert "stopped making progress" in entry["error"]
+    assert entry["timeout_phase"] == "no_progress", entry
+    assert "made no progress" in entry["error"]
     assert child.interrupted.is_set()
 
 
 def test_stale_verdict_under_a_configured_cap_reports_the_stale_threshold_not_the_cap(monkeypatch):
-    """The stale verdict pre-empts the cap, so the entry must name the threshold that actually ended
-    the wait — not a 3600s cap the child never reached."""
+    """The no-progress verdict pre-empts the cap, so the entry must name the threshold that actually
+    ended the wait — not a 3600s cap the child never reached."""
     child = _WedgedAfterFinalAnswer()
     parent = SimpleNamespace(
         session_id="parent", _current_task_id=None, _active_children=[child],
@@ -73,6 +82,7 @@ def test_stale_verdict_under_a_configured_cap_reports_the_stale_threshold_not_th
     monkeypatch.setattr(delegate_tool, "_HEARTBEAT_INTERVAL", 0.01)
     monkeypatch.setattr(delegate_tool, "_HEARTBEAT_STALE_CYCLES_IDLE", 2)
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 3600)
+    monkeypatch.setattr(delegate_tool, "_get_hung_child_seconds", lambda: 0.2)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
     valve = threading.Timer(30.0, child.release.set)
     valve.daemon = True
@@ -84,5 +94,6 @@ def test_stale_verdict_under_a_configured_cap_reports_the_stale_threshold_not_th
         child.release.set()
 
     assert entry["status"] == "timeout", entry
-    assert "stopped making progress" in entry["error"] and "3600" not in entry["error"], entry["error"]
-    assert entry["timeout_seconds"] == 2 * 0.01
+    assert "made no progress" in entry["error"] and "3600" not in entry["error"], entry["error"]
+    assert entry["timeout_phase"] == "no_progress", entry
+    assert entry["timeout_seconds"] == 0.2

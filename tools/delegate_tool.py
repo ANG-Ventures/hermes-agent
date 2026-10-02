@@ -2959,6 +2959,15 @@ def _run_single_child(
                 entry["schema_retries"] = _schema_retries
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
+            # Upstream (child_run._build_child_entry): a still-violating final answer is NOT
+            # discarded — the parent gets the raw text plus a note that it is unvalidated.
+            if _schema_valid is False and entry.get("status") == "completed" and entry.get("summary"):
+                entry["schema_note"] = (
+                    "Final answer does not satisfy the declared output_schema"
+                    + (" (after 1 retry)" if _schema_retries else "")
+                    + "; `summary` is the child's raw, UNVALIDATED final text — extract what you need "
+                    "from it yourself (see schema_errors) rather than re-running the task."
+                )
 
         # steer_subagent() returning True means "queued". Every queued steer
         # the child never wrote into a tool result is named here as MISSED
@@ -3964,6 +3973,10 @@ def delegate_task(
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context, model=creds.get("model"), provider=creds.get("provider")
     )
+    # Upstream 0cb996d977: announce the batch tag once so interleaved ``[set N · i/n]`` lines
+    # from several fan-outs on one console stay attributable.
+    _announce_batch(parent_agent, n_tasks, live_deleg_id)
+    _batch_tag = format_batch_tag(live_deleg_id, parent_agent)
 
     recovery_max_spawn_raw = recovery_execution.get("max_spawn_depth")
     recovery_max_spawn = (
@@ -4242,7 +4255,8 @@ def delegate_task(
                             else "✗"
                         )
                         remaining = n_tasks - completed_count
-                        completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                        _slot = f"{_batch_tag} · {idx+1}/{n_tasks}" if _batch_tag else f"{idx+1}/{n_tasks}"
+                        completion_line = f"{icon} [{_slot}] {label}  ({dur}s)"
                         if spinner_ref:
                             try:
                                 spinner_ref.print_above(completion_line)
@@ -4524,6 +4538,12 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            # Upstream (#116000): persist the live-transcript locators on the unit's row before any
+            # worker starts, so an owner death replays the recovered event WITH the transcript tails
+            # the parent needs to continue. live_paths omits failed writers.
+            task_transcripts={str(_ti): str(live_writers[_ti].path) for _ti in range(len(live_writers))
+                              if live_writers[_ti] is not None
+                              and getattr(live_writers[_ti], "path", None) is not None},
         )
 
         if (

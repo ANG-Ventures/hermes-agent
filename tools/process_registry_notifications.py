@@ -461,6 +461,9 @@ def format_process_notification(evt: dict) -> "str | None":
         # Say so where the output is the payload (a teammate's reply): a silent tail reads as whole.
         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
+    # Fork: the NO_REPLY silence hint rides every completion (gateway/run_notifications mirrors it) so an
+    # already-reported or inert result does not get re-announced.
+    from tools.process_registry import COMPLETION_SILENCE_HINT
     return (
         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+        f"{attribution}Command: {_cmd}\nOutput:\n{_out}\n{COMPLETION_SILENCE_HINT}]")
