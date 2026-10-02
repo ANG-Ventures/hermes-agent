@@ -3594,10 +3594,12 @@ def try_activate_fallback(
             # ~2 days, and re-clamping to 4h re-probes a provably-dead primary
             # ~12 times before it can possibly recover. Take the escalation
             # ceiling OR the provider's own base, whichever is larger.
-            backoff_seconds = min(
+            # Whole seconds (upstream #117484 arms ``ceil(provider_delay)``): a
+            # fractional reset must not reopen the primary a tick early.
+            backoff_seconds = math.ceil(min(
                 base_cooldown * (2 ** backoff_count),
                 max(base_cooldown, 14400),
-            )
+            ))
             agent._rate_limited_until = time.monotonic() + backoff_seconds
             logging.info(
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
@@ -5095,7 +5097,9 @@ class _StreamingCall(StreamingWaitMonitor):
             if reasoning_text is None and isinstance(getattr(delta, "model_extra", None), dict):
                 reasoning_text = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
             if reasoning_text:
-                reasoning_text = reasoning_splicer.feed(reasoning_text)
+                # Relays also emit reasoning deltas as content-part lists/dicts (upstream
+                # 37fb7adfd6); flatten BEFORE the surrogate splicer, which drops non-strings.
+                reasoning_text = reasoning_splicer.feed(flatten_message_text(reasoning_text, sep=""))
             if reasoning_text:
                 # Summary-part models omit the separator between markdown blocks; re-insert it.
                 reasoning_text = separate_glued_reasoning_blocks(

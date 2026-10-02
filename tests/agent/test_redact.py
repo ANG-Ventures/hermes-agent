@@ -1040,7 +1040,10 @@ class TestCfgDottedRePerformance:
         must_redact = [
             ("spring.datasource.password=Sup3rS3cret", "Sup3rS3cret"),
             ("app.api.key=ak_live_998877", "ak_live_998877"),
-            ("a.b.c.d.e.token=tok_abc123", "tok_abc123"),
+            # Upstream's ambiguous-key policy (test_ambiguous_key_preserves_obviously_
+            # noncredential_value): a bare ``token`` key only masks a credential-SHAPED
+            # value, so the corpus row carries one (>=12 chars, mixed classes).
+            ("a.b.c.d.e.token=tok_abc123XYZ789", "tok_abc123XYZ789"),
             ("my.secret.thing=val9876", "val9876"),
             ("auth.credential=cred_xyz789", "cred_xyz789"),
             ("x.api-key=hunter2value", "hunter2value"),

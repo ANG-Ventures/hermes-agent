@@ -414,6 +414,7 @@ def settle_unrecovered_error(
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
+            current_turn_user_idx=current_turn_user_idx,
         ))
 
     wait_time = compute_error_backoff(

@@ -1108,12 +1108,13 @@ def max_retries_exhausted_result(
     agent: Any, api_error: Exception, classified: Any, *, max_retries: int, is_rate_limited: bool,
     error_msg: str, api_kwargs: Any, api_messages: Any, messages: List[Dict[str, Any]],
     conversation_history: Any, api_call_count: int, approx_tokens: int, provider: Any,
-    base_url: Any, model: Any, delivered: str = "",
+    base_url: Any, model: Any, delivered: str = "", current_turn_user_idx: Any = None,
 ) -> Dict[str, Any]:
     """Terminal path once retries, transport recovery and fallback all failed: flush the
     trace, emit the billing / rate-limit / generic status, print stream-drop or thinking-timeout
     guidance (the latter wins), persist, build the result with ``failure_reason`` /
-    ``failure_retryable`` / ``billing_block``."""
+    ``failure_retryable`` / ``billing_block``. Appends the quota-registry soonest-reset line
+    and captures the durable turn handoff (``turn_handoff_saved``) at the cut."""
     # Result/guidance helpers stay in the loop module (tests import + patch them there).
     from hermes_cli.anon_auth import is_anonymous_agent
     from agent.conversation_loop import (
@@ -1217,8 +1218,29 @@ def max_retries_exhausted_result(
             "happens when it writes a very large file in one go. Ask me to write the file in "
             "smaller sections (or via execute_code with Python's open())."
         )
+    # When the registry proved the whole fallback tail dead, surface the useful
+    # fail-fast fact (soonest reset) instead of discarding the producer-only timestamp.
+    from agent.quota_registry_gate import append_quota_exhaustion_message
+
+    _final_response = append_quota_exhaustion_message(agent, _final_response)
+    # ── Durable handoff at the cut (2026-09-21) ──────────────────────────
+    # The chain is exhausted and this turn is about to die. Persist what was in
+    # flight (request, tool calls + results, half-written text, open todos) so the
+    # next turn resumes instead of reconstructing from scrollback. Never raises.
+    from agent.chat_completion_helpers import _fallback_reason_text
+    from agent.turn_handoff import capture_turn_handoff
+
+    _handoff_notice = capture_turn_handoff(
+        agent, messages, turn_start_idx=current_turn_user_idx or 0,
+        reason=_fallback_reason_text(classified.reason),
+    )
+    if _handoff_notice:
+        _final_response += f"\n\n{_handoff_notice}"
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
     result.update({
+        # True when a machine-readable handoff was persisted for this session and
+        # will be injected next turn.
+        "turn_handoff_saved": bool(_handoff_notice),
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
         # (``rate_limit`` / ``billing``) from a task failure.
         "failure_reason": classified.reason.value,
