@@ -22,6 +22,7 @@ import pytest
 
 from gateway.restart import (
     LAUNCHD_LABEL_ENV,
+    LAUNCHD_HARD_EXIT_RESERVE_S,
     LAUNCHD_STOP_CLEANUP_RESERVE_S,
     effective_stop_drain_timeout,
     effective_stop_watchdog_delay,
@@ -38,7 +39,11 @@ from gateway.shutdown_watchdog import (
     resolve_shutdown_watchdog_delay,
 )
 
-_CAPPED = 60.0 - LAUNCHD_STOP_CLEANUP_RESERVE_S
+# Fork contract (kept at the 2026-10-01 parity merge): the two reserves are ADDITIVE —
+# the drain may use at most ``exit_timeout - hard_exit_reserve - cleanup_reserve`` so the
+# teardown completes before the watchdog's os._exit, not merely before launchd's SIGKILL
+# (see resolve_launchd_capped_drain). Upstream caps at ``exit_timeout - cleanup`` only.
+_CAPPED = 60.0 - LAUNCHD_HARD_EXIT_RESERVE_S - LAUNCHD_STOP_CLEANUP_RESERVE_S
 
 _PRINT_OUTPUT = """\
 ai.hermes.gateway-aegis = {
@@ -1005,7 +1010,7 @@ def _runner(*, drain: float, launchd: float | None, by_signal: bool):
 
 def test_effective_drain_capped_only_for_signal_stops_under_launchd():
     signal_stop = _runner(drain=180.0, launchd=60.0, by_signal=True)
-    assert effective_stop_drain_timeout(signal_stop) == 50.0
+    assert effective_stop_drain_timeout(signal_stop) == _CAPPED
     # In-band restart (SIGUSR1 → after-turn → stop()) is not launchd-timed.
     assert effective_stop_drain_timeout(_runner(drain=180.0, launchd=60.0, by_signal=False)) == 180.0
     # Not launchd-owned (systemd, s6, foreground): configured drain stands.
@@ -2517,4 +2522,4 @@ def test_sigterm_handler_marks_stop_as_signal_driven_unless_planned_takeover(mon
     runner.stop = lambda: asyncio.sleep(0)
     run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
     assert runner._stop_requested_by_signal is (not takeover)
-    assert effective_stop_drain_timeout(runner) == (180.0 if takeover else 50.0)
+    assert effective_stop_drain_timeout(runner) == (180.0 if takeover else _CAPPED)

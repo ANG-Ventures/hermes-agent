@@ -4152,6 +4152,7 @@ class GatewaySlashCommandsMixin(
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                             "request_overrides": dict(result.request_overrides or {}),
+                            "capabilities": dict(result.runtime_capabilities or {}),
                         })
 
                         # Announce the deliberate switch to the conversation (P2).
@@ -4168,83 +4169,14 @@ class GatewaySlashCommandsMixin(
                                 **_switch_announce_kwargs,
                             )
 
-                        # Write-through the non-secret parts to the session
-                        # store so the picked model survives a gateway restart
-                        # (api_key is never persisted).
-                        try:
-                            await _self.async_session_store.set_model_override(
-                                _session_key,
-                                _self._session_model_overrides[_session_key],
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
-                            )
-
-                        # Evict cached agent so the next turn creates a fresh
-                        # agent from the override rather than relying on the
-                        # stale cache signature to trigger a rebuild.
-                        _self._evict_cached_agent(_session_key)
-
-                        # Persist to config (default) unless --session opted out,
-                        # mirroring the text /model command path above so a picked
-                        # model survives across sessions like a typed one (#49066).
-                        if persist_global:
-                            try:
-                                # Write-back round-trip: raw read is correct
-                                # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_user_config_raw
-                                _persist_cfg = read_user_config_raw(config_path)
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                try:
-                                    from hermes_cli.route_identity import should_clear_context_pin_async
-
-                                    if await should_clear_context_pin_async(
-                                        _persist_model_cfg.get("default")
-                                        or _persist_model_cfg.get("model"),
-                                        result.new_model,
-                                        _persist_model_cfg.get("base_url"),
-                                        result.base_url,
-                                        _persist_model_cfg.get("provider"),
-                                        result.target_provider,
-                                    ):
-                                        _persist_model_cfg.pop("context_length", None)
-                                except Exception:
-                                    _persist_model_cfg.pop("context_length", None)
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                # Named providers always resolve base_url/api_mode fresh,
-                                # so any leftover is cleared unconditionally below. Custom
-                                # providers have no registry entry to re-derive from, so
-                                # they need an explicit set-or-clear here — the previous
-                                # lone `if result.base_url:` left a stale base_url behind
-                                # when switching to a custom provider whose resolver
-                                # returned an empty base_url (#25107).
-                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                elif _is_custom_target:
-                                    _persist_model_cfg.pop("base_url", None)
-                                if _is_custom_target:
-                                    if result.api_mode:
-                                        _persist_model_cfg["api_mode"] = result.api_mode
-                                    else:
-                                        _persist_model_cfg.pop("api_mode", None)
-                                else:
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
+                        # Config write-through (--global, #49066), session-override
+                        # write-through / #100314 redundant-override drop, and the
+                        # cache eviction — one durable commit shared with the typed path.
+                        _global_error = await _self._commit_model_switch_durable(
+                            result, session_key=_session_key, source=event.source,
+                            config_path=config_path, persist_global=persist_global,
+                            one_turn=False,
+                        )
 
                         # Build confirmation text.  Use display form so opaque
                         # Palantir IDs (ri.language-model-service..*) get
@@ -4310,7 +4242,11 @@ class GatewaySlashCommandsMixin(
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if persist_global and _global_error is not None:
+                            # Never claim a clean global commit the disk did not take (#100314).
+                            lines.append(t("gateway.model.warning_prefix", warning=_global_error))
+                            lines.append(t("gateway.model.session_only_hint"))
+                        elif persist_global:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
@@ -4584,12 +4520,16 @@ class GatewaySlashCommandsMixin(
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
                 "request_overrides": dict(result.request_overrides or {}),
+                # Upstream: the override carries the route's resolved runtime capabilities
+                # (native compaction etc.) so the next agent build does not re-probe them.
+                "capabilities": dict(result.runtime_capabilities or {}),
             })
             if one_turn:
-                if not hasattr(self, "_pending_one_turn_model_restores"):
-                    self._pending_one_turn_model_restores = {}
-                self._pending_one_turn_model_restores[session_key] = (
-                    restore_snapshot or {"had_override": False, "override": None}
+                # A repeated --once before the turn runs must keep the EARLIEST snapshot: the
+                # later command's snapshot is the first temporary model, not the user's
+                # standing override (upstream _claim_one_turn_restore).
+                self._claim_one_turn_restore(
+                    session_key, restore_snapshot or {"had_override": False, "override": None},
                 )
             elif hasattr(self, "_pending_one_turn_model_restores"):
                 self._pending_one_turn_model_restores.pop(session_key, None)
@@ -4610,89 +4550,13 @@ class GatewaySlashCommandsMixin(
                     **_switch_announce_kwargs,
                 )
 
-            # Write-through the non-secret parts (model/provider/base_url) to
-            # the session store so the override survives a gateway restart.
-            # api_key/api_mode are never persisted — they are re-resolved via
-            # runtime provider resolution on rehydration.
-            #
-            # /model --once is intentionally EXCLUDED from the write-through:
-            # a one-turn override must never survive a restart. The persisted
-            # value stays at the pre-once state (the prior session override,
-            # or nothing), which is exactly what the finally-restore reverts
-            # the in-memory dict to. (#29923 review defect: the original
-            # implementation wrote through, so a crash before the restore
-            # rehydrated the once-model permanently.)
-            if not one_turn:
-                try:
-                    await self.async_session_store.set_model_override(
-                        session_key,
-                        self._session_model_overrides[session_key],
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to persist session model override", exc_info=True
-                    )
-
-            # Evict cached agent so the next turn creates a fresh agent from the
-            # override rather than relying on cache signature mismatch detection.
-            self._evict_cached_agent(session_key)
-
-            # Persist to config (default) unless --session opted out
-            if persist_global:
-                try:
-                    # Write-back round-trip: raw read is correct (merged
-                    # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    try:
-                        from hermes_cli.route_identity import should_clear_context_pin_async
-
-                        if await should_clear_context_pin_async(
-                            model_cfg.get("default") or model_cfg.get("model"),
-                            result.new_model,
-                            model_cfg.get("base_url"),
-                            result.base_url,
-                            model_cfg.get("provider"),
-                            result.target_provider,
-                        ):
-                            model_cfg.pop("context_length", None)
-                    except Exception:
-                        model_cfg.pop("context_length", None)
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    # See the picker handler above for why custom providers need an
-                    # explicit set-or-clear instead of the old lone truthy check (#25107).
-                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    elif _is_custom_target:
-                        model_cfg.pop("base_url", None)
-                    if _is_custom_target:
-                        if result.api_mode:
-                            model_cfg["api_mode"] = result.api_mode
-                        else:
-                            model_cfg.pop("api_mode", None)
-                    else:
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
+            # Session-override write-through (never for --once, #29923), config
+            # write-through (--global), the #100314 redundant-override drop and the
+            # cache eviction — one durable commit shared with the picker path.
+            _global_error = await self._commit_model_switch_durable(
+                result, session_key=session_key, source=event.source,
+                config_path=config_path, persist_global=persist_global, one_turn=one_turn,
+            )
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -4771,7 +4635,11 @@ class GatewaySlashCommandsMixin(
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global:
+            if persist_global and _global_error is not None:
+                # Never claim a clean global commit the disk did not take (#100314).
+                lines.append(t("gateway.model.warning_prefix", warning=_global_error))
+                lines.append(t("gateway.model.session_only_hint"))
+            elif persist_global:
                 lines.append(t("gateway.model.saved_global"))
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")
@@ -4830,6 +4698,52 @@ class GatewaySlashCommandsMixin(
             )
 
         return await _finish_switch()
+
+    async def _commit_model_switch_durable(
+        self, result, *, session_key: str, source, config_path, persist_global: bool, one_turn: bool,
+    ) -> Optional[str]:
+        """Durable half of a committed /model switch (fork handler; mirrors upstream's
+        ``GatewayModelCommandsMixin._record_model_switch``): config write-through via the
+        ONE persist writer (#11576390), the #100314 redundant-override rule, the session-store
+        write-through (never for ``--once``, #29923) and the cache eviction.
+
+        Returns the warning for a ``--global`` switch whose config write or stale-override
+        cleanup failed (the switch then truthfully stays a session override), else ``None``.
+        """
+        from gateway import slash_commands_model as _model_mixin
+
+        global_error: Optional[str] = None
+        if persist_global:
+            try:
+                # Resolved through the module so tests/operators can patch the writer seam.
+                await _model_mixin._persist_model_switch_to_config(result, config_path)
+            except Exception as e:
+                logger.warning("Failed to persist model switch: %s", e)
+                global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
+        # A --global switch has ONE durable authority: config.yaml. On success drop the session
+        # override (memory + store) — a redundant copy would shadow every later global change
+        # after a restart (#100314). Precedence is session > channel_overrides > config.yaml, so
+        # under a channel_overrides model the session override must stay.
+        if persist_global and global_error is None and self._channel_override_for(source) is None:
+            try:
+                await self.async_session_store.set_model_override(session_key, None)
+            except Exception as e:
+                logger.warning("Failed to clear persisted session model override: %s", e)
+                global_error = t("gateway.model.err_stale_override", error=e)
+            else:
+                self._session_model_overrides.pop(session_key, None)
+        elif not one_turn:
+            # Non-secret write-through so the override survives a restart (api_key/api_mode are
+            # re-resolved on rehydration); a --once override must NOT outlive a restart (#29923).
+            try:
+                await self.async_session_store.set_model_override(
+                    session_key, self._session_model_overrides[session_key],
+                )
+            except Exception:
+                logger.debug("Failed to persist session model override", exc_info=True)
+        # Evict cached agent so the next turn builds fresh from the override.
+        self._evict_cached_agent(session_key)
+        return global_error
 
     async def _announce_model_switch(
         self,
