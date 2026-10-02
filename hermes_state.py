@@ -210,7 +210,13 @@ def _default_db_path() -> Path:
     ``get_hermes_home()`` is resolved fresh (a runtime HERMES_HOME redirect works regardless of import)."""
     override = globals().get("DEFAULT_DB_PATH")
     if override is not None and override != _IMPORT_DEFAULT_DB_PATH:
-        return override
+        # A re-pointed module global (the hermetic conftest's per-test pin) is a PROCESS-wide
+        # redirect; a context-local profile scope (``_profile_runtime_scope`` on a served turn)
+        # is more specific and must still win, or a multiplexed secondary opens the launch
+        # profile's state.db (#94590 residue).
+        from hermes_constants import get_hermes_home_override
+        if not get_hermes_home_override():
+            return override
     return get_hermes_home() / "state.db"
 
 
