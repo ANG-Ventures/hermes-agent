@@ -44,7 +44,7 @@ def _make_runner(monkeypatch, tmp_path, config_yaml="agent:\n  reasoning_effort:
 
 
 def _yaml_load(path):
-    import yaml
+    import hermes_yaml as yaml
     try:
         with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}

@@ -5507,7 +5507,7 @@ class GatewaySlashCommandsMixin(
         """
         if not session_key:
             return False
-        import yaml
+        import hermes_yaml as yaml
         path = self._session_service_tiers_path()
         try:
             existing = {}
@@ -5573,7 +5573,7 @@ class GatewaySlashCommandsMixin(
             config_path = _gateway_config_home() / "config.yaml"
             if not config_path.exists():
                 return True
-            import yaml
+            import hermes_yaml as yaml
 
             # One immutable byte snapshot, parsed once. Do not validate one
             # read and obtain policy from a second loader: that creates a

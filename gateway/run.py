@@ -9750,15 +9750,8 @@ class GatewayRunner(
         session = getattr(source, "_restart_followup_session", None)
         if not session:
             return
-        logger.error(
-            "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
-            "user=%s: replayed follow-up refused at intake; it is DROPPED",
-            session,
-            reason,
-            getattr(getattr(source, "platform", None), "value", "unknown"),
-            getattr(source, "chat_id", None),
-            getattr(source, "user_id", None),
-        )
+        from gateway.fork_ext.restart_followups import report_refused_followup
+        report_refused_followup(source, reason)
 
     def _save_restart_failure_counts(self, counts: dict[str, dict]) -> None:
         path = self._restart_failure_counts_path()
