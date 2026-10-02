@@ -27,7 +27,8 @@ def _make_call(api_kwargs, *, deltas_sent=False, api_mode="chat_completions"):
     call.agent = SimpleNamespace(
         provider="custom", model="gpt-5.6-sol", api_mode=api_mode,
         _interrupt_requested=False,
-        _is_provider_stream_parse_error=lambda e: False,
+        # Fork contract: the stream-parse classifier also receives http_status=.
+        _is_provider_stream_parse_error=lambda e, **_kw: False,
         _buffer_status=lambda text: call.buffered.append(text),
         _disable_streaming=False, _stream_5xx_probe_ts=None,
         _fire_stream_delta=lambda text: call.deltas.append(text),
@@ -42,6 +43,8 @@ def _make_call(api_kwargs, *, deltas_sent=False, api_mode="chat_completions"):
     call.deltas_were_sent = {"yes": deltas_sent}
     call.provider_tool_in_flight = {"yes": False}
     call._request_cancelled = {"value": False}
+    # Fork: _handle_stream_error reads the stream diag (http_status) off the client pair.
+    call.clients = SimpleNamespace(diag={}, close_once=lambda *_a, **_k: None)
     return call
 
 

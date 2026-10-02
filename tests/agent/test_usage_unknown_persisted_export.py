@@ -301,11 +301,12 @@ def test_legacy_rows_read_as_measured(tmp_path):
 def _loop_accumulate(agent, names):
     """Run the SHIPPED cumulative-counter + absorbing-flag blocks.
 
-    Both are lifted from ``agent/conversation_loop.py`` by AST anchor, so a
-    refactor that moves either seam fails loudly here instead of silently
-    testing a copy that no longer ships.
+    Both are lifted from ``agent/turn_usage.py`` (upstream moved the usage-commit
+    site out of ``conversation_loop.py``) by AST anchor, so a refactor that moves
+    either seam fails loudly here instead of silently testing a copy that no
+    longer ships.
     """
-    tree = ast.parse((ROOT / "agent/conversation_loop.py").read_text())
+    tree = ast.parse((ROOT / "agent/turn_usage.py").read_text())
 
     def _lift(anchor, count):
         matches = [n for n in ast.walk(tree) if anchor(n)]
@@ -390,7 +391,13 @@ def test_cli_status_snapshot_and_cache_ratio(name):
     snapshot.update(session_flags)
     snapshot["session_prompt_tokens_unknown"] = prompt_tokens_unknown(session_flags)
 
-    tree = ast.parse((ROOT / "cli.py").read_text())
+    # Upstream moved the status-bar producer into hermes_cli/cli_status_bar_mixin.py; the
+    # fork's suppression rule now reads through ``self._cache_ratio_unknown`` (cli.py). Lift
+    # the ratio block (delta_prompt, delta_read, the if/elif chain) PLUS the two statements
+    # after the enclosing try that stamp ``cache_hit_pct`` / ``cache_hit_label``.
+    import cli as cli_mod
+
+    tree = ast.parse((ROOT / "hermes_cli/cli_status_bar_mixin.py").read_text())
     anchors = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Assign)
@@ -402,13 +409,22 @@ def test_cli_status_snapshot_and_cache_ratio(name):
     assert len(parent) == 1
     body = parent[0].body
     start = body.index(anchors[0])
-    block = body[start:start + 3]  # delta_prompt, delta_read, the if/elif chain
+    block = list(body[start:start + 3])
+    outer = [n for n in ast.walk(tree)
+             if isinstance(getattr(n, "body", None), list) and parent[0] in n.body]
+    assert len(outer) == 1, "shipped CLI cache-ratio seam moved"
+    after = outer[0].body[outer[0].body.index(parent[0]) + 1:]
+    stamps = [n for n in after if isinstance(n, (ast.Assign, ast.If))
+              and "cache_hit_" in ast.unparse(n)][:2]
+    assert len(stamps) == 2, "shipped CLI cache-ratio label stamp moved"
+    block += stamps
     exec(compile(ast.fix_missing_locations(ast.Module(body=block, type_ignores=[])),
                  "cli-cache-ratio", "exec"),
          {"snapshot": snapshot, "cur_prompt": snapshot["session_prompt_tokens"],
           "cur_read": snapshot["session_cache_read_tokens"],
           "base_prompt": 0, "base_read": 0, "max": max, "min": min,
-          "UNKNOWN_TOKENS_LABEL": "unknown"})
+          "pct": None, "ratio_unknown": False,
+          "self": SimpleNamespace(_cache_ratio_unknown=cli_mod.HermesCLI._cache_ratio_unknown)})
 
     usage = _usage(name)
     ratio_unknown = prompt_tokens_unknown(usage) or usage.cache_read_tokens_unknown
@@ -438,6 +454,7 @@ def test_usage_card_totals_say_unknown(name, capsys):
         agent=agent, conversation_history=[],
         session_start=__import__("datetime").datetime.now(),
         _print_nous_credits_block=lambda: False, _print_usage_cta=lambda: None,
+        _print_account_limits=lambda: False,  # upstream #42904 account-limits block
         verbose=False, provider=None, base_url=None, api_key=None,
     )
     cli_mod.HermesCLI._show_usage(shell)
@@ -543,8 +560,8 @@ def test_langfuse_summary_dict_path_preserves_flags(name):
     instead would test this file's own code and survive a mutation that strips
     the flags from the real reconstruction.
     """
-    from agent.usage_pricing import CanonicalUsage
-    from plugins.observability.langfuse import _unknown_usage_details
+    from agent.usage_pricing import CanonicalUsage, normalize_usage
+    from plugins.observability.langfuse import _unknown_flags_namespace, _unknown_usage_details
 
     usage = _usage(name)
     summary = {
@@ -555,26 +572,28 @@ def test_langfuse_summary_dict_path_preserves_flags(name):
         **_flags(usage),
     }
 
+    # Upstream (a764c189e7) unified the response/summary paths into one
+    # ``canonical = normalize_usage(...) if usage is None else CanonicalUsage(...)`` statement
+    # inside ``_usage_and_cost``; the fork's flag carry-over rides its summary-dict branch.
     tree = ast.parse((ROOT / "plugins/observability/langfuse/__init__.py").read_text())
     anchors = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Assign)
-        and any(ast.unparse(t) == "_cu" for t in n.targets)
+        and any(ast.unparse(t) == "canonical" for t in n.targets)
         and "CanonicalUsage(" in ast.unparse(n.value)
     ]
     assert len(anchors) == 1, "shipped summary-dict reconstruction seam moved"
     ns = {
         "CanonicalUsage": CanonicalUsage,
+        "normalize_usage": normalize_usage,
+        "_unknown_flags_namespace": _unknown_flags_namespace,
         "USAGE_UNKNOWN_FIELDS": USAGE_UNKNOWN_FIELDS,
         "usage": summary,
-        "_input": summary["input_tokens"], "_output": summary["output_tokens"],
-        "_cache_read": summary["cache_read_tokens"],
-        "_cache_write": summary["cache_write_tokens"],
-        "_reasoning": summary["reasoning_tokens"],
+        "raw_usage": None, "provider": "anthropic", "api_mode": "",
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[anchors[0]], type_ignores=[])),
                  "langfuse-summary-dict", "exec"), ns)
-    rebuilt = ns["_cu"]
+    rebuilt = ns["canonical"]
 
     for key, expected in _flags(usage).items():
         assert getattr(rebuilt, key) is expected, (

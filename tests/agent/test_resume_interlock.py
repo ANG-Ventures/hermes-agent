@@ -70,7 +70,7 @@ def test_resume_summary_only_blocks_forward_tool_call_and_logs(caplog):
         _mock_tool_call("terminal", '{"command":"touch should-not-run"}', "call-1")
     )
 
-    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+    with patch("model_tools.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
         agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
 
     mock_hfc.assert_not_called()
@@ -87,7 +87,7 @@ def test_resume_summary_only_blocks_every_tool_round_in_same_turn():
     agent = _make_agent("terminal")
     agent._resume_summary_only = True
 
-    with patch("run_agent.handle_function_call", return_value="executed") as mock_hfc:
+    with patch("model_tools.handle_function_call", return_value="executed") as mock_hfc:
         agent._execute_tool_calls_sequential(
             _assistant_message(_mock_tool_call("terminal", "{}", "call-1")),
             [],
@@ -109,7 +109,7 @@ def test_resume_summary_only_read_tool_block_does_not_emit_violation(caplog):
     agent.tool_progress_callback = MagicMock()
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+    with patch("model_tools.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
         agent._execute_tool_calls_sequential(
             _assistant_message(_mock_tool_call("read_file", '{"path":"README.md"}', "call-1")),
             messages,
@@ -129,7 +129,7 @@ def test_normal_turn_executes_tools_without_interference():
     messages = []
     assistant_message = _assistant_message(_mock_tool_call("terminal", "{}", "call-1"))
 
-    with patch("run_agent.handle_function_call", return_value="executed") as mock_hfc:
+    with patch("model_tools.handle_function_call", return_value="executed") as mock_hfc:
         agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
 
     mock_hfc.assert_called_once()

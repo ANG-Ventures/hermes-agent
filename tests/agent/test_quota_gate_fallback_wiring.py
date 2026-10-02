@@ -267,11 +267,14 @@ def test_all_exhausted_terminal_response_names_soonest_reset(monkeypatch):
 
 def test_turn_prologue_resets_snapshot_derived_gate_state():
     """The cached gateway-agent path must clear gate state every turn."""
-    from agent.turn_context import build_turn_context
+    from agent.turn_context import _bind_turn_identity, build_turn_context
 
+    # Upstream extracted the per-turn identity/state binding into
+    # _bind_turn_identity; the reset lives there and the facade calls it
+    # BEFORE the primary restore.
+    assert "reset_quota_gate_turn_state(agent)" in inspect.getsource(_bind_turn_identity)
     source = inspect.getsource(build_turn_context)
-    assert "reset_quota_gate_turn_state(agent)" in source
-    assert source.index("reset_quota_gate_turn_state(agent)") < source.index(
+    assert source.index("_bind_turn_identity(") < source.index(
         "agent._restore_primary_runtime()"
     )
 

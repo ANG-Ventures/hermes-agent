@@ -1195,6 +1195,21 @@ def _init_fallback_chain(agent, fallback_model):
             print(f"🔄 Fallback chain ({len(chain)} providers): " + " → ".join(labels))
 
 
+def _tool_catalog_fn(name: str):
+    """Resolve ``get_tool_definitions`` / ``check_toolset_requirements`` honoring BOTH patch
+    contracts: fork tests patch ``run_agent.<name>`` (the facade re-export), upstream tests
+    patch ``model_tools.<name>``. A patched facade attribute wins; otherwise read model_tools
+    so a ``model_tools`` patch is not shadowed by the facade's import-time copy."""
+    import model_tools
+
+    facade = getattr(_ra(), name, None)
+    pristine = (
+        facade is None
+        or (getattr(facade, "__module__", None) == "model_tools" and getattr(facade, "__name__", None) == name)
+    )
+    return getattr(model_tools, name) if pristine else facade
+
+
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     # A multiplexed gateway may have switched HERMES_HOME since model_tools was imported;
     # make sure this profile's plugins are discovered before the tool snapshot.
@@ -1210,7 +1225,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
+    agent.tools = _tool_catalog_fn("get_tool_definitions")(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
@@ -1239,7 +1254,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
             print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
         if disabled_toolsets:
             print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
-        requirements = _ra().check_toolset_requirements()
+        requirements = _tool_catalog_fn("check_toolset_requirements")()
         missing_reqs = [name for name, available in requirements.items() if not available]
         if missing_reqs:
             agent._safe_print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}", diagnostic=True)

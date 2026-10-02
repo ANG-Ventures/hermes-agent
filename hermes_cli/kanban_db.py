@@ -7899,11 +7899,13 @@ def _pid_create_time(pid: int) -> Optional[float]:
     if os.name == "posix":
         try:
             from datetime import datetime
+            from tools.environments.local import build_subprocess_env
             proc = subprocess.run(
                 ["ps", "-o", "lstart=", "-p", str(int(pid))],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", timeout=1,
-                env={**os.environ, "LC_ALL": "C"}, check=False,
+                env=build_subprocess_env(scrub_secrets=False, inherit_profile_home=False, extra={"LC_ALL": "C"}),
+                check=False,
             )
             if proc.returncode == 0:
                 return datetime.strptime(

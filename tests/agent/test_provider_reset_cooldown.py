@@ -31,7 +31,10 @@ def _fallback_client():
     ("reset_at", "expected_seconds"),
     [
         (1_700_000_090.2, 91),
-        (1_700_274_291, 274_291),
+        # Fork guard (test_quota_window_cooldown): a provider reset with no
+        # positively-identified 7d quota window is clamped to 6h, so a ~3.2-day
+        # retry-after benches the primary for 21_600 s, not 274_291.
+        (1_700_274_291, 6 * 60 * 60),
         (None, 60),
         ("not-a-timestamp", 60),
         (1_699_999_999, 60),

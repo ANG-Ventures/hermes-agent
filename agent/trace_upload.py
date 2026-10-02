@@ -112,10 +112,11 @@ def _git_branch(cwd: str) -> str:
         return ""
     try:
         import subprocess
+        from hermes_cli._subprocess_compat import noninteractive_git_env
         r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, cwd=cwd,
                            stdin=subprocess.DEVNULL,
-                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})  # read-only probe: never refresh the index (fork #822)
+                           env={**noninteractive_git_env(), "GIT_OPTIONAL_LOCKS": "0"})  # read-only probe: never refresh the index (fork #822)
     except Exception:
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""

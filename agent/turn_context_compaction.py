@@ -21,6 +21,7 @@ from agent.context_engine import (
     trigger_compare_tokens_for as _trigger_compare_tokens_for,
 )
 from agent.conversation_compression import (
+    ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE, ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE,
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock, conversation_history_after_compression,
 )
@@ -534,12 +535,52 @@ def _engine_preflight_maintenance(
         return
     if not _wants_engine_preflight:
         return
+    _engine_name = getattr(_compressor, "name", type(_compressor).__name__)
+    _engine_threshold = getattr(_compressor, "threshold_tokens", 0)
     logger.info(
         "Engine-driven preflight maintenance: %s requested "
         "compress() at ~%s tokens (below %s threshold)",
-        getattr(_compressor, "name", type(_compressor).__name__),
-        f"{_preflight_tokens:,}", f"{getattr(_compressor, 'threshold_tokens', 0):,}",
+        _engine_name, f"{_preflight_tokens:,}", f"{_engine_threshold:,}",
     )
+    # Name the ARM that fired, and WHY: every other compaction path announces itself, so a
+    # below-threshold engine-driven compaction was the one event with no explanation
+    # (fork 5636a8a6d5 / 89b3c1a71f). Name the trigger when the engine exposes one.
+    _engine_reason = ""
+    try:
+        _engine_reason = str(getattr(_compressor, "last_preflight_reason", "") or "").strip()
+    except Exception:
+        _engine_reason = ""
+    if _engine_reason:
+        _engine_preflight_default = ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE.format(
+            engine=_engine_name, tokens=_preflight_tokens, threshold=_engine_threshold, reason=_engine_reason,
+        )
+    else:
+        _engine_preflight_default = ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE.format(
+            engine=_engine_name, tokens=_preflight_tokens, threshold=_engine_threshold,
+        )
+    _engine_preflight_status = automatic_compaction_status_message(
+        _compressor, phase="engine_preflight_maintenance", default_message=_engine_preflight_default,
+        approx_tokens=_preflight_tokens, threshold_tokens=_engine_threshold, model=agent.model,
+    )
+    if _engine_preflight_status:
+        # Ask the engine whether this pass is worth telling the user about: a sanitize-only
+        # cleanup adoption RUNS but folds nothing, so announcing it emits "maintenance
+        # compaction ... this may take a moment" and then no stats (fork 829d4e0f3e).
+        # Absent hook => announce, so engines that never implement it are unchanged.
+        _preflight_visible = True
+        try:
+            _visible_hook = getattr(_compressor, "preflight_is_user_visible", None)
+            if callable(_visible_hook):
+                _preflight_visible = bool(_visible_hook())
+        except Exception:
+            # A buggy engine must never silence a real compaction.
+            _preflight_visible = True
+        if _preflight_visible:
+            agent._emit_status(_engine_preflight_status)
+        else:
+            logger.debug(
+                "Engine preflight pass is not user-visible (sanitize-only); suppressing compaction status"
+            )
     _engine_input = out.messages
     out.messages, out.active_system_prompt = agent._compress_context(
         _engine_input, system_message, approx_tokens=_preflight_tokens, task_id=effective_task_id,

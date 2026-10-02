@@ -239,7 +239,8 @@ class TestCallSiteIsWired:
         import ast
         import inspect
 
-        import agent.conversation_loop as cl
+        # Upstream moved the backoff selection into turn_recovery.compute_error_backoff.
+        import agent.turn_recovery as cl
 
         tree = ast.parse(inspect.getsource(cl))
         calls = [
@@ -263,6 +264,6 @@ class TestCallSiteIsWired:
     def test_probe_is_called_in_the_loop(self):
         import inspect
 
-        import agent.conversation_loop as cl
+        import agent.turn_recovery as cl
 
         assert "pool_seat_exhaustion_state(agent)" in inspect.getsource(cl)

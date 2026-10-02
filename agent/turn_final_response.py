@@ -117,6 +117,39 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+
+    # ── Known placeholder final text (t_887f9584) ─────────────────────────
+    # Runs at the seam where final_response is derived, BEFORE the empty ladder /
+    # partial-stream recovery below, so a bridge closer ("Proceeding.") or an
+    # echoed CLI placeholder is routed as empty-after-tools (once-only nudge) or
+    # replaced by a visible notice instead of being delivered as the answer.
+    from agent.conversation_loop import _TURN_ENDED_WITHOUT_REPLY, classify_placeholder_final_text
+
+    _placeholder_route = classify_placeholder_final_text(
+        final_response,
+        prior_was_tool=any(m.get("role") == "tool" for m in messages[-5:]),
+        already_nudged=getattr(agent, "_post_tool_empty_retried", False),
+        provider=getattr(agent, "provider", None),
+        history=messages,
+    )
+    if _placeholder_route is not None:
+        logger.warning(
+            "Final text is a known placeholder %r — %s (model=%s provider=%s)",
+            final_response,
+            "treating as empty after tool calls" if _placeholder_route == "empty" else "replacing with a visible notice",
+            agent.model, agent.provider,
+        )
+        final_response = "" if _placeholder_route == "empty" else _TURN_ENDED_WITHOUT_REPLY
+        # The streamed buffer holds the same placeholder; partial-stream recovery
+        # (turn_empty_response) must not resurrect it.
+        agent._current_streamed_assistant_text = ""
+        try:
+            assistant_message.content = final_response
+        except Exception:
+            pass
+        if _placeholder_route == "notice":
+            agent._emit_status("⚠️ Model ended the turn with a placeholder instead of a reply")
+
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False

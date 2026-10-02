@@ -165,10 +165,13 @@ class TestCodexVocabulary:
         with model=gpt-6.1-sol, reasoning.effort=max -> HTTP 200, and both
         response.created and response.completed echo effort 'max'. 'max' must
         not clamp to xhigh on 6.1, including the -900k window alias."""
-        from agent.reasoning_effort import CODEX_GPT56_EFFORTS, codex_supported_efforts
+        from agent.reasoning_effort import CODEX_ASTRA_EFFORTS, codex_supported_efforts
 
+        # Upstream live-probed 2026-09-29 that ``none`` 400s on 6.1 Sol, so it takes
+        # Astra's low..max ladder (NO_DISABLE_TIER_PREFIXES); 'max' still passes.
         for slug in ("gpt-6.1-sol", "gpt-6.1-sol-900k", "openai/gpt-6.1-sol"):
-            assert codex_supported_efforts(slug) is CODEX_GPT56_EFFORTS, slug
+            assert codex_supported_efforts(slug) is CODEX_ASTRA_EFFORTS, slug
+            assert "max" in codex_supported_efforts(slug)
             assert clamp_effort("max", codex_supported_efforts(slug)) == "max"
 
     @pytest.mark.parametrize(

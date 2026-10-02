@@ -244,7 +244,7 @@ def _persisted_content_projection(msg: Dict[str, Any], content: Any) -> Any:
     Shared by the first write and the in-place content re-persist so both
     store the same projection of a multimodal list.
     """
-    from agent.message_sanitization import _multimodal_message_text_projection
+    from agent.tool_dispatch_helpers import _multimodal_message_text_projection
 
     _multimodal_projection = _multimodal_message_text_projection(
         {**msg, "content": content}
@@ -359,8 +359,11 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     ):
         api_content = content
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
+    # Fork: persist the same image-free projection the next turn boundary uses (the exact
+    # producer ``text_summary`` sidecar wins over the generic text+[screenshot] projection), so
+    # live history and rebuilt requests stay byte-identical (tests/agent/test_tool_name_db_persistence).
     row = {
-        "role": role, "content": _durable_content(content),
+        "role": role, "content": _persisted_content_projection(msg, content),
         "tool_name": msg.get("tool_name") or (msg.get("name") if role == "tool" else None),
         "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
         "tool_call_id": msg.get("tool_call_id"), "effect_disposition": msg.get("effect_disposition"),

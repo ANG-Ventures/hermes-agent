@@ -1853,9 +1853,15 @@ class TestBedrockIamStreamingFallback:
 
 
 class _AnthropicEventStream:
-    """``messages.stream()`` context manager that yields *events* then raises *error* mid-stream."""
+    """``messages.stream()`` context manager that yields *events* then raises *error* mid-stream.
 
-    response = None
+    Fork contract (agent.stream_diag.is_provider_stream_parse_error): jiter's broad
+    ``expected value at line`` wording only counts as a provider stream-parse error when the
+    HTTP response opened 2xx (stream_diag_capture_response snapshots ``response.status_code``),
+    so the stub carries a 200 response like the real MessageStream does.
+    """
+
+    response = SimpleNamespace(status_code=200, headers={})
 
     def __init__(self, events, error):
         self._events, self._error = events, error

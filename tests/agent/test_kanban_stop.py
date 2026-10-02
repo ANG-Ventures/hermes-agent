@@ -240,11 +240,13 @@ def test_empty_toolset_does_not_nudge(clear_kanban_env):
 def test_conversation_loop_passes_agent_tools_to_stop_guard():
     # The loop must thread the live toolset into the guard, otherwise the
     # module-level fix above is inert in production.
+    # Upstream moved the stop gates out of conversation_loop into
+    # agent/turn_stop_gates.py; the guard call lives in _kanban_stop_nudge there.
     import inspect
-    from agent import conversation_loop
+    from agent import turn_stop_gates
 
-    src = inspect.getsource(conversation_loop)
-    call = src[src.index("_kanban_nudge = build_kanban_stop_nudge("):]
+    src = inspect.getsource(turn_stop_gates._kanban_stop_nudge)
+    call = src[src.index("return build_kanban_stop_nudge("):]
     call = call[: call.index("except Exception")]
     assert 'tools=getattr(agent, "tools", None)' in call
 
@@ -385,8 +387,9 @@ def test_non_worker_does_not_nudge(clear_kanban_env):
 def test_closed_run_needs_no_tool_history(worker_run, handoff):
     conn, task = worker_run
     if handoff == "complete":
+        # Upstream #117483: a completion must carry result/summary evidence.
         assert kb.complete_task(conn, task.id, metadata={"tests_run": 1},
-                                expected_run_id=task.current_run_id)
+                                result="closed by test", expected_run_id=task.current_run_id)
     elif handoff == "block":
         assert kb.block_task(
             conn, task.id, reason="Missing input", expected_run_id=task.current_run_id,

@@ -835,23 +835,25 @@ class TestCodexOAuthContextLength:
     def test_gpt6_sol_luna_variant_resolves_to_measured_872k(self, slug, expected):
         """Both slugs advertise 272K on the codex-sub catalog but report
         max_context_window=872,000 (measured 2026-09-22). Only the explicit
-        ``-900k`` opt-in variant resolves to that cap."""
+        ``-900k`` opt-in variant resolves to that cap — since the 2026-10-01
+        parity sync the verified table says 900K and the live catalog's
+        ``max_context_window`` caps the bump dynamically (#105443)."""
         from agent.model_metadata import get_model_context_length
 
         fake_response = MagicMock()
         fake_response.status_code = 200
         fake_response.json.return_value = {
-            "models": [{"slug": slug, "context_window": 272_000}]
+            "models": [{"slug": slug, "context_window": 272_000, "max_context_window": 872_000}]
         }
         import agent.model_metadata as mm
         mm._codex_oauth_context_cache = {}
-        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+        with patch("agent.model_metadata.model_metadata_http.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
                 model=slug + "-900k",
                 base_url="https://chatgpt.com/backend-api/codex",
-                api_key="fake-token",
+                api_key=_codex_jwt("fake-token"),
                 provider="openai-codex",
             )
         assert ctx == expected
@@ -868,13 +870,13 @@ class TestCodexOAuthContextLength:
         }
         import agent.model_metadata as mm
         mm._codex_oauth_context_cache = {}
-        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+        with patch("agent.model_metadata.model_metadata_http.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
                 model=slug,
                 base_url="https://chatgpt.com/backend-api/codex",
-                api_key="fake-token",
+                api_key=_codex_jwt("fake-token"),
                 provider="openai-codex",
             )
         assert ctx == 272_000
@@ -882,7 +884,9 @@ class TestCodexOAuthContextLength:
     @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
     def test_gpt6_sol_luna_offline_fallback_also_bumped(self, slug):
         """With the live probe down, the 272K fallback-table entry for an
-        opted-in variant is bumped the same way."""
+        opted-in variant is bumped the same way. No catalog ``max_context_window``
+        is available offline, so the bump lands on the verified 900K cap
+        (upstream #105443 contract adopted by the 2026-10-01 parity sync)."""
         from agent.model_metadata import get_model_context_length
 
         fake_response = MagicMock()
@@ -890,7 +894,7 @@ class TestCodexOAuthContextLength:
         fake_response.json.return_value = {}
         import agent.model_metadata as mm
         mm._codex_oauth_context_cache = {}
-        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+        with patch("agent.model_metadata.model_metadata_http.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
@@ -899,7 +903,7 @@ class TestCodexOAuthContextLength:
                 api_key="expired-token",
                 provider="openai-codex",
             )
-        assert ctx == 872_000
+        assert ctx == 900_000
 
     @pytest.mark.parametrize("slug", ["gpt-5.6-sol-900k"])
     def test_fallback_table_resolution_also_bumped(self, slug):
@@ -948,10 +952,11 @@ class TestCodexOAuthContextLength:
     # (model_id, is_valid_variant, expected_ctx, expected_wire_model)
     _900K_TABLE = [
         ("gpt-5.6-sol-900k",              True,  900_000, "gpt-5.6-sol"),
-        # GPT-6 Sol/Luna: catalog-measured max_context_window 872,000
-        # (2026-09-22), so their opt-in variant resolves to 872K, not 900K.
-        ("gpt-6-sol-900k",                True,  872_000, "gpt-6-sol"),
-        ("gpt-6-luna-900k",               True,  872_000, "gpt-6-luna"),
+        # GPT-6 Sol/Luna: verified 900K; a live catalog max_context_window
+        # (872,000 measured 2026-09-22) caps the bump dynamically (#105443) —
+        # this table's mock catalog publishes none, so the verified cap holds.
+        ("gpt-6-sol-900k",                True,  900_000, "gpt-6-sol"),
+        ("gpt-6-luna-900k",               True,  900_000, "gpt-6-luna"),
         ("gpt-5.6-terra-900k",            True,  900_000, "gpt-5.6-terra"),
         ("gpt-5.6-luna-900k",             True,  900_000, "gpt-5.6-luna"),
         ("gpt-5.4-900k",                  True,  900_000, "gpt-5.4"),
@@ -1675,8 +1680,8 @@ class TestClaudeProxyContextLengthContract:
         base_url = "http://100.92.54.25:18801/anthropic"  # a real apx tailscale endpoint shape
 
         with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
-             patch("agent.model_metadata.requests.get",
-                   return_value=self._mock_models_response(self._PROXY_MODELS_BODY)):
+             patch("agent.model_metadata.model_metadata_http.stream",
+                   return_value=_streamed(self._mock_models_response(self._PROXY_MODELS_BODY))):
             meta = mm.fetch_endpoint_model_metadata(base_url, api_key="", force_refresh=True)
 
         assert meta.get("claude-fable-5", {}).get("context_length") == 1_000_000
@@ -1692,8 +1697,8 @@ class TestClaudeProxyContextLengthContract:
         base_url = "http://127.0.0.1:18810/anthropic"  # the claude-apr pool passthrough
 
         with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
-             patch("agent.model_metadata.requests.get",
-                   return_value=self._mock_models_response(self._PROXY_MODELS_BODY)):
+             patch("agent.model_metadata.model_metadata_http.stream",
+                   return_value=_streamed(self._mock_models_response(self._PROXY_MODELS_BODY))):
             ctx = mm._resolve_endpoint_context_length("claude-fable-5", base_url, api_key="")
 
         assert ctx == 1_000_000, (
@@ -1715,8 +1720,8 @@ class TestClaudeProxyContextLengthContract:
         }
 
         with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
-             patch("agent.model_metadata.requests.get",
-                   return_value=self._mock_models_response(prefix_bug_body)):
+             patch("agent.model_metadata.model_metadata_http.stream",
+                   return_value=_streamed(self._mock_models_response(prefix_bug_body))):
             ctx = mm._resolve_endpoint_context_length("claude-fable-5", base_url, api_key="")
 
         assert ctx is None, (
@@ -1788,8 +1793,8 @@ class TestClaudeProxyContextLengthContract:
 
         def requests_get(url, *a, **k):
             if url.rstrip("/").endswith("/models"):
-                return self._mock_models_response(openai_catalog)
-            return _resp(404, {})
+                return _streamed(self._mock_models_response(openai_catalog))
+            return _streamed(_resp(404, {}))
 
         httpx_client = MagicMock()
         httpx_client.__enter__ = lambda s: httpx_client
@@ -1798,7 +1803,7 @@ class TestClaudeProxyContextLengthContract:
         httpx_client.post.side_effect = lambda url, *a, **k: _resp(200, {})  # /api/show → {}
 
         with patch("httpx.Client", return_value=httpx_client), \
-             patch("agent.model_metadata.requests.get", side_effect=requests_get):
+             patch("agent.model_metadata.model_metadata_http.stream", side_effect=requests_get):
             ctx = mm.get_model_context_length(
                 model="claude-fable-5", base_url=base_url, api_key="",
                 provider="claude-apx-1",
@@ -2340,20 +2345,24 @@ class TestMoAContextLength:
     def test_provider_specific_cache_is_not_reconciled_as_aggregator(
         self, tmp_path, monkeypatch
     ):
-        """Dedicated provider limits still win over the native model window."""
-        import yaml as _yaml
+        """Dedicated provider limits still win over the native model window.
+
+        Since the 2026-10-01 parity sync a Bedrock cache row is only reused when it
+        carries the ``bedrock_confirmed_v1`` provenance marker (legacy scalars are
+        ignored until a probe replaces them — see TestBedrockContextCachePersistence),
+        so the row is written through ``save_context_length(source=...)``."""
         import agent.model_metadata as mm
         from agent import models_dev
 
         cache_file = tmp_path / "context_length_cache.yaml"
-        key = "claude-fable-5@https://bedrock-runtime.us-east-1.amazonaws.com"
-        cache_file.write_text(_yaml.safe_dump({"context_lengths": {key: 200000}}))
+        base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
         monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
+        mm.save_context_length("claude-fable-5", base_url, 200000, source="bedrock-confirmed-v1")
 
         with patch.object(models_dev, "fetch_models_dev", return_value=_AGG_MODELS_DEV_SAMPLE) as fetch:
             ctx = mm.get_model_context_length(
                 "claude-fable-5",
-                base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+                base_url=base_url,
                 provider="bedrock",
             )
 

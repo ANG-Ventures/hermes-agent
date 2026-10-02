@@ -659,7 +659,7 @@ class TestRateLimitCooldown:
 
     def test_cooldown_uses_retry_after_context_on_rate_limit_reason(self):
         """Fallback cooldown should honor provider retry-after/reset windows."""
-        from run_agent import FailoverReason
+        from agent.error_classifier import FailoverReason
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
