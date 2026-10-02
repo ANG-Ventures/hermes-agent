@@ -265,6 +265,7 @@ def build_index(repo: Path, modules, *, noqa_token: str | None = None) -> dict:
     token = noqa_token or _NOQA_TOKEN
     index: dict = {}
     _IMPORT_MAPS.clear()
+    _FAMILY_CACHE.clear()
     for rel in sorted(modules):
         path = repo / rel
         try:
@@ -422,7 +423,12 @@ def _resolve(name: str, current_file: str, start_file: str, index, by_name,
     if imported is not None and imported in index:
         yield imported
         return
-    for candidate_file in (current_file, start_file):
+    # Tier 2 also covers the file's MIXIN FAMILY: upstream (parity 2026-10-01) split
+    # gateway/run.py into run_*.py and gateway/session.py into session_*.py mixin modules
+    # composing ONE class, so ``self._save`` inside session.py's body now resolves to the def
+    # in session_persistence.py. Without this the walk fell through to ``start_file`` and
+    # charged kanban_watchers.py's unrelated ``_save`` (os.replace) to a SessionStore chain.
+    for candidate_file in (current_file, *_mixin_family(current_file, index), start_file):
         key = (candidate_file, name)
         if key in index:
             yield key
@@ -437,6 +443,35 @@ def _resolve(name: str, current_file: str, start_file: str, index, by_name,
     unique = by_name.get(name, ())
     if len(unique) == 1:
         yield unique[0]
+
+
+_FAMILY_CACHE: dict[str, tuple[str, ...]] = {}
+
+
+def _mixin_family(rel: str, index) -> tuple[str, ...]:
+    """Sibling modules of ``rel`` that compose the same class: ``<dir>/<base>.py`` plus every
+    ``<dir>/<base>_*.py``, where ``<base>`` is the shortest ``_``-prefix of the stem for which
+    ``<dir>/<base>.py`` is indexed (``session_persistence`` -> ``session``; ``slash_commands_model``
+    -> ``slash_commands``; ``api_server_room_grants`` -> ``api_server``). Never includes ``rel``."""
+    cached = _FAMILY_CACHE.get(rel)
+    if cached is not None:
+        return cached
+    files = {key[0] for key in index}
+    directory, _, filename = rel.rpartition("/")
+    stem = filename[: -len(".py")] if filename.endswith(".py") else filename
+    parts = stem.split("_")
+    family: tuple[str, ...] = ()
+    for cut in range(1, len(parts) + 1):
+        base = "_".join(parts[:cut])
+        base_rel = f"{directory}/{base}.py" if directory else f"{base}.py"
+        if base_rel in files:
+            prefix = f"{directory}/{base}_" if directory else f"{base}_"
+            members = sorted(f for f in files if f == base_rel or (
+                f.startswith(prefix) and "/" not in f[len(prefix):]))
+            family = tuple(f for f in members if f != rel)
+            break
+    _FAMILY_CACHE[rel] = family
+    return family
 
 
 def ratchet_key(offender: str) -> str:

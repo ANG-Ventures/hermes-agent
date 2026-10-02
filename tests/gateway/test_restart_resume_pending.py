@@ -28,6 +28,7 @@ import asyncio
 import inspect
 import os
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1325,18 +1326,19 @@ async def test_startup_restore_replay_cancellation_retains_current_and_tail():
 
 def test_gateway_start_arms_restore_watchdog_before_platform_connects():
     """The absolute deadline is wired at the same point as the global gate."""
-    source = inspect.getsource(GatewayRunner.start)
+    # Upstream (parity 2026-10-01) split start() into _start_impl + helpers; the per-platform
+    # adapter creation/connect loop now lives behind _start_prefilter_platforms.
+    source = inspect.getsource(GatewayRunner._start_impl)
     gate_arm = source.index("self._startup_restore_in_progress = True")
     arm_log = source.index(
         "PHASE=startup_restore_gate_flip state=armed caller=start", gate_arm
     )
     watchdog_arm = source.index("self._startup_restore_gate_watchdog()", gate_arm)
-    connect_loop = source.index(
-        "for platform, platform_config in self.config.platforms.items()", gate_arm
-    )
+    connect_loop = source.index("await self._start_prefilter_platforms()", gate_arm)
 
     assert gate_arm < arm_log < watchdog_arm < connect_loop
-    assert '"timeout=%.3fs"' in source[arm_log:watchdog_arm]
+    # The arm log carries the drain bound (the literal may be one string or two).
+    assert "timeout=%.3fs" in source[arm_log:watchdog_arm]
 
 
 def test_adapter_replay_contract_defines_exception_as_not_accepted():
@@ -1425,9 +1427,24 @@ async def test_one_raising_replay_neither_wedges_gate_nor_eats_queue(monkeypatch
 
     await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
 
+    # Fork contract (differs from upstream, which DROPS a raising replay): the gate opens
+    # BEFORE the replay owner runs, the raising event is RETAINED and retried with back-off,
+    # and the other session is promoted ahead of it — nothing is lost
+    # (test_startup_restore_replay_error_fails_open pins the retention side).
     assert runner._startup_restore_in_progress is False
-    assert handled == ["second"]
-    assert runner._startup_restore_queue == []
+    replay_task = runner._startup_restore_replay_task
+    assert replay_task is not None
+    try:
+        for _ in range(50):
+            if handled == ["second"]:
+                break
+            await asyncio.sleep(0.02)
+        assert handled == ["second"]
+        assert [ev.text for ev in runner._startup_restore_queue] == ["first"]
+    finally:
+        replay_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await replay_task
 
 
 @pytest.mark.asyncio
@@ -1453,11 +1470,21 @@ async def test_post_drain_inbound_processes_instead_of_queueing(monkeypatch):
     assert runner._startup_restore_in_progress is False
 
     # The next inbound event reads the flag at run_inbound's gate; with the gate
-    # open it proceeds past the queueing branch rather than appending.
+    # open it proceeds past the queueing branch rather than appending. (Fork contract:
+    # the raising "doomed" replay itself is RETAINED in the queue and retried with
+    # back-off by the replay owner, never dropped.)
     late = MessageEvent(text="late", message_type=MessageType.TEXT,
                         source=make_restart_source(chat_id="late-chat"))
-    await runner._handle_message(late)
-    assert runner._startup_restore_queue == []
+    try:
+        await runner._handle_message(late)
+        assert late not in runner._startup_restore_queue
+        assert [ev.text for ev in runner._startup_restore_queue] == ["doomed"]
+    finally:
+        replay_task = runner._startup_restore_replay_task
+        if replay_task is not None:
+            replay_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await replay_task
 
 
 # ---------------------------------------------------------------------------

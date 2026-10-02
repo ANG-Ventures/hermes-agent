@@ -643,7 +643,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._display_name = str(profiles[0].get("display_name") or "").strip()
         self._self_npub = hex_to_npub(self._self_pubkey) or ""
         # Two profiles must not drive the same identity on one relay (duplicate replies, split de-dupe state).
-        if not self._acquire_platform_lock(
+        if not await self._acquire_platform_lock_async(
                 "buzz", f"{self.relay_url}:{self._self_pubkey}", f"Buzz identity {self._self_pubkey[:8]}… on {self.relay_url}"):
             return False
         # Map channel ids to names and pick the watch set.
@@ -674,7 +674,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             await self._seed_channel(channel_id, chat_type="group")
         await self._discover_dms(seed=True)
-        self._save_cursors()
+        await asyncio.to_thread(self._save_cursors)  # atomic_json_write: never on the loop
         # Prefer the NIP-42 WebSocket push; poll when it can't be established (auto) or the user pinned "poll".
         transport_used = "poll"
         if self.transport in ("auto", "websocket"):

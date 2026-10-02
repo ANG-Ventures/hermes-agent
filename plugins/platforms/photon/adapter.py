@@ -1034,7 +1034,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 try:
                     resp = await client.post(self._sidecar_url("/healthz"), headers=self._sidecar_headers())
                     if resp.status_code == 200:  # let out-of-process senders (cron) reach this sidecar
-                        _write_runtime_record(self._sidecar_port, self._sidecar_token, self._sidecar_proc.pid)
+                        await asyncio.to_thread(  # atomic_json_write: never on the loop
+                            _write_runtime_record, self._sidecar_port, self._sidecar_token, self._sidecar_proc.pid)
                         return
                 except httpx.RequestError as e:
                     last_err = e
