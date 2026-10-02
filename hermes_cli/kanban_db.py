@@ -3346,8 +3346,11 @@ def _refuse_noncanonical_board_path(path: Path) -> None:
     """Raise :class:`KanbanNonCanonicalBoardPathError` for ``kanban/boards/default/kanban.db``.
 
     Structural (path shape only), so it holds under any root, pin or sandbox.
+    Judged on the RESOLVED target, not the spelling: a relative ``kanban.db``
+    from a ``boards/default`` cwd, a ``boards/default/../default/kanban.db``
+    and a symlinked parent all land on the same file (Prism d0894d0cbe77).
     """
-    p = Path(path)
+    p = Path(path).expanduser().resolve(strict=False)
     if (
         p.name == "kanban.db"
         and p.parent.name == DEFAULT_BOARD
