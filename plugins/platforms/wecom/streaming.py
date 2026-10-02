@@ -241,7 +241,15 @@ class WeComStreamMixin:
     async def _send_stream_reply(self, reply_req_id: str, stream_id: str, content: str, finish: bool = False) -> Dict[str, Any]:
         """Send one ``msgtype: "stream"`` frame: intermediates non-blocking/skip-if-pending, the final frame awaits
         its ack so 846608/6000 are detected. Raises WeComStreamExpiredError on expiry."""
-        truncated = self._truncate_stream_content(content or "", self.MAX_STREAM_CONTENT_LENGTH)
+        if finish:
+            # The final frame is what stays on screen: keep the start AND the
+            # end (the conclusion) within the byte cap (t_11223645).
+            # Intermediate frames stay a head preview; the final replaces them.
+            from gateway.platforms.base import keep_head_and_tail_text
+
+            truncated = keep_head_and_tail_text(content or "", self.MAX_STREAM_CONTENT_LENGTH, utf8_bytes=True)
+        else:
+            truncated = self._truncate_stream_content(content or "", self.MAX_STREAM_CONTENT_LENGTH)
         if len(content or "") != len(truncated):
             logger.warning("[%s] Stream content truncated for stream_id=%s", self.name, stream_id)
         body: Dict[str, Any] = {"msgtype": "stream", "stream": {"id": stream_id, "finish": bool(finish), "content": truncated}}
