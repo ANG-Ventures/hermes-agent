@@ -3427,6 +3427,24 @@
       }
     },
     {
+      "name": "session.redo",
+      "summary": "Fork: re-activate the last n undone half-turns of an idle session (DB-backed /redo).",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionRedoParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionRedoResult"
+        }
+      }
+    },
+    {
       "name": "session.resume",
       "summary": "Attach to a stored session: reuse it if live here, else lazy / deferred / cold / eager rebuild.",
       "params": [
@@ -31044,6 +31062,107 @@
           "reason"
         ],
         "title": "SessionReclaimedPayload",
+        "type": "object"
+      },
+      "SessionRedoParams": {
+        "additionalProperties": false,
+        "description": "Fork: ``n`` (alias ``count``) half-turns to re-activate; default 1.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "n": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "N"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Count"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionRedoParams",
+        "type": "object"
+      },
+      "SessionRedoResult": {
+        "additionalProperties": false,
+        "properties": {
+          "reactivated_count": {
+            "title": "Reactivated Count",
+            "type": "integer"
+          },
+          "new_tail_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "New Tail Id"
+          },
+          "prefill_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prefill Text"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message"
+          }
+        },
+        "required": [
+          "reactivated_count"
+        ],
+        "title": "SessionRedoResult",
         "type": "object"
       },
       "SessionResumeParams": {

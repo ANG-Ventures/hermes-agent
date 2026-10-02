@@ -3295,6 +3295,19 @@ export type UndoIntent = 'retry' | 'undo'
 export interface SessionUndoResult {
   removed: number
 }
+/** Fork: ``n`` (alias ``count``) half-turns to re-activate; default 1. */
+export interface SessionRedoParams {
+  session_id: string
+  profile?: string | null
+  n?: number | null
+  count?: number | null
+}
+export interface SessionRedoResult {
+  reactivated_count: number
+  new_tail_id?: number | null
+  prefill_text?: string | null
+  message?: string | null
+}
 export interface SessionSaveParams {
   session_id: string
   profile?: string | null
@@ -5251,6 +5264,8 @@ export interface RpcMethods {
   'session.most_recent': { params: SessionMostRecentParams; result: SessionMostRecentResult }
   /** Redirect the active turn (queued for the next turn while the agent is still building). */
   'session.redirect': { params: SessionCorrectionParams; result: SessionCorrectionResult }
+  /** Fork: re-activate the last n undone half-turns of an idle session (DB-backed /redo). */
+  'session.redo': { params: SessionRedoParams; result: SessionRedoResult }
   /** Attach to a stored session: reuse it if live here, else lazy / deferred / cold / eager rebuild. */
   'session.resume': { params: SessionResumeParams; result: SessionResumeResult }
   /** Export the transcript to ~/.hermes/sessions/saved (classic /save). */
@@ -5566,6 +5581,7 @@ export const RPC_METHODS = [
   'session.list',
   'session.most_recent',
   'session.redirect',
+  'session.redo',
   'session.resume',
   'session.save',
   'session.set_hidden',
