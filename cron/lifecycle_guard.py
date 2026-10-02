@@ -674,6 +674,8 @@ def _profile_derived_self_names() -> set[str]:
     """
     try:
         from hermes_cli.gateway import (
+            _home_owns_bare_service_name,
+            _profile_name_from_home,
             get_hermes_home,
             get_launchd_label,
             get_service_name,
@@ -682,7 +684,12 @@ def _profile_derived_self_names() -> set[str]:
 
         home = Path(str(get_hermes_home())).resolve()
         default = Path(str(get_default_hermes_root())).resolve()
-        if home != default and home.parent != (default / "profiles").resolve():
+        # Same basis `_profile_suffix` uses: anything else gets the hash
+        # suffix, i.e. a fabricated identity — fail closed.
+        if not (
+            _home_owns_bare_service_name(home)
+            or _profile_name_from_home(home, default)
+        ):
             return set()
         names: set[str] = set()
         label = get_launchd_label()

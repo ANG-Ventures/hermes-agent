@@ -882,8 +882,9 @@ def _dispatch_authorized_once(
     from agent.terminal_approval_batch import prepare_current_terminal
     prepare_current_terminal(ref)
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    if ref.name == "cronjob":
+    if ref.name == "cronjob_manage":
         # The cron flagship-route guard reads the calling agent's provider/model (#922).
+        # ref.name is already canonical (_canonical_tool_name maps the legacy "cronjob").
         from tools.cronjob_tools import _current_agent_model
 
         def _execute_with_agent_model(args):
