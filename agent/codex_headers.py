@@ -7,8 +7,6 @@ new symbol from an older cached ``auxiliary_client`` module.
 
 from __future__ import annotations
 
-import base64
-import json
 from typing import Any, Dict
 from urllib.parse import urlparse
 
@@ -65,14 +63,15 @@ def codex_account_headers(access_token: str) -> Dict[str, str]:
     if not isinstance(access_token, str) or not access_token.strip():
         return headers
     try:
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return headers
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        auth = json.loads(base64.urlsafe_b64decode(payload_b64)).get("https://api.openai.com/auth", {})
-        acct_id = auth.get("chatgpt_account_id")
-        if isinstance(acct_id, str) and acct_id:
+        # One parser for the account claim (hermes_cli.auth.get_codex_account_id): sync, the quota
+        # probe and every HTTP client must agree on the identity (tests/hermes_cli/test_codex_account_id.py).
+        from hermes_cli.auth import get_codex_account_id
+        from hermes_cli.auth_constants import _decode_jwt_claims
+        acct_id = get_codex_account_id(access_token)
+        if acct_id:
             headers["ChatGPT-Account-ID"] = acct_id
+        auth = _decode_jwt_claims(access_token).get("https://api.openai.com/auth")
+        auth = auth if isinstance(auth, dict) else {}
         residency = auth.get("chatgpt_data_residency") or auth.get("chatgpt_compute_residency")
         if isinstance(residency, str) and residency.strip():
             headers["x-openai-internal-codex-residency"] = residency.strip()

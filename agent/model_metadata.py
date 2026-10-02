@@ -2229,6 +2229,13 @@ def fetch_codex_catalog_entries(get: Callable[[str], Any], base_url: str = "") -
     return [], status
 
 
+def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
+    """Account header value for the per-account Codex model catalog (single parser in hermes_cli.auth)."""
+    from hermes_cli.auth import get_codex_account_id
+
+    return get_codex_account_id(access_token)
+
+
 def _codex_oauth_token_fingerprint(access_token: str, base_url: str = "") -> str:
     """Non-secret cache key for a Codex OAuth access token (plus the base it was probed against —
     a gateway's catalog can differ from chatgpt.com's for the same forwarded token)."""

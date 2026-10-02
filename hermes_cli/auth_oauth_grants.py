@@ -257,15 +257,14 @@ def _oauth_identity(entry: Dict[str, Any]) -> Optional[str]:
     Codex / xAI access tokens are JWTs with ``sub`` / ``email`` / ``chatgpt_account_id`` claims;
     Anthropic ``sk-ant-oat`` tokens carry none (None → lineage rests on id / token material).
     """
-    from hermes_cli.auth import _nonempty_str
+    from hermes_cli.auth import _nonempty_str, get_codex_account_id
     if not isinstance(entry, dict):
         return None
     for token in (entry.get("access_token"), entry.get("id_token")):
         claims = _decode_jwt_claims(token)
         if not claims:
             continue
-        nested = claims.get("https://api.openai.com/auth")
-        account = nested.get("chatgpt_account_id") if isinstance(nested, dict) else None
+        account = get_codex_account_id(token)  # the one account-claim parser
         for value in (account, claims.get("sub"), claims.get("email")):
             if _nonempty_str(value):
                 return value.strip()

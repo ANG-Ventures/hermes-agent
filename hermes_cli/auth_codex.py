@@ -407,7 +407,10 @@ def _codex_http_client(**kwargs: Any) -> "httpx.Client":
     token refresh / device login / usage probes time out where the official Codex CLI (which races families
     per RFC 8305) works.
     """
-    client = httpx.Client(event_hooks={"response": [_cap_codex_response_body]}, **kwargs)
+    # Read ``httpx`` through the facade: fork tests swap ``hermes_cli.auth.httpx`` wholesale
+    # (``monkeypatch.setattr(auth, "httpx", SimpleNamespace(Client=...))``), not just ``.Client``.
+    from hermes_cli import auth as _auth_facade
+    client = _auth_facade.httpx.Client(event_hooks={"response": [_cap_codex_response_body]}, **kwargs)
     with suppress(Exception):
         from agent.process_bootstrap import enable_happy_eyeballs_on_client
         enable_happy_eyeballs_on_client(client)
