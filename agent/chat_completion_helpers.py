@@ -87,9 +87,15 @@ _POOL_HEADER_NAMES = (
 _POOLED_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"})
 _PINNED_PROVIDER_KEYS = {
     "gemini-bridge": "gemini",
+    # API-key metered: the fleet's ONE OpenRouter account is the sub
+    # (config/usage-registry.json providers.openrouter, t_f2fc31f6).
+    "openrouter": "openrouter",
 }
 XAI_SUB_PREFIX_LEN = 8  # usage meter key = OIDC sub[:8] lowercase (registry.xai_key)
-_PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
+# Lane-grammar PINNED face x (plugins/model-providers/lane-names.json): one sub per N.
+# Mirrors hermes-home scripts/subs_data/registry.py _PINNED_LANE_RE (t_f2fc31f6:
+# claude-dtlx-N went live 2026-10-02 and recorded NULL under the old [ab]px form).
+_PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-(?:a|b[thsa]?|d[ths]?)[pl]x[fs]?-\d+$")
 _POOL_SUB_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _API_CALL_SEQ_INIT_LOCK = threading.Lock()
 _API_CALL_FAILURE_LOCK = threading.Lock()
@@ -431,18 +437,26 @@ def _emit_aux_api_call_record(
     usage: Any,
     api_mode: str,
     route_id: Optional[str] = None,
+    pool_headers: Optional[dict[str, str]] = None,
 ) -> None:
     """Ledger one auxiliary-model call under the turn that made it.
 
     Same row shape as the main-lane record, sharing the turn's sequence
     allocator so ``(turn_id, seq)`` never collides. ``attribution='aux:<task>'``
     makes the store tag ``lane_family='aux'``: the row is measurable per aux
-    lane but excluded from the turn's main-lane cache statistics. No sub
-    identity is known on the aux path, so ``sub_key`` stays NULL. Fail-open.
+    lane but excluded from the turn's main-lane cache statistics. ``sub_key``
+    follows the main-lane rules (t_f2fc31f6): the relay's ``x-pool-served-by``
+    on the served response, else the pinned key of a single-account provider,
+    else NULL. A Codex / xAI account is never read off the agent here: the aux
+    client does not run on the agent's credential. Fail-open.
     """
     try:
         if not turn_id:
             return
+        sub_key, _ = _route_identity(
+            str(provider or "").strip().lower(), dict(pool_headers or {}), agent,
+            codex_from_agent=False,
+        )
         seq = _next_api_call_seq(agent, turn_id)
         from plugins.blackbox import record_api_call
 
@@ -454,7 +468,7 @@ def _emit_aux_api_call_record(
             model=model,
             usage=usage,
             api_mode=api_mode,
-            sub_key=None,
+            sub_key=sub_key,
             attribution=f"aux:{task}",
             http_status=200,
             relay_synthetic=False,
