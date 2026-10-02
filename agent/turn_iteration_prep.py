@@ -155,9 +155,11 @@ def prepare_iteration(
         _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer, current_turn_user_idx)
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
-    # newest tool result; off with no budget.
+    # newest tool result of the CURRENT turn; off with no budget. The turn bound matters: the
+    # steer row just inserted above is a ``role:user`` row, and an unbounded scan would stop
+    # there and never find the tool result (fork #1496 placement contract).
     if getattr(agent, "run_budget_seconds", None):
-        _maybe_inject_run_budget_wrapup(agent, messages)
+        _maybe_inject_run_budget_wrapup(agent, messages, current_turn_user_idx)
 
     # Appended to the newest tool result; never a synthetic user/system row.
     _maybe_inject_iteration_budget_warning(agent, messages)
