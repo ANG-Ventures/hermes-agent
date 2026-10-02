@@ -1035,6 +1035,16 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_names_alerts_pager_rule():
+    """Workers twice staged raw #alerts senders that home-autocommit then
+    quarantined (t_9056981b, t_5685054a). The one paging rule must reach every
+    worker through the injected guidance, not a skill it may not load."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "scripts/lib/episode_pager.py" in KANBAN_GUIDANCE
+    assert "# alerts-pager-ok: <reason>" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
