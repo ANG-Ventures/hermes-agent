@@ -64,7 +64,8 @@ def test_one_aux_call_in_a_turn_lands_one_aux_row(db, fake_impl):
         auxiliary_client.call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
     finally:
         aux_accounting.reset_blackbox_turn(token)
-    assert _rows(db) == [("turn-1", 0, "gemini-bridge", "gemini-2.5-flash", None,
+    # sub_key: gemini-bridge is single-account, so the aux row carries its pinned key (t_f2fc31f6; was NULL)
+    assert _rows(db) == [("turn-1", 0, "gemini-bridge", "gemini-2.5-flash", "gemini",
                           "aux:compression", "aux", 400, 600, 0, 20)]
 
 

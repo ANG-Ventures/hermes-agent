@@ -8844,7 +8844,8 @@ def call_llm(
         _record_aux_call_cost(response, route_info, streamed=bool(stream))
         if not stream:
             from agent.aux_accounting import record_aux_api_call
-            record_aux_api_call(response, task, route_info, route_id=aux_route.id_for(route_info.get("provider")))
+            record_aux_api_call(response, task, route_info, route_id=aux_route.id_for(route_info.get("provider")),
+                                pool_headers=aux_route.pool_headers())
         return response
     finally:
         if latency_info is not None:
@@ -9176,7 +9177,8 @@ async def async_call_llm(
             )
         outcome = "ok"
         from agent.aux_accounting import record_aux_api_call
-        record_aux_api_call(response, task, route_info, route_id=aux_route.id_for(route_info.get("provider")))
+        record_aux_api_call(response, task, route_info, route_id=aux_route.id_for(route_info.get("provider")),
+                            pool_headers=aux_route.pool_headers())
         return response
     finally:
         # Same duration contract as the sync path: an engine that summarises on the async client

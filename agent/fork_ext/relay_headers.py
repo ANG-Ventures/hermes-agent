@@ -297,12 +297,15 @@ class _AuxRoute:
     relay answer with its own ``x-pool-route-id``.
     """
 
-    __slots__ = ("route_id", "offered_to", "wire")
+    __slots__ = ("route_id", "offered_to", "wire", "served_by")
 
     def __init__(self):
         self.route_id = mint_harness_route_id()
         self.offered_to = set()
         self.wire = None
+        # The pooled relay's x-pool-served-by on the served response (the sub
+        # that answered), same last-response-wins rule as ``wire``.
+        self.served_by = None
 
     def id_for(self, provider):
         """The id the served route's boundary record carries, else None.
@@ -322,9 +325,18 @@ class _AuxRoute:
             return relay_id
         return self.route_id if sent else None
 
+    def pool_headers(self):
+        """``{x-pool-served-by: <sub>}`` the served response carried, else ``{}``.
+
+        Evidence only: a relay that served nothing identifiable, or a
+        non-relay provider, carries no header and the aux row stays NULL.
+        """
+        return {_POOL_SERVED_BY_HEADER: self.served_by} if self.served_by else {}
+
 
 _AUX_ROUTE: "ContextVar[_AuxRoute | None]" = ContextVar("aux_route_id", default=None)
 _POOL_ROUTE_ID_HEADER = "x-pool-route-id"
+_POOL_SERVED_BY_HEADER = "x-pool-served-by"
 _RELAY_ROUTE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -353,6 +365,7 @@ def aux_route_headers(provider) -> dict:
         if route is None:
             return {}
         route.wire = None
+        route.served_by = None
         p = provider.strip().lower() if isinstance(provider, str) else ""
         if not _AUX_ROUTE_PROVIDER_RE.fullmatch(p):
             return {}
@@ -381,6 +394,7 @@ def note_aux_http_response(response) -> None:
         if not (isinstance(relay_id, str) and _RELAY_ROUTE_ID_RE.fullmatch(relay_id)):
             relay_id = None
         route.wire = (sent, relay_id)
+        route.served_by = (getattr(response, "headers", None) or {}).get(_POOL_SERVED_BY_HEADER) or None
     except Exception:
         return
 

@@ -152,7 +152,7 @@ def test_aux_id_is_recorded_only_for_the_provider_that_served(monkeypatch):
     """Fallback case: the id went to gemini-bridge, a third party served."""
     got = []
     monkeypatch.setattr("agent.aux_accounting.record_aux_api_call",
-                        lambda response, task, route_info, route_id=None: got.append(route_id))
+                        lambda response, task, route_info, route_id=None, pool_headers=None: got.append(route_id))
 
     def impl(**kw):
         first = ac._build_call_kwargs("gemini-bridge", "m", kw["messages"], task=kw["task"])
@@ -332,3 +332,35 @@ def test_store_migrates_an_existing_db_without_the_column(tmp_path, monkeypatch)
     with sqlite3.connect(path) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turn_api_calls)")}
     assert "route_id_origin" in cols
+
+
+# ---- t_f2fc31f6: the aux scope keeps the relay's x-pool-served-by -----------
+
+def test_aux_scope_records_served_by_of_the_served_response_only():
+    with rh.aux_route_scope() as route:
+        kw = ac._build_call_kwargs("claude-bpr", "m", [{"role": "user", "content": "x"}], task="compression")
+        req = httpx.Request("POST", "http://127.0.0.1/v1/x", headers=dict(kw.get("extra_headers") or {}))
+        rh.note_aux_http_response(httpx.Response(200, request=req, headers={"x-pool-served-by": "sub-vps-7"}))
+        assert route.pool_headers() == {"x-pool-served-by": "sub-vps-7"}
+        # a fallback attempt rebuilds kwargs: the failed attempt's seat must not leak onto it
+        ac._build_call_kwargs("openrouter", "m", [{"role": "user", "content": "x"}], task="compression")
+        assert route.pool_headers() == {}
+        rh.note_aux_http_response(httpx.Response(200, request=req))
+        assert route.pool_headers() == {}
+
+
+def test_aux_call_hands_served_by_to_the_recorder(monkeypatch):
+    got = []
+    monkeypatch.setattr("agent.aux_accounting.record_aux_api_call",
+                        lambda response, task, route_info, route_id=None, pool_headers=None: got.append(pool_headers))
+
+    def impl(**kw):
+        sent = ac._build_call_kwargs("claude-bpr", "m", kw["messages"], task=kw["task"])
+        req = httpx.Request("POST", "http://127.0.0.1/v1/x", headers=dict(sent.get("extra_headers") or {}))
+        rh.note_aux_http_response(httpx.Response(200, request=req, headers={"x-pool-served-by": "sub-vps-4"}))
+        kw["route_info"]["provider"] = "claude-bpr"
+        return SimpleNamespace(choices=[], usage=None)
+
+    monkeypatch.setattr(ac, "_call_llm_impl", impl)
+    ac.call_llm("title_generation", messages=[{"role": "user", "content": "x"}])
+    assert got == [{"x-pool-served-by": "sub-vps-4"}]
