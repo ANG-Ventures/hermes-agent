@@ -184,19 +184,36 @@ def _set_fast(rid, params, key, value, session):
         return _err(rid, 4002, f"unknown fast mode: {value}")
     overrides = None
     if nv in ("fast", "ultrafast"):
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.models import resolve_fast_mode_capability_for_configured_route
+        from hermes_cli.providers import infer_api_mode_from_provider
         if agent is not None:
             target_model = getattr(agent, "model", None)
+            target_provider = getattr(agent, "provider", None)
+            target_api_mode = getattr(agent, "api_mode", None)
+            target_base_url = getattr(agent, "base_url", None)
         else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
             session_override = (session or {}).get("model_override") or {}
-            target_model = (isinstance(session_override, dict) and session_override.get("model")) or _resolve_model()
+            if not isinstance(session_override, dict):
+                session_override = {}
+            model_cfg = _load_cfg().get("model") or {}
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+            target_model = session_override.get("model") or _resolve_model()
+            target_provider = session_override.get("provider") or model_cfg.get("provider")
+            target_api_mode, target_base_url = model_cfg.get("api_mode"), None
         if not target_model:
             return _err(rid, 4002, "fast mode is not available without a selected model")
-        overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
-                                                base_url=getattr(agent, "base_url", None),
-                                                tier="ultrafast" if nv == "ultrafast" else None)
-        if overrides is None:
+        # Fork: the route-aware verdict (model + provider + api_mode + live base_url) shared with every
+        # request builder; the model-only wrapper is banned from call sites (test_fast_route_capability).
+        # An unpinned provider (absent / ``auto``) resolves against the model's documented native route.
+        capability = resolve_fast_mode_capability_for_configured_route(
+            model=target_model, provider=target_provider,
+            api_mode=target_api_mode or infer_api_mode_from_provider(target_provider),
+            base_url=target_base_url,
+            tier="ultrafast" if nv == "ultrafast" else None)
+        if not capability.supported:
             return _err(rid, 4002, f"{nv} mode is not available for this model")
+        overrides = dict(capability.request_overrides or {})
     if session is not None:
         # Session-scoped like `reasoning` (global = `--global` / Settings → Model): writing config.yaml
         # here flipped fast mode for every surface. The create override survives rebuilds; "" pins normal.

@@ -158,13 +158,14 @@ class TestFastModeRouting(unittest.TestCase):
         # Provider should NOT have changed
         assert route["runtime"]["provider"] == "openai"
         assert route["runtime"]["api_mode"] == "chat_completions"
-        # Proxy routes fail closed even when they carry a GPT model id.
-        assert route["request_overrides"] == {}
+        # But request_overrides should be set (first-party OpenAI route).
+        assert route["request_overrides"] == {"service_tier": "priority"}
 
-        # Proxied routes (OpenRouter etc.) strip/400 on the param — never sent.
+        # Proxied routes (OpenRouter etc.) strip/400 on the param — never sent. With a static
+        # tier set the fork route resolves to ``{}`` (never None; see the two tests below).
         stub.base_url = "https://openrouter.ai/api/v1"
         stub.provider = "openrouter"
-        assert cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")["request_overrides"] is None
+        assert cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")["request_overrides"] == {}
 
     def test_turn_route_keeps_primary_runtime_when_model_has_no_fast_backend(self):
         cli_mod = _import_cli()

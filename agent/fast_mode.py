@@ -66,13 +66,22 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
     ``speed`` for a model this session learned has no fast capacity."""
     overrides = dict(getattr(agent, "request_overrides", None) or {})
     if getattr(agent, "service_tier", None) in BOUNDED_MODES and time.monotonic() < getattr(agent, "_fast_until", 0.0):
-        from hermes_cli.models import resolve_fast_mode_overrides
+        # Fork: the route-aware verdict (model + provider + api_mode + live base_url), the same gate
+        # the static tiers use (tests/cli/test_fast_route_capability.py forbids the model-only wrapper).
+        from hermes_cli.models import resolve_fast_mode_capability
+        from hermes_cli.providers import infer_api_mode_from_provider
         base_url = getattr(agent, "base_url", None)
+        provider = getattr(agent, "provider", None)
         if getattr(agent, "api_mode", None) == "anthropic_messages":
             base_url = getattr(agent, "_anthropic_base_url", None) or base_url
-        overrides.update(
-            resolve_fast_mode_overrides(getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url) or {}
-        )
+        try:
+            overrides.update(resolve_fast_mode_capability(
+                model=getattr(agent, "model", None), provider=provider,
+                api_mode=getattr(agent, "api_mode", None) or infer_api_mode_from_provider(provider),
+                base_url=base_url,
+            ).request_overrides or {})
+        except Exception:
+            pass
     if "speed" in overrides and getattr(agent, "model", None) in (getattr(agent, "_fast_mode_unavailable_models", None) or ()):
         overrides.pop("speed", None)
     return overrides
