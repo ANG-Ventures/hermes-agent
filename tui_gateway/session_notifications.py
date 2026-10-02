@@ -388,9 +388,11 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
                 text = _format_kanban_event_text(sub, task, ev, slug)
                 if text:
                     texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
-            # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
-            # later reopen notify the same session. The claimed cursor prevents replay.
-            if task and getattr(task, "status", "") == "archived":
+            # fork (t_6d6e9467): done/archived end notify-sub ownership once the claimed events are
+            # delivered — the terminal line still arrives; later card noise reaches nobody. A reopened
+            # ``done`` card is re-subscribed explicitly by its controller. Same rule as the gateway
+            # notifier (gateway/kanban_watchers.py); upstream's archive-only variant is not taken.
+            if _kb.notify_sub_is_final(task):
                 with contextlib.suppress(Exception):
                     _kbn.remove_notify_sub(conn, **sub_ident)
     return texts

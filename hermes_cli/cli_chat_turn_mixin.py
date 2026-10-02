@@ -95,11 +95,14 @@ class CLIChatTurnMixin:
             message = str(message)  # UI metadata is on the staged row, never in model content.
 
         # A new user message invalidates the redo stack (a fresh branch from the undo point).
-        if self.session_id:
+        # getattr: the mixin does not own ``session_id`` (cli_init_mixin sets it); a partial surface
+        # (upstream's stream-mixin-only test CLI) simply has no redo stack to clear.
+        _redo_session_id = getattr(self, "session_id", None)
+        if _redo_session_id:
             try:
                 from hermes_undo import on_user_message_appended
 
-                on_user_message_appended(self.session_id)
+                on_user_message_appended(_redo_session_id)
             except Exception as e:
                 logger.debug("redo clear on user append failed: %s", e)
 
