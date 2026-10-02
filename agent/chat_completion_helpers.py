@@ -5488,7 +5488,11 @@ class _StreamingCall(StreamingWaitMonitor):
         OpenAI primary is replaced lazily."""
         self.agent._emit_stream_drop(
             error=e, attempt=attempt + 1, max_attempts=max_retries + 1, mid_tool_call=mid_tool_call, diag=self.clients.diag)
-        if self.agent._is_provider_stream_parse_error(e):
+        # Same classification as _handle_stream_error: the fork's stream_diag classifier needs
+        # the attempt's HTTP status to accept jiter's broad "expected value" wording (#107830).
+        _diag = self.clients.diag
+        if self.agent._is_provider_stream_parse_error(
+                e, http_status=_diag.get("http_status") if isinstance(_diag, dict) else None):
             from agent.anthropic_adapter import buffer_anthropic_tool_input
             buffer_anthropic_tool_input(self.api_kwargs, getattr(self.agent, "_anthropic_base_url", None))
         self._cancel_current_stream_attempt(reason)

@@ -203,6 +203,11 @@ class _FinalizerAgent:
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         self.valid_tool_names = []
+        # Upstream's result_model_fields reads these as DATA (a truthy lambda from __getattr__
+        # would read as "fallback active" with a callable runtime).
+        self._fallback_activated = False
+        self._primary_runtime = None
+        self.last_served_model = None
 
     def _handle_max_iterations(self, *_a):
         raise AssertionError("not expected")

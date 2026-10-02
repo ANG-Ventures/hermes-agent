@@ -30,7 +30,8 @@ def _agent(**kw):
         _interrupt_requested=False,
         _stream_options_unsupported=False,
         _emit_stream_drop=MagicMock(),
-        _is_provider_stream_parse_error=lambda e: False,
+        # Fork contract: the stream-parse classifier also receives http_status=.
+        _is_provider_stream_parse_error=lambda e, **_kw: False,
         **kw,
     )
 

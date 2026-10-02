@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from hermes_cli._subprocess_compat import noninteractive_git_env
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover — Windows
@@ -62,7 +64,7 @@ def _git_toplevel(shared_root: Path) -> Optional[Path]:
         out = subprocess.run(
             ["git", "-C", str(shared_root), "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env={**noninteractive_git_env(), "GIT_OPTIONAL_LOCKS": "0"},
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -77,7 +79,7 @@ def _git(repo: Path, *args: str, timeout: int = 30) -> Tuple[int, str, str]:
         p = subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env={**noninteractive_git_env(), "GIT_OPTIONAL_LOCKS": "0"},
         )
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.SubprocessError) as e:
