@@ -155,10 +155,22 @@ def _idle_compaction(
     from agent import turn_context as _tc
 
     messages = out.messages
+    # Fork: the gap is measured from ``_idle_gap_anchor_ts`` when a driver stamped one for this
+    # turn, else from ``_last_activity_ts``. The gateway MUST stamp the anchor: it resets
+    # ``_last_activity_ts`` to "now" before the turn (watchdog, #9051) and rebuilds evicted agents
+    # with a construction-time clock, so ``_last_activity_ts`` alone reads a ~0s gap there and the
+    # trigger could never fire. The anchor is one-shot per turn (consumed even when idle
+    # compaction is disabled, so a stale stamp cannot leak into a later turn).
+    _idle_anchor = getattr(agent, "_idle_gap_anchor_ts", None)
+    agent._idle_gap_anchor_ts = None
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if not (agent.compression_enabled and _idle_after > 0 and messages):
         return
-    _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+    if isinstance(_idle_anchor, (int, float)) and not isinstance(_idle_anchor, bool) and _idle_anchor > 0:
+        _idle_since = float(_idle_anchor)
+    else:
+        _idle_since = getattr(agent, "_last_activity_ts", time.time())
+    _idle_gap = time.time() - _idle_since
     if _idle_gap < _idle_after:
         return
     _compressor = agent.context_compressor

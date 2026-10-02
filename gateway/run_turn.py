@@ -443,10 +443,13 @@ class GatewayTurnMixin:
         return None
 
     @staticmethod
-    def _is_intentional_silence(agent_result, response) -> bool:
+    def _is_intentional_silence(agent_result, response, *, internal: bool = False) -> bool:
+        """``internal``: a system-generated event (bg-process completion, restore replay) has no
+        human waiting, so a short note + NO_REPLY on its own line is suppressed (autonomous
+        rule); human turns keep the exact-marker rule."""
         try:
             from gateway.response_filters import is_intentional_silence_agent_result
-            return is_intentional_silence_agent_result(agent_result, response)
+            return is_intentional_silence_agent_result(agent_result, response, internal=internal)
         except Exception:
             return False
 
@@ -833,6 +836,19 @@ class GatewayTurnMixin:
                 )
             if session_entry.last_prompt_tokens > 0:
                 _approx_tokens, _token_source = session_entry.last_prompt_tokens, "actual"
+                if _approx_tokens >= _compress_token_threshold:
+                    # Fork: after a restart (no cached agent below) the stored figure may predate
+                    # the last compaction. Rough overestimates; a stored figure more than twice it
+                    # cannot describe this transcript -> treat it as absent.
+                    _rough_tokens = estimate_messages_tokens_rough(history)
+                    if _rough_tokens * 2 < session_entry.last_prompt_tokens:
+                        logger.info(
+                            "Session hygiene: stored last_prompt_tokens ~%s for %s predates the current "
+                            "transcript (rough ~%s); ignoring it",
+                            f"{session_entry.last_prompt_tokens:,}", session_entry.session_id,
+                            f"{_rough_tokens:,}",
+                        )
+                        _approx_tokens, _token_source = _rough_tokens, "estimated"
             elif _anchored is not None:
                 _approx_tokens, _token_source = _anchored, "anchored"
             else:
@@ -1373,14 +1389,18 @@ class GatewayTurnMixin:
         ``(agent, sync_session_db)``."""
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
         from run_agent import AIAgent
+        # Snapshot the session id BEFORE the awaits below: a /new or rotation can move
+        # session_entry.session_id meanwhile, and the detached agent must bind the session
+        # the hygiene plan was computed for (FleetReview #976).
+        _hyg_old_sid = session_entry.session_id
         try:
-            _hyg_session_row = await self._session_db.get_session(session_entry.session_id)
+            _hyg_session_row = await self._session_db.get_session(_hyg_old_sid)
         except Exception as exc:
             _hyg_session_row = None
             logger.warning(
                 "Session hygiene could not restore the system prompt for session %s: %s. "
                 "Preserving an empty prompt so the live turn rebuilds it with its "
-                "configured providers.", session_entry.session_id, exc, exc_info=True,
+                "configured providers.", _hyg_old_sid, exc, exc_info=True,
             )
         _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
         # With compression.checkpoint_required on, load the memory provider so the checkpoint exists
@@ -1391,12 +1411,17 @@ class GatewayTurnMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
-        _hyg_agent = AIAgent(
-            **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
-            skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
-            session_id=session_entry.session_id, session_db=_hyg_session_db,
-        )
-        _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
+        def _build_hyg_agent():
+            _a = AIAgent(
+                **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
+                skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
+                # The snapshot, never the live entry (#976).
+                session_id=_hyg_old_sid, session_db=_hyg_session_db,
+            )
+            _seed_hygiene_system_prompt(_a, _hyg_session_row)
+            return _a
+
+        _hyg_agent = _build_hyg_agent()
         # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
         # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
         # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
@@ -1635,11 +1660,13 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
+        _intentional_silence = self._is_intentional_silence(
+            agent_result, response, internal=_silence_kind == "internal_notification",
+        )
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
             logger.warning(
@@ -2141,13 +2168,33 @@ class GatewayTurnMixin:
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         )
 
-    def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
-        """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
+    async def _hmwa_discard_stale_result(self, source, _quick_key, run_generation, agent_result=None, session_entry=None):
+        """A newer run generation superseded this turn: drop its deferred post-delivery callback.
+
+        The reply is discarded, but the API calls this turn made are real: persist their last
+        prompt size so the next turn's hygiene valve does not read a figure from before an in-turn
+        compaction (fork, 2026-09-29: /stop after a queued follow-up left a pre-compaction ~1.02M
+        peak stored and hygiene compacted a 16% context). Guarded by the result's session_id so a
+        reset session is never written.
+        """
         logger.info(
             "Discarding stale agent result for %s — generation %d is no longer current",
             _quick_key or "?", run_generation,
         )
         self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        _stale_prompt_tokens = agent_result.get("last_prompt_tokens") if isinstance(agent_result, dict) else None
+        if isinstance(_stale_prompt_tokens, int) and session_entry is not None:
+            try:
+                await self.async_session_store.update_session(
+                    session_entry.session_key,
+                    last_prompt_tokens=_stale_prompt_tokens,
+                    touch_activity=False,
+                    expected_session_id=agent_result.get("session_id") or session_entry.session_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist last_prompt_tokens for stale result %s", _quick_key or "?", exc_info=True,
+                )
 
     @dataclasses.dataclass
     class _PreparedTurn:
@@ -2401,7 +2448,9 @@ class GatewayTurnMixin:
             await self._hmwa_stop_typing_for_turn(event, source)
 
             if not self._is_session_run_current(_quick_key, run_generation):
-                self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                await self._hmwa_discard_stale_result(
+                    source, _quick_key, run_generation, agent_result=agent_result, session_entry=session_entry,
+                )
                 return None
 
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
@@ -3534,6 +3583,15 @@ class GatewayTurnMixin:
             return
         turn_state = self._session_state(session_key).turn
         turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx
+        # Turn boundary: the slot just went sentinel -> real agent, and
+        # _snapshot_running_agents() (the source of active_agent_keys)
+        # EXCLUDES sentinels. Without a persist here gateway_state.json
+        # keeps the claim-time snapshot for the whole turn — measured
+        # live 2026-09-19 21:11: `active_agents=1, active_agent_keys=[]`
+        # on a busy gateway — so the safe-restart watcher's per-session
+        # gate cannot see the running session and the boot auto-resume
+        # E2E has no key to check. Preserves gateway_state (read-merge).
+        self._persist_active_agents()
         if self._draining:
             self._update_runtime_status("draining")
 
@@ -3991,7 +4049,10 @@ class GatewayTurnMixin:
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
+        if self._is_intentional_silence(
+            _delivery_result, first_response,
+            internal=turn_ctx.persist_user_display_kind == "internal_notification",
+        ):
             if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",

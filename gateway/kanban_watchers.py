@@ -34,7 +34,12 @@ from gateway.kanban_watchers_common import (
     _to_thread_process_service,
     logger,
 )
-from gateway.kanban_watchers_notifier import _safe_review_reason, _wake_scope_id
+from gateway.kanban_watchers_notifier import (
+    _adapter_for_subscription,
+    _safe_review_reason,
+    _served_profile_scope,
+    _wake_scope_id,
+)
 from gateway.routing_identity import (
     creator_stamp_is_session_key,
     effective_routing_lane,
@@ -1595,19 +1600,29 @@ class GatewayKanbanWatchersMixin:
                             for sub in subs:
                                 try:
                                     owner_profile = sub.get("notifier_profile") or None
-                                    if owner_profile and owner_profile != notifier_profile:
-                                        _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                        if not _owner_adapters:
-                                            logger.debug(
-                                                "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                                sub.get("task_id"), owner_profile, notifier_profile,
-                                            )
-                                            continue
                                     platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
                                         logger.debug(
                                             "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                             sub.get("task_id"), platform or "<missing>",
+                                        )
+                                        continue
+                                    # Durable route check BEFORE claiming (upstream
+                                    # bdd7192bcf/5579fd5cdf): a served profile with no
+                                    # adapter of its own may still deliver through the
+                                    # primary bot (profile_routes-pinned chat, or an
+                                    # api_server session its own store owns); one that
+                                    # resolves to nothing is skipped unclaimed.
+                                    try:
+                                        _route_plat = _Platform(platform)
+                                    except ValueError:
+                                        _route_plat = None
+                                    if _route_plat is not None and _adapter_for_subscription(
+                                        self, _route_plat, sub, owner_profile or notifier_profile,
+                                    ) is None:
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s owned by profile %s has no deliverable adapter on %s; skipping",
+                                            sub.get("task_id"), owner_profile or notifier_profile, platform,
                                         )
                                         continue
                                     old_cursor, cursor, events = _kbn.claim_unseen_events_for_sub(
@@ -1682,7 +1697,7 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    adapter = _adapter_for_subscription(self, plat, sub, sub_profile or None)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -1961,57 +1976,61 @@ class GatewayKanbanWatchersMixin:
                         # failure instead of burning MAX_SEND_FAILURES ticks.
                         _target_gone = False
                         try:
-                            _send_res = await send_adapter.send(
-                                send_chat_id, msg, metadata=metadata,
-                            )
-                            # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
-                            if getattr(_send_res, "success", True) is False:
-                                # A gone LOG channel must not drop the
-                                # subscriber's sub (its wake still matters).
-                                _target_gone = _routed is None and (
-                                    getattr(_send_res, "error_kind", None) == "not_found"
+                            # Pings and artifact uploads read the SUBSCRIBER
+                            # profile's media policy / display language, not the
+                            # launch profile's (upstream 284d220ba4).
+                            async with _served_profile_scope(self, plat, sub, sub_profile):
+                                _send_res = await send_adapter.send(
+                                    send_chat_id, msg, metadata=metadata,
                                 )
-                                raise RuntimeError(
-                                    "adapter send() reported failure: "
-                                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                # A SendResult(success=False) without an exception
+                                # (returned by push-capable adapters on a genuine
+                                # transient failure) must count as a FAILED
+                                # delivery — otherwise the cursor advances and the
+                                # event is permanently lost. Adapters returning
+                                # None (or anything non-SendResult shaped) keep
+                                # the legacy "no exception == delivered" contract.
+                                if getattr(_send_res, "success", True) is False:
+                                    # A gone LOG channel must not drop the
+                                    # subscriber's sub (its wake still matters).
+                                    _target_gone = _routed is None and (
+                                        getattr(_send_res, "error_kind", None) == "not_found"
+                                    )
+                                    raise RuntimeError(
+                                        "adapter send() reported failure: "
+                                        f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                    )
+                                logger.debug(
+                                    "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                                    kind, sub["task_id"], platform_str, send_chat_id, board_slug,
                                 )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, send_chat_id, board_slug,
-                            )
-                            _sent_event_ids.add(ev.id)
-                            # After delivering the text notification, surface
-                            # any artifact paths the worker referenced in
-                            # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
-                                try:
-                                    await self._deliver_kanban_artifacts(
-                                        adapter=send_adapter,
-                                        chat_id=send_chat_id,
-                                        metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=task,
-                                    )
-                                except Exception as art_exc:
-                                    logger.debug(
-                                        "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
-                                    )
-                            lane_dedupe.mark_sent(lane_key)
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
+                                _sent_event_ids.add(ev.id)
+                                # After delivering the text notification, surface
+                                # any artifact paths the worker referenced in
+                                # ``kanban_complete(summary=..., artifacts=[...])``
+                                # (or the legacy ``result`` field) as native
+                                # uploads. ``extract_local_files`` finds bare
+                                # absolute paths in the summary;
+                                # ``send_document`` / ``send_image_file`` uploads
+                                # them. Only fires on the ``completed`` event so
+                                # we never spam attachments on retries.
+                                if kind == "completed":
+                                    try:
+                                        await self._deliver_kanban_artifacts(
+                                            adapter=send_adapter,
+                                            chat_id=send_chat_id,
+                                            metadata=metadata,
+                                            event_payload=getattr(ev, "payload", None),
+                                            task=task,
+                                        )
+                                    except Exception as art_exc:
+                                        logger.debug(
+                                            "kanban notifier: artifact delivery for %s failed: %s",
+                                            sub["task_id"], art_exc,
+                                        )
+                                lane_dedupe.mark_sent(lane_key)
+                                # Reset the failure counter on success.
+                                sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
@@ -2166,11 +2185,19 @@ class GatewayKanbanWatchersMixin:
                             from gateway.wake import deliver_wake
 
                             try:
-                                await deliver_wake(
-                                    adapter,
-                                    text=_synth,
-                                    session_id=_session_key,
-                                )
+                                # A served profile's raw-session wake runs
+                                # in-process under THAT profile's scope (upstream
+                                # 5579fd5cdf): the shared listener's /p/<profile>/
+                                # self-post would need the profile's own
+                                # API_SERVER_KEY, and an unprefixed self-post
+                                # would resume the session in the DEFAULT store.
+                                async with _served_profile_scope(self, plat, sub, sub_profile) as _served_profile:
+                                    await deliver_wake(
+                                        adapter,
+                                        text=_synth,
+                                        session_id=_session_key,
+                                        profile=_served_profile,
+                                    )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,

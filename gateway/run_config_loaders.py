@@ -153,9 +153,11 @@ class GatewayConfigLoadersMixin:
 
         Closes #21256.
         """
-        from gateway.run import _load_gateway_config
+        # Fork: read through the runtime loader so ``${VAR}`` templates in config.yaml are
+        # expanded for reasoning reads too (and tests patch one seam for the whole chain).
+        from gateway.run import _load_gateway_runtime_config
         from hermes_constants import resolve_reasoning_config
-        return resolve_reasoning_config(_load_gateway_config(), model)
+        return resolve_reasoning_config(_load_gateway_runtime_config(), model)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:

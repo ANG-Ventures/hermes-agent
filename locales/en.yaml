@@ -1192,8 +1192,8 @@ platform:
         description: "Show or change the model"
         arg_name: "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current."
       reasoning:
-        description: "Show/change reasoning effort, or toggle showing it"
-        arg_effort: "Pick a level, reset the override, or show/hide reasoning. Leave empty to see current."
+        description: "Show/change reasoning effort: none, minimal, low, medium, high, xhigh, max, ultra"
+        arg_effort: "Effort: none, minimal, low, medium, high, xhigh, max, or ultra. Or reset/show/hide. Empty = current."
         choice_none: "none — disable reasoning"
         choice_ultra: "ultra — maximum reasoning"
         choice_reset: "reset — clear this session's override"

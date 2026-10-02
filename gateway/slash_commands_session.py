@@ -607,11 +607,18 @@ class GatewaySessionCommandsMixin:
         _checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
             default=False)
-        tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
-                            skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
-                            session_id=session_id,
-                            session_db=getattr(self._session_db, "_db", self._session_db))
-        _seed_hygiene_system_prompt(tmp_agent, session_row)
+        # OFF the event loop (fork, 2026-09-24): AIAgent.__init__ loads the context engine under
+        # the process-global _LOAD_LOCK (20-60 s while worker turns hold it) — a
+        # PHASE=event_loop_blocked site that stalled Discord heartbeats past the ~41 s ACK window.
+        def _build_tmp_agent():
+            _a = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
+                         skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
+                         session_id=session_id,
+                         session_db=getattr(self._session_db, "_db", self._session_db))
+            _seed_hygiene_system_prompt(_a, session_row)
+            return _a
+
+        tmp_agent = await asyncio.to_thread(_build_tmp_agent)
         # Real platform during construction (context engines bind correctly); the stamp afterwards
         # only marks this agent as no real surface. Since #104414 Platform is not a restore-identity
         # field, so it no longer forces the next live turn to rebuild; the seed's retain flag is what
@@ -1061,7 +1068,9 @@ class GatewaySessionCommandsMixin:
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id},
+                # ``_branch_point_len`` = how many rows the branch inherited; everything after it
+                # is the delta /merge folds back (fork, test_discord_branch_thread_merge).
+                model_config={"_branched_from": parent_session_id, "_branch_point_len": len(history)},
                 parent_session_id=parent_session_id, user_id=dest_source.user_id,
                 session_key=dest_key, chat_id=dest_source.chat_id, chat_type=dest_source.chat_type,
                 thread_id=dest_source.thread_id, origin_json=_branch_origin_json,
@@ -1088,7 +1097,16 @@ class GatewaySessionCommandsMixin:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(dest_key)
         self._evict_cached_agent(dest_key)
-        msg_count = len([m for m in history if m.get("role") == "user"])
+        if not in_place:
+            with contextlib.suppress(Exception):
+                self._release_running_agent_state(dest_key)
+        # Count = raw transcript rows (matches the /footer "N msgs" tally = sessions.message_count),
+        # NOT a user-only subset, so the "inherits N messages" line reconciles with the footer.
+        msg_count = len(history)
+        if not in_place:
+            # Intro posted INTO the new thread with a link back to the PARENT conversation, so the
+            # child<->parent relationship is navigable from both sides (fork #66023 follow-up).
+            await self._branch_post_thread_intro(source, dest_source, branch_title, msg_count)
         if in_place:
             key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
             reply = t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
@@ -1098,6 +1116,21 @@ class GatewaySessionCommandsMixin:
         key = "gateway.branch.branched_thread_one" if msg_count == 1 else "gateway.branch.branched_thread_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id,
                  thread=format_thread_ref(source.platform, dest_source.thread_id))
+
+    async def _branch_post_thread_intro(self, source: SessionSource, dest_source: SessionSource,
+                                        title: str, msg_count: int) -> None:
+        """Best-effort anchor message in the freshly opened branch thread."""
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None:
+            return
+        try:
+            parent_ref = source.thread_id or source.chat_id
+            parent_mention = (format_thread_ref(source.platform, str(parent_ref)) if parent_ref
+                              else t("gateway.branch.thread_parent_fallback"))
+            intro = t("gateway.branch.thread_intro", title=title, count=msg_count, parent=parent_mention)
+            await adapter.send(str(dest_source.thread_id), intro)
+        except Exception as exc:
+            logger.debug("branch: thread intro send failed: %s", exc)
 
     async def _branch_open_thread(self, source: SessionSource, title: str) -> Optional[SessionSource]:
         """Open the sibling thread a plain ``/branch`` clones into; the destination source, or

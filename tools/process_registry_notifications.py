@@ -408,6 +408,15 @@ def _completion_status(evt: dict) -> str:
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
 
+# Every agent-facing completion turn must name the silence token the gateway
+# actually suppresses (gateway/response_filters.SILENT_REPLY_TOKEN), else agents
+# answer their own completions with "already handled" posts (Ace, 2026-09-27).
+COMPLETION_SILENCE_HINT = (
+    "If this result is already reported or changes nothing for the user, "
+    "end your reply with NO_REPLY on its own line — nothing will be posted."
+)
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a completion_queue event into an ``[IMPORTANT: ...]`` message."""
     evt_type = evt.get("type", "completion")
@@ -463,4 +472,5 @@ def format_process_notification(evt: dict) -> "str | None":
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
     return (
         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+        f"{attribution}Command: {_cmd}\nOutput:\n{_out}\n"
+        f"{COMPLETION_SILENCE_HINT}]")

@@ -5628,15 +5628,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                      strip: bool = True, prefix: str = "slash_"):
         """Build a slash callback rendering ``template`` from its args via ``_run_simple_slash``;
         the introspected signature is synthesised from ``args`` (see ``_NATIVE_SLASH_COMMAND_SPECS``)."""
+        defaults = {a[0]: a[2] for a in args if a[2] is not _REQUIRED}
+
         async def _handler(interaction: discord.Interaction, **kwargs):
-            text = template.format(**kwargs)
+            # discord.py fills omitted optional options from the synthesised signature's
+            # defaults; a direct call (tests, internal re-dispatch) must render the same text.
+            text = template.format(**{**defaults, **kwargs})
             call_args = (text.strip() if strip else text,) + (() if followup is None else (followup,))
             await self._run_simple_slash(interaction, *call_args)
         _handler.__name__ = prefix + {"bg": "background"}.get(name, name).replace("-", "_")
         params = [inspect.Parameter("interaction", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=discord.Interaction)]
         for arg_name, arg_type, default, _desc, _choices in args:
             if isinstance(arg_type, tuple):  # (type, lo, hi) -> bounded option
-                arg_type = discord.app_commands.Range[arg_type]
+                # Resolved tolerantly: the test-suite discord stubs are SimpleNamespaces
+                # without ``Range``; the bare type keeps the option (bounds are a UI hint).
+                _range = getattr(discord.app_commands, "Range", None)
+                arg_type = _range[arg_type] if _range is not None else arg_type[0]
             params.append(inspect.Parameter(
                 arg_name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=arg_type,
                 default=inspect.Parameter.empty if default is _REQUIRED else default,

@@ -39,7 +39,7 @@ from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional
 
 from hermes_cli.config import get_hermes_home
 
-from tools.process_registry_notifications import format_process_notification
+from tools.process_registry_notifications import COMPLETION_SILENCE_HINT, format_process_notification  # noqa: F401 (re-export)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 
@@ -2949,12 +2949,6 @@ def resolve_agent_notify_mode() -> str:
         )
     except Exception:
         return ""
-
-
-COMPLETION_SILENCE_HINT = (
-    "If this result is already reported or changes nothing for the user, "
-    "end your reply with NO_REPLY on its own line — nothing will be posted."
-)
 
 
 process_registry = ProcessRegistry()

@@ -2677,10 +2677,16 @@ class SessionStore(
         except Exception:
             return None
         if row is None:
+            # An old inert route whose row was never created is a failed-create stub (#581);
+            # any OTHER missing row at ROUTING time is a hard delete made outside the gateway
+            # (CLI / TUI / DELETE /api/sessions/<id>) and is treated exactly like an ended one, or
+            # run_agent's INSERT OR IGNORE resurrects the deleted session under its old id
+            # (upstream #42422). Startup pruning (session_persistence._plan_stale_prune) keeps the
+            # narrower stub-only reap so genuine legacy routes still load.
             return (
                 "never_persisted_stub"
                 if self._is_never_persisted_stub(entry)
-                else None
+                else "ended"
             )
         return "ended" if row.get("end_reason") is not None else None
 

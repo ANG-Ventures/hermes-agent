@@ -214,9 +214,11 @@ async def test_model_reset_db_commit_survives_json_mirror_failure(
         {"default": "global-model", "provider": "openai-api"},
     )
     db = SessionDB(tmp_path / "state.db")
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
     sessions_dir = tmp_path / "gateway-sessions"
     store = SessionStore(sessions_dir, GatewayConfig())
+    # Fork store wiring (#98573): the handle is acquired per scope through the process registry;
+    # ``store._db = x`` is the documented pin that makes this store use the test's SessionDB.
+    store._db = db
     runner = _make_runner()
     event = _make_event("/model reset")
     entry = store.get_or_create_session(event.source)
@@ -268,9 +270,11 @@ async def test_model_reset_db_failure_rolls_back_memory_and_reports_failure(
         {"default": "global-model", "provider": "openai-api"},
     )
     db = SessionDB(tmp_path / "state.db")
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
     sessions_dir = tmp_path / "gateway-sessions"
     store = SessionStore(sessions_dir, GatewayConfig())
+    # Fork store wiring (#98573): the handle is acquired per scope through the process registry;
+    # ``store._db = x`` is the documented pin that makes this store use the test's SessionDB.
+    store._db = db
     runner = _make_runner()
     event = _make_event("/model reset")
     entry = store.get_or_create_session(event.source)

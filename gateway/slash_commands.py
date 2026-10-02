@@ -1814,193 +1814,6 @@ class GatewaySlashCommandsMixin(
         body = f"{header}\n\n{session_info}" if session_info else header
         return EphemeralReply(f"{body}{_tip_line}")
 
-    async def _handle_branch_command(self, event: MessageEvent) -> str:
-        """Handle /branch [name] — fork the current session into a new independent copy.
-
-        Copies conversation history to a new session so the user can explore
-        a different approach without losing the original.
-        Inspired by Claude Code's /branch command.
-        """
-        import uuid as _uuid
-
-        if not self._session_db:
-            from hermes_state import format_session_db_unavailable
-            return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
-
-        source = event.source
-        session_key = self._session_key_for_source(source)
-
-        # Load the current session and its transcript
-        current_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(current_entry.session_id)
-        if not history:
-            return t("gateway.branch.no_conversation")
-
-        branch_name = event.get_command_args().strip()
-
-        # Generate the new session ID
-        from datetime import datetime as _dt
-        now = _dt.now()
-        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-        short_uuid = _uuid.uuid4().hex[:6]
-        new_session_id = f"{timestamp_str}_{short_uuid}"
-
-        # Determine branch title
-        if branch_name:
-            branch_title = branch_name
-        else:
-            current_title = await self._session_db.get_session_title(current_entry.session_id)
-            base = current_title or "branch"
-            branch_title = await self._session_db.get_next_title_in_lineage(base)
-
-        parent_session_id = current_entry.session_id
-
-        # Branch-point: how many messages the branch inherits from the parent.
-        # Everything AFTER this index in the branch transcript is NEW exploration
-        # that happened only in the branch — that's the DELTA /merge folds back,
-        # so it doesn't re-summarize history the parent already has.
-        branch_point_len = len(history)
-
-        # Serialize the parent's full origin (same shape as the reset path's
-        # db_create_kwargs in gateway/session.py, #82633) so the branch row
-        # carries complete identity from birth. Prefer the live entry's origin
-        # (it may hold richer metadata than the triggering event's source).
-        _branch_origin = current_entry.origin or source
-        _branch_origin_json = None
-        if _branch_origin is not None:
-            try:
-                import json as _json
-
-                _branch_origin_json = _json.dumps(_branch_origin.to_dict())
-            except Exception:
-                _branch_origin_json = None
-
-        # Create the new session with parent link.
-        # Persist a stable ``_branched_from`` marker in model_config so
-        # list_sessions_rich() keeps the branch visible in /resume and
-        # /sessions even after the parent is reopened and re-ended with a
-        # different end_reason (e.g. tui_shutdown overwriting 'branched').
-        # The child sends the parent's exact system prompt: a row without one makes the branch's
-        # first turn rebuild (re-probing the workspace) and forfeits the warm cache the copied
-        # transcript buys.
-        try:
-            parent = await self._session_db.get_session(parent_session_id)
-            await self._session_db.create_session(
-                session_id=new_session_id,
-                source=source.platform.value if source.platform else "gateway",
-                model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id, "_branch_point_len": branch_point_len},
-                parent_session_id=parent_session_id,
-                # Gateway routing columns — forward ALL of them at CREATE time,
-                # same fix as the compression-rotation bug in
-                # agent/conversation_compression.py. Without these, the branched
-                # child row has NULL routing columns until switch_session() below
-                # calls _record_gateway_session_peer() — a crash/kill anywhere
-                # between here and there (most plausibly mid-history-copy, since
-                # each append_message call a few lines down is independently
-                # best-effort) leaves the branch permanently unroutable:
-                # unreachable by chat/thread lookup, and unreachable via /resume's
-                # IDOR guard too (which requires the row's chat_id/thread_id to
-                # match the caller's). user_id is critical for the fallback lookup
-                # path (hermes_state.py:1994-2009) that searches by the complete
-                # peer tuple when session_key doesn't match. origin_json and
-                # display_name complete the identity (same shape as the reset
-                # path's db_create_kwargs in gateway/session.py, #82633) so
-                # consumers that read routing/presentation data from state.db
-                # (mcp_serve, mirror, channel directory) see the branch row
-                # fully formed with zero backfill gap.
-                user_id=source.user_id,
-                session_key=session_key,
-                chat_id=source.chat_id,
-                chat_type=source.chat_type,
-                thread_id=source.thread_id,
-                origin_json=_branch_origin_json,
-                display_name=current_entry.display_name,
-                system_prompt=(parent or {}).get("system_prompt") or None,
-            )
-        except Exception as e:
-            logger.error("Failed to create branch session: %s", e)
-            return t("gateway.branch.create_failed", error=e)
-
-        # Copy conversation history to the new session in bounded-chunk
-        # transactions (see #23254): one txn per row was the removed
-        # write-amplification pattern, and a history can be hundreds of rows.
-        # Best-effort like the old loop — a failed copy still yields a
-        # usable (partial) branch.
-        try:
-            await self._session_db.append_messages_batch(
-                new_session_id,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "tool_name": msg.get("tool_name") or msg.get("name"),
-                        "tool_calls": msg.get("tool_calls"),
-                        "tool_call_id": msg.get("tool_call_id"),
-                        "finish_reason": msg.get("finish_reason"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Keep the api_content sidecar so the branch's first turn
-                        # replays the parent's exact wire bytes (warm provider
-                        # prompt cache) instead of a full cold prefill.
-                        "api_content": extract_api_content_sidecar(msg),
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in history
-                ],
-                chunk_rows=500,
-            )
-        except Exception:
-            pass  # Best-effort copy
-
-        # Set title
-        try:
-            await self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
-
-        # Count = raw transcript rows (matches the /footer "N/Nmsgs" tally =
-        # sessions.message_count = len(history)), NOT a user-only subset — so the
-        # "inherits N messages" line reconciles with the footer the user sees.
-        msg_count = len(history)
-
-        # Discord: spawn a NEW thread bound to the branch session and leave the
-        # parent channel on its own session (the parent conversation continues
-        # in place). Every other platform keeps the classic in-place switch.
-        new_thread_id = await self._try_discord_branch_thread(
-            source, branch_title, new_session_id, msg_count,
-        )
-        if new_thread_id:
-            thread_mention = f"<#{new_thread_id}>"
-            key = (
-                "gateway.branch.thread_branched_one"
-                if msg_count == 1
-                else "gateway.branch.thread_branched_many"
-            )
-            return t(
-                key,
-                title=branch_title,
-                count=msg_count,
-                thread=thread_mention,
-                parent=parent_session_id,
-                new=new_session_id,
-            )
-
-        # Classic in-place branch: switch the current session key to the copy.
-        new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
-        if not new_entry:
-            return t("gateway.branch.switch_failed")
-        self._clear_session_boundary_security_state(session_key)
-
-        # Evict any cached agent for this session
-        self._evict_cached_agent(session_key)
-
-        key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
-        return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
-
     async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.
 
@@ -2239,61 +2052,18 @@ class GatewaySlashCommandsMixin(
                 runtime_kwargs["platform"] = platform_key
             runtime_kwargs["gateway_session_key"] = session_key
 
-            # The manual compression helper runs outside the live session's
-            # fully initialized prompt environment (it loads the memory
-            # provider only when compression.checkpoint_required demands it),
-            # and _compress_context may persist its cached system prompt.
-            # Restore the exact live-session prompt so provider blocks are
-            # retained.
-            session_row = None
-            get_session = getattr(self._session_db, "get_session", None)
-            if callable(get_session):
-                try:
-                    session_row = await get_session(session_entry.session_id)
-                except Exception as exc:
-                    logger.warning(
-                        "Manual compression could not restore the system prompt "
-                        "for session %s: %s. Preserving an empty prompt so the "
-                        "live turn rebuilds it with its configured providers.",
-                        session_entry.session_id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            # This agent performs a lossy rewrite. When the operator enabled
-            # compression.checkpoint_required, the memory provider must be
-            # loaded so _compress_context() can create the required
-            # pre-compression checkpoint; otherwise keep the historical fast
-            # path (no provider init, no best-effort hook) for this helper.
-            from hermes_cli.config import load_config as _load_cfg
-            from utils import is_truthy_value as _is_truthy
-
-            _checkpoint_required = _is_truthy(
-                ((_load_cfg() or {}).get("compression") or {}).get(
-                    "checkpoint_required"
-                ),
-                default=False,
+            # Same reasoning setting as a live turn (session /reasoning > per-model > global):
+            # without it the transport applies its default effort — a 400 on non-reasoning
+            # models (#85153 class).
+            runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(
+                source=source, model=model,
             )
-            # OFF the event loop (2026-09-24): AIAgent.__init__ loads the
-            # context engine under the process-global _LOAD_LOCK (20-60 s while
-            # worker turns hold it) — a PHASE=event_loop_blocked site that
-            # stalled Discord heartbeats past the ~41 s ACK window.
-            def _build_tmp_agent():
-                _a = AIAgent(
-                    **runtime_kwargs,
-                    model=model,
-                    max_iterations=4,
-                    quiet_mode=True,
-                    skip_memory=not _checkpoint_required,
-                    enabled_toolsets=["memory"],
-                    session_id=session_entry.session_id,
-                    session_db=getattr(self._session_db, "_db", self._session_db),
-                )
-                _seed_hygiene_system_prompt(_a, session_row)
-                return _a
-
+            # Build through the shared helper (upstream seam, restores the live prompt and
+            # honours compression.checkpoint_required); it constructs the AIAgent OFF the loop.
             _compress_sid = session_entry.session_id
-            tmp_agent = await asyncio.to_thread(_build_tmp_agent)
+            tmp_agent = await self._build_manual_compression_agent(
+                session_entry.session_id, model, runtime_kwargs,
+            )
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next
@@ -4152,6 +3922,7 @@ class GatewaySlashCommandsMixin(
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                             "request_overrides": dict(result.request_overrides or {}),
+                            "capabilities": dict(result.runtime_capabilities or {}),
                         })
 
                         # Announce the deliberate switch to the conversation (P2).
@@ -4168,83 +3939,14 @@ class GatewaySlashCommandsMixin(
                                 **_switch_announce_kwargs,
                             )
 
-                        # Write-through the non-secret parts to the session
-                        # store so the picked model survives a gateway restart
-                        # (api_key is never persisted).
-                        try:
-                            await _self.async_session_store.set_model_override(
-                                _session_key,
-                                _self._session_model_overrides[_session_key],
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
-                            )
-
-                        # Evict cached agent so the next turn creates a fresh
-                        # agent from the override rather than relying on the
-                        # stale cache signature to trigger a rebuild.
-                        _self._evict_cached_agent(_session_key)
-
-                        # Persist to config (default) unless --session opted out,
-                        # mirroring the text /model command path above so a picked
-                        # model survives across sessions like a typed one (#49066).
-                        if persist_global:
-                            try:
-                                # Write-back round-trip: raw read is correct
-                                # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_user_config_raw
-                                _persist_cfg = read_user_config_raw(config_path)
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                try:
-                                    from hermes_cli.route_identity import should_clear_context_pin_async
-
-                                    if await should_clear_context_pin_async(
-                                        _persist_model_cfg.get("default")
-                                        or _persist_model_cfg.get("model"),
-                                        result.new_model,
-                                        _persist_model_cfg.get("base_url"),
-                                        result.base_url,
-                                        _persist_model_cfg.get("provider"),
-                                        result.target_provider,
-                                    ):
-                                        _persist_model_cfg.pop("context_length", None)
-                                except Exception:
-                                    _persist_model_cfg.pop("context_length", None)
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                # Named providers always resolve base_url/api_mode fresh,
-                                # so any leftover is cleared unconditionally below. Custom
-                                # providers have no registry entry to re-derive from, so
-                                # they need an explicit set-or-clear here — the previous
-                                # lone `if result.base_url:` left a stale base_url behind
-                                # when switching to a custom provider whose resolver
-                                # returned an empty base_url (#25107).
-                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                elif _is_custom_target:
-                                    _persist_model_cfg.pop("base_url", None)
-                                if _is_custom_target:
-                                    if result.api_mode:
-                                        _persist_model_cfg["api_mode"] = result.api_mode
-                                    else:
-                                        _persist_model_cfg.pop("api_mode", None)
-                                else:
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
+                        # Config write-through (--global, #49066), session-override
+                        # write-through / #100314 redundant-override drop, and the
+                        # cache eviction — one durable commit shared with the typed path.
+                        _global_error = await _self._commit_model_switch_durable(
+                            result, session_key=_session_key, source=event.source,
+                            config_path=config_path, persist_global=persist_global,
+                            one_turn=False,
+                        )
 
                         # Build confirmation text.  Use display form so opaque
                         # Palantir IDs (ri.language-model-service..*) get
@@ -4310,7 +4012,11 @@ class GatewaySlashCommandsMixin(
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if persist_global and _global_error is not None:
+                            # Never claim a clean global commit the disk did not take (#100314).
+                            lines.append(t("gateway.model.warning_prefix", warning=_global_error))
+                            lines.append(t("gateway.model.session_only_hint"))
+                        elif persist_global:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
@@ -4584,12 +4290,16 @@ class GatewaySlashCommandsMixin(
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
                 "request_overrides": dict(result.request_overrides or {}),
+                # Upstream: the override carries the route's resolved runtime capabilities
+                # (native compaction etc.) so the next agent build does not re-probe them.
+                "capabilities": dict(result.runtime_capabilities or {}),
             })
             if one_turn:
-                if not hasattr(self, "_pending_one_turn_model_restores"):
-                    self._pending_one_turn_model_restores = {}
-                self._pending_one_turn_model_restores[session_key] = (
-                    restore_snapshot or {"had_override": False, "override": None}
+                # A repeated --once before the turn runs must keep the EARLIEST snapshot: the
+                # later command's snapshot is the first temporary model, not the user's
+                # standing override (upstream _claim_one_turn_restore).
+                self._claim_one_turn_restore(
+                    session_key, restore_snapshot or {"had_override": False, "override": None},
                 )
             elif hasattr(self, "_pending_one_turn_model_restores"):
                 self._pending_one_turn_model_restores.pop(session_key, None)
@@ -4610,89 +4320,13 @@ class GatewaySlashCommandsMixin(
                     **_switch_announce_kwargs,
                 )
 
-            # Write-through the non-secret parts (model/provider/base_url) to
-            # the session store so the override survives a gateway restart.
-            # api_key/api_mode are never persisted — they are re-resolved via
-            # runtime provider resolution on rehydration.
-            #
-            # /model --once is intentionally EXCLUDED from the write-through:
-            # a one-turn override must never survive a restart. The persisted
-            # value stays at the pre-once state (the prior session override,
-            # or nothing), which is exactly what the finally-restore reverts
-            # the in-memory dict to. (#29923 review defect: the original
-            # implementation wrote through, so a crash before the restore
-            # rehydrated the once-model permanently.)
-            if not one_turn:
-                try:
-                    await self.async_session_store.set_model_override(
-                        session_key,
-                        self._session_model_overrides[session_key],
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to persist session model override", exc_info=True
-                    )
-
-            # Evict cached agent so the next turn creates a fresh agent from the
-            # override rather than relying on cache signature mismatch detection.
-            self._evict_cached_agent(session_key)
-
-            # Persist to config (default) unless --session opted out
-            if persist_global:
-                try:
-                    # Write-back round-trip: raw read is correct (merged
-                    # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    try:
-                        from hermes_cli.route_identity import should_clear_context_pin_async
-
-                        if await should_clear_context_pin_async(
-                            model_cfg.get("default") or model_cfg.get("model"),
-                            result.new_model,
-                            model_cfg.get("base_url"),
-                            result.base_url,
-                            model_cfg.get("provider"),
-                            result.target_provider,
-                        ):
-                            model_cfg.pop("context_length", None)
-                    except Exception:
-                        model_cfg.pop("context_length", None)
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    # See the picker handler above for why custom providers need an
-                    # explicit set-or-clear instead of the old lone truthy check (#25107).
-                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    elif _is_custom_target:
-                        model_cfg.pop("base_url", None)
-                    if _is_custom_target:
-                        if result.api_mode:
-                            model_cfg["api_mode"] = result.api_mode
-                        else:
-                            model_cfg.pop("api_mode", None)
-                    else:
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
+            # Session-override write-through (never for --once, #29923), config
+            # write-through (--global), the #100314 redundant-override drop and the
+            # cache eviction — one durable commit shared with the picker path.
+            _global_error = await self._commit_model_switch_durable(
+                result, session_key=session_key, source=event.source,
+                config_path=config_path, persist_global=persist_global, one_turn=one_turn,
+            )
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -4771,7 +4405,11 @@ class GatewaySlashCommandsMixin(
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global:
+            if persist_global and _global_error is not None:
+                # Never claim a clean global commit the disk did not take (#100314).
+                lines.append(t("gateway.model.warning_prefix", warning=_global_error))
+                lines.append(t("gateway.model.session_only_hint"))
+            elif persist_global:
                 lines.append(t("gateway.model.saved_global"))
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")
@@ -4830,6 +4468,52 @@ class GatewaySlashCommandsMixin(
             )
 
         return await _finish_switch()
+
+    async def _commit_model_switch_durable(
+        self, result, *, session_key: str, source, config_path, persist_global: bool, one_turn: bool,
+    ) -> Optional[str]:
+        """Durable half of a committed /model switch (fork handler; mirrors upstream's
+        ``GatewayModelCommandsMixin._record_model_switch``): config write-through via the
+        ONE persist writer (#11576390), the #100314 redundant-override rule, the session-store
+        write-through (never for ``--once``, #29923) and the cache eviction.
+
+        Returns the warning for a ``--global`` switch whose config write or stale-override
+        cleanup failed (the switch then truthfully stays a session override), else ``None``.
+        """
+        from gateway import slash_commands_model as _model_mixin
+
+        global_error: Optional[str] = None
+        if persist_global:
+            try:
+                # Resolved through the module so tests/operators can patch the writer seam.
+                await _model_mixin._persist_model_switch_to_config(result, config_path)
+            except Exception as e:
+                logger.warning("Failed to persist model switch: %s", e)
+                global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
+        # A --global switch has ONE durable authority: config.yaml. On success drop the session
+        # override (memory + store) — a redundant copy would shadow every later global change
+        # after a restart (#100314). Precedence is session > channel_overrides > config.yaml, so
+        # under a channel_overrides model the session override must stay.
+        if persist_global and global_error is None and self._channel_override_for(source) is None:
+            try:
+                await self.async_session_store.set_model_override(session_key, None)
+            except Exception as e:
+                logger.warning("Failed to clear persisted session model override: %s", e)
+                global_error = t("gateway.model.err_stale_override", error=e)
+            else:
+                self._session_model_overrides.pop(session_key, None)
+        elif not one_turn:
+            # Non-secret write-through so the override survives a restart (api_key/api_mode are
+            # re-resolved on rehydration); a --once override must NOT outlive a restart (#29923).
+            try:
+                await self.async_session_store.set_model_override(
+                    session_key, self._session_model_overrides[session_key],
+                )
+            except Exception:
+                logger.debug("Failed to persist session model override", exc_info=True)
+        # Evict cached agent so the next turn builds fresh from the override.
+        self._evict_cached_agent(session_key)
+        return global_error
 
     async def _announce_model_switch(
         self,
@@ -5507,7 +5191,7 @@ class GatewaySlashCommandsMixin(
         """
         if not session_key:
             return False
-        import yaml
+        import hermes_yaml as yaml
         path = self._session_service_tiers_path()
         try:
             existing = {}
@@ -5573,7 +5257,7 @@ class GatewaySlashCommandsMixin(
             config_path = _gateway_config_home() / "config.yaml"
             if not config_path.exists():
                 return True
-            import yaml
+            import hermes_yaml as yaml
 
             # One immutable byte snapshot, parsed once. Do not validate one
             # read and obtain policy from a second loader: that creates a
@@ -5908,109 +5592,6 @@ class GatewaySlashCommandsMixin(
         except Exception:  # noqa: BLE001
             logger.debug("session reasoning resolution for /model failed", exc_info=True)
             return {}
-
-    async def _try_discord_branch_thread(
-        self,
-        source: "SessionSource",
-        branch_title: str,
-        new_session_id: str,
-        msg_count: int,
-    ) -> Optional[str]:
-        """Discord path for /branch: spawn a thread bound to the branch session.
-
-        On Discord, /branch spawns a NEW thread under the parent text channel
-        and binds the copied (branch) session to that thread's session key —
-        leaving the parent channel on its own session (the parent conversation
-        continues in place). Inside a thread already, spawns a SIBLING thread
-        under the same parent channel (Discord can't nest threads).
-
-        Returns the new thread id on success. Returns ``None`` to signal the
-        caller to fall back to the classic in-place branch (non-Discord, DMs,
-        a thread with no resolvable parent, or thread creation failed).
-        """
-        if source.platform != Platform.DISCORD:
-            return None
-        adapter = self.adapters.get(Platform.DISCORD) if getattr(self, "adapters", None) else None
-        if adapter is None:
-            return None
-        # Threads only exist in server channels, not DMs.
-        if source.chat_type == "dm":
-            return None
-
-        # Resolve the parent text channel to host the new thread. In a thread
-        # already → sibling under the same parent; in a channel → this channel.
-        if source.chat_type == "thread":
-            parent_channel_id = source.parent_chat_id
-            if not parent_channel_id:
-                # No resolvable parent — fall back to classic in-place branch.
-                return None
-        else:
-            parent_channel_id = source.chat_id
-        if not parent_channel_id:
-            return None
-
-        try:
-            new_thread_id = await adapter.create_handoff_thread(
-                str(parent_channel_id), branch_title,
-            )
-        except Exception as exc:
-            logger.debug("branch: create_handoff_thread raised: %s", exc, exc_info=True)
-            new_thread_id = None
-        if not new_thread_id:
-            # Thread creation not permitted / failed — classic in-place branch.
-            return None
-
-        # Build the thread's session source. For a Discord thread the adapter
-        # keys chat_id to the thread id itself (effective_channel), thread_id to
-        # the thread id, and parent_chat_id to the hosting channel — mirror that
-        # so the session key we bind here matches the one a real user message in
-        # the thread will produce (thread sessions are user-shared by default).
-        dest_source = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id=str(new_thread_id),
-            chat_type="thread",
-            user_id="system:branch",
-            user_name="Branch",
-            thread_id=str(new_thread_id),
-            parent_chat_id=str(parent_channel_id),
-        )
-        thread_session_key = self._session_key_for_source(dest_source)
-
-        # Make sure a session_store entry exists for the thread key, then
-        # re-point it at the copied branch session (mirrors _process_handoff).
-        await self.async_session_store.get_or_create_session(dest_source)
-        switched = await self.async_session_store.switch_session(thread_session_key, new_session_id)
-        if switched is None:
-            logger.warning(
-                "branch: could not bind thread key %s -> %s",
-                thread_session_key, new_session_id,
-            )
-            return None
-        self._clear_session_boundary_security_state(thread_session_key)
-        self._evict_cached_agent(thread_session_key)
-        try:
-            self._release_running_agent_state(thread_session_key)
-        except Exception:
-            pass
-
-        # Post an intro into the new thread so the branch has a visible anchor.
-        # Include a link back to the PARENT conversation (where /branch ran) so
-        # the child<->parent relationship is navigable from BOTH sides (the
-        # parent channel already got a link INTO this thread).
-        try:
-            parent_ref = source.thread_id or source.chat_id
-            parent_mention = f"<#{parent_ref}>" if parent_ref else t("gateway.branch.thread_parent_fallback")
-            intro = t(
-                "gateway.branch.thread_intro",
-                title=branch_title,
-                count=msg_count,
-                parent=parent_mention,
-            )
-            await adapter.send(str(new_thread_id), intro)
-        except Exception as exc:
-            logger.debug("branch: thread intro send failed: %s", exc)
-
-        return str(new_thread_id)
 
     def _undo_tail_suffix(self, session_id: str) -> str:
         """Render a one-line '↦ now at …' confirmation of the active tail.

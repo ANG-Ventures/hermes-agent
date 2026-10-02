@@ -6770,7 +6770,9 @@ class GatewayRunner(
         coordinator = self._get_deferred_restart_coordinator()
         entry = self.session_store._entries.get(session_key)
         source = getattr(entry, "origin", None)
-        adapter = self._delivery_adapter_for(source) if source is not None else None
+        # Through the fork seam (``_adapter_for_source`` -> ``_delivery_adapter_for``): the restart
+        # tests pin the barrier on the adapter that seam resolves.
+        adapter = self._adapter_for_source(source) if source is not None else None
         delivered = asyncio.Event()
 
         def _mark_self(request) -> bool:
