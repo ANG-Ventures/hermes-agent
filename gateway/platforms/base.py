@@ -3112,6 +3112,11 @@ class BasePlatformAdapter(ABC):
         logger.warning(
             "[%s] Dropping inbound event for %s: explicit profile route targets an unserved profile",
             self.name, getattr(source, "chat_id", "?"))
+        # Fork (t_43e058b7): a replayed restart follow-up refused here is LOST, never silent. The
+        # runner's ingress gate reports the same, but this adapter-level drop runs before it.
+        with contextlib.suppress(Exception):
+            from gateway.fork_ext.restart_followups import report_refused_followup
+            report_refused_followup(source, "profile_route_rejected")
         return True
 
     def _session_key_profile(self, source: Optional[Any] = None) -> Optional[str]:

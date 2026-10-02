@@ -381,3 +381,24 @@ def acknowledge_followup(path: str) -> bool:
     except OSError:
         logger.warning("restart follow-up acknowledgement failed for %s", path, exc_info=True)
         return False
+
+
+def report_refused_followup(source: Any, reason: str) -> None:
+    """A replayed restart follow-up refused at intake is LOST, never silent.
+
+    Its spool file was acknowledged when the adapter accepted the replay, so this
+    log line is the only remaining trace (t_43e058b7). No-op for a source that is
+    not a replay (``_restart_followup_session`` is set only by the boot loader).
+    """
+    session = getattr(source, "_restart_followup_session", None)
+    if not session:
+        return
+    logger.error(
+        "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
+        "user=%s: replayed follow-up refused at intake; it is DROPPED",
+        session,
+        reason,
+        getattr(getattr(source, "platform", None), "value", "unknown"),
+        getattr(source, "chat_id", None),
+        getattr(source, "user_id", None),
+    )

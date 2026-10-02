@@ -69,7 +69,8 @@ async def test_secondary_reconnect_loop_escalates_under_own_profile(tmp_path, mo
     monkeypatch.setattr(runner, "_secondary_reconnect_attempt", failing_attempt)
     monkeypatch.setattr(runner, "_safe_adapter_disconnect", noop_disconnect)
     monkeypatch.setattr(runner, "_routed_profile_home", lambda name: secondary)
-    monkeypatch.setattr(gateway_run, "_reconnect_backoff", lambda attempts: 0.02)
+    # Fork signature: _reconnect_backoff(attempt, platform) (Discord 120s cap, 2026-08-20 DNS outage).
+    monkeypatch.setattr(gateway_run, "_reconnect_backoff", lambda attempts, platform=None: 0.02)
 
     task = asyncio.create_task(runner._run_secondary_profile_reconnect("sec", Platform.DISCORD))
     deadline = time.monotonic() + 5

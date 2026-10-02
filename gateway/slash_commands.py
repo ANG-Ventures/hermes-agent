@@ -2787,16 +2787,28 @@ class GatewaySlashCommandsMixin(
         status_agent = agent if is_running else self._cached_agent_for(session_key)
         self._rehydrate_session_model_override(session_key)
         active_override = self._session_model_override(session_key) or {}
+        if not active_override:
+            # Fork rehydrate fails closed on a credential-unresolvable persisted identity (the turn
+            # resolver must not run it); /status is display-only and still shows the user's
+            # committed /model pin rather than the pre-switch DB row (upstream contract).
+            try:  # pins sqlite read: off-loop, as /fast does
+                _lookup = await asyncio.to_thread(self._persisted_session_route_identity, session_key)
+            except Exception:
+                _lookup = None
+            if _lookup is not None and _lookup.state == "valid" and _lookup.identity:
+                active_override = {k: v for k, v in dict(_lookup.identity).items() if k in ("model", "provider")}
         model_name, provider_name, context_used, context_total, route = _status_model_route(
             status_agent, active_override, persisted_route, session_row, session_entry
         )
         # -1 on the compressor after a compaction means "post-compaction estimate": prefer that
         # reading over the stored pre-compaction figure _status_model_route fell back to (t_64728f32).
         _ctx = getattr(status_agent, "context_compressor", None) if status_agent is not None else None
+        context_estimated = False
         if _ctx is not None:
             from gateway.runtime_footer import live_context_tokens
 
             _reading = live_context_tokens(_ctx)
+            context_estimated = _reading.estimated
             if _reading.post_compaction:
                 context_used = max(0, _reading.tokens or 0)
         if not context_total and model_name:
@@ -2831,13 +2843,15 @@ class GatewaySlashCommandsMixin(
         except Exception:
             pass
         from agent.context_breakdown import context_display_source
-        mark = "~" if context_display_source(getattr(status_agent, "context_compressor", None)) != "provider_usage" else ""
+        # "~": upstream's preflight-seed provenance OR the fork's post-compaction estimate.
+        mark = "~" if (context_estimated or context_display_source(_ctx) != "provider_usage") else ""
         if context_total:
             pct = min(100, round((context_used / context_total) * 100))
             lines.append(t("gateway.status.context", used=mark + _fmt(context_used), total=_fmt(context_total),
                            pct=f"{mark}{pct}"))
         elif context_used:
-            lines.append(t("gateway.status.context_used", used=mark + _fmt(context_used)))
+            # Template already carries "~" (a stored figure is an estimate by construction).
+            lines.append(t("gateway.status.context_used", used=_fmt(context_used)))
         state = t("gateway.status.state_yes") if fields["agent_running"] else t("gateway.status.state_no")
         lines += [t("gateway.status.tokens", tokens=fields["tokens"]),
                   t("gateway.status.agent_running", state=state)]

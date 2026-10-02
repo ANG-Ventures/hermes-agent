@@ -86,7 +86,9 @@ async def handle_setup_files_command(
     if not arg:
         client_secret_present = oauth_helper._client_secret_path().exists()
         token_path = oauth_helper._token_path(sender_key)
-        creds = oauth_helper.load_user_credentials(sender_key) if token_path.exists() else None
+        # May refresh + persist the token (atomic_write_text): never on the loop.
+        creds = (await asyncio.to_thread(oauth_helper.load_user_credentials, sender_key)
+                 if token_path.exists() else None)
         if creds is not None:
             who = sender_key or t(_K + "who_shared")
             await _reply(t(_K + "active", who=who, token_path=str(token_path)))

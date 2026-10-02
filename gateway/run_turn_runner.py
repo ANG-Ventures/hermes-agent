@@ -873,11 +873,28 @@ class TurnRunner:
 
     def _status_live(self) -> bool:
         """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
+        return bool(self._status_adapter_now()) and self._ctx._run_still_current()
+
+    def _status_adapter_now(self):
+        """The side-channel adapter resolved at SEND time (fork, 2026-08-05 incident): a platform
+        reconnect mid-turn replaces the object snapshotted at turn start and sends through the
+        stale one are silently dropped. ``ctx._current_status_adapter`` re-resolves from the live
+        registry; the turn-start snapshot is the fallback (bare test contexts, resolver failure)."""
+        ctx = self._ctx
+        # getattr: bare SimpleNamespace test contexts carry only the snapshot.
+        resolver = getattr(ctx, "_current_status_adapter", None)
+        if callable(resolver):
+            try:
+                adapter = resolver()
+            except Exception:
+                adapter = None
+            if adapter:
+                return adapter
+        return getattr(ctx, "_status_adapter", None)
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        self._schedule(self._status_adapter_now().send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -966,10 +983,12 @@ class TurnRunner:
             return dropped
         resolver = ctx._current_status_adapter
         try:
-            adapter = resolver() if callable(resolver) else ctx._status_adapter
+            adapter = resolver() if callable(resolver) else None
         except Exception as exc:
             _warn_route_drop("adapter_resolution_failed", type(exc).__name__)
             return dropped
+        if not adapter:
+            adapter = self._status_adapter_now()  # turn-start snapshot fallback (bare test contexts)
         if not adapter:
             _warn_route_drop("no_status_adapter")
             return dropped
@@ -1192,7 +1211,7 @@ class TurnRunner:
                     stts.on_delta(None)
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
-            elif not already_streamed and ctx._status_adapter and str(text or "").strip():
+            elif not already_streamed and self._status_adapter_now() and str(text or "").strip():
                 # Interim commentary: never the turn-final, and a split-capping adapter delivers
                 # it as one message (t_784a01bd).
                 from gateway.platforms.base import mark_commentary_send
@@ -1635,7 +1654,8 @@ class TurnRunner:
         from tools import clarify_gateway as clarify_mod
         import uuid
         ctx = self._ctx
-        if not ctx._status_adapter:
+        adapter = self._status_adapter_now()
+        if not adapter:
             # Nothing can render the question: say so, or the batch's blank answers read as
             # user inactivity (#112684).
             return UNDELIVERED_NO_SURFACE, False
@@ -1649,7 +1669,7 @@ class TurnRunner:
 
         def _text_fallback():
             """Schedule the plain-text prompt when the native card cannot render; None = no such path."""
-            coro = text_fallback_coro(ctx._status_adapter, **send_kwargs)
+            coro = text_fallback_coro(adapter, **send_kwargs)
             return None if coro is None else self._schedule(coro, "Clarify text fallback failed to schedule")
         clarify_mod.register(
             clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
@@ -1661,7 +1681,7 @@ class TurnRunner:
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            adapter.pause_typing_for_chat(ctx._status_chat_id)
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -1672,7 +1692,7 @@ class TurnRunner:
         except Exception:
             logger.debug("Stream-consumer flush before clarify prompt failed", exc_info=True)
         fut = self._schedule(
-            ctx._status_adapter.send_clarify(**send_kwargs),
+            adapter.send_clarify(**send_kwargs),
             "Clarify send failed to schedule",
         )
         # Boundary rule (see _approval_send_outcome): a send timeout is AMBIGUOUS — the card may
@@ -1687,10 +1707,10 @@ class TurnRunner:
         if not answered:
             # No answer arrived (timeout, /new, run end): retire the native card so it stops
             # looking answerable. Adapters without a persistent card have no such method.
-            retire = getattr(type(ctx._status_adapter), "retire_clarify_card", None)
+            retire = getattr(type(adapter), "retire_clarify_card", None)
             if callable(retire):
                 self._schedule(
-                    retire(ctx._status_adapter, clarify_id, _clarify_expired_notice()),
+                    retire(adapter, clarify_id, _clarify_expired_notice()),
                     "Clarify card retire failed to schedule")
         elif rearm:
             # Reopen typing IMMEDIATELY, not on the LLM's first post-answer token (native streaming
@@ -1703,7 +1723,7 @@ class TurnRunner:
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                adapter.resume_typing_for_chat(ctx._status_chat_id)
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -1714,7 +1734,7 @@ class TurnRunner:
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
-        adapter = ctx._status_adapter
+        adapter = self._status_adapter_now()
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.

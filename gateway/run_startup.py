@@ -81,6 +81,12 @@ class GatewayStartupMixin:
         try:
             await adapter.handle_message(event)
             dispatched_ok = True
+            # Capture the adapter task BEFORE any further await. Upstream's re-queue back-off
+            # (#123229) tolerates exactly ONE self-bounce of the resume event off the pre-claim
+            # sentinel; every extra event-loop turn spent here before the shield below lets the
+            # drain bounce again and pushes the real recovery turn behind a 0.25s..1s back-off.
+            session_tasks = getattr(adapter, "_session_tasks", {})
+            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
             # Scheduling is not dispatch: cancelled wrappers cost no credit; charge only once the
             # adapter accepted the turn.
             if _auto_resume_max_attempts() > 0:
@@ -90,8 +96,6 @@ class GatewayStartupMixin:
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Auto-resume attempt accounting failed for %s: %s", session_key, exc)
-            session_tasks = getattr(adapter, "_session_tasks", {})
-            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
             if task is not None:
                 await asyncio.shield(task)
         finally:

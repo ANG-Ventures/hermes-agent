@@ -53,7 +53,10 @@ def test_live_pool_runs_more_than_36_blocking_turns_concurrently(monkeypatch):
         names = {f.result(timeout=10) for f in futs}
         assert len(names) == n
         assert all(nm.startswith("hermes-gateway") for nm in names), names
-        assert pool._work_queue.qsize() == 0
+        # Nothing may sit queued behind a cap. Upstream's _UnboundedThreadExecutor has no queue
+        # at all (one thread per work item); a ThreadPoolExecutor must have drained its queue.
+        queue = getattr(pool, "_work_queue", None)
+        assert queue is None or queue.qsize() == 0
     finally:
         pool.shutdown(wait=True)
 

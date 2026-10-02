@@ -89,19 +89,24 @@ def test_adapter_for_source_still_prefers_registered_transport():
 # ── 2. Structural: side-channel closures must not capture the snapshot ──
 
 
-# Closures inside _run_agent that deliver to the status side-channel. Every
-# one of these fires from the agent worker thread at an arbitrary point in a
-# potentially hours-long turn — exactly when a reconnect may have replaced
-# the adapter.
-_SIDE_CHANNEL_CLOSURES = {
+# ── 2. Structural: every side-channel send site resolves the adapter per send ──
+#
+# Parity 2026-10-01: upstream extracted the turn body into ``TurnRunner``
+# (gateway/run_turn_runner.py); the fork's side-channel closures became methods
+# there. ``_current_status_adapter`` is bound onto the TurnContext in
+# ``GatewayRunner._run_agent_bind_turn_callbacks`` (gateway/run_turn.py) and
+# every send site reads it through ``TurnRunner._status_adapter_now``.
+_SIDE_CHANNEL_METHODS = {
     "_status_callback_sync",
-    "_interim_assistant_cb",
     "_notice_callback_sync",
-    "_deliver_bg_review_message",
-    "_bg_review_send",
+    "_make_bg_review_callbacks",
     "_clarify_callback_sync",
+    "_ask_clarify_question",
     "_approval_notify_sync",
+    "_send_status_text",
+    "_status_live",
 }
+_RESOLVERS = {"_current_status_adapter", "_status_adapter_now"}
 
 
 def _find_defs(tree, names):
@@ -112,36 +117,67 @@ def _find_defs(tree, names):
     return found
 
 
-def test_side_channel_closures_late_bind_the_adapter():
-    import gateway.run as run_mod
+def _attr_refs(node, attr):
+    return [n.lineno for n in ast.walk(node)
+            if isinstance(n, ast.Attribute) and n.attr == attr
+            and not isinstance(n.ctx, ast.Store)]
 
-    tree = ast.parse(inspect.getsource(run_mod))
-    defs = _find_defs(tree, _SIDE_CHANNEL_CLOSURES | {"_current_status_adapter"})
 
+def test_turn_binding_publishes_the_late_bind_resolver():
+    import gateway.run_turn as bind_mod
+
+    tree = ast.parse(inspect.getsource(bind_mod))
+    defs = _find_defs(tree, {"_current_status_adapter"})
     assert "_current_status_adapter" in defs, (
         "_current_status_adapter (the per-send late-bind helper) is missing "
-        "from gateway/run.py — the stale-adapter fix was reverted"
+        "from gateway/run_turn.py — the stale-adapter fix was reverted"
     )
+    stores = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Attribute) and n.attr == "_current_status_adapter"
+              and isinstance(n.ctx, ast.Store)]
+    assert stores, "turn_ctx._current_status_adapter is never bound onto the TurnContext"
 
-    missing = _SIDE_CHANNEL_CLOSURES - set(defs)
-    assert not missing, f"expected closures not found (renamed?): {missing}"
+
+def test_side_channel_closures_late_bind_the_adapter():
+    import gateway.run_turn_runner as runner_mod
+
+    tree = ast.parse(inspect.getsource(runner_mod))
+    defs = _find_defs(tree, _SIDE_CHANNEL_METHODS | {"_status_adapter_now"})
+
+    assert "_status_adapter_now" in defs, (
+        "TurnRunner._status_adapter_now (the per-send resolver) is missing — "
+        "the stale-adapter fix was reverted"
+    )
+    missing = _SIDE_CHANNEL_METHODS - set(defs)
+    assert not missing, f"expected side-channel methods not found (renamed?): {missing}"
+
+    # The resolver itself is the ONE place allowed to read the turn-start snapshot (fallback).
+    # It reads the late-bind closure via getattr (bare test contexts lack it) — accept either form.
+    resolver = defs["_status_adapter_now"]
+    reads = _attr_refs(resolver, "_current_status_adapter") + [
+        n.lineno for n in ast.walk(resolver)
+        if isinstance(n, ast.Constant) and n.value == "_current_status_adapter"
+    ]
+    assert reads, "resolver must consult _current_status_adapter"
 
     offenders = {}
-    for name in sorted(_SIDE_CHANNEL_CLOSURES):
+    for name in sorted(_SIDE_CHANNEL_METHODS):
         node = defs[name]
-        stale_refs = [
-            n.lineno
-            for n in ast.walk(node)
-            if isinstance(n, ast.Name) and n.id == "_status_adapter"
-        ]
+        stale_refs = _attr_refs(node, "_status_adapter")
+        if name == "_make_bg_review_callbacks":
+            # The post-delivery release hook registers on the adapter that RECEIVED the event
+            # (hook registry is per adapter object); its sends go through _send_status_text.
+            stale_refs = [ln for ln in stale_refs
+                          if "register_post_delivery_callback" not in ast.get_source_segment(
+                              inspect.getsource(runner_mod), node) .splitlines()[ln - node.lineno]]
         if stale_refs:
             offenders[name] = stale_refs
 
     assert not offenders, (
-        "side-channel closures reference the turn-start _status_adapter "
-        "snapshot directly — a mid-turn platform reconnect replaces that "
-        "object and sends through it are silently dropped. Route through "
-        f"_current_status_adapter() instead. Offenders: {offenders}"
+        "side-channel methods reference the turn-start _status_adapter snapshot "
+        "directly — a mid-turn platform reconnect replaces that object and sends "
+        "through it are silently dropped. Route through _status_adapter_now() "
+        f"instead. Offenders: {offenders}"
     )
 
 

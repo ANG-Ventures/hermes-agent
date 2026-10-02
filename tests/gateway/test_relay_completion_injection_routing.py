@@ -76,9 +76,9 @@ async def test_injection_resolves_relay_adapter_for_fronted_platform():
         "[delegation completed]", _slack_async_event()
     )
 
-    # 2026-08 parity merge: the fork's injection contract returns outcome
-    # strings; "delivered" is adapter acceptance (upstream's True).
-    assert result == "delivered", (
+    # 2026-10-01 parity: upstream's True/False/None injection contract is the
+    # merged one (ledger F02c); True is adapter acceptance.
+    assert result is True, (
         f"injection returned {result!r} on a relay-fronted gateway — the "
         "completion was dropped exactly as in the 2026-08-09 staging "
         "incident (literal adapter scan misses Platform.RELAY)"
@@ -96,9 +96,8 @@ async def test_injection_retries_when_platform_not_fronted():
     evt["platform"] = "discord"
 
     result = await runner._inject_watch_notification("[x]", evt)
-    # Fork vocabulary: a resolvable route with no live adapter is "temporary"
-    # (retryable — an adapter may reconnect), never a delivery. The invariant
-    # under test — relay must not hijack unrelated targets — is the zero
-    # handle_message count.
-    assert result in ("temporary", "dropped")
+    # A resolvable route with no live adapter is False (retryable — an adapter
+    # may reconnect), never a delivery. The invariant under test — relay must
+    # not hijack unrelated targets — is the zero handle_message count.
+    assert result is False
     assert adapter.handle_message.await_count == 0

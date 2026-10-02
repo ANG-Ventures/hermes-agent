@@ -9753,15 +9753,8 @@ class GatewayRunner(
         session = getattr(source, "_restart_followup_session", None)
         if not session:
             return
-        logger.error(
-            "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
-            "user=%s: replayed follow-up refused at intake; it is DROPPED",
-            session,
-            reason,
-            getattr(getattr(source, "platform", None), "value", "unknown"),
-            getattr(source, "chat_id", None),
-            getattr(source, "user_id", None),
-        )
+        from gateway.fork_ext.restart_followups import report_refused_followup
+        report_refused_followup(source, reason)
 
     def _save_restart_failure_counts(self, counts: dict[str, dict]) -> None:
         path = self._restart_failure_counts_path()
@@ -10679,9 +10672,28 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
-        logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
+    # The wait MUST cover the old gateway's graceful stop budget: its SIGTERM handler drains
+    # in-flight turns for ``restart_drain_timeout`` (cron for ``cron_drain_timeout``), then
+    # checkpoints + closes SQLite. A fixed 10s grace SIGKILLed a draining gateway MID-WRITE on
+    # every busy restart (fork incident 2026-09-16: ``gateway.previous_unclean_exit`` then
+    # ``database disk image is malformed`` days later). Same budget ``TimeoutStopSec`` derives
+    # from (#94759), so --replace and systemd agree. Loaders resolve from the mixin, not the
+    # module-level ``GatewayRunner`` name (tests stub that with a bare runner).
+    try:
+        _drain_s = GatewayConfigLoadersMixin._load_restart_drain_timeout()
+        _cron_s = GatewayConfigLoadersMixin._load_cron_drain_timeout()
+    except Exception:  # config unreadable → same floor as systemd
+        _drain_s, _cron_s = 0.0, 0.0
+    grace_s = resolve_replace_takeover_grace_s(_drain_s, _cron_s)
+    logger.info(
+        "Waiting up to %.0fs for old gateway (PID %d) to drain and exit before force-kill",
+        grace_s, existing_pid,
+    )
+    if not await _wait_for_pid_exit(existing_pid, max(1, int(grace_s / 0.5)), 0.5):
+        logger.warning(
+            "Old gateway (PID %d) did not exit within %.0fs after SIGTERM, sending SIGKILL.",
+            existing_pid, grace_s,
+        )
         old_gateway_exited = False
         try:
             terminate_pid(existing_pid, force=True, expected_start_time=existing_start_time)
@@ -10749,8 +10761,13 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
         _stderr_handler = logging.StreamHandler(_safe_stderr())
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(_gateway_stderr_formatter())
+        # Under launchd stderr IS a file (logs/gateway.error.log); attached directly, every WARNING+
+        # on the event loop became a synchronous disk write (PHASE=event_loop_blocked seconds=10 in
+        # the Discord heartbeat path -> ack_stale reconnect, 2026-09-23). Route it through the async
+        # QueueListener the rotating file handlers already use (fork).
+        from hermes_logging import _register_queued_handler as _queue_handler
+        _queue_handler(_stderr_handler)
         root = logging.getLogger()
-        root.addHandler(_stderr_handler)
         if _stderr_level < root.level:  # so DEBUG records can reach the handler
             root.setLevel(_stderr_level)
 

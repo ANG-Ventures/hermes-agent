@@ -117,6 +117,8 @@ class TestVoiceModeProfileIsolation:
         a._client = MagicMock()
         a._client.get_channel = MagicMock(return_value=None)
         a.handle_message = AsyncMock()
+        # upstream: voice input resolves the text channel's chat_type via get_chat_info
+        a.get_chat_info = AsyncMock(return_value={"type": "channel"})
         return a
 
     @pytest.mark.asyncio

@@ -157,11 +157,11 @@ class TestUsageAccountSection:
         # persisted-provider fetch path under test is exercised deterministically.
         monkeypatch.setattr(runner, "_compact_account_limit_lines", lambda: [])
         monkeypatch.setattr(
-            "gateway.slash_commands_status.fetch_account_usage",
+            "gateway.slash_commands.fetch_account_usage",
             lambda provider, base_url=None, api_key=None: object(),
         )
         monkeypatch.setattr(
-            "gateway.slash_commands_status.render_account_usage_lines",
+            "gateway.slash_commands.render_account_usage_lines",
             lambda snapshot, markdown=False: [
                 "📈 **Account limits**",
                 "Provider: openai-codex (Pro)",
@@ -268,11 +268,11 @@ class TestUsageAccountSection:
         monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": {"provider": "openai-codex"}})
         monkeypatch.setattr(
-            "gateway.slash_commands_status.fetch_account_usage",
+            "gateway.slash_commands.fetch_account_usage",
             lambda provider, base_url=None, api_key=None: object(),
         )
         monkeypatch.setattr(
-            "gateway.slash_commands_status.render_account_usage_lines",
+            "gateway.slash_commands.render_account_usage_lines",
             lambda snapshot, markdown=False: ["📈 **Account limits**", "Provider: openai-codex (Plus)",
                                               "Weekly: 91% remaining (9% used)"],
         )
@@ -307,11 +307,11 @@ class TestUsageAccountSection:
 
         monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
         monkeypatch.setattr(
-            "gateway.slash_commands_status.fetch_account_usage",
+            "gateway.slash_commands.fetch_account_usage",
             lambda provider, base_url=None, api_key=None: object(),
         )
         monkeypatch.setattr(
-            "gateway.slash_commands_status.render_account_usage_lines",
+            "gateway.slash_commands.render_account_usage_lines",
             lambda snapshot, markdown=False: ["account limits"],
         )
         monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])

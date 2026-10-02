@@ -2259,9 +2259,10 @@ class GatewayShutdownMixin:
                 reason="shutdown",
             )
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
+        # _pending_messages is NOT cleared here: drain=True above took the atomic snapshot-and-clear
+        # before the await; a clear after it would destroy a message that arrived mid-flush.
         self._running_agents.clear()
         self._running_agents_ts.clear()
-        self._pending_messages.clear()
         self._pending_approvals.clear()
         for _attr in ("_active_session_leases", "_busy_ack_ts"):  # absent on bare shutdown-path doubles
             if hasattr(self, _attr):

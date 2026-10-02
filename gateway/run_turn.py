@@ -4509,7 +4509,25 @@ class GatewayTurnMixin:
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
-        turn_ctx._status_adapter = self._delivery_adapter_for(source)
+        _status_adapter = self._delivery_adapter_for(source)
+        turn_ctx._status_adapter = _status_adapter
+
+        def _current_status_adapter() -> Any:
+            """Late-bind the status/side-channel adapter at SEND time (fork, 2026-08-05 incident).
+
+            The adapter snapshotted at turn start can be REPLACED mid-turn by the platform reconnect
+            watcher (Discord ws ``ack_stale`` → ``self.adapters[platform]`` holds a NEW object); sends
+            through the stale object are silently dropped — a model-fallback announce generated 80s
+            after a reconnect never reached the channel. Re-resolve from the live registry per send;
+            fall back to the snapshot when live resolution fails (platform offline mid-reconnect).
+            """
+            try:
+                _live = self._delivery_adapter_for(source)
+            except Exception:
+                _live = None
+            return _live or _status_adapter
+
+        turn_ctx._current_status_adapter = _current_status_adapter
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
@@ -4605,6 +4623,20 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        # Fork runtime net: a turn whose bound executor context disagrees with its call is
+        # reported before dispatch (a cross-session follow-up executing under a stale key).
+        from gateway.session_context import get_session_env
+        try:
+            expected_session_key = self._session_key_for_source(source)
+        except Exception:
+            expected_session_key = session_key
+        bound_session_key = get_session_env("HERMES_SESSION_KEY", "")
+        if expected_session_key and bound_session_key != expected_session_key:
+            logger.warning(
+                "Agent executor context mismatch: bound session %r, executing turn %r",
+                bound_session_key, expected_session_key,
+            )
+
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,

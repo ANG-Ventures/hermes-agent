@@ -24,8 +24,12 @@ class ProcessCheckpointMixin:
         try:
             with self._lock:
                 entries = []
-                for s in self._running.values():
-                    if s.exited:
+                # Restart-durable handoff (fork, t_1191e078): a child handed to the next boot stays
+                # in the checkpoint even after THIS process's reader reaps it (exited, in _finished),
+                # or a child finishing in the restart gap vanishes before the next boot adopts it.
+                handed_off = [s for s in self._finished.values() if s.id in self._handoff_ids]
+                for s in list(self._running.values()) + handed_off:
+                    if s.exited and s.id not in self._handoff_ids:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
@@ -85,7 +89,8 @@ class ProcessCheckpointMixin:
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
             fate = self._detached_host_fate(pid, entry.get("host_start_time"))
-            if fate == "reused":
+            durable = bool(entry.get("output_log"))
+            if fate == "reused" and not durable:
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
                     "start time no longer matches — PID was recycled onto "
@@ -100,7 +105,14 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
-                continue
+                    continue
+                if not durable:
+                    continue
+                # A restart-durable spawn (fork, t_1191e078) that finished while no gateway was
+                # running: its log + exit file still hold the result (PID identity is irrelevant;
+                # a recycled PID is never signalled), so adopt it below and let
+                # ``_refresh_detached_session`` finish it from the recorded exit instead of
+                # dropping the completion.
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             fields.update(
                 command=entry.get("command", "unknown"),
@@ -122,5 +134,8 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
+            if fate != "running":
+                # Durable spawn adopted past its death: finish it from the recorded exit now.
+                self._refresh_detached_session(session)
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered

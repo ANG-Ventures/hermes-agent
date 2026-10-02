@@ -127,9 +127,10 @@ async def test_stop_mid_api_call_then_adapter_cancel_does_not_leak_lease():
             SESSION_ID, owner_key=qk, generation=generation, timeout=1800
         )
         token.owner_task = asyncio.current_task()
+        # Parity 2026-10-01: tokens are keyed by acquiring run generation (upstream
+        # TurnState.lease_tokens) so a displaced turn frees only its own lease.
         state = runner._session_state(qk).turn
-        state.lease_token = token
-        state.lease_generation = generation
+        state.lease_tokens[generation] = token
         # _mark_durable_active_turn's carrier attributes.
         setattr(ev, "_gateway_active_turn_session_key", qk)
         setattr(ev, "_gateway_active_turn_token", "durable-token")
@@ -166,7 +167,7 @@ async def test_stop_mid_api_call_then_adapter_cancel_does_not_leak_lease():
     )
     assert not lease.lock.locked()
     state = runner._peek_session_state(key)
-    assert state.turn.lease_token is None
+    assert not state.turn.lease_tokens
 
     # The user's next message acquires at once instead of being rejected.
     token = await registry.acquire(
@@ -289,8 +290,7 @@ async def test_release_turn_lease_mismatch_on_held_token_warns(caplog):
     key = "agent:main:discord:thread:1:1"
     token = await registry.acquire(SESSION_ID, owner_key=key, generation=1, timeout=1)
     state = runner._session_state(key).turn
-    state.lease_token = token
-    state.lease_generation = 1
+    state.lease_tokens[1] = token
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         assert runner._release_turn_lease(key, 2) is False

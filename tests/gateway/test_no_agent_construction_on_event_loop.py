@@ -130,16 +130,15 @@ def test_walker_catches_a_direct_call_and_ignores_to_thread_payload():
 #
 # Remaining pins must carry a reason; the list may only shrink.  A new site must
 # be offloaded (``asyncio.to_thread`` or ``self.async_session_store``) instead.
-KNOWN_ONE_HOP_STORE_CALLS = {
-    # _schedule_resume_pending_sessions schedules resume tasks through
-    # StartupResumePool.submit -> asyncio.create_task, so it must run on the
-    # loop. It runs only at boot and on platform reconnect. Since t_cc8533d1,
-    # SessionStore._lock never spans SQLite/fsync, so its locked snapshot
-    # waits only on in-memory critical sections.
-    ("_platform_reconnect_watcher", "_schedule_resume_pending_sessions"),
-    ("_restore_resume_pending_sessions_at_startup", "_schedule_resume_pending_sessions"),
-    ("start", "_schedule_resume_pending_sessions"),
-}
+KNOWN_ONE_HOP_STORE_CALLS: set[tuple[str, str]] = set()
+# ^ (empty) The historical entries — start / _restore_resume_pending_sessions_at_startup /
+# _platform_reconnect_watcher -> _schedule_resume_pending_sessions — are now TWO hops:
+# upstream (parity 2026-10-01) extracted the lock-held snapshot into the sync helper
+# _resume_pending_candidates, which this one-hop walker cannot see. The accepted site is
+# pinned by test_resume_snapshot_is_the_known_two_hop_site below instead. (It schedules
+# resume tasks through StartupResumePool.submit -> asyncio.create_task, so it must run on
+# the loop; it runs only at boot and on platform reconnect; since t_cc8533d1 SessionStore._lock
+# never spans SQLite/fsync, so its locked snapshot waits only on in-memory critical sections.)
 
 _BLOCKING_STORE_SEEDS = {"_lock", "_db"}
 
@@ -264,9 +263,36 @@ def _parse(rel: str) -> ast.AST:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
+def _parse_with_mixins(rel: str, class_name: str, sibling_glob: str) -> ast.AST:
+    """``_parse(rel)`` with the class's upstream-split mixin bodies folded back in.
+
+    Parity 2026-10-01: upstream moved most of ``GatewayRunner`` into ``gateway/run_*.py`` and most
+    of ``SessionStore`` into ``gateway/session_*.py`` as ``*Mixin`` classes. The walkers below key
+    on ONE ``ClassDef`` named *class_name*, so every ``*Mixin`` class body from the sibling modules
+    is appended to that class's body (module-level code stays where it was)."""
+    tree = _parse(rel)
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == class_name)
+    for path in sorted((REPO / "gateway").glob(sibling_glob)):
+        sibling = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in sibling.body:
+            if isinstance(node, ast.ClassDef) and node.name.endswith("Mixin"):
+                cls.body.extend(node.body)
+            else:
+                tree.body.append(node)
+    return tree
+
+
+def _runner_tree() -> ast.AST:
+    return _parse_with_mixins("gateway/run.py", "GatewayRunner", "run_*.py")
+
+
+def _store_tree() -> ast.AST:
+    return _parse_with_mixins("gateway/session.py", "SessionStore", "session_*.py")
+
+
 def test_one_hop_session_store_calls_on_loop_only_shrink():
-    tree = _parse("gateway/run.py")
-    blocking = _blocking_store_members(_parse("gateway/session.py"))
+    tree = _runner_tree()
+    blocking = _blocking_store_members(_store_tree())
     hits = _one_hop_store_calls(tree, _sync_runner_methods_touching_store(tree, blocking))
     new = sorted(hits - KNOWN_ONE_HOP_STORE_CALLS)
     stale = sorted(KNOWN_ONE_HOP_STORE_CALLS - hits)
@@ -281,9 +307,29 @@ def test_one_hop_session_store_calls_on_loop_only_shrink():
     )
 
 
+def test_resume_snapshot_is_the_known_two_hop_site():
+    """The boot/reconnect resume scheduler still takes the store lock on the loop — via the
+    extracted ``_resume_pending_candidates`` helper. Pin that shape so the empty
+    ``KNOWN_ONE_HOP_STORE_CALLS`` above is a measured fact, not the walker going blind."""
+    tree = _runner_tree()
+    blocking = _blocking_store_members(_store_tree())
+    sync_touching = _sync_runner_methods_touching_store(tree, blocking)
+    assert "_resume_pending_candidates" in sync_touching
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "GatewayRunner")
+    scheduler = next(
+        fn for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_schedule_resume_pending_sessions"
+    )
+    assert any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_resume_pending_candidates"
+        for n in ast.walk(scheduler)
+    )
+
+
 def test_blocking_store_members_track_the_real_store():
     """The callee set is derived from SessionStore, not hand-listed."""
-    blocking = _blocking_store_members(_parse("gateway/session.py"))
+    blocking = _blocking_store_members(_store_tree())
     # Lock-takers and SQLite paths, including transitive ones.
     for name in ("_ensure_loaded", "mark_resume_pending", "clear_resume_pending",
                  "has_platform_message_id_answerable", "_save"):

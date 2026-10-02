@@ -1407,7 +1407,8 @@ class GatewayInboundMixin:
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
-            self._hm_evict_reaped_agent(_quick_key)
+            # Reads state.db (``_is_session_ended_in_db``) under the store lock: off the loop.
+            await asyncio.to_thread(self._hm_evict_reaped_agent, _quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
