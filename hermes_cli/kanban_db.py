@@ -19356,9 +19356,40 @@ def _reap_worker_session(
     return len(signalled)
 
 
+_CARD_ID_RE = re.compile(r"t_[0-9a-f]+")
+
+
+def _cmdline_profile_cards(cmdline) -> set[str]:
+    """Card ids named as a path component of a ``--user-data-dir`` argument.
+
+    Chrome on Linux rewrites its argv area for its process title, and the
+    kernel's ``/proc/<pid>/environ`` window sits right after argv, so every
+    Chrome process reads back an environment WITHOUT the run identity
+    (measured on ACE-AI: 0 of 11 chrome processes kept
+    ``HERMES_KANBAN_TASK``; their ``cat`` helpers did). A browser profile
+    under the card workspace (``.../workspaces/<card>/...`` or
+    ``<repo>/.worktrees/<card>/...``) still names the card in its argv.
+    """
+    out: set[str] = set()
+    args = list(cmdline or [])
+    for i, arg in enumerate(args):
+        if arg.startswith("--user-data-dir="):
+            path = arg.split("=", 1)[1]
+        elif arg == "--user-data-dir" and i + 1 < len(args):
+            path = args[i + 1]
+        else:
+            continue
+        out.update(c for c in path.replace("\\", "/").split("/") if _CARD_ID_RE.fullmatch(c))
+    return out
+
+
 def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
     """``(pid, pgid)`` of every live process whose ENVIRONMENT carries exactly
-    this task+run identity, wherever it sits in the session tree.
+    this task+run identity, wherever it sits in the session tree. A process
+    with no run identity in its environment also matches when its
+    ``--user-data-dir`` names the card (:func:`_cmdline_profile_cards`):
+    Linux Chrome erases its own environment window. Callers bound every
+    match by the run's birth window, which tells runs of one card apart.
 
     A worker's children inherit its environment. One class of child
     ``setsid()``s into a NEW session on purpose (the browser-use harness
@@ -19375,7 +19406,7 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
         my_sid = None
     want_task, want_run = str(task_id), str(run_id)
     found: list[tuple[int, int]] = []
-    for proc in psutil.process_iter(["pid"]):
+    for proc in psutil.process_iter(["pid", "cmdline"]):
         pid = proc.info["pid"]
         if pid == me or pid <= 1:
             continue
@@ -19383,7 +19414,11 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             env = proc.environ()
         except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
             continue
-        if env.get("HERMES_KANBAN_TASK") != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
+        env_task = env.get("HERMES_KANBAN_TASK")
+        if env_task is None:
+            if want_task not in _cmdline_profile_cards(proc.info.get("cmdline")):
+                continue
+        elif env_task != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
             continue
         try:
             if my_sid is not None and os.getsid(pid) == my_sid:

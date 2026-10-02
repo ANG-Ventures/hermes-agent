@@ -176,35 +176,85 @@ def census_worker_trees(
     ``runs`` maps ``(task_id, str(run_id))`` -> worker pid (= session id).
     A process belongs to a run when its session id is the worker's pid, or
     its environment carries the run's task+run id (children that setsid out
-    of the session keep the env). Same uid only; self excluded.
+    of the session keep the env), or it has no run identity in its
+    environment and its ``--user-data-dir`` names the card (Linux Chrome).
+    Session members that are, or descend from, a process older than the
+    worker are a previous holder of a recycled sid and are not counted.
+    Same uid only; self excluded.
     Returns ``{key: {"procs": n, "top": [(name, n), ...]}}``.
     """
     if not runs or not hasattr(os, "getuid"):
         return {}
+    from hermes_cli import kanban_db as kb
+
     by_sid = {int(pid): key for key, pid in runs.items() if pid}
+    by_card = {key[0]: key for key in runs}
+    # Generation check: a session id outlives its leader, so a recycled
+    # worker pid could inherit an older session's members, and those keep
+    # forking. A genuine member is born after the worker (its leader) and so
+    # is every same-session ancestor; 1 s slack for clock granularity. An
+    # unreadable worker birth trusts the sid match.
+    leader_birth = {sid: kb._member_birth(sid) for sid in by_sid}
     uid = os.getuid()  # windows-footgun: ok (hasattr-gated above)
     me = os.getpid()
     members: dict[tuple[str, str], Counter] = {k: Counter() for k in runs}
-    for proc in psutil.process_iter(["pid", "uids", "name"]):
+    # pid -> (sid, ppid, birth) for every same-uid process, for the walk.
+    table: dict[int, tuple[Optional[int], int, Optional[float]]] = {}
+    sid_hits: list[tuple[int, int, str]] = []
+    for proc in psutil.process_iter(
+            ["pid", "ppid", "uids", "name", "cmdline", "create_time"]):
         info = proc.info
         pid = info.get("pid") or 0
         uids = info.get("uids")
         if pid <= 1 or pid == me or uids is None or uids.real != uid:
             continue
-        key = None
         try:
-            key = by_sid.get(os.getsid(pid))
+            sid: Optional[int] = os.getsid(pid)
         except OSError:
-            pass
-        if key is None:
-            try:
-                env = proc.environ()
-            except (psutil.Error, OSError):
-                continue
+            sid = None
+        table[pid] = (sid, info.get("ppid") or 0, info.get("create_time"))
+        name = info.get("name") or "?"
+        if sid in by_sid:
+            sid_hits.append((pid, sid, name))
+            continue
+        try:
+            env = proc.environ()
+        except (psutil.Error, OSError):
+            continue
+        if env.get("HERMES_KANBAN_TASK") is None:
+            # Linux Chrome erases its environ window; its profile path still
+            # names the card (kb._cmdline_profile_cards).
+            cards = kb._cmdline_profile_cards(info.get("cmdline"))
+            key = next((by_card[c] for c in cards if c in by_card), None)
+            # The card names no run: a browser older than this run's worker
+            # belongs to an earlier run of the card, not this one.
+            lead = leader_birth.get(runs[key]) if key is not None else None
+            born = info.get("create_time")
+            if lead is not None and born is not None and born < lead - 1.0:
+                key = None
+        else:
             key = (env.get("HERMES_KANBAN_TASK"), env.get("HERMES_KANBAN_RUN_ID"))
-            if key not in members:
-                continue
-        members[key][info.get("name") or "?"] += 1
+        if key in members:
+            members[key][name] += 1
+
+    def _stale(pid: int, sid: int) -> bool:
+        lead = leader_birth.get(sid)
+        if lead is None:
+            return False
+        seen: set[int] = set()
+        while pid in table and pid not in seen and pid != sid:
+            seen.add(pid)
+            p_sid, ppid, born = table[pid]
+            if p_sid != sid:
+                return False
+            if born is not None and born < lead - 1.0:
+                return True
+            pid = ppid
+        return False
+
+    for pid, sid, name in sid_hits:
+        if not _stale(pid, sid):
+            members[by_sid[sid]][name] += 1
     return {
         k: {"procs": sum(c.values()), "top": c.most_common(3)}
         for k, c in members.items()
@@ -293,9 +343,18 @@ def enforce_worker_process_cap(
             "script, a leaked browser/pytest pool) or raise the cap, then unblock."
         )
         try:
-            kb.block_task(conn, tid, reason=reason, kind="capability", expected_run_id=run_id)
+            blocked = kb.block_task(
+                conn, tid, reason=reason, kind="capability", expected_run_id=run_id)
         except Exception as exc:
+            blocked = False
             _log.warning("kanban: process-cap block of %s failed: %s", tid, exc)
+        if not blocked:
+            # The tree is already reaped; the card was not blocked (DB locked,
+            # run moved on). Do not page a block that did not happen: the
+            # crash path sees the dead worker next tick, and a respawned
+            # runaway trips the cap again.
+            _log.warning("kanban: process-cap kill of %s run %s not followed by a block", tid, run_id)
+            continue
         capped.append(tid)
         if notify:
             _notify_cap(tid, run_id, c["procs"], cap, top)

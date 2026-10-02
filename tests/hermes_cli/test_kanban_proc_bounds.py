@@ -283,6 +283,62 @@ def test_cap_off_and_dry_run_never_signal(conn, monkeypatch):
     assert w.poll() is None and all(kb._pid_alive(p) for p in kids)
 
 
+def test_failed_block_is_not_reported_as_capped(conn, monkeypatch):
+    # Prism P1: a kill whose block did not persist must not be paged or
+    # returned as a blocked card.
+    tid = kb.create_task(conn, title="runaway", assignee="worker")
+    assert kb.claim_task(conn, tid) is not None
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    _STARTED.append(sleeper.pid)
+    assert kb._set_worker_pid(conn, tid, sleeper.pid)
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
+                        lambda *a, **k: {"terminated": True})
+    pages: list = []
+    monkeypatch.setattr(kpb, "_notify_cap", lambda *a: pages.append(a))
+    fake = lambda runs: {k: {"procs": 999, "top": [("x", 999)]} for k in runs}
+
+    def _locked(*a, **k):
+        raise kb.sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kb, "block_task", _locked)
+    assert kpb.enforce_worker_process_cap(conn, cap=32, census=fake) == []
+    monkeypatch.setattr(kb, "block_task", lambda *a, **k: False)
+    assert kpb.enforce_worker_process_cap(conn, cap=32, census=fake) == []
+    assert pages == []
+    # The audit event still lands, and its payload is JSON (Prism P1 #2).
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='process_cap_exceeded'",
+        (tid,)).fetchall()
+    assert len(rows) == 2 and '"top": [["x", 999]]' in rows[0]["payload"]
+
+
+@pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
+def test_census_ignores_members_older_than_the_worker(conn, monkeypatch):
+    # Prism P1: a recycled worker pid must not inherit an older session's
+    # members (or what they fork). Simulate: the recorded worker is "born"
+    # after its session's members.
+    tid = kb.create_task(conn, title="card", assignee="worker")
+    assert kb.claim_task(conn, tid) is not None
+    w, kids = _spawn_worker(conn, tid, 6)
+    key = (tid, str(kb.get_task(conn, tid).current_run_id))
+    assert kpb.census_worker_trees({key: w.pid})[key]["procs"] == 7  # control
+    real = kb._member_birth
+    monkeypatch.setattr(kb, "_member_birth",
+                        lambda pid: time.time() + 5.0 if pid == w.pid else real(pid))
+    # The 5 older session members drop out; the worker (the new leader) and
+    # the env-tagged setsid escapee outside the session still count.
+    assert kpb.census_worker_trees({key: w.pid})[key]["procs"] == 2
+
+
+def test_cmdline_profile_cards():
+    f = kb._cmdline_profile_cards
+    assert f(["chrome", "--user-data-dir=/x/workspaces/t_ab12/chrome"]) == {"t_ab12"}
+    assert f(["chrome", "--user-data-dir", "/r/.worktrees/t_cd34/p"]) == {"t_cd34"}
+    assert f(["chrome", "--user-data-dir=/tmp/prof", "/x/t_ab12"]) == set()
+    assert f(["chrome", "--user-data-dir=/x/t_ab12x/p"]) == set()
+    assert f(None) == set()
+
+
 def test_dispatch_tick_runs_the_cap(conn, monkeypatch):
     calls: list = []
     monkeypatch.setattr(kpb, "enforce_worker_process_cap",
@@ -307,7 +363,8 @@ def _headless_chrome() -> str | None:
     ):
         for c in sorted(home.glob(pattern)):
             return str(c)
-    return shutil.which("chrome-headless-shell") or shutil.which("chromium")
+    return (shutil.which("chrome-headless-shell") or shutil.which("chromium")
+            or shutil.which("google-chrome"))
 
 
 # Fake worker: launches headless Chrome detached into its OWN session (the way
@@ -365,6 +422,10 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     leaked = _chrome_procs(profile)
     assert len(leaked) >= 2, "Chrome did not start its helpers; drill proves nothing"
     _STARTED.extend(leaked)
+    # The live per-run census sees the browser too (Linux Chrome erases its
+    # environ window; the profile path under the card workspace names it).
+    key = (tid, str(task.current_run_id))
+    assert kpb.census_worker_trees({key: worker.pid})[key]["procs"] >= 1 + len(leaked)
 
     assert kb.complete_task(conn, tid, summary="done")
     worker.stdin.write("go\n")
