@@ -179,7 +179,7 @@ class _Index:
         self.modules = {_module_name(rel) for rel in files}
         for rel in files:
             try:
-                text = (self.root / rel).read_text(encoding="utf-8", errors="replace")
+                text = (self.root / rel).read_text(encoding="utf-8-sig", errors="replace")
                 with warnings.catch_warnings():
                     # Test-file docstring escapes are not our signal; keep CI logs clean.
                     warnings.simplefilter("ignore", SyntaxWarning)
@@ -357,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         changed = args.changed or sys.stdin.read().splitlines()
         durations: dict[str, float] = {}
         if args.durations and Path(args.durations).is_file():
-            durations = json.loads(Path(args.durations).read_text(encoding="utf-8"))
+            durations = json.loads(Path(args.durations).read_text(encoding="utf-8-sig"))
         idx = _Index(Path(args.repo_root))
         files, reason = select(changed, idx.root, durations, idx)
         slices = 0

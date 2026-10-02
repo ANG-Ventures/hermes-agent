@@ -352,7 +352,7 @@ def _plugin_identity(plugin_dir: Path) -> dict[str, str]:
     info = {"vendored_path": str(plugin_dir)}
     yaml_path = plugin_dir / "plugin.yaml"
     if yaml_path.exists():
-        for line in yaml_path.read_text(encoding="utf-8").splitlines():
+        for line in yaml_path.read_text(encoding="utf-8-sig").splitlines():
             if line.startswith("name:"):
                 info["plugin_name"] = line.split(":", 1)[1].strip().strip('"')
             elif line.startswith("version:"):
@@ -360,7 +360,7 @@ def _plugin_identity(plugin_dir: Path) -> dict[str, str]:
     provenance_path = plugin_dir / "VENDORED_FROM.txt"
     if provenance_path.exists():
         provenance = " ".join(
-            line.strip() for line in provenance_path.read_text(encoding="utf-8").splitlines()
+            line.strip() for line in provenance_path.read_text(encoding="utf-8-sig").splitlines()
             if line.strip()
         )
         info["provenance"] = provenance[:600]

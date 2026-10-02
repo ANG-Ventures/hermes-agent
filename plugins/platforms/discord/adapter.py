@@ -865,7 +865,7 @@ class _DiscordDeadChannelTracker:
         if not path.exists():
             return []
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(data, list):
                 return [str(cid) for cid in data if str(cid).strip()]
         except Exception:
@@ -963,7 +963,7 @@ class _DiscordRestartRecoveryState:
         if not path.exists():
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
             logger.debug("[Discord] Failed to load restart-recovery state", exc_info=True)
             return

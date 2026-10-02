@@ -1103,7 +1103,7 @@ def _owned_late_results(parent_agent: Any) -> List[Dict[str, Any]]:
         if rid in snapshot:
             continue
         try:
-            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec = json.loads(p.read_text(encoding="utf-8-sig"))
         except Exception:
             continue
         if not (isinstance(rec, dict) and isinstance(rec.get("entry"), dict)):

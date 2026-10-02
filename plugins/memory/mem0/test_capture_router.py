@@ -133,7 +133,7 @@ def test_router_dispatch_prefs_to_mem0_world_to_staged(tmp_path):
     assert res["destination"] == "staging"
     staged = res["staged_path"]
     assert os.path.exists(staged)
-    body = open(staged, encoding="utf-8").read()
+    body = open(staged, encoding="utf-8-sig").read()
     assert body.startswith("---")
     assert "source_turn: t001" in body
     assert "session: sess1" in body
@@ -157,7 +157,7 @@ def test_router_scrubs_secret_world_facts_before_any_write(tmp_path, staging_mod
     res = router.route_turn("u", "a", turn_id="t009", session="s")
     assert res["world_scrubbed"] == 1
     assert [f["content"] for f in res["world_facts"]] == ["gbrain uses PGLite by default"]
-    written = "".join(p.read_text(encoding="utf-8") for p in tmp_path.rglob("*.md"))
+    written = "".join(p.read_text(encoding="utf-8-sig") for p in tmp_path.rglob("*.md"))
     assert "PGLite" in written and secret not in written
 
 
@@ -639,6 +639,6 @@ def test_default_write_same_target_reentrant_writers_do_not_collide(tmp_path, mo
     CaptureRouter._default_write(target, "A-content")   # must not raise
 
     assert fired
-    with open(target, encoding="utf-8") as fh:
+    with open(target, encoding="utf-8-sig") as fh:
         assert fh.read() == "A-content"                 # last publish wins, whole (never truncated)
     assert sorted(os.listdir(os.path.dirname(target))) == ["turn.md"]   # no temp left behind

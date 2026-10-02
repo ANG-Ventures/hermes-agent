@@ -842,7 +842,7 @@ def _worktree_bundle_meta(worktree: Path, commits: int) -> Dict[str, Any]:
     """
     meta: Dict[str, Any] = {"commits": commits}
     try:
-        meta["gitdir"] = (worktree / ".git").read_text(encoding="utf-8", errors="replace").strip()
+        meta["gitdir"] = (worktree / ".git").read_text(encoding="utf-8-sig", errors="replace").strip()
     except OSError:
         pass
     for key, argv in (

@@ -256,7 +256,7 @@ def _channel_display_names() -> dict[tuple[str, str], str]:
     """Use the gateway's discovered channel directory when available."""
     path = get_hermes_home() / "channel_directory.json"
     try:
-        directory = json.loads(path.read_text(encoding="utf-8"))
+        directory = json.loads(path.read_text(encoding="utf-8-sig"))
         return {
             (platform, str(channel["id"])): str(channel["name"])
             for platform, channels in directory.get("platforms", {}).items()

@@ -1143,7 +1143,7 @@ def _read_board_aliases() -> dict[str, str]:
     if cached_stamp == stamp:
         return cached_val
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         _BOARD_ALIAS_CACHE = (stamp, {})
         return {}
@@ -3985,7 +3985,7 @@ def _operator_token_state() -> str:
     if not presented:
         return "absent"
     try:
-        expected = operator_token_path().read_text(encoding="utf-8").strip()
+        expected = operator_token_path().read_text(encoding="utf-8-sig").strip()
     except OSError:
         return "no_token_file"
     if not expected:
@@ -14635,7 +14635,7 @@ def _notify_rate_limit_circuit(
 
         marker = board_state_dir(board) / _RATE_LIMIT_CIRCUIT_MARKER
         try:
-            seen = json.loads(marker.read_text(encoding="utf-8"))
+            seen = json.loads(marker.read_text(encoding="utf-8-sig"))
         except Exception:
             seen = {}
         if not isinstance(seen, dict):
@@ -14821,7 +14821,7 @@ def _load_pr_state_cache(
             > _RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS
         ):
             return {}, set()
-        payload = json.loads(swap_path.read_text(encoding="utf-8"))
+        payload = json.loads(swap_path.read_text(encoding="utf-8-sig"))
         nonterminal_cache = {
             (str(repo), int(number)): state
             for repo, number, state in payload.get("nonterminal", [])

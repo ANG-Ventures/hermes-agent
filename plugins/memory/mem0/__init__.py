@@ -756,7 +756,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from hermes_constants import get_hermes_home
             cfg_path = get_hermes_home() / "mem0.json"
-            kill = (json.loads(cfg_path.read_text(encoding="utf-8")).get("retrieval_kill") or {})
+            kill = (json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("retrieval_kill") or {})
             return self._truthy(kill.get("rerank", False))
         except Exception:
             return False
@@ -844,7 +844,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from hermes_constants import get_hermes_home
             cfg_path = get_hermes_home() / "mem0.json"
-            blk = json.loads(cfg_path.read_text(encoding="utf-8")).get("prefetch_relevance_floor")
+            blk = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("prefetch_relevance_floor")
             return blk if isinstance(blk, dict) else {}
         except Exception:
             return {}
@@ -1000,7 +1000,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from hermes_constants import get_hermes_home
             cfg_path = get_hermes_home() / "mem0.json"
-            blk = json.loads(cfg_path.read_text(encoding="utf-8")).get(key)
+            blk = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get(key)
             return blk if isinstance(blk, dict) else {}
         except Exception:
             return {}
@@ -1723,7 +1723,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 return self._live_capture_val
             cfg_capture = None
             if mtime and cfg_path.exists():
-                cfg_capture = json.loads(cfg_path.read_text(encoding="utf-8")).get("capture")
+                cfg_capture = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("capture")
             value, source = resolve_capture(env_val, cfg_capture)
             self._live_capture_val = value
             self._live_capture_sig = sig
@@ -2077,7 +2077,7 @@ class Mem0MemoryProvider(MemoryProvider):
         cutoff = time.time() - 3600.0
         n = 0
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8-sig") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -2107,7 +2107,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except (ValueError, OSError):
             return {}
 

@@ -150,7 +150,7 @@ def effective_cpu_count(cgroup_root: Path = _CGROUP_ROOT) -> Tuple[int, str]:
     """
     # 1. cgroup v2
     try:
-        raw = (cgroup_root / "cpu.max").read_text(encoding="utf-8").split()
+        raw = (cgroup_root / "cpu.max").read_text(encoding="utf-8-sig").split()
         if len(raw) == 2 and raw[0] != "max":
             quota, period = int(raw[0]), int(raw[1])
             if quota > 0 and period > 0:
@@ -161,10 +161,10 @@ def effective_cpu_count(cgroup_root: Path = _CGROUP_ROOT) -> Tuple[int, str]:
     # 2. cgroup v1
     try:
         quota = int(
-            (cgroup_root / "cpu" / "cpu.cfs_quota_us").read_text(encoding="utf-8")
+            (cgroup_root / "cpu" / "cpu.cfs_quota_us").read_text(encoding="utf-8-sig")
         )
         period = int(
-            (cgroup_root / "cpu" / "cpu.cfs_period_us").read_text(encoding="utf-8")
+            (cgroup_root / "cpu" / "cpu.cfs_period_us").read_text(encoding="utf-8-sig")
         )
         if quota > 0 and period > 0:
             return max(1, -(-quota // period)), "cgroup-v1"
@@ -334,7 +334,7 @@ def _plugin_dependent_tests(plugin_name: str, repo_root: Path) -> List[Path]:
         if path.resolve().is_relative_to(own_root):
             continue
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         if pattern.search(text):
@@ -1299,7 +1299,7 @@ def _run_one_file_once(
             # selector). A file whose source defines no ``def test``/``class Test``
             # is not a pytest target — flag it ⚠, don't RED the whole suite on it.
             try:
-                _src = file.read_text(encoding="utf-8", errors="replace")
+                _src = file.read_text(encoding="utf-8-sig", errors="replace")
                 import re as _re
                 _has_tests = bool(_re.search(r"^\s*(async\s+)?def\s+test|^\s*class\s+Test",
                                              _src, _re.MULTILINE))

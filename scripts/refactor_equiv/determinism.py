@@ -133,7 +133,7 @@ def preflight_scan(paths: Iterable[str | os.PathLike[str]], named_seams: Iterabl
         path = Path(raw)
         if not path.exists():
             continue
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
             hit = _SCAN.search(line)
             if hit and hit.group(0) not in seams:
                 missing.append(f"{path}:{lineno}:{hit.group(0)}")

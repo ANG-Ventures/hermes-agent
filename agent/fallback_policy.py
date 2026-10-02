@@ -163,7 +163,7 @@ def _pin_seat_map(path: Optional[str] = None) -> Dict[Tuple[str, int], str]:
         key = (path, os.stat(path).st_mtime_ns)
         if _hosts_cache["key"] == key:
             return _hosts_cache["map"]
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             hosts = json.load(fh).get("hosts") or []
         out: Dict[Tuple[str, int], str] = {}
         for h in hosts:

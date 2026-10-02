@@ -38,7 +38,7 @@ def _resolve_relative(module: str, level: int, package: str) -> str:
 
 def imports_for_source(path: Path, module: str) -> set[str]:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
     except SyntaxError:
         return set()
     package = module if path.name == "__init__.py" else (module.rsplit(".", 1)[0] if "." in module else "")

@@ -1717,7 +1717,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _read_durable_exit_code(exit_path: str) -> Optional[int]:
         """Exit code the spawn wrapper recorded, or None when it never wrote one."""
         try:
-            return int(Path(exit_path).read_text(encoding="utf-8").strip())
+            return int(Path(exit_path).read_text(encoding="utf-8-sig").strip())
         except (OSError, ValueError):
             return None
 

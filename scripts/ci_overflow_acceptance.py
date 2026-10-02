@@ -58,7 +58,7 @@ def pages(path: str) -> list:
 
 
 def workflow_data(path: Path) -> dict:
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
     # PyYAML YAML 1.1 parses the Actions `on` key as True.
     if True in data:
         data["on"] = data.pop(True)

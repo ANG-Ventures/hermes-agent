@@ -352,7 +352,7 @@ def app_gates(repo: str, controller_root: Path | None) -> list[CheckResult]:
         return [check(n, "UNVERIFIABLE", {}, "supply --controller-root (fleet-ops-scripts/ci-overflow-controller)") for n in names]
     sys.path.insert(0, str(controller_root))
     gh_mod = importlib.import_module("cioc.github")
-    cfg = json.loads((controller_root / "config.json").read_text(encoding="utf-8"))
+    cfg = json.loads((controller_root / "config.json").read_text(encoding="utf-8-sig"))
     gh = gh_mod.GitHub(cfg["api_base"], gh_mod.InstallationTokens(cfg["api_base"], cfg["app_id"], cfg["installation_id"],
                                                                   os.path.expanduser(cfg["key_path"])))
 

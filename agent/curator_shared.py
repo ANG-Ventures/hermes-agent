@@ -381,7 +381,7 @@ def attempt_crash_recovery(
     if not manifest_path.exists():
         return False, "snapshot has no manifest"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return False, "unreadable snapshot manifest"
     

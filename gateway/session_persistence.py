@@ -584,7 +584,7 @@ class SessionPersistenceMixin:
                 raise OSError("Session routing file is locked by another writer")
             try:
                 path = self.sessions_dir / "sessions.json"
-                existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                existing = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
                 assert_unique_routing_entries(data, existing, retired_keys=retired_keys)
                 self._write_sessions_json_unlocked(data)
             finally:

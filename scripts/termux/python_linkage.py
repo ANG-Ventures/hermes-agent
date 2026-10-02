@@ -21,7 +21,7 @@ def link_extension(extension: Path, library: Path) -> bool:
     if reader is None:
         raise RuntimeError("a native ELF reader is required for Python linkage verification")
     symbols = subprocess.check_output(
-        [reader, "--dyn-syms", "--wide", str(extension)], text=True,
+        [reader, "--dyn-syms", "--wide", str(extension)], text=True, encoding="utf-8", errors="replace",
     )
     if not any(
         " UND " in line and line.split()[-1].startswith(("Py", "_Py"))
@@ -29,10 +29,10 @@ def link_extension(extension: Path, library: Path) -> bool:
     ):
         return False
     needed = subprocess.check_output(
-        ["patchelf", "--print-needed", str(extension)], text=True,
+        ["patchelf", "--print-needed", str(extension)], text=True, encoding="utf-8", errors="replace",
     ).splitlines()
     soname = subprocess.check_output(
-        ["patchelf", "--print-soname", str(library)], text=True,
+        ["patchelf", "--print-soname", str(library)], text=True, encoding="utf-8", errors="replace",
     ).strip()
     if not soname:
         raise RuntimeError(f"libpython has no SONAME: {library}")

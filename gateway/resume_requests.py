@@ -123,7 +123,7 @@ def sweep_resume_requests(
             continue
         path = directory / name
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
             # Typed deferred SELF restarts have a persisted multi-stage
             # lifecycle owned by gateway.deferred_restart. The legacy tuple
             # sweep must never unlink them.

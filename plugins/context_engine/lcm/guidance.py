@@ -18,7 +18,7 @@ MAX_RECALL_POLICY_BYTES = 8 * 1024
 @lru_cache(maxsize=1)
 def get_recall_policy() -> str:
     """Return the canonical bounded recall policy shipped by this plugin."""
-    policy = RECALL_POLICY_PATH.read_text(encoding="utf-8").strip()
+    policy = RECALL_POLICY_PATH.read_text(encoding="utf-8-sig").strip()
     size = len(policy.encode("utf-8"))
     if not policy:
         raise RuntimeError(f"Hermes-LCM recall policy is empty: {RECALL_POLICY_PATH}")

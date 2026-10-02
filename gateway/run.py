@@ -7432,7 +7432,7 @@ class GatewayRunner(
             return False
         data = None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
             data = None
         # Always unlink (consume) — even malformed/foreign — so it can't linger.
@@ -8103,7 +8103,7 @@ class GatewayRunner(
             try:
                 stale = True
                 try:
-                    data = json.loads(f.read_text(encoding="utf-8"))
+                    data = json.loads(f.read_text(encoding="utf-8-sig"))
                     if isinstance(data, dict):
                         ts = float(data.get("ts", 0) or 0)
                         # Keep ONLY current-boot, in-TTL crumbs (an in-flight
@@ -9801,7 +9801,7 @@ class GatewayRunner(
 
         path = self._restart_failure_counts_path()
         try:
-            raw_counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            raw_counts = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
         except Exception:
             return {}
         if not isinstance(raw_counts, dict):

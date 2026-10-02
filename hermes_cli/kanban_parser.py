@@ -499,7 +499,7 @@ _SPECS = [
                   "of the work)."),
         _arg("--draft-ok", metavar="REASON",
              help="Audited per-card override for the DRAFT-PR refusal: the handoff names a "
-                  "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "
+                  "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)
                   "PR). The draft is not routed to review; a completion_draft_override event "
                   "records the PRs and REASON. An empty REASON is refused."),
         _arg("--survivor-ref", action="append", metavar="[REPO=]URL#SHA",

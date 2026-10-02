@@ -119,7 +119,7 @@ def _alternates(repo):
         return []
     path = location.stdout.decode("utf-8", "replace").strip()
     try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines() if path else []
+        lines = Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines() if path else []
     except OSError:
         return []
     return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
@@ -385,7 +385,7 @@ def _gitfile_target(path):
     try:
         if not marker.is_file():
             return None
-        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+        first = marker.read_text(encoding="utf-8-sig", errors="replace").splitlines()[:1]
     except OSError:
         return None
     if not first or not first[0].startswith("gitdir:"):

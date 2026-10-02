@@ -320,7 +320,7 @@ def parse_gitleaks_version(text: str) -> str | None:
 def find_pinned_gitleaks_version(repo: Path) -> str | None:
     workflow_dir = repo / ".github" / "workflows"
     for path in sorted(list(workflow_dir.glob("*.yml")) + list(workflow_dir.glob("*.yaml"))):
-        version = parse_gitleaks_version(path.read_text(encoding="utf-8", errors="replace"))
+        version = parse_gitleaks_version(path.read_text(encoding="utf-8-sig", errors="replace"))
         if version:
             return version
     return None

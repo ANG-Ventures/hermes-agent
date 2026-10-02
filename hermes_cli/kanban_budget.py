@@ -319,7 +319,7 @@ def _marker_path(board_dir: Path) -> Path:
 def read_pause_marker(board_dir) -> Optional[dict]:
     path = _marker_path(Path(board_dir))
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
 

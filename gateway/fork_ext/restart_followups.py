@@ -346,7 +346,7 @@ def take_followups(
     key = _spool_key(home, create=False)
     for path in files:
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
             if (
                 not isinstance(record, dict)
                 or not record.get("session_key")

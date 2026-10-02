@@ -5505,7 +5505,7 @@ class GatewaySlashCommandsMixin(
         try:
             existing = {}
             if path.exists():
-                with open(path, encoding="utf-8") as f:
+                with open(path, encoding="utf-8-sig") as f:
                     loaded = yaml.safe_load(f) or {}
                 if isinstance(loaded, dict):
                     existing = loaded
@@ -5571,7 +5571,7 @@ class GatewaySlashCommandsMixin(
             # One immutable byte snapshot, parsed once. Do not validate one
             # read and obtain policy from a second loader: that creates a
             # rollback-policy TOCTOU when the second read fails or changes.
-            snapshot = config_path.read_text(encoding="utf-8")
+            snapshot = config_path.read_text(encoding="utf-8-sig")
             cfg = yaml.safe_load(snapshot)
             if cfg is None:
                 cfg = {}

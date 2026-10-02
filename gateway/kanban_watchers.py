@@ -661,7 +661,7 @@ class _GuardStuckNotifier:
         try:
             import json
 
-            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            data = json.loads(self._state_path.read_text(encoding="utf-8-sig"))
             return {str(k): float(v) for k, v in data.items()} if isinstance(data, dict) else {}
         except (OSError, ValueError, TypeError, AttributeError):
             return {}
@@ -808,7 +808,7 @@ def _land_queue_prior_outcome(root: Path, repo: str, number: int) -> Optional[st
         return None
     for path in paths:
         try:
-            row = json.loads(path.read_text(encoding="utf-8"))
+            row = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue
         if (isinstance(row, dict) and str(row.get("repo", "")).lower() == repo.lower()

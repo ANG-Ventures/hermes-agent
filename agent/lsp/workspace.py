@@ -35,7 +35,7 @@ def normalize_path(path: str) -> str:
 def _gitfile_target_exists(gitfile: Path) -> bool:
     """True if a ``.git`` *file*'s ``gitdir:`` target exists."""
     try:
-        first = gitfile.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        first = gitfile.read_text(encoding="utf-8-sig", errors="replace").splitlines()[0]
     except (OSError, IndexError):
         return False
     if not first.startswith("gitdir:"):

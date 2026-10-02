@@ -805,7 +805,7 @@ def load_create_metrics() -> Dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("Failed to read %s: %s", path, e)
         return {}

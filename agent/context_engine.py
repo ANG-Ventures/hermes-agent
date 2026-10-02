@@ -817,7 +817,7 @@ class ContextEngine(ABC):
         import time as _time
 
         stamp = _time.strftime("%Y-%m-%dT%H:%M:%S")
-        with open(os.path.join(state_dir, "skew-samples.log"), "a", encoding="utf-8") as fh:
+        with open(os.path.join(state_dir, "skew-samples.log"), "a", encoding="utf-8-sig") as fh:
             fh.write(f"{stamp} {line}\n")
 
     def _resolve_content_class(

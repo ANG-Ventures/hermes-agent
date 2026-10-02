@@ -2546,7 +2546,7 @@ class SessionStore(
         sessions_file = self.sessions_dir / "sessions.json"
         if sessions_file.exists():
             try:
-                with open(sessions_file, "r", encoding="utf-8") as f:
+                with open(sessions_file, "r", encoding="utf-8-sig") as f:
                     legacy_data = json.load(f)
             except Exception as e:
                 legacy_error = e
