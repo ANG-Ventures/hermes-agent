@@ -179,3 +179,56 @@ def test_notify_repair_dedupe_keeps_home_chat(board, capsys):
         assert _chats(conn, single) == [OWNER]
     assert run() == 0
     assert "one subscriber chat per platform" in capsys.readouterr().out
+
+
+# (4) a board that cannot be scanned is a FAILURE, never an all-clear ----------
+# Prism P1 cf49dc4f0623 on #1635 (t_030662ba): every per-board exception was
+# swallowed, so a locked DB printed the all-clear and exited 0.
+
+def _run_dedupe(*extra):
+    root = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(root.add_subparsers(dest="command"))
+    return kc.kanban_command(root.parse_args(
+        ["kanban", "notify-repair", "--dedupe", *extra]))
+
+
+def _boom(conn, apply=False):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_dedupe_board_failure_is_nonzero_and_not_all_clear(board, capsys, monkeypatch):
+    monkeypatch.setattr(kb, "dedupe_notify_subs", _boom)
+    assert _run_dedupe("--apply") != 0
+    cap = capsys.readouterr()
+    assert "one subscriber chat per platform" not in cap.out
+    assert "database is locked" in cap.err
+
+
+def test_dedupe_board_failure_json_reports_failed_board(board, capsys, monkeypatch):
+    import json
+    monkeypatch.setattr(kb, "dedupe_notify_subs", _boom)
+    assert _run_dedupe("--apply", "--json") != 0
+    d = json.loads(capsys.readouterr().out)
+    assert d["failed"] and "database is locked" in d["failed"][0]["error"]
+
+
+def test_dedupe_all_boards_one_bad_board_still_scans_the_rest(board, capsys, monkeypatch):
+    real = kb.dedupe_notify_subs
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _sub(conn, tid, OWNER, also=True)
+        _sub(conn, tid, OTHER, also=True)
+    monkeypatch.setattr(kb, "list_boards",
+                        lambda *a, **k: [{"slug": "default"}, {"slug": "bad"}])
+    real_connect = kb.connect_closing
+
+    def connect(*a, board=None, **k):
+        if board == "bad":
+            raise sqlite3.DatabaseError("file is not a database")
+        return real_connect(*a, **k)
+    monkeypatch.setattr(kb, "connect_closing", connect)
+    monkeypatch.setattr(kb, "dedupe_notify_subs", real)
+    assert _run_dedupe("--all-boards") != 0
+    cap = capsys.readouterr()
+    assert tid in cap.out                      # the good board was still reported
+    assert "'bad'" in cap.err and "file is not a database" in cap.err
