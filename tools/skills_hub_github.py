@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -113,6 +114,9 @@ class GitHubAuth:
         return get_secret("GITHUB_TOKEN") or get_secret("GH_TOKEN")
 
     def _try_gh_cli(self) -> Optional[str]:
+        from hermes_cli.copilot_auth import gh_is_shim_fronted
+        if gh_is_shim_fronted(shutil.which("gh")):
+            return None  # the gh-shim refuses `gh auth token`; don't spam its log
         try:
             result = subprocess.run(
                 ["gh", "auth", "token"], capture_output=True, text=True, encoding='utf-8', errors='replace',

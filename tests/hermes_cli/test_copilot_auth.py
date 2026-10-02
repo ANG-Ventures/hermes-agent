@@ -168,7 +168,7 @@ class TestGhShimSkip:
         run.assert_not_called()
 
     def test_skills_hub_skips_gh_cli_under_shim(self, tmp_path, monkeypatch):
-        from tools import skills_hub
+        from tools import skills_hub_github as skills_hub  # GitHubAuth's home after upstream's hub split
         d = tmp_path / "gh-shim"
         d.mkdir()
         shim = self._script(d / "gh", "exit 3\n")

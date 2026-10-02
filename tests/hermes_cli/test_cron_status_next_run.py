@@ -49,6 +49,9 @@ def test_status_earliest_persisted_instant(later, earlier, capsys):
       {"next_run_at": "2026-11-01T01:15:00-05:00"}],
      "  2 active job(s)\n  Next run: 2026-11-01T06:15:00Z\n"),
 ])
-def test_status_missing_invalid_and_equivalent_instants(jobs, expected, capsys):
+def test_status_missing_invalid_and_equivalent_instants(jobs, expected, capsys, monkeypatch):
+    # The fork appends its vanished-job guard line to every status summary; this test pins the
+    # next-run ordering lines only.
+    monkeypatch.setattr("hermes_cli.cron._print_vanished_job_warning", lambda: None)
     _print_active_jobs_summary(jobs)
     assert capsys.readouterr().out == expected
