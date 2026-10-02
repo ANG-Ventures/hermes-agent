@@ -376,10 +376,9 @@ def _plugin_provider_enters_picker(pp) -> bool:
 def sync_plugin_provider_catalog() -> int:
     """Admit every registered plugin provider without a built-in row; return how many were added.
 
-    Runs at import and again from ``providers._sync_auth_registry`` whenever a profile is registered
-    after this module was imported. The import-time pass alone observes a *partial* registry: a
-    plugin whose own imports pull ``hermes_cli.models`` in mid-``_discover_providers()``, or a
-    profile registered later at runtime, would otherwise never reach the picker, ``hermes model``,
+    Called from ``providers._sync_auth_registry`` whenever a profile is registered after this
+    module was imported (NOT at import — see the note at the bottom of this module). A profile
+    registered later at runtime would otherwise never reach the picker, ``hermes model``,
     ``/model`` or the Desktop ``model.options`` list until restart — the catalog twin of the auth
     registry window (#102123). Idempotent by slug; built-in rows are never rewritten.
     """
@@ -402,7 +401,13 @@ def sync_plugin_provider_catalog() -> int:
 
 _PROVIDER_LABELS: dict[str, str] = {p.slug: p.label for p in CANONICAL_PROVIDERS}
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
-sync_plugin_provider_catalog()
+# fork (e8249c38cb / #816, canary tests/providers/test_fork_canary_plugin_discovery_not_at_import.py):
+# NO import-time ``sync_plugin_provider_catalog()`` here. ``list_providers()`` imports every
+# model-provider plugin, and plugins import ``hermes_cli.models`` (which imports this module)
+# at their own import time — a models-first import order handed them a partially initialised
+# module and registered 0 providers. The plugin rows reach the catalog on the FIRST READ of the
+# ``hermes_cli.models`` facade (``_LazyCanonicalProviders`` -> ``_extend_canonical_from_plugins``);
+# ``providers._sync_auth_registry`` still calls the function above for profiles registered later.
 
 
 # ---------------------------------------------------------------------------
