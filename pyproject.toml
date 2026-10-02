@@ -549,6 +549,14 @@ dev = [
   "ty==0.0.82",
   "ruff==0.15.10",
   "setuptools==83.0.0",
+  # Fork CI/workflow-contract tests (tests/ci/*, tests/test_ci_*,
+  # tests/test_run_tests_parallel_*, kanban/gateway yaml fixtures) and the
+  # scripts/ci_*.py lints they exercise still read workflows via PyYAML.
+  # Upstream unified first-party runtime YAML on ruamel (284dbaf5370) and
+  # dropped the direct pin; keep PyYAML in the TEST environment only so the
+  # runtime payload stays ruamel-only. Same version uv.lock already resolves
+  # transitively.
+  "pyyaml==6.0.3",
 ] # starlette: CVE-2026-48710; setuptools: 83 (torch >=2.13 requires setuptools 83)
 # Native launcher and provider-catalog E2E dependencies belong in the test
 # environment, not the core runtime. Keep the Anthropic SDK at the same
