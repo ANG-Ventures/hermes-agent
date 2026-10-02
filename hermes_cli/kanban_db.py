@@ -11512,6 +11512,31 @@ def complete_task(
         and candidate.current_run_id is not None
         and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
     )
+    # Receipt gate (t_e21aa11c): a dispatcher-owned worker handoff
+    # (``expected_run_id`` set) that closes ``done`` with prose only -- no PR,
+    # survivor, attachment or structured metadata -- is refused before any
+    # mutation. Operator closes are not gated. Knob ``kanban.receipt_gate``.
+    if (
+        expected_run_id is not None
+        and candidate.status == 'running' and not review_claimed
+        and not approve_head_sha and not superseded_by
+        and configured_receipt_gate()
+    ):
+        from hermes_cli import kanban_receipt as _receipt
+        if _receipt.missing(
+            summary=summary, result=result, metadata=metadata,
+            survivor_pr=survivor_pr, survivor_ref=survivor_ref,
+            survivor_none=survivor_none,
+            attachments=_receipt.attachment_count(conn, task_id),
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, _receipt.EVENT,
+                    {"reason": _receipt.REASON_CODE,
+                     "metadata_keys": sorted((metadata or {}).keys())
+                     if isinstance(metadata, dict) else []},
+                )
+            raise _receipt.ReceiptRequiredError(task_id)
     negative_trigger: Optional[str] = None
     if (
         candidate.status == 'running' and not review_claimed
@@ -14023,6 +14048,17 @@ def configured_negative_handoff_review() -> bool:
     except Exception:
         return False
     return value is True or str(value).strip().casefold() in ("1", "true", "yes", "on")
+
+
+def configured_receipt_gate() -> bool:
+    """``kanban.receipt_gate`` — refuse a receipt-less implementer completion (default on)."""
+    try:
+        value, _source = _kanban_review_setting("receipt_gate", True)
+    except Exception:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() not in ("0", "false", "no", "off")
 
 
 def configured_review_policy() -> str:

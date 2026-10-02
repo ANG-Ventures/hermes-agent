@@ -181,7 +181,8 @@ def test_running_child_completes_while_derived_from_parent_is_open(kanban_home):
         run_id = kb.get_task(conn, child).current_run_id
 
         assert kb.complete_task(
-            conn, child, summary="shipped", expected_run_id=run_id,
+            conn, child, summary="shipped", metadata={"tests_run": 1},
+            expected_run_id=run_id,
         ) is True
         assert kb.get_task(conn, child).status == "done"
         assert kb.get_task(conn, parent).status == "ready"

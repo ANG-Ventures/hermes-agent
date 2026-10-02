@@ -115,6 +115,7 @@ def test_owner_still_completes_its_own_card(home):
     task_id, run_id = _running_card(home)
 
     out = _run(home, "complete", task_id, "--summary", "owner done",
+               "--metadata", '{"tests_run": 1}',
                extra=_worker_env(task_id, run_id, "pending"))
 
     assert out.returncode == 0, out.stdout + out.stderr

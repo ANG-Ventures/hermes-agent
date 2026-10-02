@@ -329,6 +329,7 @@ def test_milestone_only_in_place_completion_uses_worker_run_id(kanban_home, monk
         assert ok is False and "expected_run_id" in reason
         assert _status(conn, tid) == "running"
         ok, reason = kb.request_review(conn, tid, summary="done",
+                                       metadata={"tests_run": 1},
                                        expected_run_id=run_id, with_reason=True)
         assert ok is True, reason
         assert _status(conn, tid) == "done"

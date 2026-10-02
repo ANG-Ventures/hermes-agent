@@ -125,8 +125,8 @@ def test_request_review_from_worker_profile_completes_in_place_under_root_none(
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
         ok, reason = kb.request_review(
-            conn, tid, summary="PR green", expected_run_id=claimed.current_run_id,
-            with_reason=True,
+            conn, tid, summary="PR green", metadata={"tests_run": 1},
+            expected_run_id=claimed.current_run_id, with_reason=True,
         )  # reviewer omitted
         assert ok is True and "review skipped" in reason, reason
         assert kb.get_task(conn, tid).status == "done"

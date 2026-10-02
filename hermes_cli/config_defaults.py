@@ -3273,6 +3273,11 @@ DEFAULT_CONFIG = {
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.
         "negative_handoff_review": False,
+        # True: a worker's completion of a running card with no receipt (no
+        # PR, survivor, attachment or structured metadata beyond bookkeeping)
+        # is refused with reason code no_receipt (t_e21aa11c). Lint the board:
+        # python -m hermes_cli.kanban_receipt --days 7
+        "receipt_gate": True,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
         # or "qa:required" get a reviewer session (being a task_links parent

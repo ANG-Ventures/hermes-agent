@@ -33,6 +33,7 @@ from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
+from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -4935,6 +4936,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             )
             return 2
     failed: list[str] = []
+    no_receipt = False
     with kb.connect_closing() as conn:
         for tid in ids:
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
@@ -4973,6 +4975,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     superseded_by=superseded_by,
                     draft_ok=draft_ok,
                 )
+            except ReceiptRequiredError as receipt_err:
+                failed.append(tid)
+                no_receipt = True
+                print(f"cannot complete {tid}: {receipt_err}.", file=sys.stderr)
+                continue
             except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
@@ -5000,6 +5007,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 if override:
                     print(f"  draft override recorded for {', '.join(override['prs'])}: "
                           f"{override['reason']}")
+    if no_receipt:
+        return EXIT_NO_RECEIPT
     return 0 if not failed else 1
 
 
@@ -5437,6 +5446,9 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
                 with_reason=True,
             )
+        except ReceiptRequiredError as receipt_err:
+            print(f"cannot request review for {tid}: {receipt_err}", file=sys.stderr)
+            return EXIT_NO_RECEIPT
         except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
             print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
             return 1
