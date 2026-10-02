@@ -54,6 +54,10 @@ from hermes_cli.models_catalog_static import (
 from hermes_cli.models_reasoning_caps import (
     _OPENROUTER_CATALOG_URL,
     _seed_reasoning_caps)
+# Fork facade re-export: ``validate_requested_model`` moved to ``models_validate`` upstream; fork
+# callers and tests import / patch it on ``hermes_cli.models`` (``model_switch`` reads it here at
+# call time so ``patch("hermes_cli.models.validate_requested_model")`` keeps intercepting).
+from hermes_cli.models_validate import validate_requested_model  # noqa: F401
 from hermes_cli.models_local import (
     _OLLAMA_LOCAL_MODELS_CACHE,
     _OLLAMA_LOCAL_MODELS_CACHE_TTL,

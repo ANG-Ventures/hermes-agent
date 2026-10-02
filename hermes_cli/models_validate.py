@@ -671,7 +671,12 @@ def _validate_live_listing(req: _Request) -> Optional[dict[str, Any]]:
     if req.normalized == "nous" and req.lookup.lower() in _nous_portal_recommended_names():
         return _accept_with_note(f"Note: `{req.requested}` was not found in the live /v1/models listing "
                                  "but is a current Nous Portal recommendation — accepted.")
-    return _reject(f"Model `{req.requested}` was not found in this provider's model listing.{match.suggestion_text}")
+    # The live listing answered and omitted the id. Callers that hold independent evidence the id
+    # is real (a user-configured alias) use ``not_listed`` to report "exists but unavailable"
+    # instead of a typo (fork; tests/hermes_cli/test_model_switch_configured_unlisted.py).
+    verdict = _reject(f"Model `{req.requested}` was not found in this provider's model listing.{match.suggestion_text}")
+    verdict["not_listed"] = True
+    return verdict
 
 
 def _validate_bedrock(req: _Request) -> Optional[dict[str, Any]]:
