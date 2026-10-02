@@ -16,6 +16,7 @@ from agent.session_activity import (
 )
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_errors import SessionActiveWriteGuardError
+from hermes_state_ext import _session_list_denorm_enabled
 from hermes_state_common import (
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _non_continuation_child_sql,
@@ -192,12 +193,22 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     return [sid for sid in found if sid not in seeds]
 
 
-def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
+def _delete_delegate_children(
+    conn, parent_ids: List[str], orphaned_child_ids: Optional[List[str]] = None,
+) -> List[str]:
+    """Cascade-delete delegate children; ``orphaned_child_ids`` (when given) receives the ids of
+    stragglers orphaned below so the caller can recompute their denormalized recency."""
     ids = _collect_delegate_child_ids(conn, parent_ids)
     for chunk in _id_chunks(ids):
         ph = _session_ids_placeholders(chunk)
         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
+        if orphaned_child_ids is not None:
+            orphaned_child_ids.extend(
+                row["id"] for row in conn.execute(
+                    f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})", chunk,
+                ).fetchall()
+            )
         conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
     return ids
@@ -371,15 +382,19 @@ class SessionSessionsMixin:
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
         def _do(conn):
+            # Fork denorm gate: capture the recency root BEFORE the upsert so a
+            # re-parented row's previous root is recomputed too.
+            previous_root_id = self._resolve_effective_last_active_root(conn, session_id)
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, created_source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
                    parent_session_id, cwd, profile_name, transport_profile, git_repo_root,
-                   origin_json, display_name, started_at
+                   origin_json, display_name, started_at,
+                   effective_last_active
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                    ON CONFLICT(id) DO UPDATE SET
                        source = CASE
                            WHEN sessions.source = 'unknown'
@@ -428,6 +443,8 @@ class SessionSessionsMixin:
                 self._delete_unreferenced_system_prompts(conn)
             if parent_session_id:
                 self._inherit_parent_session_metadata(conn, session_id)
+            self._recompute_effective_last_active(conn, previous_root_id)
+            self._recompute_effective_last_active_for_session(conn, session_id)
         # Transcript-critical: a failed row creation aborts the turn.
         self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
@@ -495,10 +512,17 @@ class SessionSessionsMixin:
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session ended; the first end_reason wins (a compression split must keep
         ``'compression'`` even if a stale end_session() lands later); reopen_session() to re-end."""
-        self._execute_write(lambda conn: self._end_and_bump(
-            conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL",
-            (time.time(), end_reason, session_id), session_id, end_reason,
-        ))
+        def _do(conn):
+            # Fork denorm gate: an end_reason write can add/remove a compression
+            # edge, so capture the recency root BEFORE the mutation.
+            root_id = self._resolve_effective_last_active_root(conn, session_id)
+            self._end_and_bump(
+                conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL",
+                (time.time(), end_reason, session_id), session_id, end_reason,
+            )
+            self._recompute_effective_last_active(conn, root_id)
+            self._recompute_effective_last_active_for_session(conn, session_id)
+        self._execute_write(_do)
 
     def _end_and_bump(self, conn, sql: str, params: tuple, session_id: str, reason: str) -> int:
         """Run an end-stamp UPDATE; only a boundary this call actually wrote advances the
@@ -514,6 +538,9 @@ class SessionSessionsMixin:
         The guard compares against the parent's started_at, not its current ended_at: a parent that was
         reopened and re-ended later still owns reset children from its earlier boundaries."""
         def _do(conn):
+            # Fork denorm gate: capture the recency root BEFORE any mutation
+            # below, so the walk sees the pre-reopen lineage edges.
+            root_id = self._resolve_effective_last_active_root(conn, session_id)
             # Retire busy-queue accept rows that never drained (#125577): a restart discarded the
             # in-memory queue, so nothing re-placed/deactivated the row written at accept time and
             # alternation repair would glue the never-run prompt into the previous turn's user
@@ -542,6 +569,8 @@ class SessionSessionsMixin:
             )
             # Resuming re-activates the chat: drop the idle sweep's archive (never a manual one).
             self._unarchive_auto_archived_lineage(conn, session_id)
+            self._recompute_effective_last_active(conn, root_id)
+            self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
     def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool:
@@ -688,12 +717,26 @@ class SessionSessionsMixin:
     def update_session_meta(
         self, session_id: str, model_config_json: str, model: Optional[str] = None,
     ) -> None:
-        """Update model_config and (COALESCE) optionally model."""
+        """Update model_config and (COALESCE) optionally model.
+
+        Rewriting ``model_config`` can flip a row's session.list *visibility* (it carries the
+        ``_delegate_from`` / ``_branched_from`` markers the visible-clause keys on) and can MOVE the
+        row between compression roots, so the denormalized ``effective_last_active`` of both the row
+        and its *previous* root are recomputed here — otherwise the old root keeps a recency that
+        still folds in the departed child's messages and diverges from the CTE oracle. The previous
+        root is captured BEFORE the write, like every other linkage-changing path.
+        """
         self.flush_token_counts()  # barrier against queued token deltas — see update_session_model
-        self._write_sql(
-            "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-            (model_config_json, model, session_id),
-        )
+
+        def _do(conn):
+            previous_root_id = self._resolve_effective_last_active_root(conn, session_id)
+            conn.execute(
+                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
+                (model_config_json, model, session_id),
+            )
+            self._recompute_effective_last_active(conn, previous_root_id)
+            self._recompute_effective_last_active_for_session(conn, session_id)
+        self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
@@ -702,6 +745,11 @@ class SessionSessionsMixin:
                 "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
                 (self._store_system_prompt(conn, system_prompt), session_id),
             )
+            if system_prompt is None:
+                logger.warning(
+                    "Explicit system_prompt=NULL write for session %s via "
+                    "update_system_prompt", session_id, stack_info=True,
+                )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
@@ -920,12 +968,77 @@ class SessionSessionsMixin:
             (session_id, session_id, value),
         ) > 0
 
+    #: ``end_reason`` written by :meth:`set_session_archived` when it retires a still-live row.
+    #: Deliberately absent from the recoverable set in ``find_latest_gateway_session_for_peer``
+    #: (``agent_close`` / ``ws_orphan_reap``) so stale-route recovery starts a fresh session
+    #: instead of silently reopening an archived conversation.
+    ARCHIVE_END_REASON = "archived"
+
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Soft-hide (or unhide) a session and its compression lineage; messages are kept.
         This is the DELIBERATE archive (user, CLI, API): it clears the ``auto_archived``
-        provenance, so re-activation never un-hides it on the user's behalf."""
-        return self._set_lineage_column(
-            "archived", session_id, int(archived), extra_set_sql=", auto_archived = 0")
+        provenance, so re-activation never un-hides it on the user's behalf.
+
+        Archiving is also a **routing-affecting** operation. Flipping the flag alone left the
+        gateway's ``gateway_routing`` key for that session orphaned forever: every in-memory
+        eviction path in ``gateway/session.py`` gates on the row being *ended*, so a row with
+        ``end_reason IS NULL`` was unreachable by all of them and the key was rewritten from the
+        live index on every full persist. So archiving:
+
+        * retires still-live rows with ``end_reason = 'archived'`` (COALESCE, so ``'compression'``
+          and every other explicit reason survive — the lineage edges depend on them), which
+          re-enables the existing startup prune and routing-time self-heal; and
+        * drops the durable routing rows that map to the archived lineage, so an install with no
+          live gateway is clean immediately rather than at the next restart.
+
+        Unarchiving reverses exactly what archiving wrote (rows still carrying
+        ``end_reason = 'archived'``); a session ended for a real reason stays ended, and no routing
+        entry is resurrected — the next message rebuilds it through the normal create path.
+        A session archived while still live is now an *ended* row, so the retention sweep
+        (``sessions.auto_prune``) can eventually reap it.
+        """
+        def _do(conn):
+            params = (session_id, session_id)
+            if archived:
+                cursor = conn.execute(
+                    _LINEAGE_CTE_SQL + """
+                    UPDATE sessions
+                    SET archived = 1, auto_archived = 0,
+                        ended_at = COALESCE(ended_at, ?),
+                        end_reason = COALESCE(end_reason, ?)
+                    WHERE id IN (SELECT id FROM lineage)
+                    """,
+                    (*params, time.time(), self.ARCHIVE_END_REASON),
+                )
+            else:
+                cursor = conn.execute(
+                    _LINEAGE_CTE_SQL + """
+                    UPDATE sessions
+                    SET archived = 0, auto_archived = 0,
+                        ended_at = CASE WHEN end_reason = ? THEN NULL ELSE ended_at END,
+                        end_reason = CASE WHEN end_reason = ? THEN NULL ELSE end_reason END
+                    WHERE id IN (SELECT id FROM lineage)
+                    """,
+                    (*params, self.ARCHIVE_END_REASON, self.ARCHIVE_END_REASON),
+                )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if archived:
+                # Match on the mapped session_id, not on (scope, session_key): two profiles sharing
+                # one state.db produce the same key in different scopes for *different* sessions,
+                # and only this lineage's mapping is orphaned. json_valid guards the delete so one
+                # corrupt routing row cannot fail the archive.
+                conn.execute(
+                    _LINEAGE_CTE_SQL + """
+                    DELETE FROM gateway_routing
+                    WHERE json_valid(entry_json)
+                      AND json_extract(entry_json, '$.session_id') IN (SELECT id FROM lineage)
+                    """,
+                    params,
+                )
+            return rowcount
+        return self._execute_write(_do) > 0
 
     def _auto_archive_lineage(self, session_id: str) -> bool:
         """The idle sweep's archive: like :meth:`set_session_archived` but stamps
@@ -1311,7 +1424,9 @@ class SessionSessionsMixin:
         """Project a list_sessions_rich row: shape the preview, drop internal ordering columns."""
         s = cls._session_row_dict(row)
         s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+        # Both the query alias and the fork's denormalized real column.
         s.pop("_effective_last_active", None)
+        s.pop("effective_last_active", None)
         return s
 
     def list_sessions_rich(
@@ -1319,16 +1434,33 @@ class SessionSessionsMixin:
         cwd_prefix: str = None, limit: int = 20, offset: int = 0, include_children: bool = False,
         min_message_count: int = 0, project_compression_tips: bool = True,
         order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False,
-        id_query: str = None, search_query: str = None, compact_rows: bool = False,
+        id_query: str = None, _force_cte_oracle: bool = False, search_query: str = None,
+        compact_rows: bool = False,
         include_pinned: bool = False, session_key: str = None, include_hidden: bool = False,
         include_subagents: bool = False,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
-        by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
-        ``include_pinned`` back-fills pins the page missed, still obeying the other
+        by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``)
+        unless the dormant ``dashboard.session_list_denorm`` flag is true, in which case the indexed
+        denormalized path applies LIMIT/OFFSET before enrichment (``_force_cte_oracle`` pins the
+        CTE for parity checks); ``include_pinned`` back-fills pins the page missed, still obeying the other
         filters except archived: a pin is an explicit keep, so a pinned row stamped
         archived must still return."""
         self.flush_token_counts()  # rows carry token/cost totals
+        if (
+            order_by_last_active
+            and not _force_cte_oracle
+            and not include_children
+            and _session_list_denorm_enabled()
+            and not (search_query or "").strip()
+            and not compact_rows
+        ):
+            return self._list_sessions_rich_denorm(
+                source=source, exclude_sources=exclude_sources, cwd_prefix=cwd_prefix,
+                limit=limit, offset=offset, min_message_count=min_message_count,
+                project_compression_tips=project_compression_tips,
+                include_archived=include_archived, archived_only=archived_only, id_query=id_query,
+            )
         where_clauses, params = _session_filter_where(
             exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
@@ -1557,7 +1689,7 @@ class SessionSessionsMixin:
             include_archived=include_archived,
         )
         with self._read_ctx() as conn:
-            if self._conn is None:
+            if conn is None:
                 raise RuntimeError("SessionDB connection is closed")
             rows = conn.execute(
                 "SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count "
@@ -1646,12 +1778,18 @@ class SessionSessionsMixin:
                 for covered_id, expected in expected_display_messages.items()
             ):
                 return False
-            removed_ids.extend(_delete_delegate_children(conn, [session_id]))
+            orphaned_child_ids: List[str] = []
+            removed_ids.extend(_delete_delegate_children(conn, [session_id], orphaned_child_ids))
+            direct_orphans, affected_root_ids = self._collect_orphan_effective_last_active_targets(
+                conn, [session_id]
+            )
+            orphaned_child_ids.extend(direct_orphans)
             conn.execute(  # orphan remaining children (branches) so FK is satisfied
                 "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._recompute_effective_last_active_many(conn, affected_root_ids + orphaned_child_ids)
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.append(session_id)
             return True
@@ -1720,7 +1858,12 @@ class SessionSessionsMixin:
                     skipped_ids.extend(sorted(active_ids))
                 if not existing:
                     return 0
-            removed_ids.extend(_delete_delegate_children(conn, existing))
+            orphaned_child_ids: List[str] = []
+            removed_ids.extend(_delete_delegate_children(conn, existing, orphaned_child_ids))
+            direct_orphans, affected_root_ids = self._collect_orphan_effective_last_active_targets(
+                conn, existing
+            )
+            orphaned_child_ids.extend(direct_orphans)
             for chunk in _id_chunks(existing):
                 ph = _session_ids_placeholders(chunk)
                 conn.execute(  # orphan children whose parent is in the kill list (FK)
@@ -1730,6 +1873,7 @@ class SessionSessionsMixin:
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(existing)
+            self._recompute_effective_last_active_many(conn, affected_root_ids + orphaned_child_ids)
             return len(existing)
         count = self._execute_write(_do)
         for sid in removed_ids:
@@ -1759,6 +1903,9 @@ class SessionSessionsMixin:
             ).fetchall()}
             if not session_ids:
                 return 0
+            orphaned_child_ids, affected_root_ids = self._collect_orphan_effective_last_active_targets(
+                conn, list(session_ids)
+            )
             for chunk in _id_chunks(session_ids):
                 ph = _session_ids_placeholders(chunk)
                 conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
@@ -1767,6 +1914,7 @@ class SessionSessionsMixin:
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
                 removed_ids.extend(chunk)
+            self._recompute_effective_last_active_many(conn, affected_root_ids + orphaned_child_ids)
             self._delete_unreferenced_system_prompts(conn)
             return len(session_ids)
         count = self._execute_write(_do)

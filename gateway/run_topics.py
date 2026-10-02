@@ -107,7 +107,7 @@ class GatewayTopicThreadsMixin:
         if not key:
             return True
         stamps, now = getattr(self, attr), time.monotonic()
-        if now - stamps.get(key, 0.0) < cooldown_s:
+        if now - stamps.get(key, float("-inf")) < cooldown_s:  # monotonic origin is boot; 0.0 is not "never"
             return False
         stamps[key] = now
         return True

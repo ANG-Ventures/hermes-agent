@@ -35,7 +35,7 @@ class CLIProcessNotificationsMixin:
 
     def _drain_process_notifications(self, consumer: str) -> None:
         from tools.process_registry import process_registry
-        from tools.async_delegation import claim_event_delivery, complete_event_delivery
+        from tools.async_delegation import claim_event_delivery, complete_event_delivery_with_retry
         from tools.process_registry_notifications import (
             HEARTBEAT_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification, group_process_notifications,
             heartbeat_display_text)
@@ -48,7 +48,7 @@ class CLIProcessNotificationsMixin:
             if claim is None:
                 continue
             claimed.append((event, text))
-            complete_event_delivery(event, claim)
+            complete_event_delivery_with_retry(event, claim)
         if self._background_notifications_suppressed():
             # Subagent results are not process notifications: they still land.
             claimed = [(event, text) for event, text in claimed if event.get("type") == "async_delegation"]

@@ -128,7 +128,12 @@ if not _loaded_env_paths:
     logger.info("No .env file found. Using system environment variables.")
 
 
-from model_tools import get_toolset_for_tool
+# Re-exports for tests that `mock.patch("run_agent.<X>")` (ruff's in-module usage scan cannot see them).
+from agent.process_bootstrap import OpenAI  # noqa: F401
+from model_tools import (
+    check_toolset_requirements,  # noqa: F401
+    get_toolset_for_tool,
+)
 from tools.terminal_tool_lifecycle import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool_lifecycle import cleanup_browser

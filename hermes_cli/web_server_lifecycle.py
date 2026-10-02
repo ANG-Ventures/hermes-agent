@@ -212,7 +212,12 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
         return
 
     try:
-        atomic_json_write(Path(target), {"port": int(actual_port)}, indent=None, separators=(",", ":"))
+        # ``project_root`` = the tree this backend runs from: the desktop's code-skew effect gate
+        # (fork, SPEC 2026-07-01 AC-3; tests/hermes_cli/test_web_server_ready_file.py).
+        from hermes_cli.web_server import PROJECT_ROOT
+        atomic_json_write(
+            Path(target), {"port": int(actual_port), "project_root": str(PROJECT_ROOT)},
+            indent=None, separators=(",", ":"))
     except Exception as exc:
         _log.warning("Failed to write dashboard ready file %r: %s", target, exc)
 

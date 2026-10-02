@@ -20,7 +20,7 @@ from .whatsapp_identity import canonical_whatsapp_identifier
 from utils import atomic_replace
 from hermes_state import RewindWouldOrphanError
 from gateway.session_identity import transport_profile_of
-from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
+from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED, _SESSIONS_JSON_README
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
@@ -1730,176 +1730,6 @@ class SessionStore(
 
     # ---- fork-only methods carried from gateway/session.py monolith (parity 2026-10-01, lane L02) ----
 
-    def _plan_stale_prune(self, db, items):
-        """Decide stale / repointed routes. Performs the state.db I/O.
-
-        Returns ``(stale_keys, repointed)`` or ``None`` when a DB error made
-        the pass unsafe (logged; pruning is skipped entirely, as before).
-        """
-        stale_keys: list = []
-        repointed: Dict[str, "SessionEntry"] = {}
-        try:
-            for key, entry in items:
-                row = db.get_session(entry.session_id)
-                # row is None        -> keep active/recent legacy; reap only an
-                #                       old route with no evidence of activity
-                # end_reason is None  -> session alive — keep
-                # end_reason not None -> session ended — prune
-                if row is None:
-                    if self._is_never_persisted_stub(entry):
-                        logger.warning(
-                            "gateway.session: pruning old inert routing entry "
-                            "%r -> %s; session row was never persisted",
-                            key,
-                            entry.session_id,
-                        )
-                        stale_keys.append(key)
-                    continue
-                if row.get("end_reason") is not None:
-                    recovered_entry = None
-                    recovery_lookup_failed = False
-                    if entry.origin is not None:
-                        try:
-                            recovered_entry = self._recover_session_from_db(
-                                session_key=key,
-                                source=entry.origin,
-                                now=_now(),
-                                raise_on_lookup_error=True,
-                            )
-                        except Exception as exc:
-                            logger.debug(
-                                "gateway.session: recovery lookup failed for stale "
-                                "sessions.json entry %r -> %s: %s",
-                                key,
-                                entry.session_id,
-                                exc,
-                            )
-                            recovery_lookup_failed = True
-
-                    if recovery_lookup_failed:
-                        continue
-
-                    # If the stale entry points at a compression-ended parent but
-                    # a newer live child session exists for the exact same gateway
-                    # peer, repoint the routing index instead of dropping it. A
-                    # hard restart between compression rotation and the next clean
-                    # save otherwise leaves Telegram with no resumable mapping, so
-                    # queued/resume-pending work disappears until the user sends a
-                    # fresh message.
-                    if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
-                        logger.warning(
-                            "gateway.session: repointing stale sessions.json entry "
-                            "%r from ended %s (end_reason=%r) to recovered %s",
-                            key,
-                            entry.session_id,
-                            row["end_reason"],
-                            recovered_entry.session_id,
-                        )
-                        repointed[key] = recovered_entry
-                        continue
-
-                    # A non-None recovery with the SAME session id is a
-                    # successful resume (all recovery gates passed, row
-                    # reopened): keep the routing entry — it is proven valid,
-                    # not a dead route (#95957). Keep the ORIGINAL entry
-                    # object, not the recovered one: the recovered entry is
-                    # rebuilt minimal from the DB row and would silently drop
-                    # live state the existing entry carries (token/cost
-                    # counters, model_override, resume_pending/queued-work
-                    # markers, metadata). Nothing in sessions.json changes,
-                    # so no save is needed for this branch.
-                    if recovered_entry is not None:
-                        logger.info(
-                            "gateway.session: reopened ended session %s for "
-                            "sessions.json entry %r (end_reason=%r); keeping route",
-                            entry.session_id, key, row["end_reason"],
-                        )
-                        continue
-
-                    logger.warning(
-                        "gateway.session: pruning stale sessions.json entry "
-                        "%r -> %s (end_reason=%r); left by a crashed gateway",
-                        key, entry.session_id, row["end_reason"],
-                    )
-                    stale_keys.append(key)
-        except Exception as exc:
-            logger.warning(
-                "gateway.session: stale-entry pruning skipped due to DB error: %s",
-                exc,
-            )
-            return None
-        return stale_keys, repointed
-
-    def _rewind_retryable_composite(
-        self, session_id: str, n: int = 1
-    ) -> Optional[Dict[str, Any]]:
-        """Composite-carrier-aware rewind for gateway ``/retry`` (upstream path).
-
-        The selected current turn must still be a composite carrier, and its
-        live payload must be losslessly replayable as text before anything
-        changes. Replay-policy failures (``retryable_user_text``) raise
-        ``ValueError`` to the caller so /retry can explain why the carrier is
-        unsafe; persistence errors return ``None``.
-        """
-        with self._get_transcript_drain_lock():
-            if n < 1:
-                n = 1
-            from agent.context_compressor import (
-                retryable_user_text,
-                split_user_originated_turn,
-                user_originated_turn_view,
-            )
-
-            try:
-                expected_active_ids = self._db.get_active_message_ids(session_id)
-                durable = self._db.get_messages_as_conversation(
-                    session_id,
-                    include_row_ids=True,
-                )
-                user_indices = [
-                    index
-                    for index, message in enumerate(durable)
-                    if user_originated_turn_view(message) is not None
-                ]
-                if not user_indices:
-                    return None
-                turns_undone = min(n, len(user_indices))
-                target = durable[user_indices[-turns_undone]]
-                target_id = target.get("_row_id")
-                if not isinstance(target_id, int):
-                    return None
-                handoff, target_view = split_user_originated_turn(target)
-                if target_view is None:
-                    return None
-                if handoff is None:
-                    return None
-            except Exception as e:
-                logger.debug("rewind_session: failed to resolve canonical target: %s", e)
-                return None
-            # Keep replay-policy failures distinct from persistence errors
-            # so /retry can explain why the selected carrier is unsafe.
-            target_text = retryable_user_text(target_view.get("content"))
-            try:
-                result = self._db.rewind_to_message(
-                    session_id,
-                    target_id,
-                    preserve_compaction_handoff=handoff is not None,
-                    expected_active_ids=expected_active_ids,
-                    expected_target_content=target_view.get("content"),
-                )
-            except ValueError as e:
-                logger.debug("rewind_session: %s", e)
-                return None
-            except Exception as e:
-                logger.debug("rewind_session: rewind_to_message failed: %s", e)
-                return None
-            self._clear_dirty_transcript(session_id)
-            return {
-                "rewound_count": result.get("rewound_count", 0),
-                "turns_undone": turns_undone,
-                "target_text": target_text,
-            }
-
     def _redirect_legacy_alias_routes_locked(self) -> int:
         """Fold shape-only legacy aliases into their canonical keys at load.
 
@@ -1979,7 +1809,7 @@ class SessionStore(
         try:
             import hermes_undo
 
-            hermes_undo._session_db = self._db
+            hermes_undo._session_db = self._db_for_session_id(session_id)
             result = hermes_undo.undo(session_id, n)
         except RewindWouldOrphanError as e:
             # A concurrent turn is mid-flush (an assistant(tool_calls)→tool pair
@@ -2045,9 +1875,8 @@ class SessionStore(
         lock_held: bool = False,
     ) -> None:
         """Write one captured routing entry; the I/O half of ``_save_entry``."""
-        _db = getattr(self, "_db", None)
-        saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
-        if callable(saver):
+        saver = self._routing_db_method("save_gateway_routing_entry")
+        if saver is not None:
             from gateway.routing_identity import SessionKeyConflict
             save_lock = getattr(self, "_save_lock", None)
             if save_lock is None:
@@ -2178,7 +2007,8 @@ class SessionStore(
                     origin,
                     group_sessions_per_user=self.config.group_sessions_per_user,
                     thread_sessions_per_user=self.config.thread_sessions_per_user,
-                    profile=parts[1],
+                    # The key slot is a namespace (``main`` / ``main~``), not a profile id.
+                    profile=profile_from_session_key_namespace(parts[1]),
                 )
                 groups.setdefault(canonical, []).append((key, entry))
             merged, retired_keys = self._merge_alias_groups(groups, self._entries)
@@ -2435,19 +2265,7 @@ class SessionStore(
         # starting with "_" are skipped on load (see _ensure_loaded_locked), so
         # this never round-trips into a SessionEntry. Ordered first via a fresh
         # dict so it renders at the top of the pretty-printed JSON.
-        data = {
-            "_README": (
-                "LEGACY MIRROR of the gateway routing index (the primary copy "
-                "lives in the gateway_routing table in ~/.hermes/state.db). "
-                "Maps messaging session keys (agent:main:<platform>:...) to "
-                "active session IDs. This is NOT the session list. ALL "
-                "sessions (CLI, TUI, and gateway) live in ~/.hermes/state.db "
-                "and are shown by `hermes sessions list` and `/sessions`. "
-                "Disable this file with `gateway.write_sessions_json: false` "
-                "in config.yaml."
-            ),
-            **data,
-        }
+        data = {"_README": _SESSIONS_JSON_README, **data}
         fd, tmp_path = tempfile.mkstemp(
             dir=str(self.sessions_dir), suffix=".tmp", prefix=".sessions_"
         )
@@ -2714,17 +2532,15 @@ class SessionStore(
         db_load_succeeded = False
         # getattr: some tests build partially-initialized stores without
         # __init__ (same pattern as _prune_stale_sessions_locked).
-        _db = getattr(self, "_db", None)
-        if _db:
-            loader = getattr(_db, "load_gateway_routing_entries", None)
-            if callable(loader):
-                try:
-                    db_rows = dict(loader(scope=self._routing_scope()))
-                    db_load_succeeded = True
-                except Exception as e:
-                    logger.warning(
-                        "gateway.session: state.db routing load failed: %s", e
-                    )
+        loader = self._routing_db_method("load_gateway_routing_entries")
+        if loader is not None:
+            try:
+                db_rows = dict(loader(scope=self._routing_scope()))
+                db_load_succeeded = True
+            except Exception as e:
+                logger.warning(
+                    "gateway.session: state.db routing load failed: %s", e
+                )
         legacy_data = None
         legacy_error = None
         sessions_file = self.sessions_dir / "sessions.json"
@@ -2772,9 +2588,6 @@ class SessionStore(
         apply under the lock only to routes that still hold the entry object
         the decision was made on (a route touched meanwhile is left alone).
         """
-        db = getattr(self, "_db", None)
-        if not db:
-            return
         with self._lock:
             items = list(self._entries.items())
             # Entries are also rewritten IN PLACE (compression-tip heal), so
@@ -2782,7 +2595,7 @@ class SessionStore(
             sids = {key: entry.session_id for key, entry in items}
         if not items:
             return
-        plan = self._plan_stale_prune(db, items)
+        plan = self._plan_stale_prune(items)
         if plan is None:
             return
         with self._lock:

@@ -94,8 +94,13 @@ class SessionRecoveryMixin:
         return recovered_profile == self._active_profile_name()
 
     def _generate_session_key(self, source: SessionSource, key_source: Optional[SessionSource] = None) -> str:
-        """Session key for *source* (profile from *source*; key from *key_source* if given)."""
+        """Session key for *source* (profile from *source*; key from *key_source* if given).
+        ``source_resolver`` (the gateway's adapter-derived canonicalization) runs first so direct
+        store writers key the chat the way the platform does."""
         from gateway.session import build_session_key
+        resolver = getattr(self, "source_resolver", None)
+        if resolver is not None:
+            resolver(source)
         return build_session_key(
             key_source if key_source is not None else source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),

@@ -36,6 +36,7 @@ def _tick_admitted(
     if lock_fd is None:
         return 0
 
+    _dispatch_release = None
     try:
         # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
         with contextlib.suppress(ImportError):
@@ -46,6 +47,23 @@ def _tick_admitted(
         if can_dispatch is not None and not can_dispatch():
             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+        # A dying process must not scan for due jobs (fork #1307, t_1f4598ad). Anything it
+        # dispatches is refused ("Skipped: cron scheduler is shutting down"), which records
+        # last_status=error, advances next_run_at a whole period and consumes a restart_requeue
+        # marker the next boot needed. Leave due jobs and markers for the next process's ticker.
+        if _sched.is_shutting_down():
+            _sched.logger.debug("Cron tick skipped: scheduler is shutting down")
+            return 0
+        # Shared-checkout admission hold (gateway/checkout_admission.py): a gate exposing
+        # ``admit()`` returns a release callable that must span the whole dispatch window, so a
+        # hold engaged mid-tick still sees every job this tick registers (get_running_job_ids)
+        # or refuses it.
+        _dispatch_admit = getattr(can_dispatch, "admit", None)
+        if callable(_dispatch_admit):
+            _dispatch_release = _dispatch_admit()
+            if _dispatch_release is None:
+                _sched.logger.debug("Cron dispatch refused by shared-checkout admission hold")
+                return 0
 
         from cron.bot_chat_delivery import drain, drain_in_background
         if sync:
@@ -60,6 +78,9 @@ def _tick_admitted(
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
         due_jobs = _sched.get_due_jobs()
+        # LOUD missed one-shot notices (fork #1087): a one-shot past its grace window is reported
+        # to its delivery target instead of silently expiring.
+        _sched._deliver_missed_oneshot_notices(adapters=adapters, loop=loop)
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
         if not due_jobs:
@@ -118,4 +139,9 @@ def _tick_admitted(
         _sched._sweep_mcp_orphans_when_all_done(_all_futures)
         return sum(_results)
     finally:
+        if _dispatch_release is not None:
+            try:
+                _dispatch_release()
+            except Exception:
+                _sched.logger.debug("cron dispatch admission release failed", exc_info=True)
         _sched._release_tick_lock(lock_fd)

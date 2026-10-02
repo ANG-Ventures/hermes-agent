@@ -1204,7 +1204,13 @@ def list_authenticated_providers(
     never stalls the picker (#114215)."""
 
     from agent.models_dev import fetch_models_dev
+    from hermes_cli import provider_seam
     from hermes_cli.config import coerce_provider_id, stringify_provider_map
+
+    # Hot registration (fork provider-registry generation seam): give refresh callbacks a chance
+    # to publish missing names before anything below reads the registries. Pinned by
+    # tests/fork_canaries/test_fork_canary_provider_seam.py.
+    provider_seam.refresh("picker")
 
     non_blocking_catalogs = bool(non_blocking_catalogs)
 
@@ -1261,6 +1267,17 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         _lap_custom_provider_rows(b, custom_providers)
 
+    # Final ``model_catalog.excluded_providers`` post-filter (fork #712). The per-section gates
+    # above cover the built-in rows (lmstudio, built-in, overlay, canonical); sections 3
+    # (``providers:``), 3b (bare custom) and 4 (``custom_providers:``) have no exclusion gate, so
+    # an excluded user endpoint would still reach every consumer of this function. A post-pass
+    # over the rows means a section added later cannot reintroduce the omission;
+    # ``inventory.build_models_payload`` applies the SAME predicate again after injecting rows
+    # this function never sees.
+    if b.excluded:
+        from hermes_cli.model_switch import provider_row_is_excluded
+        b.results = [r for r in b.results if not provider_row_is_excluded(r, b.excluded)]
+
     return _finalize_picker_rows(b.results, user_providers, current_model)
 
 
@@ -1285,12 +1302,20 @@ def _finalize_picker_rows(results: list, user_providers, current_model: str) -> 
     # A custom/uncurated model set via `/model <provider>/<name>` would be invisible in every
     # picker (main and MoA slot pickers read these rows); inject it at the front of the current
     # provider's row.
+    # Namespace-aware presence check (fork 9ea23030a87): ``current_model`` is stored bare in
+    # config (``claude-opus-4-8``) while a provider's curated entries are namespaced
+    # (``claude-app/claude-opus-4-8``); a plain ``not in`` injects the current model a SECOND
+    # time and the picker shows it twice. Matched on the ``/`` boundary so distinct aggregator
+    # entries that merely share a trailing name (``openai/gpt-5`` vs ``azure/gpt-5``) stay apart.
+    def _same_model(a: str, b: str) -> bool:
+        return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
     if current_model:
         for row in results:
             if not row.get("is_current") or row.get("native_catalog_empty"):
                 continue
             models = row.get("models") or []
-            if current_model not in models:
+            if not any(_same_model(current_model, m) for m in models):
                 from hermes_cli.models import _model_requires_account_discovery
 
                 if _model_requires_account_discovery(row.get("slug"), current_model):
@@ -1341,12 +1366,28 @@ def list_picker_providers(
         current_model=current_model, for_picker=True, excluded_providers=excluded_providers,
         non_blocking_catalogs=non_blocking_catalogs, probe_custom_providers=probe_custom_providers,
         probe_current_custom_provider=probe_current_custom_provider)
+    from hermes_cli.model_switch import (
+        _PICKER_HIDDEN_FAILOVER_LANE_RE, _apply_picker_preferences, provider_row_is_excluded)
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
+        # ``list_authenticated_providers`` filtered ``excluded_providers`` over its OWN rows; the
+        # virtual moa row is injected afterwards and would otherwise reappear in the picker despite
+        # being excluded. Same shared predicate as the two other choke points.
+        _excl_norm = {str(p).strip().lower() for p in (excluded_providers or []) if p}
+        if _excl_norm:
+            providers = [p for p in providers if not provider_row_is_excluded(p, _excl_norm)]
 
     filtered: List[dict] = []
+    _cur = str(current_provider or "").strip().lower()
     for p in providers:
-        if str(p.get("slug", "")).lower() == "openrouter":
+        slug = str(p.get("slug", "")).lower()
+        # Hide numbered Claude failover lanes (claude-{apx,bpx}-N) from the interactive picker:
+        # internal auto-failover targets, not hand-selectable providers, and 20+ of them crowd
+        # real providers past the dropdown's 25-option cap. Visible only while CURRENTLY active.
+        # Typed `/model <lane>/...` and failover routing are unaffected (fork adf3b840499).
+        if _PICKER_HIDDEN_FAILOVER_LANE_RE.match(slug) and slug != _cur:
+            continue
+        if slug == "openrouter":
             try:
                 live_ids = [mid for mid, _ in fetch_openrouter_models(cache_only=non_blocking_catalogs)]
             except Exception:
@@ -1361,4 +1402,5 @@ def list_picker_providers(
     from hermes_cli.models_validate import drop_unofferable_model_ids
 
     drop_unofferable_model_ids(filtered)
-    return filtered
+    # ``model.picker.hide`` / ``model.picker.order`` (fork 306e24a600e): cosmetic only.
+    return _apply_picker_preferences(filtered, current_provider=_cur)

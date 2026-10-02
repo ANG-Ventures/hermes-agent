@@ -260,6 +260,11 @@ def _build_job_prompt(
     user_prompt = str(job.get("prompt") or "")
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    # One-shot fired late by the restart catch-up (fork #1087, t_9bfdd7e3): say so up front so
+    # the agent re-checks a time-sensitive action before taking it.
+    from cron.jobs import LATE_FIRE_KEY, late_fire_note
+    if job.get(LATE_FIRE_KEY):
+        user_prompt = f"{late_fire_note(job[LATE_FIRE_KEY])}\n\n{user_prompt}"
     prompt = user_prompt
     # Runtime DATA (script stdout, upstream output) legitimately quotes command-shape strings, so it
     # must not be scanned with the strict user-prompt set — see _scan_assembled_cron_prompt.
@@ -274,7 +279,7 @@ def _build_job_prompt(
             prerun_script if prerun_script is not None
             else _script._run_job_script(
                 script_path, workdir=_sched._resolve_job_workdir(job, str(job.get("id") or "")),
-                interpreter=job.get("interpreter")))
+                interpreter=job.get("interpreter"), **_sched._job_script_kwargs(job)))
         if success and not script_output:
             return None  # no output → nothing to report, skip the AI call
         heading, intro = (

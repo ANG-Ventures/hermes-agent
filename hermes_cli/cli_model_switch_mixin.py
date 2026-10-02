@@ -314,6 +314,60 @@ def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
 class CLIModelSwitchMixin:
     """Model picker, /model switch application, runtime snapshot/restore, and codex runtime handling for the interactive CLI"""
 
+    @staticmethod
+    def _refuse_unresolved_provider_prefix(current_model: str, prefix: str, slug: str, resolved_provider: str) -> None:
+        """Fail loudly when a ``provider/model`` prefix names a PROVIDER that does not resolve here.
+
+        Distinguish a benign vendor namespace (``anthropic/…``, ``openai/…``, ``meta-llama/…``)
+        from a provider-qualified model whose provider did not resolve for this profile
+        (``claude-apr/claude-fable-5``). The latter means the user asked for a specific provider
+        (often a ``plugins/model-providers/<name>/`` plugin) that is NOT registered here —
+        silently stripping the prefix and sending the bare model to openai-codex substitutes
+        BOTH model and provider, a correctness and cost bug that surfaces only as a confusing
+        downstream 400. See the claude-apr incident (2026-07-16).
+        """
+        _prefix = (prefix or "").strip().lower()
+        try:
+            from hermes_cli.model_normalize import is_known_vendor_namespace
+
+            _is_vendor = is_known_vendor_namespace(_prefix)
+        except Exception:
+            # Predicate unavailable: keep the historical strip rather than blocking startup.
+            _is_vendor = True
+        if _is_vendor or not _prefix or _prefix == "openai-codex":
+            return
+
+        _resolver_error: Exception | None = None
+        try:
+            from hermes_cli.auth import AuthError, resolve_provider
+
+            try:
+                resolve_provider(_prefix)
+                return
+            except AuthError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                # A registered provider whose plugin crashed internally is a different failure
+                # from "provider not found"; still refuse, but surface the root cause.
+                _resolver_error = exc
+        except Exception as exc:  # noqa: BLE001
+            _resolver_error = exc  # resolver import failure: err toward the loud error
+
+        _cause = (
+            f" (provider resolution raised {type(_resolver_error).__name__}: {_resolver_error} — "
+            f"this may be a crashing plugin rather than a missing one)"
+            if _resolver_error is not None else ""
+        )
+        raise ValueError(
+            f"Model '{current_model}' names provider '{prefix}', which does not resolve for this "
+            f"profile{_cause} — refusing to strip the prefix and run '{slug}' on the default "
+            f"provider '{resolved_provider}' (that would silently substitute both the model and "
+            f"the provider). If '{prefix}' is a model-providers plugin, make sure the profile can "
+            f"see it (e.g. the plugins/model-providers symlink or its credential_pool entry). "
+            f"Otherwise pass a model whose vendor prefix is recognized, or select the intended "
+            f"provider explicitly with --provider."
+        )
+
     def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
         """Normalize provider-specific model IDs and routing."""
         from cli import _split_model_config_default
@@ -375,7 +429,8 @@ class CLIModelSwitchMixin:
 
         # 1. Strip provider prefix ("openai/gpt-5.4" → "gpt-5.4")
         if "/" in current_model:
-            slug = current_model.split("/", 1)[1]
+            prefix, slug = current_model.split("/", 1)
+            self._refuse_unresolved_provider_prefix(current_model, prefix, slug, resolved_provider)
             if not self._model_is_default:
                 self._console_print(
                     "[yellow]⚠️  " + _escape(t("cli.model.stripped_provider_prefix", old=current_model, new=slug, provider="OpenAI Codex")) + "[/]")

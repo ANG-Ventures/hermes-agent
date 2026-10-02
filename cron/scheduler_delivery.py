@@ -1784,15 +1784,15 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
 
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
-) -> None:
-    """Standalone fallback for a target the live lane did not deliver."""
+) -> bool:
+    """Standalone fallback for a target the live lane did not deliver. True when it sent."""
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
@@ -1804,7 +1804,7 @@ def _deliver_standalone(
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
         _queue_for_live_reconnect(t, content, media_files, delivery_errors)
-        return
+        return False
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1817,6 +1817,7 @@ def _deliver_standalone(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
+    return True
 
 
 def _prepare_target_delivery(
@@ -1949,12 +1950,19 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 
 
 def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False,
+    success: bool = True, wrap_override: Optional[bool] = None,
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error.
+
+    ``success`` selects the framing of the wrapped delivery (the content leads on successful
+    runs, a ⚠️ failure header carries the error as the body); both end in one ``-# cron …``
+    footer line (fork t_6bedca00 #1336). ``wrap_override=False`` forces the envelope off per
+    call — the fallback alert is a self-contained 🚨 message about a job that usually SUCCEEDED
+    on its fallback."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
@@ -1984,6 +1992,13 @@ def _deliver_result(
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
         return error
 
+    # Fleet host-down gate (fork #1026): #alerts targets about a host whose owner deadman latch
+    # is armed are demoted to #logs (never dropped); the ledger rows are written only once the
+    # demoted copy actually lands (see ``_note_delivered``).
+    host_down_ledger: list = []
+    content, targets = _sched._apply_host_down_gate(
+        job, content, targets, pending_ledger=host_down_ledger)
+
     from gateway.config import load_gateway_config
 
     # Wrap with header/footer unless cron.wrap_response: false.
@@ -1992,21 +2007,30 @@ def _deliver_result(
     with contextlib.suppress(Exception):
         user_cfg = _sched.load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+    if wrap_override is not None:
+        wrap_response = wrap_override
     # Mark live sends FINAL so the platform pushes them (Telegram "important" mode mutes otherwise).
     notify_delivery = _cron_delivery_notify_enabled(user_cfg)
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
     if wrap_response:
+        # House page shape (fork t_cb147820): the content's own header leads and the wrapper
+        # folds into ONE -# footer line. A success run no longer stacks a ✅ header over a 🔴
+        # finding; a failure keeps its single ⚠️ header (fork PR #16 semantics), only the
+        # id/rule/hint lines are folded.
         task_name = job.get("name", job["id"])
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job.get('id', '')})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            "To stop or manage this job, send me a new message "
-            f"(e.g. \"stop reminder {task_name}\")."
+        job_id = job.get("id", "")
+        footer = (
+            f'{_sched.CRON_WRAPPER_FOOTER_PREFIX}{task_name} · job {job_id} · '
+            f'reply "stop reminder {task_name}" to manage'
         )
+        body = (content or "").strip("\n")
+        if success or body.startswith(f"⚠️ **{task_name}** · rc="):
+            head = []  # the page already names the job (house shape, t_4bcf8c20)
+        else:
+            head = [f"⚠️ **Cronjob Failed: {task_name}**"]
+        delivery_content = "\n".join(head + ([body] if body else []) + [footer])
     else:
         delivery_content = content
 
@@ -2054,7 +2078,24 @@ def _deliver_result(
 
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
+    delivered_chats: set = set()
+
+    def _note_delivered(platform_name, chat_id) -> None:
+        delivered_chats.add((str(platform_name).lower(), str(chat_id)))
+        # Ledger a deferral the moment it lands in #logs: a later target that aborts delivery
+        # (or a worker exit) must not lose the delivered row.
+        if host_down_ledger and ("discord", _sched._HOST_DOWN_LOGS_CHAT) in delivered_chats:
+            _sched._host_down_write_ledger(host_down_ledger)
+            host_down_ledger.clear()
+
+    _unprefixed_delivery_content = cleaned_delivery_content
     for target in targets:
+        # Per target: only the host-down demoted copies wear the prefix.
+        _host_down_prefix = target.pop(_sched._HOST_DOWN_PREFIX_KEY, None)
+        cleaned_delivery_content = (
+            f"{_host_down_prefix} {_unprefixed_delivery_content}"
+            if _host_down_prefix else _unprefixed_delivery_content
+        )
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
         from gateway.warning_notifications import warning_notifications_enabled
@@ -2088,8 +2129,10 @@ def _deliver_result(
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
+            delivered = _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+        if delivered:
+            _note_delivered(t.platform_name, t.chat_id)
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.

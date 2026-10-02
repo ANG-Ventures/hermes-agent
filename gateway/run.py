@@ -1573,8 +1573,26 @@ from hermes_constants import get_hermes_home, get_hermes_home_override, get_proc
 # override, and the import-time config bridge below would then latch the secondary's terminal.* and
 # settings into the launch process env for every later launch-profile turn.
 _hermes_home = get_process_hermes_home()
+# Import-time snapshot so _state_home() can tell a deliberately re-pointed ``_hermes_home`` (a test
+# pin) from the launch value even when the process home itself is later pinned.
+_IMPORT_HERMES_HOME = _hermes_home
+
+
+def _state_home() -> Path:
+    """Home for gateway-owned restart/resume state files, resolved at CALL time.
+
+    The launch-profile constant above is import-time state and a silent default-profile leak under
+    multiplex; the served profile's home comes from ``get_hermes_home()``. A deliberately re-pointed
+    ``gateway.run._hermes_home`` (a test pin) still wins, the same way ``hermes_state._default_db_path``
+    honours a re-pointed ``DEFAULT_DB_PATH``."""
+    pinned = globals().get("_hermes_home")
+    if pinned is not None and pinned != _IMPORT_HERMES_HOME:
+        return pinned
+    return get_hermes_home()
+
 
 # Load ~/.hermes/.env first: user-managed env files must override stale shell exports on restart.
+from dotenv import load_dotenv  # noqa: F401  # fork tests monkeypatch gateway.run.load_dotenv
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
@@ -2881,6 +2899,9 @@ _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+# Per-job cron fire-fence wait on the shutdown path (t_8d085477). Must stay far inside the launchd
+# teardown reserve (15s at clamp 60). Read by run_shutdown.py via late import.
+_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S = 2.0
 
 
 def _reap_gateway_turn_processes(
@@ -4437,6 +4458,13 @@ class GatewayRunner(
         self._init_startup_checks()
         self._init_session_db()
         self._init_registries_and_clocks()
+        # Rehydrate session-scoped /reasoning + /model overrides persisted on the SessionEntry so
+        # they survive a gateway restart (P3). Best-effort; provider config is loaded lazily
+        # per-resolve, so the model leg re-resolves credentials on demand.
+        try:
+            self._rehydrate_session_overrides()
+        except Exception:
+            logger.debug("session-override rehydrate skipped (non-fatal)", exc_info=True)
 
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""
@@ -4459,6 +4487,16 @@ class GatewayRunner(
         # only stops launchd times. See _load_launchd_exit_timeout().
         self._stop_requested_by_signal = False
         self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(self._restart_drain_timeout)
+        try:
+            from gateway.lifecycle_ledger import read_last_teardown_seconds
+
+            # Bounded against the live budget: a sample larger than the usable window cannot be
+            # reserved for, and honouring it would zero the next drain instead.
+            self._last_shutdown_teardown_s = read_last_teardown_seconds(
+                max_seconds=resolve_max_actionable_teardown_reserve_s(self._launchd_exit_timeout_s),
+            )
+        except Exception:
+            self._last_shutdown_teardown_s = None
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
@@ -4474,6 +4512,8 @@ class GatewayRunner(
                 key))
         # Loop-side boundary: sync helpers use ``session_store`` directly; async handlers await this facade.
         self._async_session_store = AsyncSessionStore(self.session_store)
+        self.session_store.on_session_key_conflict = self._notify_session_key_conflict
+        self.session_store.source_resolver = self._canonicalize_session_source
         self.delivery_router = DeliveryRouter(self.config)
 
     def _init_lifecycle_state(self) -> None:
@@ -4508,9 +4548,28 @@ class GatewayRunner(
         self._executor_closing = False
         # ALL per-session state lives here (gateway/session_state.py); use _session_state / _peek_session_state.
         self._sessions: Dict[str, SessionState] = {}
+        # Per-session handle on the asyncio Task running that session's current turn. Captured
+        # synchronously at the slot-set so it is the EXACT turn task — the background reaper evicts
+        # ONLY entries whose task is genuinely done()/cancelled (a leaked slot), never a live turn.
+        # Cleared in _release_running_agent_state.
+        self._running_agent_tasks: Dict[str, Any] = {}
+        # A /stop'd turn whose coroutine is still DRAINING (cooperative interrupt not yet reached).
+        # /stop releases the _running_agents slot at once, so the running-agent guard can't see it,
+        # but the draining turn still appends transcript rows; /undo and /redo consult this to refuse
+        # a rewind that would race it (2026-07-14 undo-clobber). Populated in
+        # _interrupt_and_clear_session; cleared in _release_running_agent_state; pruned on access.
+        self._draining_turns: Dict[str, Any] = {}
+        self._session_initiated_restart: Dict[str, bool] = {}
+        self._resumed_this_boot: set[str] = set()
         # Per-SESSION_ID turn lease: serializes [load history → run → flush] when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping), which routing-key guards cannot see.
-        self._turn_leases = SessionTurnLeaseRegistry()
+        self._turn_leases = SessionTurnLeaseRegistry(
+            # Lets acquire() tell a genuinely-live alias-key holder apart from a /stop'd turn still
+            # draining a tool call; without it the registry blames alias routing keys for every wait
+            # and the zombie case is invisible (2026-09-20 incident).
+            is_generation_current=self._is_session_run_current,
+            stale_wait=_float_env("HERMES_STALE_LEASE_WAIT", DEFAULT_STALE_LEASE_WAIT),
+        )
         # Stall-notified keys clear when pending clears / activity resumes / conversation boundary.
         # Held turn-lease tokens live on SessionState.turn.lease_tokens keyed by run generation, so a
         # stale unwind can never free a newer turn's lease (#28686). Runner-level queued interrupt text lives on
@@ -4539,6 +4598,20 @@ class GatewayRunner(
         self._startup_restore_in_progress = False
         self._startup_restore_queue: List[MessageEvent] = []
         self._startup_restore_tasks: List[asyncio.Task] = []
+        # The absolute watchdog fails open before any queued-event replay can block intake.
+        self._startup_restore_watchdog_task: Optional[asyncio.Task] = None
+        self._startup_restore_replay_task: Optional[asyncio.Task] = None
+        # Bounded successor respawns for a crashing replay owner (Greptile P1).
+        self._startup_restore_replay_failures: int = 0
+        # Schedule-time disposition for synthetic startup resume turns: the persisted transcript
+        # classification is prepared off-loop right before scheduling and the selected mode stays
+        # attached only for that synthetic turn.
+        self._auto_resume_decisions: Dict[str, Any] = {}
+        # session_key -> False when the persisted tail proves the previous turn already completed.
+        # Absent means "unknown", which schedules as before — the gate only skips on positive evidence.
+        self._boot_resume_has_work: Dict[str, bool] = {}
+        self._startup_resume_modes: Dict[str, Dict[str, Any]] = {}
+        self._auto_resume_attempt_store = None
         # Set by start_gateway() only for an explicit ``--replace`` launch; scoped to each adapter's
         # cold-start connect and removed before any reconnect can run.
         self._platform_lock_takeover_on_start = False
@@ -4579,6 +4652,8 @@ class GatewayRunner(
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
+        # Sessions whose persisted /model identity is not currently credential-resolvable.
+        self._session_model_override_unavailable: set[str] = set()
         # Failed-to-connect platforms for background reconnection: Platform -> {config, attempts, next_retry}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
         # Strong refs to detached fatal-error handler tasks so the loop can't GC them mid-run.
@@ -5012,7 +5087,21 @@ class GatewayRunner(
     # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by recover_interrupted_turns()
     # for a crash-left turn marker (no .clean_shutdown marker). All mean "killed mid-turn" -> startup
     # auto-resume.
-    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
+    # ``reboot_interrupted``: host reboot mid-turn. ``restart_consumed_interrupted``: a session that
+    # self-initiated a restart AND was still running when the drain timed out (genuinely interrupted);
+    # UNLIKE bare ``restart_consumed`` (a CLEAN self-restart, excluded to break the F1/F2
+    # restart->resume->restart cascade) it auto-resumes so preserve-and-prompt surfaces the interrupted
+    # work, while still recording the F2 replay-mark so a genuine loop is bounded/suspended.
+    _AUTO_RESUME_REASONS = frozenset({
+        "restart_timeout", "shutdown_timeout", "restart_interrupted", "reboot_interrupted",
+        _REASON_RESTART_CONSUMED_INTERRUPTED,
+    })
+    # Absolute deadline the shutdown watchdog is ACTUALLY armed with; the drain and the cron leash
+    # consume it instead of re-deriving a variant (#838).
+    _armed_shutdown_deadline_s: Optional[float] = None
+    _TERMINAL_GATEWAY_STATES = frozenset({"stopped", "startup_failed"})
+    # A non-sentinel _running_agents entry with no recorded task survives the reaper this long.
+    _REAP_GRACE_SECS: float = 30.0
 
     _MAX_SUPERVISED_RESTARTS = 5
     # Ran this long before crashing = HEALTHY (isolated crash, not a crash-loop); restart counter resets.
@@ -5273,9 +5362,9 @@ class GatewayRunner(
         housekeeping grow threads without limit. Housekeeping therefore gets its own bounded pool;
         exhausting that one delays only more housekeeping, which is best-effort by construction.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._get_housekeeping_executor(), copy_context().run, func, *args)
+        return await self._submit_with_context(
+            self._get_housekeeping_executor(), "housekeeping", func, *args
+        )
 
     def _get_or_create_pool(self, attr: str, make_pool: Callable[[], concurrent.futures.Executor]) -> concurrent.futures.Executor:
         """Return (creating under ``_executor_lock``) the pool at ``attr``; one lock + closing flag fences both."""
@@ -12135,9 +12224,7 @@ class GatewayRunner(
 
         try:
             emitted = await asyncio.wait_for(
-                self._run_housekeeping_in_executor(
-                    "finalize", emit_abandoned_session_ends, agents, reason
-                ),
+                self._run_housekeeping_in_executor(emit_abandoned_session_ends, agents, reason),
                 timeout=self._FINALIZE_TIMEOUT_S,
             )
             if emitted:
@@ -12321,7 +12408,7 @@ class GatewayRunner(
                 request_key,
                 request_reason,
                 request_handoff,
-            ) in _resume_requests.sweep_resume_requests(_hermes_home):
+            ) in _resume_requests.sweep_resume_requests(_state_home()):
                 try:
                     # A dropbox request is by contract a DELIBERATE external
                     # ask (the safe-restart/reboot watchers submitting a
@@ -14181,31 +14268,6 @@ class GatewayRunner(
         value = getattr(comp, "last_prompt_tokens", None) if comp is not None else None
         return value if isinstance(value, int) else None
 
-    async def _run_housekeeping_in_executor(self, label, func, *args):
-        """Run best-effort session housekeeping off the TURN pool.
-
-        Callers of this helper wrap their await in ``asyncio.wait_for`` and, on
-        timeout, log "the worker thread is left to finish on its own" and move
-        on. That bounds the AWAIT but NOT the OCCUPANCY: a
-        ``concurrent.futures`` work item that has already begun executing is
-        not cancellable, so an abandoned worker keeps its pool slot for as long
-        as its blocking call runs.
-
-        On the shared turn pool that made housekeeping able to starve turns
-        outright — and scale-invariantly, since N abandonments retire N slots
-        for any N. That is the 2026-09-20 incident: boot resumes scheduled at
-        10:02:45 did not start their turn BODIES until 10:12:36 (~590s) with
-        only 4-5 sessions live. The slots were not busy with turns; they were
-        retired by housekeeping nobody was waiting on any more.
-
-        Housekeeping therefore gets its own bounded pool. Exhausting it now
-        delays only more housekeeping, which is already best-effort by
-        construction.
-        """
-        return await self._submit_with_context(
-            self._get_housekeeping_executor(), label, func, *args
-        )
-
     def _active_compaction_count(self) -> int:
         """Count context compactions currently running in this process.
 
@@ -14451,17 +14513,6 @@ class GatewayRunner(
         """
         return effective_stop_drain_timeout(self)
 
-    def _get_housekeeping_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Return the gateway-owned executor for best-effort housekeeping."""
-        # Prefix stays under "hermes-gateway" so _shutdown_executor's
-        # liveness scan keeps counting these workers.
-        return _get_or_create_pool(
-            self,
-            "_housekeeping_executor",
-            "hermes-gateway-hk",
-            _housekeeping_executor_max_workers(),
-        )
-
     @staticmethod
     def _session_service_tiers_path():
         """Path to the durable per-session /fast override store.
@@ -14470,7 +14521,7 @@ class GatewayRunner(
         survives a gateway restart without mutating global config (the
         ``--global`` lane owns ``agent.service_tier``).
         """
-        return _hermes_home / "gateway_session_tiers.yaml"
+        return _state_home() / "gateway_session_tiers.yaml"
 
     def _clear_restart_replay_marks(self, session_key: str) -> None:
         with self._restart_failure_counts_rmw() as counts:
@@ -14486,9 +14537,7 @@ class GatewayRunner(
         store = getattr(self, "_auto_resume_attempt_store", None)
         if store is None:
             from gateway.auto_resume import AutoResumeAttemptStore
-            store = AutoResumeAttemptStore(
-                _hermes_home / "state" / "auto_resume_attempts.json"
-            )
+            store = AutoResumeAttemptStore(_state_home() / "state" / "auto_resume_attempts.json")
             self._auto_resume_attempt_store = store
         return store
 
@@ -14498,7 +14547,7 @@ class GatewayRunner(
         if coordinator is None or coordinator.boot_id != current_boot_id:
             from gateway.deferred_restart import DeferredRestartCoordinator
 
-            coordinator = DeferredRestartCoordinator(_hermes_home, boot_id=current_boot_id)
+            coordinator = DeferredRestartCoordinator(_state_home(), boot_id=current_boot_id)
             self._deferred_restart_coordinator = coordinator
         return coordinator
 
@@ -14604,10 +14653,10 @@ class GatewayRunner(
         return encode_restart_failure_entry(entry)
 
     def _restart_failure_counts_path(self) -> Path:
-        return _hermes_home / self._STUCK_LOOP_FILE
+        return _state_home() / self._STUCK_LOOP_FILE
 
     def _restart_initiated_dir(self) -> Path:
-        return _hermes_home / _RESTART_INITIATED_DIRNAME
+        return _state_home() / _RESTART_INITIATED_DIRNAME
 
 
 def _run_planned_stop_watcher(

@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cli.cli_hint import hint_value
 from hermes_constants import get_hermes_home
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_holders import read_only_db_uri
@@ -279,7 +280,8 @@ def _repair_scratch_space_error(db_path: Path) -> Optional[str]:
 def _backup_free_space_error(db_path: Path) -> Optional[str]:
     """Disk guard for the forensic copy: reason to refuse, or None. A full raw copy on a nearly-full volume (which a
     preceding repair loop may itself have caused) can finish off the disk and every process on the machine."""
-    hint = _MANUAL_RECOVER_HINT.format(db_path=db_path)
+    # Shell-quoted so a path with a space (a normal macOS home) pastes as one argument.
+    hint = _MANUAL_RECOVER_HINT.format(db_path=hint_value(str(db_path)))
     error, need, free, headroom = _disk_budget(db_path, "forensic copy")
     if error is not None:
         return f"{error}. {hint}"
@@ -398,8 +400,8 @@ def _persistent_repair_exhausted_error(db_path: Path) -> str:
     profile_arg = profile_cli_selector()
     return (f"automatic repair has already failed {_MAX_PERSISTENT_REPAIR_ATTEMPTS} times on this exact file — the "
             f"corruption is beyond the schema/FTS repair strategies (likely b-tree page damage). Manual recovery "
-            f"required: restore a backup, or salvage with `hermes {profile_arg}sessions recover --source {db_path} "
-            f"--inspect-only`, then (if it reports recoverable) `hermes {profile_arg}sessions recover --source {db_path} "
+            f"required: restore a backup, or salvage with `hermes {profile_arg}sessions recover --source {hint_value(str(db_path))} "
+            f"--inspect-only`, then (if it reports recoverable) `hermes {profile_arg}sessions recover --source {hint_value(str(db_path))} "
             f"--output recovered-state.db` (recovery snapshots the damaged file first, then runs the page-level "
             f"`.recover` lane on the copy; do NOT point a raw `sqlite3` shell at the live database). "
             f"Delete {_repair_ledger_path(db_path).name} to force another automatic attempt.")

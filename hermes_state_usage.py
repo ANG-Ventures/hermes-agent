@@ -15,26 +15,55 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("hermes_state")
 
 _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+# UNKNOWN != 0 discriminators (agent/usage_pricing.USAGE_UNKNOWN_FIELDS): absorbing per session
+# (``MAX(flag, ?)`` latches), so one unmeasured call marks the bucket for the session's life.
+_USAGE_UNKNOWN_FLAGS = (
+    "input_tokens_unknown", "output_tokens_unknown", "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown", "usage_unknown")
+# Last-turn snapshot columns: NOT summed, COALESCE(?, existing) — last non-None wins — so a
+# caller that does not pass them leaves the previous turn's split standing.
+_LAST_TURN_FLAGS = tuple(f"last_turn_{f}" for f in _USAGE_UNKNOWN_FLAGS)
+_LAST_TURN_COUNTERS = tuple(f"last_turn_{c}" for c in _TOKEN_COUNTERS)
 
 
 def _token_update_sql(delta: bool) -> str:
     """``UPDATE sessions`` for one usage report: *delta* adds to the stored counters (CLI
     per-call path), otherwise sets them (gateway cumulative path). Cost/route columns
-    COALESCE-fill either way (statement text is pinned by the SQL trace harness)."""
+    COALESCE-fill either way (statement text is pinned by the SQL trace harness).
+
+    ``cost_status`` is judged against the POST-update estimated AND actual dollars: an incoming
+    ``'unknown'``/``'partial'`` stores ``'partial'`` when the row holds any priced spend, else
+    ``'unknown'`` — so a NULL-keep write never relabels retained catalog spend as unknown (stranding
+    it outside the reprice allowlist), a first actual of $5 arriving with 'unknown' turns partial,
+    and an incoming 'partial' is not stored verbatim after a $0 replace (r6 round-4 finding 10)."""
     def add(col: str) -> str:  # "col + ?" / "COALESCE(col, 0) + ?" in delta mode, bare "?" otherwise
         return f"{col} + ?" if delta else "?"
     def add0(col: str) -> str:
         return f"COALESCE({col}, 0) + ?" if delta else "?"
     counters = "".join(f"                   {c} = {add(c)},\n" for c in _TOKEN_COUNTERS)
+    flags = "".join(f"                   {f} = MAX(COALESCE({f}, 0), ?),\n" for f in _USAGE_UNKNOWN_FLAGS)
+    snapshot = "".join(f"                   {c} = COALESCE(?, {c}),\n" for c in (*_LAST_TURN_FLAGS, *_LAST_TURN_COUNTERS))
     estimated = "COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0)" if delta else "COALESCE(?, 0)"
+    post_estimated = "COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0)" if delta else "COALESCE(?, 0)"
+    post_actual = "COALESCE(actual_cost_usd, 0) + ?" if delta else "?"
     return (
-        "UPDATE sessions SET\n" + counters
+        "UPDATE sessions SET\n" + counters + flags + snapshot
         + f"""                   estimated_cost_usd = {estimated},
                    actual_cost_usd = CASE
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE {add0("actual_cost_usd")}
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN ? IS NULL THEN cost_status
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN {post_estimated} > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE {post_actual} END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE ?
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -53,9 +82,12 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    session_id, model, billing_provider, billing_base_url, billing_mode,
                    task, api_call_count, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   input_tokens_unknown, output_tokens_unknown,
+                   cache_read_tokens_unknown, cache_write_tokens_unknown,
+                   usage_unknown,
                    estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
                    first_seen, last_seen
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
                DO UPDATE SET
                    api_call_count = api_call_count + excluded.api_call_count,
@@ -64,9 +96,26 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   input_tokens_unknown = MAX(input_tokens_unknown, excluded.input_tokens_unknown),
+                   output_tokens_unknown = MAX(output_tokens_unknown, excluded.output_tokens_unknown),
+                   cache_read_tokens_unknown = MAX(cache_read_tokens_unknown, excluded.cache_read_tokens_unknown),
+                   cache_write_tokens_unknown = MAX(cache_write_tokens_unknown, excluded.cache_write_tokens_unknown),
+                   usage_unknown = MAX(usage_unknown, excluded.usage_unknown),
                    estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   -- Same rule as the sessions row, judged against THIS (model, provider, mode,
+                   -- task) row's own dollars: the incoming status is session-wide, so a wholly
+                   -- unpriced model must not inherit another model's spend and render "partial"
+                   -- (r6 finding 1), and a row holding priced dollars is never relabelled 'unknown'.
+                   cost_status = CASE
+                       WHEN excluded.cost_status IS NULL THEN cost_status
+                       WHEN excluded.cost_status IN ('unknown', 'partial') THEN (
+                           CASE WHEN estimated_cost_usd + excluded.estimated_cost_usd > 0
+                                     OR actual_cost_usd + excluded.actual_cost_usd > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE excluded.cost_status
+                   END,
                    cost_source = COALESCE(excluded.cost_source, cost_source),
                    last_seen = excluded.last_seen"""
 
@@ -76,7 +125,12 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
 _MODEL_USAGE_FIELDS = frozenset((
     "model", "billing_provider", "billing_base_url", "billing_mode", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
-    "actual_cost_usd", "cost_status", "cost_source", "api_call_count"))
+    "actual_cost_usd", "cost_status", "cost_source", "api_call_count", *_USAGE_UNKNOWN_FLAGS))
+
+
+def _flag(value) -> Optional[int]:
+    """Bool -> the 0/1 the INTEGER flag columns store; None stays None (COALESCE keeps the row)."""
+    return None if value is None else (1 if value else 0)
 
 
 class SessionUsageMixin:
@@ -226,6 +280,12 @@ class SessionUsageMixin:
                     if value is not None:
                         # All-None runs stay None so COALESCE keeps the stored value.
                         merged[f] = (merged.get(f) or 0.0) + value
+                for f in self._TOKEN_DELTA_SNAPSHOT_FIELDS:
+                    value = kwargs.get(f)
+                    if value is not None:
+                        # Last-non-None-wins (NOT a sum): mirrors the COALESCE(?, existing) write, so a
+                        # merged run ends with the newest turn's snapshot exactly as sequential apply would.
+                        merged[f] = value
             else:
                 groups.append((key, session_id, dict(kwargs)))
         return [(sid, kw) for _, sid, kw in groups]
@@ -276,13 +336,26 @@ class SessionUsageMixin:
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False,
+        last_turn_input_tokens: Optional[int]=None, last_turn_output_tokens: Optional[int]=None,
+        last_turn_cache_read_tokens: Optional[int]=None, last_turn_cache_write_tokens: Optional[int]=None,
+        last_turn_reasoning_tokens: Optional[int]=None,
+        input_tokens_unknown: bool=False, output_tokens_unknown: bool=False, cache_read_tokens_unknown: bool=False,
+        cache_write_tokens_unknown: bool=False, usage_unknown: bool=False,
+        last_turn_input_tokens_unknown: Optional[bool]=None, last_turn_output_tokens_unknown: Optional[bool]=None,
+        last_turn_cache_read_tokens_unknown: Optional[bool]=None,
+        last_turn_cache_write_tokens_unknown: Optional[bool]=None, last_turn_usage_unknown: Optional[bool]=None,
         source: Optional[str]=None,
     ) -> None:
         """Update token counters and backfill model if unset. *absolute*=False increments
         (per-API-call deltas, CLI path); *absolute*=True sets directly (gateway path,
         where the cached agent holds cumulative totals). ``source`` is the session's real surface
-        for the row-existence guard; callers that don't know it leave the placeholder."""
+        for the row-existence guard; callers that don't know it leave the placeholder.
+        ``last_turn_*``: the newest turn's token split (snapshot, last-non-None-wins; omitted leaves
+        the stored one). ``*_unknown``: UNKNOWN != 0 provenance flags — absorbing on the session
+        row and the per-model row, snapshot-valued on the ``last_turn_*_unknown`` columns."""
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
+        for f in _USAGE_UNKNOWN_FLAGS:
+            usage[f] = bool(usage.get(f))
         # Ensure the row exists: under concurrent load create_session() may have failed on
         # locking, and the UPDATE would silently affect 0 rows. When this guard is the first
         # writer it must carry the agent's real source: the turn lease treats an existing row as
@@ -295,7 +368,19 @@ class SessionUsageMixin:
         has_accounted_usage = bool(has_usage or actual_cost_usd)
         params = (
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-            estimated_cost_usd, actual_cost_usd, actual_cost_usd, cost_status, cost_source, pricing_version,
+            _flag(bool(input_tokens_unknown)), _flag(bool(output_tokens_unknown)),
+            _flag(bool(cache_read_tokens_unknown)), _flag(bool(cache_write_tokens_unknown)),
+            _flag(bool(usage_unknown)),
+            _flag(last_turn_input_tokens_unknown), _flag(last_turn_output_tokens_unknown),
+            _flag(last_turn_cache_read_tokens_unknown), _flag(last_turn_cache_write_tokens_unknown),
+            _flag(last_turn_usage_unknown),
+            last_turn_input_tokens, last_turn_output_tokens, last_turn_cache_read_tokens,
+            last_turn_cache_write_tokens, last_turn_reasoning_tokens,
+            estimated_cost_usd, actual_cost_usd, actual_cost_usd,
+            # cost_status CASE binds: (NULL?), (incomplete?), post-update estimated contribution,
+            # (actual NULL?), actual contribution, value stored otherwise.
+            cost_status, cost_status, estimated_cost_usd, actual_cost_usd, actual_cost_usd, cost_status,
+            cost_source, pricing_version,
             billing_provider if has_accounted_usage else None,
             billing_base_url if has_accounted_usage else None,
             billing_mode if has_accounted_usage else None, model if has_accounted_usage else None,
@@ -340,6 +425,8 @@ class SessionUsageMixin:
         output_tokens: int=0, cache_read_tokens: int=0, cache_write_tokens: int=0, reasoning_tokens: int=0,
         estimated_cost_usd: Optional[float]=None, actual_cost_usd: Optional[float]=None,
         cost_status: Optional[str]=None, cost_source: Optional[str]=None, api_call_count: int=0, task: str="",
+        input_tokens_unknown: bool=False, output_tokens_unknown: bool=False, cache_read_tokens_unknown: bool=False,
+        cache_write_tokens_unknown: bool=False, usage_unknown: bool=False,
     ) -> None:
         """Accumulate a per-API-call usage delta into session_model_usage, inside the caller's
         write txn after the ``sessions`` UPDATE. A missing model/provider falls back to
@@ -356,19 +443,30 @@ class SessionUsageMixin:
         ).fetchone()
         sess = dict(row) if (row is not None and not task) else {}
         counts = [v or 0 for v in (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)]
+        # Absorbing per bucket: MAX over the accumulated flag and this delta's, so one unmeasured call
+        # latches the bucket. UNKNOWN != 0 — the int columns above keep summing regardless.
+        flags = [1 if v else 0 for v in (input_tokens_unknown, output_tokens_unknown, cache_read_tokens_unknown,
+                                          cache_write_tokens_unknown, usage_unknown)]
+        estimated, actual = float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0)
+        # A row's FIRST write cannot be "partial": there is no prior spend on this (model, provider,
+        # mode, task) to be partial about. The incoming status is session-scoped, so scope it to this
+        # row's own dollars (r6 finding 1).
+        if cost_status in ("unknown", "partial"):
+            cost_status = "partial" if (estimated > 0 or actual > 0) else "unknown"
         now = time.time()
         conn.execute(_MODEL_USAGE_UPSERT_SQL, (
             session_id, model or sess.get("model") or "unknown",
             billing_provider or sess.get("billing_provider") or "",
             billing_base_url or sess.get("billing_base_url") or "",
-            billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts,
-            float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now))
+            billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts, *flags,
+            estimated, actual, cost_status, cost_source, now, now))
 
     def record_auxiliary_usage(
         self, session_id: str, task: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
         billing_base_url: Optional[str]=None, input_tokens: int=0, output_tokens: int=0, cache_read_tokens: int=0,
         cache_write_tokens: int=0, reasoning_tokens: int=0, estimated_cost_usd: Optional[float]=None,
-        api_call_count: int=1,
+        api_call_count: int=1, input_tokens_unknown: bool=False, output_tokens_unknown: bool=False,
+        cache_read_tokens_unknown: bool=False, cache_write_tokens_unknown: bool=False, usage_unknown: bool=False,
     ) -> None:
         """Record an auxiliary LLM call's usage (vision, compression, title generation, ...)
         as a per-(model, provider, task) delta in ``session_model_usage`` WITHOUT touching
@@ -383,6 +481,8 @@ class SessionUsageMixin:
         if not session_id or not task:
             return
         usage["api_call_count"] = 1 if api_call_count is None else int(api_call_count)
+        for f in _USAGE_UNKNOWN_FLAGS:
+            usage[f] = bool(usage.get(f))
         # FK to sessions.id: same guard as update_token_counts; the aux path carries no surface, so
         # the placeholder stays repairable by the creator's upsert (_insert_session_row).
         self._insert_session_row(session_id, "unknown")

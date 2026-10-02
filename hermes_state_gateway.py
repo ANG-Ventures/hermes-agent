@@ -255,6 +255,7 @@ class SessionGatewayMixin:
         ancestors = include_compression_ancestors
         query_params = [session_id, *identity] if ancestors else [*identity, session_id]
         def _do(conn):
+            root_id = self._resolve_effective_last_active_root(conn, session_id)
             conn.execute(
                 f"""{_COMPRESSION_LINEAGE_CTE if ancestors else ""}
                    UPDATE sessions
@@ -266,10 +267,9 @@ class SessionGatewayMixin:
                    {"WHERE id IN (SELECT id FROM compression_lineage)" if ancestors else "WHERE id = ?"}""",
                 query_params,
             )
-            if ancestors:
-                return
             # The UPDATE silently no-ops on a missing row — insert it with full identity.
-            if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is None:
+            if not ancestors and conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is None:
                 conn.execute(
                     """INSERT INTO sessions (
                                id, source, created_source, user_id, session_key, chat_id,
@@ -291,6 +291,10 @@ class SessionGatewayMixin:
                     (session_id, source, source, user_id, session_key, chat_id, chat_type, thread_id, display_name,
                      origin_json, self._own_profile_name(), transport_profile, time.time()),
                 )
+            # Fork denorm gate: recompute AFTER the self-heal insert above, so a row this call
+            # just created is included in the denormalization.
+            self._recompute_effective_last_active(conn, root_id)
+            self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
     def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
@@ -298,20 +302,27 @@ class SessionGatewayMixin:
         namespaces the index per sessions_dir so two stores never share routing state."""
         if not session_key or not entry_json:
             return
-        self._write_sql(
-            """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(scope, session_key) DO UPDATE SET
-                   entry_json = excluded.entry_json,
-                   updated_at = excluded.updated_at""",
-            (scope, session_key, entry_json, time.time()),
-        )
+        def _do(conn):
+            self._assert_unique_gateway_routes(conn, {session_key: entry_json}, scope)
+            conn.execute(
+                """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(scope, session_key) DO UPDATE SET
+                       entry_json = excluded.entry_json,
+                       updated_at = excluded.updated_at""",
+                (scope, session_key, entry_json, time.time()),
+            )
+        self._execute_write(_do)
 
-    def replace_gateway_routing_entries(self, entries: Dict[str, str], *, scope: str = "") -> None:
+    def replace_gateway_routing_entries(
+        self, entries: Dict[str, str], *, scope: str = "", retired_keys=(),
+    ) -> None:
         """Atomically replace the routing index for *scope* (keys absent from *entries*
-        are removed); other scopes untouched."""
+        are removed); other scopes untouched. ``retired_keys``: keys the caller is deliberately
+        retiring this write, exempt from the routing-identity uniqueness assertion."""
         now = time.time()
         def _do(conn):
+            self._assert_unique_gateway_routes(conn, entries, scope, retired_keys=retired_keys)
             conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
             if entries:
                 conn.executemany(
@@ -585,6 +596,10 @@ class SessionGatewayMixin:
                 "UPDATE sessions SET ended_at = COALESCE(ended_at, ?), "
                 "end_reason = 'superseded_by_repair' WHERE id = ?",
                 (time.time(), donor_id))
+            # The orphan may have just become the donor's child: keep the denormalized
+            # session-list rollup coherent for both rows.
+            self._recompute_effective_last_active_for_session(conn, orphan_id)
+            self._recompute_effective_last_active_for_session(conn, donor_id)
             return True
         return self._execute_write(_do)
 

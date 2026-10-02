@@ -97,6 +97,7 @@ def check_api_response(
     truncated_tool_call_retries: Any, current_turn_user_idx: Any, api_call_count: Any,
     api_request_id: Any, api_start_time: Any, effective_task_id: Any, turn_id: Any,
     _preflight_compression_blocked: Any, _last_preflight_pressure: Any,
+    _turn_calls: Any = None, _call_route: Any = None, _call_composition: Any = None,
 ) -> ResponseCheckVerdict:
     """Verify ``response`` in the original order. The retry buffer is NOT cleared on success
     (bytes back != usable content); ``_preflight_compression_blocked``/``_last_preflight_pressure``
@@ -196,6 +197,8 @@ def check_api_response(
         agent, response, messages=messages, api_call_count=api_call_count,
         api_duration=api_duration, compression_attempts=compression_attempts,
         max_compression_attempts=max_compression_attempts,
+        turn_calls=_turn_calls, call_route=_call_route, call_composition=_call_composition,
+        turn_id=turn_id,
     )
     compression_attempts = _usage_outcome.compression_attempts
     if _usage_outcome.rearmed:

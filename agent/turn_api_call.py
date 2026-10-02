@@ -42,6 +42,8 @@ class ApiCallVerdict:
     response: Any
     thinking_spinner: Any
     interrupted: Any
+    # Fork (Blackbox): the route that served this call, captured at dispatch (t_0c5c3822).
+    _call_route: Any = None
 
 
 def _should_stream(agent: Any) -> bool:
@@ -69,15 +71,24 @@ def perform_api_call(
     agent: Any, *, api_kwargs: Any, _original_api_kwargs: Any, _llm_middleware_trace: Any,
     _moa_prepared_request: Any, _retry: Any, thinking_spinner: Any, retry_count: Any,
     api_call_count: Any, api_request_id: Any, effective_task_id: Any, turn_id: Any,
-    interrupted: Any,
+    interrupted: Any, _turn_calls: Any = None,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
     response = None
+    from agent.chat_completion_helpers import _dispatch_route_snapshot, _live_route
+    from agent.conversation_loop import _settle_unaccepted_billed_responses
+
+    # Price at the route that SERVES this call: captured at dispatch, never read back from the
+    # agent after the call returns (a mid-turn switch would misprice it, t_0c5c3822). The sent
+    # ``model`` wins over the agent's when the request carries one.
+    _call_route = _live_route(agent)
+    if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("model"), str) and api_kwargs["model"]:
+        _call_route["model"] = api_kwargs["model"]
 
     def _verdict(action: str) -> ApiCallVerdict:
         return ApiCallVerdict(
             action=action, response=response, thinking_spinner=thinking_spinner,
-            interrupted=interrupted,
+            interrupted=interrupted, _call_route=_call_route,
         )
 
     def _stop_spinner():
@@ -92,6 +103,12 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        # Execution middleware may have re-routed; re-read at the terminal edge.
+        _call_route.update(_live_route(agent))
+        _sent_model = next_api_kwargs.get("model") if isinstance(next_api_kwargs, dict) else None
+        if isinstance(_sent_model, str) and _sent_model:
+            _call_route["model"] = _sent_model
+        agent._inflight_request_route = _dispatch_route_snapshot(agent, _call_route)
         if _use_streaming:
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
@@ -121,6 +138,10 @@ def perform_api_call(
 
     from hermes_cli.middleware import run_llm_execution_middleware
 
+    # A 200 the loop refused/failed over (malformed, refused) was still billed: settle it into the
+    # turn ledger before the next dispatch so a retry cannot double-count or drop it.
+    if _turn_calls is not None:
+        _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     # The ``_model_request_active`` bracket is taken under the redirect lock when one exists,
     # so redirect() can't observe a half-toggled flag.
     _model_request_active = getattr(agent, "_model_request_active", None)
@@ -138,6 +159,7 @@ def perform_api_call(
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
         )
     finally:
+        agent._inflight_request_route = None
         with _bracket:
             if _model_request_active is not None:
                 _model_request_active.clear()

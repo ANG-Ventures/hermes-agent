@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -189,7 +188,13 @@ class GatewayConfigLoadersMixin:
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
-        """Set or clear the session-scoped reasoning override."""
+        """Set or clear the session-scoped reasoning override.
+
+        Write-through: the override is ALSO persisted onto the SessionEntry so it survives a
+        gateway restart (P3a); the in-memory state alone is lost on restart, silently reverting
+        /reasoning high to the config default. Manual /new and /reset preserve the entry without
+        calling this user-action setter; explicit clears and lifecycle cleanup still call it.
+        """
         if not session_key:
             return
         # Per-session field write: a lazy ``_session_reasoning_overrides = {}`` init replaced the
@@ -197,6 +202,16 @@ class GatewayConfigLoadersMixin:
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+        # Persist onto the session entry (best-effort: a persistence hiccup must never break the
+        # in-memory switch the user just made).
+        try:
+            store = getattr(self, "session_store", None)
+            entry = store.entry_for(session_key) if store is not None else None
+            if entry is not None:
+                entry.reasoning_override = dict(reasoning_config) if reasoning_config is not None else None
+                store.persist()
+        except Exception:
+            logger.debug("reasoning-override persist skipped (non-fatal)", exc_info=True)
 
     def _resolve_session_service_tier(self, source=None, session_key: Optional[str] = None) -> Optional[str]:
         """Effective service tier: a session-scoped /fast override beats the config default.
@@ -559,9 +574,13 @@ class GatewayConfigLoadersMixin:
         if agent is None:
             return
         new_chain = list(chain or [])
-        rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
-        if getattr(agent, "_fallback_activated", False) and rate_limited_until > time.monotonic():
-            return
+        if getattr(agent, "_fallback_activated", False):
+            # One restore predicate (fallback spec §4.2): legacy cooldown AND the sticky gate,
+            # cheap form (no /eligibility I/O).
+            from agent.fallback_wiring import restore_allowed
+
+            if not restore_allowed(agent, probe=False).allowed:
+                return
         old_chain = list(getattr(agent, "_fallback_chain", []) or [])
         agent._fallback_chain = new_chain
         agent._fallback_model = new_chain[0] if new_chain else None

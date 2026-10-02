@@ -133,21 +133,15 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
 def _sync_codex_pool_entries(
     auth_store: Dict[str, Any], tokens: Dict[str, str], last_refresh: Optional[str],
     previous_singleton_tokens: Optional[Dict[str, str]] = None) -> None:
-    """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
+    """Update only explicitly singleton-owned Codex rows after a fresh login.
 
-    ``device_code`` (the singleton-seeded entry from ``hermes setup`` / the model picker) is always
-    synced. ``manual:device_code`` (``hermes auth add openai-codex``) is synced only when its
-    access_token equals the PREVIOUS singleton token — a legacy alias of the singleton; an entry
-    with its own token material is an independent account and must be left alone. ``manual:api_key``
-    and any other source are independent credentials and are never overwritten by a re-auth.
-
-    See #33000, #39236.
-    The original #33538 fix refreshed every ``manual:device_code`` entry unconditionally. That worked when
-    ``manual:device_code`` only meant "legacy alias of the singleton", but the same source string is now
-    also produced by independent-account additions, and the broad sync silently clobbered distinct accounts
-    with the latest-authenticated token pair. The access_token-match check distinguishes the two cases
-    without changing the source-string contract.
+    ``device_code`` (the singleton-seeded entry from ``hermes setup`` / the model picker) is
+    synced. Manual rows (``manual:device_code``, ``manual:api_key``, ...) are independent grants,
+    even when an old workaround copied identical token bytes into them. Retiring those aliases is
+    an explicit ownership migration (fork #673), never an inference from account IDs or token
+    equality; ``previous_singleton_tokens`` is accepted for callers that still pass it and ignored.
     """
+    del previous_singleton_tokens
     access_token = tokens.get("access_token")
     if not access_token:
         return
@@ -155,13 +149,8 @@ def _sync_codex_pool_entries(
     entries = _pool_entries(auth_store, "openai-codex")
     if entries is None:
         return
-    # None/empty prev_at → no manual entry can be an alias (right default for a first-ever save).
-    prev_at = (previous_singleton_tokens or {}).get("access_token") or None
     for entry in _codex_pool_dicts(entries):
-        source = entry.get("source")
-        is_alias = source == "manual:device_code" and bool(
-            prev_at and entry.get("access_token") == prev_at)
-        if not (source == "device_code" or is_alias):
+        if entry.get("source") != "device_code":
             continue
         entry["access_token"] = access_token
         if refresh_token:
@@ -196,10 +185,8 @@ def _save_codex_tokens(
         last_refresh = _utc_now_z()
     with _provider_state_transaction("openai-codex") as (auth_store, state, source_path):
         state = dict(state) if state else {}
-        # Capture the previous singleton tokens BEFORE overwriting: the pool sync uses them to
-        # tell legacy singleton-aliases (refresh) from independent ``auth add`` accounts (keep).
-        previous_singleton_tokens = (
-            state.get("tokens") if isinstance(state.get("tokens"), dict) else None)
+        # Explicit login writes the active store. Only declared device_code rows are synchronized;
+        # manual grants remain independent (fork #673).
         state.update(tokens=tokens, last_refresh=last_refresh, auth_mode="chatgpt")
         if label and str(label).strip():
             state["label"] = str(label).strip()
@@ -209,8 +196,7 @@ def _save_codex_tokens(
             # chain into ROOT's store (never set_active — a refresh is not a provider choice).
             target_store, target_path, set_active = _load_auth_store(source_path), source_path, False
         _store_provider_state(target_store, "openai-codex", state, set_active=set_active)
-        _sync_codex_pool_entries(
-            target_store, tokens, last_refresh, previous_singleton_tokens=previous_singleton_tokens)
+        _sync_codex_pool_entries(target_store, tokens, last_refresh)
         _save_auth_store(target_store, target_path=target_path)
 
 
@@ -496,10 +482,14 @@ def refresh_codex_oauth_pure(
     if response.status_code == 429:
         # Quota exhaustion on the token endpoint: the refresh token is still valid and re-auth
         # cannot lift a quota cap, so classify distinctly from auth failures ("retry later").
-        raise _codex_quota_exhausted_error(
+        exc = _codex_quota_exhausted_error(
             _parse_retry_after_seconds(getattr(response, "headers", None)))
+        exc.http_status = response.status_code
+        raise exc
     if response.status_code != 200:
-        raise _codex_refresh_failure_error(response)
+        exc = _codex_refresh_failure_error(response)
+        exc.http_status = response.status_code
+        raise exc
     refresh_payload, refreshed_access = _refresh_payload_access_token(
         response, provider="openai-codex", invalid_response=None,
         invalid_json=("Codex token refresh returned invalid JSON.", "codex_refresh_invalid_json"),
@@ -607,6 +597,16 @@ def resolve_codex_runtime_credentials(
     from hermes_cli.auth import (
         _auth_store_lock, _codex_access_token_is_expiring, _probe_codex_quota_restored,
         _read_codex_tokens)
+    if not read_only:
+        # Fork #673: a pool with explicitly owned rows refreshes through its single-use owner
+        # transaction (agent/codex_owner.py). Never from a read-only caller: the owner path may
+        # refresh and persist.
+        from agent.codex_owner import resolve_runtime
+        owned = resolve_runtime(
+            force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+            refresh_skew_seconds=refresh_skew_seconds)
+        if owned is not None:
+            return owned
     read_error: Optional[AuthError] = None
     data = None
     observed: Optional[str] = None
@@ -632,6 +632,13 @@ def resolve_codex_runtime_credentials(
             imported = _recover_codex_tokens_from_cli(
                 str(exc.code or "auth_error"), observed_access_token=observed)
             if imported:
+                # Recovery may have just created a durable singleton. Route any ensuing refresh
+                # through its owner transaction too (fork #673).
+                owned = resolve_runtime(
+                    force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+                    refresh_skew_seconds=refresh_skew_seconds)
+                if owned is not None:
+                    return owned
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
     if data is None:
         pool_token, pool_base = _pool_codex_credential()

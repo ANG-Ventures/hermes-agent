@@ -178,6 +178,13 @@ class CLIInfoMixin:
             else:
                 self._show_tool_availability_warnings()
 
+        # Nudge to resume a prior turn that was cut off mid-flight (restart /
+        # reboot / terminal-close). The tool+API work is already persisted, so
+        # `hermes chat -c` recovers it without re-running anything. Only on a
+        # FRESH launch (never when already resuming), best-effort.
+        if not getattr(self, "_resumed", False):
+            self._maybe_nudge_resume_interrupted_session()
+
         # Low context warning — tied to the runtime guard so guidance cannot drift.
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, is_local_endpoint
         if ctx_len and ctx_len < MINIMUM_CONTEXT_LENGTH:
@@ -230,12 +237,17 @@ class CLIInfoMixin:
         self._console_print()
 
     def _fast_command_available(self) -> bool:
+        """True when the route supports ANY static tier (fast/priority or ultrafast)."""
         try:
-            from hermes_cli.models import model_supports_fast_mode
+            # Unbound spelling: tests drive this with a bare SimpleNamespace stub.
+            from cli import HermesCLI
+
+            return (
+                HermesCLI._fast_capability(self).supported
+                or HermesCLI._fast_capability(self, "ultrafast").supported
+            )
         except Exception:
             return False
-        agent = getattr(self, "agent", None)
-        return model_supports_fast_mode(getattr(agent, "model", None) or getattr(self, "model", None))
 
     def _command_available(self, slash_command: str) -> bool:
         if slash_command == "/fast":
@@ -736,6 +748,25 @@ class CLIInfoMixin:
         pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
         elapsed = format_duration_compact((datetime.now() - self.session_start).total_seconds())
 
+        # UNKNOWN != 0, cumulative + absorbing. Shared rule (the same
+        # format_token_count the Blackbox card and status bar use) so one
+        # unmeasured call in the window renders that term "unknown" here
+        # instead of a right-aligned number the user would read as measured.
+        from agent.usage_pricing import (
+            format_token_count, prompt_tokens_unknown,
+            session_total_tokens_unknown, session_usage_unknown_flags,
+        )
+
+        _flags = session_usage_unknown_flags(agent)
+        _any = session_total_tokens_unknown(agent)
+        _prompt_unknown = prompt_tokens_unknown(_flags)
+        _output_unknown = _flags["output_tokens_unknown"] or _flags["usage_unknown"]
+
+        def _tok(value: int, unknown: bool) -> str:
+            return format_token_count(
+                value, unknown=unknown, formatter=lambda v: f"{int(v):,}"
+            ).rjust(10)
+
         def _label_row(key: str, value: str) -> None:
             # Labels are re-padded here (not in the catalog) so translated widths still align.
             print(f"  {t(key):<26} {value}")
@@ -743,13 +774,13 @@ class CLIInfoMixin:
         print(f"  {t('cli.usage.header_session')}")
         print(f"  {'─' * 40}")
         _label_row("cli.usage.label_model", str(agent.model))
-        _label_row("cli.usage.label_input_tokens", f"{input_tokens:>10,}")
-        _label_row("cli.usage.label_output_tokens", f"{output_tokens:>10,}")
+        _label_row("cli.usage.label_input_tokens", _tok(input_tokens, _flags["input_tokens_unknown"] or _flags["usage_unknown"]))
+        _label_row("cli.usage.label_output_tokens", _tok(output_tokens, _output_unknown))
         if reasoning_tokens:
             _label_row("cli.usage.label_reasoning_subset", f"{reasoning_tokens:>10,}")
-        _label_row("cli.usage.label_prompt_tokens_total", f"{agent.session_prompt_tokens:>10,}")
-        _label_row("cli.usage.label_completion_tokens", f"{agent.session_completion_tokens:>10,}")
-        _label_row("cli.usage.label_total_tokens", f"{agent.session_total_tokens:>10,}")
+        _label_row("cli.usage.label_prompt_tokens_total", _tok(agent.session_prompt_tokens, _prompt_unknown))
+        _label_row("cli.usage.label_completion_tokens", _tok(agent.session_completion_tokens, _output_unknown))
+        _label_row("cli.usage.label_total_tokens", _tok(agent.session_total_tokens, _any))
         _label_row("cli.usage.label_api_calls", f"{calls:>10,}")
         _label_row("cli.usage.label_session_duration", f"{elapsed:>10}")
         print(f"  {'─' * 40}")

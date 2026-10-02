@@ -24,6 +24,10 @@ _AGENT_COUNTERS = (
     "session_input_tokens", "session_output_tokens", "session_cache_read_tokens",
     "session_cache_write_tokens", "session_prompt_tokens", "session_completion_tokens",
     "session_total_tokens", "session_api_calls")
+_UNKNOWN_FLAGS = (
+    "input_tokens_unknown", "output_tokens_unknown", "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown", "usage_unknown", "session_prompt_tokens_unknown",
+    "session_total_tokens_unknown")
 
 
 def _threshold_style(value, ladder, fallback: str) -> str:
@@ -52,10 +56,28 @@ class CLIStatusBarMixin:
             return "class:status-bar-bad"
         return _threshold_style(percent_used, ((50, "warn"),), "good")
 
-    def _cache_hit_rate(self, snapshot: dict, precision: int = 1) -> "tuple[float, str] | None":
+    def _cache_hit_rate(
+        self, snapshot: dict, precision: int = 1
+    ) -> "tuple[float | None, str] | None":
         """Return (cache_pct, label) or None without cache data. Prefers the baseline-delta pct
         from ``_get_status_bar_snapshot`` (resets on model switch / compression, so it reflects
-        the *current* cache regime); falls back to the session-lifetime ratio."""
+        the *current* cache regime); falls back to the session-lifetime ratio.
+
+        When the window carries an UNKNOWN term the segment says so and the
+        pct is ``None``: suppressing only the delta would hand the render
+        straight to the session-lifetime fallback below, which divides the
+        same raw unflagged counters and prints the fabricated ratio the
+        suppression exists to prevent.
+        """
+        if self._cache_ratio_unknown(snapshot):
+            from agent.usage_pricing import UNKNOWN_TOKENS_LABEL
+
+            # Consume the producer label only when it agrees with provenance;
+            # stale snapshots must not smuggle a percentage past this guard.
+            label = snapshot.get("cache_hit_label")
+            if label != UNKNOWN_TOKENS_LABEL:
+                label = UNKNOWN_TOKENS_LABEL
+            return None, f"◎ {label}"
         delta_pct = snapshot.get("cache_hit_pct")
         if delta_pct is not None:
             return float(delta_pct), f"◎ {float(delta_pct):.{precision}f}%"
@@ -66,8 +88,14 @@ class CLIStatusBarMixin:
             return cache_pct, f"◎ {cache_pct:.{precision}f}%"
         return None
 
-    def _cache_hit_rate_style(self, cache_pct: float) -> str:
-        """Higher is better (opposite of context %)."""
+    def _cache_hit_rate_style(self, cache_pct: "float | None") -> str:
+        """Higher is better (opposite of context %).
+
+        ``None`` is the UNKNOWN arm of ``_cache_hit_rate`` — there is no pct to
+        grade, so it renders dim rather than being scored as a bad hit rate.
+        """
+        if cache_pct is None:
+            return _DIM
         return _threshold_style(cache_pct, ((70, "good"), (40, "warn")), "bad")
 
     @staticmethod
@@ -223,6 +251,9 @@ class CLIStatusBarMixin:
             "context_length": None,
             "context_percent": None,
             **dict.fromkeys(_AGENT_COUNTERS, 0),
+            # UNKNOWN != 0 (cumulative, absorbing). Default measured so a
+            # snapshot built before any agent exists reads exactly as today.
+            **dict.fromkeys(_UNKNOWN_FLAGS, False),
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
@@ -301,6 +332,22 @@ class CLIStatusBarMixin:
 
         for key in _AGENT_COUNTERS:
             snapshot[key] = getattr(agent, key, 0) or 0
+        # UNKNOWN != 0, cumulative. Shared rule from agent.usage_pricing — the
+        # cumulative figures are sums over the same canonical usage the per-turn
+        # Blackbox card reads, so they use the SAME unknown vocabulary rather
+        # than a forked status-bar-only one.
+        try:
+            from agent.usage_pricing import (
+                prompt_tokens_unknown, session_total_tokens_unknown,
+                session_usage_unknown_flags,
+            )
+
+            _session_flags = session_usage_unknown_flags(agent)
+            snapshot.update(_session_flags)
+            snapshot["session_prompt_tokens_unknown"] = prompt_tokens_unknown(_session_flags)
+            snapshot["session_total_tokens_unknown"] = session_total_tokens_unknown(agent)
+        except Exception:
+            pass
 
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
@@ -348,6 +395,7 @@ class CLIStatusBarMixin:
         # invalidate the prompt cache). hit = cache_read / prompt_tokens, where
         # prompt = input + cache_read + cache_write (CanonicalUsage).
         pct = None
+        ratio_unknown = False
         try:
             base_model = getattr(self, "_cache_hit_baseline_model", None)
             base_prompt = int(getattr(self, "_cache_hit_baseline_prompt", 0) or 0)
@@ -373,14 +421,26 @@ class CLIStatusBarMixin:
                 _rebase(tokens=True)
             delta_prompt = cur_prompt - base_prompt
             delta_read = cur_read - base_read
+            # A cache RATIO over cumulative counters is only a measurement when
+            # both terms are. An unmeasured call contributes 0 to each sum, so
+            # a ratio computed across it is fabricated — it reads as a cache
+            # miss that never happened (or a 100% hit that did not). Suppress
+            # the percentage and render the explicit unknown label instead.
+            if self._cache_ratio_unknown(snapshot):
+                ratio_unknown = True
             # A zero-read regime hides the segment (no data ≠ an alarming 0%); pct stays a
             # float so renderers choose their own precision.
-            if delta_prompt > 0 and delta_read > 0:
+            elif delta_prompt > 0 and delta_read > 0:
                 pct = max(0.0, min(100.0, (delta_read / delta_prompt) * 100))
         except Exception:
             pct = None
         snapshot["cache_hit_pct"] = pct
-        snapshot["cache_hit_label"] = f"{pct:.0f}%" if pct is not None else ""
+        if ratio_unknown:
+            from agent.usage_pricing import UNKNOWN_TOKENS_LABEL
+
+            snapshot["cache_hit_label"] = UNKNOWN_TOKENS_LABEL
+        else:
+            snapshot["cache_hit_label"] = f"{pct:.0f}%" if pct is not None else ""
 
         # Rolling avg latency / velocity over the deques kept by agent/conversation_loop.py
         # (hidden on Codex app-server, which reports no latency).
@@ -1102,8 +1162,14 @@ class CLIStatusBarMixin:
         if wide:
             # Session token total (Σ) — opt-in only via an explicit fields list.
             total_tokens = snapshot.get("session_total_tokens", 0)
-            if total_tokens and field_set is not None and "total_tokens" in field_set:
-                segs.append([(_DIM, f"Σ{format_token_count_compact(total_tokens)}")])
+            if (total_tokens or snapshot.get("session_total_tokens_unknown")) and field_set is not None and "total_tokens" in field_set:
+                from agent.usage_pricing import format_token_count
+
+                segs.append([(_DIM, "Σ" + format_token_count(
+                    total_tokens,
+                    unknown=bool(snapshot.get("session_total_tokens_unknown")),
+                    formatter=format_token_count_compact,
+                ))])
         return segs
 
     def _build_status_bar_text(self, width: Optional[int] = None) -> str:

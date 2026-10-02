@@ -25,10 +25,18 @@ _STATE_DB_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
 
 def _real_platform_state_root() -> Optional[Path]:
     """The REAL platform-default Hermes root. Avoids ``Path.home()`` /
-    ``hermes_constants`` (tests monkeypatch Path.home to a tempdir); ``expanduser``
-    reads HOME/passwd, which the conftest never rewrites."""
+    ``hermes_constants`` (tests monkeypatch Path.home to a tempdir).
+
+    Anchored on the OS ACCOUNT home (``hermes_state._os_account_home``, the passwd entry) rather
+    than ``os.path.expanduser("~")``, which on POSIX is just ``$HOME``: reading ``$HOME`` made this
+    answer "production" for the tmpdir of any test using the hermetic ``monkeypatch.setenv("HOME",
+    tmp_path)`` idiom, so both guards refused a hermetic board (2026-09-21: 2 files / 24 tests red).
+    A guard that fires on the standard isolation idiom teaches people to disarm it globally; keeping
+    it precise is what keeps it armed. The account home is still not monkeypatchable from inside a
+    test, so the property the old anchor protected is preserved."""
     try:
-        home = Path(os.path.expanduser("~"))
+        from hermes_state import _os_account_home
+        home = _os_account_home() or Path(os.path.expanduser("~"))
         if sys.platform == "win32":
             base = os.environ.get("LOCALAPPDATA", "").strip()
             root = Path(base) / "hermes" if base else home / "AppData" / "Local" / "hermes"

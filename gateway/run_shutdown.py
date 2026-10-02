@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import json
 import logging
 import os
 import shlex
@@ -25,7 +24,9 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
-    effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
+    effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget,
+    resolve_armed_shutdown_watchdog_delay, resolve_elapsed_adjusted_drain,
+    resolve_max_actionable_teardown_reserve_s, resolve_stop_drain_deadline_s,
 )
 from gateway.run_common import _UNSET
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
@@ -168,6 +169,27 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
+def _run_seam(name: str, default: Any) -> Any:
+    """Resolve a helper through ``gateway.run`` at call time: the fork's shutdown tests monkeypatch
+    ``gateway.run.<name>`` (``arm_shutdown_watchdog``, ``resolve_elapsed_adjusted_drain``,
+    ``resolve_cron_drain_budget``), and this sibling must read where those patches land."""
+    from gateway import run as _run
+    return getattr(_run, name, default)
+
+
+def _armed_watchdog_delay(runner: object, *, elapsed_s: float = 0.0) -> float:
+    """Fork: the deadline the shutdown watchdog is ACTUALLY armed with (``gateway.restart.
+    resolve_armed_shutdown_watchdog_delay``), fed the measured last teardown so a sample above the
+    grace does not silently collapse back to the grace."""
+    return resolve_armed_shutdown_watchdog_delay(
+        effective_stop_drain_timeout(runner),
+        getattr(runner, "_launchd_exit_timeout_s", None),
+        signal_driven=getattr(runner, "_stop_requested_by_signal", False),
+        last_teardown_s=getattr(runner, "_last_shutdown_teardown_s", None),
+        elapsed_s=elapsed_s,
+    )
+
+
 class GatewayShutdownMixin:
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -183,6 +205,20 @@ class GatewayShutdownMixin:
         # API-server runs still live when the adapters were released; the adapter map is empty by the
         # time the SessionDB close gate runs, so the count has to be taken before ``adapters.clear()``.
         api_live: int = 0
+        # Fork stuck-loop accounting (#7536): genuinely-interrupted sessions (captured BEFORE the
+        # interrupt path drains ``_running_agents``) and pre-drain sessions that finished during the
+        # drain window (affirmative evidence the loop is broken).
+        pre_drain_keys: list = dataclasses.field(default_factory=list)
+        interrupted_keys: set = dataclasses.field(default_factory=set)
+        drained_clean_keys: set = dataclasses.field(default_factory=set)
+        # ``timed_out`` ORs chat/api turns with cron work; a cron-only overrun must not skip the
+        # .clean_shutdown marker or count toward suspension (measured 2026-09-20 00:22:34).
+        agents_timed_out: bool = False
+        post_drain_started_at: Optional[float] = None
+        # Every watchdog event armed on this stop; a re-arm appends a fresh one and the ``finally``
+        # must set ALL of them or a superseded thread hard-exits a shutdown that completed.
+        watchdog_events: list = dataclasses.field(default_factory=list)
+        rearm_watchdog: Optional[Callable[[float], None]] = None
 
         def elapsed(self) -> float:
             return time.monotonic() - self.started_at
@@ -195,6 +231,9 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            # /compress builds a throwaway AIAgent off ``_running_agents``; a restart armed by an
+            # unrelated session once SIGTERMed a 792-message compaction 73s in (2026-08-10).
+            + self._active_compaction_count()
         )
 
     @staticmethod
@@ -754,13 +793,13 @@ class GatewayShutdownMixin:
         error_code: Optional[str] = None, error_message: Optional[str] = None,
         needs_attention: Optional[bool] = None, retrying_since: Any = _UNSET,
     ) -> None:
-        from gateway.run import _write_runtime_status_quiet
         extra: Dict[str, Any] = {}
         if needs_attention is not None:
             extra["needs_attention"] = needs_attention
         if retrying_since is not _UNSET:
             extra["retrying_since"] = retrying_since
-        _write_runtime_status_quiet(
+        # Off-loop status write (ordered worker lane) — see _dispatch_runtime_status_write.
+        self._dispatch_runtime_status_write(
             platform=platform, platform_state=platform_state, error_code=error_code,
             error_message=error_message, **extra,
         )
@@ -811,7 +850,7 @@ class GatewayShutdownMixin:
         snapshot = self._snapshot_running_agents()
         loop = asyncio.get_running_loop()
         last_counts = self._drain_work_counts()
-        last_status_at = 0.0
+        last_status_at = float("-inf")  # loop.time() is monotonic (origin = boot); 0.0 is not "never"
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_counts, last_status_at
@@ -870,11 +909,19 @@ class GatewayShutdownMixin:
         from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
-    async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
-        """Mark every non-pending running session resume_pending; returns the keys marked."""
+    async def _mark_running_sessions_resume_pending(self, log_prefix: str, *, interrupted: bool = False) -> list:
+        """Mark every non-pending running session resume_pending; returns the keys marked.
+
+        Fork: routes through ``_mark_resume_pending_for_shutdown`` (off-loop) so the reason is the
+        session-aware one (self-initiated restart → ``restart_consumed`` / ``restart_consumed_interrupted``),
+        F2 replay marks are recorded for sessions resumed this boot, and a tripped replay breaker
+        notifies the chat. ``interrupted=True`` = the session was still running when the drain timed out.
+        """
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
+        _mark_fork = getattr(self, "_mark_resume_pending_for_shutdown", None)
+        _notify_suspended = getattr(self, "_notify_restart_loop_suspended", None)
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
         # manager during the drain, the durable marker is already written so the next gateway boot can
         # recover in-flight sessions (#27856).
@@ -882,8 +929,15 @@ class GatewayShutdownMixin:
             if _agent is _AGENT_PENDING_SENTINEL:
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                await self.async_session_store.mark_resume_pending(_sk, reason)
-                marked.append(_sk)
+                if callable(_mark_fork):
+                    _marked, _reason, _alert = await asyncio.to_thread(_mark_fork, _sk, interrupted=interrupted)
+                    if _marked:
+                        marked.append(_sk)
+                    if _alert and callable(_notify_suspended):
+                        await _notify_suspended(_sk)
+                else:
+                    await self.async_session_store.mark_resume_pending(_sk, reason)
+                    marked.append(_sk)
         return marked
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:
@@ -1172,6 +1226,14 @@ class GatewayShutdownMixin:
                 flush_agent_history_to_file(getattr(agent, "session_id", None), _session_messages)
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+        # Fork: turns still in flight here (drain + interrupt-settle expired while blocked in a
+        # provider stream or a tool) never return from run_conversation before the process exits,
+        # so on_session_end never fires and Blackbox keeps their turn_api_calls with no turns row.
+        # Record them as interrupted now; finished turns are skipped by the per-turn emitted marker.
+        # Off-loop + bounded like the hooks below. getattr-guard: bare shutdown-path doubles.
+        _emit_abandoned = getattr(self, "_emit_abandoned_turn_session_ends", None)
+        if callable(_emit_abandoned):
+            await _emit_abandoned(active_agents)
         for session_key, agent in active_agents.items():
             self._flush_agent_transcript_at_shutdown(agent)
             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
@@ -1327,71 +1389,68 @@ class GatewayShutdownMixin:
             cleanup_stale_async_clients()
 
     # Stuck-loop (restart failure) counters
-    def _stuck_loop_counts_path(self) -> Path:
-        from gateway.run import _hermes_home
-        return _hermes_home / self._STUCK_LOOP_FILE
-
-    @staticmethod
-    def _read_json_counts(path: Path) -> Optional[dict]:
-        """Parsed counter dict, or None when the file is missing/unreadable (no exists() pre-check needed)."""
-        try:
-            return json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            return None
-
     def _increment_restart_failure_counts(self, active_session_keys: set) -> None:
-        """Increment persisted restart-failure counters for active sessions; drop the rest (loop broken)."""
-        from utils import atomic_json_write
-        path = self._stuck_loop_counts_path()
-        counts = self._read_json_counts(path) or {}
-        with suppress(Exception):
-            atomic_json_write(path, {key: counts.get(key, 0) + 1 for key in active_session_keys}, indent=None)
+        """Increment persisted restart-failure counters for sessions active at this drain.
+
+        Entries are structured ``{count, replay_marks, armed}`` and shared with the F2 replay-loop
+        breaker (``_record_restart_replay_mark``) and the deferred-restart arm. Inactive sessions are
+        dropped (their loop is broken) unless they carry replay marks or an armed restart, whose
+        counter resets to 0 while the breaker state survives. One locked read-modify-write cycle:
+        ``atomic_json_write`` makes each WRITE atomic, not the RMW pair."""
+        with self._restart_failure_counts_rmw() as counts:
+            new_counts = {}
+            for key in active_session_keys:
+                entry = counts.get(key, {"count": 0, "replay_marks": [], "armed": False})
+                entry["count"] = int(entry.get("count", 0) or 0) + 1
+                new_counts[key] = entry
+            for key, entry in counts.items():
+                if key in new_counts:
+                    continue
+                if (entry.get("replay_marks") or []) or entry.get("armed"):
+                    entry["count"] = 0
+                    new_counts[key] = entry
+            counts.clear()
+            counts.update(new_counts)
 
     def _suspend_stuck_loop_sessions(self) -> int:
-        """Suspend sessions active across too many restarts (startup, AFTER crash-turn recovery)."""
-        path = self._stuck_loop_counts_path()
-        if not path.exists():
-            return 0
-        counts = self._read_json_counts(path)
-        if counts is None:
+        """Suspend sessions active across too many restarts (startup, AFTER crash-turn recovery).
+        Runs via ``asyncio.to_thread``: the entry RMW and the snapshot hold the store lock like every
+        other session-store writer. Only the stuck entries are dropped from the counters file, so the
+        breaker state of other sessions survives."""
+        if not self._restart_failure_counts_path().exists():
             return 0
         suspended = 0
-        for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
-            with suppress(Exception):
-                entry = self.session_store._entries.get(session_key)
-                if entry and not entry.suspended:
-                    entry.suspended = True
-                    suspended += 1
-                    logger.warning(
-                        "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
-                        session_key, counts[session_key],
-                    )
-        if suspended:
-            with suppress(Exception):
-                self.session_store._save()
-        # Clear the file — counters start fresh after suspension
-        with suppress(Exception):
-            path.unlink(missing_ok=True)
+        with self._restart_failure_counts_rmw() as counts:
+            stuck_keys = [
+                key for key, value in counts.items()
+                if int(value.get("count", 0) or 0) >= self._STUCK_LOOP_THRESHOLD
+            ]
+            store_lock = getattr(self.session_store, "_lock", None)
+            with store_lock if store_lock is not None else nullcontext():
+                for session_key in stuck_keys:
+                    with suppress(Exception):
+                        entry = self.session_store._entries.get(session_key)
+                        if entry and not entry.suspended:
+                            entry.suspended = True
+                            suspended += 1
+                            logger.warning(
+                                "Auto-suspended stuck session %s (active across %d consecutive restarts — "
+                                "likely a stuck loop)", session_key, counts[session_key]["count"],
+                            )
+                if suspended:
+                    with suppress(Exception):
+                        self.session_store._save()
+            for session_key in stuck_keys:
+                counts.pop(session_key, None)
         return suspended
 
-    async def _clear_restart_failure_count(self, session_key: str) -> None:
-        """Clear a completed session's restart-failure counter off-loop (atomic_json_write fsyncs)."""
-        from utils import atomic_json_write
-        path = self._stuck_loop_counts_path()
-        if not path.exists():
-            return
-        # The whole read/mutate/write is guarded (as on main): a corrupt counters file
-        # (non-dict JSON) must never raise out of a session-completion path.
-        try:
-            counts = self._read_json_counts(path) or {}
-            if session_key in counts:
-                del counts[session_key]
-                if counts:
-                    await asyncio.to_thread(atomic_json_write, path, counts, indent=None)
-                else:
-                    path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    def _clear_restart_failure_count(self, session_key: str) -> None:
+        """Drop a completed session's whole restart-failure entry (the loop is broken). Synchronous:
+        the post-turn gate runs it on a worker thread (``_apply_post_turn_resume_gate``)."""
+        with self._restart_failure_counts_rmw() as counts:
+            if session_key not in counts:
+                return
+            del counts[session_key]
 
     # Restart orchestration
     @staticmethod
@@ -1637,15 +1696,29 @@ class GatewayShutdownMixin:
         )
         self._scale_to_zero_status("draining", "restart wait: status mark failed")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        last_status_at = 0.0
+        wait_started = loop.time()
+        deadline = wait_started + timeout
+        last_status_at = float("-inf")  # loop.time() is monotonic (origin = boot); 0.0 is not "never"
+        # Fork: busy_policy=interrupt (safe-restart intent row) means "restart now". Re-read every
+        # second: the intent usually lands MID-wait (2026-09-23: wait began 03:59, deploy-lane
+        # interrupt intent 04:05, gateway then sat out the rest of the 1800 s cap until 04:29).
+        next_intent_check = 0.0
+        interrupt_capped = False
+        _intent_cap_fn = getattr(self, "_interrupt_restart_intent_cap", None)
         while self._awaitable_work_count() > 0:
             now = loop.time()
+            if not interrupt_capped and now >= next_intent_check and callable(_intent_cap_fn):
+                next_intent_check = now + 1.0
+                intent_cap = await _intent_cap_fn()
+                if intent_cap is not None:
+                    interrupt_capped = True
+                    deadline = min(deadline, now + intent_cap)
             if now >= deadline:
                 logger.warning(
                     "Restart after-turn wait timed out after %.0fs with %d "
                     "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)", timeout, self._active_work_count(),
+                    "interrupt remaining work (#77184)%s", now - wait_started, self._active_work_count(),
+                    " [busy_policy=interrupt]" if interrupt_capped else "",
                 )
                 return False
             if (now - last_status_at) >= 30.0:
@@ -1668,8 +1741,27 @@ class GatewayShutdownMixin:
         return True
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+        # Fork: name the caller on the line that starts the restart (2026-09-23 forensics had to
+        # eliminate SIGTERM/FGR by absence). getattr-guard: bare shutdown-path doubles.
+        _describe = getattr(self, "_describe_restart_requester", None)
+        requester = _describe() if callable(_describe) else "unknown"
         if self._restart_task_started:
+            logger.info("Restart request from %s ignored: a restart is already in progress", requester)
             return False
+        session_key = ""
+        try:
+            from gateway.session_context import get_session_env
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
+            if session_key:
+                self._session_initiated_restart[session_key] = True
+        except Exception:
+            pass
+        self._restart_requester = requester
+        with suppress(Exception):
+            logger.warning(
+                "PHASE=restart_requested requester=%s detached=%s via_service=%s session=%s active_work=%d",
+                requester, detached, via_service, session_key or "-", self._active_work_count(),
+            )
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -1686,6 +1778,15 @@ class GatewayShutdownMixin:
             if detached:
                 with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
                     await self._launch_detached_restart_command()
+            # Fork: written HERE (not at request time) so the row lands inside the boot notice's
+            # planned-restart window of the death it explains.
+            try:
+                from gateway.fork_ext.unclean_restart_notice import record_in_band_restart
+                await asyncio.to_thread(
+                    record_in_band_restart, requester, detail=f"detached={detached} via_service={via_service}",
+                )
+            except Exception:
+                logger.debug("in-band restart ledger row failed", exc_info=True)
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
@@ -1736,12 +1837,19 @@ class GatewayShutdownMixin:
             return None
 
     @staticmethod
-    def _stop_kill_tool_subprocesses(phase: str) -> list:
+    def _stop_kill_tool_subprocesses(phase: str, *, keep_restart_durable: bool = False) -> list:
         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
 
         Called twice: after a drain timeout (reclaim children before systemd SIGKILLs) and as a final
         catch-all. Best-effort; one failing subsystem cannot block the rest.
+
+        ``keep_restart_durable`` (fork, t_1191e078): on the graceful path of a restart (in-band restart,
+        or an unplanned supervisor SIGTERM such as ``launchctl kickstart -k`` that KeepAlive revives),
+        durable ``notify_on_complete`` children survive and stay in the checkpoint; the next boot
+        re-adopts them and delivers their result. A planned stop and the post-interrupt (drain-timeout)
+        phase still kill all (#8202).
         """
+        from gateway.run import _SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S
 
         def _step(label: str, fn: Callable[[], Any]) -> Any:
             return GatewayShutdownMixin._quiet_step(f"{label} ({phase}) error", fn)
@@ -1753,11 +1861,25 @@ class GatewayShutdownMixin:
 
         def _kill_processes() -> None:
             from tools.process_registry import process_registry
+            _keep = frozenset()
+            if keep_restart_durable and phase == "final-cleanup":
+                try:
+                    _keep = process_registry.restart_durable_ids()
+                    if _keep:
+                        process_registry.hand_off_to_next_boot(_keep)
+                except Exception as _e:
+                    _keep = frozenset()  # never let the exemption skip the kill below
+                    logger.debug("restart_durable_ids (%s) error: %s", phase, _e)
+                if _keep:
+                    logger.info(
+                        "Shutdown (%s): keeping %d restart-durable background process(es) alive: %s",
+                        phase, len(_keep), ", ".join(sorted(_keep)),
+                    )
             # Host shutdown: kill even persist_on_release jobs or they become
             # PPID=1 orphans (#41225/#46778); an explicit source reaches them.
             _count_step(
                 "Shutdown (%s): killed %d tool subprocess(es)",
-                lambda: process_registry.kill_all(source="gateway_shutdown"))
+                lambda: process_registry.kill_all(exclude_ids=_keep, source="gateway_shutdown"))
 
         def _mark_cron_interrupted() -> list:
             # kill_all() is global: a cron job mid-dispatch lost its tool subprocess and its agent thread may
@@ -1766,8 +1888,12 @@ class GatewayShutdownMixin:
             # (kill_all() has no per-job-ID targeting — it's a global sweep). No-op when no cron job is in
             # flight. See #60432.
             from cron.scheduler import mark_running_jobs_interrupted
+            # Bounded fence wait (fork, t_8d085477): the job's own thread holds its fire fence across
+            # delivery, and that delivery waits on THIS event loop — an unbounded wait here was a
+            # cross-thread deadlock broken only by the delivery future's 60s timeout.
             _interrupted = mark_running_jobs_interrupted(
-                f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished."
+                f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished.",
+                lock_timeout=_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S,
             )
             if _interrupted:
                 logger.warning(
@@ -1780,7 +1906,10 @@ class GatewayShutdownMixin:
             from tools.async_delegation import interrupt_all as _interrupt_async
             _count_step(
                 "Shutdown (%s): interrupted %d background delegation(s)",
-                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
+                # recoverable=True (fork): records marked for boot-scan re-dispatch, not dropped.
+                lambda: _interrupt_async(
+                    reason=f"gateway shutdown ({phase})", recoverable=True, lock_timeout=0.1,
+                ),
             )
 
         _step("process_registry.kill_all", _kill_processes)
@@ -1799,7 +1928,7 @@ class GatewayShutdownMixin:
         return _marked_cron_jobs
 
     @staticmethod
-    async def _stop_kill_tool_subprocesses_off_loop(phase: str) -> list:
+    async def _stop_kill_tool_subprocesses_off_loop(phase: str, *, keep_restart_durable: bool = False) -> list:
         """Run _stop_kill_tool_subprocesses in a worker thread; returns cron job IDs marked interrupted.
 
         ``kill_all`` fans out into per-target ``kill_process`` calls that do blocking work
@@ -1813,11 +1942,17 @@ class GatewayShutdownMixin:
         watchdog remains the hard backstop.
         """
         return await asyncio.to_thread(
-            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
+            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase, keep_restart_durable=keep_restart_durable,
         )
 
     async def _stop_begin_teardown(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
+        # Fork: flush the Telegram boot-redelivery HWM to disk before teardown so the next boot's
+        # guard has the freshest dispatched-update_id (scope B / SPEC D-2). Best-effort.
+        with suppress(Exception):
+            _hwm = getattr(self, "_tg_redelivery_hwm", None)
+            if _hwm is not None:
+                _hwm.flush()
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
@@ -1844,27 +1979,77 @@ class GatewayShutdownMixin:
         # Notify all chats with active agents BEFORE draining — adapters are still connected here.
         await self._notify_active_sessions_of_shutdown()
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
+        # Fork: cancel boot auto-resumes that were SCHEDULED but whose turn never started, and
+        # re-mark them resumable. BEFORE the drain wait: a pending sentinel still counts in
+        # ``len(self._running_agents)``, so leaving these in place makes the drain wait out its full
+        # cap on work that only exists because of the pending resume — then interrupt it, skip the
+        # .clean_shutdown marker, and have the next boot resume every affected session a SECOND
+        # time (incident 2026-09-20, Apollo).
+        _cancel_pending = getattr(self, "_cancel_pending_boot_resumes_for_shutdown", None)
+        if callable(_cancel_pending):
+            try:
+                await _cancel_pending()
+            except Exception:
+                logger.warning("pending boot-resume shutdown cancellation failed; continuing shutdown", exc_info=True)
+            logger.info("Shutdown phase: pending boot-resume cancel done at +%.2fs", ctx.elapsed())
 
     async def _stop_drain_active_work(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Pre-mark resume_pending, drain agents/cron/API work into ``ctx``."""
-        from gateway.run import GatewayRunner
+        from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
+        self._replay_marked_during_stop = set()
         # Pre-mark resume_pending BEFORE the drain so a mid-drain SIGKILL still leaves a durable marker.
         _pre_drain_keys = await GatewayRunner._mark_running_sessions_resume_pending(
             self, "pre-drain mark_resume_pending"
+        )
+        ctx.pre_drain_keys = list(_pre_drain_keys)
+        # Fork (#838 close-out): THE ONE DEADLINE. The watchdog was armed at the TOP of stop() with an
+        # ABSOLUTE deadline, but this drain is a RELATIVE budget that only starts HERE — after the
+        # notify/mark/cancel phases. Read the elapsed at the POINT OF USE (a snapshot taken before the
+        # marking loop charges that loop to neither the drain nor the teardown reserve). Re-arm FIRST
+        # with the measured elapsed (extend-only, launchd-capped), THEN resolve the deadline from the
+        # watchdog now in force, and consume it in BOTH the drain fit and the cron leash below.
+        _drain_elapsed_at_fit = ctx.elapsed()
+        if callable(ctx.rearm_watchdog):
+            ctx.rearm_watchdog(
+                resolve_armed_shutdown_watchdog_delay(
+                    effective_stop_drain_timeout(self),
+                    getattr(self, "_launchd_exit_timeout_s", None),
+                    signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                    last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                    elapsed_s=_drain_elapsed_at_fit,
+                )
+            )
+        _stop_deadline_s = resolve_stop_drain_deadline_s(
+            effective_stop_drain_timeout(self),
+            getattr(self, "_launchd_exit_timeout_s", None),
+            signal_driven=getattr(self, "_stop_requested_by_signal", False),
+            last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+            armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
+        )
+        timeout = _run_seam("resolve_elapsed_adjusted_drain", resolve_elapsed_adjusted_drain)(
+            timeout,
+            getattr(self, "_launchd_exit_timeout_s", None),
+            signal_driven=getattr(self, "_stop_requested_by_signal", False),
+            elapsed_s=_drain_elapsed_at_fit,
+            last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+            armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
         )
         _cron_at_start = self._active_cron_job_count()
         _api_at_start = self._active_api_run_count()
         _deferred_at_start = ctx.deferred_count()
         # Cron floor clamped to the watchdog leash; getattr-guard for bare shutdown-path doubles.
         _cron_drain_cfg = getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT)
-        # Under launchd the real leash is launchd's own exit timeout, not our watchdog
-        # (drain + grace): a signal-driven stop that lets cron work push past it is SIGKILLed
-        # before cleanup runs.
-        # ``timeout`` is already the effective (launchd-capped) drain, so this is the same
-        # leash the thread watchdog is armed with — dump margin included.
-        _cron_leash = effective_stop_watchdog_delay(self, resolve_shutdown_watchdog_delay(timeout))
-        _cron_timeout = resolve_cron_drain_budget(
-            timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=ctx.elapsed(),
+        # Under launchd the real leash is the ARMED watchdog deadline minus the post-drain teardown
+        # reserve (THE ONE DEADLINE above). Clamping to the raw ExitTimeOut and holding back only
+        # CRON_DRAIN_CLEANUP_RESERVE_S was the #838 defect: the cron floor raised the budget back up
+        # to the hard-exit instant and consumed the whole teardown reserve.
+        _cron_leash = resolve_shutdown_watchdog_delay(timeout)
+        _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
+        if getattr(self, "_stop_requested_by_signal", False) and _launchd_budget:
+            _cron_leash = min(_cron_leash, float(_launchd_budget))
+        _cron_timeout = _run_seam("resolve_cron_drain_budget", resolve_cron_drain_budget)(
+            timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=_drain_elapsed_at_fit,
+            deadline_s=_stop_deadline_s,
         )
         if _cron_at_start and _cron_timeout > timeout:
             logger.info(
@@ -1873,8 +2058,24 @@ class GatewayShutdownMixin:
                 _cron_at_start, _cron_timeout, _cron_drain_cfg, timeout,
             )
         _drain_started_at = time.monotonic()
+        # Fork: tell the cron scheduler to stop STARTING new script work before the drain begins,
+        # or the ticker dispatches a fresh long-running script mid-drain and hands us new work.
+        try:
+            from cron.scheduler import signal_shutdown
+            signal_shutdown("gateway shutdown drain")
+        except Exception as _e:
+            logger.debug("cron signal_shutdown failed: %s", _e)
         ctx.active_agents, ctx.timed_out = await self._drain_active_agents(timeout, _cron_timeout)
         ctx.drain_elapsed = time.monotonic() - _drain_started_at
+        ctx.post_drain_started_at = time.monotonic()
+        # Chat/api turns are the only work whose transcript the interrupt can leave half-finished; a
+        # cron job that outlives its own deadline (#82161) is terminated and recorded in jobs.json.
+        # Gating the hedge-clear pass and the .clean_shutdown marker on the ORed ``timed_out`` meant a
+        # cron-only overrun skipped both and the next boot re-prompted every finished session.
+        ctx.agents_timed_out = bool(ctx.timed_out) and bool(
+            any(_agent is not _AGENT_PENDING_SENTINEL for _agent in self._running_agents.values())
+            or self._active_api_run_count()
+        )
         logger.info(
             "Shutdown phase: drain done at +%.2fs (drain took %.2fs, timed_out=%s, active_at_start=%d, "
             "active_now=%d, cron_at_start=%d, cron_now=%d, api_at_start=%d, api_now=%d, "
@@ -1883,7 +2084,7 @@ class GatewayShutdownMixin:
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
             _deferred_at_start, ctx.deferred_count(),
         )
-        if ctx.timed_out:
+        if ctx.agents_timed_out:
             return
         # Graceful drain: clear the pre-drain resume_pending markers so sessions that finished
         # during the drain window don't carry a stale flag.
@@ -1893,19 +2094,67 @@ class GatewayShutdownMixin:
                     await self.async_session_store.clear_resume_pending(_sk)
                 except Exception as _e:
                     logger.debug("clear_resume_pending after drain failed for %s: %s", _sk, _e)
+        # Every pre-drain session no longer running finished cleanly — its stuck-loop count is cleared.
+        ctx.drained_clean_keys = {_sk for _sk in _pre_drain_keys if _sk not in self._running_agents}
 
     async def _stop_interrupt_remaining_work(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Drain timed out: mark resume_pending, interrupt, settle, kill tool subprocesses, notify cron."""
-        from gateway.run import GatewayRunner
+        from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
         logger.warning(
             "Gateway drain timed out after %.1fs with %d active agent(s), "
             "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
             "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
             self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
         )
+        # Fork (t_8d085477): per-turn evidence for the timeout — WHAT each surviving turn was doing.
+        _now_wall = time.time()
+        for _sk, _agent in list(self._running_agents.items()):
+            if _agent is _AGENT_PENDING_SENTINEL:
+                logger.warning("PHASE=drain_timeout_turn key=%s state=pending", _sk)
+                continue
+            try:
+                _act = _agent.get_activity_summary() or {}
+            except Exception:
+                _act = {}
+            _started_ts = self._running_agents_ts.get(_sk)
+            _idle = _act.get("seconds_since_activity")
+            logger.warning(
+                "PHASE=drain_timeout_turn key=%s turn_age=%s current_tool=%s api_calls=%s idle=%s last_activity=%r",
+                _sk,
+                f"{_now_wall - float(_started_ts):.0f}s" if isinstance(_started_ts, (int, float)) else "?",
+                _act.get("current_tool"), _act.get("api_call_count"),
+                f"{float(_idle):.0f}s" if isinstance(_idle, (int, float)) else "?",
+                str(_act.get("last_activity_desc") or "")[:120],
+            )
+        # Fork: terminate in-flight cron SCRIPTS. The drain WAITS on them but nothing could CANCEL
+        # them (a no_agent script runs under a blocking subprocess, default ceiling 3600s). SIGTERM
+        # lets the script run its own traps; kill_all() stays the backstop.
+        try:
+            from cron.scheduler import terminate_running_scripts
+            terminate_running_scripts("gateway drain timeout")
+        except Exception as _e:
+            logger.debug("terminate_running_scripts failed: %s", _e)
+        # Fork stuck-loop accounting: capture the genuinely-interrupted set HERE, at this pre-interrupt
+        # read of ``_running_agents`` — the interrupt path below drains the dict, so a later read would
+        # be empty and a genuinely-stuck session would never accumulate toward suspension.
+        ctx.interrupted_keys = {
+            _sk for _sk, _agent in self._running_agents.items() if _agent is not _AGENT_PENDING_SENTINEL
+        }
+        # Pre-drain sessions NOT in the still-running set finished during the drain window despite the
+        # overall timeout: clear their counts AND release their pre-drain resume_pending hedge — the
+        # reason stamped there is in _AUTO_RESUME_REASONS, so a stale flag makes startup auto-resume
+        # re-prompt the user about work that already completed.
+        ctx.drained_clean_keys = {_sk for _sk in ctx.pre_drain_keys if _sk not in self._running_agents}
+        for _sk in ctx.drained_clean_keys:
+            try:
+                await self.async_session_store.clear_resume_pending(_sk)
+            except Exception as _e:
+                logger.debug("clear_resume_pending after timed-out drain failed for %s: %s", _sk, _e)
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
-        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        # interrupted=True: a self-initiated restart becomes restart_consumed_interrupted (auto-surfaces
+        # on boot) instead of restart_consumed (silent).
+        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending", interrupted=True)
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)
@@ -1983,13 +2232,25 @@ class GatewayShutdownMixin:
         # self-terminates anyway.
         self._background_tasks.clear()
         ctx.api_live = self._active_api_run_count()
+        # Fork: sweep follow-ups still parked in adapter queues into the restart spool before the
+        # adapters (and their queues) die with the process.
+        _spool = getattr(self, "_spool_adapter_pending_for_restart", None)
+        if callable(_spool):
+            try:
+                await _spool()
+            except Exception:
+                logger.debug("adapter follow-up spool sweep failed", exc_info=True)
         self.adapters.clear()
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
+        # Off-loop (fork): each payload ends in an unbounded os.replace inside the timed shutdown path.
+        # Pass the LIVE view with drain=True rather than a dict() copy: the offload's await is a window in
+        # which a message can arrive and re-queue into this slot; only an atomic snapshot-and-clear before
+        # that await keeps it from being wiped unflushed.
         with suppress(Exception):
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+            from gateway.shutdown_flush import flush_pending_to_file_async
+            await flush_pending_to_file_async(self._pending_messages, reason="shutdown", drain=True)
         # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
         with suppress(Exception):
             from gateway.shutdown_flush import flush_overflow_to_file
@@ -2007,8 +2268,12 @@ class GatewayShutdownMixin:
                 getattr(self, _attr).clear()
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
-        # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
-        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
+        # Off-loop: same blocking sweep as the post-interrupt kill (#116327). Restart-durable
+        # notify_on_complete children survive a RESTART's graceful path (fork, t_1191e078).
+        await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
+            "final-cleanup",
+            keep_restart_durable=bool(self._restart_requested or getattr(self, "_signal_initiated_shutdown", False)),
+        )
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
@@ -2110,7 +2375,13 @@ class GatewayShutdownMixin:
         release_gateway_runtime_lock()
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
         # half-finished sessions, so no marker — the next startup recovers their turn markers.
-        if not ctx.timed_out:
+        if not ctx.agents_timed_out:
+            if ctx.timed_out:
+                logger.info(
+                    "Drain timed out on cron/background work only — no chat or api turn was interrupted; "
+                    "writing .clean_shutdown marker so the next startup does not suspend and re-prompt "
+                    "sessions that finished cleanly."
+                )
             with suppress(Exception):
                 (_hermes_home / ".clean_shutdown").touch()
         else:
@@ -2118,9 +2389,16 @@ class GatewayShutdownMixin:
                 "Skipping .clean_shutdown marker — drain timed out with "
                 "interrupted agents; next startup will recover their interrupted turns."
             )
-        # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
-        if ctx.active_agents:
-            self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
+        # Stuck-loop detection (#7536, fork accounting): only a GENUINELY INTERRUPTED session counts
+        # toward auto-suspension — the drain timed out AND the session was still running at the
+        # pre-interrupt capture. A clean drain means every active session finished its turn; counting
+        # the drain-START snapshot auto-suspended healthy sessions after 3 clean deploy-restarts.
+        _reset_counts = getattr(self, "_reset_stuck_loop_counts", None)
+        if ctx.agents_timed_out and ctx.interrupted_keys:
+            self._increment_restart_failure_counts(ctx.interrupted_keys)
+        # Sessions that finished during the drain window proved they can complete — clear their counts.
+        if ctx.drained_clean_keys and callable(_reset_counts):
+            _reset_counts(ctx.drained_clean_keys)
         if self._restart_requested and self._restart_command_source is None:
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
                 atomic_json_write(
@@ -2133,8 +2411,18 @@ class GatewayShutdownMixin:
                     indent=None,
                 )
         if self._restart_requested and self._restart_via_service:
-            # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
-            self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
+            _shortcut = getattr(self, "_launch_systemd_restart_shortcut", None)
+            if callable(_shortcut):
+                _shortcut()
+            # Fork deployment model: systemd units use Restart=always, so a planned restart exits
+            # cleanly (0) and is still relaunched — TEMPFAIL (75) there trips stepped restart backoff.
+            # launchd's KeepAlive.SuccessfulExit=false needs a NON-zero exit, so keep 75 on macOS (and
+            # whenever not under a systemd invocation). Paired darwin test asserts the 75 path.
+            self._exit_code = (
+                GATEWAY_SERVICE_RESTART_EXIT_CODE
+                if sys.platform == "darwin" or not os.environ.get("INVOCATION_ID")
+                else 0
+            )
             self._exit_reason = self._exit_reason or "Gateway restart requested"
         self._draining = False
         # Terminal gateway_state: "stopped", or "running" on an UNEXPECTED signal (docker restart,
@@ -2162,6 +2450,27 @@ class GatewayShutdownMixin:
         except Exception:
             logger.debug("Failed to flush terminal gateway runtime status", exc_info=True)
         _shutdown_gateway_health_export(self)
+        # Fork: persist the measured post-drain teardown so the next signal-driven stop reserves for it.
+        if ctx.post_drain_started_at is not None:
+            _teardown_elapsed = time.monotonic() - ctx.post_drain_started_at
+            try:
+                from gateway.lifecycle_ledger import record_teardown_timing
+                record_teardown_timing(
+                    _teardown_elapsed,
+                    total_shutdown_seconds=ctx.elapsed(),
+                    drain_seconds=ctx.drain_elapsed,
+                    # Only a stop that ran under the supervisor's deadline predicts the next SIGTERM.
+                    budgeted=bool(
+                        getattr(self, "_stop_requested_by_signal", False)
+                        and getattr(self, "_launchd_exit_timeout_s", None) is not None
+                    ),
+                )
+            except Exception as _e:
+                logger.debug("Failed to record shutdown teardown timing: %s", _e)
+            logger.info(
+                "Shutdown phase: post-drain teardown completed in %.2fs (persistence complete; total %.2fs)",
+                _teardown_elapsed, ctx.elapsed(),
+            )
         logger.info("Gateway stopped (total teardown %.2fs)", ctx.elapsed())
 
     def _shutdown_watchdog_snapshot(self, ctx: "GatewayShutdownMixin._StopContext") -> dict:
@@ -2177,9 +2486,89 @@ class GatewayShutdownMixin:
             "restart_drain_timeout": self._restart_drain_timeout,
             "effective_drain_timeout": effective_stop_drain_timeout(self),
             "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-            "watchdog_delay_s": _effective_watchdog_leash(self),
+            # The deadline CURRENTLY in force, read from what the arming site published — not
+            # re-derived (a re-arm moves it). ABSOLUTE from the start of stop().
+            "watchdog_delay_s": (
+                getattr(self, "_armed_shutdown_deadline_s", None)
+                if getattr(self, "_armed_shutdown_deadline_s", None) is not None
+                else _armed_watchdog_delay(self)
+            ),
+            "persistence_complete": False,
             "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None,
         }
+
+    def _rearm_shutdown_watchdog(
+        self, ctx: "GatewayShutdownMixin._StopContext", delay_s: float, snapshot_fn: Callable[[], dict],
+    ) -> None:
+        """Fork (#838 finding 4): re-arm the hard-exit backstop to a LATER absolute deadline once the
+        pre-drain elapsed is KNOWN, so ``os._exit`` moves out by that elapsed instead of charging it
+        to the teardown reserve.
+
+        EXTEND-ONLY and LAUNCHD-ONLY (``resolve_launchd_shutdown_watchdog_delay`` short-circuits with
+        no live ``ExitTimeOut``, so elsewhere the new deadline would be uncapped). ONE exception to
+        extend-only: a CURRENT deadline already past launchd's SIGKILL wall is SHORTENED to the wall
+        (``stop(restart=True)`` arms signal_driven=False → raw inner leash; a supervisor SIGTERM mid-stop
+        then leaves a decorative ``os._exit`` armed past an uncatchable SIGKILL).
+
+        UNIT MISMATCH handled here only: ``delay_s`` / ``_armed_shutdown_deadline_s`` are ABSOLUTE from
+        the start of stop(); ``arm_shutdown_watchdog`` takes a RELATIVE delay — the REMAINING time is
+        armed, the absolute value published.
+
+        FAIL-SAFE ORDERING: the replacement is armed BEFORE any state is committed and before the old
+        one is retired; a raising OR silent (``None`` — ``RuntimeError: can't start new thread`` under
+        FD exhaustion) arming leaves stop() under the watchdog it already had.
+        """
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        _budget = getattr(self, "_launchd_exit_timeout_s", None)
+        if not getattr(self, "_stop_requested_by_signal", False) or not _budget:
+            return
+        try:
+            _new = max(float(delay_s), 0.0)
+        except (TypeError, ValueError):
+            return
+        _cur = getattr(self, "_armed_shutdown_deadline_s", None)
+        _wall = resolve_max_actionable_teardown_reserve_s(_budget)
+        if _wall is None:
+            return  # unreadable budget: no actionable launchd wall, no safety premise
+        _cur_past_wall = _cur is not None and float(_cur) > _wall + 1e-9
+        if _cur_past_wall:
+            _new = min(_new, _wall)
+        elif _cur is not None and _new <= float(_cur) + 0.5:
+            return
+        _elapsed_now = max(ctx.elapsed(), 0.0) if ctx.started_at is not None else 0.0
+        _remaining = max(_new - _elapsed_now, 0.0)
+        if _remaining <= 0.0:
+            return  # a zero delay is a silent no-op in arm_shutdown_watchdog; keep the live backstop
+        _prev = self._shutdown_watchdog_done
+        _fresh = threading.Event()
+        ctx.watchdog_events.append(_fresh)  # registered BEFORE arming so the finally can retire it
+        try:
+            _armed_ev = _run_seam("arm_shutdown_watchdog", arm_shutdown_watchdog)(
+                _remaining, done_event=_fresh, snapshot_fn=snapshot_fn, exit_code=1,
+            )
+        except Exception:
+            logger.warning(
+                "Shutdown watchdog re-arm failed; continuing under the watchdog already armed at stop()+%.1fs",
+                float(_cur) if _cur is not None else -1.0, exc_info=True,
+            )
+            return
+        if _armed_ev is None:
+            logger.warning(
+                "Shutdown watchdog re-arm did not arm (thread start failed); continuing under the "
+                "watchdog already armed at stop()+%.1fs", float(_cur) if _cur is not None else -1.0,
+            )
+            return
+        # Replacement is live — commit, then retire the old one (never an instant with no backstop).
+        self._shutdown_watchdog_done = _fresh
+        self._armed_shutdown_deadline_s = _new
+        if _prev is not None:
+            _prev.set()
+        logger.info(
+            "Shutdown watchdog re-armed to stop()+%.1fs (was stop()+%.1fs; %.1fs from now at elapsed %.1fs) — "
+            "absorbing the measured pre-drain elapsed instead of charging it to the post-drain teardown reserve",
+            _new, float(_cur) if _cur is not None else -1.0, _remaining, _elapsed_now,
+        )
 
     async def _stop_impl(self) -> None:
         """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
@@ -2195,11 +2584,18 @@ class GatewayShutdownMixin:
         ctx = GatewayShutdownMixin._StopContext(
             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
         )
+        ctx.watchdog_events.append(_watchdog_done)
+        _snapshot_fn = lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx)  # noqa: E731
         if not os.environ.get("PYTEST_CURRENT_TEST"):
-            arm_shutdown_watchdog(
-                _effective_watchdog_leash(self), done_event=_watchdog_done,
-                snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
+            # Fork: the measured teardown reaches the arming site (leash = max(grace, reserve)), and the
+            # deadline ACTUALLY armed is PUBLISHED so the drain fit and the cron leash consume it instead
+            # of re-deriving a variant (#838 defect class).
+            _watchdog_delay = _armed_watchdog_delay(self)
+            self._armed_shutdown_deadline_s = _watchdog_delay
+            _run_seam("arm_shutdown_watchdog", arm_shutdown_watchdog)(
+                _watchdog_delay, done_event=_watchdog_done, snapshot_fn=_snapshot_fn, exit_code=1,
             )
+        ctx.rearm_watchdog = lambda delay_s: GatewayRunner._rearm_shutdown_watchdog(self, ctx, delay_s, _snapshot_fn)
         try:
             await GatewayRunner._stop_begin_teardown(self, ctx)
             timeout = effective_stop_drain_timeout(self)
@@ -2217,7 +2613,8 @@ class GatewayShutdownMixin:
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
         finally:
-            _watchdog_done.set()
+            for _ev in ctx.watchdog_events:
+                _ev.set()
 
     async def stop(
         self, *, restart: bool = False, detached_restart: bool = False, service_restart: bool = False

@@ -27,7 +27,9 @@ from hermes_state_dbfile import RETIRED_GENERATION_DIR_SUFFIX
 from hermes_state_holders import read_only_db_uri
 
 from hermes_cli.archive_safe import normalize_archive_parts
-from hermes_cli.backup_sqlite import _close_quietly, _safe_copy_db
+from hermes_cli.backup_sqlite import (  # noqa: F401
+    _SAFE_COPY_BASE_BUDGET_S, _SAFE_COPY_BUDGET_PER_GB_S, _SAFE_COPY_STALL_DEADLINE_S, _close_quietly,
+    _safe_copy_budget_s, _safe_copy_db)
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS, profile_root_entry
 from hermes_cli.sizefmt import format_bytes as _format_size
 

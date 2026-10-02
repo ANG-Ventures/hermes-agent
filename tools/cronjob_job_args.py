@@ -371,6 +371,28 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from hermes_constants import get_hermes_home
     raw = script.strip()
     scripts_dir = get_hermes_home() / "scripts"
+
+    # Reject INLINE SCRIPT CONTENT pasted into `script=` instead of a filename (fork, scheduler
+    # Rule #14). A multi-line body (or a shebang) is the #1 cron misconfig: the runner treats the
+    # whole blob as a path and fails every tick with `[Errno 63] File name too long` — a
+    # double-silent dead job (it never runs AND its own failure alert never fires).
+    if "\n" in raw or raw.startswith("#!"):
+        return (
+            f"`script` must be a FILENAME under {scripts_dir}/, not inline script content. "
+            f"Write the script to e.g. {scripts_dir}/my-job.sh (chmod +x), then pass "
+            "script=\"my-job.sh\"."
+        )
+
+    # Reject FILENAME + ARGS (`foo.sh --flag`): the runner does not split args off, so it looks
+    # for a file literally named `foo.sh --flag` and fails `Script not found`.
+    if raw != raw.split()[0]:
+        first = raw.split()[0]
+        return (
+            f"`script` must be a bare filename with no arguments. Got {raw!r}. The runner does "
+            f"not split args off {first!r}; make a wrapper script in {scripts_dir}/ that "
+            "hardcodes the flags and pass just its filename."
+        )
+
     if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
         return (
             f"Script path must be relative to {scripts_dir}/. "
@@ -380,7 +402,25 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from tools.path_security import validate_within_dir
     scripts_dir.mkdir(parents=True, exist_ok=True)
     resolved_script = scripts_dir / raw
-    if validate_within_dir(resolved_script, scripts_dir):
+    containment_error = validate_within_dir(resolved_script, scripts_dir)
+    if containment_error:
+        # Same exception as the fire-time guard (cron.scheduler_script._resolve_script_path): an
+        # in-dir symlink into the fleet-shared <root>/scripts is a legitimate shared script
+        # (fork #1066, profile un-nesting).
+        import os
+        from pathlib import Path
+
+        from cron.scheduler import _script_path_admitted
+
+        try:
+            if _script_path_admitted(
+                resolved_script.resolve(), Path(os.path.abspath(resolved_script)),
+                scripts_dir, get_hermes_home(),
+            ):
+                containment_error = None
+        except (OSError, RuntimeError, ValueError):
+            pass
+    if containment_error:
         return f"Script path escapes the scripts directory via traversal: {raw!r}"
     if not resolved_script.is_file():
         return (

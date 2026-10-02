@@ -1479,6 +1479,11 @@ class _LoopState:
     approx_tokens: Any = None
     request_pressure_tokens: Any = None
     total_chars: Any = None
+    # Fork (Blackbox): the route that SERVED this call, captured at dispatch (turn_api_call) so a
+    # mid-turn model switch cannot misprice the call; and the per-call request composition
+    # (turn_request_assembly), attached to the per-call ``_turn_calls`` entry.
+    _call_route: Any = None
+    _call_composition: Any = None
     thinking_spinner: Any = None
     api_start_time: Any = None
     retry_count: int = 0

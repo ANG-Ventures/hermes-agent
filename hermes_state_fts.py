@@ -182,7 +182,7 @@ class SessionFtsSetupMixin:
         """Only an optional tokenizer is missing (trigram needs SQLite >= 3.34;
         cjk_unicode61 is loadable): "this one index can't be served", never "disable FTS"."""
         err = str(exc).lower()
-        return "no such tokenizer: trigram" in err or "no such tokenizer: cjk_unicode61" in err
+        return "no such tokenizer" in err and ("trigram" in err or "cjk_unicode61" in err)
 
     @staticmethod
     def _db_has_legacy_inline_fts(cursor: sqlite3.Cursor) -> bool:

@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from agent.memory_manager import sanitize_context
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import _sanitize_surrogates
 from agent.history_commentary import visible_commentary
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
@@ -326,6 +327,9 @@ class StreamDeliveryMixin:
             # Check the parts list, not the joined property (joining per token copies the whole reply).
             if not prepended_break and not getattr(self, "_streamed_assistant_text_parts", None):
                 text = text.lstrip("\n")
+            # Final safety floor before any callback sees the delta: a lone surrogate crashes
+            # gateway/CLI UTF-8 writes before the accumulator can sanitize it.
+            text = _sanitize_surrogates(text)
         if not text:
             return
         delivered = self._deliver_to_stream_callbacks(text)
@@ -340,6 +344,8 @@ class StreamDeliveryMixin:
         provider reasoning delta and stops inline forwarding for the rest of this model response."""
         if not inline:
             self._native_reasoning_streamed = True
+        if isinstance(text, str):
+            text = _sanitize_surrogates(text)
         if self._stream_writer_superseded():
             # Single-writer guard (#65991): fence out a superseded stream's reasoning deltas the same way as
             # content deltas.

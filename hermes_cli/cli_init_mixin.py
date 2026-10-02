@@ -134,6 +134,25 @@ class CLIInitMixin:
                 _startup_provider_override = _startup_route.provider
                 _startup_base_url_override = _startup_route.base_url
                 _startup_api_key_override = _startup_route.api_key
+        # Fork: resolve an explicit `-m <alias>` / `-m <provider>/<model>` exactly like the
+        # interactive `/model` command would (config `model.aliases` + inline provider
+        # qualification, incl. the `provider/model` slash form for registered providers that
+        # upstream's route resolver only accepts for *configured* providers). Without this the
+        # raw string went to the current provider, 400'd, and the fallback chain silently served
+        # a different provider+model with only a one-line banner (measured 2026-09-18). Applies
+        # ONLY to an explicit CLI arg; config `model.default` is already a concrete id.
+        _inline_provider_override: Optional[str] = None
+        if model and not _startup_provider_override and not self.model.lower().startswith("moa:"):
+            from hermes_cli.model_switch import resolve_startup_model_arg
+            _inline_provider_override, self.model = resolve_startup_model_arg(
+                self.model,
+                provider or _nested_provider or _cfg_provider or "",
+                CLI_CONFIG.get("providers") if isinstance(CLI_CONFIG.get("providers"), dict) else None,
+                CLI_CONFIG.get("custom_providers") if isinstance(CLI_CONFIG.get("custom_providers"), list) else None,
+            )
+            if provider and _inline_provider_override and _inline_provider_override != provider:
+                # `--provider X -m Y/model`: the explicit flag wins, like /model.
+                _inline_provider_override = None
         # ``moa:<preset>`` selects the MoA virtual provider before provider resolution so the
         # real provider never sees the unknown model; the prefix wins over --provider.
         # A ``moa:<preset>`` model string selects the MoA virtual provider in one shot (parity with
@@ -153,11 +172,15 @@ class CLIInitMixin:
         # See #28660.
         self._explicit_api_key = api_key or _startup_api_key_override or None
         self._explicit_base_url = base_url or _startup_base_url_override or None
+        # Raw ``--provider`` flag. A kanban worker treats it as the dispatcher's pin and
+        # refuses auth-time substitution (t_4fe0700a).
+        self._explicit_provider = provider
+        self._kanban_pin_rate_limited: Optional[str] = None
 
         # Resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
-            _moa_provider_override or provider or _startup_provider_override or _nested_provider
-            or _cfg_provider or "auto"
+            _moa_provider_override or provider or _startup_provider_override or _inline_provider_override
+            or _nested_provider or _cfg_provider or "auto"
         )
         # `--provider <custom>` without `-m` uses that entry's default_model, else the global
         # default goes to the custom endpoint and the compressor gets the wrong context length.
@@ -403,7 +426,8 @@ class CLIInitMixin:
         self._pet_kitty_cache: dict = {}
         self._pet_kitty_image_id = self._pet_frame_idx = 0
         self._pet_lock = threading.Lock()
-        self._pet_cfg_checked = self._pet_event_until = 0.0
+        self._pet_event_until = 0.0
+        self._pet_cfg_checked: float = float("-inf")  # monotonic; 0.0 = "just now" on fresh boot
         self._pet_event: str = ""
         self._pet_reasoning = self._pet_turn_error = False
         self._attached_images: list[Path] = []

@@ -20,6 +20,7 @@ from agent.context_compressor import (
 )
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_manager import sanitize_context
+from agent.message_sanitization import _INTERRUPT_CLOSE_FINISH_REASON
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
@@ -187,18 +188,88 @@ def _db_flush_seed_ids(agent) -> set:
     current_session_id = getattr(agent, "session_id", None)
     same_session = getattr(agent, "_flushed_db_message_session_id", None) == current_session_id
     seed_ids = getattr(agent, "_flushed_db_message_ids", None) if same_session and agent._last_flushed_db_idx != 0 else None
+    if not same_session or agent._last_flushed_db_idx == 0:
+        # Fork row bookkeeping is per session: a new session id must not inherit row ids / content refs.
+        agent._flushed_db_row_ids = {}
+        agent._flushed_db_content_refs = {}
+        agent._interrupt_close_repersisted_ids = set()
     agent._flushed_db_message_session_id = current_session_id
     return seed_ids if isinstance(seed_ids, set) else set()
 
 
+def _db_flush_fork_state(agent) -> Tuple[Dict[int, int], Dict[int, Any], set]:
+    """``(flushed_row_ids, content_refs, repersisted_ids)`` — the fork's in-place re-persist bookkeeping.
+
+    ``flushed_row_ids`` maps ``id(msg)`` → durable row id; ``content_refs`` maps a flushed ``tool`` row id →
+    the exact content object written (content is replaced, never edited, so identity detects a /steer or
+    run-budget append after the per-result flush); ``repersisted_ids`` holds ``id(msg)`` of rows whose
+    ``interrupt_close`` flag is already durable. Created lazily: ``object.__new__`` test agents lack them.
+    """
+    flushed_row_ids = getattr(agent, "_flushed_db_row_ids", None)
+    if not isinstance(flushed_row_ids, dict):
+        flushed_row_ids = {}
+        agent._flushed_db_row_ids = flushed_row_ids
+    content_refs = getattr(agent, "_flushed_db_content_refs", None)
+    if not isinstance(content_refs, dict):
+        content_refs = {}
+        agent._flushed_db_content_refs = content_refs
+    repersisted_ids = getattr(agent, "_interrupt_close_repersisted_ids", None)
+    if not isinstance(repersisted_ids, set):
+        repersisted_ids = set()
+        agent._interrupt_close_repersisted_ids = repersisted_ids
+    return flushed_row_ids, content_refs, repersisted_ids
+
+
 def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
-    """Skip the identity-matched, still-marked prefix of the previous flush's snapshot."""
+    """Skip the identity-matched, still-marked prefix of the previous flush's snapshot.
+
+    Identity proves the same dict OBJECT, not the same CONTENT: the fork mutates an already-flushed
+    tail in place (``close_interrupted_tool_sequence`` stamps ``finish_reason="interrupt_close"``; a
+    /steer appends to the newest tool result). Stop the prefix skip at the first message carrying a
+    mutation-sensitive field so those rows are always re-examined (parity merge 2026-08-08).
+    """
+    from run_agent import _has_mutable_flush_state, _tool_content_mutated_since_flush
+    _, content_refs, _ = _db_flush_fork_state(agent)
     scan_start = 0
     for prev, cur in zip(getattr(agent, "_db_flush_scan_prefix", None) or (), messages):
-        if cur is not prev or not cur.get(_DB_PERSISTED_MARKER):
+        if (
+            cur is not prev or not cur.get(_DB_PERSISTED_MARKER)
+            or _has_mutable_flush_state(cur) or _tool_content_mutated_since_flush(cur, content_refs)
+        ):
             break
         scan_start += 1
     return scan_start
+
+
+def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, int], content_refs: Dict[int, Any],
+                                 repersisted_ids: set) -> None:
+    """Re-persist the two fields the fork stamps onto an ALREADY-FLUSHED dict in place.
+
+    * ``finish_reason="interrupt_close"`` (``close_interrupted_tool_sequence`` on a plain-text assistant
+      tail): one targeted ``update_message_finish_reason`` so the resume discriminator survives reload.
+    * A flushed ``tool`` row whose content was replaced (the /steer marker or run-budget notice appended
+      after the per-result flush): stamp the sent bytes as the row's ``api_content`` sidecar so replay
+      sends what was sent and keeps the steer (t_a17e2305).
+    """
+    from run_agent import _persisted_content_projection, _tool_content_mutated_since_flush
+    msg_id = id(msg)
+    if _tool_content_mutated_since_flush(msg, content_refs):
+        row_id = msg["_db_persisted_row_id"]
+        sent = _persisted_content_projection(msg, msg.get("content"))
+        try:
+            if isinstance(sent, str) and sent:
+                agent._session_db.set_message_api_content(agent.session_id, row_id, sent)
+            content_refs[row_id] = msg.get("content")
+        except Exception as e:
+            logger.warning("tool api_content re-persist failed (row=%s): %s", row_id, e)
+    if msg.get("finish_reason") == _INTERRUPT_CLOSE_FINISH_REASON and msg_id not in repersisted_ids:
+        row_id = msg.get("_row_id") or msg.get("_db_persisted_row_id") or flushed_row_ids.get(msg_id)
+        if isinstance(row_id, int):
+            try:
+                agent._session_db.update_message_finish_reason(agent.session_id, row_id, _INTERRUPT_CLOSE_FINISH_REASON)
+                repersisted_ids.add(msg_id)
+            except Exception as e:
+                logger.warning("interrupt_close re-persist failed (row=%s): %s", row_id, e)
 
 
 def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any]:
@@ -208,10 +279,18 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
+    # Load-bearing for restart drain-window recovery dedup (has_platform_message_id).
+    platform_id = msg.get("platform_message_id") or msg.get("message_id")
     if is_current_turn_user and role == "user":
         content, api_content = durable_user_row_content(agent, msg, content, api_content)
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
+        # The interrupted-turn platform id (#48677 backfill dedupe) is stamped on the WRITTEN row so a
+        # later backfill-on-reconnect sees the turn is already persisted; the live dict is never mutated
+        # (parity with content/timestamp). Drain-window message-loss SPEC D-10.
+        ov_platform_id = getattr(agent, "_persist_user_message_platform_id", None)
+        if ov_platform_id is not None and not platform_id:
+            platform_id = ov_platform_id
     if api_content == content:
         api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes
@@ -232,8 +311,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
         "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
-        # Load-bearing for restart drain-window recovery dedup.
-        "platform_message_id": msg.get("platform_message_id") or msg.get("message_id"),
+        "platform_message_id": platform_id,
         "observed": bool(msg.get("observed")),
     }
     if isinstance(msg.get("_row_id"), int):
@@ -259,11 +337,32 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
     batch_rows: List[Dict[str, Any]] = []
     batch_msgs: List[Dict] = []
     tool_uid_owners: dict = {}  # tool_call_uid_from_history memo; the scanned dicts outlive this loop
+    flushed_row_ids, content_refs, repersisted_ids = _db_flush_fork_state(agent)
+    # Superseded-turn write gate (/stop, /new, stale-agent eviction — see ``_persist_superseded``): resolved
+    # ONCE, fail-open (any error reading it leaves suppression OFF — a dropped real row is data loss, I5).
+    try:
+        persist_superseded = bool(getattr(agent, "_persist_superseded", False))
+    except Exception:
+        persist_superseded = False
+    # Pairing safety: the assistant(tool_calls) row flushes in a DIFFERENT flush from its tool result within
+    # one iteration, so the suppressed-id set lives on the AGENT (lazily, only when superseded) and survives
+    # the whole drain (Greptile-B1′).
+    suppressed_tool_call_ids: Optional[set] = None
+    if persist_superseded:
+        suppressed_tool_call_ids = getattr(agent, "_superseded_suppressed_tool_call_ids", None)
+        if not isinstance(suppressed_tool_call_ids, set):
+            suppressed_tool_call_ids = set()
+            agent._superseded_suppressed_tool_call_ids = suppressed_tool_call_ids
+    suppressed_superseded_rows = 0
     for msg_idx in range(_db_flush_scan_start(agent, messages), len(messages)):
         msg = messages[msg_idx]
         # Append-only flush: a mid-turn persist of scaffolding would commit a synthetic turn the end-of-turn
         # drop cannot un-write. Skip regardless of position.
-        if not isinstance(msg, dict) or _is_ephemeral_scaffolding(msg) or msg.get(_DB_PERSISTED_MARKER):
+        if not isinstance(msg, dict) or _is_ephemeral_scaffolding(msg):
+            continue
+        if msg.get(_DB_PERSISTED_MARKER):
+            # Already durable by marker; the fork may still have stamped a field in place.
+            _db_flush_repersist_in_place(agent, msg, flushed_row_ids, content_refs, repersisted_ids)
             continue
         # Already durable (history copy or caller-seeded): stamp so future flushes skip it.
         is_history = id(msg) in history_ids
@@ -272,6 +371,32 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
         ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT):
             msg[_DB_PERSISTED_MARKER] = True
             continue
+        # Superseded-turn write gate: runs AFTER every "already durable" skip above, so it only ever sees a
+        # genuinely NEW row. 🔴 CARVE-OUT (I1): the interrupt-close tail MUST still persist — it is the
+        # role-alternation repair and the restart-loop backstop (#45230/#49201/#49243). 🔴 PAIRING (B1): a
+        # ``tool`` result is suppressed ONLY when its owning assistant(tool_calls) was also suppressed; an
+        # already-durable owner is skipped above and never recorded, so its result lands (no #48879 orphan).
+        if persist_superseded and msg.get("finish_reason") != _INTERRUPT_CLOSE_FINISH_REASON:
+            if msg.get("role") == "tool":
+                if msg.get("tool_call_id") in suppressed_tool_call_ids:
+                    suppressed_superseded_rows += 1
+                    continue
+            elif msg.get("role") == "assistant":
+                tcs = msg.get("tool_calls")
+                if isinstance(tcs, list):
+                    for tc in tcs:
+                        tcid = (tc.get("id") or tc.get("tool_call_id")) if isinstance(tc, dict) else getattr(tc, "id", None)
+                        if tcid:
+                            suppressed_tool_call_ids.add(tcid)
+                suppressed_superseded_rows += 1
+                continue
+            else:
+                # FAIL-OPEN on any other role: a zombie writes only assistant+tool rows, and dropping a real
+                # user message would be data loss (I5). Persist normally; log for diagnosability.
+                logger.debug(
+                    "persist gate: superseded turn produced an unexpected new %r row for session %s — "
+                    "persisting (fail-open)", msg.get("role"), getattr(agent, "session_id", "?"),
+                )
         if getattr(agent, "_mute_notification_reply", False) and not is_history:
             # Only new rows, never the cached history prefix. Keep evidence/model
             # context intact while transcript pollers omit unsolicited presentation.
@@ -284,25 +409,67 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
                 msg[TOOL_CALL_UID] = tool_uid
         batch_rows.append(_db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message))
         batch_msgs.append(msg)
+    if suppressed_superseded_rows:
+        logger.info(
+            "persist: suppressed %d superseded-turn content row(s) for session %s (turn was /stop'd or "
+            "/new'd; interrupt-close tail preserved)", suppressed_superseded_rows, getattr(agent, "session_id", "?"),
+        )
     return batch_rows, batch_msgs
+
+
+def _db_flush_record_row_ids(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Dict],
+                             batch_row_ids: List[Any]) -> None:
+    """Fork bookkeeping after a committed batch: positional row-id capture for the in-place re-persist path
+    (``_db_persisted_row_id`` on the live dict, ``_flushed_db_row_ids``, tool ``content_refs``)."""
+    flushed_row_ids, content_refs, repersisted_ids = _db_flush_fork_state(agent)
+    for idx, written in enumerate(batch_msgs):
+        row_id = batch_row_ids[idx] if idx < len(batch_row_ids) else None
+        if not isinstance(row_id, int) and isinstance(written.get("_row_id"), int):
+            # Repaired-in-place rows get no freshly-inserted id but carry their durable one.
+            row_id = written["_row_id"]
+        if isinstance(row_id, int):
+            flushed_row_ids[id(written)] = row_id
+            written["_db_persisted_row_id"] = row_id
+            if written.get("role") == "tool":
+                content_refs[row_id] = written.get("content")
+            # Appended already carrying the flag ⇒ durably persisted; no later re-persist needed.
+            if written.get("finish_reason") == _INTERRUPT_CLOSE_FINISH_REASON:
+                repersisted_ids.add(id(written))
+        elif written.get("finish_reason") == _INTERRUPT_CLOSE_FINISH_REASON:
+            # Without a row id a later in-place interrupt_close mutation cannot be re-persisted; a lost flag
+            # falls back to the old "skip unfinished work" resume. append_messages_batch fills row_ids_out
+            # with ints in prod — a miss means a mock/altered API, so make it loud.
+            logger.warning(
+                "flush: append_messages_batch returned no row id (%r) for an interrupt_close message; "
+                "in-place re-persist will be skipped", row_id,
+            )
 
 
 def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Dict], messages: List[Dict]) -> None:
     """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
+    batch_row_ids: List[int] = []
     agent._session_db.append_messages_batch(
         session_id=agent.session_id, messages=batch_rows,
         compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+        row_ids_out=batch_row_ids,
         turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
+    _db_flush_record_row_ids(agent, batch_rows, batch_msgs, batch_row_ids)
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
         # The insert already rewrote the older rows (SessionDB._drop_shadowed_checkpoint_rows); mirror it on
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
+    session_id = getattr(agent, "session_id", None)
+    if session_id:
+        try:
+            agent._session_db.recompute_effective_last_active(session_id)
+        except Exception as e:
+            logger.warning("Session DB effective_last_active recompute failed: %s", e)
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
@@ -468,8 +635,13 @@ class SessionPersistenceMixin:
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None):
         """Serialize direct and turn-boundary session flushes per agent."""
+        # Duck-typed stubs bind only this method (tests/agent/test_persist_platform_message_id.py); fall back
+        # to the mixin's own unlocked flush so the real path still runs end to end.
+        flush_unlocked = getattr(self, "_flush_messages_to_session_db_unlocked", None)
+        if flush_unlocked is None:
+            flush_unlocked = SessionPersistenceMixin._flush_messages_to_session_db_unlocked.__get__(self, type(self))
         with _persist_lock(self):
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return flush_unlocked(messages, conversation_history)
 
     def _flush_messages_to_session_db_unlocked(
         self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None, _adoption_budget: int = 1,

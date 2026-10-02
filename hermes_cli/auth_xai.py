@@ -149,6 +149,9 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
+        # Persisting good tokens resolves any prior refresh/login failure; a stale revoked-token
+        # error left behind after a successful re-login looks like a live outage (fork #326).
+        state.pop("last_auth_error", None)
         global_root = _global_auth_file_path()
         if source_path is not None and global_root is not None and _same_path(source_path, global_root):
             # Root-only write-back: a profile copy would shadow root and disable write-through.

@@ -317,6 +317,9 @@ class SessionMaintenanceMixin:
                 session_ids -= self._guarded_ids(conn, session_ids)
             if not session_ids:
                 return 0
+            orphaned_child_ids, affected_root_ids = self._collect_orphan_effective_last_active_targets(
+                conn, list(session_ids)
+            )
             # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
             for chunk in _id_chunks(session_ids):
                 ph = _placeholders(chunk)
@@ -324,6 +327,7 @@ class SessionMaintenanceMixin:
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
                 removed_ids.extend(chunk)
+            self._recompute_effective_last_active_many(conn, affected_root_ids + orphaned_child_ids)
             self._delete_unreferenced_system_prompts(conn)
             return len(session_ids)
         count = self._execute_write(_do)
@@ -335,7 +339,7 @@ class SessionMaintenanceMixin:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""
         try:
             with self._read_ctx() as conn:
-                if self._conn is None:
+                if conn is None:
                     return None
                 return [int(conn.execute(f"PRAGMA {name}").fetchone()[0]) for name in names]
         except Exception as exc:

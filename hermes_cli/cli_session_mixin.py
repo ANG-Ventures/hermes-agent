@@ -256,6 +256,12 @@ class CLISessionMixin:
             model=getattr(self, "model", None), provider=getattr(self, "provider", None),
             created_fallback=self.session_start, agent_running=bool(getattr(self, "_agent_running", False)),
         )
+        # UNKNOWN != 0 (cumulative, absorbing): one unmeasured call in the session
+        # renders the total "unknown" instead of a number the user reads as measured.
+        from agent.usage_pricing import format_token_count, session_total_tokens_unknown
+        fields["tokens"] = format_token_count(
+            getattr(agent, "session_total_tokens", 0) or 0,
+            unknown=session_total_tokens_unknown(agent), formatter=lambda n: f"{n:,}")
 
         reasoning_label = None
         rc = getattr(agent, "reasoning_config", None) or getattr(self, "reasoning_config", None)
@@ -765,49 +771,97 @@ class CLISessionMixin:
         return last_message
 
     def undo_last(self, n: int = 1, prefill: bool = True):
-        """Back up N user turns: truncate history, soft-delete on disk, prefill the composer.
+        """Undo N half-turns via the shared undo core and render its prefill.
 
-        Discards everything from the Nth-from-last user message onward (clamped to the oldest
-        turn). Rows are soft-deleted in SessionDB (``active=0``, kept for audit), memory
-        providers get ``on_session_switch(rewound=True)``, and the agent is patched like
-        /branch does. ``prefill=False`` is for programmatic callers (checkpoint rollback)
-        that must not touch the input buffer. Returns the number of user turns undone (None when
-        nothing changed).
+        For the default ``n=1`` with warm history available, prefer the
+        upstream carrier-rewind contract (full user-turn rewind bound
+        warm<->durable, live-ask-only prefill); the half-turn core remains the
+        path for explicit counts and for callers driving straight off the
+        durable transcript (gateway /undo, warm-less CLI states). ``prefill=False``
+        is for programmatic callers (checkpoint rollback) that must not touch the
+        input buffer. Returns the number of turns undone (None when nothing changed).
         """
         from cli import logger
-        if not self.conversation_history:
-            print(t("cli.session.undo_no_messages"))
+        if not self.session_id:
+            print("(._.) No active session to undo.")
             return
-        n = max(n, 1)
+        if (
+            n == 1
+            and self._session_db is not None
+            and self.conversation_history
+            and self._undo_last_user_turn(prefill=prefill)
+        ):
+            return 1
+        try:
+            import hermes_undo
+
+            if self._session_db is not None:
+                hermes_undo._session_db = self._session_db
+            result = hermes_undo.undo(self.session_id, n)
+        except Exception as e:
+            logger.debug("undo: failed: %s", e)
+            print(f"(._.) Undo failed: {e}")
+            return
+
+        rewound_ids = list(result.get("rewound_ids") or [])
+        if not rewound_ids:
+            print("(._.) Nothing to undo.")
+            return
+
+        self._reload_active_history_after_rewind(rewound=True)
+        half_turns = result.get("half_turns", n)
+        prefill_text = result.get("prefill_text")
+        print(f"(^_^)b Undid {half_turns} half-turn(s) ({len(rewound_ids)} message(s)).")
+        print(f"  {t('cli.session.undo_remaining', count=len(self.conversation_history))}")
+        if prefill and isinstance(prefill_text, str):
+            self._prefill_input_buffer(prefill_text)
+        return half_turns
+
+    def _undo_last_user_turn(self, *, prefill: bool) -> bool:
+        """Carrier-aware single-user-turn undo (upstream carrier-rewind contract).
+
+        Binds the last warm user turn to its durable row via ``SessionDB.rewind_user_turn``
+        (shared with /retry): the richer WARM prefix survives (media part-lists, ephemeral
+        scaffolding dropped), a composite compaction carrier is archived with its canonical
+        hidden scaffold retained, and the prefill is ONLY the live ask. Rows are soft-deleted
+        (``active=0``, kept for audit), memory providers get ``on_session_switch(rewound=True)``,
+        and the agent is patched like /branch does. Returns True when the rewind completed;
+        False means fall back to the half-turn core (no bindable user turn, or binding
+        failure — the core fails soft on all of those).
+        """
+        from cli import logger
 
         from agent.context_compressor import history_before_user_originated_turn
 
         warm_history = list(self.conversation_history)
         user_indices = _user_turn_indices(warm_history)
         if not user_indices:
-            print(t("cli.session.undo_no_user_message"))
-            return
+            return False
 
-        turns_undone = min(n, len(user_indices))
-        target_ordinal = len(user_indices) - turns_undone
+        turns_undone = 1
+        target_ordinal = len(user_indices) - 1
         cut_idx = user_indices[target_ordinal]
         removed_count = len(warm_history) - cut_idx
         truncated, live_view = history_before_user_originated_turn(warm_history, cut_idx)
         removed_text = self._undo_content_to_text(live_view.get("content"))
 
         rewound_rows = 0
-        if self._session_db is not None and self.session_id:
-            try:
-                outcome = self._session_db.rewind_user_turn(
-                    self.session_id, target_ordinal, warm_history=warm_history)
-                truncated = outcome.prefix
-                # Canonical editable prefill: the raw carrier holds the reference-summary wrapper.
-                removed_text = outcome.live_text or removed_text
-                rewound_rows = outcome.rewound_count
-            except Exception as e:
-                logger.debug("undo: durable rewind failed: %s", e)
-                print(t("cli.session.undo_failed", error=e))
-                return
+        rewound_ids: list = []
+        replaced = False
+        try:
+            active_before = list(self._session_db.get_active_message_ids(self.session_id))
+            outcome = self._session_db.rewind_user_turn(
+                self.session_id, target_ordinal, warm_history=warm_history)
+            truncated = outcome.prefix
+            # Canonical editable prefill: the raw carrier holds the reference-summary wrapper.
+            removed_text = outcome.live_text or removed_text
+            rewound_rows = outcome.rewound_count
+            active_after = set(self._session_db.get_active_message_ids(self.session_id))
+            rewound_ids = [i for i in active_before if i not in active_after]
+            replaced = bool(active_after - set(active_before))
+        except Exception as e:
+            logger.debug("undo: user-turn rewind failed, falling back: %s", e)
+            return False
 
         # Publish only after the durable rewind succeeds (or no store exists).
         self._publish_truncated_history(truncated, invalidate_prompt=True)
@@ -818,6 +872,21 @@ class CLISessionMixin:
             with contextlib.suppress(Exception):
                 _mm.on_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
 
+        # Keep CLI /redo working after a full-turn undo: bank the op in the
+        # shared undo core. Skip carrier rewinds — a scaffold replacement row
+        # is now live, so blind reactivation of the archived composite would
+        # duplicate the handoff.
+        if rewound_ids and not replaced:
+            try:
+                import hermes_undo
+
+                hermes_undo._session_db = self._session_db
+                state = hermes_undo.get_state(self.session_id)
+                state.undo_stack.append(hermes_undo.UndoOp(n=1, rewound_ids=rewound_ids))
+                state.redo_stack.clear()
+            except Exception:  # pragma: no cover - redo banking is best-effort
+                pass
+
         key = "cli.session.undo_ok_one" if turns_undone == 1 else "cli.session.undo_ok_other"
         print(t(key, count=turns_undone, messages=rewound_rows or removed_count,
                 backup=f"{removed_text[:60]}{'...' if len(removed_text) > 60 else ''}"))
@@ -825,7 +894,75 @@ class CLISessionMixin:
         # Editable, not auto-sent (Claude-Code-style).
         if prefill and removed_text:
             self._prefill_input_buffer(removed_text)
-        return turns_undone
+        return True
+
+    def redo_last(self, n: int = 1):
+        """Redo N undo operations via the shared undo core."""
+        from cli import logger
+        if not self.session_id:
+            print("(._.) No active session to redo.")
+            return
+        try:
+            import hermes_undo
+
+            if self._session_db is not None:
+                hermes_undo._session_db = self._session_db
+            result = hermes_undo.redo(self.session_id, n)
+        except Exception as e:
+            logger.debug("redo: failed: %s", e)
+            print(f"(._.) Redo failed: {e}")
+            return
+
+        reactivated = int(result.get("reactivated_count") or 0)
+        if reactivated <= 0:
+            print(f"(._.) {result.get('message') or 'Nothing to redo.'}")
+            return
+
+        self._reload_active_history_after_rewind(rewound=True)
+        print(f"(^_^)b Redid {result.get('ops_redone', n)} undo operation(s) ({reactivated} message(s) restored).")
+        tail = self.conversation_history[-1] if self.conversation_history else None
+        if tail:
+            role = tail.get("role", "message")
+            content = tail.get("content")
+            if isinstance(content, str) and content:
+                preview = content[:60] + ("..." if len(content) > 60 else "")
+                print(f"  Restored tail ({role}): \"{preview}\"")
+            else:
+                print(f"  Restored tail: {role} turn.")
+
+    def _reload_active_history_after_rewind(self, *, rewound: bool = False) -> None:
+        """Re-read the active transcript after a half-turn undo/redo and mirror it onto the agent."""
+        from cli import logger
+        if self._session_db is not None and self.session_id:
+            try:
+                self.conversation_history = self._session_db.get_messages_as_conversation(
+                    self.session_id, include_timestamp=True
+                )
+            except Exception as e:
+                logger.debug("rewind: active history reload failed: %s", e)
+
+        if self.agent is not None:
+            if hasattr(self.agent, "_invalidate_system_prompt"):
+                try:
+                    self.agent._invalidate_system_prompt()
+                except Exception:
+                    pass
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                try:
+                    self.agent._last_flushed_db_idx = len(self.conversation_history)
+                except Exception:
+                    pass
+            try:
+                _mm = getattr(self.agent, "_memory_manager", None)
+                if _mm is not None and self.session_id:
+                    _mm.on_session_switch(
+                        self.session_id,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=rewound,
+                    )
+            except Exception:
+                pass
 
     @staticmethod
     def _undo_content_to_text(content) -> str:
@@ -1181,7 +1318,9 @@ class CLISessionMixin:
         profile_flag = "" if _active_profile in ("default", "custom") else f" -p {_active_profile}"
         print(f"  hermes --resume {self.session_id}{profile_flag}")
         if session_title:
-            print(f"  hermes -c \"{session_title}\"{profile_flag}")
+            from hermes_cli.cli_hint import hint_value
+
+            print(f"  hermes -c {hint_value(session_title)}{profile_flag}")
         print()
         print(t("cli.session.exit_label_session", session_id=self.session_id))
         if session_title:

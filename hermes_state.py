@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
 from hermes_state_common import (
     TITLE_SOURCE_DERIVED as _TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM as _TITLE_SOURCE_LLM,
     TITLE_SOURCE_USER as _TITLE_SOURCE_USER,
-    _BRANCH_CHILD_SQL, _LISTABLE_CHILD_SQL,
+    _BRANCH_CHILD_SQL, _LISTABLE_CHILD_SQL, _sql_json_extract,
     escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity,
 )
 # Fork-only helpers consumed by the fork-only SessionDB methods below (hermes_state_ext is a
@@ -173,9 +173,19 @@ _BARE_BILLING_PROVIDERS = frozenset({"auto", "custom"})
 
 T = TypeVar("T")
 
-# Import-time snapshot lets _default_db_path() detect a re-pointed DEFAULT_DB_PATH
-# (tests monkeypatch the constant directly).
-DEFAULT_DB_PATH = _IMPORT_DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+def __getattr__(name: str):
+    """Lazy module attributes. ``DEFAULT_DB_PATH`` resolves ``get_hermes_home()`` at ACCESS time, not
+    import time: a frozen import-time constant ignores a later ``HERMES_HOME`` redirect (hermetic
+    suites opened the production state.db; 2026-07-24 incident). A test ``monkeypatch.setattr`` on the
+    module materializes a real global that shadows this, which ``_default_db_path`` honours."""
+    if name == "DEFAULT_DB_PATH":
+        return get_hermes_home() / "state.db"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# Import-time snapshot lets _default_db_path() detect a deliberately re-pointed DEFAULT_DB_PATH
+# (a REAL global set by a test monkeypatch; the lazy attribute above creates none).
+_IMPORT_DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 # Back off from read-only opens after one fails: not per query, but short enough that
 # transient fd pressure doesn't strand the read pool.
@@ -198,7 +208,10 @@ _READ_BUSY_TIMEOUT_S = 5.0
 def _default_db_path() -> Path:
     """Default state DB path at CALL time: a re-pointed ``DEFAULT_DB_PATH`` wins, else
     ``get_hermes_home()`` is resolved fresh (a runtime HERMES_HOME redirect works regardless of import)."""
-    return DEFAULT_DB_PATH if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH else get_hermes_home() / "state.db"
+    override = globals().get("DEFAULT_DB_PATH")
+    if override is not None and override != _IMPORT_DEFAULT_DB_PATH:
+        return override
+    return get_hermes_home() / "state.db"
 
 
 # Live-DB guard knobs live HERE (not in hermes_state_guard): the hermetic conftest monkeypatches
@@ -1792,10 +1805,27 @@ class SessionDB(
         "api_call_count",
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    # UNKNOWN != 0 discriminators: ROUTE fields (part of the merge KEY) — two adjacent deltas merge only
+    # when their unknown state is identical, so the merged ``flag = MAX(flag, ?)`` write equals applying
+    # them in sequence; disagreeing deltas apply one by one and the store's MAX() latches. Not a sum (a
+    # bool is not additive) and not last-wins (that would clear a latched unknown).
+    _TOKEN_DELTA_FLAG_FIELDS = (
+        "input_tokens_unknown", "output_tokens_unknown", "cache_read_tokens_unknown",
+        "cache_write_tokens_unknown", "usage_unknown",
+    )
+    # Snapshot fields: NOT summed. "The last turn's usage", written COALESCE(?, existing) — last non-None
+    # wins; a merged run must keep the newest turn's snapshot, else every later turn's is dropped.
+    _TOKEN_DELTA_SNAPSHOT_FIELDS = (
+        "last_turn_input_tokens", "last_turn_output_tokens", "last_turn_cache_read_tokens",
+        "last_turn_cache_write_tokens", "last_turn_reasoning_tokens",
+        "last_turn_input_tokens_unknown", "last_turn_output_tokens_unknown",
+        "last_turn_cache_read_tokens_unknown", "last_turn_cache_write_tokens_unknown",
+        "last_turn_usage_unknown",
+    )
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url",
         "billing_mode", "source",
-    )
+    ) + _TOKEN_DELTA_FLAG_FIELDS
 
     MAX_TITLE_LENGTH = 100
 
@@ -1935,7 +1965,7 @@ class SessionDB(
     ) -> Optional[str]:
         """Walk child→parent compression edges and return the recency root."""
         row = conn.execute(
-            """
+            f"""
             WITH RECURSIVE ancestors(id, depth) AS (
                 SELECT s.id, 0 FROM sessions s WHERE s.id = ?
                 UNION
@@ -1944,8 +1974,8 @@ class SessionDB(
                 JOIN sessions child ON child.id = ancestors.id
                 JOIN sessions parent ON parent.id = child.parent_session_id
                 WHERE parent.end_reason = 'compression'
-                  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                  AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                  AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
             )
             SELECT id FROM ancestors ORDER BY depth DESC LIMIT 1
             """,
@@ -1964,7 +1994,7 @@ class SessionDB(
         if not self._is_effective_last_active_visible(conn, session_id):
             return None
         row = conn.execute(
-            """
+            f"""
             WITH RECURSIVE chain(cur_id, depth) AS (
                 SELECT s.id, 0 FROM sessions s WHERE s.id = ?
                 UNION
@@ -1973,8 +2003,8 @@ class SessionDB(
                 JOIN sessions parent ON parent.id = chain.cur_id
                 JOIN sessions child ON child.parent_session_id = chain.cur_id
                 WHERE parent.end_reason = 'compression'
-                  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                  AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                  AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
             )
             SELECT MAX(COALESCE(
                 (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = chain.cur_id),
@@ -2026,11 +2056,12 @@ class SessionDB(
         # persisted message can legitimately carry a timestamp older than the
         # pre-created session row (gateway/desktop replay path), so a pure
         # monotonic bump would leave effective_last_active stuck at started_at.
-        message_count_row = conn.execute(
-            "SELECT COUNT(*) AS count FROM messages WHERE session_id = ?",
+        # Bounded probe (upstream's append-work contract): we only need "0/1 row vs more".
+        message_count = len(conn.execute(
+            "SELECT 1 FROM messages WHERE session_id = ? LIMIT 2",
             (session_id,),
-        ).fetchone()
-        if message_count_row and int(message_count_row["count"] or 0) <= 1:
+        ).fetchall())
+        if message_count <= 1:
             self._recompute_effective_last_active_for_session(conn, session_id)
             return
         if not self._is_effective_last_active_visible(conn, root_id):
@@ -2093,8 +2124,8 @@ class SessionDB(
                 JOIN sessions parent ON parent.id = chain.cur_id
                 JOIN sessions child ON child.parent_session_id = chain.cur_id
                 WHERE parent.end_reason = 'compression'
-                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                  AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                  AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
             ),
             chain_max AS (
                 SELECT root_id,
@@ -2795,65 +2826,14 @@ class SessionDB(
         project_compression_tips: bool,
         include_children: bool,
     ) -> List[Dict[str, Any]]:
-        sessions = []
-        for row in rows:
-            s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
-            # Drop internal/denormalized columns so callers see the pre-reland shape.
-            s.pop("_effective_last_active", None)
-            s.pop("effective_last_active", None)
-            sessions.append(s)
-
-        # Project compression roots forward to their tips. Each row whose
-        # end_reason is 'compression' has a continuation child; replace the
-        # surfaced fields (id, message_count, title, last_active, ended_at,
-        # end_reason, preview) with the tip's values so the list entry acts
-        # as the live conversation. Keep the root's started_at to preserve
-        # chronological ordering by original conversation start.
+        """Shared tail of the denorm fast path: the SAME row projection, tip projection and
+        ``unread`` stamp as the CTE path in ``list_sessions_rich`` (``_list_row`` /
+        ``_project_compression_tips``), so the two paths produce byte-identical rows."""
+        sessions = [self._list_row(row) for row in rows]
         if project_compression_tips and not include_children:
-            projected = []
-            for s in sessions:
-                if s.get("end_reason") != "compression":
-                    projected.append(s)
-                    continue
-                tip_id = self.get_compression_tip(s["id"])
-                if tip_id == s["id"]:
-                    projected.append(s)
-                    continue
-                tip_row = self._get_session_rich_row(tip_id)
-                if not tip_row:
-                    projected.append(s)
-                    continue
-                # Preserve the root's started_at for stable sort order, but
-                # surface the tip's identity and activity data.
-                merged = dict(s)
-                for key in (
-                    "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
-                    "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
-                ):
-                    if key in tip_row:
-                        merged[key] = tip_row[key]
-                merged["_lineage_root_id"] = s["id"]
-                projected.append(merged)
-            sessions = projected
-
-        # fork-parity: upstream added the derived ``unread`` key, stamped at the
-        # tail of list_sessions_rich. The fork's denorm fast path RETURNS before
-        # ever reaching that stamping loop, so rows from the fast path were
-        # missing ``unread`` while the CTE oracle carried it — the two paths
-        # disagreed and the denorm acceptance oracle compared unequal. Stamp it
-        # here, in the tail BOTH paths share, so the fast path and the oracle
-        # produce identical rows.
+            sessions = self._project_compression_tips(sessions, False)
         for s in sessions:
             s["unread"] = self.session_unread(s)
-
         return sessions
 
     def _list_sessions_rich_denorm(
@@ -2908,8 +2888,8 @@ class SessionDB(
                 "    JOIN sessions child ON child.parent_session_id = parent.id "
                 "    WHERE parent.id = s.id "
                 "      AND parent.end_reason = 'compression' "
-                "      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-                "      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                f"      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
+                f"      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
                 "      AND COALESCE(child.source, '') != 'tool' "
                 "    UNION ALL "
                 "    SELECT child.id, id_chain.depth + 1 "
@@ -2917,8 +2897,8 @@ class SessionDB(
                 "    JOIN sessions parent ON parent.id = id_chain.cur_id "
                 "    JOIN sessions child ON child.parent_session_id = id_chain.cur_id "
                 "    WHERE parent.end_reason = 'compression' "
-                "      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-                "      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                f"      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
+                f"      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
                 "      AND COALESCE(child.source, '') != 'tool' "
                 "  ) "
                 "  SELECT 1 FROM id_chain WHERE LOWER(cur_id) LIKE ? ESCAPE '\\' LIMIT 1"

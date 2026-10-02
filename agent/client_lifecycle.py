@@ -948,11 +948,52 @@ class ClientLifecycleMixin:
         if merged:
             self._client_kwargs["default_headers"] = merged
 
-    def _swap_credential(self, entry) -> bool:
-        """Adopt *entry* as the live credential. Returns False, changing nothing, when the entry's
-        route cannot serve this conversation's model (a conversation's model is never rewritten by a
-        rotation; the caller treats a refused swap as "no entry")."""
+    def _swap_credential(self, entry):
+        """Adopt *entry* as the live credential.
+
+        Returns ``False``, changing nothing, when the entry's route cannot serve this
+        conversation's model (a conversation's model is never rewritten by a rotation; the
+        caller treats a refused swap as "no entry"). Otherwise returns the fork's tri-state
+        :class:`run_agent.SwapOutcome`: ``SWAPPED`` when a usable key was installed;
+        ``RETRYABLE_EXHAUSTED`` / ``MISSING_CREDENTIAL`` when the entry resolves an empty key and
+        NO client is installed. The empty-key refusal prevents building an Anthropic client with
+        ``api_key=""``, which raises a non-retryable ``TypeError("Could not resolve authentication
+        method…")`` at request time and aborts the turn — masking a transient rate limit as a local
+        bug. Callers go through ``agent_runtime_helpers._swap_installed`` which honours both shapes.
+        """
+        from run_agent import SwapOutcome
+
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+
+        # Guard: never install a keyless client. Distinguish a transient 429-exhaustion
+        # (retryable, self-heals on window reset) from a genuine missing/dead credential
+        # (loud config error) using the entry's own rate-limit marker, bounded by its TTL.
+        if not (isinstance(runtime_key, str) and runtime_key.strip()):
+            try:
+                from agent.credential_pool import _exhausted_until
+                exhausted_until = _exhausted_until(entry)
+            except Exception:  # noqa: BLE001 - never crash the recovery path on this probe
+                exhausted_until = None
+            is_ratelimit_exhausted = (
+                getattr(entry, "last_error_code", None) == 429
+                and exhausted_until is not None
+                and time.time() < exhausted_until
+            )
+            if is_ratelimit_exhausted:
+                logger.info(
+                    "Credential rotation: pool entry %s has no usable key and is 429-exhausted "
+                    "within its window — treating as retryable rate-limit (not installing a "
+                    "keyless client).",
+                    getattr(entry, "id", "?"),
+                )
+                return SwapOutcome.RETRYABLE_EXHAUSTED
+            logger.warning(
+                "Credential rotation: pool entry %s has no usable key and no live 429 exhaustion "
+                "— treating as MISSING credential (config error), not a transient rate-limit.",
+                getattr(entry, "id", "?"),
+            )
+            return SwapOutcome.MISSING_CREDENTIAL
+
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         from hermes_cli.providers import is_actual_route
         actual_route = is_actual_route(getattr(self, "provider", ""), runtime_base)
@@ -979,14 +1020,14 @@ class ClientLifecycleMixin:
             self._anthropic_client = self._build_direct_anthropic_client(runtime_key, self._anthropic_base_url)
             self._is_anthropic_oauth = self._anthropic_oauth_flag(runtime_key)
             self.api_key, self.base_url = runtime_key, stripped_base
-            return True
+            return SwapOutcome.SWAPPED
         self.api_key, self.base_url = runtime_key, stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
-        return True
+        return SwapOutcome.SWAPPED
 
     def _reapply_route_client_config(self, *, route_changed: bool) -> None:
         """Recompute route-derived client kwargs (TLS material, default headers) for ``self.base_url``.
@@ -1006,17 +1047,19 @@ class ClientLifecycleMixin:
             logger.debug("custom-provider TLS resolution skipped on credential rotation", exc_info=True)
         self._apply_client_headers_for_base_url(self.base_url, apply_user_headers=not route_changed)
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
+    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None, on_response: Any = None):
         # A supplied request-local client was already refreshed in _create_request_anthropic_client.
         if client is None and self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         # Strips Responses-only kwargs that leak in under an api_mode-flip race.
         from agent.anthropic_adapter import create_anthropic_message
         # on_response: rate-limit + credits state live in response headers, which the parsed Message drops.
+        # A caller-supplied callback is call-scoped (it wraps this one); swapping a callback on the
+        # shared agent would race interrupt-abandoned workers and transpose two calls' headers.
         return create_anthropic_message(
             client or self._anthropic_client, api_kwargs, log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
-            on_response=self._capture_anthropic_response_headers,
+            on_response=on_response or self._capture_anthropic_response_headers,
         )
 
     def _rebuild_anthropic_client(self) -> None:

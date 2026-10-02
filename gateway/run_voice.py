@@ -230,16 +230,22 @@ class GatewayVoiceMixin:
         return False
 
     @staticmethod
-    def _voice_input_source(adapter, guild_id: int, user_id: int, text_ch_id) -> SessionSource:
+    async def _voice_input_source(adapter, guild_id: int, user_id: int, text_ch_id) -> Optional[SessionSource]:
         """Bound text channel's own source when available (voice shares the text conversation's
-        session), else a synthetic one."""
+        session), else a synthetic one. None when the text channel cannot be resolved."""
         if source_data := getattr(adapter, "_voice_sources", {}).get(guild_id):
             source = SessionSource.from_dict(source_data)
             source.user_id = source.user_name = str(user_id)
         else:
+            # Voice input must join the text channel's session: the chat_type comes from the
+            # resolved Discord channel, never a hard-coded producer label.
+            info = await adapter.get_chat_info(str(text_ch_id))
+            if info.get("error"):
+                logger.warning("Cannot resolve voice input's Discord channel")
+                return None
             source = SessionSource(
                 platform=Platform.DISCORD, chat_id=str(text_ch_id), user_id=str(user_id),
-                user_name=str(user_id), chat_type="channel",
+                user_name=str(user_id), chat_type=info["type"],
                 profile=getattr(adapter, "_owner_profile", None))
         # Serialization drops transport provenance; auth must still follow the receiving bot.
         source._transport_adapter_ref = weakref.ref(adapter)
@@ -255,7 +261,9 @@ class GatewayVoiceMixin:
         text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
         if not text_ch_id:
             return
-        source = self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
+        source = await self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
+        if source is None:
+            return
         # The cached source still carries the previous speaker's identity (per-sender routes,
         # #106019): drop the pin so the seam re-resolves for THIS speaker.
         from gateway.session_identity import clear_identity

@@ -22,6 +22,36 @@ class _SQLiteBackupTimeout(RuntimeError):
     """Raised when a SQLite snapshot remains busy past its deadline."""
 
 
+# Bounds for a single SQLite safe-copy (fork). Two guards, both needed:
+#
+#   * STALL: the longest the copy may run without copying any page. Fast-fails a DB held under an
+#     exclusive lock by another process (live Chrome profile), where not one page ever moves.
+#   * BUDGET: an absolute wall-clock cap, SIZED TO THE DATABASE. Terminates the case the stall
+#     guard structurally cannot: sqlite3's backup API RESTARTS the copy whenever the source is
+#     written mid-backup, so a large DB under continuous writes can thrash — pages keep copying
+#     (never a stall) while `remaining` keeps resetting and the copy never converges. Measured on
+#     a live 3 GB state.db: repeated resets to the full page count, destination pinned at 65 MB
+#     for 6+ minutes with no stall ever detected.
+#
+# BUDGET replaces a FIXED 60s wall-clock deadline, which did not scale with the database: a 3 GB
+# live state.db takes ~39s of healthy copying (measured) — under 60s idle, over it under load —
+# so the copy failed closed and `hermes backup --quick` shipped a snapshot with NO state.db
+# (2026-09-20). The per-GB allowance is ~9x the measured healthy rate, so it bounds a pathological
+# copy without ever aborting a merely large one.
+_SAFE_COPY_STALL_DEADLINE_S = 60.0
+_SAFE_COPY_BASE_BUDGET_S = 60.0
+_SAFE_COPY_BUDGET_PER_GB_S = 120.0
+
+
+def _safe_copy_budget_s(src: Path) -> float:
+    """Absolute wall-clock budget for copying *src*, scaled by its size."""
+    try:
+        gb = src.stat().st_size / (1024 ** 3)
+    except OSError:
+        gb = 0.0
+    return _SAFE_COPY_BASE_BUDGET_S + gb * _SAFE_COPY_BUDGET_PER_GB_S
+
+
 def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
     if conn is not None:
         with suppress(Exception):
@@ -32,6 +62,10 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
     """Copy a SQLite database with the backup() API (WAL-safe consistent snapshot).
 
     Fails closed when no consistent snapshot can be made: copying only the main file loses WAL data.
+    Bounded so it can never hang the whole backup: a ``busy_timeout`` caps each lock wait, a STALL
+    deadline aborts a copy that moves no pages at all, and a size-scaled BUDGET aborts a copy that
+    keeps moving pages but never converges (sqlite restart-thrash under continuous writes); see
+    ``_SAFE_COPY_STALL_DEADLINE_S``.
     """
     conn = backup_conn = None
     try:
@@ -54,11 +88,37 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         # full locked-source deadline instead of adding the default timeout before each callback.
         conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
         backup_conn = sqlite3.connect(str(dst))
-        busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
+        now0 = time.monotonic()
+        busy_deadline = now0 + max(0.0, timeout_seconds)
+        stall_deadline = now0 + _SAFE_COPY_STALL_DEADLINE_S
+        budget_s = _safe_copy_budget_s(src)
+        budget_deadline = now0 + budget_s
+        last_copied = -1
 
-        def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
-            nonlocal busy_deadline
+        def _check_backup_progress(status: int, remaining: int, total: int) -> None:
+            nonlocal busy_deadline, stall_deadline, last_copied
             now = time.monotonic()
+            # Size-scaled absolute cap: bounds a restart-thrashing copy that never stalls but
+            # never converges either.
+            if now > budget_deadline:
+                try:
+                    size_note = f"{src.stat().st_size / (1024 ** 3):.2f} GB"
+                except OSError:
+                    size_note = "unknown size"
+                raise TimeoutError(
+                    f"safe-copy exceeded its {budget_s:.0f}s budget for {size_note} "
+                    f"({remaining}/{total} pages remaining; source written faster than it can be copied?)")
+            # Stall cap: abort fast when NO PAGES are being copied at all. A sqlite backup RESTART
+            # (source written mid-copy) resets `copied`, which differs from the previous value and
+            # so counts as progress — work being redone, not a stall. The budget bounds that case.
+            copied = total - remaining
+            if copied != last_copied:
+                last_copied = copied
+                stall_deadline = now + _SAFE_COPY_STALL_DEADLINE_S
+            elif now > stall_deadline:
+                raise TimeoutError(
+                    f"safe-copy copied no pages for {_SAFE_COPY_STALL_DEADLINE_S}s "
+                    f"({remaining}/{total} pages remaining; locked by another process?)")
             if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                 if now >= busy_deadline:
                     raise _SQLiteBackupTimeout(f"database remained locked for {timeout_seconds:g} seconds")

@@ -343,12 +343,18 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
     except (ValueError, RuntimeError, OSError):
         # RuntimeError: unexpandable ``~`` (no resolvable HOME).
         return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+    if raw.is_absolute():
+        lexical = Path(os.path.abspath(raw))
+        path = raw.resolve()
+    else:
+        lexical = Path(os.path.abspath(scripts_dir / raw))
+        path = (scripts_dir / raw).resolve()
 
     # Traversal / absolute-path / symlink escape guard — MUST stay inside HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # One exception (fork t_04822736): an entry that lives lexically in a named profile's scripts
+    # dir and is a symlink into the fleet-shared <root>/scripts is admitted — profiles legitimately
+    # share scripts, and refusing that symlink left a job failing identically every tick for 19 h.
+    if not _sched._script_path_admitted(path, lexical, scripts_dir, _sched._get_hermes_home()):
         return None, (
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
@@ -429,9 +435,25 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
+# Fleet default GitHub lane for cron script children (fork t_f0780685). A plain script that ran
+# a bare `gh` without naming a lane spent the shared stored login. When this home ships the gh
+# shim (var/gh-shim/gh), the child gets the shim first on PATH plus a DEFAULT lane the shim uses
+# only when the script sets no lane itself (export / setdefault still win), and the script's
+# path so the shim keeps audited stored-login sites on the stored login. No shim -> the env is
+# untouched. Tests import both names from here; the facade (cron.scheduler) carries the same
+# constant for github-apps-lint.
+CRON_SCRIPT_DEFAULT_GH_LANE = "watchers"
+
+
+def _apply_cron_default_gh_lane(env: dict, script: Path) -> None:
+    return _sched._apply_cron_default_gh_lane(env, script)
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    *, timeout_seconds: Optional[int] = None, job_name: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -442,12 +464,30 @@ def _run_job_script(
     Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
-    ``.py`` scripts (#8714).
+    ``.py`` scripts (#8714). timeout_seconds: per-job ceiling (``_job_script_kwargs``) that may
+    only LOWER the global ``cron.script_timeout_seconds`` cap. job_name / job_id: for the timeout
+    log line and the shutdown-kill re-fire flag.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
+    # Refuse to START new script work once the gateway has begun draining: the ticker could
+    # otherwise dispatch a fresh long-running script a second before SIGTERM and hand the drain
+    # brand-new work to wait out (fork #1307).
+    if _sched.is_shutting_down():
+        return False, (
+            f"Skipped: cron scheduler is shutting down (not starting {path.name})"
+        )
+    # The global cap is the hard ceiling; a per-job ceiling may only LOWER it (a 15-min job
+    # with a 2 h ceiling otherwise piles up overlapping wedged instances, fork #1027).
     script_timeout = _get_script_timeout()
+    if timeout_seconds is not None:
+        try:
+            _job_timeout = int(timeout_seconds)
+        except (TypeError, ValueError):
+            _job_timeout = 0
+        if _job_timeout > 0:
+            script_timeout = min(script_timeout, _job_timeout)
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -479,6 +519,20 @@ def _run_job_script(
         # in terminal.env_passthrough from that scope (#114209). The factory snapshots the process
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
+        # A script child is a plain script, not an agent process. The gateway advertises itself
+        # via the agent markers in its OWN os.environ (gateway.run.main), so without this every
+        # cron script inherited them and fleet tooling keyed on them (the gh shim's profile-wins
+        # lane resolution) misclassified laned no_agent crons as the gateway profile
+        # (t_7fee0f83). Any agent a script launches re-advertises itself.
+        for _agent_marker in ("AI_AGENT", "HERMES_AGENT"):
+            env.pop(_agent_marker, None)
+        # Same reason for the gateway's agent.process_env_files overlay (the gh lane PATH shim +
+        # git credential helper, t_45c11886): a script child keeps the env it had before this
+        # gateway sourced those files.
+        from hermes_cli.process_env_files import strip_overlay
+
+        strip_overlay(env)
+        _apply_cron_default_gh_lane(env, path)
         env.update(env_overlay)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
@@ -487,30 +541,47 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
-        deadline = time.monotonic() + script_timeout
-        while True:
-            # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
-            # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
-            if cancel_event is not None and cancel_event.is_set():
-                _terminate_cron_script_tree(proc)
-                _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_cron_script_tree(proc)
-                _drain_script_pipes(proc)
-                # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
-                # reaches the script's own process group — a grandchild that called setsid (backgrounded
-                # shell jobs, watchdogs) escapes it and keeps running after the job reports failure (#71148
-                # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
-                # signalling, so own-session grandchildren are reached too — the unified deadline layer's
-                # tree-kill (#85147, d6a5cb9725).
-                return False, f"Script timed out after {script_timeout}s: {path}"
-            try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        # Registered so the shutdown drain can TERMINATE this script (see
+        # cron.scheduler.terminate_running_scripts); deregistered on EVERY exit so a later drain
+        # never signals a dead or recycled pid. start_new_session (POSIX) / the win32
+        # creationflags give the script its own group, so the drain never touches the gateway's.
+        _proc_key = id(proc)
+        with _sched._script_procs_lock:
+            _sched._active_script_procs[_proc_key] = proc
+        try:
+            _started = time.monotonic()
+            deadline = _started + script_timeout
+            while True:
+                # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
+                # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
+                if cancel_event is not None and cancel_event.is_set():
+                    _terminate_cron_script_tree(proc)
+                    _drain_script_pipes(proc)
+                    return False, "Script cancelled because cron fire ownership was lost"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_cron_script_tree(proc)
+                    _drain_script_pipes(proc)
+                    # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
+                    # reaches the script's own process group — a grandchild that called setsid (backgrounded
+                    # shell jobs, watchdogs) escapes it and keeps running after the job reports failure (#71148
+                    # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
+                    # signalling, so own-session grandchildren are reached too — the unified deadline layer's
+                    # tree-kill (#85147, d6a5cb9725).
+                    logger.warning(
+                        "PHASE=cron_script_timeout job=%s elapsed=%d timeout=%d script=%s",
+                        job_name or path.name, int(time.monotonic() - _started),
+                        script_timeout, path.name,
+                    )
+                    return False, f"Script timed out after {script_timeout}s: {path}"
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            with _sched._script_procs_lock:
+                _sched._active_script_procs.pop(_proc_key, None)
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
@@ -526,6 +597,18 @@ def _run_job_script(
 
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
+            if (
+                job_id
+                and _sched.is_shutting_down()
+                and _sched._is_shutdown_kill_returncode(proc.returncode)
+            ):
+                # Killed by the gateway shutdown drain (or its backstop), not a script failure:
+                # flag it so run_one_job re-queues one fire (fork #462/#1429).
+                with _sched._script_procs_lock:
+                    _sched._restart_killed_job_ids.add(str(job_id))
+                parts.append(
+                    "Killed by gateway shutdown mid-run; eligible for one "
+                    "re-fire after restart.")
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -558,9 +641,11 @@ def _run_job_script_with_claim_heartbeat(
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
+    script_kwargs = _sched._job_script_kwargs(job)
+
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), **script_kwargs)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

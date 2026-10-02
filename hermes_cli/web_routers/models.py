@@ -162,7 +162,10 @@ async def get_model_options(
             with _config_profile_scope(profile):
                 return build_model_options_payload(
                     load_picker_context(), explicit_only=bool(explicit_only),
-                    include_unconfigured=bool(include_unconfigured), refresh=bool(refresh))
+                    include_unconfigured=bool(include_unconfigured), refresh=bool(refresh),
+                    # fork parity: honour the user's model.picker hide/order config on desktop
+                    # picker opens (see build_models_payload).
+                    apply_picker_prefs=True)
 
         return await run_in_threadpool(_build_payload_scoped)
 

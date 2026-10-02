@@ -57,6 +57,48 @@ def _persistence_explanation_key(cause: Optional[str]) -> str:
     return f"explainer.persistence.{cause}" if cause in _PERSISTENCE_CAUSES else "explainer.persistence.default"
 
 
+_PERSISTENCE_EVIDENCE_BASE = (
+    "the turn was stopped because session storage could not be written (the transcript would "
+    "have been lost on restart). "
+)
+_PERSISTENCE_EVIDENCE_RESTART = (
+    "The gateway shut down or restarted mid-turn, so the append could not complete. Nothing was "
+    "lost — send your message again now that it is back up."
+)
+
+
+def _persistence_evidence_explanation(agent: Any) -> str:
+    """Fork evidence path (2026-08-10 incident): never assert a cause that was not measured.
+
+    Prefer, in order: a REAL disk-full signal (``is_disk_full_error``, the same detector the TUI
+    gateway uses), then a restart landing mid-turn, then an honest "not identified" that hands
+    over the real exception text.
+    """
+    exc = getattr(agent, "_session_persistence_error", None)
+    try:
+        from hermes_state_errors import is_disk_full_error
+        disk_full = is_disk_full_error(exc)
+    except Exception:
+        disk_full = False
+    if disk_full:
+        return _PERSISTENCE_EVIDENCE_BASE + (
+            "The disk is full — free some space, then send your message again."
+        )
+    if bool(getattr(agent, "_shutdown_landed_mid_turn", False)):
+        return _PERSISTENCE_EVIDENCE_BASE + _PERSISTENCE_EVIDENCE_RESTART
+    try:
+        from gateway.shutdown_forensics import shutdown_landed_within
+        if shutdown_landed_within(300.0):
+            return _PERSISTENCE_EVIDENCE_BASE + _PERSISTENCE_EVIDENCE_RESTART
+    except Exception:
+        pass
+    detail = f" ({type(exc).__name__}: {exc})" if exc is not None else ""
+    return _PERSISTENCE_EVIDENCE_BASE + (
+        f"The cause was not identified{detail}. Check the disk (`df -h`), state.db permissions, "
+        "and whether the gateway restarted mid-turn, then send your message again."
+    )
+
+
 def _file_mutation_identity(path: str, task_id: Optional[str]) -> str:
     """One key per on-disk target: the file tools' task-resolved absolute path, case-folded
     on case-insensitive hosts. A failure recorded as ``notes.md`` and the write that later
@@ -232,15 +274,24 @@ class TurnExplainersMixin:
 
     @staticmethod
     def _format_turn_completion_explanation(
-        turn_exit_reason: str, persistence_cause: Optional[str] = None, db_path=None, model: str = "",
+        turn_exit_reason: str, cause_or_agent: Any = None, db_path=None, model: str = "",
+        *, persistence_cause: Optional[str] = None,
     ) -> str:
         """User-facing explanation for an abnormal turn ending, or "" for normal / unknown reasons.
 
         ``text_response(...)`` is the healthy terminal; unknown/diagnostic-only reasons (e.g.
         ``guardrail_halt``, which surfaces its own message) are not second-guessed.
+
+        The second parameter carries EITHER the classified persistence cause string
+        (``hermes_state.classify_persistence_error``) OR the live agent (fork evidence-based
+        diagnosis: ``is_disk_full_error`` + restart-mid-turn forensics, 2026-08-10 incident). Both
+        shapes are accepted so every existing caller and both test contracts keep working.
         """
         if not turn_exit_reason:
             return ""
+        if persistence_cause is None and isinstance(cause_or_agent, str):
+            persistence_cause = cause_or_agent
+        agent = cause_or_agent if not isinstance(cause_or_agent, str) else None
         reason = str(turn_exit_reason)
         if reason.startswith("text_response"):
             return ""
@@ -269,7 +320,10 @@ class TurnExplainersMixin:
 
                 fill["db_path"] = str(db_path or _default_db_path())
                 fill["backups_dir"] = str(get_default_hermes_root() / "backups")
-            body = t(_persistence_explanation_key(persistence_cause), **fill)
+            if agent is not None and persistence_cause not in _PERSISTENCE_CAUSES:
+                body = _persistence_evidence_explanation(agent)
+            else:
+                body = t(_persistence_explanation_key(persistence_cause), **fill)
         else:
             body = None
         return t("explainer.no_reply_prefix") + body if body else ""

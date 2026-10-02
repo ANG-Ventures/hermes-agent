@@ -40,9 +40,17 @@ class ActivityTrackingMixin:
 
     def _touch_activity(
         self, desc: str, *, provenance: Optional[ActivityProvenance] = None,
-        force_persist: bool = False,
+        force_persist: bool = False, progress: bool = True, heartbeat: bool = False,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
+
+        ``progress=False`` marks a pure wait ticker (e.g. "still waiting on the provider"): it refreshes
+        liveness but not ``_last_progress_ts``, which the kanban stall detector reads to tell a live
+        wrapper from a progressing loop (t_7d034e3b). ``heartbeat=True`` marks a periodic liveness tick
+        fired while ONE tool call is still running; it still advances ``_last_progress_ts`` (a running
+        tool is progress for the stall detector) but neither it nor a ``progress=False`` ticker advances
+        ``_last_progress_event_ts``, which the delegate hung-child detector keys on
+        (docs/dev/delegate-child-lifecycle.md).
 
         Bumps a monotonic generation under the activity lock so the watchdog can bind a stall observation to
         the exact ``(generation, timestamp)`` it sampled. Also bridges (rate-limited, best-effort) to the
@@ -66,6 +74,10 @@ class ActivityTrackingMixin:
                 getattr(self, "_turn_liveness_activity_generation", 0) + 1
             )
             self._last_activity_ts = time.time()
+            if progress:
+                self._last_progress_ts = self._last_activity_ts
+                if not heartbeat:
+                    self._last_progress_event_ts = self._last_activity_ts
             self._last_activity_desc = bound_activity_description(desc)
             self._last_activity_provenance = resolved_provenance
             # Real progress invalidates a reserved abort claim; an in-flight watchdog interrupt must abandon
@@ -77,7 +89,9 @@ class ActivityTrackingMixin:
                 from tools.kanban_tools import (
                     heartbeat_current_worker_from_env, inject_new_comments_from_env
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(
+                    progress_at=getattr(self, "_last_progress_ts", None),
+                )
                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
                 inject_new_comments_from_env(self)
         if force_persist or is_terminal_compression_provenance(resolved_provenance):
@@ -102,11 +116,14 @@ class ActivityTrackingMixin:
         if not callable(touch):
             return
         from agent.session_activity import (
-            SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS, normalize_activity_provenance
+            SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS, SESSION_ACTIVITY_PERSIST_NEVER,
+            normalize_activity_provenance,
         )
 
         now_mono = time.monotonic()
-        last_mono = getattr(self, "_session_activity_last_persist_mono", 0.0)
+        last_mono = getattr(
+            self, "_session_activity_last_persist_mono", SESSION_ACTIVITY_PERSIST_NEVER
+        )
         if (now_mono - last_mono) < SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS:
             return
         self._session_activity_last_persist_mono = now_mono

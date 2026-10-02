@@ -35,6 +35,10 @@ class AssembledRequest:
     approx_tokens: Any
     request_pressure_tokens: Any
     total_chars: Any
+    # Fork (Blackbox): char/4 breakdown of the EXACT payload being sent (fixed system+tool schemas vs
+    # history/tool results); attached to the per-call ``_turn_calls`` entry, the final call's becomes
+    # the turn's recorded breakdown. ``None`` when the breakdown failed (telemetry never breaks the loop).
+    _call_composition: Any = None
 
 
 def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original_user_message: Any) -> None:
@@ -260,7 +264,18 @@ def assemble_api_request(
         request_pressure_tokens = _pressure_with_real_floor(
             agent.context_compressor, request_pressure_tokens
         )
+    try:
+        from agent.conversation_loop import _resolve_skills_prompt_text
+        from agent.model_metadata import compose_request_breakdown
+
+        _call_composition = compose_request_breakdown(
+            api_messages, system_prompt=effective_system or "",
+            skills_prompt=_resolve_skills_prompt_text(agent), tools=agent.tools or None,
+        )
+    except Exception:
+        _call_composition = None
     return AssembledRequest(
         "fallthrough", api_messages, tools_for_api, _moa_prepared_request,
         pending_moa_prepared_request, approx_tokens, request_pressure_tokens, approx_tokens * 4,
+        _call_composition,
     )

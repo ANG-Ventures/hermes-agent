@@ -28,7 +28,8 @@ from gateway.restart import (
 )
 from gateway.run_shutdown import _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
-    DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
+    DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+    DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
 )
 from typing import Any, Dict, Optional, Tuple
@@ -60,61 +61,177 @@ class GatewayStartupMixin:
 
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
+        resume_reason: Optional[str] = None,
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
-        until it finishes, else a user message can race it)."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
+        until it finishes, else a user message can race it).
+
+        The session is marked as running a boot-resume recovery turn (``_startup_resume_active``) so
+        the busy-input path demotes ``interrupt`` to ``queue``: a user message seconds after a restart
+        must not abort the recovery turn at iteration 1 (2026-07-10 live incident)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL, _auto_resume_max_attempts
+        active = getattr(self, "_startup_resume_active", None)
+        if active is None:
+            active = self._startup_resume_active = set()
+        active.add(session_key)
+        dispatched_ok = False
+        # Explain an UNCLEAN prior death BEFORE the resumed turn runs: the only surface left when no
+        # drain ran (watchdog os._exit / SIGKILL). Best-effort, never raises.
+        await self._maybe_notify_unclean_restart(adapter, event, session_key, resume_reason)
         try:
             await adapter.handle_message(event)
+            dispatched_ok = True
+            # Scheduling is not dispatch: cancelled wrappers cost no credit; charge only once the
+            # adapter accepted the turn.
+            if _auto_resume_max_attempts() > 0:
+                try:
+                    await asyncio.to_thread(
+                        self._get_auto_resume_attempt_store().record_session_attempt, session_key,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Auto-resume attempt accounting failed for %s: %s", session_key, exc)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
             if task is not None:
                 await asyncio.shield(task)
         finally:
-            # Release the pre-claimed slot if handle_message raised before _handle_message took ownership.
+            # Marker ownership belongs to the TURN lifecycle (_release_running_agent_state clears it
+            # at turn exit); the adapter task awaited above is NOT the agent turn, which can start
+            # ~40ms after this finally runs. Discard here only when the slot is EMPTY.
+            if self._running_agents.get(session_key) is None:
+                active.discard(session_key)
+                getattr(self, "_startup_resume_modes", {}).pop(session_key, None)
+            # Release the pre-claimed slot (the resume event self-bounces off its own pre-claim and the
+            # adapter's late-arrival drain re-dispatches it AFTER this). On a SUCCESSFUL dispatch the
+            # protection marker must stay armed for that incoming recovery turn (AEGIS-RIG 2026-07-11);
+            # on dispatch FAILURE nothing will ever run — clear everything.
             _pre_state = self._peek_session_state(session_key)
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(session_key)
+                self._release_running_agent_state(
+                    session_key, clear_startup_resume_protection=not dispatched_ok,
+                )
+                if not dispatched_ok:
+                    active.discard(session_key)
+                    getattr(self, "_startup_resume_modes", {}).pop(session_key, None)
+                    self._clear_pending_boot_resume(session_key)
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
-        queue.append(event)
         with suppress(Exception):
-            source = event.source
+            setattr(event, "_hermes_startup_restore_queued_at", time.monotonic())
+        queue.append(event)
+        source = getattr(event, "source", None)
+        with suppress(Exception):
             logger.info(
                 "Queued inbound message during gateway startup restore: platform=%s chat=%s",
                 source.platform.value if source and source.platform else "unknown",
                 source.chat_id if source else "unknown",
             )
+        # Acknowledge ONCE per chat so a queued message (esp. a slash command) does not look dead until
+        # the gate releases; fire-and-forget, and a feedback nicety must never break queuing.
+        try:
+            self._maybe_ack_startup_restore_queue(source)
+        except Exception as e:
+            logger.debug("startup-restore ack scheduling failed: %s", e)
 
     async def _drain_startup_restore_queue(self) -> int:
-        """Replay inbound messages queued while startup auto-resume ran."""
+        """Replay queued inbound without surrendering ownership on failure.
+
+        Runs only after the global gate opens. The queue head is removed only after ``handle_message``
+        accepts it: an unavailable adapter or a dispatch failure retains ownership and retries with
+        backoff (warnings rate-limited to one per minute per event). Unrelated sessions may pass a
+        blocked session, but FIFO within one session is preserved."""
         drained = 0
-        queue = getattr(self, "_startup_restore_queue", None) or []
-        while queue:
-            event = queue.pop(0)
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            return 0
+        retry_delay = 0.1
+        last_warning_at: Dict[int, float] = {}
+        last_phase_warning_at: Dict[int, float] = {}
+
+        def _session_key(ev) -> Optional[str]:
+            src = getattr(ev, "source", None)
+            if src is None:
+                return None
             try:
-                source = getattr(event, "source", None)
-                adapter = self._intake_adapter_for(source)
-                if adapter is None:
-                    logger.debug(
-                        "Dropping startup-restore queued message: adapter unavailable for %s",
-                        getattr(getattr(source, "platform", None), "value", None),
-                    )
-                    continue
-                # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
-                with suppress(Exception):
-                    setattr(event, "_hermes_startup_restore_replay", True)
-                await adapter.handle_message(event)
+                return self._session_key_for_source(src)
             except Exception:
-                # One bad replay must not abort the drain: the remaining queued
-                # events still deserve their turn, and a raise here used to skip
-                # the gate release in _finish_startup_restore entirely.
-                logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
+                return None
+
+        def _promote_other_session(blocked_event: MessageEvent) -> bool:
+            blocked_key = _session_key(blocked_event)
+            if blocked_key is None:
+                return False
+            for index in range(1, len(queue)):
+                candidate_key = _session_key(queue[index])
+                if candidate_key is not None and candidate_key != blocked_key:
+                    queue.insert(0, queue.pop(index))
+                    return True
+            return False
+
+        def _rate_limited_log(table: Dict[int, float], ev, now: float):
+            last = table.get(id(ev))
+            emit = last is None or now - last >= 60.0
+            if emit:
+                table[id(ev)] = now
+            return (logger.warning if emit else logger.debug), emit
+
+        def _log_retry(reason: str, retry_event: MessageEvent, *, failed: bool) -> None:
+            now = time.monotonic()
+            log, emit = _rate_limited_log(last_warning_at, retry_event, now)
+            queued_at = getattr(retry_event, "_hermes_startup_restore_queued_at", now)
+            retry_source = getattr(retry_event, "source", None)
+            log(
+                "Startup-restore replay deferred: reason=%s platform=%s chat=%s queue_depth=%d age=%.1fs "
+                "retry_in=%.1fs", reason,
+                getattr(getattr(retry_source, "platform", None), "value", "unknown"),
+                getattr(retry_source, "chat_id", "unknown"), len(queue), max(0.0, now - queued_at),
+                retry_delay, exc_info=failed and emit,
+            )
+
+        while queue:
+            event = queue[0]
+            source = getattr(event, "source", None)
+            adapter = self._intake_adapter_for(source)
+            if adapter is None:
+                _log_retry("adapter unavailable", event, failed=False)
+                _promote_other_session(event)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 5.0)
                 continue
+            # Mark the replay so _handle_message does not re-queue it (the gate is already open).
+            with suppress(Exception):
+                setattr(event, "_hermes_startup_restore_replay", True)
+            replay_started = time.monotonic()
+            phase_log, _ = _rate_limited_log(last_phase_warning_at, event, replay_started)
+            plat = getattr(getattr(source, "platform", None), "value", "unknown")
+            chat = getattr(source, "chat_id", "unknown")
+            phase_log("PHASE=startup_restore_replay_enter platform=%s chat=%s queue_remaining=%d", plat, chat, len(queue))
+            try:
+                await adapter.handle_message(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log_retry("dispatch raised before acceptance", event, failed=True)
+                _promote_other_session(event)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 5.0)
+                continue
+            queue.pop(0)
+            spool_path = getattr(event, "_hermes_restart_followup_path", None)
+            if spool_path:
+                from gateway.fork_ext.restart_followups import acknowledge_followup
+                await asyncio.to_thread(acknowledge_followup, spool_path)
+            last_warning_at.pop(id(event), None)
+            last_phase_warning_at.pop(id(event), None)
+            logger.warning(
+                "PHASE=startup_restore_replay_exit platform=%s chat=%s elapsed=%.3fs",
+                plat, chat, time.monotonic() - replay_started,
+            )
             drained += 1
+            retry_delay = 0.1
         return drained
 
     @staticmethod
@@ -214,36 +331,80 @@ class GatewayStartupMixin:
 
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
-        release + drain inbound. On timeout the gate opens and resume turns finish in the background
-        (NOT cancelled) — safe because ``_schedule_resume_pending_sessions`` claims each
-        ``_running_agents`` slot SYNCHRONOUSLY first, so drained inbound queues behind."""
+        release the gate and schedule the queued replay. On timeout the gate opens and resume turns
+        finish in the background (NOT cancelled) — safe because ``_schedule_resume_pending_sessions``
+        claims each ``_running_agents`` slot SYNCHRONOUSLY first, so drained inbound queues behind.
+        The gate is released in ``finally`` and BEFORE queued replay (adapter hooks may block, and
+        queued replay must never extend the fleet-wide outage); the replay itself runs on its own
+        owner task so a blocked platform cannot pin startup. If the absolute watchdog already released
+        the gate, it owns the replay — never race it."""
         from gateway.run import _startup_restore_drain_timeout_secs
-        drained = 0
+        if not getattr(self, "_startup_restore_in_progress", False):
+            self._startup_restore_tasks = []
+            return
+        timeout = _startup_restore_drain_timeout_secs()
+        tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
+        logger.warning(
+            "PHASE=startup_restore_finish_enter tasks=%d queued=%d timeout=%.3fs",
+            len(tasks), len(getattr(self, "_startup_restore_queue", []) or []), timeout,
+        )
+        owns_gate = False
         try:
-            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
             if tasks:
+                wait_started = time.monotonic()
                 # Tasks outliving the gate get a late-failure callback (their done-callback only discards them).
                 done = await self._wait_bounded_or_release(
-                    set(tasks), _startup_restore_drain_timeout_secs(),
+                    set(tasks), timeout,
                     "Startup-restore gate released after %.0fs with %d boot auto-resume turn(s) "
                     "still running; draining inbound queue now (resume slots already claimed, so no "
                     "duplicate agents). Slow turn(s) continue in the background.",
                     "background startup auto-resume task failed after gate release", level=logging.DEBUG,
                 )
+                logger.warning(
+                    "PHASE=startup_restore_wait_exit done=%d pending=%d elapsed=%.3fs",
+                    len(done), len(tasks) - len(done), time.monotonic() - wait_started,
+                )
                 report = self._late_failure_callback("startup auto-resume task failed", level=logging.DEBUG)
                 for task in done:
                     report(task)
-            self._startup_restore_tasks = []
             # Warm the turn machinery BEFORE the queue drains: inbound turns must not build skeleton prompts.
             await self._await_startup_warmup()
-            drained = await self._drain_startup_restore_queue()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Startup-restore wait failed; releasing inbound gate", exc_info=True)
         finally:
-            # The inbound gate must open no matter what raised above it (bounded wait, warm-up,
-            # drain): a stuck _startup_restore_in_progress would queue every non-internal inbound
-            # forever (run_inbound.py reads this flag first). See #116514.
-            self._startup_restore_in_progress = False
-        if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+            # The inbound gate must open no matter what raised above it: a stuck
+            # _startup_restore_in_progress would queue every non-internal inbound forever
+            # (run_inbound.py reads this flag first). See #116514.
+            owns_gate = bool(getattr(self, "_startup_restore_in_progress", False))
+            self._startup_restore_tasks = []
+            if owns_gate:
+                self._startup_restore_in_progress = False
+                logger.warning(
+                    "PHASE=startup_restore_gate_flip state=released caller=finish queued=%d",
+                    len(getattr(self, "_startup_restore_queue", []) or []),
+                )
+                watchdog = getattr(self, "_startup_restore_watchdog_task", None)
+                if watchdog is not None and watchdog is not asyncio.current_task():
+                    watchdog.cancel()
+        if owns_gate:
+            self._schedule_startup_restore_queue_drain()
+
+    @staticmethod
+    def _log_background_resume_result(task: "asyncio.Task") -> None:
+        """Done-callback for a boot-resume turn that outlived the startup-restore gate: a late failure
+        is logged instead of being swallowed once the task leaves ``_background_tasks``; cancellation
+        (shutdown) is expected and not an error."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            from gateway import run as _run  # the facade logger is the seam fork tests patch
+            _run.logger.log(
+                logging.DEBUG, "background startup auto-resume task failed after gate release",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
@@ -530,29 +691,65 @@ class GatewayStartupMixin:
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
-        enumeration failed or the restart-loop breaker tripped for this boot."""
+        enumeration failed or the restart-loop breaker owns the break for this boot.
+
+        A session that is otherwise resumable but whose ``resume_reason`` is NOT recognized is the
+        founding-bug signature (silently dropped from startup auto-resume, never wakes on its own), so
+        it is warned about; structural deferral (suspended, no origin) stays silent."""
+        from gateway.run import _auto_resume_max_attempts, _restart_loop_threshold
+        # Resume-request DROPBOX: external tools (the safe-restart watcher) ask for a resume via atomic
+        # request files instead of editing sessions.json (last-writer-wins clobber race). Consumed
+        # BEFORE the snapshot so a request flows through the same gates as a gateway-marked session.
+        # Fail-open: a broken dropbox never blocks resume of gateway-marked sessions.
+        self._sweep_resume_requests()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
-                ]
+                candidates, unknown = [], []
+                for entry in self.session_store._entries.values():  # noqa: SLF001
+                    if not entry.resume_pending or entry.suspended or entry.origin is None:
+                        continue
+                    if platform is not None and entry.origin.platform != platform:
+                        continue
+                    if entry.resume_reason in self._AUTO_RESUME_REASONS:
+                        candidates.append(entry)
+                    else:
+                        unknown.append((entry.session_key, entry.resume_reason))
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
-        # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
-        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
+        for key, reason in unknown:
+            logger.warning(
+                "Auto-resume skipped session %s: resume_reason %r is not in _AUTO_RESUME_REASONS %s — the "
+                "session stays resume_pending and will only resume on the next inbound message (not at "
+                "startup).", key, reason, sorted(self._AUTO_RESUME_REASONS),
+            )
+        # Restart-loop breaker: only boots WITH restart-interrupted sessions count, recorded ONCE per
+        # boot (reconnect passes re-check without re-recording). The per-session F2 replay-mark →
+        # SUSPEND breaker is the PRIMARY mechanism (it suspends the ONE looping session while healthy
+        # ones still resume); this global guard only short-circuits when F2 cannot act, and the log
+        # names which mechanism owns the break (``deferred_to``) so an operator can tell a working
+        # breaker from a broken one.
         if candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window, max_gap_seconds=_max_gap):
-                    return None
+                if not getattr(self, "_restart_loop_guard_recorded_this_boot", False):
+                    tripped = _rlg.check_and_record(_max_restarts, _window, max_gap_seconds=_max_gap)
+                    self._restart_loop_guard_recorded_this_boot = True
+                else:
+                    tripped = _rlg.is_restart_loop_tripped(_max_restarts, _window, max_gap_seconds=_max_gap)
+                if tripped:
+                    f2_armed = _restart_loop_threshold() > 0
+                    logger.warning(
+                        "Restart-loop guard tripped at boot: deferred_to=%s (per-session replay breaker "
+                        "threshold=%s, per-session auto-resume cap=%s). Auto-resume proceeds for sessions "
+                        "that are still under both per-session limits.",
+                        "per_session_breaker" if f2_armed else "global_guard",
+                        _restart_loop_threshold(), _auto_resume_max_attempts(),
+                    )
+                    if not f2_armed:
+                        return None
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
@@ -572,19 +769,113 @@ class GatewayStartupMixin:
             logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
         return False
 
+    def _boot_resume_skip_cause(self, entry, source) -> Optional[str]:
+        """Why ``entry`` must NOT get an unprompted boot resume, or None to proceed.
+
+        ``no_unfinished_work`` / ``user_stopped``: the persisted tail proves the previous turn already
+        completed (the pre-drain ``resume_pending`` HEDGE survives a SIGKILL mid-drain), so the marker is
+        CLEARED — a finished turn has nothing to preserve and the next real message continues the same
+        transcript. Fails OPEN: an unread tail is absent from ``_boot_resume_has_work`` and resumes.
+
+        ``attempt_cap`` / ``cap_unaccountable``: the per-SESSION budget that survives boots (a session
+        re-amputated every boot shows a fresh tail and rowid to every per-turn gate; one dead Discord
+        session replayed ~450k chars ten times on 2026-09-20). The marker is LEFT SET: by construction
+        the session still has unfinished work, and ``resume_pending`` is the ONLY carrier of the user's
+        recovery context (reason/kind/handoff + the reason-aware prompt on the next real message).
+        An unaccountable store (unwritable) denies too, so the denial evaporates once the disk is fixed."""
+        from gateway.run import _auto_resume_max_attempts
+        if getattr(self, "_boot_resume_has_work", {}).get(entry.session_key, True) is False:
+            cause = "user_stopped" if getattr(entry, "user_stopped_at", None) is not None else "no_unfinished_work"
+            logger.warning(
+                "PHASE=boot_resume_skipped key=%s reason=%s platform=%s kind=%s cause=%s",
+                entry.session_key, getattr(entry, "resume_reason", None),
+                getattr(getattr(source, "platform", None), "value", None), getattr(entry, "resume_kind", None), cause,
+            )
+            try:
+                self.session_store.clear_resume_pending(entry.session_key)
+            except Exception as exc:
+                logger.debug("clear_resume_pending after boot-resume skip failed for %s: %s", entry.session_key, exc)
+            return cause
+        max_attempts = _auto_resume_max_attempts()
+        if max_attempts <= 0:
+            return None
+        attempt_count: Optional[int] = 0
+        try:
+            allowed, attempt_count = self._get_auto_resume_attempt_store().session_resume_verdict(
+                entry.session_key, max_attempts)
+        except Exception as exc:  # noqa: BLE001 — never abort a boot on this
+            logger.debug("Auto-resume attempt cap check failed for %s: %s", entry.session_key, exc)
+            allowed, attempt_count = False, None
+        if allowed:
+            return None
+        cause = "attempt_cap" if attempt_count is not None else "cap_unaccountable"
+        logger.warning(
+            "PHASE=boot_resume_skipped key=%s reason=%s platform=%s kind=%s cause=%s attempts=%s max=%s",
+            entry.session_key, getattr(entry, "resume_reason", None),
+            getattr(getattr(source, "platform", None), "value", None), getattr(entry, "resume_kind", None),
+            cause, attempt_count if attempt_count is not None else "unknown", max_attempts,
+        )
+        return cause
+
+    def _boot_resume_disposition(self, entry, requested_mode: str) -> tuple:
+        """Schedule-time disposition of one synthetic resume: ``(mode, fallback_reason,
+        pending_attempt, tail_override_reason)``. SELF is a fresh synthesized handoff and auto-resumes
+        without consuming the SIBLING once-ever credit; a SIBLING turn auto-continues only when its
+        persisted tail was classified eligible (``always`` overrides a tail veto by operator policy) and
+        its stable assistant rowid has not been continued before. The credit is consumed by the caller
+        only AFTER scheduling succeeds."""
+        from gateway.run import _RESUME_UNATTENDED_MODES
+        mode, fallback, pending, tail_override = "prompt", None, None, None
+        if requested_mode not in _RESUME_UNATTENDED_MODES:
+            return mode, fallback, pending, tail_override
+        if getattr(entry, "resume_kind", None) == "self":
+            return "auto", None, None, None
+        assessment = getattr(self, "_auto_resume_decisions", {}).get(entry.session_key)
+        if assessment is None:
+            return mode, "the persisted tail was not classified at schedule time", None, None
+        if not assessment.auto_eligible and not (requested_mode == "always" and assessment.turn_rowid is not None):
+            return mode, assessment.reason or "the persisted tail was ambiguous", None, None
+        if not assessment.auto_eligible:
+            tail_override = assessment.reason or "the persisted tail was ambiguous"
+        elif assessment.turn_rowid is None:
+            return mode, "the interrupted turn had no stable assistant rowid", None, None
+        attempts = self._get_auto_resume_attempt_store()
+        if attempts.has_attempt(entry.session_key, assessment.turn_rowid):
+            return mode, "this interrupted turn was already auto-continued once", None, None
+        return "auto", None, (attempts, assessment.turn_rowid), tail_override
+
+    def _get_startup_resume_pool(self):
+        """Lazily built pool pacing boot resumes. Default UNBOUNDED (Ace ruling 2026-09-23): every
+        restart-interrupted session resumes at once; a positive ``gateway.startup_resume_concurrency``
+        is an explicit operator throttle."""
+        pool = getattr(self, "_startup_resume_pool", None)
+        if pool is None:
+            from gateway.turn_admission import StartupResumePool
+            concurrency = getattr(self.config, "startup_resume_concurrency", None)
+            if concurrency is not None and (type(concurrency) is not int or concurrency <= 0):
+                logger.warning("Invalid gateway.startup_resume_concurrency value %r; using unbounded", concurrency)
+                concurrency = None
+            pool = self._startup_resume_pool = StartupResumePool(concurrency)
+        return pool
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
         from gateway.run import (
-            _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+            _AGENT_PENDING_SENTINEL, _RESUME_UNATTENDED_MODES, _auto_continue_freshness_window,
+            _is_fresh_gateway_interruption, _resume_interrupted_turns_mode,
         )
         window = _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
             return 0
-        scheduled = 0
+        scheduled = skipped = 0
+        requested_mode = _resume_interrupted_turns_mode()
+        startup_modes = getattr(self, "_startup_resume_modes", None)
+        if startup_modes is None:
+            startup_modes = self._startup_resume_modes = {}
         for entry in candidates:
             # Epoch math: the marker was stamped naive-local by the previous process, possibly
             # on the other side of a DST change; wall-clock subtraction is off by the shift.
@@ -604,23 +895,70 @@ class GatewayStartupMixin:
                 continue
             if not self._resume_owner_authorized(entry.session_key, source):
                 continue
+            if self._boot_resume_skip_cause(entry, source) is not None:
+                skipped += 1
+                continue
+            resume_mode, fallback_reason, pending_attempt, tail_override = (
+                self._boot_resume_disposition(entry, requested_mode))
+            startup_modes[entry.session_key] = {"mode": resume_mode, "reason": fallback_reason}
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
             _resume_state = self._session_state(entry.session_key)
             _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
             _resume_state.turn.started_ts = time.time()
+            self._resumed_this_boot.add(entry.session_key)
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
-            task = self._retain_background_task(
-                asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
+            resume_reason = getattr(entry, "resume_reason", None)
+            task = self._get_startup_resume_pool().submit(
+                self._run_startup_resume_event, adapter, event, entry.session_key, resume_reason,
             )
+            # Shutdown must tell a resume whose turn NEVER STARTED (cancel + re-mark) from one that is
+            # running (drain normally): the create_task -> turn-body gap reached ~590s on 2026-09-20.
+            self._register_pending_boot_resume(entry.session_key, resume_reason, task)
+            if pending_attempt is not None:
+                attempts, turn_rowid = pending_attempt
+                if not attempts.consume(entry.session_key, turn_rowid):
+                    resume_mode, fallback_reason = "prompt", "the durable auto-resume attempt could not be recorded"
+                    startup_modes[entry.session_key] = {"mode": resume_mode, "reason": fallback_reason}
+            # Restart-continuity audit breadcrumb (WARNING so it survives a raised log threshold);
+            # fail-open: a broken log sink must not abort the resume.
+            try:
+                from gateway.auto_resume import resume_kind_for_reason
+                kind = getattr(entry, "resume_kind", None) or resume_kind_for_reason(resume_reason)
+                plat = getattr(getattr(source, "platform", None), "value", None)
+                if resume_mode == "auto":
+                    logger.warning(
+                        "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s kind=%s mode=auto%s",
+                        entry.session_key, resume_reason, plat, kind,
+                        f" tail_override={tail_override}" if tail_override else "",
+                    )
+                elif requested_mode in _RESUME_UNATTENDED_MODES:
+                    logger.warning(
+                        "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s kind=%s mode=prompt "
+                        "fallback_reason=%s", entry.session_key, resume_reason, plat, kind,
+                        fallback_reason or "unspecified",
+                    )
+                else:
+                    logger.warning(
+                        "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s kind=%s",
+                        entry.session_key, resume_reason, plat, kind,
+                    )
+            except Exception:
+                pass
+            self._retain_background_task(task)
             if getattr(self, "_startup_restore_in_progress", False):
                 tasks = getattr(self, "_startup_restore_tasks", None)
                 if tasks is None:
                     tasks = self._startup_restore_tasks = []
                 tasks.append(task)
             scheduled += 1
+        pool = getattr(self, "_startup_resume_pool", None)
+        if scheduled and pool is not None and pool.pending:
+            logger.warning("PHASE=boot_resume_throttled pending=%s concurrency=%s", len(pool.pending), pool.concurrency)
+        if skipped:
+            logger.info("Skipped auto-resume for %d session(s) with no unfinished work or over the per-session cap", skipped)
         if scheduled:
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
@@ -684,6 +1022,15 @@ class GatewayStartupMixin:
                     )),
                     max_strikes=int(getattr(
                         config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
+                    )),
+                    # Fork: hold the exit-75 verdict while the host is load-starved (gateway.config).
+                    starvation_load_factor=float(getattr(
+                        config, "liveness_starvation_load_factor",
+                        DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+                    )),
+                    starvation_max_hold_s=float(getattr(
+                        config, "liveness_starvation_max_hold_s",
+                        DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
                     )),
                 )
             except Exception:
@@ -1154,9 +1501,16 @@ class GatewayStartupMixin:
         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
             # Auto-suspend it so the user gets a clean slate on the next message. See #7536.
-            stuck = self._suspend_stuck_loop_sessions()
+            stuck = await asyncio.to_thread(self._suspend_stuck_loop_sessions)
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
+        # Reap F2 restart-initiator breadcrumbs from a prior boot or past the TTL: a crumb whose boot_id
+        # != current is from a restart that already happened, and a turn whose gate never ran would
+        # otherwise leave its crumb on disk.
+        with _log_suppressed(logging.DEBUG, "Restart-initiator breadcrumb sweep failed: %s"):
+            swept = self._sweep_restart_initiated_breadcrumbs()
+            if swept:
+                logger.info("Swept %d stale restart-initiator breadcrumb(s)", swept)
 
     async def _start_prefilter_platforms(self) -> Tuple[bool, int, list, list]:
         """Create + wire an adapter per enabled platform (no connects). Returns
@@ -1488,9 +1842,17 @@ class GatewayStartupMixin:
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
-        # auto-resume stays visible on the next user message.
-        self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
+        # auto-resume stays visible on the next user message. The binding sequence is
+        # prepare (deferred-restart reconciliation + off-loop tail classification) -> schedule -> finish.
+        await self._migrate_discord_session_keys()
+        await self._restore_resume_pending_sessions_at_startup()
+        # Adapters and startup restore are complete: claim async-delegation restart recovery once and
+        # queue its terminal events before the watcher starts. OFF-LOOP: a JSON registry rewrite plus a
+        # heavy lazy import chain blocked the loop >20s at boot (discord.py heartbeat `latency_exceeded`).
+        try:
+            await asyncio.to_thread(self._recover_async_delegations_once)
+        except Exception:
+            logger.error("Async delegation restart recovery failed during gateway startup", exc_info=True)
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
         await self._send_session_db_warning_notifications()
@@ -1549,6 +1911,10 @@ class GatewayStartupMixin:
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         # marker (prior-instantiation markers are ignored via epoch).
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+        # Shared-checkout admission gate (checkout_admission in config.yaml): publish our serving signal.
+        _checkout_gate = self._checkout_admission_gate()
+        if _checkout_gate is not None:
+            self._spawn_supervised(_checkout_gate.publish_forever, "checkout_admission_publisher")
 
     @staticmethod
     async def _start_flush_runtime_status() -> None:
@@ -1570,7 +1936,17 @@ class GatewayStartupMixin:
             await self._start_flush_runtime_status()
 
     async def _start_impl(self) -> bool:
+        from gateway.run import _startup_restore_drain_timeout_secs, prime_system_proxy_cache
         logger.info("Starting Hermes Gateway...")
+        # Warm the macOS system-proxy cache BEFORE any adapter connects: the probe shells out to
+        # `scutil --proxy`, and lazily the first caller was often a reconnect ON the event loop.
+        try:
+            await asyncio.to_thread(prime_system_proxy_cache)
+        except Exception:
+            logger.debug("system-proxy cache prime failed (non-fatal)", exc_info=True)
+        # Persisted deferred restart requests can span an OS reboot, so their ordering uses the same
+        # stable wall-clock epoch as request intent_ts.
+        self._boot_started_at = time.time()
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         if await self._abort_startup_if_shutdown_requested():
@@ -1587,8 +1963,27 @@ class GatewayStartupMixin:
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
         self._startup_restore_in_progress = True
+        with suppress(Exception):
+            logger.warning(
+                "PHASE=startup_restore_gate_flip state=armed caller=start timeout=%.3fs",
+                _startup_restore_drain_timeout_secs(),
+            )
+        # Reset the queue BEFORE loading the spool: the loader claims (deletes) the spool files.
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        # Follow-ups the previous life could not run (spooled while draining) enter the restore queue
+        # FIRST, ahead of anything newer.
+        try:
+            await self._load_restart_followups()
+        except Exception:
+            logger.debug("restart follow-up replay failed", exc_info=True)
+        # Absolute watchdog bounds the whole gate lifetime from this point: adapter dispatch can rotate
+        # the tracked resume wrapper before the real turn starts, so the bounded wait alone is not enough.
+        self._startup_restore_watchdog_task = self._retain_background_task(
+            asyncio.create_task(self._startup_restore_gate_watchdog())
+        )
+        # Per-restore-cycle ack dedupe: a fresh restart re-acks queued chats once each.
+        self._startup_restore_acked_chats = set()
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
@@ -1625,6 +2020,11 @@ class GatewayStartupMixin:
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()
+        # Busy-gateway-quiescence reaper: evicts _running_agents entries whose turn task is done().
+        try:
+            self._retain_background_task(asyncio.create_task(self._reap_dead_running_agents_loop()))
+        except Exception:
+            logger.warning("failed to start running-agent reaper loop", exc_info=True)
         # A boot that could not start every configured platform is not a normal run: stamp ``degraded``
         # so ``gateway status`` / /api/status / the health snapshot surface it, instead of only a log
         # line next to "Gateway running with N platform(s)".

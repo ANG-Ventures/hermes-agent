@@ -120,27 +120,16 @@ class SessionLifecycleMixin:
         """
         return self._update_entry(session_key, lambda e: setattr(e, "suspended", True))
 
-    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at) -> None:
-        """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
-        neither leak an unowned token nor drop a live one. Lock held."""
-        candidate = entry.to_dict()
-        candidate["active_turn_token"] = token
-        candidate["active_turn_started_at"] = _iso(started_at)
-        touched = _now() if started_at is not None else None
-        if touched is not None:
-            # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
-            # downgrade/upgrade window.
-            candidate["updated_at"] = touched.isoformat()
-        self._save_entry(session_key, entry_data=candidate, lock_held=True)
-        entry.active_turn_token = token
-        entry.active_turn_started_at = started_at
-        if touched is not None:
-            entry.updated_at = touched
-
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
-        unwind cannot clear a newer turn."""
+        unwind cannot clear a newer turn.
+
+        Persist-before-publish without holding ``_lock`` across SQLite (t_cc8533d1): the
+        candidate is captured under the lock, written with the lock released, then published
+        under the lock again.
+        """
+        from gateway.session import _claim_turn_marker_revision
         token = uuid.uuid4().hex
         with self._lock:
             entry = self._entry_locked(session_key)
@@ -148,17 +137,53 @@ class SessionLifecycleMixin:
                 return None
             # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
             # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
-            self._set_turn_marker_locked(session_key, entry, token, datetime.now(timezone.utc))
+            started_at = datetime.now(timezone.utc)
+            touched = _now()
+            candidate = entry.to_dict()
+            candidate["active_turn_token"] = token
+            candidate["active_turn_started_at"] = _iso(started_at)
+            # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
+            # downgrade/upgrade window.
+            candidate["updated_at"] = touched.isoformat()
+
+        # Persist before publishing the marker in memory: if the durable write raises, a later
+        # unrelated save cannot leak an unowned token.
+        revision = self._save_entry(session_key, entry_data=candidate)
+
+        def _publish(current: SessionEntry) -> None:
+            # Persist and publish order can differ between concurrent marks; disk keeps the
+            # highest revision, so memory must too.
+            if not _claim_turn_marker_revision(current, revision):
+                return
+            current.active_turn_token = token
+            current.active_turn_started_at = started_at
+            current.updated_at = touched
+
+        self._publish_persisted_entry(session_key, entry, revision, _publish)
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
         """Compare-and-swap clear an active-turn marker; ``False`` when the entry disappeared or a
         newer turn owns it."""
+        from gateway.session import _claim_turn_marker_revision
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None or entry.active_turn_token != token:
                 return False
-            self._set_turn_marker_locked(session_key, entry, None, None)
+            candidate = entry.to_dict()
+            candidate["active_turn_token"] = None
+            candidate["active_turn_started_at"] = None
+
+        # Keep the live token until the clear is durable: a failed write stays retryable instead
+        # of becoming a false mismatch.
+        revision = self._save_entry(session_key, entry_data=candidate)
+
+        def _publish(current: SessionEntry) -> None:
+            if current.active_turn_token == token and _claim_turn_marker_revision(current, revision):
+                current.active_turn_token = None
+                current.active_turn_started_at = None
+
+        self._publish_persisted_entry(session_key, entry, revision, _publish)
         return True
 
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
@@ -178,7 +203,11 @@ class SessionLifecycleMixin:
                 max_age_seconds > 0 and epoch_now - started_at.timestamp() > max_age_seconds
             )
             if not marker_is_stale and not entry.suspended:
-                if entry.resume_pending:
+                if entry.user_stopped_at is not None:
+                    # The user killed this turn on purpose; a crash marker left behind by the
+                    # same stop must not revive it.
+                    pass
+                elif entry.resume_pending:
                     # A drain-timeout marker is more specific; keep it.
                     if entry.last_resume_marked_at is None:
                         entry.last_resume_marked_at = now
@@ -204,26 +233,44 @@ class SessionLifecycleMixin:
             return True
         return self._update_all_entries_locked(_discard)
 
-    def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
+    def mark_resume_pending(
+        self, session_key: str, reason: str = "restart_timeout", *,
+        resume_kind: Optional[str] = None, resume_handoff: Optional[str] = None,
+        resume_request_id: Optional[str] = None,
+    ) -> bool:
         """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
-        unlike ``suspend_session``). True if marked."""
-        def _apply(entry: SessionEntry):
-            if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
-                return False
-            entry.resume_pending = True
-            entry.resume_reason = reason
-            entry.last_resume_marked_at = _now()
-        return self._update_entry(session_key, _apply)
+        unlike ``suspend_session``). True if marked. The in-memory mark lives in
+        ``_mark_resume_pending_in_memory_locked`` (legacy-alias redirect, never re-arms a
+        suspended or /stop'd session); every hedge mark flows through it."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            if self._mark_resume_pending_in_memory_locked(
+                session_key, reason, resume_kind=resume_kind, resume_handoff=resume_handoff,
+                resume_request_id=resume_request_id,
+            ):
+                self._save()
+                return True
+        return False
 
-    def clear_resume_pending(self, session_key: str) -> bool:
-        """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
-        def _apply(entry: SessionEntry):
-            if not entry.resume_pending:
+    def clear_resume_pending(self, session_key: str, **kw) -> bool:
+        """Clear the resume-pending flag after a successful resumed turn; True if cleared.
+
+        ``marked_at`` (optional): the ``last_resume_marked_at`` the caller's turn started from.
+        When given, a mark written AFTER that snapshot (a concurrent shutdown drain) is left in
+        place — it is not the mark this turn recovered from (FleetReview #1043).
+        """
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.resume_pending:
                 return False
-            entry.resume_pending = False
-            entry.resume_reason = None
-            entry.last_resume_marked_at = None
-        return self._update_entry(session_key, _apply)
+            if "marked_at" in kw and entry.last_resume_marked_at != kw["marked_at"]:
+                logger.info(
+                    "Keeping resume mark for %s: re-marked during the turn (%s -> %s)",
+                    session_key, kw["marked_at"], entry.last_resume_marked_at)
+                return False
+            self._clear_resume_pending_entry(entry)
+            self._save()
+            return True
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop routing entries idle (by ``updated_at``) for more than max_age_days; suspended

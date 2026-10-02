@@ -311,7 +311,12 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                # Synthetic continuation from the goal judge — not authored by the human. Without
+                # this flag the shared-multi-user sender prefix would stamp "[<user>] " onto it
+                # (impersonation; same class as the boot-resume ghost message, 2026-07-10).
+                self._enqueue_fifo(
+                    _quick_key, self._synthetic_prompt_event(source, prompt, internal=True), adapter,
+                )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -402,7 +407,9 @@ class GatewayGoalsMixin:
                 )
             return
 
-        source = self._build_process_event_source({
+        # Off the loop (Aegis, 2026-09-23): the source resolver reads the session store, which
+        # under 6+ live turns convoyed behind the writer lock and blocked the loop for 10-50 s.
+        source = await self._run_in_executor_with_context(self._build_process_event_source, {
             "session_key": "",
             "platform": platform_name,
             "chat_id": chat_id,

@@ -26,9 +26,15 @@ from typing import Iterable
 # only carry the user's own shell state (PATH, functions, exports they set), not Hermes' per-turn session
 # identity. Used by unit tests as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
+# Matches BOTH dump forms (bash ``declare -x NAME=`` and ``export NAME=``). HERMES_HOME is matched
+# EXACTLY (``=``-anchored, like the fixed-name delegated-child marker): HERMES_HOME_BACKUP and friends
+# are ordinary user vars and must survive;
+# HERMES_KANBAN_ is a prefix (the dispatcher's task/run/workspace vars). Why (fork #543): the snapshot is
+# replayed in OTHER sessions, and a captured HERMES_HOME repoints them at a foreign state.db /
+# auth.json / kanban; a captured kanban identity fences the PARENT session's kanban CLI.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "^(declare -x |export )(HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT=|HERMES_HOME=|HERMES_KANBAN_|"
     "HERMES_RPC_|HERMES_KERNEL_DIR)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -69,6 +75,10 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "${!HERMES_BROWSER_CONTROL_*} "
+        # Dispatcher-owned kanban identity (task/run/workspace): per-EXECUTION, not user shell
+        # state; a snapshot taken inside a worker's window would fence the parent session's
+        # kanban CLI on every later ``source`` (fork #543).
+        "${!HERMES_KANBAN_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
@@ -81,7 +91,8 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        # HERMES_HOME exact: a replayed snapshot must never repoint another session's home (fork #543).
+        f"HERMES_UI_SESSION_ID HERMES_HOME{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
 

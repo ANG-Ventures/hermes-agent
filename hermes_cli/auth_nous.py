@@ -909,16 +909,35 @@ class _NousRuntimeResolve:
 
     def __init__(
         self, auth_store: Dict[str, Any], state: Dict[str, Any], state_source_path: Optional[Path],
-        *, force_refresh: bool, stale_access_token: Optional[str], timeout_seconds: float) -> None:
+        *, force_refresh: bool, stale_access_token: Optional[str], timeout_seconds: float,
+        pool_state: Optional[Dict[str, Any]] = None) -> None:
         self.auth_store, self.state, self._source_path = auth_store, state, state_source_path
         self.force_refresh, self.stale_access_token = force_refresh, stale_access_token
         self.timeout_seconds = timeout_seconds
+        self.pool_state = pool_state
         self.sequence_id = uuid.uuid4().hex[:12]
         self._persisted_state = dict(state)
         self.persisted_any = False
+        # Reconcile inside the refresh transaction, not via a best-effort pre-write: the
+        # singleton may have changed since the pool read it (fork #670).
+        self.retain_newer_pool_pair()
         self.access_token = state.get("access_token")
         self.refresh_token = state.get("refresh_token")
         self._reload_routing()
+
+    def retain_newer_pool_pair(self) -> bool:
+        """Adopt the pool's OAuth pair only when it is strictly newer than the stored one."""
+        if not self.pool_state:
+            return False
+        from agent.credential_pool import _parse_absolute_timestamp
+        pool_at = _parse_absolute_timestamp(self.pool_state.get("obtained_at"))
+        state_at = _parse_absolute_timestamp(self.state.get("obtained_at"))
+        if pool_at is None or state_at is None or pool_at <= state_at:
+            return False
+        for key in ("access_token", "refresh_token", "expires_at", "obtained_at", "expires_in"):
+            if self.pool_state.get(key) is not None:
+                self.state[key] = self.pool_state[key]
+        return True
 
     def _reload_routing(self) -> None:
         (self.portal_base_url, self.stored_inference_base_url, self.inference_base_url,
@@ -957,7 +976,9 @@ class _NousRuntimeResolve:
 
     def merge_shared(self) -> bool:
         """Adopt fresher shared-store tokens (caller holds the shared lock). True when merged."""
-        if not _merge_shared_nous_oauth_state(self.state):
+        merged = _merge_shared_nous_oauth_state(self.state)
+        # A stale shared mirror must not undo the retained (newer) pool pair either.
+        if not (self.retain_newer_pool_pair() or merged):
             return False
         self.access_token = self.state.get("access_token")
         self.refresh_token = self.state.get("refresh_token")
@@ -1047,8 +1068,12 @@ class _NousRuntimeResolve:
 def resolve_nous_runtime_credentials(
     *, timeout_seconds: float = 15.0, insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None, force_refresh: bool = False,
-    stale_access_token: Optional[str] = None) -> Dict[str, Any]:
+    stale_access_token: Optional[str] = None,
+    pool_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Resolve Nous inference credentials for runtime use (refreshing under the auth-store lock).
+
+    ``pool_state`` carries a singleton-seeded pool snapshot; only a strictly newer timestamped
+    OAuth pair may replace the state read under the lock (fork #670).
 
     A guest whose ``anon_`` credential NAS no longer knows (reaped or claimed) is retired and a new
     identity is set up once, transparently -- the one client rule covering both reap and claim.
@@ -1057,7 +1082,8 @@ def resolve_nous_runtime_credentials(
     try:
         return _resolve_nous_runtime_credentials(
             timeout_seconds=timeout_seconds, insecure=insecure, ca_bundle=ca_bundle,
-            force_refresh=force_refresh, stale_access_token=stale_access_token)
+            force_refresh=force_refresh, stale_access_token=stale_access_token,
+            pool_state=pool_state)
     except AnonCredentialDead as dead_exc:
         from hermes_cli.auth import get_provider_auth_state
         from hermes_cli.anon_auth import ANON_ACCOUNT_LOCKED
@@ -1075,7 +1101,8 @@ def resolve_nous_runtime_credentials(
 def _resolve_nous_runtime_credentials(
     *, timeout_seconds: float = 15.0, insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None, force_refresh: bool = False,
-    stale_access_token: Optional[str] = None) -> Dict[str, Any]:
+    stale_access_token: Optional[str] = None,
+    pool_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Resolve Nous inference credentials for runtime use (refreshing under the auth-store lock).
 
     ``stale_access_token`` is the bearer that just failed upstream (401): with ``force_refresh``,
@@ -1091,7 +1118,8 @@ def _resolve_nous_runtime_credentials(
             raise _nous_err("Hermes is not logged into Nous Portal.", "nous_auth_missing", relogin=True)
         run = _NousRuntimeResolve(
             auth_store, state, state_source_path, force_refresh=force_refresh,
-            stale_access_token=stale_access_token, timeout_seconds=timeout_seconds)
+            stale_access_token=stale_access_token, timeout_seconds=timeout_seconds,
+            pool_state=pool_state)
         verify = _resolve_verify(insecure=insecure, ca_bundle=ca_bundle, auth_state=state)
         _oauth_trace(
             "nous_runtime_credentials_start", sequence_id=run.sequence_id,

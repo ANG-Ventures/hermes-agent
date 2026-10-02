@@ -284,7 +284,12 @@ class SessionCompressionMixin:
                 # evict) is stale by construction — this lease holder is still continuing the
                 # conversation, and left alone it wedges rotation forever. Clear it; the closure
                 # UPDATE below re-stamps end_reason='compression'. Deliberate boundaries fail closed.
-                if not is_automatic_end_reason(parent["end_reason"]):
+                # The fork's archive stamp (``set_session_archived`` retires a still-live row with
+                # ``end_reason='archived'`` so routing self-heals) is the same shape: a live lease
+                # holder continuing an archived chat must still rotate — the child inherits the
+                # archive flag, so a deliberate archive stays hidden (#117713 contract).
+                if not (is_automatic_end_reason(parent["end_reason"])
+                        or parent["end_reason"] == self.ARCHIVE_END_REASON):
                     raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
                 conn.execute(
                     "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
@@ -321,6 +326,9 @@ class SessionCompressionMixin:
                 "WHERE id = ? AND ended_at IS NULL", (time.time(), parent_session_id))
             if updated.rowcount != 1:
                 raise RuntimeError(f"Compression parent changed during publication: {parent_session_id}")
+            # Denorm contract: the closure above links the child into the parent's recency chain, so
+            # the lineage root is recomputed after it (the per-row bumps ran before the edge existed).
+            self._recompute_effective_last_active_for_session(conn, child_session_id)
             if parent["archived"]:
                 # A live continuation under an idle-sweep archive re-activates the chat; after the
                 # closure above the child is linked into the lineage walk (#117713).
@@ -588,12 +596,17 @@ class SessionCompressionMixin:
     def acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
         wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0, on_wait=None,
-        wait_notice_interval_seconds: float = 15.0, should_abort=None, acquire_patience_s: float = 0.5,
+        wait_notice_interval_seconds: float = 15.0, wait_notice_backoff: float = 2.0,
+        wait_notice_max_interval_seconds: float = 300.0, should_abort=None, acquire_patience_s: float = 0.5,
         on_contended=None,
     ) -> bool:
         """Wait for a cross-process turn lease without holding a SQLite lock. ``on_wait(elapsed)`` is
-        best-effort: called when another holder has the lease and about every
-        ``wait_notice_interval_seconds`` after. A busy database is not a holder: the attempt is
+        best-effort: called when another holder has the lease, again after
+        ``wait_notice_interval_seconds``, then at geometrically growing gaps (``wait_notice_backoff`` x,
+        capped at ``wait_notice_max_interval_seconds``) — messaging surfaces post every notice as a fresh
+        message, and a fixed 15s cadence produced 24 "Still waiting" posts in one 6-minute wait
+        (2026-09-21); the defaults emit ~6 notices over 10 minutes (0s, 15s, 45s, 105s, 225s, 465s).
+        ``wait_notice_backoff <= 1`` restores the fixed cadence. A busy database is not a holder: the attempt is
         retried at once with a longer write patience, and ``on_contended()`` is called instead,
         since the busy writer may be the holder's last flush. ``should_abort()`` True (e.g.
         ``/stop``) returns False at once."""
@@ -603,6 +616,11 @@ class SessionCompressionMixin:
         wait_started = None
         last_notice_at = None
         notice_every = max(0.0, float(wait_notice_interval_seconds))
+        notice_backoff = max(1.0, float(wait_notice_backoff or 1.0))
+        # The cap is a real ceiling: a cap below the base interval yields the cap, not a widened interval.
+        notice_cap = max(0.0, float(wait_notice_max_interval_seconds))
+        if notice_cap > 0.0:
+            notice_every = min(notice_every, notice_cap)
         while True:
             if should_abort is not None:
                 try:
@@ -644,6 +662,10 @@ class SessionCompressionMixin:
                     on_wait(max(0.0, now - wait_started))
                 except Exception:
                     logger.debug("session turn lease on_wait callback failed", exc_info=True)
+                # Grow the gap only after a notice that followed a full interval (not the immediate
+                # first-failure notice), so the cadence is 0, +I, +I*b, +I*b^2 ... capped.
+                if last_notice_at is not None and notice_every > 0.0:
+                    notice_every = min(notice_cap, notice_every * notice_backoff)
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 

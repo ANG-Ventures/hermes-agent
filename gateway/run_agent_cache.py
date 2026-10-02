@@ -23,6 +23,7 @@ from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
     from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.session import PersistedSessionRouteLookup  # noqa: F401
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -144,14 +145,54 @@ class GatewayAgentCacheMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.model_override if state else None
 
-    def _rehydrate_session_model_override(self, session_key: str) -> None:
+    def _rehydrate_session_model_override(
+        self, session_key: str, *, persisted_route_lookup: Optional["PersistedSessionRouteLookup"] = None,
+    ) -> None:
         """Lazily restore a persisted /model override after a gateway restart: non-secret parts
         (model/provider/base_url) are written through on /model and read back on first use; api_key
-        is never persisted and is re-resolved. No-op when an in-memory override or nothing exists."""
-        from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+        is never persisted and is re-resolved. No-op when an in-memory override or nothing exists.
+
+        The persisted route identity ({model, provider, api_mode}) is durability truth: a VALID
+        identity is re-resolved through ``_reresolve_model_override_credentials`` and an
+        unresolvable one is recorded in ``_session_model_override_unavailable`` so the turn resolver
+        fails closed; UNAVAILABLE (unreadable/malformed store) raises before any provider work.
+        Only when no identity is persisted does the legacy override below apply."""
+        from gateway.run import SessionRouteUnavailableError, _resolve_runtime_agent_kwargs_for_provider
         store = getattr(self, "session_store", None)
         if self._session_model_override(session_key) is not None or store is None:
             return
+        unavailable = getattr(self, "_session_model_override_unavailable", None)
+        if unavailable is None:
+            unavailable = self._session_model_override_unavailable = set()
+        lookup = (
+            persisted_route_lookup if persisted_route_lookup is not None
+            else self._persisted_session_route_identity(session_key)
+        )
+        if lookup.state == "unavailable":
+            raise SessionRouteUnavailableError(
+                "The persisted session model preference could not be read or validated."
+            )
+        identity = lookup.identity
+        if identity:
+            try:
+                resolved = self._reresolve_model_override_credentials(identity)
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                self._session_model_overrides[session_key] = resolved
+                unavailable.discard(session_key)
+                logger.info(
+                    "Rehydrated persisted /model identity for session=%s: model=%s provider=%s",
+                    session_key, identity.get("model"), identity.get("provider"),
+                )
+            else:
+                unavailable.add(session_key)
+                logger.debug(
+                    "Persisted /model identity is not currently credential-resolvable for session=%s provider=%s",
+                    session_key, identity.get("provider"),
+                )
+            return
+        unavailable.discard(session_key)
         try:
             persisted = store.get_model_override(session_key)
         except Exception:
@@ -257,12 +298,20 @@ class GatewayAgentCacheMixin:
         return getattr(agent, "_nous_model_switch", None) == (config_model, agent.model)
 
     def _release_running_agent_state(
-        self, session_key: str, *, run_generation: Optional[int] = None
+        self, session_key: str, *, run_generation: Optional[int] = None,
+        clear_startup_resume_protection: bool = True,
     ) -> bool:
         """Pop ALL per-running-agent state for ``session_key`` (call at every site that ends a running
         turn); True when cleared. Persistent state (model overrides, voice mode, approvals) is NOT
         touched. With ``run_generation``, only clear if still current — a stale async unwind bumped
-        by /stop or /new must not clobber a newer run (returns False)."""
+        by /stop or /new must not clobber a newer run (returns False).
+
+        This is the single turn-exit chokepoint, so it also owns the boot-resume protection marker
+        (``_startup_resume_active``) and the synthetic resume disposition (``_startup_resume_modes``):
+        marker-lifetime == turn-lifetime. ``clear_startup_resume_protection=False`` is the ONE
+        non-turn-exit caller — the resume wrapper's sentinel pre-claim handback, where the queued
+        resume event's re-dispatch (the actual recovery turn) is about to claim the slot and its
+        protection must stay armed (AEGIS-RIG 2026-07-11)."""
         if not session_key or (
             run_generation is not None and not self._is_session_run_current(session_key, run_generation)
         ):
@@ -277,9 +326,37 @@ class GatewayAgentCacheMixin:
             # One structured reset instead of a drifting pop-list. Turn-lease tokens are deliberately NOT
             # cleared here — _release_turn_lease owns them.
             state.turn.clear()
+        if clear_startup_resume_protection:
+            _sra = getattr(self, "_startup_resume_active", None)
+            if _sra is not None:
+                with suppress(Exception):
+                    _sra.discard(session_key)
+            getattr(self, "_startup_resume_modes", {}).pop(session_key, None)
+        # The turn-task handle never outlives the slot (busy-gateway-quiescence reaper); idempotent.
+        getattr(self, "_running_agent_tasks", {}).pop(session_key, None)
+        # Clear a DRAINING-turn marker ONLY when its task is None or done(): /stop releases right after
+        # registering the drain (task not done), and popping unconditionally would defeat the /undo
+        # guard. A stopped turn's own unwind sees done()==False too, so the entry is pruned on the
+        # next /undo·/redo access or the session's next turn exit — a bounded, harmless leak.
+        try:
+            _draining = getattr(self, "_draining_turns", None)
+            if _draining is not None:
+                _dt = _draining.get(session_key)
+                if _dt is None or _dt.done():
+                    _draining.pop(session_key, None)
+        except Exception:
+            logger.debug("draining-turn clear skipped for %s", session_key, exc_info=True)
         # Turn boundary: a running-agent slot was just released; persist the new (lower) in-flight count
         # so the dashboard readout stays current. Preserves gateway_state (see _persist_active_agents).
         self._persist_active_agents()
+        if getattr(self, "_draining", False):
+            # Another shutdown already owns this bounce: leave submitted SELF intent for the mandatory
+            # cross-boot reconciliation; arming here would create a new shutdown task during teardown.
+            return True
+        try:
+            self._arm_deferred_restart_after_release(session_key, generation=run_generation)
+        except Exception:
+            logger.warning("Deferred SELF restart arm failed for %s", session_key, exc_info=True)
         return True
 
     def _drop_turn_slot(self, session_key: str, *, run_generation: Optional[int] = None) -> None:
@@ -324,15 +401,32 @@ class GatewayAgentCacheMixin:
         """Release the turn lease acquired by (``session_key``, ``run_generation``). Keyed by (routing
         key, run generation) so a stale unwind pops only ITS token; the registry's identity check
         refuses it if a newer turn holds the lease. Idempotent."""
-        held = self._held_turn_lease(session_key, run_generation)
-        if held is None:
+        registry = getattr(self, "_turn_leases", None)
+        state = self._peek_session_state(session_key) if session_key and registry is not None else None
+        tokens = state.turn.lease_tokens if state is not None else None
+        if tokens is None:
             return False
-        registry, tokens = held
-        token = tokens.pop(run_generation)
+        token = tokens.pop(run_generation, None)
+        if token is None:
+            # A stale unwind meeting a NEWER turn's token is the designed no-op. An OLDER generation's
+            # token still held while a later turn exits is a leak the registry cannot see: say so.
+            for older_gen, older in list(tokens.items()):
+                try:
+                    if int(older_gen) < int(run_generation) and registry.is_holder(older):
+                        logger.warning(
+                            "turn lease NOT released for %s gen %s: the held token belongs to older gen %s "
+                            "and is still the registry holder on session %s",
+                            session_key, run_generation, older_gen, getattr(older, "session_id", None),
+                        )
+                except Exception:
+                    logger.debug("turn lease leak check failed", exc_info=True)
+            return False
         try:
-            return registry.release(token)
+            # Deferred while this turn's agent worker thread still runs: a cancelled handler does not
+            # stop it (FleetReview #1409).
+            return registry.release_when_idle(token)
         except Exception:
-            logger.debug("Failed to release turn lease", exc_info=True)
+            logger.warning("Failed to release turn lease for %s", session_key, exc_info=True)
             return False
 
     def _rebind_turn_lease(self, session_key: str, run_generation: int, new_session_id: str) -> bool:
@@ -501,6 +595,12 @@ class GatewayAgentCacheMixin:
             session_key=session_key, reason=invalidation_reason,
             parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            # Superseded-turn write gate (agent/session_persistence.py): the displaced turn's late
+            # tool results must not land in the transcript the successor turn now owns.
+            try:
+                running_agent._persist_superseded = True
+            except Exception:
+                logger.debug("persist-superseded flag set skipped for %s", session_key, exc_info=True)
             # Plugins holding a per-turn external resource (an outbound RPC blocked on a tool result
             # the loop will never consume) learn the turn is gone. Fires for /stop and the /new
             # running-agent fast path; the pending-sentinel /stop has no in-flight work, so it stays
@@ -517,6 +617,21 @@ class GatewayAgentCacheMixin:
                 )
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
+        if str(invalidation_reason or "").startswith("stop_command"):
+            # Durable /stop marker: the boot gate must never re-prompt a turn the user ended.
+            try:
+                await self._mark_user_stopped(session_key)
+            except Exception:
+                logger.warning("Failed to persist user_stopped marker for stopped session %s",
+                               session_key, exc_info=True)
+        try:
+            from tools.clarify_gateway import clear_session as _clear_clarify
+            _cancelled = _clear_clarify(session_key)
+            if _cancelled:
+                logger.info("Cancelled %d pending clarify prompt(s) for %s on %s",
+                            _cancelled, session_key, interrupt_reason)
+        except Exception:
+            logger.debug("clarify cancel skipped for %s", session_key, exc_info=True)
         adapter = self._delivery_adapter_for(source)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
         if adapter and callable(interrupt_session_activity):
@@ -546,6 +661,17 @@ class GatewayAgentCacheMixin:
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:
+            # The stopped turn's task keeps draining after the slot is released; /undo and /redo
+            # consult ``_draining_turns`` so they never rewind under a still-writing turn.
+            try:
+                _task = getattr(self, "_running_agent_tasks", {}).get(session_key)
+                if _task is not None and not _task.done():
+                    draining = getattr(self, "_draining_turns", None)
+                    if draining is None:
+                        draining = self._draining_turns = {}
+                    draining[session_key] = _task
+            except Exception:
+                logger.debug("draining-turn capture skipped for %s", session_key, exc_info=True)
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)

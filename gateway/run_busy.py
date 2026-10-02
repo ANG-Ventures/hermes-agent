@@ -598,6 +598,15 @@ class GatewayBusySessionMixin:
         )
         if demoted_for_compression:
             effective_mode = self._demote_interrupt(session_key, "context compression is in flight (#56391)")
+        # Boot-resume protection (fork, 2026-07-10 live incident): a user message arriving seconds
+        # after a gateway restart must not abort the recovery turn — that turn is replaying work the
+        # restart interrupted (handoff verification, deferred deliverables). Same demotion pattern
+        # as subagents/compression above; explicit /stop remains the escape hatch.
+        demoted_for_startup_resume = (
+            effective_mode == "interrupt" and self._session_in_startup_resume(session_key)
+        )
+        if demoted_for_startup_resume:
+            effective_mode = self._demote_interrupt(session_key, "a boot-resume recovery turn is running")
         steered = redirected = False
         agent_live = running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL
         plain_text = (
@@ -629,10 +638,14 @@ class GatewayBusySessionMixin:
             redirected = self._redirect_active_turn(
                 running_agent, (event.text or "").strip(), session_key, event
             )
-        return self._BusySteerOutcome(
+        outcome = self._BusySteerOutcome(
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
         )
+        # FOLLOWUP gateway/run.py: add ``demoted_for_startup_resume: bool = False`` to
+        # ``GatewayRunner._BusySteerOutcome`` and pass it in the constructor above.
+        outcome.demoted_for_startup_resume = demoted_for_startup_resume
+        return outcome
 
     @staticmethod
     def _demote_interrupt(session_key: str, why: str) -> str:
@@ -730,6 +743,7 @@ class GatewayBusySessionMixin:
         self, event: MessageEvent, now: float, _busy_state, running_agent: Any, *,
         is_steer_mode: bool, is_queue_mode: bool, is_redirect_mode: bool,
         demoted_for_subagents: bool, demoted_for_compression: bool,
+        demoted_for_startup_resume: bool = False,
     ) -> str:
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _hermes_home, _load_gateway_config, _platform_config_key
@@ -774,6 +788,12 @@ class GatewayBusySessionMixin:
         elif is_queue_mode and demoted_for_subagents:
             # Explain the demotion: the follow-up didn't kill the subagent; /stop is the escape hatch.
             head, tail = t("gateway.busy.subagent_working_head"), self._BUSY_DEMOTED_TAIL
+        elif is_queue_mode and demoted_for_startup_resume:
+            # Fork: say only what is NEW here (queued behind the recovery). ONE restart message per
+            # boot, and it is the boot notice (fork_ext.unclean_restart_notice) — this ack must not
+            # re-announce the restart (2026-09-22 consolidation).
+            head = "⏳ Still finishing the interrupted work"
+            tail = " — your message is queued and folds in right after (use /stop to cancel the recovery)."
         elif is_queue_mode and demoted_for_compression:
             head, tail = t("gateway.busy.compressing_head"), self._BUSY_DEMOTED_TAIL
         elif is_queue_mode:
@@ -900,6 +920,7 @@ class GatewayBusySessionMixin:
             is_queue_mode=is_queue_mode, is_redirect_mode=is_redirect_mode,
             demoted_for_subagents=_steer.demoted_for_subagents,
             demoted_for_compression=_steer.demoted_for_compression,
+            demoted_for_startup_resume=getattr(_steer, "demoted_for_startup_resume", False),
         )
         await self._send_busy_ack_reply(event, adapter, message)
         return True
@@ -919,6 +940,8 @@ class GatewayBusySessionMixin:
         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
         "loop", "refine", "review", "voice",
+        # fork-only session commands (handlers in gateway/slash_commands.py)
+        "redo", "merge", "resume-handoff",
     )
 
     def _command_handler_table(self, names) -> Dict[str, Any]:

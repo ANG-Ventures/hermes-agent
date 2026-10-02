@@ -139,11 +139,16 @@ class AuthError(RuntimeError):
     def __init__(
         self, message: str, *, provider: str = "", code: Optional[str] = None, relogin_required: bool = False,
         retry_after: Optional[float] = None, retryable: Optional[bool] = None,
+        http_status: Optional[int] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.code = code
         self.relogin_required = relogin_required
+        # HTTP status of the upstream response that produced this error (fork #673): the Codex
+        # owner transaction (agent/codex_owner.py) distinguishes a 429 quota stop from an auth
+        # refusal by it. None when the error did not come from an HTTP response.
+        self.http_status = http_status
         # Optional wait hint in seconds (a server ``Retry-After`` or a client cooldown) and whether a
         # later attempt can succeed at all. None = the raiser did not say; callers treat None as
         # "retryable, no hint" for transport-shaped errors and as terminal for auth refusals.

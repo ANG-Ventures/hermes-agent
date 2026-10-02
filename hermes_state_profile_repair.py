@@ -170,8 +170,13 @@ class SessionProfileRepairMixin:
                 for session_id, key, parent_key in rows:
                     mine, theirs = session_key_profile(key), session_key_profile(parent_key)
                     if mine is not None and theirs is not None and mine != theirs:
+                        # Denorm contract: a lineage edge is removed, so the old recency root and
+                        # the detached child are recomputed (root captured BEFORE the write).
+                        previous_root_id = self._resolve_effective_last_active_root(conn, session_id)
                         severed += conn.execute(
                             "UPDATE sessions SET parent_session_id = NULL WHERE id = ?", (session_id,)).rowcount
+                        self._recompute_effective_last_active(conn, previous_root_id)
+                        self._recompute_effective_last_active_for_session(conn, session_id)
             return severed
         return self._execute_write(_do)
 
@@ -247,10 +252,13 @@ class SessionProfileRepairMixin:
         def _do(conn) -> bool:
             if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
                 return False
+            orphaned_child_ids, affected_root_ids = self._collect_orphan_effective_last_active_targets(
+                conn, [session_id])
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._recompute_effective_last_active_many(conn, affected_root_ids + orphaned_child_ids)
             self._delete_unreferenced_system_prompts(conn)
             return True
         return bool(self._execute_write(_do))

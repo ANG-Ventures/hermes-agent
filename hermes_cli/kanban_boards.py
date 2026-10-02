@@ -25,10 +25,13 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 def _board_task_counts(slug: str) -> dict[str, int]:
     """``{status: count}`` for a board. Safe to call on an empty DB."""
     try:
-        if not kb.kanban_db_path(board=slug).exists():
-            return {}
-        with kbc.connect_closing(board=slug) as conn:
-            rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
+        # Called once per board by ``boards list`` — enumeration, not addressing.
+        # The extent covers ``connect_closing`` too, which re-resolves the path.
+        with kb.enumerating_boards():
+            if not kb.kanban_db_path(board=slug).exists():
+                return {}
+            with kbc.connect_closing(board=slug) as conn:
+                rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
         return {}
@@ -51,7 +54,9 @@ def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> 
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     boards = kb.list_boards(include_archived=bool(getattr(args, "all", False)))
     current = kb.get_current_board()
-    for b in boards:
+    # Enumeration: the enrich loop asks every board on disk for its counts; scoping
+    # the loop body keeps any future per-board call added here covered by construction.
+    for b in kb.enumerating_each(boards):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())

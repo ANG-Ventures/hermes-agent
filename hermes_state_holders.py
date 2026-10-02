@@ -547,14 +547,28 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
     if psutil is None:
         return [(-1, "open-file scan unavailable")]
     try:
-        for process in psutil.process_iter(["pid", "open_files"]):
-            info = process.info
-            pid = int(info["pid"])
+        for process in psutil.process_iter(["pid"]):
+            pid = int(process.info["pid"])
             if pid == os.getpid():
                 continue
-            for opened in info.get("open_files") or ():
+            # Per-process: psutil's open_files() stats every path the process holds, so one foreign
+            # process with an unrelated unreadable/guarded file (the fleet test-gate's lock under the
+            # real home, which the hermetic I/O guard refuses) must not turn the WHOLE scan into an
+            # unknown holder. AccessDenied already reads as "no files" (psutil); other per-process
+            # errors get the same treatment.
+            try:
+                open_files = process.open_files()
+            except Exception:
+                continue
+            for opened in open_files or ():
                 path = getattr(opened, "path", "")
-                if path and canonical_sqlite_path(os.path.realpath(path)) in watched:
+                if not path:
+                    continue
+                try:
+                    resolved = os.path.realpath(path)
+                except Exception:
+                    resolved = path
+                if canonical_sqlite_path(resolved) in watched or canonical_sqlite_path(path) in watched:
                     holders.append((pid, path))
     except Exception as exc:
         logger.warning(

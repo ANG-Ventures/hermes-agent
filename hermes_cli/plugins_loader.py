@@ -137,8 +137,11 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
 def _evict_modules(module_name: str) -> None:
     """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
     prefix = f"{module_name}."
-    for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
-        del sys.modules[name]
+    # Snapshot ``sys.modules`` first (fork, blackbox plugin 2026-09-29): another thread importing
+    # mid-scan raises "dictionary changed size during iteration", which failed the whole plugin
+    # load — its hooks never registered, so the worker's turn had calls and no turns row.
+    for name in [n for n in list(sys.modules) if n == module_name or n.startswith(prefix)]:
+        sys.modules.pop(name, None)
 
 
 def _serialized_replacement(method):

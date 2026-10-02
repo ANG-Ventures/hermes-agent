@@ -229,6 +229,13 @@ class SessionTranscriptMixin:
         """
         with self._transcript_retry_lock:
             pending = self._enqueue_transcript_message(session_id, message)
+            # Fork feature (/undo /redo): a fresh user message invalidates the redo stack.
+            if message.get("role") == "user":
+                try:
+                    from hermes_undo import on_user_message_appended
+                    on_user_message_appended(session_id)
+                except Exception as e:
+                    logger.debug("redo clear on user append failed: %s", e)
             msg = pending[0]
         queue_session_id = session_id
 
@@ -511,6 +518,13 @@ class SessionTranscriptMixin:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
                 return False
             self._clear_dirty_transcript(session_id)
+            # Fork feature (/undo /redo): a rewrite hard-deletes and renumbers rows, so any
+            # in-memory undo/redo stack now references dead ids; invalidate it.
+            try:
+                import hermes_undo
+                hermes_undo.clear_state(session_id)
+            except Exception as e:
+                logger.debug("rewrite_transcript: undo-state clear skipped: %s", e)
             return True
 
     def has_input_owner(self, session_id: str, owner: str) -> bool:
@@ -549,8 +563,9 @@ class SessionTranscriptMixin:
             session_id = db.get_compression_tip(session_id) or session_id
         try:
             # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
+            # include_timestamp: fork LCM ingest surfaces per-row arrival ts.
             return self._db_for_session_id(session_id).get_messages_as_conversation(
-                session_id, repair_alternation=True)
+                session_id, include_timestamp=True, repair_alternation=True)
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers
             # must fail closed, not start from [].
@@ -562,21 +577,32 @@ class SessionTranscriptMixin:
     def rewind_session(
         self, session_id: str, n: int = 1, *, require_retryable_composite: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Back up ``n`` user turns via soft-delete (``active=0``), mirroring CLI ``/undo [N]``.
-        Returns ``{"rewound_count", "turns_undone", "target_text"}`` or ``None`` (no DB / no rewindable
-        turn / persistence failure); ``n`` clamps to the oldest user turn. ``require_retryable_composite``
-        is the gateway ``/retry`` guard: the selected turn must be a composite carrier whose live payload
-        is losslessly replayable as text — that replay-policy ``ValueError`` propagates so /retry can
-        explain why the carrier is unsafe."""
+        """Back up ``n`` half-turns / user turns. Two callers, two contracts (fork parity):
+
+        - Plain path (gateway ``/undo [N]``): delegates to the shared undo core
+          (``hermes_undo.undo``) via ``_rewind_via_undo_core``, soft-deleting rows. Returns a
+          result dict (has ``rewound_ids``), ``None`` (healthy empty), ``{"status": "busy"}``
+          (retryable: transient lock/busy DB error or the mid-flush ``RewindWouldOrphanError``)
+          or ``{"status": "error"}`` (any other exception) so the caller reports HONESTLY — never
+          a false "Nothing to undo".
+        - ``require_retryable_composite=True`` (gateway ``/retry`` on a composite carrier): the
+          selected turn must be a composite carrier whose live payload is losslessly replayable
+          as text; that replay-policy ``ValueError`` propagates so /retry can explain why the
+          carrier is unsafe. Returns ``{"rewound_count", "turns_undone", "target_text"}`` or
+          ``None``; ``n`` clamps to the oldest user turn.
+        """
         db = self._db_for_session_id(session_id)
         if not db:
             return None
-        from hermes_state_rewind import RewindTargetUnavailableError
         with self._get_transcript_drain_lock():
+            if not require_retryable_composite:
+                # Serialize against pending-queue drains/appends; the fork's undo core owns the
+                # DB mutation, this lock owns the in-process ordering.
+                return self._rewind_via_undo_core(session_id, n)
+            from hermes_state_rewind import RewindTargetUnavailableError
             try:
                 outcome = db.rewind_user_turn(
-                    session_id, -max(n, 1), require_retryable=require_retryable_composite,
-                    require_composite=require_retryable_composite)
+                    session_id, -max(n, 1), require_retryable=True, require_composite=True)
             except RewindTargetUnavailableError as e:
                 logger.debug("rewind_session: %s", e)
                 return None

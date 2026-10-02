@@ -97,9 +97,30 @@ class StatusOutputMixin:
         from gateway.warning_notifications import DiagnosticText
         self._emit_status(DiagnosticText(message))
 
-    def _emit_status(self, message: str) -> None:
-        """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
-        self._emit_status_kind("lifecycle", message, origin="_emit_status")
+    def _emit_status(self, message: str) -> bool:
+        """Emit a lifecycle status message (CLI + gateway ``status_callback``).
+
+        Returns ``True`` when the gateway-delivery leg accepted the message (a ``status_callback``
+        exists, did not raise, and did not explicitly return ``False``); ``False`` otherwise (no
+        callback, raised, or rejected). ``True`` means accepted/scheduled, not adapter-confirmed.
+        Purely additive — existing callers ignore it; the compaction announce uses it to detect a
+        lost send.
+        """
+        from gateway.warning_notifications import is_warning_status
+        try:
+            if not is_warning_status("lifecycle", message) or self._warning_presentation_enabled():
+                self._vprint(f"{self.log_prefix}{message}", force=True)
+        except Exception:
+            pass
+        status_callback = getattr(self, "status_callback", None)
+        if status_callback:
+            try:
+                accepted = status_callback("lifecycle", message)
+                return accepted is not False
+            except Exception:
+                logger.debug("status_callback error in _emit_status", exc_info=True)
+                return False
+        return False
 
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning for degraded side paths where the turn continues but the user must know."""
@@ -149,8 +170,9 @@ class StatusOutputMixin:
 
     def _emit_wait_notice(self, text: str) -> None:
         """Rewrite the live status line (CLI spinner, TUI ``thinking.delta``, gateway activity)
-        so long provider waits are not an anonymous spinner."""
-        self._touch_activity(text)
+        so long provider waits are not an anonymous spinner.
+        A wait notice is liveness, not progress (``progress=False``)."""
+        self._touch_activity(text, progress=False)
         self._call_callback("thinking_callback", text, origin="_emit_wait_notice")
 
     def _emit_diagnostic_wait(self, text: str) -> None:

@@ -121,6 +121,12 @@ def run_tool_round(
         _tool_turn_persisted = agent._flush_messages_to_session_db(messages, conversation_history)
     except Exception as exc:
         _tool_turn_persisted = False
+        # Keep the exception so the user-facing exit message can name what actually happened
+        # (evidence-based diagnosis in _format_turn_completion_explanation). Without it the
+        # explainer guessed "full disk" during a mid-turn gateway restart on a box with 6.1 TiB
+        # free (2026-08-10).
+        with suppress(Exception):
+            agent._session_persistence_error = exc
         from hermes_state import classify_persistence_error
         agent._last_persistence_error_cause = classify_persistence_error(exc)
         logger.warning(

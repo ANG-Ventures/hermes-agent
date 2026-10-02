@@ -52,6 +52,14 @@ def _report_compression_timeout(
     """Host-side timeout bookkeeping: log, activity stamp, cooldown ladder, user warning."""
     from agent.conversation_compression import mark_context_compression_timed_out
     mark_context_compression_timed_out(agent)
+    # Fork parity: rotation-independent ABORT signal. A timed-out compaction produces NOTHING to
+    # persist, so ``_last_compaction_persist_failed`` stays False and the id is unchanged — the exact
+    # surface signature of a genuine "nothing to compress" no-op. Without this flag the gateway renders
+    # the bland "No changes: transcript preserved" for a run that actually died on a stalled
+    # summariser. Mirrors the #44794 persist-failure signal.
+    agent._last_compaction_aborted = True
+    agent._last_compaction_abort_reason = "timeout"
+    agent._last_compaction_abort_waited = float(waited)
     if total_exhausted:
         logger.warning(
             "Context compression reached its total ceiling after %.1fs (progress observed=%s); continuing without compression",
@@ -222,11 +230,13 @@ class CompressionFacadeMixin:
         self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default",
         focus_topic: str = None, force: bool = False, bypass_cooldown: bool = False,
         defer_context_engine_notification: bool = False, commit_fence=None, verbatim_tail: list = None,
-        trigger: str = None,
+        trigger: str = None, trigger_reason: str = None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
         ``force=True`` (manual /compress) bypasses the summary-failure cooldown; ``bypass_cooldown=True``
         (provider-proven overflow recovery) runs one real attempt while the cooldown stays armed.
+        ``trigger_reason`` (optional) names WHY this compaction fired (threshold / overflow_413 /
+        overflow_context / tier_reduction) so the in-chat announce can show it; ``None`` → no reason clause.
 
         ``force=True`` is passed by the manual ``/compress`` slash command so users can bypass the
         summary-failure cooldown after an auto-compress abort. Auto-compress callers use the default
@@ -282,7 +292,7 @@ class CompressionFacadeMixin:
                     approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic, force=force,
                     bypass_cooldown=bypass_cooldown or same_turn_fallback_recovery,
                     defer_context_engine_notification=(defer_context_engine_notification), commit_fence=fence,
-                    verbatim_tail=verbatim_tail, trigger=trigger,
+                    verbatim_tail=verbatim_tail, trigger=trigger, trigger_reason=trigger_reason,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

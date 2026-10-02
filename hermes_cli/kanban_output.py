@@ -71,11 +71,39 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+# Statuses on which an open workspace-refusal episode is still live news.
+_REFUSAL_VISIBLE_STATUSES = frozenset({"todo", "ready", "review"})
+
+
+def _fmt_refusal(state: Optional[dict]) -> str:
+    """``WORKSPACE REFUSED (<reason>) since <ts>`` or ``""``."""
+    if not state:
+        return ""
+    return (
+        f"WORKSPACE REFUSED ({state.get('reason')}) since "
+        f"{_fmt_ts(state.get('since'))}"
+    )
+
+
+def _pin_badge(t) -> str:
+    """``[PIN claude-bpx-N: <reason>]`` for a card's deliberate sub pin."""
+    from hermes_cli.model_policy import format_pin_badge
+
+    return format_pin_badge(
+        getattr(t, "provider_override", None), getattr(t, "pin_sub_reason", None),
+    )
+
+
+def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    flag = ""
+    if refusal and t.status in _REFUSAL_VISIBLE_STATUSES:
+        flag = f"  [{_fmt_refusal(refusal)}]"
+    pin = _pin_badge(t)
+    pin = f"  {pin}" if pin else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{pin}{flag}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
@@ -85,4 +113,9 @@ def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
+    d["reasoning_effort"] = getattr(t, "reasoning_effort", None)
+    d["pin_sub_reason"] = getattr(t, "pin_sub_reason", None)
+    d["pin_sub_fallback"] = bool(getattr(t, "pin_sub_fallback", False))
+    d["unhomed"] = bool(getattr(t, "unhomed", False))
+    d["no_worker"] = bool(getattr(t, "no_worker", False))
     return d

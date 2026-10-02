@@ -454,8 +454,13 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
             and _stripped[-1:] not in _SENTENCE_END
         )
         if _is_empty_terminal or _is_partial_fragment or str(_turn_exit_reason) == "partial_stream_recovery":
+            _cause = getattr(agent, "_last_persistence_error_cause", None)
             _explanation = agent._format_turn_completion_explanation(
-                _turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None),
+                _turn_exit_reason,
+                # Prefer the classified persistence cause (upstream); fall back to the agent
+                # itself so the fork's evidence-based diagnosis (disk-full probe + restart
+                # forensics) still runs when no cause was classified.
+                _cause if _cause and _cause != "unknown" else agent,
                 db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
                 model=str(getattr(agent, "model", "") or ""),
             )

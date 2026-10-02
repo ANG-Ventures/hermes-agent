@@ -39,11 +39,11 @@ from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from utils import base_url_hostname
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
     from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.session import PersistedSessionRouteLookup  # noqa: F401
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -171,14 +171,22 @@ class GatewayTurnMixin:
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        persisted_route_lookup: Optional["PersistedSessionRouteLookup"] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
-        (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
+        (``_resolve_gateway_model(user_config)`` and default provider resolution).
+
+        The persisted route identity is durability truth: an UNAVAILABLE lookup fails closed before
+        any provider work, a VALID identity whose credentials cannot be re-resolved raises
+        ``SessionRouteUnavailableError`` (the preference is preserved, the turn does not silently
+        fall back to the default provider), and a cached override that diverges from the persisted
+        identity is discarded so rehydration rebuilds it from the entry."""
         from gateway.run import (
-            _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
-            _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
+            SessionRouteUnavailableError, _credential_pool_for_provider, _get_channel_override,
+            _resolve_gateway_model, _resolve_runtime_agent_kwargs,
+            _resolve_runtime_agent_kwargs_for_provider,
         )
         skey = self._resolve_session_key_or_none(source, session_key)
         # Every exit path starts clean: the /model-override fast path returns before the pop below,
@@ -186,11 +194,49 @@ class GatewayTurnMixin:
         # notice must never attach to another session's next turn (#74349).
         self._pre_agent_fallback_notice = None
 
+        persisted_identity = None
+        route_lookup = None
+        if skey:
+            route_lookup = (
+                persisted_route_lookup if persisted_route_lookup is not None
+                else self._persisted_session_route_identity(skey)
+            )
+            if route_lookup.state == "unavailable":
+                raise SessionRouteUnavailableError(
+                    "The persisted session model preference could not be read or "
+                    "validated. No provider request was made; repair the session "
+                    "store or use `/model reset`."
+                )
+            persisted_identity = route_lookup.identity
+            cached_override = self._session_model_overrides.get(skey)
+            if persisted_identity and cached_override:
+                def _identity(o):
+                    return self._configured_route_identity({"model": {
+                        "default": o.get("model"), "provider": o.get("provider"), "api_mode": o.get("api_mode"),
+                    }})
+                if _identity(cached_override) != _identity(persisted_identity):
+                    # Cache reconciliation, not a preference clear (P3b/RC-2): the persisted identity
+                    # stays authoritative and is rehydrated below without a user-action stamp.
+                    self._session_model_overrides.pop(skey, None)
+
         model = _resolve_gateway_model(user_config)
         if skey:
-            self._rehydrate_session_model_override(skey)
+            self._rehydrate_session_model_override(skey, persisted_route_lookup=route_lookup)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        if persisted_identity and (not override or not override.get("api_key")):
+            unavailable = getattr(self, "_session_model_override_unavailable", None)
+            if unavailable is None:
+                unavailable = self._session_model_override_unavailable = set()
+            unavailable.add(skey)
+            provider = str(persisted_identity.get("provider") or "<unknown>")
+            preferred_model = str(persisted_identity.get("model") or "<unset>")
+            raise SessionRouteUnavailableError(
+                "Session model preference "
+                f"`{provider}/{preferred_model}` is currently unavailable because "
+                "its credentials could not be resolved. The preference was "
+                "preserved; restore that provider's credentials or use `/model reset`."
+            )
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -310,7 +356,7 @@ class GatewayTurnMixin:
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
         from gateway.run import _deep_merge_request_overrides
         from agent.fast_mode import STATIC_TIERS
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.models import resolve_fast_mode_capability
         # Tests bind this method onto bare namespaces, so no class-level tables here.
         runtime = {
             k: runtime_kwargs.get(k) for k in (
@@ -335,9 +381,11 @@ class GatewayTurnMixin:
             route["request_overrides"] = base_request_overrides
             return route
         try:
-            overrides = resolve_fast_mode_overrides(
-                route["model"], provider=runtime["provider"], base_url=runtime["base_url"], tier=tier,
-            )
+            # Route-gated verdict shared with the /fast command UX: provider + api_mode decide the
+            # family (codex_fast serializes ``service_tier=fast``; unknown providers/proxies fail closed).
+            overrides = resolve_fast_mode_capability(
+                model=route["model"], provider=runtime["provider"], api_mode=runtime["api_mode"], tier=tier,
+            ).request_overrides
         except Exception:
             overrides = None
         # Fast-mode keys (service_tier / speed) are top-level and don't collide with extra_body.
@@ -453,6 +501,22 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+        # A real inbound user message supersedes any /stop marker: the user resumed by hand, so a
+        # LATER interruption of this session must auto-resume normally. Internal/synthetic events
+        # (boot resumes, kanban wakes) are not the user speaking. Best-effort — the boot gate
+        # independently supersedes the marker by rowid.
+        if not getattr(event, "internal", False) and getattr(session_entry, "user_stopped_at", None) is not None:
+            try:
+                await self.async_session_store.clear_user_stopped(session_key)
+            except Exception:
+                logger.debug("clear_user_stopped failed for %s", session_key, exc_info=True)
+        # SPEC scope B: a Telegram hard-kill re-delivery whose answer is already durably in the
+        # transcript is suppressed; fail-OPEN in every uncertain case (never drop a genuine message).
+        if await asyncio.to_thread(self._is_telegram_boot_redelivered_duplicate, event, session_entry):
+            return
+        # SPEC INV-6: companion answerable rows for a multi-update aggregate so a future re-delivery
+        # of a non-first constituent suppresses too.
+        await asyncio.to_thread(self._persist_telegram_aggregate_constituents, event, session_entry)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
@@ -631,6 +695,7 @@ class GatewayTurnMixin:
         approx_tokens: int
         msg_count: int
         warn_token_threshold: int
+        compress_token_threshold: int = 0
 
     @staticmethod
     def _hmwa_hygiene_read_config(hs, data):
@@ -768,6 +833,16 @@ class GatewayTurnMixin:
                 _approx_tokens, _token_source = _anchored, "anchored"
             else:
                 _approx_tokens, _token_source = estimate_messages_tokens_rough(history), "estimated"
+            # The stored figure can predate an in-turn compaction; a live cached agent's real
+            # last-call usage supersedes it.
+            _live_tokens = self._live_prompt_tokens_for_session(session_key, session_entry.session_id)
+            if _live_tokens is not None and _live_tokens > 0:
+                if session_entry.last_prompt_tokens > 0 and session_entry.last_prompt_tokens != _live_tokens:
+                    logger.info(
+                        "Session hygiene: stored last_prompt_tokens ~%s for %s superseded by live ~%s from the cached agent",
+                        f"{session_entry.last_prompt_tokens:,}", session_entry.session_id, f"{_live_tokens:,}",
+                    )
+                _approx_tokens, _token_source = _live_tokens, "actual (live)"
 
         # Hard safety valve: force compression at an extreme message count regardless of tokens,
         # breaking the disconnect → no token data → no compression spiral. 5000 clears 1M+ sessions.
@@ -808,7 +883,7 @@ class GatewayTurnMixin:
                 _msg_count, f"{_approx_tokens:,}", _token_source,
                 int(hs.threshold_pct * 100), f"{_hyg_context_length:,}", f"{_compress_token_threshold:,}",
             )
-        return self._HygienePlan(_needs_compress, _approx_tokens, _msg_count, _warn_token_threshold)
+        return self._HygienePlan(_needs_compress, _approx_tokens, _msg_count, _warn_token_threshold, _compress_token_threshold)
 
     async def _hmwa_hygiene_wait_for_summary(self, attempt, hs, session_entry):
         """Progress-aware inline wait for the detached hygiene compressor. Returns the compressed
@@ -1166,10 +1241,12 @@ class GatewayTurnMixin:
     async def _hmwa_hygiene_apply_result(
         self, attempt, hs, _compressed, history, plan, *,
         session_entry, session_key, source, _quick_key, run_generation,
+        _hyg_msgs=None, _hyg_model=None, _hyg_runtime=None,
     ):
         """Adopt a finished hygiene compression, rebind the session + turn lease, record
-        streak/cooldown, and warn the user on abort."""
+        streak/cooldown, warn the user on abort, and announce a landed compaction in-chat."""
         from gateway.run import _reset_hygiene_failure_streak, hygiene_compaction_recovered
+        _hyg_old_sid = session_entry.session_id
         _hyg_rotated, _hyg_in_place, _new_count, _new_tokens = await self._hmwa_hygiene_adopt_transcript(
             attempt, _compressed, history, plan, session_entry=session_entry, source=source,
             _quick_key=_quick_key, run_generation=run_generation,
@@ -1192,6 +1269,22 @@ class GatewayTurnMixin:
             new_tokens=_new_tokens,
         ):
             await asyncio.to_thread(_reset_hygiene_failure_streak, self, session_key)
+        if not _hyg_aborted and (_hyg_rotated or _hyg_in_place):
+            # In-chat compaction announce (engine-aware, formatted from REAL gateway facts — NOT the
+            # throwaway agent's filtered done-site view). Contentless on the channel rail for privacy.
+            # Fires on ANY landed compaction (rotate OR in-place), never on the no-op preserve branch.
+            _by_messages = plan.msg_count >= hs.hard_msg_limit
+            await self._announce_hygiene_compaction(
+                agent=attempt.agent, source=source, meta=attempt.meta,
+                old_session_id=_hyg_old_sid, new_session_id=session_entry.session_id,
+                eligible_count=len(_hyg_msgs or []), new_count=_new_count,
+                pre_tokens=plan.approx_tokens, post_tokens=_new_tokens,
+                model=_hyg_model, runtime=_hyg_runtime or {},
+                trigger_reason="hygiene_messages" if _by_messages else "hygiene_tokens",
+                trigger_value=hs.hard_msg_limit if _by_messages else plan.compress_token_threshold,
+                raw_pre_count=plan.msg_count, raw_history=history, eligible_msgs=_hyg_msgs,
+                compressed=_compressed,
+            )
         if _hyg_aborted:
             await self._hmwa_hygiene_record_failure_cooldown(
                 hs, session_key, session_entry.session_id,
@@ -1336,6 +1429,7 @@ class GatewayTurnMixin:
                 attempt, hs, _compressed, history, plan, session_entry=session_entry,
                 session_key=session_key, source=source, _quick_key=_quick_key,
                 run_generation=run_generation,
+                _hyg_msgs=_hyg_msgs, _hyg_model=_hyg_model, _hyg_runtime=_hyg_runtime,
             )
         finally:
             # Evict the cached agent so the next turn rebuilds its system prompt.
@@ -1503,6 +1597,7 @@ class GatewayTurnMixin:
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
+        _run_start_resume_marked_at=None,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -1551,14 +1646,17 @@ class GatewayTurnMixin:
             time.time() - _msg_start_time, agent_result.get("api_calls", 0), len(response),
         )
 
-        # Successful turn: clear the consecutive-restart stuck-loop counter and resume_pending (set
-        # by drain-timeout shutdown) so later messages don't get the restart-interruption note.
+        # Successful turn: clear this session's restart-recovery state — the F2 replay-loop breaker
+        # window AND the stuck-loop drain-timeout counter (a completed real turn is affirmative proof
+        # the session is not stuck) — plus resume_pending (set by drain-timeout shutdown) so later
+        # messages don't get the restart-interruption note. A turn whose only outcome was ANOTHER
+        # restart records a replay mark instead; see _apply_post_turn_resume_gate. ``marked_at`` is
+        # the mark this turn recovered from: a mark written while the turn ran (a concurrent shutdown
+        # drain) is newer and must survive the clear.
         if session_key and _should_clear_resume_pending_after_turn(agent_result):
-            await self._clear_restart_failure_count(session_key)
-            try:
-                await self.async_session_store.clear_resume_pending(session_key)
-            except Exception as _e:
-                logger.debug("clear_resume_pending failed for %s: %s", session_key, _e)
+            await asyncio.to_thread(
+                self._apply_post_turn_resume_gate, session_key, marked_at=_run_start_resume_marked_at,
+            )
 
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
@@ -2139,6 +2237,33 @@ class GatewayTurnMixin:
             title_user_message=title_user_message,
         ), _session_env_tokens
 
+    async def _hmwa_check_persisted_route(self, source, session_key) -> Optional[str]:
+        """Fail closed on an unreadable or credential-less persisted session route BEFORE any session
+        hygiene, onboarding, media enrichment, global provider resolution or agent construction runs:
+        the persisted route identity is a security/billing boundary. Returns the reply to send instead
+        of running the turn, or ``None`` to proceed.
+
+        Off the loop: the lookup takes ``SessionStore._lock``, which a worker thread can hold across a
+        routing load or save (a single on-loop wait blocked the event loop ~100 s on 2026-09-24).
+        Contract: tests/gateway/test_no_agent_construction_on_event_loop.py."""
+        from gateway.run import SessionRouteUnavailableError, _load_gateway_config
+        route_lookup = await asyncio.to_thread(self._persisted_session_route_identity, session_key)
+        if route_lookup.state == "unavailable":
+            return (
+                "⚠️ Provider authentication failed: The persisted session model "
+                "preference could not be read or validated. No provider request "
+                "was made; repair the session store or use `/model reset`."
+            )
+        if route_lookup.state == "valid":
+            try:
+                self._resolve_session_agent_runtime(
+                    source=source, session_key=session_key, user_config=_load_gateway_config(),
+                    persisted_route_lookup=route_lookup,
+                )
+            except SessionRouteUnavailableError as exc:
+                return f"⚠️ Provider authentication failed: {exc}"
+        return None
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -2155,6 +2280,9 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        route_refusal = await self._hmwa_check_persisted_route(source, session_key)
+        if route_refusal is not None:
+            return route_refusal
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2180,6 +2308,8 @@ class GatewayTurnMixin:
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
             _run_start_session_id = session_entry.session_id
+            # The resume mark this turn recovers from (see _hmwa_shape_agent_response).
+            _run_start_resume_marked_at = getattr(session_entry, "last_resume_marked_at", None)
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
@@ -2235,6 +2365,7 @@ class GatewayTurnMixin:
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
+                _run_start_resume_marked_at=_run_start_resume_marked_at,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
@@ -2333,18 +2464,40 @@ class GatewayTurnMixin:
         from gateway.run import _profile_runtime_scope
         return _profile_runtime_scope(self._resolve_profile_home_for_source(source), {})
 
-    def _reset_notice_session_info(self, source: SessionSource) -> str:
+    def _reset_notice_session_info(
+        self, source: SessionSource, *, session_key: Optional[str] = None,
+        session_entry: Optional[Any] = None,
+    ) -> str:
         """Session-info block for the auto-reset notice, resolved inside the profile serving ``source``.
 
         Call via ``asyncio.to_thread``: resolution can block (credential refresh, context-length
         probes), and the scope is entered here so contextvars behave in the worker thread."""
         with self._profile_scope_for_source(source):
-            return self._format_session_info()
+            return self._format_session_info(
+                source=source, session_key=session_key, session_entry=session_entry,
+            )
 
-    def _format_session_info(self) -> str:
-        """Model / provider / context-length / endpoint block so users can spot bad context detection."""
-        from gateway.run import _resolve_gateway_model_context
-        resolved = _resolve_gateway_model_context()
+    def _format_session_info(
+        self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
+        session_entry: Optional[Any] = None,
+    ) -> str:
+        """Model / provider / reasoning / context-length / endpoint block so users can spot bad context
+        detection. With ``session_key`` the block describes the route the NEXT turn will actually use
+        (persisted /model identity, durable chat pin, session /reasoning override), resolved through the
+        same authority as the turn itself; without it, the configured default route."""
+        from gateway.run import (
+            _endpoint_url_for_display, _load_gateway_config, _resolve_gateway_model_context,
+        )
+        model = route = None
+        if session_key:
+            # A fresh transcript entry can have no identity while its chat still has a durable pin:
+            # resolve exactly as the next turn would (raises SessionRouteUnavailableError fail-closed).
+            model, runtime = self._resolve_session_agent_runtime(
+                source=source, session_key=session_key, user_config=_load_gateway_config(),
+            )
+            route = {k: runtime.get(k) for k in ("provider", "base_url", "api_key")}
+        resolved = _resolve_gateway_model_context(model, route)
+        provider = (route.get("provider") if route else None) or resolved.provider
         context_length = resolved.context_length
         ctx_source = {
             "config": "config",
@@ -2354,21 +2507,37 @@ class GatewayTurnMixin:
             f"{context_length / 1_000_000:.1f}M" if context_length >= 1_000_000
             else f"{context_length // 1_000}K" if context_length >= 1_000 else str(context_length)
         )
+        # Effective reasoning effort for the fresh session: a manual reset may preserve a deliberate
+        # per-session override.
+        reasoning_label = None
+        try:
+            reasoning_label = self._reasoning_effort_label(
+                self._resolve_session_reasoning_config(
+                    source=source, session_key=session_key, model=resolved.model,
+                )
+                if session_key else self._load_reasoning_config()
+            )
+        except Exception:
+            reasoning_label = None
         lines = [
             t("gateway.session.info_model", model=resolved.model),
-            t("gateway.session.info_provider", provider=resolved.provider or "openrouter"),
-            t("gateway.session.info_context", tokens=ctx_display, source=ctx_source),
+            t("gateway.session.info_provider", provider=provider or "openrouter"),
         ]
-        if (resolved.provider or "") == "moa":
+        if reasoning_label:
+            lines.append(f"◆ Reasoning: {reasoning_label}")
+        lines.append(t("gateway.session.info_context", tokens=ctx_display, source=ctx_source))
+        if (provider or "") == "moa":
             # The preset name hides who pays: the aggregator runs every tool-loop step (#112359).
             from hermes_cli.config import load_config
             from hermes_cli.moa_config import normalize_moa_config
             agg = normalize_moa_config(load_config().get("moa"))["presets"].get(resolved.model, {}).get("aggregator") or {}
             if agg:
                 lines.append(t("gateway.session.info_acting_model", provider=agg.get("provider"), model=agg.get("model")))
-        base_url = resolved.base_url
-        if base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1", "0.0.0.0"):
-            lines.append(t("gateway.session.info_endpoint", url=base_url))
+        # Endpoint only for local/loopback routes, and only its origin: a session base_url can carry
+        # credentials in userinfo or a secret in its path.
+        display_endpoint = _endpoint_url_for_display(resolved.base_url) if resolved.base_url else ""
+        if display_endpoint:
+            lines.append(t("gateway.session.info_endpoint", url=display_endpoint))
         return "\n".join(lines)
 
     async def _run_background_task(
@@ -2927,10 +3096,32 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, **turn_kwargs,
     ) -> Dict[str, Any]:
-        """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
-        when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+        """Session-binding and profile-scoping wrapper around ``_run_agent_inner`` (same keyword
+        parameters; profile scope is a pass-through when multiplexing is off).
+
+        Rebind the session identity from THIS call's own arguments before any local or proxy
+        execution: recursive queued turns bypass the top-level message handler and would otherwise
+        inherit the outer turn's coherent identity."""
+        from gateway.session_context import reset_session_vars, restore_session_vars
+        reset_tokens = reset_session_vars()
+        session_tokens: list = []
+        try:
+            session_tokens = self._set_session_vars_for_source(
+                source=source, session_key=turn_kwargs.get("session_key"), session_id=session_id,
+                message_id=turn_kwargs.get("event_message_id"),
+            )
+            # Turn admission (gateway.max_concurrent_turns): the handler's permit is reused only in
+            # its own task, never by an independently spawned child.
+            async with self._get_turn_admission().slot(
+                turn_kwargs.get("session_key"), ack=lambda: self._ack_turn_slot_wait(source),
+            ):
+                with self._profile_scope_for_source(source):
+                    return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+        finally:
+            try:
+                restore_session_vars(session_tokens)
+            finally:
+                restore_session_vars(reset_tokens)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -3476,6 +3667,9 @@ class GatewayTurnMixin:
         worker.executor_task = asyncio.ensure_future(
             self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
         )
+        # A cancelled/timed-out caller must not free the admission slot while this executor
+        # thread still runs (gateway.max_concurrent_turns).
+        self._get_turn_admission().retain_worker(worker.executor_task)
         return worker
 
     @staticmethod

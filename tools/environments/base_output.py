@@ -6,6 +6,8 @@ stdout drain thread used by ``BaseEnvironment._wait_for_process``.
 """
 
 import codecs
+import errno
+import logging
 import os
 import select
 import subprocess
@@ -24,6 +26,8 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 _SPILL_MAX_AGE_S = 7 * 86400
+
+logger = logging.getLogger(__name__)
 
 
 class _BoundedOutputCollector:
@@ -48,6 +52,9 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        # Abnormal reasons the drain thread stopped early (fork #553). Read by
+        # ``_finalize_wait_result`` so a capture we failed to read never renders as an empty result.
+        self.drain_error: list[str] = []
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
@@ -196,9 +203,36 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
     return _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
 
-def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None) -> dict:
-    """Assemble a wait result, attaching spill metadata when overflow occurred."""
+def _finalize_wait_result(
+    collector: _BoundedOutputCollector, rendered: str, returncode: int | None,
+    drain_error: "list[str] | None" = None,
+) -> dict:
+    """Assemble a wait result, attaching spill metadata when overflow occurred.
+
+    ``drain_error`` (explicit, else ``collector.drain_error``) carries any abnormal reason the
+    drain thread stopped early. When present we FAIL LOUD: the marker is prepended to the output
+    and ``drain_error`` is exposed on the result dict. Silently returning an empty capture is what
+    made the fd >= FD_SETSIZE blackout so expensive to diagnose (fork #553) — a command that
+    produced nothing and a capture we failed to read looked identical to every caller.
+    """
+    if drain_error is None:
+        drain_error = getattr(collector, "drain_error", None)
+    if drain_error:
+        reason = drain_error[0]
+        marker = (
+            "[hermes] OUTPUT CAPTURE FAILED — the drain thread aborted "
+            f"({reason}). Any output below is INCOMPLETE and the exit code "
+            "may not reflect the command's real result. This is a Hermes "
+            "bug, not a result: re-run the command, and if it repeats use "
+            "execute_code as a bypass.\n"
+        )
+        rendered = marker + rendered
+        logger.error(
+            "terminal drain aborted abnormally (%s); returning a loud capture-failure marker "
+            "instead of a silent empty result", reason)
     result = {"output": rendered, "returncode": returncode}
+    if drain_error:
+        result["drain_error"] = drain_error[0]
     spill = collector.close_spill()
     if spill:
         result["output_total_chars"] = collector.total_chars
@@ -395,31 +429,58 @@ def _drain_stdout(proc: ProcessHandle, output: _BoundedOutputCollector, stop: "t
 
 
 def _drain_fd_select(proc, fd: int, output: _BoundedOutputCollector, decoder, stop=None) -> None:
-    """POSIX drain: select() poll, stopping ~300ms after bash exits with the pipe idle, or
-    when *stop* is set (the pipe is being handed to another reader — yield-to-background)."""
+    """POSIX drain: poll() loop, stopping ~300ms after bash exits with the pipe idle, or
+    when *stop* is set (the pipe is being handed to another reader — yield-to-background).
+
+    ``poll()`` rather than ``select()`` (fork #553): ``select()`` raises ``ValueError`` for any
+    fd >= FD_SETSIZE (1024), so in a gateway holding many descriptors EVERY command returned
+    ``{"output": "", "returncode": 0}`` — a silent blackout. An abnormal abort is recorded in
+    ``output.drain_error`` so the result renders a loud marker instead of an empty capture.
+    """
+    drain_error = output.drain_error
     idle_after_exit = 0
-    while True:
-        if stop is not None and stop.is_set():
-            return
-        try:
-            ready, _, _ = select.select([fd], [], [], 0.1)
-        except (ValueError, OSError):
-            return  # fd already closed
-        if ready:
+    poller = select.poll()
+    try:
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    except (ValueError, OSError) as exc:
+        drain_error.append(f"{type(exc).__name__}: {exc}")
+        return
+    try:
+        while True:
+            if stop is not None and stop.is_set():
+                return
             try:
-                chunk = os.read(fd, 4096)
-            except (ValueError, OSError):
+                events = poller.poll(100)
+            except OSError as exc:
+                if getattr(exc, "errno", None) == errno.EINTR:
+                    continue
+                drain_error.append(f"{type(exc).__name__}: {exc}")
                 return
-            if not chunk:
-                return  # true EOF — all writers closed
-            output.append(decoder.decode(chunk))
-            idle_after_exit = 0
-        elif proc.poll() is not None:
-            # bash is gone and the pipe was idle ~100ms; allow two more cycles
-            # for a buffered tail, then stop (a grandchild may hold the pipe).
-            idle_after_exit += 1
-            if idle_after_exit >= 3:
+            except ValueError as exc:
+                # The fd was closed under us: expected once the child has exited.
+                if proc.poll() is None:
+                    drain_error.append(f"{type(exc).__name__}: {exc}")
                 return
+            if events:
+                try:
+                    chunk = os.read(fd, 4096)
+                except (ValueError, OSError):
+                    return
+                if not chunk:
+                    return  # true EOF — all writers closed
+                output.append(decoder.decode(chunk))
+                idle_after_exit = 0
+            elif proc.poll() is not None:
+                # bash is gone and the pipe was idle ~100ms; allow two more cycles
+                # for a buffered tail, then stop (a grandchild may hold the pipe).
+                idle_after_exit += 1
+                if idle_after_exit >= 3:
+                    return
+    finally:
+        try:
+            poller.unregister(fd)
+        except (KeyError, ValueError, OSError):
+            pass
 
 
 def _drain_fd_windows(proc, fd: int, output: _BoundedOutputCollector, decoder, stop=None) -> None:

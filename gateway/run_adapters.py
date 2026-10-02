@@ -108,6 +108,13 @@ class GatewayAdapterLifecycleMixin:
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+        # t_e253d9d5: cancel_background_tasks() clears _pending_messages into a non-replayable
+        # flush file; let it spool follow-ups for boot replay first (see
+        # BasePlatformAdapter.cancel_background_tasks).
+        try:
+            adapter._shutdown_pending_sink = self._spool_one_adapter_pending
+        except Exception:
+            logger.debug("pending-sink install failed%s", suffix, exc_info=True)
         try:
             if not await self._await_adapter_cleanup_with_timeout(adapter.cancel_background_tasks(), timeout):
                 logger.warning(
@@ -760,7 +767,7 @@ class GatewayAdapterLifecycleMixin:
         self._update_platform_runtime_status(
             platform.value, platform_state="retrying", error_code=error_code, error_message=error_message,
         )
-        backoff = _reconnect_backoff(attempt)
+        backoff = _reconnect_backoff(attempt, platform)  # Discord caps at 120s (2026-08-20 DNS outage)
         info["attempts"] = attempt
         info["next_retry"] = time.monotonic() + backoff
         return backoff
@@ -881,6 +888,7 @@ class GatewayAdapterLifecycleMixin:
             await build_channel_directory(self.adapters)
         # A platform offline at startup skipped its restart-interrupted sessions; resume them now.
         try:
+            await self._prepare_auto_resume_decisions(platform=platform)
             self._schedule_resume_pending_sessions(platform=platform)
         except Exception:
             logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
@@ -1451,7 +1459,7 @@ class GatewayAdapterLifecycleMixin:
                         functools.partial(_profile_runtime_scope, hydrate_secrets=False), profile_home):
                     self._flag_reconnect_needs_attention(
                         platform, queue_info, time.monotonic(), status_key=f"{profile_name}:{platform.value}")
-                backoff = _reconnect_backoff(attempts)
+                backoff = _reconnect_backoff(attempts, platform)
                 logger.info(
                     "Secondary %s reconnect retry in %ds (profile: %s)", platform.value, backoff, profile_name
                 )

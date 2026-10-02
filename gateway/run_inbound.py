@@ -18,6 +18,7 @@ import re
 import shutil
 import time
 from contextlib import suppress
+from contextvars import ContextVar
 from pathlib import Path
 
 from agent.i18n import t
@@ -43,6 +44,16 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Fork: chat id for the per-clip STT outcome lines (``stt: chat=<c> transcribed N chars in Ts`` /
+# ``stt FAILED: chat=<c> after Ts: <why>``), set by the inbound callers around transcription so the
+# lines pair with the ``[voice Ns]`` inbound line for log readers. Fork tests import it from
+# ``gateway.run`` (FOLLOWUP: re-export there).
+_STT_LOG_CHAT: "ContextVar[str]" = ContextVar("_STT_LOG_CHAT", default="unknown")
+
+
+def _stt_log_failed(why: str, started: float) -> None:
+    logger.info("stt FAILED: chat=%s after %.1fs: %s", _STT_LOG_CHAT.get(), time.monotonic() - started, why)
 
 
 def rehome_inbound_media(event: MessageEvent) -> None:
@@ -232,6 +243,7 @@ class GatewayInboundMixin:
                 "Dropping inbound message because its explicit profile route "
                 "targets an unserved profile"
             )
+            self._hm_report_refused_restart_followup(source, "profile_route_rejected")
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
@@ -277,7 +289,9 @@ class GatewayInboundMixin:
                 # No user identity (Telegram service messages, channel forwards, anonymous admin
                 # posts, sender_chat): can't be paired but may be authorized via a chat allowlist.
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                self._hm_report_refused_restart_followup(source, "unauthorized")
                 return None
+            self._hm_report_refused_restart_followup(source, "unauthorized")
             # DMs get a pairing code or a one-time decline, groups are ignored. A bot cannot pair, and
             # answering one mid-cooldown is outbound traffic.
             pairable_dm = source.chat_type == "dm" and not getattr(source, "is_bot", False)
@@ -297,6 +311,14 @@ class GatewayInboundMixin:
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
         return event, source, False
+
+    def _hm_report_refused_restart_followup(self, source: SessionSource, reason: str) -> None:
+        """Fork (t_43e058b7): a replayed restart follow-up refused at intake is LOST, never silent.
+        getattr-guard: bare test runners build GatewayRunner via object.__new__."""
+        _report = getattr(self, "_report_refused_restart_followup", None)
+        if callable(_report):
+            with suppress(Exception):
+                _report(source, reason)
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
@@ -1028,10 +1050,44 @@ class GatewayInboundMixin:
             return True, t("gateway.moa.prepare_failed")
         return False, None
 
+    async def _hm_cmd_boomerang(self, event, source, _quick_key):
+        # Fork: /boomerang <task> rewrites into a boomerang skill invocation and falls through to
+        # normal dispatch so it runs as an agent turn (the /moa event.text-rewrite pattern). The skill
+        # tells the agent to delegate_task(inherit_context=true, ...) with the autonomous-execution
+        # contract; the child's summary re-enters this session asynchronously when it finishes.
+        boomerang_task = event.get_command_args().strip()
+        if not boomerang_task:
+            return True, (
+                "Usage: /boomerang <task>\n"
+                "Runs the task autonomously in an isolated subagent that inherits this session's "
+                "context; a summary returns here when it finishes."
+            )
+        try:
+            from agent.skill_commands import build_skill_invocation_message, resolve_skill_command_key
+            cmd_key = resolve_skill_command_key("boomerang")
+            msg = build_skill_invocation_message(cmd_key, boomerang_task) if cmd_key else None
+            if not msg:
+                # Skill not installed — degrade to an inline instruction so the feature still works.
+                msg = (
+                    f"Boomerang this task: {boomerang_task}\n\n"
+                    "Use delegate_task with inherit_context=true so the subagent inherits this "
+                    "conversation's context. Instruct it to execute autonomously (make reasonable "
+                    "assumptions, do NOT stop to ask; if blocked, complete what you can and report the "
+                    "blocker), and to end with a structured summary (Outcome / Changed / "
+                    "Commands+validation / Blockers). Its summary will re-enter this session when it "
+                    "finishes — acknowledge the dispatch and continue."
+                )
+            event.text = msg
+        except Exception as _boom_exc:
+            logger.warning("boomerang command rewrite failed: %s", _boom_exc)
+            return True, "Failed to prepare the boomerang turn."
+        return False, None
+
     # Idle-path built-ins with bespoke flow (confirmations, prompt rewrites, one-shot MoA), each
     # handled by ``_hm_cmd_<name>`` → ``(handled, result)``; ``(False, None)`` falls through to the agent.
     _HM_CANONICAL_COMMANDS = frozenset({
         "new", "start", "egress", "learn", "plan", "init", "blueprint", "undo", "queue", "steer", "moa",
+        "boomerang",
     })
 
     async def _hm_dispatch_canonical_command(
@@ -1044,6 +1100,16 @@ class GatewayInboundMixin:
             self._gateway_plain_command_handlers().get(canonical)
             or self._gateway_idle_command_handlers().get(canonical)
         )
+        # Fork: a plugin-registered /context wins over the built-in. This fast path runs before the
+        # plugin-dispatch block, which would silently shadow a plugin registering the same name — the
+        # fork ships exactly such a plugin. Defer to the plugin when one is registered.
+        if plain_handler is not None and canonical == "context":
+            try:
+                from hermes_cli.plugins import get_plugin_command_handler
+                if get_plugin_command_handler("context") is not None:
+                    plain_handler = None
+            except Exception:
+                pass
         if plain_handler is not None:
             async with self._async_profile_scope_for_source(source):
                 return True, await plain_handler(event)
@@ -1364,12 +1430,32 @@ class GatewayInboundMixin:
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
 
+        # Fork (t_e8017c37): shared-checkout admission hold. Unlike the marker-polled external drain
+        # above, this re-reads the durable operator hold on EVERY admission. Internal continuations are
+        # admitted+counted under ``drain`` and refused only under ``freeze``. The ticket spans the
+        # whole turn (released in the finally below). getattr-guard: bare object.__new__ runners.
+        _checkout_ticket = None
+        _checkout_gate_fn = getattr(self, "_checkout_admission_gate", None)
+        _checkout_gate = _checkout_gate_fn() if callable(_checkout_gate_fn) else None
+        if _checkout_gate is not None:
+            from gateway.checkout_admission import AdmissionRefused
+            try:
+                _checkout_ticket = _checkout_gate.admit(f"message:{_quick_key}", internal=bool(is_internal))
+            except AdmissionRefused as exc:
+                logger.info("Refusing turn for session %s — %s", _quick_key, exc.reason)
+                return (
+                    "⏳ This agent is paused for a maintenance update and isn't "
+                    "accepting new turns right now. Please resend shortly."
+                )
+
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            if _checkout_ticket is not None:
+                _checkout_ticket.release()
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1380,6 +1466,14 @@ class GatewayInboundMixin:
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
+        # 🔴 LOAD-BEARING NO-AWAIT INVARIANT (fork busy-gateway-quiescence reaper, RC-1): capture THIS
+        # turn's asyncio Task synchronously here, in the same straight-line block as the slot-set
+        # above. The turn runs INLINE in this handler coroutine, so ``current_task()`` IS the turn
+        # task. An ``await`` between the slot-set and this capture would let the reaper observe a
+        # non-sentinel slot with no recorded task and mis-classify a live turn as leaked (INV-4).
+        if not hasattr(self, "_running_agent_tasks"):
+            self._running_agent_tasks = {}  # self-heal for object.__new__ partials
+        self._running_agent_tasks[_quick_key] = asyncio.current_task()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
@@ -1406,23 +1500,34 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
-            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
-            self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
-            # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
-            # clears it only once the reply is in the delivery ledger (else a kill in between
-            # left neither marker nor ledger row and the persisted reply was never sent).
-            if not getattr(event, "_turn_marker_handoff", False):
-                await self._clear_durable_active_turn(event)
-            # Release only this turn's generation. Eviction may immediately admit a replacement
-            # through the cold path; an unconditional release here would then clear the replacement
-            # sentinel/agent and lease. Reset/stop release their stale slot before installing a
-            # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
-            self._release_running_agent_state(_quick_key, run_generation=_run_generation)
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
-            # the lease its own turn acquired, never a newer turn's.
+            # the lease its own turn acquired, never a newer turn's. It runs FIRST, before any await
+            # in this finally (fork, 2026-09-27): after /stop the adapter cancels this task
+            # (cancel_session_processing), and a CancelledError landing on an await below used to
+            # skip this release, leaking the lease until restart.
             self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
+                # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
+                self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
+                # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
+                # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
+                # clears it only once the reply is in the delivery ledger (else a kill in between
+                # left neither marker nor ledger row and the persisted reply was never sent).
+                if not getattr(event, "_turn_marker_handoff", False):
+                    await self._clear_durable_active_turn(event)
+            finally:
+                try:
+                    # Release only this turn's generation, on every exit path including a cancellation
+                    # delivered on the await above. Eviction may immediately admit a replacement
+                    # through the cold path; an unconditional release here would then clear the
+                    # replacement sentinel/agent and lease. Reset/stop release their stale slot before
+                    # installing a successor, preserving reset-zombie cleanup without granting gen-N
+                    # successor authority.
+                    self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+                finally:
+                    if _checkout_ticket is not None:
+                        _checkout_ticket.release()
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
@@ -1451,7 +1556,10 @@ class GatewayInboundMixin:
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_multi_user and source.user_name:
+        # Fork: synthetic gateway events (boot auto-resume, queued continuations, internal re-prompts)
+        # must never impersonate the user — stamping "[<user>] " onto an EMPTY internal event turned it
+        # non-empty and skipped the reason-aware recovery note downstream (2026-07-10 live incident).
+        if _is_shared_multi_user and source.user_name and not getattr(event, "internal", False):
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
@@ -1537,17 +1645,25 @@ class GatewayInboundMixin:
     async def _enrich_inbound_voice(
         self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]
     ) -> str:
-        message_text, _successful_transcripts = await self._enrich_message_with_transcription(
-            message_text, audio_paths,
-        )
+        _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
+        try:
+            message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+                message_text, audio_paths,
+            )
+        finally:
+            _STT_LOG_CHAT.reset(_stt_chat_token)
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
         # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
+        # Through the once-helper (fork, FleetReview #101): it records the echoed count on the event,
+        # so a pending/busy path that later echoes the same event's transcripts sends only the unsent tail.
         if _successful_transcripts and self._should_echo_stt_transcripts():
             _echo_adapter = self._delivery_adapter_for(source)
             if _echo_adapter:
                 _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                await self._echo_stt_transcripts(_echo_adapter, source, _successful_transcripts, metadata=_echo_meta)
+                await self._echo_pending_stt_transcripts_once(
+                    event, _echo_adapter, source, _successful_transcripts, metadata=_echo_meta,
+                )
         return message_text
 
     @staticmethod
@@ -2048,8 +2164,13 @@ class GatewayInboundMixin:
         agent_path = to_agent_visible_cache_path(os.path.abspath(path))
         return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
 
-    async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
-        """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
+    async def _transcribe_one_clip(
+        self, path: str, transcribe_audio, transcribe_audio_local_fallback, *, started: Optional[float] = None,
+    ) -> Tuple[Optional[str], str]:
+        """``(transcript_or_None, note)`` for one clip via configured STT with local fallback.
+        Every failure logs one ``stt FAILED`` INFO line keyed on ``_STT_LOG_CHAT`` (fork)."""
+        if started is None:
+            started = time.monotonic()
         result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
         if not result.get("success"):
             fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
@@ -2058,12 +2179,14 @@ class GatewayInboundMixin:
                 result = fallback
         if not result["success"]:
             logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
+            _stt_log_failed(str(result.get("error", "unknown error"))[:200], started)
             return None, self._untranscribed_audio_note(path)
         transcript = result["transcript"]
         # STT may return success=True with an empty/whitespace transcript (silence, cut-off);
         # empty quotes make the agent reply to nothing and can loop, so emit a sentinel note.
         # See #41603.
         if not (transcript or "").strip():
+            _stt_log_failed("empty transcript (silence/inaudible)", started)
             return None, (
                 "[The user sent a voice message but it came through "
                 "empty or inaudible — speech-to-text returned no "
@@ -2083,6 +2206,8 @@ class GatewayInboundMixin:
         from gateway.run import _probe_audio_duration
         audio_paths = list(dict.fromkeys(audio_paths))
         if not getattr(self.config, "stt_enabled", True):
+            for _ in audio_paths:
+                _stt_log_failed("stt disabled in config", time.monotonic())
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
@@ -2097,21 +2222,31 @@ class GatewayInboundMixin:
             )
         except ModuleNotFoundError as e:
             logger.error("Transcription module unavailable: %s", e)
+            for _ in audio_paths:
+                _stt_log_failed(f"transcription module unavailable: {e}", time.monotonic())
             return self._prepend_media_prefix("[voice message could not be transcribed]", user_text), []
 
         enriched_parts = []
         successful_transcripts: List[str] = []
         for path in audio_paths:
+            _stt_started = time.monotonic()
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 transcript, note = await self._transcribe_one_clip(
-                    path, transcribe_audio, transcribe_audio_local_fallback,
+                    path, transcribe_audio, transcribe_audio_local_fallback, started=_stt_started,
                 )
                 if transcript is not None:
                     successful_transcripts.append(transcript)
+                    # INFO carries size + latency only: the words are the user's speech (passwords,
+                    # PII) and INFO logs are long-lived (fork, Backfill C3).
+                    logger.info(
+                        "stt: chat=%s transcribed %d chars in %.1fs",
+                        _STT_LOG_CHAT.get(), len(transcript), time.monotonic() - _stt_started,
+                    )
                 enriched_parts.append(note)
             except Exception as e:
                 logger.error("Transcription error: %s", e)
+                _stt_log_failed(f"{type(e).__name__}: {e}"[:200], _stt_started)
                 enriched_parts.append(self._untranscribed_audio_note(path))
 
         if enriched_parts:
@@ -2137,7 +2272,13 @@ class GatewayInboundMixin:
         if not audio_paths:
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+        _stt_chat_token = _STT_LOG_CHAT.set(
+            str(getattr(getattr(event, "source", None), "chat_id", None) or "unknown")
+        )
+        try:
+            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+        finally:
+            _STT_LOG_CHAT.reset(_stt_chat_token)
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts
@@ -2154,6 +2295,7 @@ class GatewayInboundMixin:
             return
         already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
         event._gateway_pending_stt_echoed = max(already_echoed, len(transcripts))
+        setattr(event, "_gateway_pending_stt_echo_sent", True)
         await self._echo_stt_transcripts(
             adapter, source, transcripts[already_echoed:], metadata=metadata, log_context=log_context,
         )

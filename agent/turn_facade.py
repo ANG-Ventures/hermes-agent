@@ -40,7 +40,9 @@ class TurnFacadeMixin:
         cancel_background_review_for_live_turn(self)
 
         from agent import relay_runtime
-        from agent.aux_accounting import reset_accounting_context, set_accounting_context
+        from agent.aux_accounting import (
+            reset_accounting_context, reset_blackbox_turn, set_accounting_context, set_blackbox_turn,
+        )
         from agent.auxiliary_client import scoped_runtime_main
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
@@ -72,7 +74,7 @@ class TurnFacadeMixin:
         relay_lease = relay_turn = lease = None
         # Scope tokens start None: early returns leave the try before the set_*() calls and
         # the finally resets each one unconditionally.
-        token = affinity_token = acct_token = None
+        token = affinity_token = acct_token = bb_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
 
@@ -137,6 +139,10 @@ class TurnFacadeMixin:
             acct_token = set_accounting_context(
                 getattr(self, "_session_db", None), getattr(self, "session_id", None)
             )
+            # Blackbox per-call ledger for aux calls: bind this turn's id (the one turn_context adopts
+            # from _relay_pending_turn_id) so aux rows land under it with attribution='aux:<task>'
+            # (t_39628ae3).
+            bb_token = set_blackbox_turn(self, relay_turn_id)
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
@@ -159,6 +165,12 @@ class TurnFacadeMixin:
                     # the interrupt clear itself waits for the thread join in the outer finally.
                     if lease is not None:
                         lease.stop_refresher()
+            # Early returns inside run_conversation bypass finalize_turn and with it the once-per-turn
+            # on_session_end hook; emit it here so every turn (and its Blackbox turn_api_calls) gets a
+            # turns row. No-op when the finalizer already emitted for this turn id.
+            from agent.turn_finalizer import emit_unfinalized_session_end
+
+            emit_unfinalized_session_end(self, relay_turn_id, result=result)
             terminal = result if isinstance(result, dict) else {}
             relay_outcome = (
                 "cancelled" if terminal.get("interrupted") is True
@@ -171,6 +183,12 @@ class TurnFacadeMixin:
                 finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            try:
+                from agent.turn_finalizer import emit_unfinalized_session_end
+
+                emit_unfinalized_session_end(self, relay_turn_id, exc=exc)
+            except Exception:
+                pass
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):
@@ -207,6 +225,8 @@ class TurnFacadeMixin:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if bb_token is not None:
+                        reset_blackbox_turn(bb_token)
                     if token is not None:
                         reset_conversation_context(token)
                     if affinity_token is not None:
