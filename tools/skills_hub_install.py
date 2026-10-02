@@ -149,6 +149,9 @@ def install_from_quarantine(
     safe_skill_name = _validate_skill_name(skill_name)
     safe_category = _validate_install_parent_path(category) if category else ""
     quarantine_resolved = quarantine_path.resolve()
+    # noqa: root-equality  the rmtree below targets install_dir (validated separately by
+    # _resolve_lock_install_path/_check_install_target), not the quarantine path; the
+    # quarantine root itself is a staging dir, moving it would only relocate it.
     if not quarantine_resolved.is_relative_to(_quarantine_dir().resolve()):
         raise ValueError(f"Unsafe quarantine path: {quarantine_path}")
 

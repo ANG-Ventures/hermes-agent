@@ -222,6 +222,9 @@ def _safe_skills_path(skills_dir: Path) -> str:
     safe_dir = _safe_skills_tempdir = Path(tempfile.mkdtemp(prefix="hermes-skills-safe-"))
 
     for base, files in _walk_skill_tree(skills_dir):
+        # noqa: root-equality  relative_to() here builds COPY destinations under a fresh
+        # mkdtemp; base == skills_dir maps to safe_dir itself (mkdir exist_ok). The rmtree
+        # below only ever removes that private temp dir, never a derived path.
         (safe_dir / base.relative_to(skills_dir)).mkdir(parents=True, exist_ok=True)
         for item in files:
             shutil.copy2(str(item), str(safe_dir / item.relative_to(skills_dir)))

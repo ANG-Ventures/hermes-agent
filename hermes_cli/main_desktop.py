@@ -254,6 +254,8 @@ def _swap_staged_desktop_app(desktop_dir: Path, staging_dir: Path) -> Optional[P
         return None
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
+    # noqa: root-equality  staged_exe is a FILE strictly below staged_root; the rmtree
+    # calls above target the staging/previous dirs, not this computed path.
     return live_root / staged_exe.relative_to(staged_root)
 
 

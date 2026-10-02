@@ -135,13 +135,18 @@ def _load_model_provider(copied: Path, manifest):
     providers/ discovery (PluginManager skips the kind), so demanding ``register(ctx)`` would fail
     every valid provider plugin. Registry additions are undone on exit."""
     import providers
+    from hermes_cli import provider_seam
 
     # The live install may already have imported this very plugin (same directory name) during
     # startup discovery; import the copy fresh and put the live module/profiles back afterwards.
     module_name = providers._user_module_name(copied, "")
     prior_module = sys.modules.pop(module_name, None)
     before = dict(providers._REGISTRY)
-    before_aliases = dict(providers._ALIASES)
+    # ``_REGISTRY`` / ``_ALIASES`` are the fork's additive generation-seam facades
+    # (hermes_cli/provider_seam.py): ``pop``/``clear`` raise. Undo by swapping the
+    # whole generation back, which rewrites every facade's mirror at once.
+    generation = provider_seam.current()
+    before_sources = dict(providers._SOURCES)
     try:
         providers._import_plugin_dir(copied, "user")
         registered = tuple(sorted(
@@ -151,12 +156,9 @@ def _load_model_provider(copied: Path, manifest):
                 "model-provider plugin registered no ProviderProfile at import (see the warning above)")
         yield registered
     finally:
-        for name in [n for n, p in providers._REGISTRY.items() if before.get(n) is not p]:
-            providers._REGISTRY.pop(name)
-            providers._SOURCES.pop(name, None)
-        providers._REGISTRY.update(before)
-        providers._ALIASES.clear()
-        providers._ALIASES.update(before_aliases)
+        provider_seam._restore(generation)
+        providers._SOURCES.clear()
+        providers._SOURCES.update(before_sources)
         providers._PROVIDER_LIST_CACHE = None
         sys.modules.pop(module_name, None)
         if prior_module is not None:

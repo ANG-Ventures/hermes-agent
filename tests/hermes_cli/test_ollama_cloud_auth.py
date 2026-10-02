@@ -153,6 +153,10 @@ class TestEnsureDirectAliases:
 
         existing = {"pre": DirectAlias("pre-model", "custom", "")}
         monkeypatch.setattr(ms, "DIRECT_ALIASES", existing)
+        # Mark the populated contents as the loader's own. Contents a caller seeded are
+        # deliberately never discarded (upstream #16767 — tests seed the dict in place);
+        # the hot-reload contract under test is "a populated cache is still refreshed".
+        monkeypatch.setattr(ms, "_DIRECT_ALIAS_LOADED", dict(existing))
 
         call_count = [0]
         def counting_load():
