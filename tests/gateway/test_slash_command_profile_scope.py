@@ -39,6 +39,8 @@ def runner():
 
     class _Runner(GatewaySlashCommandsMixin):
         _run_in_executor_with_context = GatewayRunner._run_in_executor_with_context
+        # fork: the context-preserving hop routes through the latency-logging submitter
+        _submit_with_context = GatewayRunner._submit_with_context
         _get_executor = GatewayRunner._get_executor
 
     r = _Runner()

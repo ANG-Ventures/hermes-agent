@@ -127,7 +127,8 @@ def _status_model_route(
     row_route = (_clean_str(session_row.get("model")), _clean_str(session_row.get("billing_provider")), {})
     # First fully-resolved (model AND provider) route wins; the SessionDB row is used even if partial.
     model_name, provider_name, route = next((r for r in routes if r[0] and r[1]), row_route)
-    context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
+    # A stored -1 is the compaction sentinel, never a figure to render (t_64728f32).
+    context_used = context_used or max(0, _int_value(getattr(session_entry, "last_prompt_tokens", 0)))
     user_config: dict[str, Any] = {}
     if not model_name or not provider_name:
         user_config = _quiet_sync(_load_gateway_config, {})
@@ -261,6 +262,16 @@ class GatewayStatusCommandsMixin:
         status_agent = agent if is_running else self._cached_agent_for(session_key)
         self._rehydrate_session_model_override(session_key)
         active_override = self._session_model_override(session_key) or {}
+        if not active_override:
+            # Fork rehydrate fails closed on a credential-unresolvable persisted identity (the turn
+            # resolver must not run it); /status is display-only and still shows the user's
+            # committed /model pin rather than the pre-switch DB row (upstream contract).
+            try:
+                _lookup = self._persisted_session_route_identity(session_key)
+            except Exception:
+                _lookup = None
+            if _lookup is not None and _lookup.state == "valid" and _lookup.identity:
+                active_override = {k: v for k, v in dict(_lookup.identity).items() if k in ("model", "provider")}
         model_name, provider_name, context_used, context_total, route = _status_model_route(
             status_agent, active_override, persisted_route, session_row, session_entry
         )
@@ -366,7 +377,9 @@ class GatewayStatusCommandsMixin:
             agent, ctx, session_entry, source
         )
         from agent.context_breakdown import context_display_source
-        mark = "~" if context_display_source(ctx) != "provider_usage" else ""
+        from gateway.runtime_footer import live_context_tokens
+        # "~": upstream's preflight-seed provenance OR the fork's post-compaction estimate (t_64728f32).
+        mark = "~" if (live_context_tokens(ctx).estimated or context_display_source(ctx) != "provider_usage") else ""
         # Gauge path: preserve the provenance of the selected occupancy figure.
         if used > 0 and context_length > 0:
             pct = _pct(used, context_length)
