@@ -2099,13 +2099,15 @@ class SessionDB(
     ) -> Tuple[List[str], List[str]]:
         if not parent_ids:
             return [], []
-        ph = _sql_placeholders(parent_ids)
-        children = [
-            row["id"] for row in conn.execute(
-                f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
-                parent_ids,
-            ).fetchall()
-        ]
+        from hermes_state_common import _id_chunks
+        # Chunked like every other IN-list over session ids: a bulk prune/delete hands this
+        # thousands of parents at once (SQLITE_LIMIT_VARIABLE_NUMBER, legacy ceiling 999).
+        children: List[str] = []
+        for chunk in _id_chunks(parent_ids):
+            children.extend(row["id"] for row in conn.execute(
+                f"SELECT id FROM sessions WHERE parent_session_id IN ({_sql_placeholders(chunk)})",
+                chunk,
+            ).fetchall())
         roots: List[str] = []
         for child_id in children:
             root_id = self._resolve_effective_last_active_root(conn, child_id)

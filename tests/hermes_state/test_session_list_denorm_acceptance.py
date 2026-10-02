@@ -419,11 +419,17 @@ def test_all_five_delete_orphan_sites_promote_surviving_continuation(
             _create_session(db, parent_id, started_at=10.0)
 
         db.end_session(parent_id, "compression")
+        # parity 2026-10-01 (upstream 7d49b46e15, ``whole_lineages``): prune no longer deletes a
+        # compression ancestor while a live continuation follows it — the lineage ages through
+        # its tip. A reset fork is NOT a continuation, so prune still orphans it and the
+        # orphan-promotion path under test is exercised the same way.
+        child_config = {"_reset_from": parent_id} if delete_mode == "prune-sessions" else None
         _create_session(
             db,
             "child",
             started_at=20.0,
             parent_session_id=parent_id,
+            model_config=child_config,
         )
         _append(db, "child", 50.0)
         assert _stored(db, "child") is None
@@ -788,16 +794,31 @@ def test_all_six_session_parent_mutation_sites_are_maintenance_adjacent():
     # The 2026-08 parity merge added a 7th site: adopt_orphaned_gateway_session
     # stamps parent_session_id during gateway orphan repair (and recomputes the
     # rollup for both rows).
-    import hermes_state_portability
+    # parity 2026-10-01: upstream split SessionDB into one mixin per domain
+    # (hermes_state_{sessions,maintenance,gateway,portability,profile_repair,...}), so
+    # scan every ``hermes_state*.py`` sibling. Two consequences for the census:
+    # ``_insert_session_row`` builds its upsert from ``_UPSERT_KEEP_EXISTING_SQL`` (a
+    # joined list, not a literal, so the AST scan cannot see it; it is recompute-adjacent
+    # by inspection) and the profile-repair lane adds two sites (``delete_moved_session``,
+    # ``sever_crossed_parents``), both maintenance-adjacent.
+    import glob
 
     source = "\n".join(
-        Path(mod.__file__).read_text(encoding="utf-8")
-        for mod in (hermes_state, hermes_state_portability)
+        Path(path).read_text(encoding="utf-8")
+        for path in sorted(glob.glob(str(Path(hermes_state.__file__).with_name("hermes_state*.py"))))
     )
     sites, maintained = _parent_mutation_contract(source)
 
-    assert len(sites) == 7, sites
+    assert sites == {
+        "_attach_import_parents", "adopt_orphaned_gateway_session", "delete_empty_sessions",
+        "delete_moved_session", "delete_session", "delete_sessions", "prune_sessions",
+        "sever_crossed_parents",
+    }, sites
     assert sites - maintained == set()
+    # The upsert site the AST scan cannot read: still a parent_session_id writer, still recomputed.
+    import inspect
+    upsert_src = inspect.getsource(hermes_state.SessionDB._insert_session_row)
+    assert "_UPSERT_KEEP_EXISTING_SQL" in upsert_src and "_recompute_effective_last_active" in upsert_src
 
 
 def test_parent_mutation_contract_detects_a_new_unmaintained_site():
