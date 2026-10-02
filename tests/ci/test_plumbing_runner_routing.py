@@ -17,7 +17,8 @@ WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
         ("ci.yaml", "all-checks-pass"),
         ("ci.yaml", "ci-timings"),
         ("tests.yml", "save-durations"),
-        ("osv-scanner.yml", "emit-status"),
+        # osv-scanner.yml's emit-status wrapper was retired with the per-PR OSV
+        # run (upstream; the scan is weekly against main, no review_status job).
     ],
 )
 def test_plumbing_job_is_unconditionally_hosted(workflow, job_id):
@@ -65,5 +66,8 @@ def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
 def test_e2e_invocation_emits_stacks_before_job_cancellation():
     job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
     step = next(step for step in job["steps"] if step.get("name") == "Run e2e tests")
-    assert "python -m pytest tests/e2e/ -v --tb=short -o faulthandler_timeout=120" in step["run"]
+    # Upstream runs the e2e files through the per-file runner (one pytest per
+    # file); the fork's stall-stack flag (#792) rides along as a bare pytest flag.
+    assert "scripts/run_tests.sh --include-integration" in step["run"]
+    assert "-o faulthandler_timeout=120" in step["run"]
     assert job["timeout-minutes"] * 60 > 120

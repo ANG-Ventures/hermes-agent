@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import threading
 from io import StringIO
 from pathlib import Path
@@ -500,7 +501,7 @@ def test_catchup_selects_closure_tests_and_reports_coverage_map(tmp_path: Path) 
 
     selected, coverage = catchup.select_tests(repo, ["app/api.py"], [])
     proc = subprocess.run(
-        ["python3.11", "-m", "pytest", *selected, "-q", "-o", "addopts=", "-p", "no:randomly"],
+        [sys.executable, "-m", "pytest", *selected, "-q", "-o", "addopts=", "-p", "no:randomly"],
         cwd=repo,
         text=True,
         stdout=subprocess.PIPE,

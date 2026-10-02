@@ -60,7 +60,7 @@ _CRASH_LIMIT = 3
 _CIRCUIT_RETRY_S = 300  # half-open probe interval (seconds)
 _crash_count: int = 0
 _circuit_open: bool = False
-_circuit_open_at: float = 0.0
+_circuit_open_at: float = float("-inf")
 _breaker_lock = threading.Lock()
 
 # Warn-once: spawn/path warnings sit in the hot path and would otherwise repeat once per
@@ -341,7 +341,7 @@ def check_command_security(command: str) -> dict:
     # block/warn verdicts.
     _crash_count = 0
     if _circuit_open:
-        _circuit_open, _circuit_open_at = False, 0.0
+        _circuit_open, _circuit_open_at = False, float("-inf")
         logger.info("tirith circuit breaker closed after successful probe")
     # JSON enriches findings/summary; a parse failure never changes the verdict.
     findings, summary = [], ""

@@ -80,7 +80,7 @@ def _cua_driver_contract_status(binary: Optional[str] = None) -> dict:
         return cua_driver_runtime_contract_status(resolved)
     now = time.monotonic()
     cache = _CUA_DRIVER_CONTRACT_CACHE
-    if cache.get("fingerprint") == fingerprint and now - cache.get("checked_at", 0.0) < 30.0:
+    if cache.get("fingerprint") == fingerprint and now - cache.get("checked_at", float("-inf")) < 30.0:
         return dict(cache["state"])
     state = cua_driver_runtime_contract_status(resolved)
     cache.update(fingerprint=fingerprint, checked_at=now, state=dict(state))

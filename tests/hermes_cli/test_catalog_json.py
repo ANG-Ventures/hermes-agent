@@ -19,7 +19,7 @@ import hermes_cli.local_runtime.catalog as cat
 @pytest.fixture(autouse=True)
 def _reset_refresh_state(monkeypatch):
     """Each test starts outside the TTL window with the packaged catalog."""
-    monkeypatch.setattr(cat, "_last_refresh_attempt", 0.0)
+    monkeypatch.setattr(cat, "_last_refresh_attempt", float("-inf"))
     packaged = cat._packaged_catalog()
     monkeypatch.setattr(cat, "CATALOG", packaged)
     yield

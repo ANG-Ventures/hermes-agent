@@ -26,7 +26,7 @@ _log = logging.getLogger(__name__)
 # the mtime of a marker file it reads in its idle predicate (gateway/scale_to_zero.py). Clients ping
 # every 15s; one write per 5s per process is plenty.
 _DASHBOARD_CLIENT_TOUCH_MIN_INTERVAL_S = 5.0
-_dashboard_client_touched_at = 0.0
+_dashboard_client_touched_at = float("-inf")
 _dashboard_client_touch_lock = threading.Lock()
 
 

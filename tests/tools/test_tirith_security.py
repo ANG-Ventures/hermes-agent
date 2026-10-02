@@ -16,7 +16,7 @@ def _reset_state():
     _tirith_mod._install_threads.clear()
     _tirith_mod._crash_count = 0
     _tirith_mod._circuit_open = False
-    _tirith_mod._circuit_open_at = 0.0
+    _tirith_mod._circuit_open_at = float("-inf")
 
 
 @pytest.fixture(autouse=True)

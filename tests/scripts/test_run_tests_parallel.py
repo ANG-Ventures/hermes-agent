@@ -361,19 +361,27 @@ def test_each_file_gets_private_basetemp_and_runner_cleans_it(tmp_path: Path) ->
 def test_private_basetemp_is_cleaned_when_popen_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """A spawn failure must not leak the runner-owned temp root."""
+    """A spawn failure must not leak the runner-owned temp roots.
+
+    The runner makes TWO of them per file: the per-run TMPDIR scratch root
+    (``r-*``) and, nested under it, the fork's private ``--basetemp``
+    (``hermes-pytest-tmproot-*``). Both must be gone after the spawn fails.
+    """
     from scripts import run_tests_parallel as runner
 
-    private_basetemp = tmp_path / "private-basetemp"
+    made: list[Path] = []
 
-    def make_basetemp(*_args, **_kwargs) -> str:
-        private_basetemp.mkdir()
-        return str(private_basetemp)
+    def make_tempdir(prefix: str = "", dir: str | None = None, **_kwargs) -> str:
+        parent = Path(dir) if dir else tmp_path
+        path = parent / f"{prefix}{len(made)}"
+        path.mkdir()
+        made.append(path)
+        return str(path)
 
     def fail_to_spawn(*_args, **_kwargs):
         raise OSError("synthetic Popen failure")
 
-    monkeypatch.setattr(runner.tempfile, "mkdtemp", make_basetemp)
+    monkeypatch.setattr(runner.tempfile, "mkdtemp", make_tempdir)
     monkeypatch.setattr(runner.subprocess, "Popen", fail_to_spawn)
 
     with pytest.raises(OSError, match="synthetic Popen failure"):
@@ -381,7 +389,9 @@ def test_private_basetemp_is_cleaned_when_popen_fails(
             tmp_path / "test_probe.py", [], tmp_path, file_timeout=1,
         )
 
-    assert not private_basetemp.exists()
+    assert [p.name.rsplit("-", 1)[0] for p in made] == ["r", "hermes-pytest-tmproot"]
+    assert made[1].parent == made[0], "private --basetemp must nest under the run scratch root"
+    assert not any(p.exists() for p in made), made
 
 
 def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:

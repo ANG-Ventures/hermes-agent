@@ -41,7 +41,11 @@ def test_sessions_json_failed_replace_keeps_old_bytes_and_no_temp(tmp_path, monk
     with pytest.raises(OSError):
         store._save_sessions_json({"k": "v"})
     assert target.read_text(encoding="utf-8") == '{"old": true}'
-    assert _leftovers(sessions_dir, "sessions.json") == []
+    # ``.sessions.lock`` is the fork's cross-process writer lock (held around the
+    # routing-identity uniqueness check + replace), not a temp file: it is opened
+    # append-only and never carries payload bytes. Only the ``.sessions_*.tmp``
+    # sibling must be gone.
+    assert [n for n in _leftovers(sessions_dir, "sessions.json") if n != ".sessions.lock"] == []
 
 
 def test_suggestions_failed_replace_keeps_old_bytes_and_no_temp(tmp_path, monkeypatch, broken_replace):

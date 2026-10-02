@@ -264,7 +264,8 @@ class TmuxTui:
         self.pane_pid = int(self.tmux("display", "-p", "-t", "p", "#{pane_pid}").strip())
         self.pane_tty = self.tmux("display", "-p", "-t", "p", "#{pane_tty}").strip()
         self.server_pid = int(self.tmux("display", "-p", "#{pid}").strip() or 0)
-        self._zombie_since = self._reap_nudged = 0.0
+        self._zombie_since = 0.0  # guarded sentinel: `or now` below
+        self._reap_nudged = float("-inf")
         self.reap_nudges = 0
         self.seen: set[int] = set()
 
@@ -443,7 +444,7 @@ class TmuxTui:
         now = time.monotonic()
         self._zombie_since = self._zombie_since or now
         # tmux's own SIGCHLD normally lands within milliseconds; nudge only a zombie it left behind.
-        if (now - self._zombie_since >= 2.0 and now - self._reap_nudged >= 1.0 and self.server_pid
+        if (now - self._zombie_since >= 2.0 and now - self._reap_nudged >= 1.0 and self.server_pid  # zero-seed-ok: _zombie_since is set to `now` on first sight
                 and "tmux" in cmdline(self.server_pid)):
             self._reap_nudged, self.reap_nudges = now, self.reap_nudges + 1
             with contextlib.suppress(ProcessLookupError):

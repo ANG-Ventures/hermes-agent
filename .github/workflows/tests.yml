@@ -528,7 +528,11 @@ jobs:
         # tests/e2e/core/upgrade runs in its own job (e2e-upgrade) below.
         run: |
           mapfile -t files < <(find tests/e2e -name 'test_*.py' -not -path 'tests/e2e/core/upgrade/*' | sort)
-          scripts/run_tests.sh --include-integration "${files[@]}"
+          # -o faulthandler_timeout=120 (fork, #792): a stalled e2e test dumps
+          # every thread's stack to stderr after 120 s, so the per-file
+          # SIGKILL and the job timeout below leave evidence instead of a bare
+          # "process tree SIGKILL'd". Bare pytest flags pass through the runner.
+          scripts/run_tests.sh --include-integration "${files[@]}" -o faulthandler_timeout=120
         env:
           # An e2e file is a process tree, not one CPU-bound pytest worker. With
           # 32 files at once the hosted run starved live children before their

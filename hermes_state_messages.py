@@ -425,7 +425,8 @@ class SessionMessagesMixin:
                "display_kind": "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete",
                "display_metadata": metadata}
         stamp_message_uid(msg)  # a fresh occurrence: mint its durable id
-        params = self._message_row_params(session_id, "user", msg, None, time.time(), keep_reasoning=True)
+        message_timestamp = time.time()
+        params = self._message_row_params(session_id, "user", msg, None, message_timestamp, keep_reasoning=True)
 
         def _do(conn):
             existing = conn.execute(
@@ -443,6 +444,9 @@ class SessionMessagesMixin:
             self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
+            # Fork session-list denorm: every message INSERT keeps
+            # effective_last_active adjacent (tests/hermes_state/test_session_list_denorm_reland.py).
+            self._bump_effective_last_active_for_message(conn, session_id, message_timestamp)
             return msg_id
 
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)

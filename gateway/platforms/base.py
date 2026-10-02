@@ -602,6 +602,13 @@ def _reset_system_proxy_cache() -> None:
         _system_proxy_refreshing = False
 
 
+# Upstream names for the same cache (upstream 16b18ce6024 memoises the probe under
+# ``_MACOS_PROXY_TTL_SECONDS`` / ``reset_macos_proxy_cache``). The fork's cache above is the
+# stale-while-revalidate superset, so those names resolve to it rather than a second cache.
+_MACOS_PROXY_TTL_SECONDS = _SYSTEM_PROXY_CACHE_TTL_S
+reset_macos_proxy_cache = _reset_system_proxy_cache
+
+
 def _probe_macos_system_proxy() -> str | None:
     """Run the actual ``scutil --proxy`` probe. BLOCKING — never call on the loop."""
     if sys.platform != "darwin":

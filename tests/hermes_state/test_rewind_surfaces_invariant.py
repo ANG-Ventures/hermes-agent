@@ -48,7 +48,11 @@ def _rewind_via(surface: str, db: SessionDB, sid: str, n: int):
         store._db_for_session_id = lambda _sid: db
         store._lazy = lambda name, factory: factory()
         store._clear_dirty_transcript = lambda _sid: None
-        return store.rewind_session(sid, n)
+        # Fork contract: gateway ``/undo N`` counts HALF-turns through the shared undo core
+        # (hermes_undo; fork-features.json "slash commands /undo and /redo"), so one user turn
+        # (ask + reply, or ask + tool exchange + reply) is two half-turns. The invariant under
+        # test is the resulting active set, which must still match the user-turn surfaces.
+        return store.rewind_session(sid, 2 * n)
     warm = db.get_resume_conversations(sid)[0]  # the live process holds the alternation-repaired projection
     user_turns = sum(1 for m in warm if m.get("role") == "user")
     ordinal = user_turns - n
@@ -57,7 +61,9 @@ def _rewind_via(surface: str, db: SessionDB, sid: str, n: int):
         cli = CLISessionMixin.__new__(CLISessionMixin)
         cli._session_db, cli.session_id, cli.conversation_history, cli.agent = db, sid, warm, None
         cli._prefill_input_buffer = MagicMock()
-        cli.undo_last(n)
+        # Same fork contract as the gateway: ``undo_last(1)`` takes the carrier-rewind
+        # (one user turn) path, an explicit count N is N HALF-turns through hermes_undo.
+        cli.undo_last(n if n == 1 else 2 * n)
         return cli.conversation_history if len(cli.conversation_history) < len(warm) else None
     from tui_gateway.server import _rewind_active_session_history
     session = {"agent": SimpleNamespace(_session_messages=warm), "history": list(warm),

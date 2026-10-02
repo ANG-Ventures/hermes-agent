@@ -196,7 +196,7 @@ def _live_progress(name: str):
     1.5 GiB model would be ~1,500 lines). ``finish()`` returns the cursor to
     a clean line so the caller's status glyph starts on its own row."""
     last = 0
-    last_time = 0.0
+    last_time = float("-inf")
     stream = _progress_stream()
 
     def write(line: str) -> None:
@@ -215,7 +215,7 @@ def _live_progress(name: str):
         nonlocal last, last_time
         if stage == "unpack":
             last = 0
-            last_time = 0.0
+            last_time = float("-inf")
             write(f"  {name}: unpacking{(' ' + label) if label else ''}")
             return
         if total <= 0:

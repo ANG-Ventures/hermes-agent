@@ -104,7 +104,7 @@ def _poll_runtime_files() -> None:
 
 
 _IDLE_CHECK_S = 30.0
-_last_idle_check = 0.0
+_last_idle_check = float("-inf")
 
 
 def _poll_idle_screens() -> None:

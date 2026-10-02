@@ -72,7 +72,7 @@ class LiveTail:
         self.tail: deque[str] = deque(maxlen=TAIL_LINES)
         self._partial = ""
         self._drawn = 0
-        self._last_draw = 0.0
+        self._last_draw = float("-inf")
         if label is not None:
             if self.live:
                 self._draw(f"{indent}→ {label}…")

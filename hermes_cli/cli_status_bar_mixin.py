@@ -627,7 +627,7 @@ class CLIStatusBarMixin:
         flow = self._spinner_token_flow()
         t0 = getattr(self, "_tool_start_time", 0) or 0
         if t0 > 0:
-            elapsed = time.monotonic() - t0
+            elapsed = time.monotonic() - t0  # zero-seed-ok: guarded by `t0 > 0` (unset sentinel)
             # Fixed-width timers (01m05s / " 5.2s") avoid status-line wrap jitter on repaint.
             if elapsed >= 60:
                 elapsed_str = t("cli.shared.duration_ms_compact",
@@ -703,7 +703,8 @@ class CLIStatusBarMixin:
             return
         try:
             started = getattr(self, "_turn_summary_start", 0.0) or 0.0
-            line = collector.render(max(0.0, time.monotonic() - started) if started else 0.0)
+            elapsed = max(0.0, time.monotonic() - started) if started else 0.0  # zero-seed-ok: guarded by `if started` (unset sentinel)
+            line = collector.render(elapsed)
             if line:
                 _cprint(f"  {_D}{line}{_RST}")
         except Exception:
