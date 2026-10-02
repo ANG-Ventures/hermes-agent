@@ -28,17 +28,22 @@ def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, expli
     monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
     monkeypatch.setenv("HERMES_SESSION_ID", "ephemeral")
     monkeypatch.setattr(async_delegation, "_current_origin_session_id", lambda: "api-origin")
+    # Fork: a dispatched worker cannot mint a card on the placeholder 'default' lane
+    # (hermes_cli.kanban_worker_policy); name a real specialist profile instead.
     # Even a matching current channel must not upgrade an inherited passive policy.
     tokens = set_session_vars(platform="discord", chat_id="chat", profile="default")
     try:
-        result = json.loads(kt._handle_create(dict(title="child", assignee="default",
+        result = json.loads(kt._handle_create(dict(title="child", assignee="daedalus",
                             parents=[owner] if linked else [], session_id=explicit)))
     finally:
         clear_session_vars(tokens)
     assert result["ok"], result
     with kbc.connect_closing() as conn:
         child = kb.get_task(conn, result["task_id"])
-        assert child.session_id == (explicit or "durable")
+        # Fork (kanban_db._resolve_birth_session, C6 #1118): inside a worker run the owning
+        # task's HUMAN home wins over a tool-supplied session_id — a worker cannot re-home its
+        # fan-out; only the CLI's explicit --session does. Upstream let the arg override.
+        assert child.session_id == "durable"
         subs = kn.list_notify_subs(conn, child.id)
         assert len(subs) == 1
         for key in ("platform", "chat_id", "user_id", "delivery_mode", "delivery_metadata", "notifier_profile"):

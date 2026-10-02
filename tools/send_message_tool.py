@@ -45,6 +45,48 @@ _SEND_TARGET_IN_TURN_UNRESOLVABLE = "in_turn_unresolvable"
 _SEND_TARGET_NOT_IN_TURN = "not_in_turn"
 
 
+# Fork (#636): dispatcher-ownership seal for the worker notify channel. send_message is not an
+# agent-registered tool here; these are the availability gate the kanban-worker surfaces consult.
+def _is_dispatcher_owned_worker_process() -> bool:
+    """True only when THIS process is the dispatcher-spawned worker.
+
+    ``HERMES_KANBAN_TASK`` is inherited by every descendant process, so it
+    alone does not distinguish the worker from a nested subprocess it spawned.
+    See ``agent.delegation_context.owns_kanban_worker_authority``.
+    """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
+def _check_send_message():
+    """Gate send_message on gateway running (always available on messaging platforms).
+
+    Also passes for kanban workers — the dispatcher sets ``HERMES_KANBAN_TASK``
+    on every spawned worker, but those workers run with the assignee profile's
+    ``HERMES_HOME`` which has no ``gateway.pid``, so the gateway-running check
+    would fail even though the parent gateway is alive. Honoring the env var
+    lets workers call ``send_message`` to deliver rich content directly to the
+    originating chat (paired with ``kanban_complete`` for the short notifier
+    summary), which is the canonical pattern for any worker that needs to
+    reply with more than the ~200-char first-line truncation the kanban
+    notifier applies.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker_process():
+        return True
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if platform and platform != "local":
+        return True
+    try:
+        from gateway.status import is_gateway_running
+        return is_gateway_running()
+    except Exception:
+        return False
+
 def _has_messaging_origin() -> bool:
     """True when a messaging origin is bound for this turn — a real gateway
     session platform OR a subagent's routing-only send-origin.

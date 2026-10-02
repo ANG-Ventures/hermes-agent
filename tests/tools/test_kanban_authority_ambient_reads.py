@@ -108,10 +108,15 @@ def test_orchestrator_only_refusal_does_not_fire_for_a_non_owner(as_non_owner):
 
 def test_orchestrator_only_refusal_still_fires_for_the_real_worker(as_owner):
     """Positive control: workers stay off the board-routing tools."""
+    import pytest
+
     import tools.kanban_tools as kt
 
-    err = kt._require_orchestrator_tool("kanban_list")
-    assert err is not None and "orchestrator-only" in err
+    # Upstream shape: the guard raises _Reject (every handler is wrapped by
+    # _kanban_handler, which returns it as the structured tool error).
+    with pytest.raises(kt._Reject) as exc:
+        kt._require_orchestrator_tool("kanban_list")
+    assert "orchestrator-only" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +263,7 @@ def test_code_execution_sandbox_env_is_sealed_under_passthrough(as_owner):
     The marker has no passthrough entry of its own, so an operator who opts
     ``HERMES_KANBAN_TASK`` through produces precisely the fail-open shape.
     """
-    from agent.delegation_context import KANBAN_OWNER_PID_ENV
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_OWNER_PID_ENV
     from tools.code_execution_tool import _scrub_child_env
 
     scrubbed = _scrub_child_env(
@@ -266,8 +271,18 @@ def test_code_execution_sandbox_env_is_sealed_under_passthrough(as_owner):
         is_passthrough=lambda k: k == "HERMES_KANBAN_TASK",
         is_windows=False,
     )
-    assert scrubbed.get("HERMES_KANBAN_TASK") == "t_victim"
-    assert scrubbed.get(KANBAN_OWNER_PID_ENV) == str(os.getpid()), (
-        "passthrough readmitted the task id into the sandbox without an owner "
-        "marker — the sandboxed child resolves as the dispatcher's worker"
-    )
+    # The fail-open shape is "task var present, owner marker absent". The fork sealed it by
+    # stamping a foreign owner pid; upstream's descendant fence (delegation_context) seals it
+    # by stripping the readmitted task var and fencing the lineage's board instead. Either
+    # closes the leak; what must never come back is the unsealed shape.
+    readmitted = scrubbed.get("HERMES_KANBAN_TASK") == "t_victim"
+    if readmitted:
+        assert scrubbed.get(KANBAN_OWNER_PID_ENV) == str(os.getpid()), (
+            "passthrough readmitted the task id into the sandbox without an owner "
+            "marker — the sandboxed child resolves as the dispatcher's worker"
+        )
+    else:
+        assert scrubbed.get(DELEGATED_CHILD_ENV_MARKER), (
+            "task id stripped from the sandbox env but no lineage fence set — the "
+            "descendant would resolve as an unfenced orchestrator"
+        )

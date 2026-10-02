@@ -80,7 +80,9 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
         assert all("error" in value for value in row["tools"]), row
         assert row["later_cli"]["rc"] != 0, row
     assert [kb.get_task(conn, t).status for t in (own, foreign)] == ["running", "running"]
-    assert json.loads(kanban_tools._handle_complete({"summary": "parent handoff"}))["ok"]
+    # Fork receipt gate (kanban_receipt): prose alone is refused; a structured handback is a receipt.
+    assert json.loads(kanban_tools._handle_complete(
+        {"summary": "parent handoff", "metadata": {"findings": ["scope fixture"]}}))["ok"]
     assert kb.get_task(conn, own).status == "done"
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     conn.close()
@@ -105,7 +107,8 @@ def test_worker_cli_cannot_use_foreign_task_to_drop_run_scope(tmp_path, monkeypa
                               capture_output=True, text=True, timeout=45)
         assert proc.returncode != 0, (arguments, proc.stdout, proc.stderr)
     assert not kb.list_attachments(conn, foreign)
-    assert json.loads(kanban_tools._handle_complete({"task_id": own, "summary": "parent"}))["ok"]
+    assert json.loads(kanban_tools._handle_complete(
+        {"task_id": own, "summary": "parent", "metadata": {"findings": ["scope fixture"]}}))["ok"]
     conn.close()
 
 
