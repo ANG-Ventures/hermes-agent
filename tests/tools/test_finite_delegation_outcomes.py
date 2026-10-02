@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,9 @@ class _Child:
         self.closed = threading.Event()
         self.close_while_running = False
         self.worker = None
+        # Frozen activity clock: the fork supervisor (#1535) only times out a child that has
+        # shown no progress for the whole cap; an unknown/advancing clock stays live past it.
+        self._activity_ts = time.time()
 
     def run_conversation(self, **_kwargs):
         self.worker = threading.current_thread()
@@ -69,7 +73,7 @@ class _Child:
         self.interrupted.set()
 
     def get_activity_summary(self):
-        return {"api_call_count": 1}
+        return {"api_call_count": 1, "last_activity_ts": self._activity_ts}
 
     def close(self):
         self.close_while_running |= not self.finished.is_set()

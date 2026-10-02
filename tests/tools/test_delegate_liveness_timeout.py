@@ -8,6 +8,11 @@ provider slowness into lost work (a nearly-finished context discarded every time
 These tests pin both directions of the fix:
 - a child whose activity signals keep advancing outlives a cap far shorter than its runtime;
 - a child with no progress at all is still abandoned when the cap elapses (the knob keeps its teeth).
+
+Fork contract (parity 2026-10-01; #1535 #1542 supervisor on the hot path): the cap is still the
+parent's WAIT budget. A child with recent progress is never killed at the cap — the wait returns a
+``timed_out_running`` handle and the child's result lands as a durable late result (``action='list'``
+``late_results``); a child whose activity clock has not moved for the whole cap is abandoned there.
 """
 
 from __future__ import annotations
@@ -16,6 +21,12 @@ import threading
 import time
 from types import SimpleNamespace
 
+from tests.tools.test_delegate_late_completion import (  # noqa: F401
+    _clean_registry,
+    _late_results,
+    _wait_until,
+    fleet_home,
+)
 from tools import delegate_tool
 
 _CAP_SECONDS = 0.4
@@ -82,29 +93,36 @@ def _run(child, monkeypatch, cap=_CAP_SECONDS):
     )
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: cap)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
-    return delegate_tool._run_single_child(0, "watch the slow provider", child=child, parent_agent=parent)
+    # The parent is returned (entry stashed on it) so a late result can be read under the same owner.
+    parent.entry = delegate_tool._run_single_child(0, "watch the slow provider", child=child, parent_agent=parent)
+    return parent
 
-def test_progressing_child_outlives_a_cap_shorter_than_its_runtime(monkeypatch):
+def test_progressing_child_outlives_a_cap_shorter_than_its_runtime(fleet_home, monkeypatch):
     child = _SlowButLiveChild(total_seconds=1.2, advance=True)
+    parent = _run(child, monkeypatch)
 
-    entry = _run(child, monkeypatch)
-
-    assert entry["status"] == "completed", entry
-    assert entry["summary"] == "FINISHED AFTER OUTLIVING THE CAP", entry
-    # The cap really was armed and the child really did run past it: the budget reset on progress.
-    assert entry["duration_seconds"] > _CAP_SECONDS, entry
+    entry = parent.entry
+    # The cap really was armed: the parent's wait ended at the budget while the child kept working.
+    assert entry["status"] == delegate_tool.TIMED_OUT_RUNNING, entry
+    assert entry["timeout_seconds"] == _CAP_SECONDS
+    # ...and the child really did outlive it: never interrupted, result delivered late.
+    assert _wait_until(lambda: _late_results(parent), timeout=10.0), "late result never landed"
+    (late,) = _late_results(parent)
+    assert late["status"] == "completed", late
+    assert late["summary"] == "FINISHED AFTER OUTLIVING THE CAP", late
     assert not child.interrupted.is_set()
-    # Progress kept resetting the window, so the 80% budget warning never had cause to fire.
+    # Progress kept the child alive, so no budget warning ever had cause to fire.
     assert child.steers == [], child.steers
 
-def test_frozen_child_is_still_abandoned_when_the_cap_elapses(monkeypatch):
+def test_frozen_child_is_still_abandoned_when_the_cap_elapses(fleet_home, monkeypatch):
     """The reported death shape: calls completed earlier, then the child stops moving entirely."""
     child = _SlowButLiveChild(total_seconds=1.2, advance=False, initial_calls=49)
 
-    entry = _run(child, monkeypatch)
+    entry = _run(child, monkeypatch).entry
 
     assert entry["status"] == "timeout", entry
-    assert "no progress in that window" in entry["error"], entry["error"]
+    assert entry["exit_reason"] == "timeout", entry
+    assert f"timed out after {_CAP_SECONDS}s" in entry["error"], entry["error"]
     assert entry["timeout_seconds"] == _CAP_SECONDS
     assert entry["last_event_age"] is not None and entry["last_event_age"] > 0.3, entry
     assert child.interrupted.is_set()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 from tools import delegate_tool
@@ -28,6 +29,10 @@ class _SlowUnwindingChild:
         self.finished = threading.Event()
         self.closed = threading.Event()
         self.close_while_running = False
+        # Frozen activity clock: the fork supervisor (#1535) keeps a child whose clock is unknown or
+        # advancing alive past the cap (``timed_out_running`` + late result); only a child that has
+        # shown no progress for the whole cap is timed out, which is the shape this test exercises.
+        self._activity_ts = time.time()
 
     def run_conversation(self, **_kwargs):
         self.started.set()
@@ -51,7 +56,7 @@ class _SlowUnwindingChild:
         self.interrupted.set()
 
     def get_activity_summary(self):
-        return {"api_call_count": 1}
+        return {"api_call_count": 1, "last_activity_ts": self._activity_ts}
 
     def close(self):
         if not self.finished.is_set():

@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (  # noqa: F401
-    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
+    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _child_last_event_age,
+    _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (  # noqa: F401
@@ -2782,6 +2783,9 @@ def _run_single_child(
                     else "after_llm_calls" if is_timeout
                     else None
                 ),
+                # upstream #116001: seconds since the child's activity clock last ticked, so an
+                # operator can tell a slow-but-live provider from a runaway without forensics.
+                "last_event_age": _child_last_event_age(child) if is_timeout else None,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
