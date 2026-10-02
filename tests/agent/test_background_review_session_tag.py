@@ -58,7 +58,7 @@ def test_background_review_thread_lines_are_session_tagged(caplog, monkeypatch):
 
     seen = {}
 
-    def _fake_run(agent, messages_snapshot, prompt, task_cfg=None, review_run=None):
+    def _fake_run(agent, messages_snapshot, prompt, task_cfg=None, review_run=None, **_kwargs):
         logging.getLogger("agent.background_review").warning("early review line")
         seen["tag_inside"] = getattr(
             hermes_logging._session_context, "session_id", None

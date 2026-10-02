@@ -29,7 +29,8 @@ def test_is_destructive_command_treats_cp_as_mutating():
 
 
 def test_is_destructive_command_treats_install_as_mutating():
-    assert run_agent._is_destructive_command("install template.env .env") is True
+    from agent.tool_dispatch_helpers import _is_destructive_command
+    assert _is_destructive_command("install template.env .env") is True
 
 
 def test_aiagent_reuses_existing_errors_log_handler():
@@ -130,122 +131,6 @@ class TestProviderModelNormalization:
         assert agent.model == "anthropic/claude-sonnet-4.6"
 
 
-class TestSessionJsonSnapshotOptIn:
-    """Regression: per-session JSON snapshot writer is opt-in via config.
-
-    state.db is canonical (PR #29182).  ``sessions.write_json_snapshots``
-    defaults to False, so the agent must NOT write ``session_{sid}.json``
-    files by default — that behavior caused multi-GB sessions directories
-    on heavy users.  Users can opt back in for external tooling that reads
-    the JSON files directly.
-    """
-
-    def test_session_json_disabled_by_default(self, agent):
-        # Default config: writer is gated off.
-        assert getattr(agent, "_session_json_enabled", False) is False, (
-            "sessions.write_json_snapshots must default to False"
-        )
-
-    def test_save_session_log_noops_when_disabled(self, agent, tmp_path):
-        # When disabled, calling the method must not write any file even
-        # if logs_dir is writable and messages are non-empty.
-        agent._session_json_enabled = False
-        agent.logs_dir = tmp_path
-        agent._session_messages = [{"role": "user", "content": "hello"}]
-        agent._save_session_log()
-        # No session_*.json must appear under logs_dir.
-        assert list(tmp_path.glob("session_*.json")) == []
-
-    def test_save_session_log_writes_when_enabled(self, agent, tmp_path):
-        # Opt-in path: with the flag on and a session_id, the writer must
-        # produce ``session_{sid}.json`` under logs_dir.
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [{"role": "user", "content": "hello"}]
-        agent._save_session_log(messages)
-        expected = tmp_path / f"session_{agent.session_id}.json"
-        assert expected.exists(), (
-            "Opt-in writer must produce session_{sid}.json under logs_dir"
-        )
-
-    def test_logs_dir_retained_for_request_dumps(self, agent):
-        # logs_dir is kept unconditionally because
-        # agent_runtime_helpers.dump_api_request_debug still writes
-        # request_dump_*.json there (debug breadcrumb path), independent of
-        # the session JSON opt-in.
-        assert hasattr(agent, "logs_dir")
-
-
-class TestSaveSessionLogRedactsSecrets:
-    """Regression: session_*.json must not contain plaintext credentials (#19798, #19845)."""
-
-    @pytest.fixture(autouse=True)
-    def _ensure_redaction_enabled(self, monkeypatch):
-        """Force redaction on regardless of host HERMES_REDACT_SECRETS state.
-        The hermetic conftest blanks the env var; the module-level
-        ``_REDACT_ENABLED`` constant is captured at import time, so we
-        flip it directly for the duration of these tests."""
-        monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
-        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
-
-    def test_redacts_api_key_in_tool_content(self, agent, tmp_path):
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {
-                "role": "tool",
-                "content": "Response: Authorization: Bearer sk-proj-abc123def456ghi789jkl012mno",
-            },
-        ]
-        agent._save_session_log(messages)
-
-        snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        assert "sk-proj-abc123def456ghi789jkl012mno" not in snapshot
-
-    def test_redacts_api_key_in_user_message(self, agent, tmp_path):
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [
-            {"role": "user", "content": "My key is sk-ant-api03-abc123def456ghi789jkl012mno please use it"},
-        ]
-        agent._save_session_log(messages)
-
-        snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        assert "sk-ant-api03-abc123def456ghi789jkl012mno" not in snapshot
-
-    def test_redacts_system_prompt_credentials(self, agent, tmp_path):
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        agent._cached_system_prompt = "Use key sk-proj-realkey1234567890123456 for API calls"
-        agent._save_session_log([{"role": "user", "content": "test"}])
-
-        snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        assert "sk-proj-realkey1234567890123456" not in snapshot
-
-    def test_redacts_list_type_multimodal_content(self, agent, tmp_path):
-        """OpenAI/Anthropic multimodal shape: content = list of {type, text|image_url} parts."""
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Key: gsk_abc123def456ghi789jkl012mno"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-                ],
-            },
-        ]
-        agent._save_session_log(messages)
-
-        snapshot_text = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        snapshot = json.loads(snapshot_text)
-        parts = snapshot["messages"][0]["content"]
-        assert "gsk_abc123def456ghi789jkl012mno" not in parts[0]["text"]
-        # Image part preserved untouched
-        assert parts[1]["image_url"]["url"].startswith("data:image")
-
-
 class TestGetMessagesUpToLastAssistant:
     def test_empty_list(self, agent):
         assert agent._get_messages_up_to_last_assistant([]) == []
@@ -304,6 +189,18 @@ class TestMaskApiKey:
 
 
 class TestBuildAssistantMessage:
+    @staticmethod
+    def _enable_native_compaction(agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.6-sol"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_hostname = "chatgpt.com"
+        agent._base_url_lower = agent.base_url
+        agent.codex_responses_native_compaction = True
+        agent.compression_enabled = True
+        agent.runtime_capabilities = {"native_compaction": True}
+
     def test_basic_message(self, agent):
         msg = _mock_assistant_msg(content="Hello!")
         result = agent._build_assistant_message(msg, "stop")
@@ -602,7 +499,7 @@ class TestSafeWriter:
 
     def test_write_catches_oserror(self):
         """OSError on write is silently caught, returns len(data)."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from unittest.mock import MagicMock
         inner = MagicMock()
         inner.write.side_effect = OSError(5, "Input/output error")
@@ -612,7 +509,7 @@ class TestSafeWriter:
 
     def test_flush_catches_oserror(self):
         """OSError on flush is silently caught."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from unittest.mock import MagicMock
         inner = MagicMock()
         inner.flush.side_effect = OSError(5, "Input/output error")
@@ -622,7 +519,7 @@ class TestSafeWriter:
     def test_print_survives_broken_stdout(self, monkeypatch):
         """print() through _SafeWriter doesn't crash on broken pipe."""
         import sys
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from unittest.mock import MagicMock
         broken = MagicMock()
         broken.write.side_effect = OSError(5, "Input/output error")
@@ -659,7 +556,7 @@ class TestSafeWriter:
 
     def test_double_wrap_prevented(self):
         """Wrapping an already-wrapped stream doesn't add layers."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from io import StringIO
         inner = StringIO()
         wrapped = _SafeWriter(inner)

@@ -253,7 +253,7 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         # Generic path jitter (pre-policy) vs the capacity schedule. Pin both
         # so the test asserts on POLICY, not RNG: a 2.0 sleep is the generic
         # path, a 5.0 sleep is the capacity path.
-        patch("agent.conversation_loop.jittered_backoff", return_value=2.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=2.0),
         patch("agent.retry_utils.jittered_backoff", return_value=5.0),
         # The loop sleeps in 0.2s ticks until ``time.time() >= sleep_end``;
         # the fake clock advances on sleep so the wait is recorded, not served.

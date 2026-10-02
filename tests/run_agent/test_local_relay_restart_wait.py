@@ -90,7 +90,7 @@ def _run(agent, fake_api_call, fb_client_base, *, wait_s):
         # create=True so the contract runs (RED) on a tree without the fix.
         patch("agent.conversation_loop.wait_for_local_relay", waiter, create=True),
         patch("agent.fallback_wiring.local_relay_restart_wait_s", return_value=wait_s),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.05),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.05),
         patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(mock_fb_client, "fallback-model"),
