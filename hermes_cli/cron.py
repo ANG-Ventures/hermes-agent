@@ -183,12 +183,9 @@ def cron_list(show_all: bool = False, as_json: bool = False):
     to the on-disk layout) because the CLI exposed table output only.
     """
     from cron.jobs import effective_job_state, list_jobs
-    jobs = list_jobs(include_disabled=True)
-    if not show_all:
-        jobs = [
-            job for job in jobs
-            if job.get("enabled", True) or effective_job_state(job) == "paused"
-        ]
+    # Fork contract (tests/hermes_cli/test_cron_list_json.py): the default listing asks the store
+    # for enabled jobs only (``include_disabled=show_all``) and ``--json`` is exactly that set.
+    jobs = list_jobs(include_disabled=show_all)
 
     from hermes_cli.profiles import get_active_profile_name
     if as_json:
@@ -196,6 +193,15 @@ def cron_list(show_all: bool = False, as_json: bool = False):
 
         print(_json.dumps(jobs, indent=2, ensure_ascii=False, default=str))
         return
+
+    if not show_all:
+        # Upstream (3f399c0bd4): a paused job stays visible in the human table so the operator
+        # sees what is parked instead of "No scheduled jobs"; other disabled jobs need --all.
+        seen = {job.get("id") for job in jobs}
+        jobs += [
+            job for job in list_jobs(include_disabled=True)
+            if job.get("id") not in seen and effective_job_state(job) == "paused"
+        ]
 
     if not jobs:
         print(color(f"No scheduled jobs in profile '{get_active_profile_name()}'.\n"

@@ -34,7 +34,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from hermes_cli.config import load_config
+from hermes_cli.config import get_hermes_home, load_config
 from hermes_cli.version_info import get_version_info
 
 try:
@@ -1573,8 +1573,7 @@ def _run_serve(serve, config, host: str, port: int) -> None:
 
 
 def _dashboard_state_db_path() -> Path:
-    from hermes_constants import get_hermes_home
-
+    # Module-level ``get_hermes_home`` facade symbol (fork): tests patch it here.
     return (Path(get_hermes_home()) / "state.db").expanduser().resolve()
 
 

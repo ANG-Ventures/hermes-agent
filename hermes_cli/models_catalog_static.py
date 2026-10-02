@@ -402,7 +402,11 @@ def sync_plugin_provider_catalog() -> int:
 
 _PROVIDER_LABELS: dict[str, str] = {p.slug: p.label for p in CANONICAL_PROVIDERS}
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
-sync_plugin_provider_catalog()
+# Fork: NO import-time ``sync_plugin_provider_catalog()`` — ``list_providers()`` imports every
+# model-provider plugin, and plugins import ``hermes_cli.models`` surfaces at their own import time,
+# so discovery here runs against a partially initialised ``hermes_cli.models`` (circular import;
+# tests/hermes_cli/test_lazy_canonical_providers.py). ``hermes_cli.models`` extends the catalog
+# lazily on first read; ``providers._sync_auth_registry`` calls the sync above after discovery.
 
 
 # ---------------------------------------------------------------------------

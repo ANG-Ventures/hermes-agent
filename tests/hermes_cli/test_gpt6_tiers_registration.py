@@ -77,4 +77,6 @@ def test_gpt61_sol_resolves_context_and_pricing_like_its_tier():
     base = _OFFICIAL_DOCS_PRICING[("openai", "gpt-6.1-sol")]
     assert _OFFICIAL_DOCS_PRICING[("openai", "gpt-6.1-sol-pro")] is base
     assert base.cache_read_cost_per_million == base.input_cost_per_million / 20  # 5%, not 6 Sol's 10%
-    assert not is_codex_900k_base("gpt-6.1-sol")  # not verified above 272K on Codex
+    # Fork (#1550, tests/agent/test_gpt61_sol_900k.py): a 922,000 ceiling was measured on Codex
+    # 2026-09-30, so gpt-6.1-sol IS -900k eligible here; upstream's "not verified" guard is superseded.
+    assert is_codex_900k_base("gpt-6.1-sol")
