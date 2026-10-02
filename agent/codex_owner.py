@@ -131,6 +131,10 @@ def resolve_runtime(*, force_refresh, refresh_if_expiring, refresh_skew_seconds)
                         relogin_required=False,
                     )
                     continue
+                # The probe refreshes an expired stored token first (#89415) and adopts the
+                # rotated pair into the pool; clear the cooldown on THAT row, not the stale
+                # snapshot, or the expired access token is written back over the fresh one.
+                entry = pool._find(lambda e, _id=entry.id: e.id == _id) or entry
                 cleared = replace(
                     entry,
                     last_status=None,

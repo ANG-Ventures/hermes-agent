@@ -3667,6 +3667,181 @@ def _unknown_subkey_refusal(key: str, suggestion: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def _yaml_comment_lines(text: str) -> "Counter[str]":
+    """Multiset of comment texts in a YAML document (full-line and inline).
+
+    Heuristic on purpose: a ``#`` preceded by whitespace (or at line start)
+    begins a comment. A quoted value containing `` #`` is counted too, which
+    only matters if a rewrite drops it -- and then refusing is correct.
+    """
+    from collections import Counter
+
+    found: Counter = Counter()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            found[stripped] += 1
+            continue
+        match = re.search(r"\s#", line)
+        if match:
+            found[line[match.start():].strip()] += 1
+    return found
+
+
+def _targeted_config_edit(text: str, key: str, value: Any, expected: Any) -> Optional[str]:
+    """Apply one ``config set`` as a local text edit of ``text``.
+
+    - Existing single-line scalar at ``key``: replace just its value span.
+    - Missing leaf/sub-path under an existing block mapping: insert the new
+      lines after that mapping's last entry (top level: append at EOF).
+
+    Everything else in the file stays byte-identical. Returns None when the
+    edit is not one of those shapes (list paths, block/multi-line scalars,
+    flow mappings, a scalar replaced by a mapping ...). The result is only
+    accepted if it re-parses to exactly ``expected``, so a wrong splice can
+    never be written.
+    """
+    try:
+        node = yaml.compose(text)
+    except yaml.YAMLError:
+        return None
+    parts = key.split(".")
+    new_text = None
+    for depth, part in enumerate(parts):
+        if not isinstance(node, yaml.MappingNode) or node.flow_style or not node.value:
+            return None
+        match = None
+        for key_node, value_node in node.value:
+            if isinstance(key_node, yaml.ScalarNode) and key_node.value == part:
+                match = value_node  # last duplicate wins, like safe_load
+        if match is None:
+            # Insert {remaining path: value} after the mapping's last entry.
+            sub: Any = value
+            for seg in reversed(parts[depth + 1:]):
+                sub = {seg: sub}
+            block = _dump_block({part: sub})
+            indent = " " * node.value[0][0].start_mark.column
+            block = "".join(
+                (indent + line if line.strip() else line)
+                for line in block.splitlines(keepends=True)
+            )
+            if depth == 0:
+                sep = "" if not text or text.endswith("\n") else "\n"
+                new_text = text + sep + block
+            else:
+                last = node.value[-1][1]
+                while isinstance(last, (yaml.MappingNode, yaml.SequenceNode)) and last.value:
+                    last = last.value[-1][1] if isinstance(last, yaml.MappingNode) else last.value[-1]
+                pos = last.end_mark.index
+                if last.end_mark.column != 0:
+                    nl = text.find("\n", pos)
+                    pos = len(text) if nl == -1 else nl + 1
+                prefix = text[:pos]
+                if prefix and not prefix.endswith("\n"):
+                    prefix += "\n"
+                new_text = prefix + block + text[pos:]
+            break
+        node = match
+    else:
+        if isinstance(value, (dict, list)):
+            return None
+        if not isinstance(node, yaml.ScalarNode) or node.style not in (None, "'", '"'):
+            return None
+        start, end = node.start_mark, node.end_mark
+        if start.line != end.line:
+            return None
+        rendered = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True, width=4096)  # config-writer: ok — one scalar span, re-parsed, written via _write_config_set_text
+        rendered = rendered[:-5] if rendered.endswith("\n...\n") else rendered.rstrip("\n")
+        if not rendered or "\n" in rendered:
+            return None
+        new_text = text[: start.index] + rendered + text[end.index :]
+    try:
+        if yaml.safe_load(new_text) != expected:
+            return None
+    except yaml.YAMLError:
+        return None
+    return new_text
+
+
+def _render_config_set(config_path: Path, key: str, value: Any, new_config: dict) -> str:
+    """Render the post-``config set`` config.yaml text, preserving comments.
+
+    Preference order: (1) in-place edit of the one existing scalar
+    (byte-identical elsewhere); (2) ruamel round-trip merge (comments and
+    order kept, long scalars may re-wrap); (3) plain PyYAML dump. Each
+    candidate must re-parse to ``new_config``.
+    """
+    from utils import roundtrip_yaml_render
+
+    original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    if original.strip():
+        edited = _targeted_config_edit(original, key, value, new_config)
+        if edited is not None:
+            return edited
+        try:
+            rendered = roundtrip_yaml_render(config_path, new_config)
+            if yaml.safe_load(rendered) == new_config:
+                return rendered
+        except Exception as exc:  # ruamel rejects some PyYAML-valid docs
+            logger.debug("config set: ruamel round-trip unavailable: %s", exc)
+    return _dump_block(new_config)
+
+
+def _dump_block(data: Dict[str, Any]) -> str:
+    """Render a mapping as 2-space-indented block YAML (``hermes_yaml.safe_dump``: ruamel, the same
+    indent policy as the on-disk writer, so a spliced block matches the surrounding file's layout).
+    Text only — the config write itself goes through ``_write_config_set_text``."""
+    return yaml.safe_dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True, width=4096)  # config-writer: ok — text candidate, re-parsed, written via _write_config_set_text
+
+
+def _write_config_set_text(config_path: Path, key: str, value: Any, user_config: Dict[str, Any],
+                           force: bool) -> None:
+    """``config set`` write (fork): render the post-set text keeping the file's comments (they carry
+    rulings that lints cite); refuse with a diff when a comment would still be dropped unless
+    ``--force``; keep a ``config.yaml.bak-configset-*`` sibling holding the exact pre-write bytes
+    (t_6da78aab — what scripts/profile-config-keyguard.py needs to ACCEPT a guarded-key change).
+    Upstream's ``_write_user_config`` (ruamel full-state replace) stays the ``unset`` writer."""
+    ensure_hermes_home()
+    from utils import atomic_write_text
+    from hermes_cli.observability.shared_metrics_disabled import recording_raw_config_write
+
+    original_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    new_text = _render_config_set(config_path, key, value, user_config)
+    dropped = _yaml_comment_lines(original_text) - _yaml_comment_lines(new_text)
+    if dropped and not force:
+        import difflib
+
+        print(
+            f"✗ Refusing to write {config_path}: the rewrite would drop "
+            f"{sum(dropped.values())} comment line(s). Nothing was changed.",
+            file=sys.stderr,
+        )
+        sys.stderr.writelines(
+            difflib.unified_diff(
+                original_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=f"{config_path} (current)",
+                tofile=f"{config_path} (proposed)",
+            )
+        )
+        print(
+            "\n  Edit the file by hand, or re-run with --force to accept the loss.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if original_text and new_text != original_text:
+        import shutil
+        import time
+
+        backup = config_path.with_name(
+            f"{config_path.name}.bak-configset-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        )
+        shutil.copy2(config_path, backup)
+    recording_raw_config_write(
+        config_path, user_config,
+        lambda path, _cfg: atomic_write_text(path, new_text, preserve_mode=True))
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value at a dotted ``key``; ``value`` is auto-coerced to bool/int/float.
     ``force`` writes a known key given under the wrong prefix (``gateway.discord.foo`` where
@@ -3775,7 +3950,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    _write_user_config(config_path, user_config)
+    _write_config_set_text(config_path, key, value, user_config, force)
 
     # Keep .env in sync: terminal_tool reads TERMINAL_ENV etc. directly from env vars.
     env_var = terminal_config_env_var_for_key(key)

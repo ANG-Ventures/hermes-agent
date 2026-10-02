@@ -9,6 +9,7 @@ from typing import Any, IO, overload
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError as YAMLError
+from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode  # noqa: F401  (compose() node types)
 from ruamel.yaml.resolver import VersionedResolver
 
 
@@ -23,6 +24,15 @@ def _load(document: str | bytes, *, pure: bool) -> Any:
     yaml = YAML(typ="safe", pure=pure)
     yaml.version = (1, 1)
     return yaml.load(document)
+
+
+def compose(document: str | bytes) -> Any:
+    """Node tree (``MappingNode`` / ``SequenceNode`` / ``ScalarNode`` with start/end marks) of a
+    single document, YAML 1.1 like :func:`safe_load`. For targeted in-place text edits
+    (``hermes_cli.config._targeted_config_edit``) that need the byte span of one scalar."""
+    yaml = YAML(typ="safe", pure=True)
+    yaml.version = (1, 1)
+    return yaml.compose(document)
 
 
 def safe_load(stream: str | bytes | IO[str] | IO[bytes]) -> Any:
