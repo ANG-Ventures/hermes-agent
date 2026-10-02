@@ -257,6 +257,8 @@ def test_hooks_test_distinguishes_fail_closed_from_fail_open(tmp_path):
     closed, open_ = out.split("/nonexistent/hook-open.sh", 1)
     assert "✗ error:" in closed and "✗ error:" in open_
     assert '"action": "block"' in closed
-    assert "failed closed" in closed
+    # Fork: a MISSING hook is an infrastructure failure, not a policy "failed closed" verdict
+    # (agent/shell_hooks_missing.missing_hook_verdict); the block still names it as unrecoverable.
+    assert "infrastructure failure" in closed and "hook missing and unrecoverable" in closed
     assert '"action": "block"' not in open_
     assert "contributed nothing" in open_

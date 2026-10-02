@@ -233,7 +233,11 @@ def test_excluded_providers_filters_rows_injected_by_inventory():
         custom_providers=[],
         excluded_providers=[],
     )
-    with _list_auth_returning(rows):
+    # MoA is strictly opt-in (#63353): the virtual row needs an enabled preset in the RAW config.
+    moa_cfg = {"moa": {"presets": {"default": {"enabled": True}}}}
+    with _list_auth_returning(rows), \
+         patch("hermes_cli.config.read_raw_config", return_value=moa_cfg), \
+         patch("hermes_cli.config.load_config", return_value=moa_cfg):
         baseline = {
             r["slug"]
             for r in build_models_payload(
@@ -245,7 +249,9 @@ def test_excluded_providers_filters_rows_injected_by_inventory():
         f"sanity: {skeleton_slug} skeleton must be injected"
     )
 
-    with _list_auth_returning(rows):
+    with _list_auth_returning(rows), \
+         patch("hermes_cli.config.read_raw_config", return_value=moa_cfg), \
+         patch("hermes_cli.config.load_config", return_value=moa_cfg):
         filtered = {
             r["slug"]
             for r in build_models_payload(ctx, include_unconfigured=True)[
@@ -812,9 +818,12 @@ def test_apply_picker_prefs_hides_failover_lanes_and_config_hidden():
                 "hide": ["openai-api", "anthropic"],
                 "order": ["claude-apr", "gemini-bridge", "openrouter"],
             }
-        }
+        },
+        # MoA is strictly opt-in (#63353): an enabled preset in the raw config injects the row.
+        "moa": {"presets": {"default": {"enabled": True}}},
     }
     with _list_auth_returning(_picker_rows()), \
+         patch("hermes_cli.config.read_raw_config", return_value=cfg), \
          patch("hermes_cli.config.load_config", return_value=cfg):
         payload = build_models_payload(ctx, apply_picker_prefs=True)
     slugs = [r["slug"] for r in payload["providers"]]

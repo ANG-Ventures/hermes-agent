@@ -170,11 +170,13 @@ def test_tty_seeded_chat_keeps_background_delegation(monkeypatch, query, image):
     })
     dispatched = []
 
-    def dispatch(unit, unit_id, slot_key, routing):
-        dispatched.append(unit)
+    # Fork hot path (ledger R07-delegate POLICY-DIVERGENCE): background batches go through
+    # tools.async_delegation.dispatch_async_delegation_batch, not upstream's _dispatch_unit.
+    def dispatch(**kwargs):
+        dispatched.append(kwargs)
         return {"status": "dispatched", "delegation_id": "interactive-delegation"}
 
-    monkeypatch.setattr("tools.delegate_tool_dispatch._dispatch_unit", dispatch)
+    monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation_batch", dispatch)
     seeded = SimpleNamespace(run=lambda: AIAgent._dispatch_delegate_task(
         parent, {"tasks": [{"goal": "independent task"}]},
     ))
