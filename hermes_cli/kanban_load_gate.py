@@ -259,15 +259,13 @@ class LoadGate:
         )
 
     def host_recovered(self) -> bool:
-        """True when this tick admitted on a healthy host (see requeue of
-        host-transient blocks): enabled, not paused for load or process
-        slots, and allowance > 0."""
-        return bool(
-            self.enabled
-            and self.state in ("admitting", "cpu_headroom")
-            and not self.proc_paused
-            and (self.allowance or 0) > 0
-        )
+        """True when this tick's admit() let at least one spawn through.
+
+        Every pause/saturation state (``paused``, ``proc_paused``,
+        ``saturated``, a full ``cpu_headroom``) sets allowance 0, so this is
+        the gate's own "the host can take work" verdict. Used to requeue
+        host-transient blocks."""
+        return bool(self.enabled and (self.allowance or 0) > 0)
 
     # -- projected-load admission ------------------------------------------
     def _prune(self, now: float) -> None:
