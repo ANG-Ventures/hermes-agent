@@ -338,15 +338,17 @@ class IterationStart:
     api_call_count: Any
     interrupted: Any
     _turn_exit_reason: Any
+    active_system_prompt: Any = None
 
 
 def begin_iteration(
     agent: Any, *, messages: Any, conversation_history: Any, original_user_message: Any,
-    api_call_count: Any, interrupted: Any, _turn_exit_reason: Any,
+    api_call_count: Any, interrupted: Any, _turn_exit_reason: Any, active_system_prompt: Any = None,
 ) -> IterationStart:
-    """Iteration entry in the original order: apply a pending redirect, reset the checkpoint
-    dedup, then the interrupt / review-budget / iteration-budget exits. ``api_call_count`` is
-    incremented here (the grace call consumes its flag instead of the budget)."""
+    """Iteration entry in the original order: apply a pending redirect, apply a pending kanban
+    ``set-model --live`` route (fork), reset the checkpoint dedup, then the interrupt /
+    review-budget / iteration-budget exits. ``api_call_count`` is incremented here (the grace
+    call consumes its flag instead of the budget)."""
     from agent.conversation_loop import (
         _apply_active_turn_redirect, _review_input_budget_exhausted
     )
@@ -355,7 +357,7 @@ def begin_iteration(
         return IterationStart(
             action=action, original_user_message=original_user_message,
             api_call_count=api_call_count, interrupted=interrupted,
-            _turn_exit_reason=_turn_exit_reason,
+            _turn_exit_reason=_turn_exit_reason, active_system_prompt=active_system_prompt,
         )
 
     _redirect_text = agent._drain_pending_redirect()
@@ -366,6 +368,15 @@ def begin_iteration(
                 f"{original_user_message}\n\n" f"User correction during the turn: {_redirect_text}"
             )
         agent._persist_session(messages, conversation_history)
+
+    # Kanban ``set-model --live`` (fork, t_033a3bb1): switch this worker's provider/model/effort
+    # in place between two provider calls. No-op (one env read) outside a kanban worker; never
+    # raises. Returns the system prompt to use from here on (identity lines rewritten on a switch).
+    from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+    active_system_prompt = apply_pending_live_route(
+        agent, iteration=api_call_count + 1, active_system_prompt=active_system_prompt,
+    )
 
     # Reset per-turn checkpoint dedup so each iteration can take one snapshot.
     agent._checkpoint_mgr.new_turn()

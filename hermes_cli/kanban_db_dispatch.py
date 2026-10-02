@@ -1746,6 +1746,15 @@ def detect_crashed_workers(
 
             pid = int(row["worker_pid"])
             kind, code = _kb._classify_run_exit(conn, row["id"], row["current_run_id"], pid)
+            if kind == "unknown":
+                # Neither the run receipt nor the reap registry (children of THIS
+                # process only) saw the exit: a per-tick ``hermes kanban dispatch``
+                # process reads the trailer the worker wrote to its own log, so the
+                # same death gets the same booking as under the embedded dispatcher
+                # (upstream ``_classify_dead_worker_exit``). No trailer = plain crash.
+                logged = _worker_log_exit_code(row["id"], board=board)
+                if logged is not None:
+                    kind, code = _exit_code_kind(logged)
             dead.append((row, pid, kind, code))
             if not _kb._pid_alive(pid):
                 # The worker died on its own; whatever it left in other

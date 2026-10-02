@@ -111,6 +111,9 @@ def _fake_cli() -> _FakeCLI:
         _openrouter_min_coding_score=None,
         session_id="session-test",
         _clarify_callback=noop,
+        _connection_callback=noop,
+        _agent_status_print=noop,
+        _active_agent_route_signature=None,
         _fallback_model=[],
         _on_thinking=noop,
         checkpoints_enabled=False,
@@ -152,7 +155,10 @@ def test_dispatcher_env_reaches_chat_q_agent_identity(monkeypatch, tmp_path):
         captured.update(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr(cli_mod, "AIAgent", fake_agent)
+    # ``_init_agent`` (hermes_cli/cli_agent_setup_mixin.py) imports ``AIAgent`` from
+    # ``run_agent`` at call time; ``cli`` no longer re-exports it.
+    import run_agent as run_agent_mod
+    monkeypatch.setattr(run_agent_mod, "AIAgent", fake_agent)
     monkeypatch.setattr(cli_mod, "_active_agent_ref", None)
     monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
     monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", lambda: None)

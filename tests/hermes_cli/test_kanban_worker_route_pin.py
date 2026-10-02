@@ -192,7 +192,7 @@ def test_runtime_failover_is_recorded_on_the_run(board, tmp_path):
     from unittest.mock import patch
 
     from agent.chat_completion_helpers import try_activate_fallback
-    from tests.run_agent.test_fallback_reasoning_override import _make_reasoning_agent
+    from tests.agent.test_fallback_reasoning_override import _make_reasoning_agent
 
     tid, run_id = board
     agent = _make_reasoning_agent()

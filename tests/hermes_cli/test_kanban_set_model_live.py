@@ -181,7 +181,7 @@ def _tool_call(call_id):
 def _worker_agent():
     from run_agent import AIAgent
 
-    with patch("model_tools.get_tool_definitions", return_value=_tool_defs("web_search")), \
+    with patch("run_agent.get_tool_definitions", return_value=_tool_defs("web_search")), \
             patch("run_agent.check_toolset_requirements", return_value={}), \
             patch("run_agent.OpenAI"):
         agent = AIAgent(
@@ -218,7 +218,7 @@ def _set_live(task_id, **kw):
 
 
 def _run(agent, tool_side_effect):
-    with patch("run_agent.handle_function_call", side_effect=tool_side_effect), \
+    with patch("model_tools.handle_function_call", side_effect=tool_side_effect), \
             patch.object(agent, "_persist_session"), \
             patch.object(agent, "_save_trajectory"), \
             patch.object(agent, "_cleanup_task_resources"):

@@ -73,8 +73,20 @@ def spawn_env(monkeypatch, tmp_path):
 
 
 def test_worker_env_drops_inherited_pythonpath_and_pythonhome(spawn_env):
-    env, _decoy = spawn_env
-    assert "PYTHONPATH" not in env
+    env, decoy = spawn_env
+    # Upstream's ``_propagate_module_import_root`` (#122299) re-pins ONLY the tree this
+    # dispatcher imports (``kanban_db_dispatch.__file__``'s repo root, plus its committed
+    # dependency site-packages) when the worker argv is the ``-m hermes_cli.main`` form —
+    # the same pin the fork applies to its native-lane runner. The inherited release pin
+    # must still be gone: nothing but the dispatcher's own import root may ride along.
+    import pathlib
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    own_root = str(pathlib.Path(kbd.__file__).resolve().parents[1])
+    entries = [e for e in env.get("PYTHONPATH", "").split(os.pathsep) if e]
+    assert str(decoy) not in entries
+    for entry in entries:
+        assert entry == own_root or entry.startswith(own_root + os.sep), entry
     assert "PYTHONHOME" not in env
 
 
