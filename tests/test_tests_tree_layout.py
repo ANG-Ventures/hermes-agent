@@ -34,6 +34,23 @@ _NON_MIRROR_DIRS = {
     "fakes", "fixtures", "honcho_plugin", "install", "integration", "manual",
     "monitoring", "openviking_plugin", "perf_guards", "scripts", "secret_sources",
     "security", "skills", "verify", "website", "computer_use", "hermes_state",
+    # Fork-only homes (ANG-Ventures/hermes-agent). The fork keeps these as
+    # cross-cutting suites rather than mirrors of one package:
+    # "blackbox"/"context_engine"/"kanban": plugin-family suites for
+    #   plugins/blackbox, plugins/context_engine, plugins/kanban (tests/plugins/
+    #   holds the per-plugin unit tests; these cover the cross-plugin contracts).
+    # "cli": the cli.py root-module suite (fork slash/usage/undo surfaces).
+    # "discord": the drain-window restart-recovery E2E (gateway + platform +
+    #   hermes_state together).
+    # "fork_canaries": fork-feature canaries gated by fork-features.json.
+    # "golden": golden-replay corpora (corpus.json/golden.json + runner) for
+    #   extracted fork modules; data-driven, no single source mirror.
+    # "run_agent": the run_agent.py root-module suite (sibling helpers +
+    #   conftest; too large to live loose at tests/ root).
+    # "state": SessionDB cross-thread / archive-compaction invariants that sit
+    #   beside tests/hermes_state (also declared above) by fork convention.
+    "blackbox", "cli", "context_engine", "discord", "fork_canaries", "golden",
+    "kanban", "run_agent", "state",
 }
 
 # Root-level modules whose tests sit directly in tests/ (no package to mirror).

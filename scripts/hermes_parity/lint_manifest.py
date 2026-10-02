@@ -21,6 +21,7 @@ jobs:
 from __future__ import annotations
 
 import glob
+import importlib.util
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -75,12 +76,19 @@ def lint_nodeids(repo: Path, nodeids: Sequence[str]) -> list[str]:
     python = repo / ".venv" / "bin" / "python"
     if not python.exists():
         python = repo / "venv" / "bin" / "python"
-    if not python.exists():
+    if python.exists():
+        python_exe = str(python)
+    elif importlib.util.find_spec("pytest") is not None:
+        # The running interpreter can collect: use it. On a CI shard (clean
+        # checkout, no repo venv) this is the test environment, and probing
+        # the fleet dev venv under ~/.hermes would trip the suite's real-home
+        # I/O guard (tests/home_io_guard.py) for nothing.
+        python_exe = sys.executable
+    else:
         python = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
-    # Last-resort fallback to the running interpreter — the fleet dev venvs
-    # above are absent on a CI shard's clean checkout, and a nonexistent path
-    # makes subprocess.run raise FileNotFoundError (the test-isolation red).
-    python_exe = str(python) if python.exists() else sys.executable
+        # Last-resort fallback to the running interpreter — a nonexistent path
+        # makes subprocess.run raise FileNotFoundError (the test-isolation red).
+        python_exe = str(python) if python.exists() else sys.executable
 
     def collects(batch: Sequence[str]) -> bool:
         proc = subprocess.run(

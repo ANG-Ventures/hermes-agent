@@ -149,12 +149,14 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: ubuntu-latest-32-core
+            # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+            runner: ubuntu-latest
             platform: linux/amd64
           # arm64 builds on the native arm64 larger runner. A build of
           # linux/arm64 on an x64 host uses emulation.
           - arch: arm64
-            runner: ubuntu-latest-32-arm-core
+            # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
 
     runs-on: ${{ matrix.runner }}
@@ -334,11 +336,13 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: ubuntu-latest-32-core
+            # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+            runner: ubuntu-latest
             platform: linux/amd64
           # Native arm64 for the same reason as the build matrix above.
           - arch: arm64
-            runner: ubuntu-latest-32-arm-core
+            # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -517,7 +521,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         variant: [slim, desktop]
-    runs-on: ubuntu-latest-32-core
+    # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       ARCH: ${{ matrix.arch }}

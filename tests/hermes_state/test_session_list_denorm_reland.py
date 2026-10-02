@@ -192,7 +192,10 @@ def test_prune_orphan_recomputes_denorm_and_survives_reopen(tmp_path):
     db = SessionDB(db_path=db_path)
     try:
         db.create_session("prune-parent", source="prune-target")
-        db.end_session("prune-parent", "compression")
+        # Not "compression": upstream's prune keeps a compression ancestor while a
+        # continuation after it survives (whole_lineages). This test is about the
+        # orphaned child's denorm recompute, so the parent ends like a plain session.
+        db.end_session("prune-parent", "stop")
         db.create_session(
             "prune-child",
             source="cli",

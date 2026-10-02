@@ -123,10 +123,14 @@ def test_preflight_scan_requires_named_seams(tmp_path):
     preflight_scan([target], named_seams=["monotonic"])
 
 
+# Explicit guard test: it feeds the REAL ~/.hermes to require_sandboxed_home()
+# to prove the refusal, and that function resolve()s the path (a metadata
+# probe). The suite-wide home I/O guard (tests/home_io_guard.py) refuses that
+# probe without this opt-in; nothing here writes.
+@pytest.mark.allow_real_home_io
 def test_sandbox_guard_refuses_real_home(monkeypatch, tmp_path):
     """The 2026-07-16 incident class: a runner invoked outside Determinism()
     with HERMES_HOME pointing at the operator's real ~/.hermes must refuse."""
-    import pytest
 
     from scripts.refactor_equiv.sandbox_guard import UnsafeHomeError, require_sandboxed_home
 

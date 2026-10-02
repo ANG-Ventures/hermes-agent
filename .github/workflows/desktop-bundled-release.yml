@@ -454,7 +454,8 @@ jobs:
       matrix:
         target:
           - label: win32-x64
-            runner: windows-latest-32-core
+            # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+            runner: windows-latest
     env: &win32-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
@@ -752,7 +753,8 @@ jobs:
       matrix:
         target:
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+            runner: windows-11-arm
     env: *win32-env
     steps: *win32-steps
 
@@ -1450,7 +1452,8 @@ jobs:
       && needs.build-win32-x64.result == 'success' && needs.build-win32-arm64.result == 'success'
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '' || inputs.channel != '')
-    runs-on: windows-latest-32-core
+    # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+    runs-on: windows-latest
     environment: release-signing
     cache-mode: read
     timeout-minutes: 45
@@ -2376,7 +2379,8 @@ jobs:
     name: Verify published candidate files
     needs: validate
     if: inputs.release-phase == 'publish'
-    runs-on: ubuntu-latest-32-core
+    # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+    runs-on: ubuntu-latest
     environment: release-signing
     timeout-minutes: 90
     env:
@@ -2401,7 +2405,8 @@ jobs:
     name: Submit the verified Store package
     needs: [validate, stable-publish]
     if: inputs.release-phase == 'publish'
-    runs-on: windows-latest-32-core
+    # fork 2026-10-01: upstream's paid larger-runner pool is absent in this org (queues forever)
+    runs-on: windows-latest
     environment: release-signing
     timeout-minutes: 60
     env:
