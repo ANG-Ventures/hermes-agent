@@ -37,6 +37,8 @@ EXPECTED_FIELDS = {
     "local_relay_waited_s",
     "local_relay_recoveries",
     "relay_drain_started_at",
+    "invalid_response_retry_floor",
+    "invalid_response_retry_done",
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
