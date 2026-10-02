@@ -250,7 +250,9 @@ def event_kwargs(fields: Dict[str, Any]) -> Dict[str, Any]:
 
     from gateway.platforms.base import MessageEvent, MessageType
 
-    known = {f.name for f in dataclasses.fields(MessageEvent)} - set(NOT_CARRIED_FIELDS)
+    # init=False fields (e.g. upstream's ``_gateway_accepted`` intake flag) are process-local
+    # state, not constructor kwargs: passing one raises TypeError and drops the replay.
+    known = {f.name for f in dataclasses.fields(MessageEvent) if f.init} - set(NOT_CARRIED_FIELDS)
     kwargs: Dict[str, Any] = {}
     for name, value in fields.items():
         if name not in known:

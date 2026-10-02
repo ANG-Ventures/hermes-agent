@@ -187,7 +187,10 @@ class GatewaySessionCommandsMixin:
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
         # profile's model, not the base config's.
         try:
-            session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
+            session_info = await asyncio.to_thread(
+                self._reset_notice_session_info, source,
+                session_key=session_key, session_entry=new_entry,
+            )
         except Exception:
             session_info = ""
         if new_entry:

@@ -641,10 +641,8 @@ class GatewayBusySessionMixin:
         outcome = self._BusySteerOutcome(
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
+            demoted_for_startup_resume=demoted_for_startup_resume,
         )
-        # FOLLOWUP gateway/run.py: add ``demoted_for_startup_resume: bool = False`` to
-        # ``GatewayRunner._BusySteerOutcome`` and pass it in the constructor above.
-        outcome.demoted_for_startup_resume = demoted_for_startup_resume
         return outcome
 
     @staticmethod

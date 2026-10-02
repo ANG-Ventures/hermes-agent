@@ -2239,7 +2239,10 @@ from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin
 from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
-from gateway.run_inbound import GatewayInboundMixin
+from gateway.run_inbound import GatewayInboundMixin, _STT_LOG_CHAT  # noqa: F401 (fork test seam)
+# Fork test seam: shutdown tests monkeypatch ``gateway.run.arm_shutdown_watchdog`` and
+# run_shutdown resolves it through ``_run_seam`` at call time.
+from gateway.shutdown_watchdog import arm_shutdown_watchdog  # noqa: F401
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
@@ -5073,6 +5076,7 @@ class GatewayRunner(
         demoted_for_compression: bool
         steered: bool
         redirected: bool
+        demoted_for_startup_resume: bool = False
 
     # Worker bound for _cleanup_agent_resources: sync, can block long (subprocess teardown, memory IO).
     _CLEANUP_TIMEOUT_S = 30.0

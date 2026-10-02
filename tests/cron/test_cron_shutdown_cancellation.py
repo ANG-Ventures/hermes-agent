@@ -185,8 +185,10 @@ def test_gateway_drain_calls_the_cron_terminator():
     import inspect
 
     import gateway.run as run_mod
+    import gateway.run_shutdown as run_shutdown_mod
 
-    src = inspect.getsource(run_mod)
+    # The stop()/drain body moved into the GatewayShutdownMixin sibling upstream.
+    src = inspect.getsource(run_mod) + "\n" + inspect.getsource(run_shutdown_mod)
     tree = ast.parse(src)
 
     called = {

@@ -1690,7 +1690,7 @@ class GatewaySlashCommandsMixin(
             return
         try:
             await asyncio.wait_for(
-                self._run_housekeeping_in_executor("cleanup", self._cleanup_agent_resources, _old_agent),
+                self._run_housekeeping_in_executor(self._cleanup_agent_resources, _old_agent),
                 timeout=_RESET_CLEANUP_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.warning(
@@ -1746,7 +1746,10 @@ class GatewaySlashCommandsMixin(
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
         # profile's model, not the base config's.
         try:
-            session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
+            session_info = await asyncio.to_thread(
+                self._reset_notice_session_info, source,
+                session_key=session_key, session_entry=new_entry,
+            )
         except Exception:
             session_info = ""
         if new_entry:

@@ -21,11 +21,13 @@ from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
 from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
-from tools.environments.base_output import (
-    ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
+from tools.environments.base_output import (  # noqa: F401 (_BoundedOutputCollector: fork test seam)
+    ProcessHandle, _BoundedOutputCollector, _finalize_wait_result, _new_output_collector,
+    _start_drain_thread,
 )
-from tools.environments.base_session_env import (
-    _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_marker, _snapshot_bootstrap_script, _split_cwd_marker,
+from tools.environments.base_session_env import (  # noqa: F401 (snapshot-exclusion names: fork test seam)
+    _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _SNAPSHOT_EXCLUDED_ENV_REGEX, _cwd_marker,
+    _export_dump_excluding_session_vars, _snapshot_bootstrap_script, _split_cwd_marker,
     _wrap_command_script,
 )
 from tools.environments.base_wait import _WaitTrace

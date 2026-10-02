@@ -5662,7 +5662,7 @@ from cron.scheduler_delivery import (  # noqa: E402
     _resolve_delivery_targets,
 )
 from cron.scheduler_script import (  # noqa: E402
-    _get_script_timeout, _get_session_db_timeout, _run_job_script_with_claim_heartbeat,
+    _get_script_timeout, _get_session_db_timeout, _run_job_script, _run_job_script_with_claim_heartbeat,
     _start_heartbeat_thread,
 )
 from cron.scheduler_prompt import (  # noqa: E402

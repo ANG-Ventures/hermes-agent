@@ -312,6 +312,11 @@ class GatewayAuthorizationMixin:
         # ``getattr``: test fixtures build bare SimpleNamespace sources without ``profile``.
         return self._authorization_adapter(getattr(source, "platform", None), getattr(source, "profile", None))
 
+    def _adapter_for_source(self, source: Optional[SessionSource]):
+        """Fork seam kept across the upstream intake/delivery split (c70565ef30): the adapter that
+        answers *source*. Slash-command handlers call it, and fork tests monkeypatch it."""
+        return self._delivery_adapter_for(source)
+
     def _owning_profile(self, adapter, platform):
         """Return (registered, profile) for a live adapter: profile is None for primary."""
         if adapter is self._primary_adapters().get(platform):
