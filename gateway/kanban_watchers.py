@@ -675,6 +675,85 @@ def _send_workspace_refusal_alert(board: str, summary: str) -> bool:
     return True
 
 
+def _send_proc_slot_alert(gate) -> bool:
+    """Page #alerts once when the load gate enters ``proc_paused``.
+
+    t_b660edb6: the Studio climbed to its per-uid process limit over 3 h
+    with load1 at 7-8 and nothing paged; at the limit every fork (hooks,
+    cron shells, this page's own subprocess) fails. The gate trips at
+    ``proc_pause_fraction`` of the limit, while a fork still works.
+    """
+    script = _alert_notify_script()
+    if script is None:
+        logger.error("kanban dispatcher: notify.py unavailable; process-slot page not delivered")
+        return False
+    from hermes_cli import kanban_load_gate as _klg
+
+    top = ", ".join(f"{name} x{n}" for name, n in _klg.top_user_proc_families(3))
+    message = (
+        "🛑 **Kanban dispatcher** · host running out of process slots\n"
+        f"{gate.last_reason}\n"
+        f"Top process names for this user: {top or 'unreadable'}\n"
+        "Spawns are paused. At the limit every fork() fails with EAGAIN "
+        "(hooks fail closed, cron shells die, the gateway watchdog exits). "
+        "Find the forker: `python3 fleet/exec-flight-recorder.py --grep . --since <now-30m>` "
+        "and count by ppid."
+    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(script), "--send", message,
+                "--channel", "discord", "--profile", "default", "--sev", "error",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: process-slot page failed")
+        return False
+    return proc.returncode == 0
+
+
+def _host_recovery_note(gate) -> Optional[str]:
+    """Requeue note when this tick's gate admits, else None (no requeue)."""
+    if not gate.host_recovered():
+        return None
+    l1 = "?" if gate.load1 is None else f"{gate.load1:.1f}"
+    return (
+        f"dispatcher load gate {gate.state}, load1={l1}, "
+        f"procs={gate.procs if gate.procs is not None else '?'}"
+        f"/{gate.proc_limit or '?'}"
+    )
+
+
+def _requeue_host_transient_on(conn, slug: str, note: Optional[str]) -> list:
+    """Unblock host-exhaustion ``transient`` cards on an OPEN board conn.
+
+    Runs on the dispatch tick's own connection (no extra board open; a
+    corrupt board already fails at connect). Errors are logged, never raised.
+    """
+    from hermes_cli import kanban_db as kb
+
+    if not note:
+        return []
+    try:
+        ids = kb.requeue_host_transient_blocks(conn, note=note)
+    except Exception:
+        # Never cost the board its dispatch tick.
+        logger.exception("kanban dispatcher: transient requeue failed on %s", slug)
+        return []
+    if ids:
+        logger.warning(
+            "kanban dispatcher [%s]: auto-requeued %d host-transient block(s) "
+            "after host recovery (%s): %s",
+            slug, len(ids), note, ", ".join(ids),
+        )
+    return ids
+
+
 def _observe_workspace_refusal_outages(notifier, results) -> int:
     """Process one full dispatcher tick; skipped boards do not imply recovery."""
     delivered = 0
@@ -3047,8 +3126,15 @@ class GatewayKanbanWatchersMixin:
                 running = _klg_mod.count_running_workers()
             return load_gate.admit_now(running=running)
 
+        _proc_paged = {"episode": False}
+
         def _finish_gate_tick(spawned: int) -> None:
             load_gate.finish_tick(spawned, logger=logger)
+            if load_gate.state != "proc_paused":
+                _proc_paged["episode"] = False
+            elif not _proc_paged["episode"]:
+                # A failed send stays unpaged, so the next tick retries.
+                _proc_paged["episode"] = _send_proc_slot_alert(load_gate)
 
         # Round-robin cursor for the per-board allowance split and the
         # wall-clock start of each board's current zero-spawn streak while
@@ -3113,7 +3199,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -3148,6 +3234,7 @@ class GatewayKanbanWatchersMixin:
                 disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
+                _requeue_host_transient_on(conn, slug, requeue_note)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -3228,6 +3315,9 @@ class GatewayKanbanWatchersMixin:
             # (t_f78d1938: consumed in fixed board order, default first, the
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
             _allowance, _spawn_paused = _sample_spawn_pause()
+            # Host-exhaustion transient blocks clear when the host does
+            # (t_b660edb6); requeued inside each board's dispatch tick.
+            _requeue_note = _host_recovery_note(load_gate)
             _tick_spawned = 0
             _demand: list[tuple[str, int]] = []
             if _allowance is not None and not _spawn_paused:
@@ -3294,6 +3384,7 @@ class GatewayKanbanWatchersMixin:
                 res = _tick_once_for_board(
                     slug, budget_cache, _paused,
                     None if _paused else _limit,
+                    requeue_note=_requeue_note,
                 )
                 out.append((slug, res))
                 _n = len(getattr(res, "spawned", None) or []) if res is not None else 0

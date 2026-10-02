@@ -15563,6 +15563,69 @@ def unblock_task(
         return True
 
 
+# A ``transient`` block whose reason names HOST resource exhaustion (out of
+# process slots, fork EAGAIN, load over the gate) clears when the host does,
+# not when a human looks. t_b660edb6: t_5ea5bcd0 blocked "Studio is out of
+# process slots ... Requeue once the host recovers" at 02:06 and sat 7h50m
+# after the host recovered (02:10) until Apollo unblocked it by hand.
+# Transient blocks for anything else (time gates, a lander, a judge error)
+# are NOT host conditions and stay put: requeueing those every healthy tick
+# would just walk them into the recurrence breaker.
+HOST_TRANSIENT_REASON_RE = re.compile(
+    r"EAGAIN|Resource temporarily unavailable|BlockingIOError|Errno 35"
+    r"|process slots|out of process|maxprocperuid|fork\(?\)?:? "
+    r"(?:fails|failed|returns|Resource)|host_emergency|\bload1\b|host load",
+    re.IGNORECASE,
+)
+HOST_TRANSIENT_MIN_BLOCKED_SECONDS = 120
+
+
+def requeue_host_transient_blocks(
+    conn: sqlite3.Connection,
+    *,
+    note: str,
+    now: Optional[int] = None,
+    min_blocked_seconds: int = HOST_TRANSIENT_MIN_BLOCKED_SECONDS,
+) -> list[str]:
+    """Unblock ``transient`` cards blocked for host exhaustion; return ids.
+
+    The CALLER decides the host has recovered (the dispatcher's load gate is
+    admitting); this only selects which blocked cards that recovery clears:
+    ``status='blocked'``, ``block_kind='transient'``, latest ``blocked`` event
+    older than ``min_blocked_seconds`` whose reason matches
+    :data:`HOST_TRANSIENT_REASON_RE`. Each goes through :func:`unblock_task`
+    with a comment naming ``note`` in the same transaction, so the respawned
+    worker reads why it is running again.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT t.id AS id, "
+        "(SELECT e.payload FROM task_events e WHERE e.task_id = t.id "
+        " AND e.kind = 'blocked' ORDER BY e.id DESC LIMIT 1) AS payload, "
+        "(SELECT e.created_at FROM task_events e WHERE e.task_id = t.id "
+        " AND e.kind = 'blocked' ORDER BY e.id DESC LIMIT 1) AS blocked_at "
+        "FROM tasks t WHERE t.status = 'blocked' AND t.block_kind = 'transient'"
+    ).fetchall()
+    out: list[str] = []
+    for row in rows:
+        if row["blocked_at"] is None or now - int(row["blocked_at"]) < min_blocked_seconds:
+            continue
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        reason = str((payload or {}).get("reason") or "") if isinstance(payload, dict) else ""
+        if not HOST_TRANSIENT_REASON_RE.search(reason):
+            continue
+        body = (
+            f"auto-requeue: host recovered ({note}). This card was blocked "
+            f"kind=transient for a host condition: {reason[:300]}"
+        )
+        if unblock_task(conn, row["id"], comment=("kanban-dispatcher", body, None, None)):
+            out.append(row["id"])
+    return out
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Legacy verdict bypass retired: claim the review and request changes.
 
@@ -26133,6 +26196,11 @@ def run_daemon(
                     if load_gate.enabled else None
                 )
                 gate_kwargs = {"spawn_paused": reason, "spawn_limit": allowance}
+                if load_gate.host_recovered():
+                    with contextlib.closing(connect()) as _rconn:
+                        requeue_host_transient_blocks(
+                            _rconn, note=f"kanban daemon load gate {load_gate.state}",
+                        )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,

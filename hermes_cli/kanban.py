@@ -5795,9 +5795,11 @@ def _one_shot_load_gate(conn, args, config, additive):
     # CPU corroboration of a load1 pause (t_bf26e8f1): a one-shot process
     # has no previous sample, so take a 0.25 s one.
     cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
+    procs, proc_limit = _klg.sample_user_procs()
     allowance, reason = gate.admit(
         load1, load5=load5, cpu_busy=cpu_busy,
         running=_klg.count_running_workers(),
+        procs=procs, proc_limit=proc_limit,
     )
     info = gate.snapshot()
     info.pop("boards", None)
@@ -5827,7 +5829,8 @@ def _one_shot_load_gate(conn, args, config, additive):
         info["override_by"] = profile
         return out
     if reason:
-        label = "PAUSED" if gate.state == "paused" else "SATURATED"
+        label = {"paused": "PAUSED", "proc_paused": "PROC-PAUSED"}.get(
+            gate.state, "SATURATED")
         print(
             f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) "
             f"- spawning 0 this call: {reason}",
