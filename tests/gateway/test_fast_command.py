@@ -514,7 +514,7 @@ def test_pure_route_identity_matches_runtime_precedence(monkeypatch):
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs_for_provider",
-        lambda provider: {
+        lambda provider, target_model=None: {
             "provider": provider,
             "api_mode": "codex_responses",
             "api_key": "channel-key",
@@ -755,7 +755,7 @@ def test_pure_route_identity_matches_runtime_exhaustive_precedence_matrix(
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs_for_provider",
-        lambda provider: {
+        lambda provider, target_model=None: {
             "provider": provider,
             "api_mode": "anthropic_messages",
             "api_key": "channel-secret",
