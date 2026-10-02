@@ -33,6 +33,19 @@ from hermes_state_common import (
     _BRANCH_CHILD_SQL, _LISTABLE_CHILD_SQL, _sql_json_extract,
     escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity,
 )
+# Re-exported for back-compat (fork): the schema/FTS constants and the trigram config gate
+# moved to hermes_state_common, but fork tests and scripts still read them off hermes_state
+# (``from hermes_state import SCHEMA_VERSION``, ``hs._trigram_fts_config_enabled()``).
+from hermes_state_common import (  # noqa: F401
+    FTS_STORAGE_VERSION, MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _trigram_fts_config_enabled,
+)
+# Same for the repair helpers upstream split into hermes_state_repair: fork callers and tests
+# (tests/test_state_db_recover_hint_pasteable.py) reach them through this facade.
+from hermes_state_repair import (  # noqa: F401
+    _MAX_PERSISTENT_REPAIR_ATTEMPTS, _REPAIR_BACKUP_MIN_FREE_BYTES, _backup_db_file, _db_fingerprint,
+    _db_opens_cleanly, _persistent_repair_attempts_exhausted, _persistent_repair_exhausted_error,
+    _repair_ledger_path,
+)
 # Fork-only helpers consumed by the fork-only SessionDB methods below (hermes_state_ext is a
 # fork module: platform/channel session search + session-list denorm gate).
 from hermes_state_ext import (
