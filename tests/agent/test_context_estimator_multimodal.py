@@ -5,6 +5,7 @@ real prompt was a fraction of that."""
 
 from agent.chat_completion_helpers import estimate_request_context_tokens, openai_codex_stale_timeout_floor
 from agent.image_token_cost import DEFAULT_IMAGE_TOKEN_COST, image_cost_context
+from agent.model_metadata import COMPOSITION_CHARS_PER_TOKEN
 
 _B64 = "data:image/png;base64," + "A" * 400_000
 
@@ -29,7 +30,10 @@ def test_text_payloads_and_tool_schemas_keep_the_legacy_estimate():
     """A base64-looking STRING is text; tool schemas mentioning ``image`` are not images."""
     payload = {"messages": [{"role": "user", "content": _B64}],
                "tools": [{"type": "function", "function": {"name": "vision", "parameters": {"type": "image"}}}]}
-    legacy = (sum(len(str(m)) for m in payload["messages"]) + len(str(payload["tools"]))) // 4
+    # Fork: the stale-call estimator shares the rough estimator's chars/token divisor (3.5 by
+    # default, 886877cfbc8) rather than upstream's char/4, so the text contract is pinned
+    # against that divisor — the point is that no image pricing is applied.
+    legacy = (sum(len(str(m)) for m in payload["messages"]) + len(str(payload["tools"]))) / COMPOSITION_CHARS_PER_TOKEN
     assert abs(estimate_request_context_tokens(payload) - legacy) < legacy * 0.02
 
 

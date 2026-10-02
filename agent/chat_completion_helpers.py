@@ -977,8 +977,13 @@ def _image_part_chars(part: Dict[str, Any], image_cost: int) -> int:
     """Char-equivalent of one image content part: the per-image cost learned from provider usage
     (x4 chars/token), never the base64 payload length. A single native screenshot priced as text
     read as ~100K+ tokens and selected the giant-conversation watchdog tiers (#63871, #76411)."""
+    from agent.model_metadata import COMPOSITION_CHARS_PER_TOKEN
+
     text = part.get("text")
-    return image_cost * 4 + (len(text) if isinstance(text, str) else 0)
+    # The learned cost is a TOKEN figure: express it in chars under the SAME divisor the
+    # estimator applies (fork: shared 3.5 chars/token, not char/4) so it round-trips to
+    # ``image_cost`` tokens instead of being inflated by 4/3.5.
+    return int(image_cost * COMPOSITION_CHARS_PER_TOKEN) + (len(text) if isinstance(text, str) else 0)
 
 
 def _payload_chars(value: Any, image_cost: int) -> int:
