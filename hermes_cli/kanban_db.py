@@ -227,6 +227,50 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     )
 
 
+# Per-card harness brain (t_a8f335c5): the Claude lane a foreign-lane worker
+# (cc-worker) dials through, normally the profile-wide ``foreign_lane.brain``.
+# Stored in the full (``f``) lane grammar; the lane runner
+# (skills-shared/coding/kanban-foreign-lane/scripts/harness_model.py) maps it to
+# its internal id and re-validates it at spawn. Pre-v2 internal ids are
+# accepted and stored in the f spelling. Bare ``clr`` / ``clx-N`` are the SLIM
+# harness since 2026-10-01 (t_faf5af7b) and are refused by name.
+CARD_BRAIN_ALLOWED = (
+    "clrf | clxf-<N> | dtlrf | dtlxf-<N> | alrf | cliproxy:<model> | openrouter:<model>"
+)
+_CARD_BRAIN_ALIASES = {"cpr-cli": "clrf", "dtlr": "dtlrf", "alrf": "alrf", "clrf": "clrf", "dtlrf": "dtlrf"}
+_CARD_BRAIN_MODEL_RE = re.compile(r"(cliproxy|openrouter):([A-Za-z0-9][A-Za-z0-9._/-]*)")
+
+
+def normalize_card_brain(brain: Optional[str]) -> Optional[str]:
+    """Validate a per-card brain against the allowlist; return its stored form.
+
+    Empty / None / ``none`` / ``-`` means "no card brain" (NULL: the profile's
+    ``foreign_lane.brain`` applies). Anything outside the allowlist raises
+    ``ValueError`` naming the allowed values, so a typo never silently falls
+    back to the profile's lane.
+    """
+    value = str(brain or "").strip()
+    if value.lower() in ("", "none", "-", "null"):
+        return None
+    low = value.lower()
+    if low in _CARD_BRAIN_ALIASES:
+        return _CARD_BRAIN_ALIASES[low]
+    m = re.fullmatch(r"(clxf|cpx-cli|dtlxf|dtlx)[-:](\d+)", low)
+    if m:
+        family = "clxf" if m.group(1) in ("clxf", "cpx-cli") else "dtlxf"
+        return f"{family}-{int(m.group(2))}"
+    m = _CARD_BRAIN_MODEL_RE.fullmatch(value)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    if low in ("clr", "clx") or re.fullmatch(r"clx[-:]\d+", low):
+        full = low.replace("clr", "clrf").replace("clx", "clxf")
+        raise ValueError(
+            f"brain {value!r} is the SLIM harness since 2026-10-01 (t_faf5af7b); "
+            f"a coding worker needs the full harness: use {full}"
+        )
+    raise ValueError(f"brain must be one of {CARD_BRAIN_ALLOWED}, got {value!r}")
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -2305,6 +2349,10 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Per-card harness brain for a foreign-lane worker (t_a8f335c5), stored in
+    # the f lane grammar (normalize_card_brain). NULL = the profile's
+    # ``foreign_lane.brain``.
+    brain: Optional[str] = None
     # Deliberate single-sub pin (``--pin-sub "<reason>"``, t_957ca870). Set
     # only when ``provider_override`` is one claude-bpx-N / claude-apx-N sub.
     # ``pin_sub_fallback`` lets a capped pinned sub fall back to its family
@@ -2437,6 +2485,7 @@ class Task:
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
+            brain=row["brain"] if "brain" in keys and row["brain"] else None,
             pin_sub_reason=(
                 row["pin_sub_reason"]
                 if "pin_sub_reason" in keys and row["pin_sub_reason"]
@@ -2635,6 +2684,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Per-card harness brain for a foreign-lane worker (t_a8f335c5), f lane
+    -- grammar (clrf, clxf-N, dtlrf, ...). NULL = profile foreign_lane.brain.
+    brain                TEXT,
     -- Deliberate single-sub pin (t_957ca870): the operator's --pin-sub reason
     -- when provider_override is claude-bpx-N / claude-apx-N. NULL = no pin.
     pin_sub_reason       TEXT,
@@ -4494,6 +4546,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "pin_sub_fallback", "pin_sub_fallback INTEGER NOT NULL DEFAULT 0"
         )
+    if "brain" not in cols:
+        # Per-card harness brain (t_a8f335c5). NULL = the profile's
+        # foreign_lane.brain, which is what existing rows were getting.
+        _add_column_if_missing(conn, "tasks", "brain", "brain TEXT")
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -7112,6 +7168,7 @@ def create_task(
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    brain: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     goal_mode: bool = False,
@@ -7186,6 +7243,7 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    brain = normalize_card_brain(brain)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
@@ -7578,8 +7636,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, brain
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -7607,6 +7665,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        brain,
                     ),
                 )
                 for pid in parents:
@@ -7639,6 +7698,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **({"brain": brain} if brain else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -7786,25 +7846,45 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
-    conn.execute(
-        f"""
-        INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-             scope_id, chat_type, notifier_profile, delivery_mode,
-             delivery_metadata, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
-               scope_id, COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
-          FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
-        """,
-        (
-            child_id,
-            int(created_at if created_at is not None else time.time()),
-            cursor,
-            *parent_ids,
-        ),
-    )
+    # One subscriber chat per card (t_484a3c72): a parent's chat joins only
+    # when the child has no live subscriber on that platform yet. Decided per
+    # parent row, oldest first, so a child of two parents in two chats ends up
+    # with one of them, not both.
+    for prow in conn.execute(
+        f"SELECT * FROM kanban_notify_subs WHERE task_id IN ({placeholders})"
+        " ORDER BY created_at, rowid",
+        parent_ids,
+    ).fetchall():
+        decision, others = _notify_sub_admission(
+            conn, task_id=child_id, platform=prow["platform"],
+            chat_id=prow["chat_id"], thread_id=prow["thread_id"] or "",
+            notifier_profile=prow["notifier_profile"],
+        )
+        if decision == "keep":
+            _log_sub_kept(child_id, others, prow["chat_id"])
+            continue
+        if decision == "replace":
+            _drop_notify_subs(conn, others)
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+                 scope_id, chat_type, notifier_profile, delivery_mode,
+                 delivery_metadata, created_at, last_event_id)
+            SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
+                   scope_id, COALESCE(chat_type, 'dm'), notifier_profile,
+                   COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+              FROM kanban_notify_subs
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (
+                child_id,
+                int(created_at if created_at is not None else time.time()),
+                cursor,
+                prow["task_id"], prow["platform"], prow["chat_id"],
+                prow["thread_id"] or "",
+            ),
+        )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -8368,6 +8448,45 @@ def _set_reasoning_effort_locked(
     return True
 
 
+def set_card_brain(
+    conn: sqlite3.Connection,
+    task_id: str,
+    brain: Optional[str],
+) -> bool:
+    """Set (or clear) the per-card harness brain (t_a8f335c5).
+
+    ``brain=None`` (or empty / ``none``) clears it: the worker uses its
+    profile's ``foreign_lane.brain``. Independent of the model and effort
+    overrides, applies on the NEXT dispatch, and records ``brain_set`` (the
+    same event ledger and actor stamp as ``reasoning_effort_set``).
+    """
+    brain = normalize_card_brain(brain)
+    with write_txn(conn):
+        if not _set_card_brain_locked(conn, task_id, brain):
+            return False
+    notify_task_updated(conn, task_id, ("brain",))
+    return True
+
+
+def _set_card_brain_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    brain: Optional[str],
+) -> bool:
+    """Write one card brain. MUST already be inside a ``write_txn``; ``brain``
+    must already have passed :func:`normalize_card_brain`."""
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(f"cannot set brain on archived task {task_id}")
+    conn.execute("UPDATE tasks SET brain = ? WHERE id = ?", (brain, task_id))
+    _append_event(conn, task_id, "brain_set", {"brain": brain})
+    return True
+
+
 @dataclass
 class BatchRouteWrite:
     """One card's requested route/effort change inside a batch."""
@@ -8380,6 +8499,9 @@ class BatchRouteWrite:
     audit_comment_body: Optional[str] = None
     touch_effort: bool = False
     effort: Optional[str] = None
+    # Per-card harness brain (``--brain`` / ``--clear-brain``, t_a8f335c5).
+    touch_brain: bool = False
+    brain: Optional[str] = None
     # Deliberate single-sub pin (``--pin-sub``); only with ``touch_model``.
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
@@ -8508,6 +8630,8 @@ def apply_batch_route_writes(
                 pin_sub_fallback=write.pin_sub_fallback,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
+        if write.touch_brain:
+            write.brain = normalize_card_brain(write.brain)
         prepared.append((write, model, provider, effort))
 
     # Home-session guard for every card in the batch, before the writer lock:
@@ -8548,6 +8672,10 @@ def apply_batch_route_writes(
                 if not _set_reasoning_effort_locked(conn, write.task_id, effort):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("reasoning_effort",)
+            if write.touch_brain:
+                if not _set_card_brain_locked(conn, write.task_id, write.brain):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("brain",)
             if changed:
                 written.append(write.task_id)
                 fields[write.task_id] = changed
@@ -25766,6 +25894,8 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
 
 _SHIM_MODEL_FAMILY_RANK = (("haiku", 1), ("sonnet", 2), ("opus", 3))
 SHIM_MODEL_CAPPED_FROM_ENV = "HERMES_KANBAN_SHIM_MODEL_CAPPED_FROM"
+# Per-card harness brain as claimed (t_a8f335c5); read by the lane runner.
+CARD_BRAIN_ENV = "HERMES_KANBAN_CARD_BRAIN"
 _SHIM_MODEL_ID_RE = re.compile(r"claude-(haiku|sonnet|opus)-\d[0-9a-z.-]*$")
 
 
@@ -25994,6 +26124,10 @@ def _default_spawn(
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    # The card's harness brain as claimed (t_a8f335c5; "" = none). The lane
+    # runner re-reads tasks.brain and stops ``model_diverged`` if it moved
+    # between this claim and its own read, as it does for model and effort.
+    env[CARD_BRAIN_ENV] = getattr(task, "brain", None) or ""
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
         from hermes_cli.kanban_worker_exit import exit_file
@@ -26755,6 +26889,206 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# One subscriber chat per card (Ace ruling 2026-10-02, t_484a3c72)
+# ---------------------------------------------------------------------------
+# A card has at most ONE notify subscription per platform. Linking, mentioning
+# or inheriting a card from another session used to add that session's chat as
+# a second subscriber, so the same lifecycle line posted in two channels
+# (t_311b6b1f held #cc-native, #dpx-ish and #prism). ``add_notify_sub`` and
+# ``_inherit_notify_subs`` (the only two writers) route through
+# :func:`_notify_sub_admission`; ``notify-subscribe --also`` is the explicit
+# escape hatch.
+
+# A subscriber chat with no gateway session activity for this long is dead:
+# a new subscriber replaces it instead of being refused.
+NOTIFY_SUB_OWNER_LIVE_SECONDS = 24 * 3600
+_CHAT_LIVENESS_TTL_S = 60.0
+_CHAT_LIVENESS_CACHE: dict = {}
+_CHAT_LIVENESS_LOCK = threading.Lock()
+
+
+def _state_db_paths(profile: Optional[str]) -> list[Path]:
+    """state.db candidates for a notifier profile: its own, then the root's."""
+    root = kanban_home()
+    out: list[Path] = []
+    prof = (profile or "").strip()
+    if prof and prof != "default":
+        out.append(root / "profiles" / prof / "state.db")
+    out.append(root / "state.db")
+    return out
+
+
+def _chat_last_active(
+    platform: str, chat_id: str, profile: Optional[str] = None,
+) -> Optional[float]:
+    """Newest gateway-session activity (epoch s) recorded for a chat.
+
+    ``0.0`` = a readable state.db holds no session for the chat; ``None`` = no
+    state.db could be read (callers treat unknown as live: refusing a second
+    subscriber is the safe side of the ruling). Read-only, cached 60 s.
+    """
+    platform = (platform or "").strip().lower()
+    chat_id = str(chat_id or "").strip()
+    if not platform or not chat_id:
+        return 0.0
+    paths = _state_db_paths(profile)
+    key = (platform, chat_id, tuple(str(p) for p in paths))
+    now = time.monotonic()
+    with _CHAT_LIVENESS_LOCK:
+        hit = _CHAT_LIVENESS_CACHE.get(key)
+        if hit is not None and now - hit[0] < _CHAT_LIVENESS_TTL_S:
+            return hit[1]
+    best: Optional[float] = None
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            sconn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0,
+            )
+            try:
+                # TUI subscriptions store the session KEY as chat_id.
+                row = sconn.execute(
+                    "SELECT MAX(MAX(COALESCE(last_activity_at, 0),"
+                    " COALESCE(effective_last_active, 0), started_at))"
+                    " FROM sessions WHERE (source = ? AND chat_id = ?)"
+                    " OR session_key = ?",
+                    (platform, chat_id, chat_id),
+                ).fetchone()
+            finally:
+                sconn.close()
+        except sqlite3.Error:
+            continue
+        value = float(row[0]) if row and row[0] is not None else 0.0
+        best = value if best is None else max(best, value)
+    with _CHAT_LIVENESS_LOCK:
+        _CHAT_LIVENESS_CACHE[key] = (now, best)
+        if len(_CHAT_LIVENESS_CACHE) > 512:
+            _CHAT_LIVENESS_CACHE.pop(next(iter(_CHAT_LIVENESS_CACHE)))
+    return best
+
+
+def notify_chat_is_live(
+    platform: str, chat_id: str, profile: Optional[str] = None,
+    *, now: Optional[float] = None,
+) -> bool:
+    """True when the chat's gateway session was active in the last 24 h, or
+    when liveness cannot be read (fail toward keeping the current owner)."""
+    last = _chat_last_active(platform, chat_id, profile)
+    if last is None:
+        return True
+    current = time.time() if now is None else float(now)
+    return current - last < NOTIFY_SUB_OWNER_LIVE_SECONDS
+
+
+def card_home_chat(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """``(platform, chat_id)`` of the card's home session, or None if unknown.
+
+    ``tasks.session_id`` is a gateway session KEY for gateway-created cards
+    and a raw session id otherwise; both resolve through state.db ``sessions``.
+    """
+    row = conn.execute(
+        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    sid = ((row["session_id"] if row else None) or "").strip()
+    if not sid:
+        return None
+    for path in _state_db_paths(profile):
+        if not path.is_file():
+            continue
+        try:
+            sconn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0,
+            )
+            try:
+                hit = sconn.execute(
+                    "SELECT source, chat_id, thread_id FROM sessions"
+                    " WHERE id = ? OR session_key = ?"
+                    " ORDER BY started_at DESC LIMIT 1",
+                    (sid, sid),
+                ).fetchone()
+            finally:
+                sconn.close()
+        except sqlite3.Error:
+            continue
+        if hit and hit[0] and (hit[2] or hit[1]):
+            # A thread session records the thread as its chat.
+            return str(hit[0]).lower(), str(hit[2] or hit[1])
+    return None
+
+
+def _sub_matches_chat(sub: Mapping[str, Any], chat: Optional[tuple[str, str]]) -> bool:
+    if not chat:
+        return False
+    platform, chat_id = chat
+    return (str(sub.get("platform") or "").lower() == platform
+            and chat_id in {str(sub.get("chat_id") or ""), str(sub.get("thread_id") or "")})
+
+
+def _notify_sub_admission(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    notifier_profile: Optional[str],
+) -> tuple[str, list[dict]]:
+    """Decide whether a new subscriber chat may join ``task_id``.
+
+    Returns ``(decision, others)`` where ``others`` are the card's existing
+    subscriptions on the same platform for a DIFFERENT chat/thread:
+
+    * ``"add"``     - no other subscriber on the platform (or same row again).
+    * ``"replace"`` - the new chat is the card's home chat, or every other
+      subscriber is dead (no session activity in 24 h): drop ``others``.
+    * ``"keep"``    - a live subscriber owns the card; do not add.
+    """
+    others = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ?"
+            " AND LOWER(platform) = LOWER(?)"
+            " AND NOT (chat_id = ? AND thread_id = ?)",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
+    ]
+    if not others:
+        return "add", []
+    home = card_home_chat(conn, task_id, notifier_profile)
+    new_sub = {"platform": platform, "chat_id": chat_id, "thread_id": thread_id}
+    if home is not None:
+        if any(_sub_matches_chat(o, home) for o in others):
+            return "keep", others
+        if _sub_matches_chat(new_sub, home):
+            return "replace", others
+    if any(
+        notify_chat_is_live(o["platform"], o["chat_id"], o.get("notifier_profile"))
+        for o in others
+    ):
+        return "keep", others
+    return "replace", others
+
+
+def _log_sub_kept(task_id: str, others: list[dict], chat_id: str) -> None:
+    owner = others[0]
+    _log.info(
+        "subscription kept: %s:%s owns %s (refused %s; pass notify-subscribe --also to add a second chat)",
+        owner.get("platform"), owner.get("chat_id"), task_id, chat_id,
+    )
+
+
+def _drop_notify_subs(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]]) -> None:
+    for o in rows:
+        conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = ?"
+            " AND chat_id = ? AND thread_id = ?",
+            (o["task_id"], o["platform"], o["chat_id"], o.get("thread_id") or ""),
+        )
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -26769,9 +27103,17 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
-) -> None:
+    also: bool = False,
+) -> str:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    One subscriber chat per card and platform (t_484a3c72): when another chat
+    already subscribes and its session is live, nothing is written and
+    ``"kept"`` is returned (logged as ``subscription kept: <chat> owns
+    <card>``). A dead owner (24 h idle), or a new chat that is the card's home
+    chat, is REPLACED (``"rehomed"``). ``also=True`` adds a second chat on
+    purpose (``"added"``). Otherwise returns ``"added"``.
 
     ``user_id_alt`` records the originating source's platform-specific stable
     alt ID (Signal UUID, Feishu union_id, ...) alongside ``user_id``. Active-wake
@@ -26844,7 +27186,24 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    outcome = "added"
     with write_txn(conn):
+        if not also:
+            decision, others = _notify_sub_admission(
+                conn, task_id=task_id, platform=platform, chat_id=chat_id,
+                thread_id=thread_id or "", notifier_profile=notifier_profile,
+            )
+            if decision == "keep":
+                _log_sub_kept(task_id, others, chat_id)
+                return "kept"
+            if decision == "replace":
+                _drop_notify_subs(conn, others)
+                _log.info(
+                    "subscription re-homed: %s %s -> %s:%s",
+                    task_id, ",".join(f"{o['platform']}:{o['chat_id']}" for o in others),
+                    platform, chat_id,
+                )
+                outcome = "rehomed"
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -26974,6 +27333,47 @@ def add_notify_sub(
                 """,
                 (metadata_json, task_id, platform, chat_id, thread_id or ""),
             )
+    return outcome
+
+
+
+def dedupe_notify_subs(conn: sqlite3.Connection, *, apply: bool = False) -> list[dict]:
+    """Cards holding more than one notify subscription per platform.
+
+    Keeps the card's home-session chat when one of the rows is it, else the
+    oldest row; the rest are dropped when ``apply`` is True. One dict per
+    (card, platform): ``task_id``, ``platform``, ``kept``, ``dropped``,
+    ``reason`` (``home`` | ``oldest``).
+    """
+    groups = conn.execute(
+        "SELECT task_id, LOWER(platform) AS plat FROM kanban_notify_subs"
+        " GROUP BY task_id, LOWER(platform) HAVING COUNT(*) > 1"
+        " ORDER BY task_id"
+    ).fetchall()
+    out: list[dict] = []
+    for g in groups:
+        subs = [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM kanban_notify_subs WHERE task_id = ?"
+                " AND LOWER(platform) = ? ORDER BY created_at, rowid",
+                (g["task_id"], g["plat"]),
+            )
+        ]
+        home = card_home_chat(conn, g["task_id"], subs[0].get("notifier_profile"))
+        keep = next((x for x in subs if _sub_matches_chat(x, home)), None)
+        reason = "home" if keep is not None else "oldest"
+        keep = keep or subs[0]
+        drop = [x for x in subs if x is not keep]
+        if apply:
+            with write_txn(conn):
+                _drop_notify_subs(conn, drop)
+        brief = lambda x: {"platform": x["platform"], "chat_id": x["chat_id"],
+                           "session_id": x.get("thread_id") or ""}
+        out.append({
+            "task_id": g["task_id"], "platform": g["plat"], "reason": reason,
+            "kept": brief(keep), "dropped": [brief(x) for x in drop],
+        })
+    return out
 
 
 def _notify_profile_filter(

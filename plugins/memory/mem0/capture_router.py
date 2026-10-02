@@ -227,6 +227,23 @@ def fallback_claim_headers(profile: Optional[str] = None) -> Dict[str, str]:
     return {"x-hermes-aux-task": "mem0_capture", "x-hermes-profile": profile}
 
 
+# t_52ac3307: the codex primary is CLIProxyAPI (:18812, key class mem0-capture -> harness hermes in
+# subs lanes.CPA_CALLER_KEYS). X-Fleet-Caller names the profile whose turn this capture is for; the
+# proxy records it on the usage record (a CLAIM: never routed on, never forwarded upstream).
+# Grammar is the proxy's: keys allowlisted, values [A-Za-z0-9._:-]{1,64} (no '/', unlike _CLAIM_RE).
+_FLEET_CLAIM_RE = re.compile(r"[^A-Za-z0-9._:-]")
+
+
+def primary_claim_headers(profile: Optional[str] = None) -> Dict[str, str]:
+    """X-Fleet-Caller for the codex (CLIProxyAPI) primary leg. Never raises; {} when disabled."""
+    if os.environ.get("HERMES_ATTRIBUTION_HEADER", "on").strip().lower() in ("off", "0", "false", "no"):
+        return {}
+    if profile is None:
+        profile = active_profile_name()
+    agent = _FLEET_CLAIM_RE.sub("-", str(profile).strip())[:64] or "default"
+    return {"X-Fleet-Caller": f"harness=hermes;agent={agent};kind=aux;task=mem0-capture"}
+
+
 class BridgeExtractor:
     """Runs one extraction pass against codex-bridge (PRIMARY); on ANY error/timeout falls back to
     gemini-bridge. Both are OpenAI-compatible /v1/chat/completions endpoints behind a bearer secret.
@@ -376,7 +393,8 @@ class BridgeExtractor:
             if cooldown_left > 0:
                 raise _PrimaryCoolingDown(cooldown_left)
             cands, usage, latency = self._call_with_auth_retry(
-                self._primary_url, self._primary_ref, self._model, system_prompt, user, assistant)
+                self._primary_url, self._primary_ref, self._model, system_prompt, user, assistant,
+                primary_claim_headers(profile))
             return {"candidates": cands, "usage": usage, "latency": latency, "provider": "codex-bridge"}
         except Exception as primary_err:
             if isinstance(primary_err, _PrimaryCoolingDown):

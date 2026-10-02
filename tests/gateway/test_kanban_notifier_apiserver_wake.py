@@ -161,6 +161,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
                 task_id=tid,
                 platform="api_server",
                 chat_id=chat_id,
+                also=True,  # deliberate multi-subscriber card (t_484a3c72)
             )
         kb.complete_task(conn, tid, summary="done once")
     finally:

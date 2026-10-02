@@ -1902,6 +1902,13 @@ class GatewayKanbanWatchersMixin:
                 _digest_window = (
                     _resolve_lifecycle_digest_seconds() if lifecycle_channel else 0
                 )
+                # (board, task, event id, channel) already posted to the
+                # lifecycle channel; bounded, survives across ticks so a
+                # rewound sibling sub cannot re-post the same receipt.
+                lifecycle_sent = getattr(self, "_kanban_lifecycle_sent", None)
+                if lifecycle_sent is None:
+                    lifecycle_sent = {}
+                    self._kanban_lifecycle_sent = lifecycle_sent
                 # One message per failure event, one per lane-wide cause.
                 lane_dedupe.plan(deliveries)
                 for d in deliveries:
@@ -2168,6 +2175,17 @@ class GatewayKanbanWatchersMixin:
                                 metadata = {}
                             else:
                                 _routed = None
+                        if _routed is not None:
+                            # Receipts land in exactly one place (t_484a3c72):
+                            # a card with several subscribers routes the same
+                            # event to the log channel once, not once per sub.
+                            _lc_key = (board_slug or "", sub["task_id"], ev.id, _routed)
+                            if _lc_key in lifecycle_sent:
+                                logger.debug(
+                                    "kanban notifier: %s event %s for %s already in the lifecycle channel",
+                                    kind, ev.id, sub["task_id"],
+                                )
+                                continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -2241,6 +2259,10 @@ class GatewayKanbanWatchersMixin:
                                 kind, sub["task_id"], platform_str, send_chat_id, board_slug,
                             )
                             _sent_event_ids.add(ev.id)
+                            if _routed is not None:
+                                lifecycle_sent[_lc_key] = None
+                                while len(lifecycle_sent) > 4096:
+                                    lifecycle_sent.pop(next(iter(lifecycle_sent)))
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``

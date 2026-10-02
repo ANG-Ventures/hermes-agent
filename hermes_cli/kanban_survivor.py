@@ -2971,6 +2971,20 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             if ref:
                 refs.append(dict(ref, repository=key))
                 continue
+            if data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+                # Store the artifact REF, not the body (t_f1c86daf): the same bytes the
+                # bundle/patch would hold, pushed as one commit and read back from the
+                # remote. Only when that fails does the size refusal below stand.
+                stage = f"oversize survivor push of repository {key}"
+                pushed, why = _push_oversize(repo, key, task_id, workspace)
+                if pushed is None:
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: implementation artifact exceeds attachment limit "
+                        f"({len(data)} > {kb.KANBAN_ATTACHMENT_MAX_BYTES} bytes, repository {key}) "
+                        f"and the survivor push failed: {why}"
+                    )
+                refs.append(dict(pushed, repository=key))
+                continue
             if base is None:
                 name = f"implementation-{len(bundles)}.bundle"
                 bundle = _store(conn, task_id, name, data, "application/x-git-bundle")
@@ -3208,6 +3222,34 @@ def _worktree_commit(repo, task_id):
                     GIT_AUTHOR_EMAIL="kanban@localhost", GIT_COMMITTER_EMAIL="kanban@localhost")
     return _git(repo, "commit-tree", tree, *parents, "-m",
                 f"kanban survivor: {task_id} workspace (was NOT PUSHED)", env=identity).stdout.decode().strip()
+
+
+def _push_oversize(repo, key, task_id, workspace):
+    """``(ref, None)`` once the whole working tree of ``repo`` is a commit on a durable remote, read back
+    by ``ls-remote``; else ``(None, why)``. The commit holds what ``_snapshot`` would have (tracked +
+    untracked, not ignored) on HEAD, so the ref vouches for exactly the bytes the refused artifact held."""
+    name, url = _push_target(repo)
+    if not url:
+        return None, "no push remote configured"
+    if not _durable_remote(repo, name, workspace):
+        return None, f"push remote {name} is not durable"
+    suffix = "" if key == "." else "/" + re.sub(r"[^A-Za-z0-9._-]+", "-", key)
+    branch = f"{SURVIVOR_BRANCH_PREFIX}{task_id}{suffix}"
+    try:
+        sha = _worktree_commit(repo, task_id)
+        pushed = _git(repo, "push", "--force", "--no-verify", url, f"{sha}:refs/heads/{branch}",
+                      check=False, timeout=_PUSH_TIMEOUT)
+        if pushed.returncode:
+            return None, f"git push rc={pushed.returncode}"
+        seen = _git(repo, "ls-remote", url, f"refs/heads/{branch}", check=False, timeout=_PUSH_TIMEOUT)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return None, _ext.redact(str(exc))[:200]
+    if seen.returncode or seen.stdout.decode().split()[:1] != [sha]:
+        return None, "pushed ref did not read back"
+    _log.warning("kanban survivor: %s repository %s over the attachment limit; pushed %s @ %s",
+                 task_id, key, branch, sha)
+    return {"remote": name, "url": _ext.redact(url), "branch": branch, "sha": sha,
+            "matched_by": "oversize-push"}, None
 
 
 def push_unpushed_survivor(conn, task_id, workspace):

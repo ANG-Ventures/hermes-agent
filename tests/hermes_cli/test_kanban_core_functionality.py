@@ -135,10 +135,11 @@ def test_notify_sub_crud(kanban_home):
         assert kb.list_notify_subs(conn, tid)[0]["delivery_metadata"][
             "telegram_reply_to_message_id"
         ] == "43"
-        # Distinct thread is a new row.
+        # Distinct thread is a new row (a second subscriber needs --also:
+        # one subscriber chat per card, t_484a3c72).
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
-            thread_id="5",
+            thread_id="5", also=True,
         )
         assert len(kb.list_notify_subs(conn, tid)) == 2
         # Remove one.

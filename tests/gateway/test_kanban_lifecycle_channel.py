@@ -263,3 +263,56 @@ def test_digest_single_line_posts_unchanged_and_bad_config_is_off():
     line = "✔ [default] @w Kanban t_1 done — x\nhandoff"
     assert render([line]) == line
     assert [parse_digest_seconds(v) for v in (None, "", "abc", -5, 0, "900", 900)] == [0, 0, 0, 0, 0, 900, 900]
+
+
+def _second_sub(conn, tid, chat):
+    """A legacy/--also second subscriber row, written raw so the test does not
+    depend on the admission rule it sits next to."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id,"
+            " user_id, chat_type, delivery_mode, created_at, last_event_id)"
+            " VALUES (?, 'telegram', ?, '', 'u2', 'group', 'notify', 0,"
+            " (SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?))",
+            (tid, chat, tid),
+        )
+
+
+def test_multi_subscriber_card_posts_one_receipt(tmp_path, monkeypatch):
+    """t_484a3c72: a card with two subscriber chats posted its done line to the
+    lifecycle channel twice. Receipts land in exactly one place."""
+    def make(conn):
+        tid = _card(conn, mode="notify")
+        _second_sub(conn, tid, "other-chat")
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, adapter = _run(tmp_path, monkeypatch, f"telegram:{LOG}", make)
+    done = [m for m in adapter.sent if tid in m["text"] and " done" in m["text"]]
+    assert [m["chat_id"] for m in done] == [LOG], adapter.sent
+
+
+def test_subscriber_that_is_the_lifecycle_channel_gets_one_line(tmp_path, monkeypatch):
+    def make(conn):
+        tid = _card(conn, mode="notify")
+        _second_sub(conn, tid, LOG)
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, adapter = _run(tmp_path, monkeypatch, f"telegram:{LOG}", make)
+    assert [m["chat_id"] for m in adapter.sent if tid in m["text"]] == [LOG], adapter.sent
+
+
+def test_multi_subscriber_card_digests_one_line(tmp_path, monkeypatch):
+    """t_484a3c72 x t_d62bd921: with the digest on, a two-subscriber card adds
+    its done line to the batch once."""
+    def make(conn):
+        tid = _card(conn, mode="notify")
+        _second_sub(conn, tid, "other-chat")
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    clock = [1000.0]
+    tid, adapter, runner = _run_digest(tmp_path, monkeypatch, 900, make, clock)
+    assert adapter.sent == []
+    assert len(runner._kanban_lifecycle_digest) == 1
