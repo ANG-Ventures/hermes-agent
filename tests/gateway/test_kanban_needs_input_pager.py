@@ -252,3 +252,50 @@ def test_failing_sends_cannot_starve_later_cards(kanban_home, monkeypatch):
     pager.observe(cards, send, boards, now=1000.0)
     pager.observe(cards, send, boards, now=1001.0)
     assert set(tried) == {bad, good}
+
+
+def _age_block(conn, tid, seconds=60):
+    """Move the card's block events into the past so a comment lands after them."""
+    conn.execute("UPDATE task_events SET created_at = created_at - ? WHERE task_id = ? "
+                 "AND kind IN ('blocked', 'block_loop_detected')", (seconds, tid))
+    conn.commit()
+
+
+@pytest.mark.parametrize("body", [
+    "APOLLO 14:45 — B4 RULED: keep the tool-bearing fixture.",
+    "APOLLO 17:25 — B4 CLOSED, DEPLOYED, GO. ruling applied",  # lowercase word: not a ruling
+    "APOLLO RULING 18:10 PT: build now, flip gated.",
+    "APOLLO 06:00 (Ace 05:40): RULINGS: (1) land it.",
+    "APOLLO 09:00 ANSWERED: option B.",
+])
+def test_ruling_comment_after_block_stops_the_page(kanban_home, body):
+    """t_dfc938c4: t_e6b3713d paged "needs a ruling" after Apollo posted "B4 RULED"."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _age_block(conn, tid)
+        kb.add_comment(conn, tid, "default", body)
+        got = [c["task_id"] for c in kb.needs_input_page_candidates(conn)]
+    answered = "RULED" in body or "RULING" in body or "ANSWERED" in body
+    assert got == ([] if answered else [tid])
+
+
+def test_ruling_before_the_latest_block_does_not_silence_it(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, reason="B3?")
+        _age_block(conn, tid, 120)
+        kb.add_comment(conn, tid, "default", "APOLLO 09:11 — B3 RULING: (B)+(C).")
+        conn.execute("UPDATE task_comments SET created_at = created_at - 60 WHERE task_id = ?", (tid,))
+        conn.commit()
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="B4?", kind="needs_input")
+        got = kb.needs_input_page_candidates(conn)
+    assert [c["task_id"] for c in got] == [tid] and got[0]["reason"] == "B4?"
+
+
+def test_non_ruling_comments_keep_paging(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _age_block(conn, tid)
+        kb.add_comment(conn, tid, "daedalus", "FYI: ruled out the cache; APOLLO RULED nothing yet")
+        kb.add_comment(conn, tid, "default", "APOLLO 14:40 PT: B4 is in front of Ace now as a 1-3-1.")
+        assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
