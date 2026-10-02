@@ -707,7 +707,7 @@ def sample_user_procs() -> "tuple[Optional[int], Optional[int]]":
     try:
         import psutil
 
-        uid = os.getuid()
+        uid = os.getuid()  # windows-footgun: ok (inside try; Windows -> fail open)
         count = 0
         for p in psutil.process_iter(["uids"]):
             uids = p.info.get("uids")
@@ -723,7 +723,7 @@ def top_user_proc_families(n: int = 3) -> "list[tuple[str, int]]":
     try:
         import psutil
 
-        uid = os.getuid()
+        uid = os.getuid()  # windows-footgun: ok (inside try; Windows -> fail open)
         counts: dict = {}
         for p in psutil.process_iter(["uids", "name"]):
             uids = p.info.get("uids")
