@@ -1414,7 +1414,9 @@ def compute_error_backoff(
     buffered; long Z.AI Coding waits surface immediately."""
     # Imported lazily so tests that patch ``agent.retry_utils.jittered_backoff`` /
     # ``adaptive_rate_limit_backoff`` (incl. the run_agent conftest fast-backoff fixture) intercept.
-    from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff, parse_retry_after_seconds
+    from agent.retry_utils import (
+        adaptive_rate_limit_backoff, jittered_backoff, parse_retry_after_seconds, resolve_retry_after,
+    )
 
     # Respect Retry-After on every retryable provider error, not just 429s. Retryable
     # 5xx responses (e.g. Cloudflare 520/524) also carry the header or a structured
@@ -1431,7 +1433,38 @@ def compute_error_backoff(
             _nested = _error_body.get("error")
             _payload = _nested if isinstance(_nested, dict) else _error_body
             _retry_after = parse_retry_after_seconds(_payload.get("retry_after"))
-    if _retry_after is not None:
+    if _retry_after is not None and is_rate_limited:
+        # Fork honor policy for rate limits (pure, unit-tested ``resolve_retry_after``): a
+        # Retry-After is only meaningful while the seat we rode still has a future. Once the
+        # credential pool has benched it with nothing to rotate to, the header's window and the
+        # seat's real reset (a day-plus on a weekly cap) are different clocks — sleeping the
+        # former re-429s the same dead seat and eats the caller's budget before the fallback
+        # chain is reached (measured 2026-09-16: 3 cron sessions, 600s honored each, 0 output).
+        from agent.agent_runtime_helpers import pool_seat_exhaustion_state
+
+        _seat_exhausted, _seat_recovery_s = pool_seat_exhaustion_state(agent)
+        _honored = resolve_retry_after(
+            raw_value=_retry_after,
+            is_rate_limit=True,
+            is_overload=False,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            seat_exhausted=_seat_exhausted,
+            seat_recovery_seconds=_seat_recovery_s,
+        )
+        if _honored:
+            # RC-3: make the honored-vs-jitter decision visible for triage.
+            logger.info("Honoring server Retry-After=%ss (reason=rate_limit, attempt=%s/%s)",
+                        _honored, retry_count + 1, max_retries)
+        elif _seat_exhausted:
+            # Say WHY a present Retry-After was declined ("no header sent" reads the same otherwise).
+            logger.info(
+                "Declining server Retry-After=%s on an exhausted seat (pool reports no available "
+                "entry; recovery=%ss) — falling through to fallback chain",
+                _retry_after, "unknown" if _seat_recovery_s is None else f"{_seat_recovery_s:.0f}",
+            )
+        _retry_after = _honored
+    elif _retry_after is not None:
         # Cap at 10 minutes. Anthropic Tier 1 input-token buckets reset in ~171s, so a 120s cap
         # caused us to retry before the actual reset window and re-trip the limit. 600s covers all
         # realistic provider reset windows while still rejecting pathological values. (#26293)
@@ -1733,7 +1766,9 @@ def activate_codex_app_server_fallback(agent: Any, result: Dict[str, Any]) -> bo
         return False
     agent._buffer_diagnostic_status(
         _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False))
-    return bool(agent._try_activate_fallback(reason=classified.reason))
+    return bool(agent._try_activate_fallback(
+        reason=classified.reason, display_reason=classified.display_reason,
+    ))
 
 
 def _is_genuine_nous_rate_limit(agent: Any, api_error: Exception, error_context: Any, classified: Any = None) -> bool:
@@ -1912,7 +1947,10 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            if agent._try_activate_fallback(
+                reason=classified.reason, reset_at=reset_at,
+                display_reason=classified.display_reason, error_context=error_context,
+            ):
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
@@ -1927,7 +1965,9 @@ def route_classified_error(
             "🔐 Authentication failed and could not be refreshed — "
             "switching to fallback provider..."
         )
-        if agent._try_activate_fallback(reason=classified.reason):
+        if agent._try_activate_fallback(
+            reason=classified.reason, display_reason=classified.display_reason,
+        ):
             return _fallback_break()
 
     # Nous Portal: a genuine account-level 429 is recorded to a shared file so ALL

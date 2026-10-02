@@ -358,7 +358,12 @@ def settle_unrecovered_error(
                 _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            # Thread display_reason so a client-error failover announces WHY ("(safety
+            # refusal)" / "(TLS error)") to match the status prose above (fork 2026-07-12).
+            if agent._try_activate_fallback(
+                reason=classified.reason, reset_at=reset_at,
+                display_reason=classified.display_reason, error_context=error_context,
+            ):
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
                 # re-runs the pre-API preflight against the fallback's context window.
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
@@ -390,7 +395,10 @@ def settle_unrecovered_error(
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-        if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+        if agent._try_activate_fallback(
+            reason=classified.reason, reset_at=reset_at,
+            display_reason=classified.display_reason, error_context=error_context,
+        ):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler
             # re-runs the pre-API preflight against the fallback's context window.
             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
