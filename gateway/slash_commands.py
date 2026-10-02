@@ -2239,61 +2239,18 @@ class GatewaySlashCommandsMixin(
                 runtime_kwargs["platform"] = platform_key
             runtime_kwargs["gateway_session_key"] = session_key
 
-            # The manual compression helper runs outside the live session's
-            # fully initialized prompt environment (it loads the memory
-            # provider only when compression.checkpoint_required demands it),
-            # and _compress_context may persist its cached system prompt.
-            # Restore the exact live-session prompt so provider blocks are
-            # retained.
-            session_row = None
-            get_session = getattr(self._session_db, "get_session", None)
-            if callable(get_session):
-                try:
-                    session_row = await get_session(session_entry.session_id)
-                except Exception as exc:
-                    logger.warning(
-                        "Manual compression could not restore the system prompt "
-                        "for session %s: %s. Preserving an empty prompt so the "
-                        "live turn rebuilds it with its configured providers.",
-                        session_entry.session_id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            # This agent performs a lossy rewrite. When the operator enabled
-            # compression.checkpoint_required, the memory provider must be
-            # loaded so _compress_context() can create the required
-            # pre-compression checkpoint; otherwise keep the historical fast
-            # path (no provider init, no best-effort hook) for this helper.
-            from hermes_cli.config import load_config as _load_cfg
-            from utils import is_truthy_value as _is_truthy
-
-            _checkpoint_required = _is_truthy(
-                ((_load_cfg() or {}).get("compression") or {}).get(
-                    "checkpoint_required"
-                ),
-                default=False,
+            # Same reasoning setting as a live turn (session /reasoning > per-model > global):
+            # without it the transport applies its default effort — a 400 on non-reasoning
+            # models (#85153 class).
+            runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(
+                source=source, model=model,
             )
-            # OFF the event loop (2026-09-24): AIAgent.__init__ loads the
-            # context engine under the process-global _LOAD_LOCK (20-60 s while
-            # worker turns hold it) — a PHASE=event_loop_blocked site that
-            # stalled Discord heartbeats past the ~41 s ACK window.
-            def _build_tmp_agent():
-                _a = AIAgent(
-                    **runtime_kwargs,
-                    model=model,
-                    max_iterations=4,
-                    quiet_mode=True,
-                    skip_memory=not _checkpoint_required,
-                    enabled_toolsets=["memory"],
-                    session_id=session_entry.session_id,
-                    session_db=getattr(self._session_db, "_db", self._session_db),
-                )
-                _seed_hygiene_system_prompt(_a, session_row)
-                return _a
-
+            # Build through the shared helper (upstream seam, restores the live prompt and
+            # honours compression.checkpoint_required); it constructs the AIAgent OFF the loop.
             _compress_sid = session_entry.session_id
-            tmp_agent = await asyncio.to_thread(_build_tmp_agent)
+            tmp_agent = await self._build_manual_compression_agent(
+                session_entry.session_id, model, runtime_kwargs,
+            )
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next

@@ -607,11 +607,18 @@ class GatewaySessionCommandsMixin:
         _checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
             default=False)
-        tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
-                            skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
-                            session_id=session_id,
-                            session_db=getattr(self._session_db, "_db", self._session_db))
-        _seed_hygiene_system_prompt(tmp_agent, session_row)
+        # OFF the event loop (fork, 2026-09-24): AIAgent.__init__ loads the context engine under
+        # the process-global _LOAD_LOCK (20-60 s while worker turns hold it) — a
+        # PHASE=event_loop_blocked site that stalled Discord heartbeats past the ~41 s ACK window.
+        def _build_tmp_agent():
+            _a = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
+                         skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
+                         session_id=session_id,
+                         session_db=getattr(self._session_db, "_db", self._session_db))
+            _seed_hygiene_system_prompt(_a, session_row)
+            return _a
+
+        tmp_agent = await asyncio.to_thread(_build_tmp_agent)
         # Real platform during construction (context engines bind correctly); the stamp afterwards
         # only marks this agent as no real surface. Since #104414 Platform is not a restore-identity
         # field, so it no longer forces the next live turn to rebuild; the seed's retain flag is what

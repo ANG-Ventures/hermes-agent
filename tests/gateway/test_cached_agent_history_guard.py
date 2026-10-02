@@ -79,8 +79,10 @@ def test_persistent_transcript_lag_escalates_to_error(caplog):
     persisted = [{"role": "user", "content": "hello"}]
     live = [{"role": "user", "content": "hello", "_db_persisted": True},
             {"role": "assistant", "content": "not written"}]
-    runner = SimpleNamespace()
-    ctx = SimpleNamespace(history=persisted, channel_prompt=None, user_config=None,
+    # The fork stamps the idle-compaction gap anchor from the raw transcript before converting
+    # history (test_idle_compaction_gateway_gap); the runner double must carry that seam.
+    runner = SimpleNamespace(_stamp_idle_gap_anchor=lambda agent, history, depth: None)
+    ctx = SimpleNamespace(history=persisted, channel_prompt=None, user_config=None, _interrupt_depth=0,
                           session_id="sid-1", session_key="agent:main:telegram:dm:1")
     turn = TurnRunner(runner, ctx)
     agent = SimpleNamespace(session_id="sid-1", _session_messages=live)
