@@ -13,7 +13,7 @@ merge legitimately adopted; why) / PINNED-UPSTREAM-CONTRACT / INHERITED / FOLLOW
 | tests/agent/test_a4_model_event_visibility.py | FIXED-CODE | `context_compressor._derive_trigger/_config_percent_for` read `model_thresholds`/`_config_threshold_percent` via getattr (fork `update_model` tolerated `__new__`-built doubles). | 16 passed |
 | tests/agent/test_anthropic_keychain.py | FIXED-TEST | `tests/agent/conftest` fork-only `_block_real_claude_keychain` honours the `allow_macos_keychain` opt-out the root guard already honours. | 100 passed (with bedrock) |
 | tests/agent/test_bedrock_adapter.py | FIXED-CODE | `bedrock_adapter.py`: `anthropic.claude-mythos-5` joins the 1M group (fork had Mythos 5 in DEFAULT_CONTEXT_LENGTHS only — the drift upstream's change-detector #74263 catches). | 100 passed |
-| tests/agent/test_codex_subscription_proxy_context.py | FIXED-CODE | `model_metadata.py`: restored the fork's `_resolve_codex_oauth_context_length` wrapper (upstream kept only `_with_source`). | 31 passed (group) |
+| tests/agent/test_codex_subscription_proxy_context.py | FIXED-CODE + FOLLOWUP->L1 | `model_metadata.py`: restored the fork's `_resolve_codex_oauth_context_length` wrapper (upstream kept only `_with_source`). 14/15 green here; the last red (`test_cpa_codex_slug_uses_verified_window_under_large[gpt-6-sol-872000]`, 900000 != 872000) is the fork's measured 872K gpt-6 Codex table, which L1 already restored in `d2acfa7f22` (round 5, `sync/upstream-2026-10-01-ci-L1-agent-confab-compaction`) — NOT in fold `93556253a7` nor in `fork/sync/upstream-2026-10-01` at hand-back time. Verified: cherry-picking d2acfa7f22 onto this branch → 15 passed; not landed here (L1 owns `agent/model_metadata.py` 872K table; a second copy would conflict on the fold). | 14 passed, 1 red cleared by L1 d2acfa7f22 |
 | tests/agent/test_codex_ttfb_watchdog.py | FIXED-CODE | `chat_completion_helpers.py`/`chat_completion_nonstream.py`: upstream's `_resolve_nonstream_watchdogs` extraction dropped the fork's TTFB-below-stale fast-reconnect arm and the progress-stall keepalive kill; both re-threaded. Watchdog fakes stamp attempt state via `codex_runtime._codex_watchdog_state_var`. | 44 passed (group) |
 | tests/agent/test_compaction_announce.py | FIXED-TEST | announce/lint follow the call sites into `agent/turn_*.py` + the `CompressionFacadeMixin` forwarder. | 112 passed, 2 skipped (group) |
 | tests/agent/test_compaction_attribution_lint.py | FIXED-CODE | `trigger_reason` labels re-threaded onto the extracted turn_preflight / turn_context_compaction / turn_overflow / turn_recovery / manual / gateway call sites (cherry-pick of L1 cb0f5645c50). | 112 passed, 2 skipped (group) |
@@ -49,5 +49,11 @@ merge legitimately adopted; why) / PINNED-UPSTREAM-CONTRACT / INHERITED / FOLLOW
   → 42 passed, 1 failed: `test_idle_compaction_bookkeeping_raise_keeps_turn_state` fails IDENTICALLY on the
   clean base (verified by `git checkout -- .` then re-run); it is in L1's manifest (round 5) → not chased here.
 
+## Final full-manifest re-proof (head 03fbfa506a, 11 calls x <=3 files, scripts/test-gate, sandboxed HOME)
+42 / 127+1 / 120 / 112+2sk / 37 / 309 / 57 / 362 / 17 / 38 / 23 passed. The single red across all 33 files is
+`test_codex_subscription_proxy_context.py::test_cpa_codex_slug_uses_verified_window_under_large[gpt-6-sol-872000]`
+(see its row: cleared by L1 d2acfa7f22 once folded).
+
 ## FOLLOWUP
-- none outside the manifest's src surface.
+- -> L1 (orchestrator fold): fold `d2acfa7f22` (872K gpt-6 Codex table) — it is not in the round-5 fold head
+  93556253a7; it clears the one remaining red in this manifest. No edit made here.
