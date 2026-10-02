@@ -48,8 +48,11 @@ def _runner_with_real_runtime_resolution():
     runner._consume_pending_turn_sidecar_notes.return_value = []
     for lane in ("_is_telegram_topic_lane", "_is_discord_auto_thread_lane", "_is_relay_discord_channel_lane"):
         getattr(runner, lane).return_value = False
-    # Production resolution: no /model override, no channel override.
+    # Production resolution: no /model override, no channel override, no persisted route identity
+    # (the fork's fail-closed route precheck reads this before any provider work).
+    from gateway.session import PersistedSessionRouteLookup
     runner._resolve_session_key_or_none.return_value = "test-session-key"
+    runner._persisted_session_route_identity.return_value = PersistedSessionRouteLookup("absent")
     runner._peek_session_state.return_value = None
     runner._sessions_map.return_value = {}
     runner._resolve_session_agent_runtime = types.MethodType(GatewayTurnMixin._resolve_session_agent_runtime, runner)

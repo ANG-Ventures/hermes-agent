@@ -162,6 +162,14 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert route["runtime"]["capabilities"] == {"openai_native_compaction": True}
 
 
+def _switch_result(**fields):
+    """A ``ModelSwitchResult`` as ``switch_model`` returns it — the fork re-resolves a persisted route
+    identity through ``_reresolve_model_override_credentials`` -> ``switch_model`` (never through the
+    legacy ``_resolve_runtime_agent_kwargs_for_provider`` path, which is for identity-less stores)."""
+    from hermes_cli.model_switch import ModelSwitchResult
+    return ModelSwitchResult(success=True, **fields)
+
+
 def test_rehydrate_llamacpp_override_follows_live_managed_port(store_factory):
     """The managed llama.cpp supervisor may come back on an ephemeral port (18434 busy). The persisted
     loopback URL is a snapshot of the previous boot, so rehydration must take the live endpoint."""
@@ -172,9 +180,9 @@ def test_rehydrate_llamacpp_override_follows_live_managed_port(store_factory):
 
     runner = _make_runner(store_factory())
     with patch(
-        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-        return_value={"api_key": "local-key", "base_url": "http://127.0.0.1:18434/v1",
-                      "provider": "custom", "requested_provider": "llamacpp"},
+        "hermes_cli.model_switch.switch_model",
+        return_value=_switch_result(new_model="Local.Model-Q4_K_M", target_provider="llamacpp",
+                                    api_key="local-key", base_url="http://127.0.0.1:18434/v1"),
     ):
         runner._rehydrate_session_model_override(session_key)
 
@@ -193,9 +201,10 @@ def test_rehydrate_opencode_override_heals_relay_url_for_rederived_wire(store_fa
 
     runner = _make_runner(store_factory())
     with patch(
-        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-        return_value={"api_key": "go-key", "api_mode": "chat_completions",
-                      "base_url": "https://opencode.ai/zen/go/v1", "provider": "opencode-go"},
+        "hermes_cli.model_switch.switch_model",
+        return_value=_switch_result(new_model="deepseek-v4-flash-vision-exp", target_provider="opencode-go",
+                                    api_key="go-key", api_mode="chat_completions",
+                                    base_url="https://opencode.ai/zen/go/v1"),
     ):
         runner._rehydrate_session_model_override(session_key)
 
@@ -207,7 +216,11 @@ def test_rehydrate_opencode_override_heals_relay_url_for_rederived_wire(store_fa
 def test_codex_override_never_runs_on_the_default_providers_endpoint(store_factory, codex_on_turn):
     """A persisted openai-codex override whose credentials fail to re-resolve used to be layered over the
     DEFAULT provider's runtime (Nous URL + Nous key + chat_completions). The turn runs on ONE coherent
-    route: the override's own provider when it resolves, else the whole default route with a notice."""
+    route: the override's own provider when it resolves; otherwise the fork FAILS CLOSED — the
+    preference is preserved and ``SessionRouteUnavailableError`` is raised (never a silent fallback to
+    the default provider; see test_session_model_reset.py ``credentials-unavailable``)."""
+    from gateway.run import SessionRouteUnavailableError
+
     store = store_factory()
     session_key = store.get_or_create_session(_make_source()).session_key
     store.set_model_override(session_key, {"model": "gpt-6-luna-900k", "provider": "openai-codex",
@@ -217,23 +230,29 @@ def test_codex_override_never_runs_on_the_default_providers_endpoint(store_facto
              "base_url": "https://chatgpt.com/backend-api/codex"}
     nous = {"provider": "nous", "api_key": "nous-key", "api_mode": "chat_completions",
             "base_url": "https://inference-api.nousresearch.com/v1"}
-    calls = iter([RuntimeError("refresh blip"), codex if codex_on_turn == "recovers" else RuntimeError("gone")])
 
-    def _for_provider(provider, target_model=None):
-        assert provider == "openai-codex"
-        nxt = next(calls)
-        if isinstance(nxt, Exception):
-            raise nxt
-        return dict(nxt)
+    def _switch(raw_input, current_provider, current_model, **_kw):
+        assert current_provider == "openai-codex"
+        if codex_on_turn == "recovers":
+            return _switch_result(new_model="gpt-6-luna-900k", target_provider="openai-codex",
+                                  api_key="codex-tok", api_mode="codex_responses",
+                                  base_url="https://chatgpt.com/backend-api/codex")
+        raise RuntimeError("gone")
 
-    with patch("gateway.run._resolve_runtime_agent_kwargs_for_provider", side_effect=_for_provider), \
-         patch("gateway.run._resolve_runtime_agent_kwargs", return_value=dict(nous)):
-        model, runtime = runner._resolve_session_agent_runtime(
-            session_key=session_key, user_config={"model": {"default": "openai/gpt-6-luna", "provider": "nous"}})
-
-    expected_model, expected = ("gpt-6-luna-900k", codex) if codex_on_turn == "recovers" else ("openai/gpt-6-luna", nous)
-    assert (model, {k: runtime[k] for k in expected}) == (expected_model, expected)
-    assert bool(runner._pre_agent_fallback_notice) is (codex_on_turn == "still_unavailable")
+    user_config = {"model": {"default": "openai/gpt-6-luna", "provider": "nous"}}
+    with patch("hermes_cli.model_switch.switch_model", side_effect=_switch), \
+         patch("gateway.run._resolve_runtime_agent_kwargs", return_value=dict(nous)) as default_route:
+        if codex_on_turn == "recovers":
+            model, runtime = runner._resolve_session_agent_runtime(session_key=session_key, user_config=user_config)
+            assert (model, {k: runtime[k] for k in codex}) == ("gpt-6-luna-900k", codex)
+        else:
+            with pytest.raises(SessionRouteUnavailableError):
+                runner._resolve_session_agent_runtime(session_key=session_key, user_config=user_config)
+            assert session_key in runner._session_model_override_unavailable
+    # The default provider's runtime is never consulted for a session that pinned another provider.
+    default_route.assert_not_called()
+    # The preference is preserved either way.
+    assert store_factory().get_model_override(session_key)["provider"] == "openai-codex"
 
 
 def test_runner_rehydrate_marks_credential_resolution_failure_unavailable(store_factory):
