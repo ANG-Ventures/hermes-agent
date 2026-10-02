@@ -1,14 +1,14 @@
 ---
-title: "1Password — Set up op CLI, sign in, and read or inject secrets"
+title: "1Password — Fleet service-token op CLI secret reads, writes, injection"
 sidebar_label: "1Password"
-description: "Set up op CLI, sign in, and read or inject secrets"
+description: "Fleet service-token op CLI secret reads, writes, injection"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # 1Password
 
-Set up op CLI, sign in, and read or inject secrets.
+Fleet service-token op CLI secret reads, writes, injection.
 
 ## Skill metadata
 
@@ -32,34 +32,38 @@ The following is the complete skill definition that Hermes loads when this skill
 
 Use this skill when the user wants secrets managed through 1Password instead of plaintext env vars or files.
 
+Fleet default: use the service-account token. Do not use desktop auth, `op signin`, `op account add`, or tmux auth flows on Hermes/Forge/Bastion/Skynet unless the user explicitly says this is a non-fleet/manual 1Password setup.
+
 ## Requirements
 
 - 1Password account
 - 1Password CLI (`op`) installed
-- One of: desktop app integration, service account token (`OP_SERVICE_ACCOUNT_TOKEN`), or Connect server
-- `tmux` available for stable authenticated sessions during Hermes terminal calls (desktop app flow only)
+- Service account token (`OP_SERVICE_ACCOUNT_TOKEN`) for fleet/headless use
+- Desktop app integration only for explicit non-fleet/manual setup
+- `tmux` only for explicit desktop app flow, never for normal fleet service-account use
 
 ## When to Use
 
 - Install or configure 1Password CLI
-- Sign in with `op signin`
+- Verify service-account auth with `op whoami`
 - Read secret references like `op://Vault/Item/field`
 - Inject secrets into config/templates using `op inject`
 - Run commands with secret env vars via `op run`
 
 ## Authentication Methods
 
-### Service Account (recommended for Hermes)
+### Service Account (fleet default)
 
-Set `OP_SERVICE_ACCOUNT_TOKEN` in `${HERMES_HOME:-~/.hermes}/.env` (the skill will prompt for this on first load).
-No desktop app needed. Supports `op read`, `op inject`, `op run`.
+Use the fleet service-account token via `OP_SERVICE_ACCOUNT_TOKEN`. Set it in `${HERMES_HOME:-~/.hermes}/.env` (the skill will prompt for this on first load); the fleet keeps a copy at `/Users/alexgierczyk/.openclaw/.op-service-token` on Mac Studio with sandboxed agent homes.
+No desktop app needed. Supports `op read`, `op item get|create|edit`, `op inject`, and `op run`.
 
 ```bash
-export OP_SERVICE_ACCOUNT_TOKEN="your-token-here"
-op whoami  # verify — should show Type: SERVICE_ACCOUNT
+TOKEN_FILE="${OP_SERVICE_ACCOUNT_TOKEN_FILE:-$HOME/.openclaw/.op-service-token}"
+[[ -f "$TOKEN_FILE" ]] || TOKEN_FILE="/Users/alexgierczyk/.openclaw/.op-service-token"
+OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" gtimeout 15 op whoami
 ```
 
-### Desktop App Integration (interactive)
+### Desktop App Integration (non-fleet/manual only)
 
 1. Enable in 1Password desktop app: Settings → Developer → Integrate with 1Password CLI
 2. Ensure app is unlocked
@@ -95,12 +99,11 @@ op --version
 
 3. Choose an auth method above and configure it.
 
-## Hermes Execution Pattern (desktop app flow)
+## Hermes Execution Pattern
 
-Hermes terminal commands are non-interactive by default and can lose auth context between calls.
-For reliable `op` use with desktop app integration, run sign-in and secret operations inside a dedicated tmux session.
+Hermes terminal commands are non-interactive by default. For fleet use, export `OP_SERVICE_ACCOUNT_TOKEN` inline and wrap networked `op` calls with `gtimeout 15` on macOS or `timeout 15` on Linux.
 
-Note: This is NOT needed when using `OP_SERVICE_ACCOUNT_TOKEN` — the token persists across terminal calls automatically.
+The tmux desktop-auth flow below is only for explicit non-fleet/manual setups. It is not needed when using `OP_SERVICE_ACCOUNT_TOKEN`.
 
 ```bash
 SOCKET_DIR="${TMPDIR:-${HERMES_HOME:-$HOME/.hermes}/cache/scratch}/hermes-tmux-sockets"
@@ -131,7 +134,9 @@ tmux -S "$SOCKET" kill-session -t "$SESSION"
 ### Read a secret
 
 ```bash
-op read "op://app-prod/db/password"
+TOKEN_FILE="${OP_SERVICE_ACCOUNT_TOKEN_FILE:-$HOME/.openclaw/.op-service-token}"
+[[ -f "$TOKEN_FILE" ]] || TOKEN_FILE="/Users/alexgierczyk/.openclaw/.op-service-token"
+OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" gtimeout 15 op read "op://app-prod/db/password"
 ```
 
 ### Get OTP
@@ -143,7 +148,10 @@ op read "op://app-prod/npm/one-time password?attribute=otp"
 ### Inject into template
 
 ```bash
-echo "db_password: {{ op://app-prod/db/password }}" | op inject
+TOKEN_FILE="${OP_SERVICE_ACCOUNT_TOKEN_FILE:-$HOME/.openclaw/.op-service-token}"
+[[ -f "$TOKEN_FILE" ]] || TOKEN_FILE="/Users/alexgierczyk/.openclaw/.op-service-token"
+OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" \
+  gtimeout 15 sh -c 'echo "db_password: {{ op://app-prod/db/password }}" | op inject'
 ```
 
 ### Run a command with secret env var
@@ -156,9 +164,11 @@ op run -- sh -c '[ -n "$DB_PASSWORD" ] && echo "DB_PASSWORD is set" || echo "DB_
 ## Guardrails
 
 - Never print raw secrets back to user unless they explicitly request the value.
+- Never print `OP_SERVICE_ACCOUNT_TOKEN`; redact command output if it may contain it.
 - Prefer `op run` / `op inject` instead of writing secrets into files.
-- If command fails with "account is not signed in", run `op signin` again in the same tmux session.
-- If desktop app integration is unavailable (headless/CI), use service account token flow.
+- If `op` hangs, inspect and clean stale CLI state before declaring the token bad: `ps -ef | grep '[ /]op '`, kill stale `op`/`op daemon` processes if needed, and remove `~/.config/op/op-daemon.sock`.
+- Validate with `op whoami` using `OP_SERVICE_ACCOUNT_TOKEN`. Do not infer token validity from random 1Password HTTP endpoints; many return 401/403/HTML for valid service-account tokens.
+- Interactive `op signin`, desktop app integration, `op account add`, and tmux auth flows are for non-fleet/manual setups only.
 
 ## CI / Headless note
 
