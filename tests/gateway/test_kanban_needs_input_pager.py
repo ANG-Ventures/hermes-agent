@@ -261,22 +261,52 @@ def _age_block(conn, tid, seconds=60):
     conn.commit()
 
 
-@pytest.mark.parametrize("body", [
-    "APOLLO 14:45 — B4 RULED: keep the tool-bearing fixture.",
-    "APOLLO 17:25 — B4 CLOSED, DEPLOYED, GO. ruling applied",  # lowercase word: not a ruling
-    "APOLLO RULING 18:10 PT: build now, flip gated.",
-    "APOLLO 06:00 (Ace 05:40): RULINGS: (1) land it.",
-    "APOLLO 09:00 ANSWERED: option B.",
+@pytest.mark.parametrize("body,answered", [
+    ("APOLLO 14:45 — B4 RULED: keep the tool-bearing fixture.", True),
+    ("APOLLO RULING 18:10 PT: build now, flip gated.", True),
+    ("APOLLO 06:00 (Ace 05:40): RULINGS: (1) land it.", True),
+    ("APOLLO 09:11 — B3 RULING: (B)+(C).", True),
+    ("APOLLO 09:00 ANSWERED: option B.", True),
+    ("APOLLO 17:25 — B4 CLOSED, DEPLOYED, GO. ruling applied", False),  # lowercase: no marker
+    ("APOLLO 14:40 PT: B4 NEEDS RULING: waiting for Ace.", False),        # Prism 88f87cb46ec3
+    ("APOLLO 09:00: B4 NOT ANSWERED yet.", False),
+    ("APOLLO 10:00: NO RULING yet, Ace is away.", False),
+    ("APOLLO 10:00: in front of Ace, AWAITING RULING.", False),
+    ("APOLLO 14:40 PT: B4 is in front of Ace now as a 1-3-1.", False),
+    ("FYI: APOLLO RULED on the sibling", False),                          # not a leading APOLLO
 ])
-def test_ruling_comment_after_block_stops_the_page(kanban_home, body):
+def test_ruling_comment_after_block_stops_the_page(kanban_home, body, answered):
     """t_dfc938c4: t_e6b3713d paged "needs a ruling" after Apollo posted "B4 RULED"."""
     with kb.connect_closing() as conn:
         tid = _card(conn)
         _age_block(conn, tid)
         kb.add_comment(conn, tid, "default", body)
         got = [c["task_id"] for c in kb.needs_input_page_candidates(conn)]
-    answered = "RULED" in body or "RULING" in body or "ANSWERED" in body
     assert got == ([] if answered else [tid])
+
+
+@pytest.mark.parametrize("author", ["daedalus", "daedalus-opus", "default (subagent)", "apollo (subagent)"])
+def test_ruling_text_from_a_non_operator_does_not_silence(kanban_home, author):
+    """Prism 162590a51fb8: only RULING_AUTHORS can answer; a worker or a delegated child cannot."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _age_block(conn, tid)
+        kb.add_comment(conn, tid, author, "APOLLO 09:00 ANSWERED: option B.")
+        assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
+
+
+def test_delegated_child_comment_is_marked_and_ignored(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _age_block(conn, tid)
+    monkeypatch.setattr(kb, "_is_delegated_child", lambda: True)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", "APOLLO 09:00 RULED: option B.")
+    monkeypatch.setattr(kb, "_is_delegated_child", lambda: False)
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT author FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0] \
+            .endswith(kb.SUBAGENT_AUTHOR_MARKER.strip())
+        assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
 
 
 def test_ruling_before_the_latest_block_does_not_silence_it(kanban_home):
@@ -296,6 +326,6 @@ def test_non_ruling_comments_keep_paging(kanban_home):
     with kb.connect_closing() as conn:
         tid = _card(conn)
         _age_block(conn, tid)
-        kb.add_comment(conn, tid, "daedalus", "FYI: ruled out the cache; APOLLO RULED nothing yet")
+        kb.add_comment(conn, tid, "default", "FYI: ruled out the cache; APOLLO RULED nothing yet")
         kb.add_comment(conn, tid, "default", "APOLLO 14:40 PT: B4 is in front of Ace now as a 1-3-1.")
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
