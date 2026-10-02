@@ -708,19 +708,19 @@ def _terminate_reclaimed_worker(
         return info
 
     verified_alive_at: Optional[float] = None
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT and _pid_alive(pid):
+    if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
         info["liveness_unprovable"] = True
         info["needs_attention"] = True
         return info
     if started_at is not None and started_at != UNVERIFIED_WORKER_FINGERPRINT \
-            and _pid_alive(pid) and _pid_recycled(pid, started_at):
+            and _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
         info["terminated"] = True
         info["pid_recycled"] = True
         info["identity_mismatch"] = True
         return info
-    if _pid_alive(pid):
+    if _kb._pid_alive(pid):
         verified_alive_at = time.time()
         identity = _kb._owner_identity(int(pid), *owner_window)
         info["owner_identity"] = identity
@@ -741,7 +741,7 @@ def _terminate_reclaimed_worker(
         os.kill if hasattr(os, "kill") else None
     )
     if kill is None:
-        info["terminated"] = not _pid_alive(pid)
+        info["terminated"] = not _kb._pid_alive(pid)
         return info
 
     info["termination_attempted"] = True
@@ -767,7 +767,7 @@ def _terminate_reclaimed_worker(
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not _kb._pid_alive(pid):
             info["terminated"] = True
             _kb._reap_terminated_worker_session(
                 pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
@@ -775,7 +775,7 @@ def _terminate_reclaimed_worker(
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
+    if _kb._pid_alive(pid):
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
@@ -785,7 +785,7 @@ def _terminate_reclaimed_worker(
         except (ProcessLookupError, OSError):
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    info["terminated"] = not _kb._pid_alive(pid)
     if info["terminated"]:
         _kb._reap_terminated_worker_session(
             pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
@@ -1735,7 +1735,7 @@ def detect_crashed_workers(
             pid = int(row["worker_pid"])
             kind, code = _kb._classify_run_exit(conn, row["id"], row["current_run_id"], pid)
             dead.append((row, pid, kind, code))
-            if not _pid_alive(pid):
+            if not _kb._pid_alive(pid):
                 # The worker died on its own; whatever it left in other
                 # process groups of its session would outlive it (a live pid
                 # here is a recycled one and is never used as a sid). Only a

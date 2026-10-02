@@ -1426,6 +1426,8 @@ def test_no_board_enumerator_trips_the_refusal(_pin_contradiction_env):
         kb.connect(board="pinned-board").close()
         assert kb.kanban_db_path("alpha-board").exists()
 
+    from hermes_cli import kanban_boards as kbo  # upstream moved _board_task_counts here
+
     def _slugs():
         return [b["slug"] for b in kb.list_boards(include_archived=False)]
 
@@ -1436,7 +1438,7 @@ def test_no_board_enumerator_trips_the_refusal(_pin_contradiction_env):
         ),
         "kanban_db.count_running_tasks_host": kb.count_running_tasks_host,
         "kanban.boards_list/_board_task_counts": (
-            lambda: [kc._board_task_counts(s) for s in _slugs()]
+            lambda: [kbo._board_task_counts(s) for s in _slugs()]
         ),
         "dashboard GET /boards/_board_counts": (
             lambda: [plugin_api._board_counts(s) for s in _slugs()]
