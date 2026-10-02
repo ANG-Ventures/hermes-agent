@@ -66,7 +66,10 @@ def _print_tui_exit_summary(session_id: Optional[str], active_session_file: Opti
     profile_flag = "" if active_profile in ("default", "custom") else f" -p {active_profile}"
     print(f"\n{t('cli.session.exit_resume_hint')}\n  hermes --tui --resume {target}{profile_flag}")
     if title:
-        print(f'  hermes --tui -c "{title}"{profile_flag}')
+        # fork: a title is user text pasted into a shell; hand-rolled double quotes still expand
+        # `$HOME` / `` `id` `` (tests/hermes_cli/test_cli_hint.py). `hint_value` owns the escaping.
+        from hermes_cli.cli_hint import hint_value
+        print(f'  hermes --tui -c {hint_value(title)}{profile_flag}')
     print(f"\nSession:        {target}")
     if title:
         print(f"Title:          {title}")

@@ -2,7 +2,6 @@
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -425,7 +424,13 @@ def test_refresh_429_without_retry_after_header(monkeypatch):
 
 def test_pool_only_force_refresh_rotates_the_pool_entry(tmp_path, monkeypatch):
     """Pool-only setup (empty singleton): ``force_refresh`` must refresh the pool credential
-    instead of handing back the same token the caller just got a 401 for."""
+    instead of handing back the same token the caller just got a 401 for.
+
+    Fork contract (#673): pool rows refresh through the single-use owner transaction in
+    ``agent.codex_owner`` (which POSTs via ``refresh_codex_oauth_pure``), not through
+    ``load_pool().try_refresh_matching`` — so the double sits on the token refresh itself."""
+    import hermes_cli.auth as auth
+
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
     (hermes_home / "auth.json").write_text(json.dumps({
@@ -437,14 +442,16 @@ def test_pool_only_force_refresh_rotates_the_pool_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     hints = []
 
-    class Pool:
-        def try_refresh_matching(self, api_key_hint=None, credential_id=None):
-            hints.append(api_key_hint)
-            return SimpleNamespace(runtime_api_key="pool-fresh")
+    def _rotate(access_token, refresh_token, **_kw):
+        hints.append(access_token)
+        return {"access_token": "pool-fresh", "refresh_token": "pool-refresh-2",
+                "last_refresh": "2026-01-01T00:00:00Z"}
 
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: Pool())
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rotate)
 
     resolved = resolve_codex_runtime_credentials(force_refresh=True)
     assert resolved["api_key"] == "pool-fresh"
     assert resolved["source"] == "credential_pool"
     assert hints == ["pool-revoked"]
+    rows = json.loads((hermes_home / "auth.json").read_text())["credential_pool"]["openai-codex"]
+    assert [r["access_token"] for r in rows] == ["pool-fresh"]
