@@ -3890,9 +3890,10 @@ class GatewayTurnMixin:
                         pending = None
 
         if self._draining and (pending_event or pending):
-            logger.info(
-                "Discarding pending follow-up for session %s during gateway %s",
-                session_key or "?", self._status_action_label(),
+            # Fork: never silently drop it (2026-09-23: 4 follow-ups lost). The draining process
+            # may not start a new turn, so spool it for the next boot's startup-restore replay.
+            await self._preserve_followup_across_restart(
+                session_key, pending_event, pending, source
             )
             pending_event = None
             pending = None

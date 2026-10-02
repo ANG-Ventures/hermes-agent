@@ -42,6 +42,9 @@ def _update_failed_notice() -> str:
 # platform that is merely disconnected keeps its notice for a day; an unconfigured one gets minutes.
 _UPDATE_NOTIFY_MAX_AGE_SECONDS = 24 * 60 * 60
 _UPDATE_NOTIFY_UNCONFIGURED_GRACE_SECONDS = 5 * 60
+# No gateway config at all (bare runner): neither window above is knowable, so upstream's flat
+# cap applies (601a8a17c22: a notice whose platform never connects is dropped after an hour).
+_UPDATE_NOTIFY_NO_CONFIG_MAX_AGE_SECONDS = 60 * 60
 
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
@@ -801,13 +804,17 @@ class GatewayNotificationsMixin:
                 # (the startup path reschedules this watcher while the markers exist). A configured platform
                 # that has not reconnected yet earns the long window; one that is not configured at all
                 # never will connect, so give up within minutes. A definitive True stops the rescheduling.
-                configured = _update_notify_platform_is_configured(getattr(self, "config", None), platform_str)
+                _cfg = getattr(self, "config", None)
+                configured = _update_notify_platform_is_configured(_cfg, platform_str)
                 age = _update_marker_age_seconds(pending, paths.claimed)
-                max_age = _UPDATE_NOTIFY_MAX_AGE_SECONDS if configured else _UPDATE_NOTIFY_UNCONFIGURED_GRACE_SECONDS
+                if _cfg is None:
+                    max_age = _UPDATE_NOTIFY_NO_CONFIG_MAX_AGE_SECONDS
+                else:
+                    max_age = _UPDATE_NOTIFY_MAX_AGE_SECONDS if configured else _UPDATE_NOTIFY_UNCONFIGURED_GRACE_SECONDS
                 if age is not None and age > max_age:
                     self._clear_update_markers(paths, pending.get("session_key"))
                     return _abandon(
-                        "Abandoning post-update notification for %s:%s — %s adapter unavailable for %.1fh "
+                        "Abandoning post-update notification for %s:%s — %s adapter never connected for %.1fh "
                         "(%s; limit %.1fh). The update itself finished with exit=%s.",
                         platform_str, chat_id, platform_str, age / 3600.0,
                         "configured" if configured else "platform not configured", max_age / 3600.0, exit_code,

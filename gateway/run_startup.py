@@ -194,7 +194,11 @@ class GatewayStartupMixin:
         while queue:
             event = queue[0]
             source = getattr(event, "source", None)
-            adapter = self._intake_adapter_for(source)
+            # Fork: the queue also carries spooled restart follow-ups, restored rows with no live
+            # transport provenance. ``_intake_adapter_for`` fails closed on those under multiplexing
+            # (they would retry as "adapter unavailable" forever); ``_adapter_for_source`` tries the
+            # receiving bot first and falls back to the unique (platform, profile) owner.
+            adapter = self._adapter_for_source(source)
             if adapter is None:
                 _log_retry("adapter unavailable", event, failed=False)
                 _promote_other_session(event)
