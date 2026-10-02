@@ -4401,9 +4401,12 @@ def _dispatch_once_locked(
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
+        # Same predicate as the spawn gate: ``kanban.dispatch_profiles``
+        # gated (#110995), so a default this home may not claim is never
+        # written onto an unassigned shared-board card.
         try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            _pe = _profile_exists_fn()
+            _default_assignee_resolved = _pe is None or bool(_pe(_default_assignee))
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
