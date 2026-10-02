@@ -127,7 +127,11 @@ def test_codex_rotation_keeps_proxy_override(monkeypatch):
         _reapply_route_client_config=MagicMock(), _replace_primary_openai_client=MagicMock(),
     )
 
-    assert AIAgent._swap_credential(agent, entry) is True
+    # The fork's _swap_credential reports a tri-state SwapOutcome (a pool rate-limit must not read
+    # as a keyless-client abort); a successful rotation is SWAPPED.
+    from run_agent import SwapOutcome
+
+    assert AIAgent._swap_credential(agent, entry) is SwapOutcome.SWAPPED
     assert agent.base_url == "http://127.0.0.1:8787/backend-api/codex"
     assert agent._client_kwargs["base_url"] == "http://127.0.0.1:8787/backend-api/codex"
     assert agent.api_key == "tok-second"

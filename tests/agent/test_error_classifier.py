@@ -74,6 +74,9 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
+            # 2026-10-01 parity sync — upstream members the merge adopted:
+            "role_alternation",       # strict chat-template 400, merge-and-retry (agent/moa_alternation.py)
+            "reasoning_mandatory", "incomplete_response", "model_entitlement", "upstream_blocked",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -729,9 +732,13 @@ class TestClassifyApiError:
                                        "user and assistant"}},
         )
         result = classify_api_error(e)
-        assert result.reason == FailoverReason.malformed_conversation
+        # Upstream (adopted 2026-10-01): a strict chat template rejecting adjacent same-role
+        # messages is destination-specific, not a corrupt transcript — it gets its own reason,
+        # one merge-and-retry (agent/moa_alternation.py) and may fall back to a lenient provider.
+        # Other malformed-conversation 400s keep the fork's terminal classification below.
+        assert result.reason == FailoverReason.role_alternation
         assert result.retryable is False
-        assert result.should_fallback is False
+        assert result.should_fallback is True
     def test_non_json_stream_validation_error_is_non_retryable(self):
         e = MockAPIError(
             "Provider stream returned non-JSON SSE data",
@@ -917,7 +924,9 @@ class TestClassifyApiError:
             _fallback_reason_text,
         )
 
-        label = _FALLBACK_REASON_LABELS["endpoint_not_found"]
+        # Upstream re-keyed the label table by enum member (2026-10-01 sync); the contract is
+        # the text: an endpoint miss blames the base_url, never the model.
+        label = _FALLBACK_REASON_LABELS[FailoverReason.endpoint_not_found]
         assert "model" not in label and "base_url" in label
         assert "model" not in _fallback_reason_text(FailoverReason.endpoint_not_found)
 

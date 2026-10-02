@@ -281,7 +281,9 @@ class TestFallbackReasoningOverride:
 
         import agent.chat_completion_helpers as cch
 
-        src = inspect.getsource(cch.try_activate_fallback)
+        # 2026-10-01 parity sync: upstream extracted the fallback reasoning override out of
+        # try_activate_fallback into its own helper; the structure pinned below moved with it.
+        src = inspect.getsource(cch._apply_fallback_reasoning_override)
         entry_idx = src.index('fb.get("reasoning_effort")')
         per_model_idx = src.index("resolve_per_model_reasoning_effort(")
         assert entry_idx < per_model_idx, (
