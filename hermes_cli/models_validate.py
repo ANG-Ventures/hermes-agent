@@ -536,19 +536,41 @@ def _validate_anthropic_messages(req: _Request) -> dict[str, Any]:
     listing that simply doesn't name the slug (vendors alias ids: ``kimi-k3`` is served as ``k3``)."""
     from hermes_cli import models as _m
 
-    models = _m.fetch_api_models(req.api_key, req.base_url, api_mode=req.api_mode)
+    # Probe (not ``fetch_api_models``) so the failure KIND is known: a timeout / connection
+    # failure means the endpoint may well implement /v1/models and simply didn't answer in
+    # time — a different situation from a proxy that never exposes it (fork: honest wording;
+    # TestAnthropicMessagesWarningHonesty).
+    probe = _m.probe_api_models(req.api_key, req.base_url, api_mode=req.api_mode)
+    models = probe.get("models")
+    failure = probe.get("failure")
+    # Name the ACTIVE provider and endpoint: the user may have typed a non-Anthropic-looking
+    # model string while on a Claude-shaped proxy, and "Anthropic-compatible proxies ..." alone
+    # read as if the model were the problem (fork: test_anthropic_messages_warning_clarity).
+    provider_label_str = _m.provider_label(req.provider) or (req.provider or "the active provider")
+    endpoint_str = (req.base_url or "").strip() or "the configured endpoint"
     if models is None:
+        if failure in ("timeout", "connection"):
+            reason = (
+                f"The probe of {probe.get('probed_url')} failed with a "
+                f"{'timeout' if failure == 'timeout' else 'connection error'} "
+                f"(retried once) — the endpoint may be busy or unreachable."
+            )
+        else:
+            reason = (
+                "That endpoint speaks the Anthropic Messages API and does not appear to expose "
+                "GET /v1/models."
+            )
         return _soft_accept(
-            f"Note: could not verify `{req.requested}` against this endpoint's model listing.  Many "
-            "Anthropic-compatible proxies do not implement GET /v1/models.  The model name has been accepted "
-            "without verification."
+            f"Note: could not verify `{req.requested}` against `{provider_label_str}` at "
+            f"{endpoint_str}.  {reason}  The model name has been accepted without verification."
         )
     # Vendor alias pairs sit below the default 0.5 similarity cutoff (kimi-k3 vs k3 ≈ 0.44).
     match = _match_in_catalog(req.lookup, models, case_insensitive=True, suggest_query=req.requested,
                               suggest_cutoff=0.4)
     return match.verdict(req) or _soft_accept(
-        f"Note: `{req.requested}` is not named in this endpoint's model listing (it may still serve it "
-        f"under an alias).{match.suggestion_text}"
+        f"Note: could not verify `{req.requested}` against `{provider_label_str}` at {endpoint_str}.  "
+        f"The endpoint's model listing ({probe.get('probed_url')}) does not include it; it may still "
+        f"work if the server serves it under an alias.{match.suggestion_text}"
         "\n  The model name has been accepted without verification."
     )
 

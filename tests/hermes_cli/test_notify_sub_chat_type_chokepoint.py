@@ -120,7 +120,8 @@ def test_guard_is_at_the_choke_point_not_only_at_callers():
     two of the four callers shipped uncovered in #684. If someone moves this
     back out to the callers, this fails.
     """
-    source = (ROOT / "hermes_cli/kanban_db.py").read_text(encoding="utf-8")
+    # ``add_notify_sub`` lives in the split module since upstream's kanban_db decomposition.
+    source = (ROOT / "hermes_cli/kanban_db_notify.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     fn = next(
         (n for n in ast.walk(tree)

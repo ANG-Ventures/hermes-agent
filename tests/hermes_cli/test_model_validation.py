@@ -70,10 +70,16 @@ class TestCuratedModelsForProvider:
     def test_live_catalog_projected_to_tuples_else_static_fallback(self):
         with patch("hermes_cli.models.provider_model_ids", return_value=["m-live"]):
             assert curated_models_for_provider("nous") == [("m-live", "")]
-        with patch("hermes_cli.models.provider_model_ids", return_value=[]), patch.dict(
-            "hermes_cli.models._PROVIDER_MODELS", {"nous": ["m-static"]}
-        ):
-            assert curated_models_for_provider("nous") == [("m-static", "")]
+        # The fork's provider registry is additive (provider_seam: no item deletion), so a
+        # ``patch.dict`` undo (clear) raises at exit; write directly and restore the generation.
+        from hermes_cli import models as _models, provider_seam
+        generation = provider_seam.current()
+        try:
+            _models._PROVIDER_MODELS["nous"] = ["m-static"]
+            with patch("hermes_cli.models.provider_model_ids", return_value=[]):
+                assert curated_models_for_provider("nous") == [("m-static", "")]
+        finally:
+            provider_seam._restore(generation)
 
 
 # -- normalize_provider ------------------------------------------------------
@@ -988,8 +994,13 @@ class TestProfileCatalogAuthoritative:
             models_url="https://relay.example.invalid/catalog",
             fallback_models=("plan/model-1",),
         )
-        monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
-        return profile
+        # Additive fork registry (provider_seam): register directly and restore the
+        # pre-test generation instead of a ``setitem`` undo (= pop = TypeError).
+        from hermes_cli import provider_seam
+        generation = provider_seam.current()
+        providers._REGISTRY[profile.name] = profile
+        yield profile
+        provider_seam._restore(generation)
 
     def test_model_only_in_generic_listing_is_rejected(self, relay_profile):
         """Profile catalog: ["plan/model-1"]; generic /models: ["other-vendor/model-a"];
