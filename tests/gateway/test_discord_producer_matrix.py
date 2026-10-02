@@ -48,6 +48,9 @@ def lane(request, tmp_path, monkeypatch):
         entry = runner.session_store.get_or_create_session(event.source)
         assert entry.session_id == human.session_id
         received.append(event)
+        # The production receipt (gateway.wake.admit_internal_event): an internal
+        # wake the transport accepted stamps the event, else it is WakeNotAccepted.
+        event._gateway_accepted = True
 
     monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture)
     return runner, adapter, channel, source, human, received
@@ -86,7 +89,8 @@ async def test_delegate_completion(lane):
         "type": "async_delegation", "platform": "discord", "chat_id": "123",
         "chat_type": "channel", "user_id": "456",
     })
-    assert result == "delivered"
+    # F02c ledger: the injection seam speaks upstream's True (accepted) vocabulary.
+    assert result is True
     assert len(received) == 1
 
 
@@ -122,7 +126,8 @@ async def test_kanban_notify_wake_tick(lane, tmp_path, monkeypatch):
 
 
 def test_cron_seed_converges_to_inbound(lane, monkeypatch):
-    from cron.scheduler import _seed_cron_channel_session, _seed_cron_thread_session
+    # Parity 2026-10-01: upstream extracted the seeders into cron.scheduler_delivery.
+    from cron.scheduler_delivery import _seed_cron_channel_session, _seed_cron_thread_session
     import gateway.mirror
     runner, adapter, channel, source, human, received = lane
     mirror = MagicMock(return_value=True)
