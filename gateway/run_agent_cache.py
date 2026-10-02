@@ -1110,12 +1110,9 @@ class GatewayAgentCacheMixin:
             "Agent cache pressure: anon RSS %dMB over budget %dMB — evicting %d LRU session(s): %s",
             rss_mb, bounds.memory_high_mb, evicted_count, ", ".join(key for key, _ in plan),
         )
-        try:
-            threading.Thread(target=self._release_pressure_batch, args=(plan,), daemon=True,
-                             name="agent-cache-pressure").start()
-        except Exception:
-            # Thread spawn failed (interpreter shutdown): release inline, unguarded (as on main).
-            self._release_pressure_batch(plan)
+        # Every eviction path funnels through _release_agent_off_loop (t_fc4d28db): when the daemon
+        # thread cannot start it releases inline, but never from a coroutine's own body.
+        self._release_agent_off_loop(self._release_pressure_batch, plan, name="agent-cache-pressure")
         # _release_pressure_batch drains `plan` in place (so the trim runs with no lingering agent
         # refs) — len(plan) is 0 once the daemon thread finishes, hence the pre-captured count.
         return evicted_count

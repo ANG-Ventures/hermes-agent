@@ -443,10 +443,13 @@ class GatewayTurnMixin:
         return None
 
     @staticmethod
-    def _is_intentional_silence(agent_result, response) -> bool:
+    def _is_intentional_silence(agent_result, response, *, internal: bool = False) -> bool:
+        """``internal``: a system-generated event (bg-process completion, restore replay) has no
+        human waiting, so a short note + NO_REPLY on its own line is suppressed (autonomous
+        rule); human turns keep the exact-marker rule."""
         try:
             from gateway.response_filters import is_intentional_silence_agent_result
-            return is_intentional_silence_agent_result(agent_result, response)
+            return is_intentional_silence_agent_result(agent_result, response, internal=internal)
         except Exception:
             return False
 
@@ -1657,11 +1660,13 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
+        _intentional_silence = self._is_intentional_silence(
+            agent_result, response, internal=_silence_kind == "internal_notification",
+        )
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
             logger.warning(
@@ -4044,7 +4049,10 @@ class GatewayTurnMixin:
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
+        if self._is_intentional_silence(
+            _delivery_result, first_response,
+            internal=turn_ctx.persist_user_display_kind == "internal_notification",
+        ):
             if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",

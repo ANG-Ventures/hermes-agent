@@ -13,57 +13,53 @@ it, and gets a hallucinated conversational reply instead of the feature.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
+import pytest
 
 from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
 
 
-def _gateway_run() -> Path:
-    """Locate gateway/run.py relative to the imported hermes_cli package.
-
-    Anchored on the package rather than a fixed parent depth so the test reads
-    the same file whether it lives in tests/gateway/ or a scratch dir.
-    """
-    import hermes_cli
-
-    pkg = getattr(hermes_cli, "__file__", None)
-    assert pkg, "hermes_cli has no __file__; cannot locate the repo root"
-    path = Path(pkg).resolve().parent.parent / "gateway" / "run.py"
-    assert path.is_file(), f"gateway/run.py not found next to hermes_cli: {path}"
-    return path
-
-
-# Commands that legitimately have no `canonical == "x"` branch because they are
-# dispatched by another documented mechanism. Add here ONLY with a reason.
+# Commands that legitimately have no dispatch entry because they are dispatched
+# by another documented mechanism. Add here ONLY with a reason.
 _DISPATCHED_ELSEWHERE: dict[str, str] = {}
 
 
-def _handled_canonicals(source: str) -> set[str]:
-    """Canonical names gateway/run.py actually dispatches on."""
-    names = set(re.findall(r"""canonical\s*==\s*["']([a-z0-9_-]+)["']""", source))
-    for group in re.findall(r"canonical\s+in\s*[\(\{]([^)\}]*)[\)\}]", source):
-        for tok in re.findall(r"""["']([a-z0-9_-]+)["']""", group):
-            names.add(tok)
-    # 2026-08 parity merge: the fork routes ordinary slash commands through a
-    # shared handler TABLE (_gateway_plain_command_handlers, used by both the
-    # idle and busy dispatch paths) instead of per-command `canonical == "x"`
-    # ladders. Harvest its `"name": self._handle_..._command,` keys too.
-    table = re.search(
-        r"def _gateway_plain_command_handlers\(self\).*?return \{(.*?)\n\s*\}",
-        source,
-        re.DOTALL,
-    )
-    if table:
-        names.update(
-            re.findall(r"""["']([a-z0-9_-]+)["']\s*:\s*self\.""", table.group(1))
+def _handled_canonicals() -> set[str]:
+    """Canonical names the gateway actually dispatches on.
+
+    2026-10 parity merge: upstream replaced the per-command ``canonical == "x"``
+    ladders in gateway/run.py with handler TABLES — ``_PLAIN_COMMANDS`` /
+    ``_IDLE_COMMANDS`` (gateway/run_busy.py, resolved through
+    ``_command_handler_table`` → ``_handle_<name>_command``), the idle-path
+    built-ins ``_HM_CANONICAL_COMMANDS`` (gateway/run_inbound.py →
+    ``_hm_cmd_<name>``) and the busy-path ``_BUSY_SPECIAL_HANDLERS``. Read the
+    live tables and prove every entry resolves to a real method on
+    ``GatewayRunner`` — a name in a table with no method would AttributeError
+    at dispatch time, the same silent-orphan class this test exists for.
+    """
+    from gateway.run import GatewayRunner
+
+    names: set[str] = set()
+    for name in (*GatewayRunner._PLAIN_COMMANDS, *GatewayRunner._IDLE_COMMANDS):
+        attr = GatewayRunner._COMMAND_HANDLER_ALIASES.get(name, f"_handle_{name.replace('-', '_')}_command")
+        assert callable(getattr(GatewayRunner, attr, None)), (
+            f"/{name} is in the gateway handler table but GatewayRunner.{attr} does not exist"
         )
+        names.add(name)
+    for name in GatewayRunner._HM_CANONICAL_COMMANDS:
+        assert callable(getattr(GatewayRunner, f"_hm_cmd_{name}", None)), (
+            f"/{name} is in _HM_CANONICAL_COMMANDS but GatewayRunner._hm_cmd_{name} does not exist"
+        )
+        names.add(name)
+    for key, attr in GatewayRunner._BUSY_SPECIAL_HANDLERS.items():
+        assert callable(getattr(GatewayRunner, attr, None)), (
+            f"busy handler {key!r} names GatewayRunner.{attr}, which does not exist"
+        )
+        names.add(key)
     return names
 
 
 def test_every_gateway_known_command_has_a_dispatch_handler():
-    source = _gateway_run().read_text(encoding="utf-8")
-    handled = _handled_canonicals(source)
+    handled = _handled_canonicals()
 
     orphans = []
     for name in sorted(GATEWAY_KNOWN_COMMANDS):
@@ -76,7 +72,7 @@ def test_every_gateway_known_command_has_a_dispatch_handler():
             orphans.append(cmd.name)
 
     assert not orphans, (
-        "Gateway-advertised commands with no dispatch handler in gateway/run.py: "
+        "Gateway-advertised commands with no dispatch handler in the gateway tables: "
         + ", ".join("/" + o for o in orphans)
         + ". These pass the GATEWAY_KNOWN_COMMANDS gate (so the user gets NO "
         "'Unknown command' notice) and fall through to the LLM as raw text. "
@@ -85,8 +81,16 @@ def test_every_gateway_known_command_has_a_dispatch_handler():
     )
 
 
-def test_harness_detects_a_synthetic_orphan():
-    """Negative probe: prove the parser would actually catch an orphan."""
-    handled = _handled_canonicals('if canonical == "model":\n    pass\n')
+def test_harness_detects_a_synthetic_orphan(monkeypatch):
+    """Negative probe: prove the harness would actually catch an orphan — a table
+    entry with no backing method, and an advertised name no table covers."""
+    from gateway.run import GatewayRunner
+
+    handled = _handled_canonicals()
     assert "model" in handled
     assert "definitely-not-a-command" not in handled
+    monkeypatch.setattr(
+        GatewayRunner, "_IDLE_COMMANDS", (*GatewayRunner._IDLE_COMMANDS, "definitely-not-a-command"),
+    )
+    with pytest.raises(AssertionError, match="definitely-not-a-command"):
+        _handled_canonicals()
