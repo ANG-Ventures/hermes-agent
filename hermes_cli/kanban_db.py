@@ -505,6 +505,7 @@ def _fire_dispatch_tick_hook(
             result.crashed,
             result.stale,
             result.timed_out,
+            result.process_capped,
             result.auto_blocked,
             result.rate_limited,
             result.infra_unavailable,
@@ -18916,6 +18917,9 @@ class DispatchResult:
     DIFFERENT board could otherwise mask it and reset the stuck-streak."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
+    process_capped: list[str] = field(default_factory=list)
+    """Task ids whose live worker tree exceeded
+    ``kanban.worker_max_procs_per_run`` and was terminated + blocked."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
@@ -19521,9 +19525,51 @@ def _reap_worker_session(
     return len(signalled)
 
 
-def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
-    """``(pid, pgid)`` of every live process whose ENVIRONMENT carries exactly
-    this task+run identity, wherever it sits in the session tree.
+_CARD_ID_RE = re.compile(r"t_[0-9a-f]+")
+
+
+def _cmdline_profile_cards(cmdline) -> set[str]:
+    """Card ids named as a path component of a ``--user-data-dir`` argument.
+
+    Chrome on Linux rewrites its argv area for its process title, and the
+    kernel's ``/proc/<pid>/environ`` window sits right after argv, so every
+    Chrome process reads back an environment WITHOUT the run identity
+    (measured on ACE-AI: 0 of 11 chrome processes kept
+    ``HERMES_KANBAN_TASK``; their ``cat`` helpers did). A browser profile
+    under the card workspace (``.../workspaces/<card>/...`` or
+    ``<repo>/.worktrees/<card>/...``) still names the card in its argv.
+    """
+    out: set[str] = set()
+    args = list(cmdline or [])
+    for i, arg in enumerate(args):
+        if arg.startswith("--user-data-dir="):
+            path = arg.split("=", 1)[1]
+        elif arg == "--user-data-dir" and i + 1 < len(args):
+            path = args[i + 1]
+        else:
+            continue
+        out.update(c for c in path.replace("\\", "/").split("/") if _CARD_ID_RE.fullmatch(c))
+    return out
+
+
+def _safe_cmdline(proc) -> list[str]:
+    """``proc.cmdline()``, or [] when unreadable. psutil on macOS can raise
+    ``SystemError`` (not a psutil.Error) for a process exiting mid-read."""
+    try:
+        return proc.cmdline() or []
+    except Exception:
+        return []
+
+
+def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int, bool]]:
+    """``(pid, pgid, by_env)`` of every live process whose ENVIRONMENT carries
+    exactly this task+run identity, wherever it sits in the session tree
+    (``by_env`` True). A process
+    with no run identity in its environment also matches when its
+    ``--user-data-dir`` names the card (:func:`_cmdline_profile_cards`):
+    Linux Chrome erases its own environment window (``by_env`` False: the
+    path proves the process, not its process group). Callers bound every
+    match by the run's birth window, which tells runs of one card apart.
 
     A worker's children inherit its environment. One class of child
     ``setsid()``s into a NEW session on purpose (the browser-use harness
@@ -19546,9 +19592,13 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             continue
         try:
             env = proc.environ()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+        except Exception:  # psutil on macOS: SystemError for a process exiting mid-read
             continue
-        if env.get("HERMES_KANBAN_TASK") != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
+        env_task = env.get("HERMES_KANBAN_TASK")
+        if env_task is None:
+            if want_task not in _cmdline_profile_cards(_safe_cmdline(proc)):
+                continue
+        elif env_task != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
             continue
         try:
             if my_sid is not None and os.getsid(pid) == my_sid:
@@ -19558,8 +19608,21 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
             continue
         if pgid <= 1 or pgid == os.getpgid(0):
             continue
-        found.append((pid, pgid))
+        found.append((pid, pgid, env_task is not None))
     return found
+
+
+def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of :func:`_run_env_escapees_detailed`."""
+    return [(pid, pgid) for pid, pgid, _ in _run_env_escapees_detailed(task_id, run_id)]
+
+
+#: Lower-bound slack on a member's birth time. Linux psutil derives
+#: ``create_time`` from ``/proc/stat`` ``btime``, an INTEGER second, so a
+#: process can read as born up to 1 s before it was (ACE-AI: btime fraction
+#: 0.0855 s, child births read 0.093 s early). Same slack as
+#: :func:`_session_owned_by_run`.
+_BIRTH_SLACK_SECONDS = 1.0
 
 
 def _reap_run_env_escapees(
@@ -19582,34 +19645,68 @@ def _reap_run_env_escapees(
         return 0
     if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
         return 0
-    lo, hi = float(born_after), float(born_before)
-    targets: dict[int, int] = {}
-    for pid, pgid in _run_env_escapees(task_id, run_id):
+    lo, hi = float(born_after) - _BIRTH_SLACK_SECONDS, float(born_before)
+    matched: list[tuple[int, int, bool]] = []
+    for pid, pgid, by_env in _run_env_escapees_detailed(task_id, run_id):
         born = _member_birth(pid)
         if born is None or not (lo <= born <= hi):
             continue
-        targets[pgid] = pid
-    if not targets:
+        matched.append((pid, pgid, by_env))
+    if not matched:
         return 0
-    for pgid in sorted(targets):
-        try:
-            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
-        except OSError:
-            pass
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and any(_pid_alive(p) for p in targets.values()):
-        time.sleep(0.1)
-    for pgid, pid in targets.items():
-        if _pid_alive(pid):
+    # An env match proves the whole group (the run identity is inherited).
+    # A profile-path match proves only that process, unless its group leader
+    # is itself a match: an unrelated script could have launched the browser
+    # into the script's own group, and that group is not the run's.
+    matched_pids = {pid for pid, _, _ in matched}
+    targets: dict[int, int] = {}  # pgid -> witness pid (group kill)
+    for pid, pgid, by_env in matched:
+        if by_env or pgid in matched_pids:
+            targets[pgid] = pid
+    singles: dict[int, float] = {}  # pid -> birth (identity-checked kill)
+    for pid, pgid, by_env in matched:
+        if pgid not in targets:
+            born = _member_birth(pid)
+            if born is not None:
+                singles[pid] = born
+
+    def _same(pid: int, born: float) -> bool:
+        return _member_birth(pid) == born
+
+    def _signal(sig, groups: dict[int, int], procs: dict[int, float]) -> None:
+        for pgid in sorted(groups):
             try:
-                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
+                os.killpg(pgid, sig)  # windows-footgun: ok (POSIX-gated above)
             except OSError:
                 pass
-    _log.warning(
-        "kanban: reaped %d run-identified process group(s) that escaped worker session of %s run %s",
-        len(targets), task_id, run_id,
+        for pid, born in procs.items():
+            if _same(pid, born):
+                try:
+                    os.kill(pid, sig)  # windows-footgun: ok (POSIX-gated above)
+                except OSError:
+                    pass
+
+    reaped = len(targets) + len(singles)
+    if not reaped:
+        return 0
+    _signal(signal.SIGTERM, targets, singles)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and (
+        any(_pid_alive(p) for p in targets.values())
+        or any(_same(p, b) for p, b in singles.items())
+    ):
+        time.sleep(0.1)
+    _signal(
+        signal.SIGKILL,  # windows-footgun: ok (POSIX-gated above)
+        {g: p for g, p in targets.items() if _pid_alive(p)},
+        {p: b for p, b in singles.items() if _same(p, b)},
     )
-    return len(targets)
+    _log.warning(
+        "kanban: reaped %d run-identified process group(s) and %d profile-matched "
+        "process(es) that escaped worker session of %s run %s",
+        len(targets), len(singles), task_id, run_id,
+    )
+    return reaped
 
 
 #: TERM -> KILL grace for the exit-path and orphan-sweep reaps (t_446b6b99).
@@ -23901,6 +23998,14 @@ def _dispatch_once_locked(
     if _crash_cohort:
         result.cohort_deaths.extend(_crash_cohort)
     result.timed_out = enforce_max_runtime(conn)
+    if not dry_run:
+        # A live worker whose tree outgrew the per-run cap (t_368e9873): the
+        # reapers above only act once a worker is gone.
+        try:
+            from hermes_cli.kanban_proc_bounds import enforce_worker_process_cap
+            result.process_capped = enforce_worker_process_cap(conn)
+        except Exception as exc:  # never break a dispatcher tick
+            _log.warning("kanban process cap check failed: %s", exc)
     # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
     # gate is already satisfied becomes spawnable in the SAME tick rather
     # than waiting for the next one. Bounded + cached + fail-safe: see
@@ -26258,18 +26363,28 @@ def _default_spawn(
     # the seam the 2026-09-20 load-538 incident escaped through.
     cpu_priority_mode, cpu_nice = worker_cpu_priority_config()
     priority_preexec = _build_worker_priority_preexec(cpu_nice)
+    # Process-table ceiling for the whole worker tree (t_368e9873): a
+    # self-respawning scratch script held 9,6xx of the uid's 10,666 slots on
+    # 2026-10-01 and every fork on the host failed. RLIMIT_NPROC counts the
+    # uid, so the worker tree stops at a reserve the gateways still own.
+    from hermes_cli import kanban_proc_bounds as _kpb
+    nproc_limit = _kpb.resolve_worker_nproc_limit()
+    priority_preexec = _kpb.chain_preexec(
+        priority_preexec, _kpb.worker_nproc_preexec_limit(nproc_limit),
+    )
     # macOS: nice alone leaves the worker in the gateway's own QoS class and
     # I/O tier, so worker pytest/git storms still starve the resident gateway
     # (t_14c130aa). Clamp QoS via exec-form taskpolicy; it keeps the pid.
     darwin_prefix = worker_darwin_qos_prefix(cpu_priority_mode)
     spawn_cmd = [*darwin_prefix, *cmd]
     _log.info(
-        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s",
+        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s nproc=%s",
         task.id,
         profile_arg,
         cpu_priority_mode,
         cpu_nice,
         " ".join(darwin_prefix[1:]) or "-",
+        nproc_limit if nproc_limit is not None else "-",
     )
     spawned_at = time.time()
     try:

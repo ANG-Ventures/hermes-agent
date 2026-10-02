@@ -3177,6 +3177,19 @@ DEFAULT_CONFIG = {
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
         "worker_cpu_priority": "background",
+        # Process bounds for worker trees (t_368e9873). A scratch bench that
+        # re-spawned itself 18,818 times on 2026-10-01 filled the uid's
+        # process table (10,340 / 10,666) and every fork on the host failed.
+        # worker_nproc_limit: RLIMIT_NPROC for the worker tree. It counts the
+        # whole uid, so "auto" (75% of the inherited limit, 8,000 on macOS
+        # default 10,666) keeps 25% of slots for gateways and launchd jobs.
+        # Healthy uid totals measured p99 1,815, max 5,516. 0 = off.
+        "worker_nproc_limit": "auto",
+        # worker_max_procs_per_run: a running worker whose tree (session +
+        # env-tagged escapees) exceeds this is terminated, reaped and blocked
+        # capability on the next dispatcher tick. 256 = 3 x measured p99 (74)
+        # of live per-run tree sizes, rounded up. 0 = off; minimum 32.
+        "worker_max_procs_per_run": 256,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
