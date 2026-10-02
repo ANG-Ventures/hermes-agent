@@ -37,14 +37,19 @@ Every hang verdict on this path reads progress. None of them reads liveness.
   `_touch_activity` call, including the periodic tickers that run while one
   call blocks: the non-streaming wait ticker (`progress=False`), the streaming
   wait ticker and `_emit_wait_notice`, an Anthropic `ping` / Codex keepalive
-  frame, the tool-activity heartbeat, and `touch_activity_if_due` inside a
-  running tool (`heartbeat=True`). The gateway inactivity watchdog and the
-  parent heartbeat read this clock.
+  frame, a content-free Chat Completions chunk (`{"delta": {}}` with no
+  finish_reason or usage, `_chat_chunk_is_progress`), the tool-activity
+  heartbeat, and `touch_activity_if_due` inside a running tool
+  (`heartbeat=True`). The gateway inactivity watchdog and the parent heartbeat
+  read this clock.
 - **Progress**: the child did something. `_last_progress_event_ts`
   (`last_progress_event_ts` in `get_activity_summary()`) advances only on a
-  model token or stream chunk, an API call starting or finishing, a tool
-  starting or returning, or a turn boundary: any `_touch_activity` call that
-  is neither `progress=False` nor `heartbeat=True`.
+  model token or a stream chunk that carries content (a content/reasoning
+  delta, a tool_call delta, a finish_reason, or usage), an API call starting
+  or finishing, a tool starting or returning, or a turn boundary: any
+  `_touch_activity` call that is neither `progress=False` nor
+  `heartbeat=True`. A stuck relay that trickles empty deltas is therefore
+  reaped at `hung_child_seconds` like one that sends SSE comment keepalives.
 - The kanban `progress_at` clock (`_last_progress_ts`) sits between the two.
   It ignores provider-wait tickers but still counts the in-tool heartbeat,
   because the stall detector treats a running tool as a live worker.
@@ -159,17 +164,28 @@ child's completion entry or durable late record.
 
 Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
 
-- `steer_subagent` appends an `accept` entry under the registry lock, BEFORE
-  calling `agent.steer()`, so a delivery that happens the instant the text
-  lands in the child's slot finds its entry. If `agent.steer()` refuses, the
-  entry is marked `withdrawn`.
-- The only consumer is the agent loop: `apply_pending_steer_to_tool_results`
-  and the pre-API injection call `note_steer_delivered(agent, text)` after the
-  text is in a tool result. That calls `child._steer_delivery_sink`, which
-  settles the matching entries. Matching is by content, longest first, each
-  entry consuming its own span. The agent joins pending steers with newlines
-  and can put a drained batch back behind newer text, so order is not
-  relied on.
+- `_SteerLedger.for_child` wraps the child's `steer` and
+  `_drain_pending_steer`, so EVERY producer is ledgered: `steer_subagent`
+  and any direct `child.steer()` (e.g. `_start_late_completion` notifying a
+  delegated orchestrator, #1595 Prism r1 2910). The entry is appended under
+  the ledger lock BEFORE the text reaches the slot; if the real `steer()`
+  returns False, it is `withdrawn`.
+- Drained text is bound to acceptance ids, never inferred from text (#1595
+  r1 ae8c, #1585 :334). The ledger mirrors the slot as pieces with ids. The
+  slot only grows at its end (`steer`, the one put-back
+  `requeue_pending_steer`) and only clears whole (drain, `interrupt`), so at
+  a drain the real text is a suffix of the mirror: that suffix becomes a
+  batch with ids, the prefix was dropped and stays open. A put-back returns
+  the batch, with its ids, to the end of the mirror.
+- Delivered means a model READ it (#1595 r1 26b4, Argus F3 `t_race1`). The
+  two injection sites call `note_steer_injected` once the text is in a tool
+  result; `conversation_loop` calls `note_steer_consumed` after the next model
+  response returns, and only then are the injected batches settled. A turn
+  that exits by interrupt in between leaves them in `missed()`.
+- `deliver(text)` (inject + consume in one step) and text with no batch fall
+  back to an exact line-aligned tiling of open entries (iterative, budgeted:
+  #1595 r1 7dac; a trailing separator is not a tiling: r2 32e5), else
+  line-aligned spans.
 - `missed()` is "accepted and not delivered", in acceptance order, with
   duplicates kept (#1573 :3057). Every completion path reads it: the normal
   path's success, failure and exception branches (through
@@ -184,12 +200,20 @@ Mechanism, `_SteerLedger` (one per registered child, `child._steer_ledger`):
   `deliver`) in the owning profile's delegation live dir: next to the
   child's live transcript (`<transcript>.steer.jsonl`), else in
   `live/steer_<sid>_<hex>/steer.jsonl`, which the live-dir retention prune
-  also covers. The path is resolved on the spawning thread. Memory is
-  authoritative; a failed write is logged once at WARNING.
+  also covers. The path is resolved on the spawning thread. That tree is
+  mounted into remote sandboxes, so steer text is redacted there like every
+  transcript line (#1595 r1 d066). Memory is authoritative and unredacted; a
+  failed write is logged once at WARNING.
 
-A steer accepted after closure is impossible: closure (`finish`/`stall`, or
-the normal path's completion) sets `accepting_steer=False` under the lock
-`steer_subagent` holds.
+A steer accepted after closure is impossible, for every producer: closure
+(`finish`/`stall`, or the normal path's completion) sets
+`accepting_steer=False` under the lock `steer_subagent` holds, and in the
+same critical section seals the child's ledger. A sealed ledger refuses
+every later `steer` (returns False, writes no entry, leaves the slot alone),
+so a direct `child.steer()` that never passes the registry is refused too.
+Example: a reaped grandchild's late thread nudging its already-persisted
+orchestrator gets `nudged=False`; before this it was accepted and neither
+delivered nor reported (Argus QA r2 C2, t_c72adf5b).
 
 `steer_fate_unknown: true` now means the record was written while a turn of
 the child was still live. That turn may still deliver a ledgered steer, so
@@ -214,8 +238,12 @@ Mechanism, the door (`_teardown`, with its deferred half `_release_hold`):
   `_release_child_resources` on the normal path, and the late thread after
   `persist`. It releases the run hold first. A second request after the
   close is a no-op.
-- Parent-driven closes go through the same door. `_run_single_child` stamps
-  `child._owner_teardown`. `AIAgent.close()` and `AIAgent.release_clients()`
+- Parent-driven closes go through the same door. `_build_child_agent` stamps
+  `child._owner_teardown` BEFORE it appends the child to the parent's
+  `_active_children`, so no parent close can reach the child outside the
+  door. A close that wins before the run's hold marks the slot closed;
+  `_hold_run` then returns False and `_run_single_child` fails the task
+  instead of running on closed resources (#1595 r1 f983). `AIAgent.close()` and `AIAgent.release_clients()`
   hand each active child to `_close_delegated_child(child, reason)`, which
   calls that door. A recursive close of a delegated orchestrator therefore
   reaches its still-running late grandchildren through their own doors
@@ -292,6 +320,14 @@ record.
 | `:3564` parent-driven close of a live child | real | door via `_owner_teardown` |
 | `:4963` recursive ancestor cleanup | real | door, reached by the recursion |
 
+#1585 @ eeb1e221. Tests in `tests/tools/test_delegate_round6_findings.py`:
+
+| Finding | Verdict | Mechanism |
+|---|---|---|
+| `:334` ambiguous delivery (substring settle) | real, RED on eeb1e221 | ledger: exact line-aligned tiling |
+| `:486` door raising treated as handled | by design: a raising door must not fall back to a direct close (I2); the owner's `_teardown(owner=True)` still closes the child; the swallow is now a WARNING | proof test |
+| `:297` unbounded ledger file | false: both path shapes sit in a top-level live dir that `prune_stale_live_dirs` (run on every dispatch) removes; one line per accept/withdraw/deliver | proof test |
+
 ## Test obligations
 
 - One test per finding, RED on the head where it was raised.
@@ -310,7 +346,7 @@ record.
   exactly once on the last release, and the deferred counter returns to its
   baseline.
 - Ledger unit test: duplicates are kept, a withdrawn entry is not missed,
-  matching is longest-first, and the durable operation log is complete.
+  delivery settles an exact line-aligned tiling, and the durable operation log is complete.
 - The AST contract test (`test_delegate_teardown_door.py`) is RED on
   f9d4df5a, naming its four bypasses (two door references, two run_agent loops). It includes killer mutations: a new
   door bypass in each of the three rule shapes must be reported.

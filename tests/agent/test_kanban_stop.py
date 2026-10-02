@@ -385,7 +385,8 @@ def test_non_worker_does_not_nudge(clear_kanban_env):
 def test_closed_run_needs_no_tool_history(worker_run, handoff):
     conn, task = worker_run
     if handoff == "complete":
-        assert kb.complete_task(conn, task.id, expected_run_id=task.current_run_id)
+        assert kb.complete_task(conn, task.id, metadata={"tests_run": 1},
+                                expected_run_id=task.current_run_id)
     elif handoff == "block":
         assert kb.block_task(
             conn, task.id, reason="Missing input", expected_run_id=task.current_run_id,

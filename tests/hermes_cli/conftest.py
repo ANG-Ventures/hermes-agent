@@ -13,6 +13,7 @@ def _isolate_kanban_process_registry(monkeypatch):
     # One dict object shared by the facade (writer: _record_worker_returncode) and
     # kanban_db_dispatch (reader: _classify_worker_exit). Rebinding the facade name
     # would split them, so clear the shared object instead.
+    monkeypatch.setattr(kanban_db, "_worker_identities", {})
     kanban_db._recent_worker_exits.clear()
     yield
     kanban_db._recent_worker_exits.clear()

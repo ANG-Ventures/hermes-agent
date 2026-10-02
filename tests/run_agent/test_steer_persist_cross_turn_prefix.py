@@ -24,7 +24,7 @@ import copy
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from agent.tool_dispatch_helpers import make_tool_result_message
 from plugins.blackbox.prefix_guard import compare, fingerprint_request
-from tests.run_agent.test_tool_call_incremental_persistence import (
+from tests.agent.test_tool_call_incremental_persistence import (
     SessionDB,
     _attach_real_session_db,
     _make_agent,

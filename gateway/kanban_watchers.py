@@ -925,6 +925,151 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     return proc.returncode == 0
 
 
+# Needs-input pager (t_c8ca40b4): a card waiting on a human ruling pages its
+# origin channel once per (card, reason), then "still waiting" every 2 h.
+_NEEDS_INPUT_REPAGE_SECONDS = 2 * 3600
+
+
+def _needs_input_state_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / "kanban-needs-input-pages.json"
+
+
+def _resolve_needs_input_pager_settings(load_config: Callable[[], Any]) -> "tuple[bool, bool]":
+    """``(enabled, include_dependency)`` from ``kanban.needs_input_pager`` /
+    ``kanban.needs_input_pager_dependency``, read every tick. A config read
+    error keeps the pager ON: silence is the failure this exists to stop."""
+    try:
+        cfg = load_config()
+    except Exception:
+        return True, False
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    kcfg = kcfg if isinstance(kcfg, dict) else {}
+    return (bool(kcfg.get("needs_input_pager", True)),
+            bool(kcfg.get("needs_input_pager_dependency", False)))
+
+
+def _needs_input_cards(results, include_dependency: bool = False
+                       ) -> tuple[list[tuple[str, dict]], set[str]]:
+    """Probe each ticked board; only successful probes can prove a card unblocked."""
+    from hermes_cli import kanban_db as kb
+
+    cards = []
+    observed_boards = set()
+    for board, result in results or []:
+        if result is None or getattr(result, "skipped_locked", False):
+            continue
+        try:
+            with kb.connect_closing(board=board) as conn:
+                cards.extend(
+                    (board, item) for item in kb.needs_input_page_candidates(
+                        conn, include_dependency=include_dependency)
+                )
+            observed_boards.add(board)
+        except Exception:
+            logger.exception("kanban dispatcher: needs-input probe failed on %s", board)
+    return cards, observed_boards
+
+
+class _NeedsInputPager(_GuardStuckNotifier):
+    """Page once per ``(board, card, reason-hash)``; re-page "still waiting"
+    every 2 h while the card stays blocked. A new reason is a new page. The
+    ledger persists, so a gateway restart does not re-page."""
+
+    def __init__(self, state_path: Optional[Path] = None,
+                 remind_seconds: int = _NEEDS_INPUT_REPAGE_SECONDS) -> None:
+        super().__init__(state_path, remind_seconds)
+        self._rotation = 0
+
+    @staticmethod
+    def _key(board: str, item: dict) -> str:
+        import hashlib
+
+        digest = hashlib.sha1(str(item.get("reason") or "").encode("utf-8")).hexdigest()[:12]
+        return "|".join((str(board), str(item["task_id"]), digest))
+
+    def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
+        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
+        now = time.time() if now is None else float(now)
+        current = {self._key(board, item) for board, item in cards}
+        if observed_boards is None:
+            observed_boards = {board for board, _ in cards}
+        before = dict(self._sent)
+        # Forget a key once its card left an observed board AND the last page
+        # is older than the re-page window: an unblock/re-block blip on the
+        # same reason stays deduped.
+        self._sent = {
+            key: at for key, at in self._sent.items()
+            if key in current or key.split("|", 1)[0] not in observed_boards
+            or now - at < self._remind
+        }
+        delivered = 0
+        # Rotate the start each tick: failing sends stay due, and without the
+        # rotation a run of them at the head of the list would spend the page
+        # budget every tick and starve the cards behind them.
+        cards = list(cards)
+        if cards:
+            start = self._rotation % len(cards)
+            cards = cards[start:] + cards[:start]
+            self._rotation += 1
+        for board, item in cards:
+            key = self._key(board, item)
+            last = self._sent.get(key)
+            if last is not None and now - last < self._remind:
+                continue
+            if time.monotonic() >= deadline:
+                break
+            if send(board, item, last is not None):
+                self._sent[key] = now
+                delivered += 1
+        if self._sent != before:
+            self._save()
+        return delivered
+
+
+def _notify_send(script: Path, message: str, extra: list) -> bool:
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--send", message, "--channel", "discord",
+             "--profile", "default", *extra],
+            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: needs-input page failed")
+        return False
+    return proc.returncode == 0
+
+
+def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) -> bool:
+    """Post to the card's origin channel (numeric id); mirror to #alerts at
+    priority >= 200. A card with no origin channel pages #alerts instead, so
+    a priority >= 100 card is never silent. True when the primary post landed."""
+    script = _alert_notify_script()
+    if script is None:
+        logger.error("kanban dispatcher: notify.py unavailable; needs-input page not delivered")
+        return False
+    tid = str(item["task_id"])
+    board_flag = "" if board in ("", "default", None) else f"--board {board} "
+    reason = " ".join(str(item.get("reason") or "").split())[:300]
+    lead = "⚠️ still waiting: " if still_waiting else "⚠️ "
+    message = (
+        f"{lead}`{tid}` needs a ruling: {reason} — `hermes kanban {board_flag}show {tid}`\n"
+        f"-# p{item.get('priority', 0)} · {str(item.get('title') or '')[:120]} · "
+        f"re-pages every 2 h while blocked · opt out: `hermes kanban {board_flag}edit {tid} --no-page`"
+    )
+    channel = item.get("channel")
+    if channel is not None and not str(channel).isdigit():
+        channel = None  # numeric channel ids only
+    if channel:
+        ok = _notify_send(script, message, ["--target", str(channel)])
+        if item.get("alerts") and not _notify_send(script, message, ["--sev", "error"]):
+            logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
+        return ok
+    return _notify_send(script, message, ["--sev", "error"])
+
+
 def _stall_streak_is_bad(ready_pending, any_spawned, results, *, guard_stuck=False) -> bool:
     """Decide whether a dispatcher tick counts toward the "stuck" streak.
 
@@ -2620,6 +2765,7 @@ class GatewayKanbanWatchersMixin:
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
         guard_stuck_notifier = _GuardStuckNotifier(_guard_stuck_state_path())
+        needs_input_pager = _NeedsInputPager(_needs_input_state_path())
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -3149,6 +3295,19 @@ class GatewayKanbanWatchersMixin:
                     if guard_pages:
                         logger.error("kanban dispatcher: %d guarded card(s) STUCK; "
                                      "#alerts paged with diagnostics", guard_pages)
+                    # Needs-input pager (t_c8ca40b4): a card waiting on a human
+                    # ruling pages its origin channel; config re-read per tick.
+                    _nip_on, _nip_dep = _resolve_needs_input_pager_settings(_load_config)
+                    if _nip_on:
+                        nip_cards, nip_boards = await service(
+                            _needs_input_cards, results, _nip_dep)
+                        nip_pages = await service(
+                            needs_input_pager.observe, nip_cards,
+                            _send_needs_input_page, nip_boards,
+                        )
+                        if nip_pages:
+                            logger.warning("kanban dispatcher: paged %d needs-input "
+                                           "card(s) to their origin channel", nip_pages)
                     ready_pending = await service(_ready_nonempty)
                     if _stall_streak_is_bad(ready_pending, any_spawned, results,
                                             guard_stuck=bool(guard_stuck)):

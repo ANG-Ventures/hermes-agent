@@ -176,6 +176,10 @@ def perform_api_call(
         else:
             interrupted = True
         return _verdict("break")
+    # The model answered a request carrying every steer injected so far: only now are they delivered
+    # (fork #1585/#1595, I1). An interrupt that ends the turn before this point leaves them missed.
+    from agent.agent_runtime_helpers import note_steer_consumed
+    note_steer_consumed(agent)
     return _verdict("fallthrough")
 
 

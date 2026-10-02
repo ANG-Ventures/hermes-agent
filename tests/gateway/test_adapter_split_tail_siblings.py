@@ -58,7 +58,7 @@ class TestKeepHeadAndTailText:
 
 
 # ---------------------------------------------------------------------------
-# Telegram — 4096-char splitter: unbounded (pin) + commentary one-message
+# Telegram — 4096-char splitter: unbounded (pin), commentary included
 # ---------------------------------------------------------------------------
 
 
@@ -83,15 +83,16 @@ class TestTelegram:
         assert TAIL in texts[-1]
 
     @pytest.mark.asyncio
-    async def test_interim_commentary_is_one_message(self):
+    async def test_interim_commentary_delivers_every_chunk_no_marker(self):
+        """t_9b9322a1: commentary splits like any reply; nothing elided."""
         adapter = _telegram()
         await adapter.send(
             "123", _long(12_000), metadata=mark_commentary_send(None)
         )
         texts = [c.kwargs["text"] for c in adapter._bot.send_message.await_args_list]
-        assert len(texts) == 1
-        assert "continued in session log" in texts[0]
-        assert len(texts[0]) <= adapter.MAX_MESSAGE_LENGTH
+        assert len(texts) >= 3
+        assert TAIL in texts[-1]
+        assert not any("continued in session log" in t for t in texts)
 
     @pytest.mark.asyncio
     async def test_short_commentary_is_untouched(self):

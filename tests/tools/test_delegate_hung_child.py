@@ -295,3 +295,139 @@ def test_hung_child_seconds_config(fleet_home, monkeypatch, cfg, want):
         "floor": delegate_tool._CHILD_TIMEOUT_FLOOR_S,
     }.get(want, want)
     assert got == expected
+
+
+# ── Real Chat Completions streaming loop (Argus QA r2 C1, t_4a74b712) ──────
+
+
+def _chat_chunk(content=None, finish_reason=None):
+    delta = SimpleNamespace(
+        content=content, tool_calls=None, reasoning_content=None, reasoning=None,
+    )
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model=None, usage=None)
+
+
+def _real_stream_behavior(token: str | None, duration: float):
+    """Child behavior: run the REAL ``_interruptible_streaming_api_call`` loop.
+
+    The provider stream trickles one chunk every TICK. ``token=None`` sends the
+    content-free ``{"delta": {}}`` shape a stuck relay emits; a string sends a
+    real token. The real AIAgent's activity touches land on the child's clocks.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from run_agent import AIAgent
+
+    # Built up front: AIAgent construction alone can outlast HUNG.
+    real = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    real.api_mode = "chat_completions"
+    real._interrupt_requested = False
+
+    def behavior(child):
+        real._touch_activity = child._touch_activity
+
+        def _trickle():
+            end = time.monotonic() + duration
+            while time.monotonic() < end and not child.interrupt_seen.is_set():
+                yield _chat_chunk(content=token)
+                time.sleep(TICK)
+            yield _chat_chunk(content=token or None, finish_reason="stop")
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = lambda *a, **kw: _trickle()
+        # A delegated chat_completions child normally takes the inline
+        # non-streaming path; force the streaming loop (the shape Argus's
+        # QA_STREAM=1 harness forces, and every streaming child runs).
+        with patch.object(AIAgent, "_create_request_openai_client", return_value=client), \
+                patch.object(AIAgent, "_close_request_openai_client"), \
+                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=False):
+            try:
+                real._interruptible_streaming_api_call({})
+            except Exception:
+                pass
+        return {"final_response": "late", "completed": True, "api_calls": 2}
+
+    return behavior
+
+
+def test_empty_delta_trickle_is_reaped_through_real_stream_loop(fleet_home, monkeypatch):
+    """A stream that only trickles content-free chunks is hung (C1)."""
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(delegate_tool, "_get_hung_child_seconds", lambda: HUNG)
+    _Child = _real_agent_cls()
+    parent = _Child(None, depth=0)
+    child = _Child(
+        "sa-0-empty", parent=parent, behavior=_real_stream_behavior(None, HANG_BOUND)
+    )
+
+    t0 = time.monotonic()
+    entry = delegate_tool._run_single_child(0, "empty trickle", child, parent)
+    took = time.monotonic() - t0
+
+    assert entry["status"] == "timeout", entry
+    assert entry["timeout_phase"] == "no_progress", entry
+    assert child.interrupt_seen.is_set()
+    assert took < HANG_BOUND / 2, f"reaped only after {took:.1f}s"
+
+
+def test_token_trickle_through_real_stream_loop_is_not_reaped(fleet_home, monkeypatch):
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(delegate_tool, "_get_hung_child_seconds", lambda: HUNG)
+    _Child = _real_agent_cls()
+    parent = _Child(None, depth=0)
+    child = _Child(
+        "sa-0-tokens", parent=parent, behavior=_real_stream_behavior("tok", 4 * HUNG)
+    )
+    entry = delegate_tool._run_single_child(0, "token trickle", child, parent)
+    assert entry["status"] == "completed", entry
+    assert not child.interrupt_seen.is_set()
+
+
+@pytest.mark.parametrize(
+    "chunk,want",
+    [
+        (_chat_chunk(), False),
+        (SimpleNamespace(choices=[], model=None, usage=None), False),
+        (_chat_chunk(content="x"), True),
+        (_chat_chunk(finish_reason="stop"), True),
+        (SimpleNamespace(choices=[], model=None, usage={"total_tokens": 3}), True),
+        (
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=[object()]),
+                    finish_reason=None,
+                )],
+                usage=None,
+            ),
+            True,
+        ),
+        (
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="", reasoning_content="r"),
+                    finish_reason=None,
+                )],
+                usage=None,
+            ),
+            True,
+        ),
+    ],
+)
+def test_chat_chunk_is_progress(chunk, want):
+    from agent.chat_completion_helpers import _chat_chunk_is_progress
+
+    assert _chat_chunk_is_progress(chunk) is want

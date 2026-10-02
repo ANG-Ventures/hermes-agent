@@ -88,6 +88,26 @@ def handle_api_error(
 
     status_code = getattr(api_error, "status_code", None)
     error_context = agent._extract_api_error_context(api_error)
+    # Fallback ledger evidence (fork, spec Phase 1): consumed by the next failover, cleared by the next
+    # successful call. Never raises. elapsed_s: since this call's FIRST attempt (#1613).
+    from agent import fallback_events as _fbe
+    _fbe.stash_api_error(agent, api_error, status_code, error_context,
+                         elapsed_s=time.time() - api_start_time)
+    # Stamp the quota window (5h vs 7d) so the failover announce can name WHICH limit bound.
+    # Consumed once by _quota_window_suffix; only set when the provider actually told us.
+    if isinstance(error_context, dict) and error_context.get("quota_window"):
+        agent._pending_quota_window = {
+            "quota_window": error_context.get("quota_window"),
+            "quota_window_reset": error_context.get("quota_window_reset"),
+            "quota_window_reset_text": error_context.get("quota_window_reset_text"),
+        }
+    # Pool-exhaustion SCOPE: only THIS MODEL capped vs the whole pool out.
+    try:
+        from agent.error_classifier import _POOL_MODEL_SCOPED_PATTERN as _pool_model_pat
+        if _pool_model_pat in str(api_error).lower():
+            agent._pending_pool_scope = "model"
+    except Exception:  # noqa: BLE001
+        pass
 
     # Process is exiting mid-flight: retries/rotation/fallbacks are futile and the
     # retry trace spams the shell. One log line.

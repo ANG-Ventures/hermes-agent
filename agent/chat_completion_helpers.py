@@ -1117,6 +1117,36 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     return anthropic_kwargs
 
 
+def _chat_chunk_is_progress(chunk: Any) -> bool:
+    """True when a Chat Completions stream chunk carries content.
+
+    Progress means a non-empty content/reasoning delta, a tool_call delta, a
+    finish_reason, or usage. A content-free chunk (``{"delta": {}}``, the
+    shape a stuck relay emits as keepalive-as-data) proves liveness only and
+    must not reset the delegate hung-child clock
+    (docs/dev/delegate-child-lifecycle.md, "Liveness vs progress").
+    """
+    try:
+        if getattr(chunk, "usage", None):
+            return True
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            return False
+        choice = choices[0]
+        if getattr(choice, "finish_reason", None):
+            return True
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return False
+        for attr in ("content", "reasoning_content", "reasoning", "reasoning_details", "tool_calls"):
+            if getattr(delta, attr, None):
+                return True
+        return False
+    except Exception:
+        # Unknown shape: fail open to the pre-existing behavior (progress).
+        return True
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters: delta
     string lengths plus a framing floor (~3x cheaper than ``len(repr(chunk))``
@@ -5003,7 +5033,9 @@ class _StreamingCall(StreamingWaitMonitor):
             self.clients.set_stream_handle(stream)
 
         for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
-            self._count_chunk(_diag, chunk)
+            # A content-free chunk (empty delta) proves liveness only; it must not reset the
+            # delegate hung-child clock (fork #1617).
+            self._count_chunk(_diag, chunk, heartbeat=not _chat_chunk_is_progress(chunk))
             if self.agent._interrupt_requested:
                 # A half-read SSE response stays checked out of the httpx pool and the finally
                 # would cache the client WITH the leaked connection: close on the owner first.

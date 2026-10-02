@@ -41,6 +41,7 @@ from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: h
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
+from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -781,6 +782,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         args.session = home_flag
     try:
         with kb.connect_closing() as conn:
+            _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
                 title=args.title,
@@ -824,6 +826,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 force_reason=getattr(args, "force_reason", None),
             )
             task = kb.get_task(conn, task_id)
+            # Notice only when THIS call created the card and auto-added the
+            # skill: an idempotent hit returns an older card whose created
+            # event predates the watermark taken before the call.
+            auto_added = bool(kb.created_skills_auto_added(
+                conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     except ValueError as exc:
@@ -833,6 +840,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _print_json(_task_to_dict(task))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if auto_added:
+            print(
+                f"Added skill {kb.MILESTONE_QA_SKILL} ([milestone] QA cards run "
+                "Argus on the sdlc-review procedure)."
+            )
         if auto_subscribed:
             print(
                 "Subscribed the calling session for finish notifications "
@@ -2779,6 +2791,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 f"kanban: --metadata wants a JSON object, e.g. "
                 f"--metadata '{{\"base_guard_override\": \"<reason>\"}}' ({exc})", 2)
     failed: list[str] = []
+    no_receipt = False
     with kbc.connect_closing() as conn:
         for tid in ids:
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
@@ -2823,6 +2836,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                       f"describing what was done (an empty completion is not evidence).", file=sys.stderr)
                 continue
+            except ReceiptRequiredError as receipt_err:
+                failed.append(tid)
+                no_receipt = True
+                print(f"cannot complete {tid}: {receipt_err}.", file=sys.stderr)
+                continue
             except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
@@ -2859,6 +2877,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 if override:
                     print(f"  draft override recorded for {', '.join(override['prs'])}: "
                           f"{override['reason']}")
+    if no_receipt:
+        return EXIT_NO_RECEIPT
     return 0 if not failed else 1
 
 
@@ -2924,14 +2944,19 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     do_session = new_session is not None
     no_worker = getattr(args, "no_worker", None)
     new_priority = getattr(args, "priority", None)
+    page = getattr(args, "page", None)
+    add_skills = list(getattr(args, "skills", None) or [])
+    clear_skills = bool(getattr(args, "clear_skills", False))
+    do_skills = bool(add_skills) or clear_skills
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
-            and no_worker is None and new_priority is None):
+            and no_worker is None and new_priority is None and page is None and not do_skills):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
-            "--session, --priority, --no-worker or --worker-ok)", 2)
+            "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
+            "--skill or --clear-skills)", 2)
 
     rc = 0
     with kbc.connect_closing() as conn:
@@ -2946,6 +2971,26 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 f"{args.task_id}: dispatch: "
                 + ("operator-only (no-worker)" if no_worker else "worker-ok")
             )
+        if page is not None:
+            if not kb.set_needs_input_page(
+                conn, args.task_id, page, operator=_profile_author(),
+            ):
+                print(f"cannot edit {args.task_id} (unknown id)", file=sys.stderr)
+                return 1
+            print(f"{args.task_id}: needs-input pager: " + ("on" if page else "off"))
+        if do_skills:
+            try:
+                skills = kb.set_task_skills(
+                    conn, args.task_id, add=add_skills, clear=clear_skills,
+                    operator=_profile_author(),
+                )
+            except ValueError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            if skills is None:
+                print(f"cannot edit {args.task_id} (unknown id)", file=sys.stderr)
+                return 1
+            print(f"{args.task_id}: skills: {', '.join(skills) or '(none)'}")
         if do_session:
             sid = None if new_session.strip().lower() in ("", "none") else new_session.strip()
             if not kb.set_task_session(conn, args.task_id, sid):
@@ -3256,6 +3301,9 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
                 with_reason=True,
             )
+        except ReceiptRequiredError as receipt_err:
+            print(f"cannot request review for {tid}: {receipt_err}", file=sys.stderr)
+            return EXIT_NO_RECEIPT
         except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
             return _err(f"cannot request review for {tid}: {draft_err}")
         if not ok:

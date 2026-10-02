@@ -58,9 +58,10 @@ def _tick(spillover_fn, spawned_with):
         )
 
 
-def _make(n, assignee="alpha"):
+def _make(n, assignee="alpha", body="host:any"):
     with kb.connect_closing() as conn:
-        return [kb.create_task(conn, title=f"t{i}", assignee=assignee) for i in range(n)]
+        return [kb.create_task(conn, title=f"t{i}", assignee=assignee, body=body)
+                for i in range(n)]
 
 
 def test_parse_drops_incomplete_and_unallowlisted_entries():
@@ -116,6 +117,24 @@ def test_non_scratch_cards_never_spill(kanban_home):
     spawned = []
     _tick(_plan(), spawned)
     assert spawned == []
+
+
+def test_cards_without_host_any_opt_in_never_spill(kanban_home):
+    """Allowlist + scratch is not enough: the card must opt in (t_7c0ad8db)."""
+    _make(1, body=None)
+    _make(1, body="Fix the thing.\nUse `host:any` only if it is portable.")
+    (opted,) = _make(1, body="Fix the thing.\n  HOST: any  \n")
+    spawned = []
+    res = _tick(_plan(), spawned)
+    assert spawned == [(opted, "ace-ai")]
+    assert list(res.placements) == [opted]
+
+
+def test_opted_in_marker_is_line_anchored():
+    assert kwh.opted_in("host:any")
+    assert kwh.opted_in("body\nhost: any\nmore")
+    for body in (None, "", "hostany", "host:anything", "see host:any below", "`host:any`"):
+        assert not kwh.opted_in(body), body
 
 
 def test_placement_env_survives_profile_terminal_backend(monkeypatch):

@@ -441,6 +441,10 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
+    # t_4853212d: the suite (and its gateway-run subprocess rigs) runs gateways
+    # from a checkout, often one under /Volumes/fleet-scratch. Disarm the
+    # shadow-cwd boot guard; its own tests delete this.
+    monkeypatch.setenv("HERMES_ALLOW_SHADOW_CWD", "1")
 
     # 3a-GUARD (2026-07-24 WAL incident): hermeticity canary — after the
     # redirect, the resolved state.db path must live under the sandbox. If it

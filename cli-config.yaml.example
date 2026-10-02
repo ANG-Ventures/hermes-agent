@@ -448,6 +448,24 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # Dispatcher load gate: pause new spawns while load1 > pause_above, resume once
+  # load1 < resume_below (and load5 < pause_above). Defaults when unset:
+  # enabled true, pause_above = ncpu, resume_below = 0.75 * ncpu.
+  # dispatch_load_gate:
+  #   enabled: true
+  #   pause_above: 32
+  #   resume_below: 24
+  # Worker hosts (default: empty = feature off). When the gate pauses the
+  # dispatcher host, eligible scratch cards for allowlisted profiles spawn with
+  # their terminal/file tools placed on the worker host over ssh; the agent
+  # loop and kanban tools stay on the dispatcher host.
+  # worker_hosts:
+  #   - name: ace-ai
+  #     ssh_host: ace-ai
+  #     ssh_user: kanbanw        # locked-down user on the worker host
+  #     max_workers: 4
+  #     pause_above: 18          # remote load1; no new placement above it
+  #     profiles: [daedalus-opus]
 
 # =============================================================================
 # Terminal Tool Configuration

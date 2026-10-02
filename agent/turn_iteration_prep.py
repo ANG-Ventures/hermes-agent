@@ -270,6 +270,10 @@ def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row
             messages.insert(_si + 1, steer_user_row(steer_text))
+            # Fork #1585/#1595: delivered only once a model reads it (delegate steer ledger settles
+            # on note_steer_consumed after the next response; agents without a sink note it now).
+            from agent.agent_runtime_helpers import note_steer_injected
+            note_steer_injected(agent, steer_text)
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer

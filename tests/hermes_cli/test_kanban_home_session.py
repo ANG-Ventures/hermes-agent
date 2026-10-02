@@ -190,7 +190,9 @@ def test_foreign_ok_allows_and_leaves_audit_comment(kanban_home):
         assert kb.get_task(conn, tid).status != "blocked"
         assert _comments(conn, tid) == [
             f"takeover: foreign-session action by {OTHER} (apollo): "
-            f"home session is gone [unblock] -- card re-homed to {OTHER}"
+            f"home session is gone [unblock] -- card re-homed to {OTHER}",
+            # t_4b826d5c: a foreign status change announces itself.
+            f"FOREIGN CHANGE by {OTHER} (home session is gone) [unblock]",
         ]
 
 
@@ -1114,7 +1116,7 @@ def test_session_profile_not_assignee_still_refused(kanban_home):
     assert '--operator "<who: why>"' in str(exc.value)
 
 
-def test_operator_override_records_event_and_no_comment(kanban_home):
+def test_operator_override_records_event_and_foreign_change_comment(kanban_home):
     _session_in_profile_statedb(kanban_home, "aegis", OTHER)
     with kb.connect_closing() as conn:
         tid = _card(conn, assignee="daedalus")
@@ -1122,7 +1124,10 @@ def test_operator_override_records_event_and_no_comment(kanban_home):
                                operator="Ace via Aegis: ruled (a)"):
             assert kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).status != "blocked"
-        assert _comments(conn, tid) == []
+        # No takeover comment; a status verb still announces itself (t_4b826d5c).
+        assert _comments(conn, tid) == [
+            f"FOREIGN CHANGE by {OTHER} (Ace via Aegis: ruled (a)) [unblock]"
+        ]
         ev = [e for e in kb.list_events(conn, tid) if e.kind == "operator_override"]
         assert len(ev) == 1
         assert ev[0].payload["reason"] == "Ace via Aegis: ruled (a)"
@@ -1165,7 +1170,10 @@ def test_cli_operator_flag(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).status != "blocked"
         kinds = [e.kind for e in kb.list_events(conn, tid)]
         assert "operator_override" in kinds and "takeover" not in kinds
-        assert _comments(conn, tid) == []
+        assert "foreign_change" in kinds
+        assert _comments(conn, tid) == [
+            f"FOREIGN CHANGE by {OTHER} (Ace via Aegis: ruled (a)) [unblock]"
+        ]
 
 
 # --- t_5c908e14: --takeover re-homes; explicit --session beats parent ---

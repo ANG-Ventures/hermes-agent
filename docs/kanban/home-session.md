@@ -53,6 +53,21 @@ Consumers — keep them on this one helper: `kanban list --home`, `kanban show`'
   home. Otherwise it lists the ids and exits 1. `--backfill [--dry-run]` stamps
   them `unhomed` and adds a comment.
 
+## Foreign status/timing changes (t_4b826d5c)
+
+`schedule`, `unblock`, `block`, `triage-resolve`, `assign`/`reassign` and
+`priority` on a foreign card via `--operator` or `--takeover`:
+
+- **Announce.** Posts `FOREIGN CHANGE by <session> (<reason>) [<verb>]` and
+  writes a `foreign_change` event (`via`, `reason`, `cited_msg`, `home`).
+  `session-overview.py` lists these under "Foreign changes since <ts>".
+- **Ruling precedence.** Cite the human ruling as `msg <discord id>` in the
+  reason. If the home session's newest ruling on the card (its `APOLLO … ACE …`
+  or `--operator` comments, or its own `operator_override` events) cites a
+  higher id than yours, or you cite none, the change is refused: `home
+  session holds a newer human ruling (msg <id>); re-home with --takeover or
+  ask in <origin channel>`. No id on the home side: allowed, still announced.
+
 ## Config
 
 ```yaml

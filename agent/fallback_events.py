@@ -74,6 +74,11 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # reaps it, so the route is unavailable for this session, not a bad request
     # and not quota (t_693aa2e5: 145 rows/7d rendered "unclassified error").
     ("pool_pressure", ("replayed history no longer matches",)),
+    # claude-pool box capacity / interactive-session startup (503s, t_0ff05041).
+    # Ahead of conn so "startup deadline" never drifts into a timeout needle.
+    ("pool_pressure", ("no free interactive session slot",
+                       "cli children concurrently",
+                       "did not become ready before the startup deadline")),
     # Pool-wide exhaustion for every model is still pool-wide quota.
     ("quota_model", ("no eligible sub",)),
     ("conn", ("upstream connect timed out", "upstream unreachable",
@@ -395,7 +400,17 @@ def note_unclassified(row: Optional[Dict[str, Any]], rendered: str,
                         for k, v in (ev.get("headers") or {}).items()},
             "body": _dead_letter_body(ev.get("body")),
             "rendered": _scrub_dead_letter(str(rendered or "")),
+            # t_b2e9ef12 (additive): what the classifier had no name for.
+            "socket_cause": ev.get("socket_cause"),
+            "exc_chain": [str(n) for n in (ev.get("exc_chain") or ())],
+            # host:port by construction (_endpoint); scrubbed anyway (defence in depth).
+            "endpoint": (_scrub_dead_letter(str(ev["endpoint"])) or None)
+            if ev.get("endpoint") else None,
+            "elapsed_s": ev.get("elapsed_s"),
+            "floor": {str(k): (_scrub_dead_letter(v) if isinstance(v, str) else v)
+                      for k, v in (ev.get("floor") or {}).items()},
         }
+        rec["cause"] = dead_letter_cause(rec)
         target = path or dead_letter_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "a", encoding="utf-8") as fh:
@@ -406,9 +421,136 @@ def note_unclassified(row: Optional[Dict[str, Any]], rendered: str,
         return False
 
 
+# Socket-level cause of a no-status failure (t_b2e9ef12). The SDK raises a
+# generic ``APIConnectionError``/``APITimeoutError``; the cause sits in the
+# ``__cause__`` chain (httpx -> httpcore -> builtins). Checked in priority
+# order over the WHOLE chain: a connect timeout's innermost link is a bare
+# ``TimeoutError``, so innermost-wins would misname it a read timeout.
+_SOCKET_CAUSES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("dns", ("gaierror", "herror")),
+    ("connect_refused", ("ConnectionRefusedError",)),
+    ("connect_timeout", ("ConnectTimeout",)),
+    ("pool_timeout", ("PoolTimeout",)),
+    ("tls", ("SSLError", "SSLCertVerificationError", "SSLZeroReturnError")),
+    ("conn_reset", ("ConnectionResetError", "BrokenPipeError", "ConnectionAbortedError")),
+    ("remote_protocol", ("RemoteProtocolError", "IncompleteRead", "RemoteDisconnected",
+                         "LocalProtocolError")),
+    ("read_timeout", ("ReadTimeout", "WriteTimeout", "APITimeoutError", "TimeoutError",
+                      "timeout")),
+    ("read_error", ("ReadError", "WriteError")),
+    ("connect_error", ("ConnectError", "APIConnectionError", "ConnectionError")),
+)
+_EXC_CHAIN_MAX = 8
+
+
+def exc_chain(exc: Any) -> list:
+    """Class names along ``__cause__``/``__context__``, outermost first.
+    Bounded and cycle-safe. Never raises."""
+    out: list = []
+    seen: set = set()
+    try:
+        while exc is not None and id(exc) not in seen and len(out) < _EXC_CHAIN_MAX:
+            seen.add(id(exc))
+            out.append(type(exc).__name__)
+            exc = exc.__cause__ or exc.__context__
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def socket_cause(exc: Any) -> Optional[str]:
+    """Named socket cause of ``exc`` (``connect_refused`` / ``read_timeout``
+    / ``dns`` ...), or None when no link in its chain is a transport error
+    (an HTTP status error). Never raises."""
+    names = set(exc_chain(exc))
+    for cause, members in _SOCKET_CAUSES:
+        if names.intersection(members):
+            return cause
+    return None
+
+
+def stash_response_failure(agent: Any, site: str, response: Any = None, *,
+                           detail: Optional[str] = None,
+                           elapsed_s: Optional[float] = None) -> None:
+    """Evidence for a reason-less floor failover off a BILLED response the
+    loop rejected (invalid shape, empty content). t_b2e9ef12: the 2026-10-01
+    11:25 alr fallback was a relay 200 rejected here, and the dead-letter
+    row was all nulls because nothing was stashed.
+
+    Inert on routing: it sets no ``text``/``status``/``headers``/``exc``, so
+    the trigger class, err_hash, seat/hop and the rendered rider are exactly
+    what they were without it. Only the dead-letter row reads ``floor``.
+    Never raises."""
+    try:
+        ph = _lower_headers(getattr(response, "pool_headers", None))
+        usage = getattr(response, "usage", None)
+        content = getattr(response, "content", None)
+        floor = {
+            "site": str(site),
+            # Scrub the WHOLE detail before the cut: a cut that lands between a
+            # URL password and its '@' would hide it from the redactor.
+            "detail": (_scrub_dead_letter(str(detail))[:200] or None) if detail else None,
+            "stop_reason": getattr(response, "stop_reason", None)
+            if response is not None else None,
+            "content_blocks": len(content) if isinstance(content, list) else None,
+            "output_tokens": getattr(usage, "output_tokens", None)
+            if usage is not None else None,
+            "route_id": ph.get("x-pool-route-id"),
+            "served_by": ph.get("x-pool-served-by"),
+        }
+        agent._pending_fallback_error = {
+            "at": time.monotonic(),
+            "status": None,
+            "text": None,
+            "headers": {},
+            "body": None,
+            "exc": None,
+            "endpoint": None,
+            "elapsed_s": _round_s(elapsed_s),
+            "floor": {k: v for k, v in floor.items() if v is not None},
+            "dl_headers": {},
+            "dl_body": None,
+        }
+        logger.warning(
+            "provider response rejected by the loop: site=%s stop_reason=%s "
+            "content_blocks=%s output_tokens=%s route_id=%s served_by=%s elapsed_s=%s",
+            floor["site"], floor["stop_reason"], floor["content_blocks"],
+            floor["output_tokens"], floor["route_id"], floor["served_by"],
+            _round_s(elapsed_s))
+    except Exception:  # noqa: BLE001
+        logger.debug("fallback ledger: response-failure stash failed", exc_info=True)
+
+
+def _round_s(v: Any) -> Optional[float]:
+    return round(float(v), 2) if isinstance(v, (int, float)) and v >= 0 else None
+
+
+def dead_letter_cause(rec: Dict[str, Any]) -> str:
+    """The NAME a dead-letter row files under: the socket cause, else the
+    floor site, else the relay-stated / text class, else ``http_<status>``,
+    else ``no_evidence``. Total; never ``unclassified``."""
+    if rec.get("socket_cause"):
+        return str(rec["socket_cause"])
+    floor = rec.get("floor") if isinstance(rec.get("floor"), dict) else {}
+    if floor.get("site"):
+        return str(floor["site"])
+    rc = (rec.get("headers") or {}).get("x-relay-error-class")
+    if rc:
+        return f"relay_{rc}"
+    tc = rec.get("trigger_class")
+    if tc and tc != "unclassified":
+        return str(tc)
+    if rec.get("http_status") is not None:
+        return f"http_{rec['http_status']}"
+    if rec.get("exc_name"):
+        return f"exc_{rec['exc_name']}"
+    return "no_evidence"
+
+
 def stash_api_error(agent: Any, api_error: BaseException,
                     status_code: Optional[int],
-                    error_context: Optional[Dict[str, Any]] = None) -> None:
+                    error_context: Optional[Dict[str, Any]] = None,
+                    *, elapsed_s: Optional[float] = None) -> None:
     """Remember the latest failing call's evidence for the next failover.
 
     Never raises. The raw message is kept in memory only; what reaches disk
@@ -448,11 +590,24 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "body": body if isinstance(body, dict) else None,
             "exc": type(api_error).__name__,
             "endpoint": _endpoint(api_error),
+            # t_b2e9ef12: the socket cause the SDK wrapper hides, the chain it
+            # came from, and how long the call ran. Dead-letter only.
+            "socket_cause": socket_cause(api_error),
+            "exc_chain": exc_chain(api_error),
+            "elapsed_s": _round_s(elapsed_s),
             # Dead-letter evidence (t_a716610d), in memory until a floor rider
             # renders; scrubbed by note_unclassified before it reaches disk.
             "dl_headers": _dead_letter_headers(headers),
             "dl_body": _raw_body_text(response, body, msg),
         }
+        pend = agent._pending_fallback_error
+        if pend["status"] is None:
+            # t_b2e9ef12: a no-status failure used to log nothing parseable.
+            logger.warning(
+                "provider call failed without HTTP status: exc=%s socket_cause=%s "
+                "endpoint=%s elapsed_s=%s chain=%s",
+                pend["exc"], pend["socket_cause"], pend["endpoint"],
+                pend["elapsed_s"], ">".join(pend["exc_chain"]))
     except Exception:  # noqa: BLE001
         logger.debug("fallback ledger: stash failed", exc_info=True)
 
@@ -748,11 +903,21 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         except Exception:  # noqa: BLE001
             logger.debug("fallback ledger: pin seat/hop fill failed", exc_info=True)
         _note_relay_conn(row, pending)
+        # t_b2e9ef12: name what a no-status / rejected-response call died of.
+        if pending:
+            row.setdefault("exc_name", pending.get("exc"))
+            row.setdefault("socket_cause", pending.get("socket_cause"))
+            row.setdefault("floor_site", (pending.get("floor") or {}).get("site"))
         # Raw evidence for the dead-letter ledger (t_a716610d). Not a column.
         row["_dead_letter"] = {
             "exc": pending.get("exc") if pending else None,
             "headers": dict(pending.get("dl_headers") or {}) if pending else {},
             "body": pending.get("dl_body") if pending else None,
+            "socket_cause": pending.get("socket_cause") if pending else None,
+            "exc_chain": list(pending.get("exc_chain") or ()) if pending else [],
+            "endpoint": pending.get("endpoint") if pending else None,
+            "elapsed_s": pending.get("elapsed_s") if pending else None,
+            "floor": dict(pending.get("floor") or {}) if pending else {},
         }
     return row
 

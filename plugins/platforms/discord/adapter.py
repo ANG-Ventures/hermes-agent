@@ -427,7 +427,7 @@ from gateway.platforms.base import (
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
-    is_commentary_send, keep_head_and_tail_chunks, strip_chunk_indicators,
+    keep_head_and_tail_chunks,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
@@ -3956,23 +3956,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return kept
         return [kept[0], notice, *kept[1:]]
 
-    _COMMENTARY_CONTINUED_MARKER = "\n\n… (continued in session log)"
-
-    def _commentary_chunks(self, formatted: str) -> List[str]:
-        """Interim commentary is delivered as ONE message (t_784a01bd).
-
-        Between-tool-call narration is already durable in the transcript; a
-        long block must not flood the channel or trip the split cap.  Keep
-        the first chunk's worth of text and mark the rest as elided.
-        """
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        if len(chunks) <= 1:
-            return chunks
-        marker = self._COMMENTARY_CONTINUED_MARKER
-        first = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH - len(marker))
-        bodies, _tagged = strip_chunk_indicators(first)
-        return [bodies[0] + marker]
-
     async def send(
         self,
         chat_id: str,
@@ -4023,12 +4006,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 result = await self._send_to_forum(channel, content)
                 return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
             formatted = self.format_message(content)
-            if is_commentary_send(metadata):
-                chunks = self._commentary_chunks(formatted)
-            else:
-                chunks = self._cap_split_chunks(
-                    self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-                )
+            chunks = self._cap_split_chunks(
+                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            )
 
             message_ids = []
             reference = self._reply_reference_for_send(reply_to, channel)

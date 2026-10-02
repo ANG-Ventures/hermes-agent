@@ -349,10 +349,10 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
 
 
 # Interim COMMENTARY (between-tool-call narration) is a narrower kind of
-# ``_interim_send``: heartbeats and approval fallbacks are interim too, but
-# only commentary may be shortened by an adapter, because the full text is
-# already durable in the session transcript (t_784a01bd).  Gateway-internal;
-# adapters that forward metadata strip it before the wire.
+# ``_interim_send``: heartbeats and approval fallbacks are interim too
+# (t_784a01bd).  Adapters deliver commentary through the normal split path;
+# none shorten it (t_9b9322a1).  Gateway-internal; adapters that forward
+# metadata strip it before the wire.
 INTERIM_KIND_KEY = "_interim_kind"
 INTERIM_KIND_COMMENTARY = "commentary"
 

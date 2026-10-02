@@ -171,7 +171,6 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
-    is_commentary_send, strip_chunk_indicators,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -3908,16 +3907,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     return rich_result
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
-            if len(chunks) > 1 and is_commentary_send(metadata):
-                # Interim commentary is delivered as ONE message (t_784a01bd,
-                # t_11223645): the full text is durable in the transcript, and
-                # a long narration block must not flood the chat.
-                marker = "\n\n… \\(continued in session log\\)"
-                first = self.truncate_message(
-                    formatted, self.MAX_MESSAGE_LENGTH - utf16_len(marker), len_fn=utf16_len,
-                )
-                bodies, _tagged = strip_chunk_indicators(first)
-                chunks = [bodies[0] + marker]
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [

@@ -271,6 +271,10 @@ def recover_empty_response(
             agent._empty_content_retries, agent.model, agent.provider,
         )
         agent._buffer_diagnostic_status("⚠️ Model returning empty responses — " "switching to fallback provider...")
+        # Dead-letter evidence only (fork #1613, t_b2e9ef12); class unchanged.
+        from agent import fallback_events as _fbe_floor
+        _fbe_floor.stash_response_failure(
+            agent, "empty_response", response, detail=f"finish_reason={finish_reason}")
         if agent._try_activate_fallback():
             active_system_prompt = _sync_failover_system_message(agent, api_messages, active_system_prompt)
             agent._empty_content_retries = 0

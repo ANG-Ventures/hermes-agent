@@ -2342,10 +2342,23 @@ DEFAULT_CONFIG = {
         # review does NOT re-spawn the reviewer — the card is blocked
         # (needs_input) for the orchestrator/human to take over. 0 disables.
         "max_review_rounds": 3,
+        # Needs-input pager (t_c8ca40b4): a card blocked needs_input with
+        # priority >= 100, or whose origin: line names a Discord channel id,
+        # pages that channel once per (card, reason) and re-pages every 2 h
+        # while it waits (#alerts too at priority >= 200). Per card:
+        # `hermes kanban edit <id> --no-page`.
+        "needs_input_pager": True,
+        # Also page a card parked as `dependency` on a parent that is blocked.
+        "needs_input_pager_dependency": False,
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.
         "negative_handoff_review": False,
+        # True: a worker's completion of a running card with no receipt (no
+        # PR, survivor, attachment or structured metadata beyond bookkeeping)
+        # is refused with reason code no_receipt (t_e21aa11c). Lint the board:
+        # python -m hermes_cli.kanban_receipt --days 7
+        "receipt_gate": True,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
         # or "qa:required" get a reviewer session (being a task_links parent

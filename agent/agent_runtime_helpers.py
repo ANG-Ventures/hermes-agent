@@ -4071,20 +4071,11 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 def _requeue_pending_steer(agent, steer_text: str) -> None:
-    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
-    # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
-    # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
-    # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message.
+
+    Routes through ``requeue_pending_steer`` so a delegate child's steer ledger (fork
+    ``_steer_requeue_sink``) keeps the batch's acceptance identity."""
+    requeue_pending_steer(agent, steer_text)
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -4131,7 +4122,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     messages.append(steer_user_row(steer_text))
-    note_steer_delivered(agent, steer_text)
+    note_steer_injected(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message", len(steer_text),
     )
@@ -4169,6 +4160,68 @@ def _shutdown_socket(sock: Any) -> None:
         sock.shutdown(_socket.SHUT_RDWR)
     except OSError:
         pass
+
+def note_steer_injected(agent, text) -> None:
+    """*text* was written into a message; it is delivered once a model reads it.
+
+    The agent loop calls this at its two injection sites. With an inject sink
+    (a delegate_task child's steer ledger) the drained batch is bound to its
+    acceptances now and settled by ``note_steer_consumed`` after the next
+    model response. A turn that exits first (an interrupt right after the
+    tool batch) leaves it unsettled, so it is reported as ``missed_steer``.
+    Agents without an inject sink keep the immediate delivery note.
+    """
+    sink = getattr(agent, "_steer_inject_sink", None)
+    if not callable(sink):
+        note_steer_delivered(agent, text)
+        return
+    try:
+        sink(text)
+    except Exception:
+        _ra().logger.debug("steer inject sink failed", exc_info=True)
+
+
+def note_steer_consumed(agent) -> None:
+    """A model response came back for a request carrying every injected steer."""
+    sink = getattr(agent, "_steer_consume_sink", None)
+    if not callable(sink):
+        return
+    try:
+        sink()
+    except Exception:
+        _ra().logger.debug("steer consume sink failed", exc_info=True)
+
+
+def requeue_pending_steer(agent, text) -> None:
+    """Put a drained, undelivered steer batch back behind any newer text.
+
+    The one put-back for both injection sites. A steer ledger
+    (``_steer_requeue_sink``) performs the put-back itself, under its lock,
+    so the batch keeps its acceptance identity.
+    """
+    def _put_back() -> None:
+        _lock = getattr(agent, "_pending_steer_lock", None)
+        if _lock is not None:
+            with _lock:
+                if agent._pending_steer:
+                    agent._pending_steer = agent._pending_steer + "\n" + text
+                else:
+                    agent._pending_steer = text
+        else:
+            existing = getattr(agent, "_pending_steer", None)
+            agent._pending_steer = (existing + "\n" + text) if existing else text
+
+    sink = getattr(agent, "_steer_requeue_sink", None)
+    if not callable(sink):
+        _put_back()
+        return
+    try:
+        sink(text, _put_back)
+    except Exception:
+        # No second put-back: the sink may already have done it. A batch it
+        # lost stays open in its ledger and is reported as missed_steer.
+        _ra().logger.warning("steer requeue sink failed", exc_info=True)
+
 
 
 def force_close_tcp_sockets(client: Any) -> int:

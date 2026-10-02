@@ -310,6 +310,9 @@ jobs:
           # probe runs were bench waves, measured 2026-09-28), so a bot red is silent.
           # A red dispatched by anyone else (a hand `gh workflow run`) pages ONCE
           # per wave: a later red of the same wave in the last 24h is silent.
+          # Only a prior red THIS route paged counts (FleetReview #1482): a
+          # bot-dispatched or non-default-branch red of the wave was silent, so
+          # it must not suppress the first hand-dispatched red on the default branch.
           # Any API error keeps the page (fail loud).
           if [ "$ROUTE" = alerts ] && [ "$WF_NAME" = "CI placement probe" ]; then
             WF_TITLE="$(f .display_title)"
@@ -318,9 +321,13 @@ jobs:
               ROUTE=none; echo "no page: bench-dispatched probe run; the bench grades and pages its wave"
             elif [ -n "$WAVE" ]; then
               SINCE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)"
-              PRIOR="$(api "actions/workflows/$WF_ID/runs?event=workflow_dispatch&status=failure&per_page=100" \
+              BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
+              PRIOR="$(api "actions/workflows/$WF_ID/runs?event=workflow_dispatch&status=failure&branch=$BR_Q&per_page=100" \
                 | jq -r --argjson id "$WF_RUN_ID" --arg p "placement probe $WAVE #" --arg since "$SINCE" \
+                    --arg br "$DEFAULT_BRANCH" --arg bot "ang-fleet-workers[bot]" \
                   '[.workflow_runs[] | select(.id < $id and .created_at >= $since)
+                    | select((.head_branch // "") == $br)
+                    | select((.actor.login // "") != "" and .actor.login != $bot)
                     | select((.display_title // "") | startswith($p)) | .id][0] // ""')" || PRIOR=error
               if [ "$PRIOR" = error ]; then
                 echo "::warning::prior probe run lookup failed; paging"

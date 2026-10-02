@@ -111,6 +111,12 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    worker_leftovers_reaped: list[str] = field(default_factory=list)
+    """Task ids whose exited worker left processes that were reaped this tick
+    (:func:`reap_exited_worker_leftovers`, fork t_446b6b99)."""
+    orphans_reaped: dict = field(default_factory=dict)
+    """``{card: [{pid, name, cwd}]}`` reaped by
+    :func:`sweep_terminal_workspace_orphans` this tick."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     spawn_routes: dict[str, str] = field(default_factory=dict)
@@ -3640,13 +3646,21 @@ def _dispatch_once_locked(
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    exited_workers = reap_worker_zombies()
     result_reaped_terminal = reap_terminal_workers(conn)
 
     result = DispatchResult()
     # Workers that outlived their closed run are terminated (upstream
     # reap_terminal_workers) before any reclaim/spawn decision this tick.
     result.reaped_terminal_workers = result_reaped_terminal
+    if not dry_run:
+        # A worker that exited (cleanly or not) leaves its servers behind; reap them now, and sweep
+        # init-parented strays in terminal cards' workspaces no retained handle can reach (fork t_446b6b99).
+        result.worker_leftovers_reaped = _kb.reap_exited_worker_leftovers(conn, exited_workers)
+        try:
+            result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban orphan sweep failed: %s", exc)
 
     # ---- lane-model overrides (board-level, time-boxed routing) ----
     # One clock read for the whole tick so every card in this pass sees the
@@ -3922,7 +3936,7 @@ def _dispatch_once_locked(
         # worker host) and no local workspace content (it is not on the host).
         ready_rows = [
             r for r in ready_rows
-            if spillover.eligible(r["assignee"], r["workspace_kind"])
+            if spillover.eligible(r["assignee"], r["workspace_kind"], r["body"])
             and not _kb._kwh.local_workspace_has_content(r["workspace_path"])
             and conn.execute(
                 "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? "
@@ -5704,6 +5718,7 @@ def _default_spawn(
         cpu_nice,
         " ".join(darwin_prefix[1:]) or "-",
     )
+    spawned_at = time.time()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             spawn_cmd,
@@ -5727,6 +5742,7 @@ def _default_spawn(
     with _kb._worker_processes_lock:
         _recent_worker_exits.pop(proc.pid, None)
         _kb._worker_processes[proc.pid] = proc
+    _kb._register_worker_identity(proc.pid, task.id, task.current_run_id, spawned_at)
     return proc.pid
 
 

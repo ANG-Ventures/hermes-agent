@@ -336,7 +336,17 @@ def _close_delegated_child(child: Any, reason: str) -> bool:
     try:
         door(reason)
     except Exception:
-        logger.debug("delegated child teardown door failed", exc_info=True)
+        # No direct-close fallback: the door raising does not prove the
+        # child is idle, and closing under a live turn is the I2 breach the
+        # door exists to stop. The door is total by construction (its only
+        # close, _close_child_persistence, catches everything), so reaching
+        # here is a door bug: say so loudly instead of at debug.
+        logger.warning(
+            "delegated child teardown door raised (%s); child %s left to its run",
+            reason,
+            getattr(child, "_subagent_id", None),
+            exc_info=True,
+        )
     return True
 
 

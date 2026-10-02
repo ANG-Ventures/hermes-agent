@@ -731,6 +731,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             conn,
             running_id,
             result="done",
+            metadata={"tests_run": 1},
             expected_run_id=running.current_run_id,
         )
         global_dry_run = kbd.dispatch_once(

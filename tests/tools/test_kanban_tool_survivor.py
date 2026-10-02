@@ -385,7 +385,8 @@ def test_tool_all_blank_survivor_list_normalizes_to_none(worker_env, remote_mult
     two_vanished_repos(worker_env)
 
     for blank in ([], ["   "], ["", "  "]):
-        out = complete(summary="approved", survivor_pr=blank)
+        out = complete(summary="approved", survivor_pr=blank,
+                       metadata={"verified": "receipt gate satisfied"})
         # No claim was made, so this is the plain fail-closed refusal — never
         # a completion, and never a bogus [""] claim sent to the remote.
         assert "survivor" in out.get("error", "").lower(), (blank, out)

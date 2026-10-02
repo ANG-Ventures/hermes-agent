@@ -562,6 +562,19 @@ _SPECS = [
             _arg("--worker-ok", action="store_const", const=False, dest="no_worker",
                  help="Clear the no-worker flag"),
         ),
+        # fork #1614: per-card skill list; fork #1612: needs-input pager opt-out.
+        _arg("--skill", action="append", default=[], dest="skills", metavar="NAME",
+             help="Append a skill to force-load into the worker (repeatable; "
+                  "applies from the next spawn). Records skills_set."),
+        _arg("--clear-skills", action="store_true", dest="clear_skills",
+             help="Empty the card's skill list (applied before any --skill)."),
+        _group(
+            _arg("--no-page", action="store_const", const=False, dest="page", default=None,
+                 help="Opt the card out of the needs-input pager (no origin-channel "
+                      "page when it blocks on a human ruling)"),
+            _arg("--page", action="store_const", const=True, dest="page",
+                 help="Re-enable the needs-input pager for the card"),
+        ),
     ], aliases=["update"],
        help="Edit task fields or recovery fields on an already-completed task, or (re)stamp its home session with --session"),
     _cmd("block", [
@@ -862,7 +875,8 @@ def _add_home_guard_flags(sub: argparse._SubParsersAction) -> None:
         p.add_argument(
             "--operator", dest="operator", metavar="WHO: WHY",
             help="Operator profiles (apollo/default, aegis) applying a relayed human decision "
-                 "to a foreign card; records an operator_override event, posts no comment.",
+                 "to a foreign card; records an operator_override event (status/timing verbs also post "
+                 "a FOREIGN CHANGE comment; cite the ruling as 'msg <discord id>').",
         )
 
 

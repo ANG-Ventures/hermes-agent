@@ -75,6 +75,13 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     wins and the caller is rejected. Exact agent identity prevents a finishing child with a recycled public id from
     closing its replacement."""
     with _active_subagents_lock:
+        # The ledger is the agent's own, so close it even when the registry entry is gone or
+        # recycled: this also refuses direct ``agent.steer()`` producers that bypass
+        # ``steer_subagent`` (fork #1616, Argus QA r2 C2).
+        _ledger = getattr(agent, "_steer_ledger", None)
+        _seal = getattr(_ledger, "seal", None)
+        if callable(_seal):
+            _seal()
         record = _active_subagents.get(subagent_id)
         if record is None or record.get("agent") is not agent:
             return None
@@ -150,11 +157,20 @@ def steer_subagent(
         agent = record.get("agent")
         if agent is None:
             return False
+        # Ledger first: the child may deliver the text the moment it lands in its slot, and the
+        # delivery must find its entry. A ledger-wrapped child.steer does both itself (fork #1595).
+        ledger = record.get("steer_ledger")
+        seq = None
+        if ledger is not None and getattr(agent, "_steer_ledger", None) is not ledger:
+            seq = ledger.accept(text)
         try:
-            return bool(agent.steer(text))
+            accepted = bool(agent.steer(text))
         except Exception as exc:
             logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
-            return False
+            accepted = False
+        if not accepted and seq is not None:
+            ledger.withdraw(seq)
+        return accepted
 
 def _capture_gateway_steer_authority(owner_session_id: Optional[str]) -> tuple[Any, Any]:
     """Exact request transport + live session generation, if any — an in-process
@@ -168,7 +184,7 @@ def _capture_gateway_steer_authority(owner_session_id: Optional[str]) -> tuple[A
         return None, None
 
 # Registry record fields never exposed to the TUI/RPC snapshot.
-_PRIVATE_RECORD_KEYS = frozenset({"agent", "owner_session_id", "owner_transport", "owner_session_record", "accepting_steer"})
+_PRIVATE_RECORD_KEYS = frozenset({"agent", "owner_session_id", "owner_transport", "owner_session_record", "accepting_steer", "steer_ledger"})
 
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Copy of the running subagent tree ({subagent_id, parent_id, depth, goal, model,

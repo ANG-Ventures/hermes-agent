@@ -1555,28 +1555,17 @@ class GatewayTurnMixin:
         clean — strip any leading timestamp prefix and the Discord triggering-message note (a
         model instruction, not authored text) — regardless of the toggle; only the in-context
         RENDER is gated behind gateway.message_timestamps.enabled (default OFF)."""
-        from gateway.run import _load_gateway_config, _message_timestamps_enabled
+        from gateway.run import _compose_inbound_user_turn
         from gateway.run_inbound import strip_discord_triggering_note
         persist_user_message = None
         persist_user_timestamp = None
         try:
-            from hermes_time import get_timezone as _get_evt_tz
-            from gateway.message_timestamps import (
-                coerce_message_timestamp as _coerce_msg_ts,
-                render_user_content_with_timestamp as _render_msg_ts,
-                strip_leading_message_timestamps as _strip_msg_ts,
-            )
-            _evt_tz = _get_evt_tz()
-            if message_text and isinstance(message_text, str):
-                _clean_message_text, _embedded_ts = _strip_msg_ts(message_text, tz=_evt_tz)
-                persist_user_message = strip_discord_triggering_note(event, _clean_message_text)
-                _event_epoch = _coerce_msg_ts(getattr(event, "timestamp", None), tz=_evt_tz)
-                persist_user_timestamp = _event_epoch if _event_epoch is not None else _embedded_ts
-                if _message_timestamps_enabled(_load_gateway_config()):
-                    message_text = _render_msg_ts(_clean_message_text, persist_user_timestamp, tz=_evt_tz)
-                else:
-                    # Toggle off: the model sees the clean message; timestamp stored for later opt-in.
-                    message_text = _clean_message_text
+            # One composition for fresh AND follow-up turns (fork #1606, t_29abfaf6): persist the clean
+            # text + the send time the rendered prefix came from, so replay renders the same bytes.
+            message_text, persist_user_message, persist_user_timestamp = _compose_inbound_user_turn(
+                message_text, getattr(event, "timestamp", None))
+            if persist_user_message is not None:
+                persist_user_message = strip_discord_triggering_note(event, persist_user_message)
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
         return message_text, persist_user_message, persist_user_timestamp
@@ -4073,6 +4062,24 @@ class GatewayTurnMixin:
             # of the turn they are recursively following.
             next_channel_prompt = turn_ctx.channel_prompt
 
+        # Same composition as a fresh inbound turn: the follow-up (queued event, interrupt text, leftover
+        # /steer) must persist the clean text + send time it was rendered from, or replay renders a
+        # timestamp prefix this turn never sent (fork #1606, t_29abfaf6).
+        next_persist_timestamp = None
+        try:
+            from gateway.run import _compose_inbound_user_turn
+            _composed, _clean, next_persist_timestamp = _compose_inbound_user_turn(
+                next_message, getattr(pending_event, "timestamp", None) if pending_event is not None else None)
+            if _clean is not None:
+                next_message = _composed
+                if next_persist_message is None:
+                    next_persist_message = _clean
+                else:
+                    from gateway.run_inbound import strip_discord_triggering_note
+                    next_persist_message = strip_discord_triggering_note(pending_event, _clean)
+        except Exception as _ts_err:
+            logger.debug("Follow-up timestamp composition failed (non-fatal): %s", _ts_err)
+
         # Clear the prior turn's streaming-TTS completion marker so the recursive turn isn't suppressed.
         # See #60671.
         _clear_adapter = self._delivery_adapter_for(source)
@@ -4118,6 +4125,7 @@ class GatewayTurnMixin:
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
+                persist_user_timestamp=next_persist_timestamp,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={

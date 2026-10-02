@@ -1009,6 +1009,12 @@ FLOOR_HEAD = "generic_head"
 _HOP_SUB_UNKNOWN_SEG = f"({HOP_UNKNOWN}, {SUB_UNKNOWN})"
 
 
+# claude-pool box-level refusals (t_0ff05041): no session slot / CLI-child cap
+# on the relay box, and an interactive session that missed its startup deadline.
+BOX_CAPACITY_CAUSE = "relay box at session capacity"
+BOX_STARTUP_CAUSE = "relay session startup timed out"
+
+
 def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
@@ -1027,6 +1033,10 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return _session_demoted_cause(t)
         if "draining-for-deploy" in t or ("drain" in t and "deploy" in t):
             return RELAY_DRAIN_CAUSE
+        if "startup deadline" in t:
+            return BOX_STARTUP_CAUSE
+        if "interactive session slot" in t or "cli children" in t:
+            return BOX_CAPACITY_CAUSE
         if "burn" in t:
             return "burn-in ceiling"
         if "newly-activated" in t or "young" in t:

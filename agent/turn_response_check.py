@@ -288,6 +288,10 @@ def retry_invalid_response(
     # Eager fallback: empty/malformed responses often mean rate limiting.
     if agent._fallback_index < len(agent._fallback_chain):
         agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
+    # Dead-letter evidence only (fork #1613, t_b2e9ef12); class unchanged.
+    from agent import fallback_events as _fbe_floor
+    _fbe_floor.stash_response_failure(
+        agent, "invalid_response", response, detail=", ".join(error_details), elapsed_s=api_duration)
     if agent._try_activate_fallback():
         active_system_prompt = _arm_fallback_restart(
             agent, api_messages, active_system_prompt, _retry)
@@ -306,6 +310,9 @@ def retry_invalid_response(
     if retry_count >= max_retries:
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+        _fbe_floor.stash_response_failure(
+            agent, "invalid_response_exhausted", response,
+            detail=", ".join(error_details), elapsed_s=api_duration)
         if agent._try_activate_fallback():
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)

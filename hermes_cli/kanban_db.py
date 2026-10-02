@@ -374,7 +374,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers",
-    "ended_terminal_runs", "crashed", "stale", "timed_out", "auto_blocked", "rate_limited",
+    "ended_terminal_runs", "worker_leftovers_reaped", "orphans_reaped", "crashed", "stale", "timed_out", "auto_blocked", "rate_limited",
     "infra_unavailable", "cohort_deaths", "auto_assigned_default", "respawn_guarded",
     "skipped_per_profile_capped", "skipped_unassigned", "skipped_nonspawnable",
 )
@@ -3518,7 +3518,8 @@ class MutationActor:
     foreign_ok: Optional[str] = None
     surface: str = "cli"  # "cli" | "tool" -- only shapes the refusal hint
     # ``--operator "<who: why>"``: an operator profile applying a relayed
-    # human decision. Recorded as an ``operator_override`` event, no comment.
+    # human decision. Recorded as an ``operator_override`` event; on a
+    # status/timing verb also a FOREIGN CHANGE comment (FOREIGN_CHANGE_ACTIONS).
     operator: Optional[str] = None
     # What a ``--takeover`` does to the card's home: ``"keep"`` (--keep-home),
     # ``"transfer"`` (--transfer-home), or None = the verb's default (see
@@ -4216,6 +4217,129 @@ def authorize_pending_operator_gate(conn: sqlite3.Connection) -> None:
             pass
 
 
+# Status/timing verbs whose ``--operator`` / ``--takeover`` on a foreign card
+# must announce itself (FOREIGN CHANGE comment + ``foreign_change`` event) and
+# yield to a NEWER human ruling the home session holds (t_4b826d5c: on
+# 09-30 21:58 one operator session re-parked another session's cards against
+# Ace's later ruling, and the home session learned of it 10 minutes later).
+FOREIGN_CHANGE_ACTIONS: frozenset[str] = frozenset({
+    "schedule", "unblock", "block", "triage-resolve", "reassign", "assign",
+    "priority",
+})
+# A cited human ruling: ``msg <discord message id>`` (snowflakes grow with time).
+_RULING_MSG_RE = re.compile(r"\bmsg\s+(\d{18,20})\b")
+# A home-session comment that relays a human ruling.
+_HOME_RULING_COMMENT_RE = re.compile(r"APOLLO\b.*\bACE\b|--operator", re.S)
+
+
+def ruling_msg_id(text: Optional[str]) -> Optional[int]:
+    """Newest ``msg <id>`` cited in ``text``, or ``None``."""
+    ids = [int(m) for m in _RULING_MSG_RE.findall(text or "")]
+    return max(ids) if ids else None
+
+
+def home_ruling_msg_id(
+    conn: sqlite3.Connection, task_id: str, home: str
+) -> Optional[int]:
+    """Newest Discord msg id the HOME session cited on this card: its
+    ``APOLLO … ACE …`` / ``--operator`` comments and its own
+    ``operator_override`` events. ``None`` when it cited none."""
+    sids = set(home_ids(home)) | {home}
+    refs = {derive_session_ref(s) for s in sids}
+    best: Optional[int] = None
+    for r in conn.execute(
+        "SELECT body, session_ref FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ):
+        if r["session_ref"] in refs and _HOME_RULING_COMMENT_RE.search(r["body"] or ""):
+            mid = ruling_msg_id(r["body"])
+            if mid is not None and (best is None or mid > best):
+                best = mid
+    for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'operator_override'",
+        (task_id,),
+    ):
+        try:
+            p = json.loads(r["payload"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(p, dict) or not (set(p.get("by_sessions") or ()) & sids):
+            continue
+        mid = ruling_msg_id(str(p.get("reason") or ""))
+        if mid is not None and (best is None or mid > best):
+            best = mid
+    return best
+
+
+def _origin_channel(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    for line in ((row["body"] if row else "") or "").splitlines():
+        if line.startswith("origin:"):
+            return line[len("origin:"):].split("·")[0].strip() or "the home chat"
+    return "the home chat"
+
+
+def _check_ruling_precedence(
+    conn: sqlite3.Connection, task_id: str, action: str, home: str,
+    reason: Optional[str],
+) -> None:
+    """Refuse a foreign status/timing override that would overturn a NEWER
+    human ruling held by the card's home session. No id on the home side =
+    allowed (status quo); the change is still announced."""
+    if action not in FOREIGN_CHANGE_ACTIONS:
+        return
+    home_msg = home_ruling_msg_id(conn, task_id, home)
+    if home_msg is None:
+        return
+    cited = ruling_msg_id(reason)
+    if cited is not None and cited >= home_msg:
+        return
+    raise ForeignSessionMutationError(
+        f"refused {action} on {task_id}: home session holds a newer human "
+        f"ruling (msg {home_msg}); re-home with --takeover or ask in "
+        f"{_origin_channel(conn, task_id)}. "
+        + (f"You cited msg {cited}. " if cited is not None
+           else "You cited no msg id. ")
+        + f"Re-home: hermes kanban update {task_id} --session <yours> "
+        f"--takeover \"<reason>\"."
+    )
+
+
+def _announce_foreign_change(
+    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor,
+    home: Optional[str],
+) -> None:
+    """``FOREIGN CHANGE by <session> (<reason>)`` comment + ``foreign_change``
+    event, so the home session sees a foreign status/timing change on its next
+    overview instead of discovering it by accident."""
+    if action not in FOREIGN_CHANGE_ACTIONS:
+        return
+    sess = ", ".join(actor.session_ids) or "no-session"
+    reason = actor.operator or actor.foreign_ok or ""
+    with write_txn(conn, allow_nested=True):
+        _append_event(conn, task_id, "foreign_change", {
+            "action": action,
+            "via": "--operator" if actor.operator else "--takeover",
+            "reason": reason,
+            "cited_msg": (str(ruling_msg_id(reason))
+                          if ruling_msg_id(reason) is not None else None),
+            "by_sessions": list(actor.session_ids),
+            "by_profile": actor.profile,
+            "home": home,
+        })
+    try:
+        session_ref = (derive_session_ref(actor.session_ids[0])
+                       if actor.session_ids else None)
+    except Exception:
+        session_ref = None
+    add_comment(
+        conn, task_id, author=actor.profile or "user",
+        body=f"FOREIGN CHANGE by {sess} ({reason}) [{action}]",
+        session_ref=session_ref,
+    )
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -4290,8 +4414,10 @@ def check_home_session(
                 f"refused {action} on {task_id}: --operator needs "
                 f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
             )
+        _check_ruling_precedence(conn, task_id, action, home, actor.operator)
         return actor
     if actor.foreign_ok:
+        _check_ruling_precedence(conn, task_id, action, home, actor.foreign_ok)
         return actor
     if home_guard_mode() == "warn":
         print(
@@ -4308,7 +4434,7 @@ def check_home_session(
     operator_hint = (
         f" An operator profile ({', '.join(sorted(OPERATOR_PROFILES))}) "
         f"applying a relayed human decision uses --operator \"<who: why>\" "
-        f"instead (recorded as an operator_override event, pages nothing)."
+        f"instead (recorded as an operator_override event; status/timing verbs also post a FOREIGN CHANGE comment)."
         if actor.surface == "cli" else ""
     )
     if is_unhomed(home):
@@ -4415,7 +4541,9 @@ def record_foreign_action(
     """Append the audit comment for an overridden foreign-session mutation.
 
     An ``--operator`` override records an ``operator_override`` event only:
-    no comment, so nothing pages the home session.
+    no takeover comment. A status/timing verb (:data:`FOREIGN_CHANGE_ACTIONS`)
+    additionally posts the FOREIGN CHANGE comment + ``foreign_change`` event,
+    for ``--operator`` and ``--takeover`` alike, so the home session is told.
 
     ``home_before`` is the home read BEFORE the guarded mutation ran; the
     mutation itself may have re-stamped ``tasks.session_id`` (``update
@@ -4461,6 +4589,7 @@ def record_foreign_action(
                     "home": prev_home,
                 },
             )
+        _announce_foreign_change(conn, task_id, action, actor, prev_home)
         return None
     new_home = (
         actor.session_ids[0]
@@ -4522,6 +4651,7 @@ def record_foreign_action(
         ),
         session_ref=session_ref,
     )
+    _announce_foreign_change(conn, task_id, action, actor, prev_home)
     if new_home and subscribe:
         _subscribe_new_home(conn, task_id)
     return new_home
@@ -4623,6 +4753,146 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
         if line:
             return line if line.lower().startswith("origin:") else None
     return None
+
+# ---------------------------------------------------------------------------
+# Needs-input pager (t_c8ca40b4). A priority-chain card that blocks on a human
+# question paged nobody: 3x in 24 h on the DPX chain, ~12 h of silence. The
+# gateway dispatcher pages the card's origin channel (dedup + re-page lives in
+# gateway/kanban_watchers.py); this half picks the cards and holds the opt-out.
+# ---------------------------------------------------------------------------
+
+NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
+NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
+_NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
+_NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
+# ``origin: discord <name> (<numeric channel id>) · session ...`` (see
+# format_origin_line). The id is the LAST parenthetical of the first `` · ``
+# field, so a chat name with its own parentheses still resolves. Numeric ids
+# only: a channel NAME is never a delivery target.
+_ORIGIN_DISCORD_CHANNEL_RE = re.compile(r"^origin:\s*discord\b.*\((\d{15,22})\)\s*$", re.I)
+
+
+def origin_discord_channel(body: Optional[str]) -> Optional[str]:
+    """The numeric Discord channel id in the card's ``origin:`` line, else None."""
+    line = _origin_line(body)
+    where = line.split(" \u00b7 ", 1)[0] if line else ""
+    match = _ORIGIN_DISCORD_CHANNEL_RE.match(where) if where else None
+    return match.group(1) if match else None
+
+
+def needs_input_page_enabled(conn: sqlite3.Connection, task_id: str) -> bool:
+    """False once ``edit --no-page`` opted the card out (latest toggle wins)."""
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, _NEEDS_INPUT_PAGE_OFF, _NEEDS_INPUT_PAGE_ON),
+    ).fetchone()
+    return row is None or row["kind"] == _NEEDS_INPUT_PAGE_ON
+
+
+def set_needs_input_page(
+    conn: sqlite3.Connection,
+    task_id: str,
+    enabled: bool,
+    *,
+    operator: Optional[str] = None,
+) -> bool:
+    """Opt a card out of (or back into) the needs-input pager.
+
+    Returns False for an unknown id. A change records ``needs_input_page_off``
+    / ``needs_input_page_on``; setting the current value is a silent no-op.
+    """
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            return False
+        if needs_input_page_enabled(conn, task_id) != bool(enabled):
+            _append_event(
+                conn, task_id,
+                _NEEDS_INPUT_PAGE_ON if enabled else _NEEDS_INPUT_PAGE_OFF,
+                {"operator": operator},
+            )
+    return True
+
+
+_BLOCK_REASON_EVENTS = ("blocked", "block_loop_detected")
+
+
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_REASON_EVENTS),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return str((payload or {}).get("reason") or "").strip() if isinstance(payload, dict) else ""
+
+
+def needs_input_page_candidates(
+    conn: sqlite3.Connection,
+    *,
+    include_dependency: bool = False,
+    min_priority: int = NEEDS_INPUT_PAGE_MIN_PRIORITY,
+) -> list[dict]:
+    """Cards waiting on a human ruling that should page their origin channel.
+
+    A card qualifies when it sits in ``blocked`` with kind ``needs_input`` (a
+    same-kind re-block escalates to ``triage`` and still waits on a human, so
+    that counts too) or,
+    with ``include_dependency``, waits as ``dependency`` on a parent that is
+    itself ``blocked``), was not opted out, and has ``priority >= min_priority``
+    OR an ``origin:`` line naming a numeric Discord channel. Each item carries
+    ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
+    """
+    rows = list(conn.execute(
+        "SELECT id, title, body, priority, status, block_kind FROM tasks "
+        "WHERE status IN ('blocked', 'triage') AND block_kind = 'needs_input' ORDER BY id"
+    ))
+    if include_dependency:
+        rows += list(conn.execute(
+            "SELECT id, title, body, priority, status, block_kind FROM tasks t "
+            "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
+            "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) = ? "
+            "            AND p.status = 'blocked') ORDER BY id",
+            (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        ))
+    out: list[dict] = []
+    for row in rows:
+        priority = int(row["priority"] or 0)
+        channel = origin_discord_channel(row["body"])
+        if priority < int(min_priority) and channel is None:
+            continue
+        if not needs_input_page_enabled(conn, row["id"]):
+            continue
+        if row["block_kind"] == "dependency":
+            parents = [
+                (r["id"], _latest_block_reason(conn, r["id"]))
+                for r in conn.execute(
+                    "SELECT p.id AS id FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? "
+                    "AND p.status = 'blocked' ORDER BY p.id",
+                    (row["id"], DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+                )
+            ]
+            reason = "; ".join(
+                f"waiting on blocked parent {pid}: {why or '(no reason)'}" for pid, why in parents
+            )
+        else:
+            reason = _latest_block_reason(conn, row["id"])
+        out.append({
+            "task_id": row["id"],
+            "title": row["title"],
+            "priority": priority,
+            "kind": row["block_kind"],
+            "reason": reason or "(no reason given)",
+            "channel": channel,
+            "alerts": priority >= NEEDS_INPUT_PAGE_ALERTS_PRIORITY,
+        })
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Near-duplicate guard (opt-in per create surface: CLI + kanban_create tool)
@@ -4732,6 +5002,84 @@ def near_duplicate_warning(conn: sqlite3.Connection, task_id: str) -> Optional[d
         return json.loads(row["payload"])
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_skills(skills: Iterable[str]) -> list[str]:
+    """Strip, drop empties, dedupe (order kept); refuse commas and toolset names.
+
+    Shared by :func:`create_task` and :func:`set_task_skills` so ``create
+    --skill`` and ``edit --skill`` accept exactly the same names.
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    # Collect all toolset-name confusions up front so the user sees the
+    # whole list at once. Raising on the first hit is friendly when the
+    # input has one mistake, but agents that confuse skills with toolsets
+    # usually pass several at once (`skills=["web", "browser", "terminal"]`)
+    # and serial-correcting one per failure round-trips wastes tokens.
+    toolset_typos: list[str] = []
+    for s in skills:
+        if not s:
+            continue
+        name = str(s).strip()
+        if not name:
+            continue
+        if "," in name:
+            raise ValueError(
+                f"skill name cannot contain comma: {name!r} "
+                f"(pass a list of separate names instead of a comma-joined string)"
+            )
+        if name.casefold() in KNOWN_TOOLSET_NAMES:
+            toolset_typos.append(name)
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if toolset_typos:
+        quoted = ", ".join(repr(n) for n in toolset_typos)
+        noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+        raise ValueError(
+            f"{quoted} {noun}, not skill name(s). "
+            "Put toolsets in the assignee profile's `toolsets:` config "
+            "instead of per-task skills. Skills are named skill bundles "
+            "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
+            "capabilities (e.g. `web`, `browser`, `terminal`)."
+        )
+    return cleaned
+
+
+# A ``[milestone] QA`` card runs Argus on the sdlc-review procedure; the kernel
+# only force-loads that skill for review-lane spawns (off), so create attaches it
+# (kanban-review-lane-lint's "lack skill sdlc-review" finding, t_c9af70b6).
+MILESTONE_QA_TITLE_PREFIX = "[milestone] qa"
+MILESTONE_QA_SKILL = "sdlc-review"
+
+
+def is_milestone_qa_title(title: Optional[str]) -> bool:
+    return (title or "").strip().lower().startswith(MILESTONE_QA_TITLE_PREFIX)
+
+
+def max_event_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT MAX(id) FROM task_events").fetchone()
+    return int(row[0] or 0)
+
+
+def created_skills_auto_added(
+    conn: sqlite3.Connection, task_id: str, *, after_event_id: int = 0,
+) -> list[str]:
+    """Skills ``create_task`` auto-attached to this card, read from its
+    created event; ``after_event_id`` ignores a created event at or below
+    that id (an idempotent hit returning an older card)."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "AND id > ? ORDER BY id LIMIT 1", (task_id, after_event_id),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except Exception:
+        return []
+    return list(payload.get("skills_auto_added") or [])
 
 
 def create_task(
@@ -4946,43 +5294,14 @@ def create_task(
     # not here.
     skills_list: Optional[list[str]] = None
     if skills is not None:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        # Collect all toolset-name confusions up front so the user sees the
-        # whole list at once. Raising on the first hit is friendly when the
-        # input has one mistake, but agents that confuse skills with toolsets
-        # usually pass several at once (`skills=["web", "browser", "terminal"]`)
-        # and serial-correcting one per failure round-trips wastes tokens.
-        toolset_typos: list[str] = []
-        for s in skills:
-            if not s:
-                continue
-            name = str(s).strip()
-            if not name:
-                continue
-            if "," in name:
-                raise ValueError(
-                    f"skill name cannot contain comma: {name!r} "
-                    f"(pass a list of separate names instead of a comma-joined string)"
-                )
-            if name.casefold() in KNOWN_TOOLSET_NAMES:
-                toolset_typos.append(name)
-                continue
-            if name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(name)
-        if toolset_typos:
-            quoted = ", ".join(repr(n) for n in toolset_typos)
-            noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
-            raise ValueError(
-                f"{quoted} {noun}, not skill name(s). "
-                "Put toolsets in the assignee profile's `toolsets:` config "
-                "instead of per-task skills. Skills are named skill bundles "
-                "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
-                "capabilities (e.g. `web`, `browser`, `terminal`)."
-            )
-        skills_list = cleaned
+        skills_list = _normalize_skills(skills)
+    # Auto-attach sdlc-review to a ``[milestone] QA`` card (t_c9af70b6); the
+    # created event records it so the addition is never silent.
+    skills_auto_added: list[str] = []
+    if is_milestone_qa_title(title) and MILESTONE_QA_SKILL not in (skills_list or []):
+        skills_list = [*(skills_list or []), MILESTONE_QA_SKILL]
+        skills_auto_added.append(MILESTONE_QA_SKILL)
+
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -5241,6 +5560,8 @@ def create_task(
                         "project_id": project_id,
                         "creator_task_id": creator_task_id,
                         "skills": list(skills_list) if skills_list else None,
+                        **({"skills_auto_added": skills_auto_added}
+                           if skills_auto_added else {}),
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -8945,6 +9266,31 @@ def complete_task(
         and candidate.current_run_id is not None
         and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
     )
+    # Receipt gate (t_e21aa11c): a dispatcher-owned worker handoff
+    # (``expected_run_id`` set) that closes ``done`` with prose only -- no PR,
+    # survivor, attachment or structured metadata -- is refused before any
+    # mutation. Operator closes are not gated. Knob ``kanban.receipt_gate``.
+    if (
+        expected_run_id is not None
+        and candidate.status == 'running' and not review_claimed
+        and not approve_head_sha and not superseded_by
+        and configured_receipt_gate()
+    ):
+        from hermes_cli import kanban_receipt as _receipt
+        if _receipt.missing(
+            summary=summary, result=result, metadata=metadata,
+            survivor_pr=survivor_pr, survivor_ref=survivor_ref,
+            survivor_none=survivor_none,
+            attachments=_receipt.attachment_count(conn, task_id),
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, _receipt.EVENT,
+                    {"reason": _receipt.REASON_CODE,
+                     "metadata_keys": sorted((metadata or {}).keys())
+                     if isinstance(metadata, dict) else []},
+                )
+            raise _receipt.ReceiptRequiredError(task_id)
     negative_trigger: Optional[str] = None
     if (
         candidate.status == 'running' and not review_claimed
@@ -11133,6 +11479,17 @@ def configured_negative_handoff_review() -> bool:
     except Exception:
         return False
     return value is True or str(value).strip().casefold() in ("1", "true", "yes", "on")
+
+
+def configured_receipt_gate() -> bool:
+    """``kanban.receipt_gate`` — refuse a receipt-less implementer completion (default on)."""
+    try:
+        value, _source = _kanban_review_setting("receipt_gate", True)
+    except Exception:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() not in ("0", "false", "no", "off")
 
 
 def configured_review_policy() -> str:
@@ -13711,6 +14068,52 @@ def set_task_model(
     return int(cur.rowcount or 0)
 
 
+
+def set_task_skills(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    add: Iterable[str] = (),
+    clear: bool = False,
+    operator: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Edit a card's force-loaded skills: ``clear`` empties the list first,
+    then ``add`` names are appended (validated + deduped like ``create
+    --skill``). Returns the new list, or ``None`` for an unknown id.
+
+    A change records ``skills_set`` ``{before, after, operator}``; a no-op
+    edit writes nothing. Takes effect on the card's next spawn.
+    """
+    added = _normalize_skills(add)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT skills FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        before: list[str] = []
+        if row["skills"]:
+            try:
+                parsed = json.loads(row["skills"])
+                if isinstance(parsed, list):
+                    before = [str(x) for x in parsed if x]
+            except Exception:
+                before = []
+        after = [] if clear else list(before)
+        after += [n for n in added if n not in after]
+        if after != before:
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(after) if after else None, task_id),
+            )
+            _append_event(
+                conn, task_id, "skills_set",
+                {"before": before, "after": after, "operator": operator},
+            )
+    if after != before:
+        notify_task_updated(conn, task_id, ("skills",))
+    return after
+
 @_home_session_guarded("priority")
 def set_task_priority(
     conn: sqlite3.Connection,
@@ -14647,6 +15050,10 @@ class _PrStateResolver:
             self.cycle_skip.clear()
 _worker_processes: dict = {}
 _worker_processes_lock = threading.Lock()
+# pid -> (task_id, run_id, spawned_at) for every worker THIS process spawned. Read when the worker is
+# seen to exit, so the leftovers of a run that ended cleanly (worker called kanban_complete, then
+# exited) are reaped too: the crash path only ever looks at ``running`` cards (fork t_446b6b99).
+_worker_identities: "dict[int, tuple[str, Optional[int], float]]" = {}
 
 # Startup stranding is a boot/restart reconciliation pass, not a per-tick
 # mount-probe fan-out. Ready/review candidates are still checked every tick
@@ -15072,6 +15479,261 @@ def _reap_run_env_escapees(
         len(targets), task_id, run_id,
     )
     return len(targets)
+
+
+#: TERM -> KILL grace for the exit-path and orphan-sweep reaps (t_446b6b99).
+WORKER_LEFTOVER_KILL_GRACE_SECONDS = 10.0
+#: A card must have been terminal this long before the orphan sweep touches
+#: processes in its workspace: a worker that called ``kanban_complete`` is
+#: still finishing its turn for a few seconds after the card flips to done.
+ORPHAN_SWEEP_MIN_TERMINAL_AGE_SECONDS = 300
+_ORPHAN_SWEEP_CARD_RE = re.compile(r"t_[0-9a-f]+")
+
+
+def _register_worker_identity(
+    pid: int, task_id: str, run_id: Optional[int], spawned_at: float,
+) -> None:
+    """Remember which card/run a spawned worker pid belongs to."""
+    with _worker_processes_lock:
+        _worker_identities[int(pid)] = (str(task_id), run_id, float(spawned_at))
+
+
+def reap_exited_worker_leftovers(
+    conn: Optional[sqlite3.Connection],
+    exited_pids: Iterable[int],
+    *,
+    grace: float = WORKER_LEFTOVER_KILL_GRACE_SECONDS,
+) -> list[str]:
+    """Reap what each just-exited worker left behind, whatever the card state.
+
+    Workers run in their own session (``start_new_session=True``). A worker
+    that completes its card and exits leaves every server it started (a
+    ``caddy``, a preview server, a bridge) running with ppid 1; the crash
+    path never sees it because the card is no longer ``running``
+    (2026-10-01: four such listeners, 3 h 42 m to 2 d 7 h old). For each pid
+    observed exiting this tick, reap its session's process groups and the
+    run-identified processes that left the session, then record a
+    ``worker_leftovers_reaped`` event on the card. Members must be born
+    between the spawn and the moment ``poll()`` reaped the worker: its pid
+    (= sid) is only free for reuse after that, so a recycled session leader
+    is always born too late to qualify. Returns the task ids that had
+    leftovers.
+    """
+    reaped_cards: list[str] = []
+    for pid in exited_pids:
+        with _worker_processes_lock:
+            ident = _worker_identities.pop(int(pid), None)
+        if ident is None:
+            continue
+        task_id, run_id, spawned_at = ident
+        exit_entry = _recent_worker_exits.get(int(pid))
+        now = exit_entry[1] if exit_entry else time.time()
+        try:
+            groups = _reap_worker_session(
+                int(pid), born_after=spawned_at, born_before=now, grace=grace,
+            )
+            escaped = _reap_run_env_escapees(
+                task_id, run_id, born_after=spawned_at, born_before=now, grace=grace,
+            )
+        except Exception as exc:  # never break a dispatcher tick
+            _log.warning("kanban: leftover reap of worker %s failed: %s", pid, exc)
+            continue
+        if not (groups or escaped):
+            continue
+        reaped_cards.append(task_id)
+        _log.warning(
+            "kanban: reaped leftovers of exited worker pid=%s task=%s run=%s "
+            "(session_groups=%d env_escapees=%d)",
+            pid, task_id, run_id, groups, escaped,
+        )
+        if conn is not None:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "worker_leftovers_reaped",
+                        {"pid": int(pid), "session_groups": groups,
+                         "env_escapees": escaped},
+                        run_id=run_id,
+                    )
+            except Exception as exc:
+                _log.debug("worker_leftovers_reaped event failed: %s", exc)
+    return reaped_cards
+
+
+def _card_terminal_since(conn: sqlite3.Connection, task_id: str) -> Optional[float]:
+    """When ``task_id`` last changed if it is ``done``/``archived``, else None.
+
+    "Last changed" is its newest event, so a card reopened and closed again
+    restarts the age clock."""
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] not in ("done", "archived"):
+        return None
+    ev = conn.execute(
+        "SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    return float(ev[0]) if ev and ev[0] is not None else 0.0
+
+
+_INIT_REAPER_NAMES = frozenset({"launchd", "init", "systemd"})
+
+
+def _init_parented(proc: "psutil.Process", ppid: Optional[int]) -> bool:
+    """True when ``proc`` was reparented to init: ppid 1 (launchd on macOS),
+    or a Linux ``systemd --user`` child subreaper that adopts orphans in a
+    user session (the CI runner's case)."""
+    if ppid == 1:
+        return True
+    if not ppid or not sys.platform.startswith("linux"):
+        return False
+    try:
+        return psutil.Process(ppid).name() in _INIT_REAPER_NAMES
+    except (psutil.Error, OSError):
+        return False
+
+
+def sweep_terminal_workspace_orphans(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    root: Optional[Path] = None,
+    grace: float = WORKER_LEFTOVER_KILL_GRACE_SECONDS,
+    min_terminal_age: float = ORPHAN_SWEEP_MIN_TERMINAL_AGE_SECONDS,
+    notify: bool = True,
+) -> dict[str, list[dict]]:
+    """Reap ppid-1 processes whose cwd is a TERMINAL card's scratch workspace.
+
+    Backstop for leftovers the exit-path reap cannot see: workers spawned by a
+    dispatcher that has since restarted (no retained Popen), or children that
+    dropped both the session and the run identity. A candidate must be ours
+    (same uid), reparented to init (:func:`_init_parented`), have its cwd under
+    ``<workspaces_root>/<card>/``, and that card must be ``done``/``archived``
+    for at least ``min_terminal_age`` seconds. A process whose environment
+    names a DIFFERENT card that is not terminal is left alone. Each target and
+    its descendants get SIGTERM, then SIGKILL after ``grace`` seconds. Records
+    an ``orphans_reaped`` event per card and sends ONE #logs line per sweep,
+    only when something was reaped. Returns ``{card: [{pid, name, cwd}]}``.
+    """
+    if not hasattr(os, "getuid"):
+        return {}
+    try:
+        base = root if root is not None else workspaces_root(board, stale_pin_ok=True)
+        base_real = os.path.realpath(str(base))
+    except Exception:
+        return {}
+    me, uid = os.getpid(), os.getuid()  # windows-footgun: ok (hasattr-gated above)
+    candidates: dict[str, list] = {}
+    for proc in psutil.process_iter(["pid", "ppid", "uids"]):
+        info = proc.info
+        pid = info.get("pid") or 0
+        if pid <= 1 or pid == me or not _init_parented(proc, info.get("ppid")):
+            continue
+        uids = info.get("uids")
+        if uids is None or uids.real != uid:
+            continue
+        try:
+            cwd = proc.cwd()
+        except (psutil.Error, OSError):
+            continue
+        if not cwd:
+            continue
+        try:
+            rel = os.path.relpath(os.path.realpath(cwd), base_real)
+        except ValueError:
+            continue
+        card = rel.split(os.sep, 1)[0]
+        if rel.startswith(os.pardir) or not _ORPHAN_SWEEP_CARD_RE.fullmatch(card):
+            continue
+        candidates.setdefault(card, []).append((proc, cwd))
+    if not candidates:
+        return {}
+
+    now = time.time()
+    terminal: dict[str, bool] = {}
+
+    def _is_terminal(card: str) -> bool:
+        if card not in terminal:
+            since = _card_terminal_since(conn, card)
+            terminal[card] = since is not None and now - since >= min_terminal_age
+        return terminal[card]
+
+    plan: dict[str, list] = {}
+    for card, procs in candidates.items():
+        if not _is_terminal(card):
+            continue
+        for proc, cwd in procs:
+            try:
+                env_card = proc.environ().get("HERMES_KANBAN_TASK")
+            except (psutil.Error, OSError):
+                env_card = None
+            if env_card and env_card != card and not _is_terminal(env_card):
+                continue
+            plan.setdefault(card, []).append((proc, cwd))
+    if not plan:
+        return {}
+
+    targets: dict[int, "psutil.Process"] = {}
+    reaped: dict[str, list[dict]] = {}
+    for card, procs in plan.items():
+        for proc, cwd in procs:
+            try:
+                name = proc.name()
+                family = [proc, *proc.children(recursive=True)]
+            except (psutil.Error, OSError):
+                continue
+            for p in family:
+                if p.pid > 1 and p.pid != me:
+                    targets.setdefault(p.pid, p)
+            reaped.setdefault(card, []).append({"pid": proc.pid, "name": name, "cwd": cwd})
+    for p in targets.values():
+        try:
+            p.terminate()  # psutil refuses a pid reused since it was listed
+        except (psutil.Error, OSError):
+            pass
+    _, alive = psutil.wait_procs(list(targets.values()), timeout=grace)
+    for p in alive:
+        try:
+            p.kill()
+        except (psutil.Error, OSError):
+            pass
+    if not reaped:
+        return {}
+    for card, items in reaped.items():
+        _log.warning("kanban: reaped %d orphan(s) in terminal card %s workspace: %s",
+                     len(items), card, ", ".join(f"{i['name']}({i['pid']})" for i in items))
+        try:
+            with write_txn(conn):
+                _append_event(conn, card, "orphans_reaped",
+                              {"processes": items, "sigkill": len(alive)})
+        except Exception as exc:
+            _log.debug("orphans_reaped event failed: %s", exc)
+    if notify:
+        _notify_orphan_sweep(board, reaped)
+    return reaped
+
+
+def _notify_orphan_sweep(board: Optional[str], reaped: dict[str, list[dict]]) -> None:
+    """ONE #logs line for a sweep that reaped something. Best-effort."""
+    try:
+        from hermes_cli import kanban_budget as _kbudget
+
+        script = _kbudget._notify_script_path()
+        if script is None:
+            return
+        n = sum(len(v) for v in reaped.values())
+        detail = "; ".join(
+            f"{card}: " + ", ".join(f"{i['name']}({i['pid']})" for i in items)
+            for card, items in sorted(reaped.items())
+        )
+        body = (
+            f"🧹 Kanban '{board or 'default'}': reaped {n} orphan process(es) "
+            f"left in terminal cards' workspaces: {detail}"
+        )
+        _kbudget._run_notify([
+            sys.executable, script, "--channel", "discord",
+            "--target", _kbudget.RECOVERY_TARGET, "--send", body[:1900],
+        ])
+    except Exception as exc:  # pragma: no cover - paging must never break a tick
+        _log.debug("orphan sweep notify failed: %s", exc)
 
 
 def _run_last_evidence_at(

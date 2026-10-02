@@ -411,7 +411,8 @@ def test_goal_complete_first_call_uses_deliverables_not_completion_receipt(monke
         return ("done", "deliverable verified", False, None, False)
 
     monkeypatch.setattr(kt, "judge_goal", judge)
-    result = json.loads(kt._handle_complete({"summary": "CANARY_PHASE1_NEW and CANARY_PHASE2_NEW; both exit 0"}))
+    result = json.loads(kt._handle_complete({"summary": "CANARY_PHASE1_NEW and CANARY_PHASE2_NEW; both exit 0",
+                                             "metadata": {"tests_run": 2}}))
     assert result.get("ok") is True, result
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "done"

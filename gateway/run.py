@@ -1233,6 +1233,40 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     return bool(mt)
 
 
+def _compose_inbound_user_turn(
+    message_text: Any, event_ts: Any = None
+) -> tuple[Any, Optional[str], Optional[float]]:
+    """Compose a user turn's API text and its clean persisted form.
+
+    Returns ``(api_text, persist_text, persist_ts)``. Storage keeps the clean
+    text plus the send time as metadata; when gateway.message_timestamps is
+    enabled the model sees one ``[timestamp]`` prefix rendered from that same
+    time. Replay (``_build_gateway_agent_history``) renders the prefix from
+    the stored time, so every turn must go through here or turn N+1 replays
+    bytes turn N never sent (t_29abfaf6: queued and leftover-steer follow-ups
+    were sent bare and replayed prefixed, a -30 B prefix mutation).
+    ``event_ts`` falls back to an embedded prefix, then to now. Non-string
+    input passes through unchanged with no persist override.
+    """
+    if not message_text or not isinstance(message_text, str):
+        return message_text, None, None
+    from hermes_time import get_timezone as _get_evt_tz
+    from gateway.message_timestamps import (
+        coerce_message_timestamp as _coerce_msg_ts,
+        render_user_content_with_timestamp as _render_msg_ts,
+        strip_leading_message_timestamps as _strip_msg_ts,
+    )
+
+    _evt_tz = _get_evt_tz()
+    clean_text, embedded_ts = _strip_msg_ts(message_text, tz=_evt_tz)
+    persist_ts = _coerce_msg_ts(event_ts, tz=_evt_tz)
+    if persist_ts is None:
+        persist_ts = embedded_ts if embedded_ts is not None else time.time()
+    if _message_timestamps_enabled(_load_gateway_config()):
+        return _render_msg_ts(clean_text, persist_ts, tz=_evt_tz), clean_text, persist_ts
+    return clean_text, clean_text, persist_ts
+
+
 def _has_replayable_sidecar(role: Any, content: Any, msg: Dict[str, Any]) -> bool:
     """True for an assistant row whose reply lives only in the ``api_content`` sidecar.
 
