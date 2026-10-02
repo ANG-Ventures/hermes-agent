@@ -22,6 +22,10 @@ _RELAY_RE = re.compile(r"^claude-(apr|bpr)$", re.IGNORECASE)
 # t_ee99d1cd: so are its a/d f/s harness faces (hermes-home#2173).
 _RELAY_ALIAS = {p: "claude-apr" for p in (
     "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf")}
+# t_9038e9f3: claude-btpr is the bpr relay (:18811) in tui delivery mode, the first
+# fallback rung of every claude worker profile. Unmapped, it was never judged on
+# any pool: a capped bpr still "admitted" it and the worker died at 429.
+_RELAY_ALIAS["claude-btpr"] = "claude-bpr"
 _PINNED_RE = re.compile(r"^claude-(apx|bpx)-(\d+)$", re.IGNORECASE)
 
 # Each family has its OWN relay and its own eligible_count (Argus r1, PR #953:
@@ -221,6 +225,40 @@ def configured_min_eligible() -> int:
         return 1
 
 
+def configured_pool_shed() -> list[tuple[int, int]]:
+    """``kanban.pool_shed``: ``[{below_eligible: N, max_priority: P}, ...]``.
+
+    While a claude relay pool reports fewer than N eligible subs, a card of
+    priority <= P on that pool is routed to the first NON-pool rung of its
+    profile's fallback chain (t_9038e9f3; Ace: an exhausted seat means use the
+    other vendor's seat, never a top-up, never a worker cap). Shedding only
+    re-routes: with no non-pool rung the card is admitted on its own route.
+    Returned sorted by threshold; malformed rows are dropped; absent = [] (off).
+    """
+    from hermes_cli.config import load_config
+    try:
+        rows = load_config().get("kanban", {}).get("pool_shed") or []
+    except Exception:
+        return []
+    out = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            n, prio = row.get("below_eligible"), row.get("max_priority")
+            if type(n) is int and type(prio) is int and n > 0:
+                out.append((n, prio))
+    return sorted(out)
+
+
+def shed_priority(tiers, eligible) -> int | None:
+    """Highest ``max_priority`` among tiers whose threshold ``eligible`` is under; None = no shed."""
+    if eligible is None:
+        return None
+    hit = [prio for n, prio in tiers if eligible < n]
+    return max(hit) if hit else None
+
+
 def configured_pool_spawns_per_eligible() -> int:
     """Per-tick spawns per eligible sub; zero restores unlimited admission."""
     from hermes_cli.config import load_config
@@ -390,6 +428,7 @@ def available_profile_fallback(
     task, probes: dict, cache: dict, *, min_eligible: int = 1,
     pool_urls: dict | None = None, skip_pools=frozenset(), box_health: bool = True,
     budget_available=None, skip_providers=frozenset(), skipped: list | None = None,
+    non_pool_only: bool = False,
 ) -> tuple[str, str] | None:
     """Pick a healthy configured profile rung without changing the task row.
 
@@ -398,6 +437,7 @@ def available_profile_fallback(
     or whose provider is in ``skip_providers`` (credential cooldown) is never
     chosen. When ``skipped`` is a list, every rejected rung is appended to it
     as ``{"provider", "model", "reason"}`` so the caller can say why.
+    ``non_pool_only`` (the pool-shed path) skips every claude-pool rung.
     """
     def _skip(provider, model, reason):
         if skipped is not None:
@@ -422,6 +462,9 @@ def available_profile_fallback(
         if not isinstance(provider, str) or not isinstance(model, str) or not provider or not model:
             continue
         if provider == effective_provider(task):
+            continue
+        if non_pool_only and pool_route(provider) is not None:
+            _skip(provider, model, "pool_shed")
             continue
         if skip_pools and pool_key(provider) in skip_pools:
             _skip(provider, model, "rate_limit_circuit")

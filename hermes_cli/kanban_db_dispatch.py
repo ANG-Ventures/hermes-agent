@@ -4067,11 +4067,12 @@ def _dispatch_once_locked(
     from hermes_cli.kanban_provider_health import (
         available_profile_fallback, capped_provider, configured_min_eligible,
         configured_box_health, configured_pool_health_urls, configured_probes,
-        configured_pool_spawns_per_eligible, effective_provider, pool_budget_eligible,
-        pool_key,
+        configured_pool_shed, configured_pool_spawns_per_eligible, effective_provider,
+        pool_budget_eligible, pool_key, pool_route, shed_priority,
     )
     health_probes = configured_probes()
     min_eligible = configured_min_eligible()
+    shed_tiers = configured_pool_shed()
     pool_urls = configured_pool_health_urls()
     box_health = configured_box_health()
     pool_spawns_per_eligible = configured_pool_spawns_per_eligible()
@@ -4186,6 +4187,41 @@ def _dispatch_once_locked(
         _kb._log.warning("kanban credential cooldown check failed (%s: %s)", type(exc).__name__, exc)
         cooling = {}
 
+    def pool_shed(task, route_provider, card_pinned):
+        """Pool-shed rung (t_9038e9f3): a low-priority card on a claude RELAY
+        pool whose eligible count is under a ``kanban.pool_shed`` threshold
+        spawns on its profile's first healthy NON-pool rung instead. Card pins
+        and per-sub routes are never shed; no such rung = no shed (admitted as
+        before). Returns a fallback selection or None."""
+        if not shed_tiers or card_pinned or task.pin_sub_reason:
+            return None
+        route = pool_route(route_provider)
+        if route is None or route[1] is not None:
+            return None
+        eligible = pool_budget_eligible(route_provider, health_probes, health_cache,
+                                        pool_urls, box_health=box_health)
+        max_prio = shed_priority(shed_tiers, eligible)
+        if max_prio is None or (task.priority or 0) > max_prio:
+            return None
+        skipped: list = []
+        fallback = available_profile_fallback(
+            task, health_probes, health_cache, min_eligible=min_eligible,
+            pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
+            budget_available=lambda provider: pool_budget(provider) is None,
+            skip_providers=frozenset(cooling), skipped=skipped, non_pool_only=True,
+        )
+        if fallback is None or fallback_flagship_banned(task.id, fallback[0]):
+            return None
+        payload = {"reason": "pool_shed", "provider": route_provider, "pool": route[0],
+                   "eligible": eligible, "max_priority": max_prio,
+                   "priority": task.priority or 0}
+        _kb._log.info(
+            "PHASE=kanban_pool_shed task=%s from=%s eligible=%s prio=%s<=%s to=%s/%s",
+            task.id, route_provider, eligible, task.priority, max_prio, fallback[1], fallback[0],
+        )
+        admitted_routes[task.id] = pool_key(fallback[1])
+        return fallback, payload
+
     def provider_admission(task_id, assignee):
         if (not health_probes and not any(pool_urls.values()) and not box_health
                 and not circuits and not cooling):
@@ -4194,6 +4230,7 @@ def _dispatch_once_locked(
         if task is None:
             return False, None
         task.assignee = assignee
+        card_pinned = bool(task.model_override or task.provider_override)
         # Health is judged on the EFFECTIVE route: lane override first (only
         # for cards with no pin of their own), so a capped profile default
         # under a healthy lane is admitted, and a capped lane still falls back.
@@ -4218,6 +4255,9 @@ def _dispatch_once_locked(
             if payload is None:
                 payload = pool_budget(route_provider)
         if payload is None:
+            shed = pool_shed(task, route_provider, card_pinned)
+            if shed is not None:
+                return False, shed
             admitted_routes[task_id] = circuit_pool
             return False, None
         from hermes_cli.model_policy import is_sub_pin_route, sub_pin_family_pool
@@ -4310,6 +4350,8 @@ def _dispatch_once_locked(
         claimed.model_override, claimed.provider_override = model, provider
         event = {"from_provider": capped["provider"], "to_provider": provider,
                  "to_model": model}
+        if capped.get("reason") == "pool_shed":
+            event.update({k: capped[k] for k in ("reason", "pool", "eligible", "max_priority")})
         if capped.get("fallback_skipped"):
             event["skipped"] = capped["fallback_skipped"]
         with _kbc.write_txn(conn):
@@ -4317,6 +4359,9 @@ def _dispatch_once_locked(
                           run_id=claimed.current_run_id)
 
     def fallback_route_source(source, selection):
+        if selection[1].get("reason") == "pool_shed":
+            return (f"pool-shed({source}; {selection[1]['pool']} eligible "
+                    f"{selection[1]['eligible']}, priority <= {selection[1]['max_priority']})")
         skipped = selection[1].get("fallback_skipped")
         if not skipped:
             return f"dispatch-fallback(capped {source})"
