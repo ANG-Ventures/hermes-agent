@@ -1925,7 +1925,7 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
         if not st.probe_catalog:
             # Re-resolution of an already-accepted route: no live probe.
             raise _SkipCatalogProbe
-        validation = _models_facade.validate_requested_model(
+        validation = _models_facade._validate_requested_model_seam()(
             st.new_model, validate_as, api_key=st.api_key, base_url=st.base_url,
             api_mode=st.api_mode or None, headers=headers)
     except _SkipCatalogProbe:

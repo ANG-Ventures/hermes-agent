@@ -449,22 +449,24 @@ class TestClaudeOpus55InCuratedLists:
         assert "claude-opus-5" in lst
         assert lst.index("claude-opus-5-5") < lst.index("claude-opus-5")
 
+    # OpenRouter / Nous Portal spell the id with a dot (``anthropic/claude-opus-5.5``, like
+    # ``claude-opus-4.8``) — upstream 463980c0e4 verified it with a live completion on each route.
     def test_nous_list_includes_opus_5_5_above_opus_5(self):
         from hermes_cli.models import _PROVIDER_MODELS
         lst = _PROVIDER_MODELS["nous"]
-        assert "anthropic/claude-opus-5-5" in lst
+        assert "anthropic/claude-opus-5.5" in lst
         assert "anthropic/claude-opus-5" in lst
-        assert lst.index("anthropic/claude-opus-5-5") < lst.index(
+        assert lst.index("anthropic/claude-opus-5.5") < lst.index(
             "anthropic/claude-opus-5"
         )
 
     def test_openrouter_snapshot_includes_opus_5_5_and_its_fast_sku(self):
         from hermes_cli.models import OPENROUTER_MODELS
         ids = [mid for mid, _ in OPENROUTER_MODELS]
-        assert "anthropic/claude-opus-5-5" in ids
-        assert "anthropic/claude-opus-5-5-fast" in ids
+        assert "anthropic/claude-opus-5.5" in ids
+        assert "anthropic/claude-opus-5.5-fast" in ids
         assert "anthropic/claude-opus-5" in ids
-        assert ids.index("anthropic/claude-opus-5-5") < ids.index(
+        assert ids.index("anthropic/claude-opus-5.5") < ids.index(
             "anthropic/claude-opus-5"
         )
 class TestFormatPricePerMtok:

@@ -55,9 +55,21 @@ from hermes_cli.models_reasoning_caps import (
     _OPENROUTER_CATALOG_URL,
     _seed_reasoning_caps)
 # Fork facade re-export: ``validate_requested_model`` moved to ``models_validate`` upstream; fork
-# callers and tests import / patch it on ``hermes_cli.models`` (``model_switch`` reads it here at
-# call time so ``patch("hermes_cli.models.validate_requested_model")`` keeps intercepting).
+# callers and tests import / patch it on ``hermes_cli.models`` too. ``model_switch`` resolves
+# through ``_validate_requested_model_seam`` so a patch on EITHER module intercepts.
 from hermes_cli.models_validate import validate_requested_model  # noqa: F401
+_VALIDATE_REQUESTED_MODEL_ORIGINAL = validate_requested_model
+
+
+def _validate_requested_model_seam():
+    """The live ``validate_requested_model``: a facade patch (``hermes_cli.models.*``) wins over
+    the unpatched sibling, else the sibling (``hermes_cli.models_validate.*``, also patchable)."""
+    from hermes_cli import models_validate as _mv
+
+    facade = globals().get("validate_requested_model")
+    if facade is not _VALIDATE_REQUESTED_MODEL_ORIGINAL:
+        return facade
+    return _mv.validate_requested_model
 from hermes_cli.models_local import (
     _OLLAMA_LOCAL_MODELS_CACHE,
     _OLLAMA_LOCAL_MODELS_CACHE_TTL,
