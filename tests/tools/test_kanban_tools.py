@@ -628,6 +628,11 @@ def test_worker_the_dispatcher_never_recorded_keeps_its_claim_or_never_starts(mo
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
+    # This test process stands in for the worker, so it predates its own claim.
+    # The fork judges a live pid by the claim's causal window as well as the
+    # spawn fingerprint (t_0ae83825); use the designed seam for synthetic pids.
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *_args: True)
+
     assert kt.register_current_worker_from_env() is True
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, worker_env).worker_pid == _os.getpid()
@@ -639,6 +644,20 @@ def test_worker_the_dispatcher_never_recorded_keeps_its_claim_or_never_starts(mo
         kb.claim_task(conn, late)
         stale_run = kb._current_run_id(conn, late)
         _expire_claim(conn, late)
+        # Fork contract (#921 / t_09180e10): a pid-less claim is released only
+        # once its claimer is provably dead AND the launch bound has passed; a
+        # live claimer (this process, ``kb._claimer_id()``) may still be
+        # spawning. Model the dead dispatcher the docstring describes.
+        import subprocess as _sp, sys as _sys, time as _time
+        dead = _sp.Popen([_sys.executable, "-c", "pass"], stdin=_sp.DEVNULL)
+        dead.wait(timeout=10)
+        old = int(_time.time()) - kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS - 3600
+        host = kb._claimer_id().split(":", 1)[0]
+        conn.execute("UPDATE tasks SET claim_lock = ?, started_at = ? WHERE id = ?",
+                     (f"{host}:{dead.pid}", old, late))
+        conn.execute("UPDATE task_runs SET claim_lock = ?, started_at = ? WHERE id = ?",
+                     (f"{host}:{dead.pid}", old, stale_run))
+        conn.commit()
         assert kb.release_stale_claims(conn) == 1
         kb.claim_task(conn, late)
     monkeypatch.setenv("HERMES_KANBAN_TASK", late)

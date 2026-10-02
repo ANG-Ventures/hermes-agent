@@ -180,7 +180,9 @@ def test_operator_terminal_outcome_does_not_certify_worker_exit(conn, monkeypatc
     elif release == "review":
         assert kb.request_review(conn, tid, summary="operator", reviewer="worker", force=True)
     elif release == "complete":
-        assert kb.complete_task(conn, tid, summary="operator")
+        # Upstream #111764: an operator close of a card under a LIVE worker
+        # claim is an explicit override (force=True), never implicit.
+        assert kb.complete_task(conn, tid, summary="operator", force=True)
         assert api._set_status_direct(conn, tid, "ready")
         assert kb.claim_task(conn, tid) is None
         assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"

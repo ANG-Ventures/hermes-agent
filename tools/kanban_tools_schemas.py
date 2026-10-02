@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from hermes_cli import kanban_review_schema as _review_schema
+
 _DESC_TASK_ID_DEFAULT = (
     "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env "
     "(the task the dispatcher spawned you to work on)."
@@ -264,7 +266,11 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
         "implementer with concrete required changes. This closes the review "
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
-        "review column; use kanban_block only for a genuine external blocker."
+        "review column. First post a current-run review_coverage JSON comment "
+        f"with lenses ({_review_schema.lens_list_text()}) and "
+        f"{_review_schema.coverage_fields_text().split(', ', 1)[1]}. "
+        "If a lens cannot run, use kanban_block(kind=capability), not "
+        "partial review."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
