@@ -25769,6 +25769,8 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
 
 _SHIM_MODEL_FAMILY_RANK = (("haiku", 1), ("sonnet", 2), ("opus", 3))
 SHIM_MODEL_CAPPED_FROM_ENV = "HERMES_KANBAN_SHIM_MODEL_CAPPED_FROM"
+# Per-card harness brain as claimed (t_a8f335c5); read by the lane runner.
+CARD_BRAIN_ENV = "HERMES_KANBAN_CARD_BRAIN"
 _SHIM_MODEL_ID_RE = re.compile(r"claude-(haiku|sonnet|opus)-\d[0-9a-z.-]*$")
 
 
@@ -25997,6 +25999,10 @@ def _default_spawn(
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    # The card's harness brain as claimed (t_a8f335c5; "" = none). The lane
+    # runner re-reads tasks.brain and stops ``model_diverged`` if it moved
+    # between this claim and its own read, as it does for model and effort.
+    env[CARD_BRAIN_ENV] = getattr(task, "brain", None) or ""
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
         from hermes_cli.kanban_worker_exit import exit_file

@@ -170,3 +170,27 @@ def test_show_json_carries_brain(kanban_home):
     tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker --brain alrf"))
     out = kc.run_slash(f"show {tid} --json")
     assert json.loads(out)["task"]["brain"] == "alrf"
+
+
+def test_spawn_env_exports_claimed_brain(kanban_home, monkeypatch):
+    """The dispatcher hands the lane runner the brain it claimed the card with."""
+    import subprocess
+
+    captured = {}
+
+    class _P:
+        pid = 4242
+
+    def _fake_popen(argv, **kw):
+        captured["env"] = kw.get("env") or {}
+        return _P()
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    ws = kanban_home / "ws"
+    ws.mkdir()
+    for brain, want in (("clxf-25", "clxf-25"), (None, "")):
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", assignee="cc-worker", brain=brain)
+            task = kb.get_task(conn, tid)
+        kb._default_spawn(task, str(ws))
+        assert captured["env"][kb.CARD_BRAIN_ENV] == want
