@@ -1141,8 +1141,11 @@ class TestPreflightCompression:
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=110_000),
-            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=110_000),
+            # The mid-turn request assembly / pre-API gate moved out of conversation_loop into
+            # turn_request_assembly / turn_preflight (upstream split) and read the estimators
+            # lazily from agent.model_metadata; turn_context keeps its own module-level binding.
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=110_000),
+            patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=110_000),
             patch.object(
                 agent,
                 "_compress_context",
@@ -1339,6 +1342,15 @@ class TestPreflightCompression:
         agent.context_compressor.update_from_response(
             {"prompt_tokens": 90_000, "completion_tokens": 100, "total_tokens": 90_100}
         )
+        # Parity 2026-10-01: the merge adopts upstream's deferral (0f4587e336f; pinned by
+        # test_switch_waits_for_new_provider_evidence and
+        # test_rough_over_threshold_waits_one_request_then_real_usage_compresses below): a
+        # rough reading over threshold waits one request for real usage whenever the last real
+        # prompt sat under it, replacing the fork's (rough, real) growth projection. The contract
+        # here is the CALIBRATED gate — that skew never scales a genuinely over-threshold
+        # estimate under — so make the estimate the deciding signal the way the provider-omits-
+        # usage path does (the deferral never applies there).
+        agent.context_compressor.note_usage_less_response()
 
         big_history = []
         for i in range(20):
@@ -1367,7 +1379,7 @@ class TestPreflightCompression:
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_rough_estimate),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),

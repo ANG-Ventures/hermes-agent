@@ -98,6 +98,12 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        # Execution middleware may replace the payload after the regular request preflight:
+        # re-check the byte cap at the terminal edge so the measured object is exactly what the
+        # SDK receives (fork request-body budget; raises RequestBodyBudgetExceeded).
+        from agent.turn_body_budget import terminal_request_body
+
+        next_api_kwargs = terminal_request_body(agent, next_api_kwargs)
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),

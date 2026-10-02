@@ -258,6 +258,7 @@ def _preflight_compression(
 
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
+    agent._prior_image_invariant_warned = False
     if not agent.compression_enabled:
         _rearm_uncompressed_overflow_warn(agent, out.messages, out.active_system_prompt)
         return

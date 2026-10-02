@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any
+from typing import Any, Dict, Optional
 
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
 from hermes_cli.observability.shared_metrics_efficiency import observe_request_tools
@@ -31,6 +31,8 @@ class ApiRequestBuild:
     api_kwargs: Any
     _original_api_kwargs: Any
     _llm_middleware_trace: Any
+    thinking_spinner: Any = None
+    result: Optional[Dict[str, Any]] = None
 
 
 def _set_extra_header(api_kwargs: Any, key: str, value: str) -> None:
@@ -94,10 +96,12 @@ def build_api_request(
     agent: Any, *, api_messages: Any, _moa_prepared_request: Any, tools_for_api: Any,
     system_message: Any, messages: Any, original_user_message: Any, approx_tokens: Any,
     total_chars: Any, retry_count: Any, api_call_count: Any, api_request_id: Any,
-    api_start_time: Any, effective_task_id: Any, turn_id: Any,
+    api_start_time: Any, effective_task_id: Any, turn_id: Any, thinking_spinner: Any = None,
+    conversation_history: Any = None,
 ) -> ApiRequestBuild:
     """Assemble the attempt's request in the original order (every mutation happens BEFORE
-    middleware/hooks/debug dumps observe the payload)."""
+    middleware/hooks/debug dumps observe the payload). ``action == "return"`` with ``result``
+    when the serialized body cannot satisfy the provider's byte cap (fork request-body budget)."""
     from agent.conversation_loop import (
         _moa_client_consumes_prepared_request, _redecorate_prompt_cache_for_provider,
     )
@@ -155,6 +159,21 @@ def build_api_request(
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
 
+    # Token occupancy does not model base64/JSON bytes: providers with a declared HTTP body
+    # ceiling get a serialized-size preflight after request middleware, before any provider call.
+    from agent.turn_body_budget import body_budget_failure, preflight_request_body
+
+    api_kwargs, _body_error = preflight_request_body(agent, api_kwargs)
+    if _body_error is not None:
+        return ApiRequestBuild(
+            "return", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
+            _original_api_kwargs, _llm_middleware_trace, thinking_spinner=None,
+            result=body_budget_failure(
+                agent, _body_error, messages=messages, conversation_history=conversation_history,
+                api_call_count=api_call_count, thinking_spinner=thinking_spinner,
+            ),
+        )
+
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
         original_user_message=original_user_message, approx_tokens=approx_tokens,
@@ -181,5 +200,5 @@ def build_api_request(
             )
     return ApiRequestBuild(
         "fallthrough", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
-        _original_api_kwargs, _llm_middleware_trace,
+        _original_api_kwargs, _llm_middleware_trace, thinking_spinner=thinking_spinner,
     )

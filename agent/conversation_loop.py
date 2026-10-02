@@ -2177,7 +2177,9 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         if _ng.action == "break":
             return None
         try:
-            _run_phase(build_api_request, agent, s)
+            _bq = _run_phase(build_api_request, agent, s)
+            if _bq.action == "return":
+                return _bq.result
             if _run_phase(perform_api_call, agent, s).action == "break":
                 return None
             _rc = _run_phase(check_api_response, agent, s)
