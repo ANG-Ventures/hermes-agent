@@ -185,10 +185,29 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     return (False, None)
 
 
+# Fork: reboot/shutdown hardline descriptions that may be downgraded to the DANGEROUS layer when
+# HERMES_ALLOW_REBOOT is opted into. Kept in sync with the reboot/shutdown entries in HARDLINE_PATTERNS.
+_REBOOT_HARDLINE_DESCS = {
+    "system shutdown/reboot",
+    "init 0/6 (shutdown/reboot)",
+    "systemctl poweroff/reboot",
+    "telinit 0/6 (shutdown/reboot)",
+}
+
+
+def _reboot_shutdown_allowed() -> bool:
+    """Fork: ``HERMES_ALLOW_REBOOT`` truthy downgrades the reboot/shutdown family from the unconditional
+    hardline block to the DANGEROUS layer (approval-gated; yolo / approvals.mode=off can pass) for fleet/ops
+    agents that reboot hosts they manage. Unset preserves the historical block; no other pattern is affected."""
+    from utils import env_var_enabled
+    return env_var_enabled("HERMES_ALLOW_REBOOT")
+
+
 def detect_hardline_command(command: str) -> tuple:
     """Check hardline patterns (NEVER bypassable, even in YOLO) -> (is_hardline, description)."""
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    allow_reboot = _reboot_shutdown_allowed()
     # The malformed-quoting verdict needs the author's quote state. Normalization strips escapes
     # (`\"` -> `"`), so a shell-valid pattern like `grep -o "[^\"]*"` lexed as unterminated and was
     # reported as a hardline block (118 of 125 hardline blocks in one week of real use, every one a
@@ -209,6 +228,8 @@ def detect_hardline_command(command: str) -> tuple:
                     else _mask_quoted_prose(command_variant).lower()
                 )
             if pattern_re.search(masked_lower if quote_masked else variant_lower):
+                if allow_reboot and description in _REBOOT_HARDLINE_DESCS:
+                    continue  # fork opt-in: handled by the DANGEROUS_PATTERNS layer instead
                 return (True, description)
     return (False, None)
 
@@ -289,6 +310,12 @@ DANGEROUS_PATTERNS = [
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
+    # Fork: reboot/shutdown family — normally HARDLINE. Only reaches this layer when HERMES_ALLOW_REBOOT
+    # downgrades it (detect_hardline_command); listed so it stays approval-gated rather than silently allowed.
+    (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
+    (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
+    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
+    (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (-9 / -KILL / -s KILL / -SIGKILL) and `killall -r <regex>` broad sweeps

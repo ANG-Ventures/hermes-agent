@@ -28,7 +28,9 @@ from tools.thread_context import propagate_context_to_thread
 from tools.registry import registry, tool_error
 
 from hermes_time import get_timezone_name
-from tools.code_execution_env import _resolve_child_cwd, _resolve_child_python
+from tools.code_execution_env import (  # noqa: F401 — _scrub_child_env/_HERMES_CHILD_ALLOWED: fork facade re-exports
+    _HERMES_CHILD_ALLOWED, _resolve_child_cwd, _resolve_child_python, _scrub_child_env,
+)
 from tools.code_execution_rpc import (
     _execute_checked, _private_dirs_cmd, _remote_write, _rpc_poll_loop, tool_errors_since,
 )

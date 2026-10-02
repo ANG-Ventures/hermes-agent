@@ -59,9 +59,13 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
         return f"<{type(command).__name__}>"
 
 
-def _blocked_json(error: str, status: str) -> str:
-    """The guard result envelope: exit_code 1 + *error* + *status*."""
-    return json.dumps({"output": "", "exit_code": 1, "error": error, "status": status}, ensure_ascii=False)
+def _blocked_json(error: str, status: str, *, blocked_by: Optional[str] = None) -> str:
+    """The guard result envelope: exit_code 1 + *error* + *status*. ``blocked_by`` (fork) stamps a
+    refusal with its guard marker so execute_code can surface it instead of silently returning."""
+    payload = {"output": "", "exit_code": 1, "error": error, "status": status}
+    if blocked_by:
+        payload["blocked_by"] = blocked_by
+    return json.dumps(payload, ensure_ascii=False)
 
 
 _SHELL_LEVEL_BACKGROUND_RE = re.compile(
@@ -206,6 +210,7 @@ def gateway_lifecycle_block(
         return None
     from cron.lifecycle_guard import (
         _MAX_REFERENCED_SCRIPT_BYTES,
+        GATEWAY_LIFECYCLE_BLOCK_MARKER as _GATEWAY_LIFECYCLE_BLOCK_MARKER,
         HOST_INTERPRETER_KILL_REJECTION,
         contains_host_interpreter_kill,
         contains_launchctl_submit_command,
@@ -223,7 +228,7 @@ def gateway_lifecycle_block(
             "or determine whether it is independent of Hermes. Perform authorized "
             "LaunchAgent maintenance from a separate shell outside the gateway, "
             "not by switching launchctl verbs to bypass this rejection.",
-            "error",
+            "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER,
         )
     guard_cwd_base = get_session_cwd(session_key)
     if guard_cwd_base is None:
@@ -247,20 +252,20 @@ def gateway_lifecycle_block(
             "Nothing in the command is known to contain a gateway lifecycle command, but a "
             "script the command executes must be scannable (a regular text file under 1 MiB) "
             "before it can run inside the gateway process.",
-            "error",
+            "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER,
         )
     if unsafe:
         # Name the ownership-scoped route for image-name kills: the intent is almost always "stop
         # MY background job", and re-rolling the same over-broad spelling is what takes the gateway down.
         if lifecycle_scan_root_within_budget(command) and contains_host_interpreter_kill(command):
-            return _blocked_json(HOST_INTERPRETER_KILL_REJECTION, "error")
+            return _blocked_json(HOST_INTERPRETER_KILL_REJECTION, "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER)
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "
             "uninstall the gateway from inside the gateway process. The gateway would "
             "kill this command before it could complete (SIGTERM propagates "
             "to child processes). Run `hermes gateway restart` from a "
             "separate shell outside the running gateway.",
-            "error",
+            "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER,
         )
     return None
 
