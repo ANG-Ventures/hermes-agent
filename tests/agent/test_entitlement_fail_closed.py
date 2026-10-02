@@ -67,7 +67,10 @@ def test_marker_fires_only_on_single_credential_entitlement_400_and_fallback_wal
         resolve.assert_not_called()
 
 
-def test_restore_primary_runtime_is_gated_on_rejected_primary_slug():
+def test_restore_primary_runtime_is_gated_on_rejected_primary_slug(monkeypatch):
+    # The fork replaced upstream's unconditional "Primary model restored" notice with the
+    # shared route announcement ("Model recovery (restore): ..."), gated by model.announce_recovery.
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"model": {"announce_recovery": True}})
     fb_client = MagicMock()
     fb_client.api_key, fb_client.base_url = "fallback-" + "key-1234", "https://fallback.example.com/v1"
 
@@ -86,8 +89,8 @@ def test_restore_primary_runtime_is_gated_on_rejected_primary_slug():
     agent, restored, emitted = _run("gpt-5.6-sol")
     assert restored is False
     assert (agent.provider, agent.model, agent._fallback_activated) == ("zai", "glm-5.2", True)
-    assert not any("Primary model restored" in n for n in emitted)
+    assert not any("Model recovery (restore)" in n for n in emitted)
 
     _, restored, emitted = _run("some-other-slug")
     assert restored is True
-    assert any("Primary model restored" in n for n in emitted)
+    assert any("Model recovery (restore)" in n and "openai-codex/gpt-5.6-sol" in n for n in emitted)

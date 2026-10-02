@@ -573,8 +573,10 @@ class TestPinTransition:
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": False}))
         os.utime(cfg_path, ns=(st.st_atime_ns, st.st_mtime_ns))  # same tick as the first write
         sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
-        assert sig_pinned["honcho.pin_peer_name"] is True
-        assert sig_unpinned["honcho.pin_peer_name"] is False
+        # Upstream routes the Honcho keys through the provider's ``identity_signature()``
+        # (``memory.<key>``); the fork's byte-keyed memo lives there now.
+        assert sig_pinned["memory.pin_user_identity"] is True
+        assert sig_unpinned["memory.pin_user_identity"] is False
 
 
 class TestProfilePeerUniqueness:

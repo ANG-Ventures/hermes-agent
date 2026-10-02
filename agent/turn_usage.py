@@ -159,7 +159,25 @@ def record_response_usage(
         getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
     if has_usage:
-        compressor.update_from_response(usage_dict)
+        # UNKNOWN is not a context measurement: ``update_from_response`` assigns last_prompt_tokens
+        # unconditionally, so a payload carrying ``prompt_tokens: null`` would stamp the previous
+        # REAL occupancy reading to a measured-looking 0 (status-bar meter, Blackbox context_used,
+        # persisted session entry). Gate on a MEASURED prompt count (r6 finding 7), read from the
+        # PRE-FOLD aggregator usage: advisor fan-out tokens were never part of this prompt and an
+        # advisor with no payload makes every fold flag absorbing (r6 round-4 finding 2).
+        _prompt_measured = not prompt_tokens_unknown(aggregator_usage)
+        if _prompt_measured:
+            compressor.update_from_response(
+                usage_dict if aggregator_usage is canonical_usage
+                else _loop._compressor_usage_dict(aggregator_usage)
+            )
+            # Display-only, once per session: first large-window Codex prompt above the 272K
+            # price tier (t_a56d83c1).
+            from agent.codex_tier_notice import maybe_emit_codex_tier_notice
+            maybe_emit_codex_tier_notice(agent, getattr(compressor, "last_prompt_tokens", 0))
+        elif getattr(compressor, "awaiting_real_usage_after_compression", False):
+            # Still consume the pending compaction verdict so preflight deferral cannot stay latched.
+            compressor.update_from_response({})
     # Usage-anchored accounting: snapshot exact provider usage against the durable
     # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter
     # anchors on the turn's FIRST response: later same-turn responses inflate

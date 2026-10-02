@@ -227,6 +227,11 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         return outcome
 
     clock = _FakeClock(sleeps)
+    # Upstream c5b99a3ee5 keeps should_use_direct_api_call() contexts on the STREAMING wire
+    # (inline, monitor thread), so that flag no longer lands the primary on
+    # ``_interruptible_api_call``. Disable streaming on the rig instead: the non-streaming
+    # path is ``relay_llm.execute(..., agent._interruptible_api_call)``, the fallback's seam.
+    agent._disable_streaming = True
     with (
         # Route the PRIMARY through the same seam as the fallback (the cron /
         # delegated-child inline path) so one script drives the whole turn.
@@ -253,7 +258,7 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         # Generic path jitter (pre-policy) vs the capacity schedule. Pin both
         # so the test asserts on POLICY, not RNG: a 2.0 sleep is the generic
         # path, a 5.0 sleep is the capacity path.
-        patch("agent.conversation_loop.jittered_backoff", return_value=2.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=2.0),
         patch("agent.retry_utils.jittered_backoff", return_value=5.0),
         # The loop sleeps in 0.2s ticks until ``time.time() >= sleep_end``;
         # the fake clock advances on sleep so the wait is recorded, not served.

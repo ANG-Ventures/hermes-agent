@@ -98,9 +98,15 @@ def test_same_account_alias_adopts_only_a_newer_singleton(home, monkeypatch):
     synced = pool._sync_entry_from_auth_store(alias)
     assert (synced.access_token, synced.refresh_token) == (alias_at, "rt-alias")
 
-    # The user re-authenticates the singleton (newer stamp, same principal): the alias follows.
+    # The user re-authenticates the singleton (newer stamp, same principal). Fork contract
+    # (agent/codex_owner, #673): a pool row's authority is its own row in the owning auth store,
+    # never an inferred singleton alias — the manual row keeps its own pair, and the re-auth
+    # reaches the pool through the singleton-seeded ``device_code`` row instead.
     fresh_at = _jwt("acct-A", "user-A", now + 9 * 3600)
     _write_store(home, {"access_token": fresh_at, "refresh_token": "rt-fresh"}, _iso(now + 5),
                  {"access_token": alias_at, "refresh_token": "rt-alias", "last_refresh": _iso(now - 60)})
-    synced = load_pool("openai-codex")._sync_entry_from_auth_store(alias)
-    assert (synced.access_token, synced.refresh_token) == (fresh_at, "rt-fresh")
+    pool = load_pool("openai-codex")
+    synced = pool._sync_entry_from_auth_store(alias)
+    assert (synced.access_token, synced.refresh_token) == (alias_at, "rt-alias")
+    seeded = next(e for e in pool.entries() if e.id == "seeded")
+    assert (seeded.access_token, seeded.refresh_token) == (fresh_at, "rt-fresh")

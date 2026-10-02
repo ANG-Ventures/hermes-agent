@@ -1118,9 +1118,13 @@ class _RefreshDone(Exception):
 
 
 class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
+    # Class-level default so pools built bare (``CredentialPool.__new__`` in tests, pickled
+    # shells) still read as un-owned on every ``_auth_owner`` gate instead of raising.
+    _auth_owner: Optional[Path] = None
+
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
-        self._auth_owner: Optional[Path] = None
+        self._auth_owner = None
         self._owner_baseline: Dict[str, Dict[str, Any]] = {}
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
@@ -2793,6 +2797,20 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id) if credential_id else None
+            if (
+                entry is not None
+                and api_key_hint
+                and entry.runtime_api_key != api_key_hint
+                and self._find(lambda e: e.runtime_api_key == api_key_hint) is None
+            ):
+                # The id-bound entry already holds a token other than the one that failed:
+                # another process/profile/keeper rotated the single-use pair underneath this
+                # agent. Force-refreshing would burn the fresh refresh token every other holder
+                # relies on, for a failure this token never had. Adopt the entry's current
+                # token instead; the caller retries with it.
+                adopted = self._adopt_rotated_entry_unlocked(entry, api_key_hint)
+                if adopted is not None:
+                    return adopted
             if entry is None:
                 if api_key_hint:
                     entry = self._find(lambda e: e.runtime_api_key == api_key_hint)

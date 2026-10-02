@@ -687,15 +687,20 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     def identity_signature(self) -> Dict[str, Any]:
         """Identity-mapping values from honcho.json that bust a cached gateway agent when they change.
 
-        Memoized on the file's mtime and size, so the per-message call is one stat. ``{}`` when the
-        config cannot be read."""
+        Memoized on the file's BYTES, not its mtime: two writes inside one mtime tick
+        (coarse-granularity filesystems, e.g. Blacksmith CI runners) kept the same mtime_ns and
+        served the stale signature, so a pinPeerName flip did not bust the agent cache (fork).
+        honcho.json is tiny; hashing it is cheaper than parsing it. ``{}`` when the config cannot
+        be read."""
         try:
+            import hashlib as _hashlib
+
             path = resolve_config_path()
             try:
-                stat = path.stat()
-                memo_key = (str(path), stat.st_mtime_ns, stat.st_size)
+                digest = _hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
-                memo_key = (str(path), None, None)
+                digest = None
+            memo_key = (str(path), digest)
             cached = self._identity_signature_memo.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -711,7 +716,14 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
                 "session_prefixing": [bool(cfg.session_peer_prefix), bool(cfg.session_ai_peer_prefix)],
                 "a2a_sessions": bool(cfg.a2a_sessions),
             }
-            self._identity_signature_memo = {memo_key: values}
+            # from_global_config re-reads the file: memoize only if it still holds the bytes the
+            # key was hashed from (C7 k102).
+            try:
+                recheck = _hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                recheck = None
+            if recheck == digest:
+                self._identity_signature_memo = {memo_key: values}
             return dict(values)
         except Exception:
             return {}

@@ -655,11 +655,15 @@ def test_repair_drops_orphan_tool_call_turn_with_no_text():
     repairs = AIAgent._repair_message_sequence(agent, messages)
 
     assert repairs >= 1
-    assert messages == [
+    # Pass 2 may merge the two now-adjacent user turns; the merge stamps the
+    # persistence-only ``_merged_turn_prefix`` marker (stripped on the wire), so compare
+    # the provider-visible shape only.
+    from agent.message_metadata import MERGED_TURN_PREFIX
+    visible = [{k: v for k, v in m.items() if k != MERGED_TURN_PREFIX} for m in messages]
+    assert visible == [
         {"role": "user", "content": "do X"},
         {"role": "user", "content": "never mind"},
-    ] or messages == [
-        # Pass 2 may merge the two now-adjacent user turns.
+    ] or visible == [
         {"role": "user", "content": "do X\n\nnever mind"},
     ]
 

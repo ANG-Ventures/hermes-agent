@@ -625,7 +625,7 @@ class TestSteerSurvivesRedirectRebuild:
         from types import SimpleNamespace
         from unittest.mock import patch
 
-        from tests.agent.test_run_agent import _mock_response
+        from tests.run_agent._run_agent_helpers import _mock_response
 
         agent = self._loop_agent()
         payloads = []

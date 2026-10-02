@@ -39,15 +39,17 @@ class _ExplodingProfile(ProviderProfile):
 
 @pytest.fixture
 def registered():
-    """Register profiles for one test and restore the registry afterwards."""
+    """Register profiles for one test and restore the registry afterwards.
+
+    The registry containers are additive seam facades (``hermes_cli.provider_seam``):
+    ``clear()`` is refused, so the restore goes through the seam's generation swap.
+    """
+    from hermes_cli import provider_seam
+
     _providers._discover_providers()
-    snapshot = (dict(_providers._REGISTRY), dict(_providers._ALIASES), _providers._PROVIDER_LIST_CACHE)
+    generation = provider_seam.current()
     yield _providers.register_provider
-    _providers._REGISTRY.clear()
-    _providers._REGISTRY.update(snapshot[0])
-    _providers._ALIASES.clear()
-    _providers._ALIASES.update(snapshot[1])
-    _providers._PROVIDER_LIST_CACHE = snapshot[2]
+    provider_seam._restore(generation)
 
 
 def _agent(provider: str = ""):

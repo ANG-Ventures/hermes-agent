@@ -1769,9 +1769,13 @@ def codex_sync_pool(tmp_path, monkeypatch):
         })
 
     client = httpx.Client
-    monkeypatch.setattr(auth, "httpx", SimpleNamespace(
+    # The Codex refresh / usage-probe HTTP calls live in hermes_cli.auth_codex (upstream
+    # split of hermes_cli.auth) and read ``httpx`` through that module's own name.
+    import hermes_cli.auth_codex as auth_codex
+    monkeypatch.setattr(auth_codex, "httpx", SimpleNamespace(
         Client=lambda **kw: client(transport=httpx.MockTransport(transport), **kw),
         Timeout=httpx.Timeout,
+        SyncByteStream=httpx.SyncByteStream,  # response-body cap hook subclasses it
     ))
 
     def build(*, store_account="account-A", entry_account="account-A",

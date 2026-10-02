@@ -116,7 +116,9 @@ def test_edit_preview_is_durable_before_emission_and_display_only(
             if changed:
                 assert after.strip() in metadata["inline_diff"]
             with SessionDB(db_path=db_path) as cold:
-                conversation = cold.get_messages_as_conversation(name)
+                # Resume surfaces opt in to the durable timestamp; the default projection keeps
+                # the fork's legacy byte-stable shape (F01, same as test_replay_cleanup).
+                conversation = cold.get_messages_as_conversation(name, include_timestamp=True)
             projected = progress._history_to_messages(conversation)
             projected_tool = next(row for row in projected if row["role"] == "tool")
             assert projected_tool["tool_call_id"] == call_id

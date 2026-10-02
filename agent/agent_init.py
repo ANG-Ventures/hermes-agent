@@ -1978,6 +1978,25 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     _model_cfg = _agent_cfg.get("model", {})
     _model_section = _model_cfg if isinstance(_model_cfg, dict) else {}
 
+    # Explicit model output-token override from config (``model.max_tokens``) when the caller
+    # did not pass one directly (fork; populates the chat-completions request cap).
+    if agent.max_tokens is None:
+        _config_max_tokens = _model_section.get("max_tokens")
+        if _config_max_tokens is not None:
+            try:
+                if isinstance(_config_max_tokens, bool):
+                    raise ValueError
+                _parsed_max_tokens = int(_config_max_tokens)
+                if _parsed_max_tokens <= 0:
+                    raise ValueError
+                agent.max_tokens = _parsed_max_tokens
+            except (TypeError, ValueError):
+                _warn_invalid_config_int(
+                    "model.max_tokens in config.yaml", _config_max_tokens,
+                    "must be a positive integer (e.g. 4096)", "provider default", agent=agent,
+                )
+    agent._session_init_model_config["max_tokens"] = agent.max_tokens
+
     _config_context_length = _model_section.get("context_length")
     if _config_context_length is not None:
         try:

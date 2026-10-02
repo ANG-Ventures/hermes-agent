@@ -274,18 +274,15 @@ class TestMemoryNudgeCounterPersistence:
     def test_counters_not_reset_in_preamble(self):
         """The turn preamble must not zero the nudge counters."""
         import inspect
-        from agent.turn_context import build_turn_context as _btc
-        src = inspect.getsource(_btc)
-        # The preamble (now in build_turn_context) resets many fields (retry
-        # counts, budget, etc.) before returning. Find that reset block and
-        # verify our counters aren't in it. The reset block ends at
-        # iteration_budget. Anchor exactly on
-        # ``agent.iteration_budget = IterationBudget`` so an unrelated
-        # identifier ending in ``iteration_budget`` can't match the boundary.
-        preamble_end = src.index("agent.iteration_budget = IterationBudget")
-        preamble = src[:preamble_end]
-        assert "agent._turns_since_memory = 0" not in preamble
-        assert "agent._iters_since_skill = 0" not in preamble
+        from agent import turn_context as _tc
+        # The per-turn reset now lives in ``_reset_per_turn_agent_state`` (driven by
+        # the ``_PER_TURN_RESET_STATE`` table); neither may touch the nudge counters.
+        src = inspect.getsource(_tc._reset_per_turn_agent_state)
+        reset_names = {name for name, _ in _tc._PER_TURN_RESET_STATE}
+        assert "_turns_since_memory" not in reset_names
+        assert "_iters_since_skill" not in reset_names
+        assert "agent._turns_since_memory = 0" not in src
+        assert "agent._iters_since_skill = 0" not in src
 
 
 class TestMemoryContextSanitization:
@@ -333,8 +330,8 @@ class TestMemoryProviderTurnStart:
     def test_on_turn_start_called_before_prefetch(self):
         """Source-level check: on_turn_start appears before prefetch_all in the prologue."""
         import inspect
-        from agent.turn_context import build_turn_context as _btc
-        src = inspect.getsource(_btc)
+        from agent.turn_context import _memory_turn_start_and_prefetch as _mts
+        src = inspect.getsource(_mts)
         # Find the actual method calls, not comments
         idx_turn_start = src.index(".on_turn_start(")
         idx_prefetch = src.index(".prefetch_all(")
@@ -346,8 +343,9 @@ class TestMemoryProviderTurnStart:
     def test_on_turn_start_uses_user_turn_count(self):
         """Source-level check: on_turn_start receives the user_turn_count."""
         import inspect
-        from agent.turn_context import build_turn_context as _btc
-        src = inspect.getsource(_btc)
+        import re
+        from agent.turn_context import _memory_turn_start_and_prefetch as _mts
+        src = inspect.getsource(_mts)
         # The extracted body uses ``agent.X`` rather than ``self.X``;
-        # assert the extracted-form spelling directly.
-        assert "on_turn_start(agent._user_turn_count" in src
+        # assert the extracted-form spelling directly (first positional arg).
+        assert re.search(r"on_turn_start\(\s*agent\._user_turn_count", src)

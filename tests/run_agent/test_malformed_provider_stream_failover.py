@@ -125,7 +125,7 @@ def test_http_200_malformed_stream_retries_then_fails_over_with_reason(monkeypat
             "hermes_cli.config.read_raw_config",
             return_value={"model": {"announce_route_change": True}},
         ),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 
@@ -157,7 +157,7 @@ def test_request_serialization_valueerror_remains_nonretryable(monkeypatch):
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 

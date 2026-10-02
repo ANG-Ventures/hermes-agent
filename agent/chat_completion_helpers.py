@@ -5321,7 +5321,8 @@ class _StreamingCall(StreamingWaitMonitor):
         # releasing its text here would show the provider failure as assistant output.
         if not is_router_timeout_shim(response):
             flush_pending()
-        return _stamp_pool_headers(response, self._attempt_pool_headers)
+        # getattr: callers may build a bare __new__ _StreamingCall (upstream tests) without __init__.
+        return _stamp_pool_headers(response, getattr(self, "_attempt_pool_headers", None) or {})
 
     # ── anthropic_messages wire ─────────────────────────────────────────
 
@@ -5472,7 +5473,8 @@ class _StreamingCall(StreamingWaitMonitor):
     def _finish_anthropic_message(self, message):
         """Repair split surrogates the SDK accumulator glued back together and stamp the
         relay-pool attribution headers of this attempt on the native Message."""
-        return _stamp_pool_headers(_repair_anthropic_message_surrogates(message), self._attempt_pool_headers)
+        return _stamp_pool_headers(
+            _repair_anthropic_message_surrogates(message), getattr(self, "_attempt_pool_headers", None) or {})
 
     # ── retry loop ──────────────────────────────────────────────────────
 

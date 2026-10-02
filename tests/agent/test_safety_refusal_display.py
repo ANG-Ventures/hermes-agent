@@ -113,7 +113,7 @@ def test_retry_exhaustion_runs_real_loop_and_renders_honest_notice(message, labe
         patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda model, provider: model),
         patch("agent.model_metadata.get_model_context_length", return_value=200000),
         patch("hermes_cli.config.read_raw_config", return_value={"model": {"announce_route_change": True}}),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 

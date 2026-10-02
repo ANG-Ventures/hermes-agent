@@ -104,6 +104,7 @@ from hermes_state import SessionDB
 
 class _SendAgent:
     api_mode = "chat_completions"
+    provider = "custom"  # build_api_messages consults provider_owns_transcript(agent.provider)
     ephemeral_system_prompt = None
     _compression_warning = None
     _current_turn_timestamp = 10_000.0
@@ -150,7 +151,9 @@ def test_send_wire_matches_replay_wire_after_db_round_trip(tmp_path):
         {"id": "c3", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}], timestamp=now - 110)
     db.append_message("s1", role="tool", content=grep_hit, tool_call_id="c2", tool_name="search_files", timestamp=now - 109)
     db.append_message("s1", role="tool", content=doc_text, tool_call_id="c3", tool_name="read_file", timestamp=now - 108)
-    persisted = db.get_messages_as_conversation("s1")
+    # Resume surfaces (CLI/ACP/API server/transcript loader) opt in to the durable timestamp;
+    # the default projection keeps the legacy byte-stable shape (fork F01).
+    persisted = db.get_messages_as_conversation("s1", include_timestamp=True)
     db.close()
     assert persisted[0].get("api_content") == "hello [with memory]" and persisted[2].get("timestamp")
 

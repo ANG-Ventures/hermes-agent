@@ -753,6 +753,11 @@ def test_same_model_fork_inherits_parent_cache_scope_gateway_key(tmp_path):
         agent._session_db = db
         db.create_session("sess-123", source="test")
 
+        # The tag is claimed per LIVE fork of this parent (``review``, ``review-2``...; FleetReview
+        # #91). Earlier tests' Recorder forks for "sess-123" are only released by the cyclic GC
+        # (their wrapped ``close`` references the fork), so collect before claiming.
+        import gc
+        gc.collect()
         with patch.object(run_agent, "AIAgent", _make_recorder_class()):
             fork, _rt, routed = build_cache_parity_fork(agent, max_iterations=5)
             btw, _rt, _ = build_cache_parity_fork(agent, max_iterations=5, write_origin="side_question")

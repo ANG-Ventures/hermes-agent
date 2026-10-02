@@ -494,7 +494,7 @@ class TestConversationLoopPartialStreamContinuation:
         assert result["final_response"].count(repeated_tail) == 1
 
     def test_output_limit_continuation_preserves_intentional_repetition(self, loop_agent):
-        from tests.agent.test_run_agent import _mock_response
+        from tests.run_agent._run_agent_helpers import _mock_response
 
         repeated = "This intentionally repeated sentence is longer than thirty-two characters."
         first = _mock_response(

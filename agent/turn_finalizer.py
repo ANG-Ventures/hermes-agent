@@ -390,10 +390,11 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
     # exit line keeps a fork's ``interrupted_during_api_call`` from reading as a killed
     # foreground stream — the fork shares the parent's session_id and often its model (#118693).
     _turn_origin = getattr(agent, "_turn_origin", None)
+    # ``_diag_msg`` / ``_diag_args`` end on ``task=`` / ``effective_task_id`` (fork source
+    # contract, tests/agent/test_turn_ended_task_id_log.py); the origin tag rides as a suffix.
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s task=%s"
-        + (" origin=%s" if _turn_origin else "")
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
@@ -401,16 +402,17 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         agent.iteration_budget.max_total if agent.iteration_budget else 0,
         _turn_tool_count, _last_msg_role, len(final_response) if final_response else 0,
         agent.session_id or "none", effective_task_id or "none",
-        *((_turn_origin,) if _turn_origin else ()),
     )
+    _origin_msg = " origin=%s" if _turn_origin else ""
+    _origin_args = (_turn_origin,) if _turn_origin else ()
     if _last_msg_role == "tool" and not interrupted:
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
-            + _diag_msg + " last_tool=%s",
-            *_diag_args, _last_tool_name,
+            + _diag_msg + _origin_msg + " last_tool=%s",
+            *_diag_args, *_origin_args, _last_tool_name,
         )
     else:
-        logger.info(_diag_msg, *_diag_args)
+        logger.info(_diag_msg + _origin_msg, *_diag_args, *_origin_args)
 
 
 def _append_file_mutation_footer(agent, final_response, logger):

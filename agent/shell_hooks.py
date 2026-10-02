@@ -390,7 +390,9 @@ def _spawn_once(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             if isinstance(exc, cls):
                 if cls is FileNotFoundError:
                     result["infra_failure"] = argv[0]  # absent on disk: self-heal / missing-hook policy, not a verdict
-                return failed(msg, f"spawn failed: {exc}")
+                # Named exactly, detail-free: the OSError text would only re-introduce argv (which
+                # can be the credential itself) onto the operator channel for no diagnostic gain.
+                return failed(msg)
         if getattr(exc, "winerror", None) == 193:
             # Unmapped suffix (.zsh, .fish, .rb, …) — the raw WinError text is localized, so an
             # operator on a non-English Windows could not act on it at all.
@@ -593,9 +595,11 @@ def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any], *, page: bool = Tru
         # A fail-closed gate must not silently allow on empty or garbage stdout (e.g. a stack trace);
         # an explicit allow directive or the legacy no-op ``{}`` is still accepted (fork #656).
         try:
-            data = json.loads(stdout) if stdout else None
+            data = json.loads(stdout)
         except (ValueError, RecursionError):
-            data = None
+            # Empty stdout / a stack trace: not JSON at all (distinct from a well-formed but
+            # unknown directive, so an operator can tell a crashed hook from a typo).
+            return _fail_closed_block(spec, "unparseable stdout (expected a JSON object)")
         if isinstance(data, dict):
             actions = [data[key] for key in ("action", "decision") if key in data]
             if not data or (actions and all(action == "allow" for action in actions)):

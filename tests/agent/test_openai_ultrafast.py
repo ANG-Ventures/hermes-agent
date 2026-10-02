@@ -70,7 +70,11 @@ def test_cli_refuses_ultrafast_on_a_model_without_it(monkeypatch):
     import cli as cli_mod
     from unittest.mock import MagicMock
 
-    stub = SimpleNamespace(service_tier="priority", model="gpt-6-sol", agent=MagicMock(model="gpt-6-sol"),
+    # Tiers are ROUTE-gated on the fork (model + provider + api_mode via HermesCLI._fast_capability):
+    # pin a first-party Codex route so the only variable under test is the model's ultrafast support.
+    stub = SimpleNamespace(service_tier="priority", model="gpt-6-sol", provider="openai-codex",
+                           api_mode="codex_responses",
+                           agent=MagicMock(model="gpt-6-sol", provider="openai-codex", api_mode="codex_responses"),
                            _fast_command_available=lambda: True)
     monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **k: None)
     cli_mod.HermesCLI._handle_fast_command(stub, "/fast ultrafast")

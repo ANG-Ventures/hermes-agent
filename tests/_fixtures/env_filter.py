@@ -13,6 +13,16 @@ gate; the fixture itself stays in conftest next to the sandbox it maintains.
 
 _CREDENTIAL_SUFFIXES = (
     "_API_KEY",
+    # Bare _KEY catches provider keys that don't use the _API_KEY suffix —
+    # notably CLAUDE_API_PROXY_KEY / CLAUDE_API_PROXY_F{N}_KEY / GATEWAY_PROXY_KEY,
+    # which hermes_cli.env_loader seeds into os.environ from the real ~/.hermes/.env
+    # at import time (before a test's HERMES_HOME redirect applies). Left unstripped,
+    # they register as `claude-api-proxy` providers and hijack resolve_provider("auto")
+    # auto-detection (it returns claude-api-proxy before reaching the Bedrock branch),
+    # breaking test_bedrock_integration's AWS auto-detect. The only non-credential
+    # _KEY var in practice is HERMES_SESSION_KEY, already stripped via
+    # _HERMES_BEHAVIORAL_VARS below.
+    "_KEY",
     "_TOKEN",
     "_SECRET",
     "_PASSWORD",

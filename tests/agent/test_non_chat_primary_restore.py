@@ -28,7 +28,10 @@ def _make_agent():
         return agent
 
 
-def _restore_after_fallback(primary_model):
+def _restore_after_fallback(primary_model, monkeypatch):
+    # The fork replaced upstream's unconditional "Primary model restored" notice with the
+    # shared route announcement ("Model recovery (restore): ..."), gated by model.announce_recovery.
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"model": {"announce_recovery": True}})
     agent = _make_agent()
     agent._primary_runtime["model"] = primary_model
     agent._primary_runtime["provider"] = "alibaba-token-plan"
@@ -44,20 +47,20 @@ def _restore_after_fallback(primary_model):
     return agent, restored, emitted
 
 
-def test_restore_skips_a_primary_already_known_to_be_non_chat():
-    agent, restored, emitted = _restore_after_fallback("wan2.7-image-pro")
+def test_restore_skips_a_primary_already_known_to_be_non_chat(monkeypatch):
+    agent, restored, emitted = _restore_after_fallback("wan2.7-image-pro", monkeypatch)
 
     assert restored is False
     assert (agent.provider, agent.model, agent._fallback_activated) == ("zai", "glm-5.2", True)
-    assert not any("Primary model restored" in notice for notice in emitted)
+    assert not any("Model recovery (restore)" in notice for notice in emitted)
 
-    other, other_restored, _emitted = _restore_after_fallback("acme/text-to-image")
+    other, other_restored, _emitted = _restore_after_fallback("acme/text-to-image", monkeypatch)
     assert other_restored is False
     assert other.model == "glm-5.2"
 
 
-def test_restore_still_returns_a_chat_primary():
-    _agent, restored, emitted = _restore_after_fallback("qwen3.7-plus")
+def test_restore_still_returns_a_chat_primary(monkeypatch):
+    _agent, restored, emitted = _restore_after_fallback("qwen3.7-plus", monkeypatch)
 
     assert restored is True
-    assert any("Primary model restored" in notice for notice in emitted)
+    assert any("Model recovery (restore)" in notice and "qwen3.7-plus" in notice for notice in emitted)
