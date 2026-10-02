@@ -22,6 +22,7 @@ REPO = Path(__file__).resolve().parents[4]
 PY = sys.executable
 
 # Clocks shrunk through the documented env knobs, never by patching code.
+KANBAN_FAST_CONFIG = "kanban:\n  rate_limit_cooldown_seconds: 0\n  receipt_gate: false\n"
 FAST_ENV = {
     "HERMES_KANBAN_CRASH_GRACE_SECONDS": "0",
     "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS": "0",
@@ -77,6 +78,13 @@ class Board:
             "  api_max_retries: 1\n"
             "updates:\n"
             "  check: false\n"
+            # Fork pins (a caller whose extra_config carries its own ``kanban:`` block sets them there):
+            # - ``kanban.rate_limit_cooldown_seconds`` (config) is authoritative over the legacy
+            #   ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` bridge in FAST_ENV, and load_config()
+            #   fills the documented default (300s) when unset — pin the next-tick retry.
+            # - ``kanban.receipt_gate`` (#1621, default on) refuses a worker's prose-only
+            #   ``kanban_complete``; these rigs script exactly that, so opt out.
+            + ("" if "kanban:" in self.extra_config else KANBAN_FAST_CONFIG)
             + self.extra_config,
             encoding="utf-8",
         )

@@ -85,6 +85,13 @@ def _kill_dispatcher_after(board: Board, kind: str | None) -> None:
             board.spawned_pids.add(int(row["worker_pid"]))
 
 
+def _without_origin(body: str) -> str:
+    lines = body.splitlines()
+    if lines and lines[0].lower().startswith("origin:"):
+        lines = lines[1:]
+    return "\n".join(lines).strip("\n")
+
+
 def _overlapping_runs(runs: list[dict]) -> list[tuple[int, int]]:
     spans = [(r["id"], r["started_at"], r["ended_at"] or time.time()) for r in runs]
     return [(a[0], b[0]) for i, a in enumerate(spans) for b in spans[i + 1:]
@@ -113,7 +120,9 @@ def test_dispatcher_sigkill_mid_tick_never_destroys_or_duplicates_cards(tmp_path
                 wait_until(lambda p=pid: not pid_alive(p), 60, f"worker {pid} to exit")
 
             rows = board.tasks()
-            assert {r["id"]: (r["title"], r["body"]) for r in rows} == created, rows
+            # Fork: ``kanban create`` prepends an ``origin:`` provenance line to every body
+            # (kanban_db.stamp_origin_body); the integrity check is about the caller's text.
+            assert {r["id"]: (r["title"], _without_origin(r["body"])) for r in rows} == created, rows
             for tid in created:
                 runs = board.runs(tid)
                 done = [r for r in runs if r["outcome"] == "completed"]

@@ -213,6 +213,16 @@ def _live_order(rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return [(r["id"], r["source"]) for r in sorted(live, key=lambda r: r.get("priority", 0))]
 
 
+# Fork (#673, agent/codex_owner.py, docs/codex-owner-persistence-pr.md): a terminally rejected
+# refresh is fenced by a pre-POST receipt in ``auth.json.codex-refresh/`` and raises the owner-scoped
+# "authenticate at its owner" error; the disk row is NOT rewritten with ``last_status=dead`` and
+# ``hermes -z`` reports the failure on stderr. These two cells pin upstream's status-on-disk +
+# stdout re-login contract, which the fork replaced on purpose (parity 2026-10-01, lane M6).
+_FORK_CODEX_OWNER_RECEIPT_MODEL = pytest.mark.xfail(
+    strict=False, reason="fork #673: receipt-fenced terminal refresh, owner-scoped error on stderr")
+
+
+@_FORK_CODEX_OWNER_RECEIPT_MODEL
 def test_dead_grant_on_independent_login_keeps_login_a(tmp_path) -> None:
     """B's refresh token is terminally rejected (``invalid_grant``). B leaves rotation; A — a
     different grant, a different account — keeps its pool row (id, source, first place in the
@@ -257,6 +267,7 @@ def test_throttled_refresh_on_independent_login_leaves_login_a_untouched(tmp_pat
     assert rows["login-b"].get("last_status") == "exhausted", rows["login-b"]
 
 
+@_FORK_CODEX_OWNER_RECEIPT_MODEL
 def test_dead_shared_grant_retires_every_row_of_it(tmp_path) -> None:
     """Control (green on main): when the singleton, its seeded row and a ``manual:`` alias all
     hold the SAME rejected refresh token, none stays selectable. The user gets the re-login
