@@ -269,6 +269,7 @@ def _age_block(conn, tid, seconds=60):
     ("APOLLO 09:00 ANSWERED: option B.", True),
     ("APOLLO 17:25 — B4 CLOSED, DEPLOYED, GO. ruling applied", False),  # lowercase: no marker
     ("APOLLO 14:40 PT: B4 NEEDS RULING: waiting for Ace.", False),        # Prism 88f87cb46ec3
+    ("APOLLO 14:40: B4 NEEDS AN OPERATOR RULING", False),                 # Prism cb9e35a4fe01
     ("APOLLO 09:00: B4 NOT ANSWERED yet.", False),
     ("APOLLO 10:00: NO RULING yet, Ace is away.", False),
     ("APOLLO 10:00: in front of Ace, AWAITING RULING.", False),
@@ -328,4 +329,35 @@ def test_non_ruling_comments_keep_paging(kanban_home):
         _age_block(conn, tid)
         kb.add_comment(conn, tid, "default", "FYI: ruled out the cache; APOLLO RULED nothing yet")
         kb.add_comment(conn, tid, "default", "APOLLO 14:40 PT: B4 is in front of Ace now as a 1-3-1.")
+        assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
+
+
+def test_same_second_ruling_counts_and_same_second_reblock_pages(kanban_home):
+    """Prism 6da195bd4c18: created_at is whole seconds; order by event id instead."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn, reason="B4?")
+        kb.add_comment(conn, tid, "default", "APOLLO 14:45 — B4 RULED: keep the fixture.")
+        conn.execute("UPDATE task_events SET created_at = 1000 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE task_comments SET created_at = 1000 WHERE task_id = ?", (tid,))
+        conn.commit()
+        assert kb.needs_input_page_candidates(conn) == []
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="B5?", kind="needs_input")
+        conn.execute("UPDATE task_events SET created_at = 1000 WHERE task_id = ?", (tid,))
+        conn.commit()
+        got = kb.needs_input_page_candidates(conn)
+    assert [c["task_id"] for c in got] == [tid] and got[0]["reason"] == "B5?"
+
+
+def test_worker_run_on_the_card_cannot_answer_with_an_operator_label(kanban_home):
+    """Prism 4b2f58cb33c4: a dispatched worker's comment on its own card carries its run_id."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _age_block(conn, tid)
+        run_id = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, 'daedalus', 'running', 1)",
+            (tid,),
+        ).lastrowid
+        conn.commit()
+        kb.add_comment(conn, tid, "default", "APOLLO 09:00 ANSWERED: option B.", run_id=run_id)
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]

@@ -6755,17 +6755,23 @@ def set_needs_input_page(
 _BLOCK_REASON_EVENTS = ("blocked", "block_loop_detected")
 # An operator comment that answers the block (t_dfc938c4: t_e6b3713d re-paged
 # "needs a ruling" 80 min after "APOLLO 14:45 — B4 RULED"). All of:
-#  * author is an operator/Ace author (kanban_worker_policy.RULING_AUTHORS), not
-#    a delegated child (SUBAGENT_AUTHOR_MARKER): a worker cannot silence a page;
+#  * author is an operator/Ace author (kanban_worker_policy.RULING_AUTHORS, the
+#    same label trust find_ruled_parent uses), not a delegated child
+#    (SUBAGENT_AUTHOR_MARKER), and the comment carries no worker run_id (a
+#    dispatched run on this card stamps one; ``--author default`` cannot drop it);
 #  * the first line opens with ``APOLLO`` and carries an uppercase RULED /
-#    RULING(S) / ANSWERED whose two preceding words hold no negator, so
-#    "NEEDS RULING", "NO RULING yet", "NOT ANSWERED" stay pending;
-#  * it is newer than the card's latest block event (a fresh block pages again).
+#    RULING(S) / ANSWERED whose clause (text since the last : ; , . ( ) or dash)
+#    holds no negator, so "NEEDS (AN OPERATOR) RULING", "NO RULING yet",
+#    "NOT ANSWERED" stay pending;
+#  * it was written after the card's latest block event, ordered by event id
+#    (``created_at`` is whole seconds; a same-second ruling must still count and
+#    a same-second re-block must still page).
 _RULING_ANSWER_LEAD_RE = re.compile(r"\AAPOLLO\b")
 _RULING_ANSWER_WORD_RE = re.compile(r"\b(?:RULED|RULINGS?|ANSWERED)\b")
+_RULING_CLAUSE_BREAK_RE = re.compile(r"[:;,.()\u2013\u2014]")
 _RULING_ANSWER_NEGATORS = frozenset({
     "needs", "need", "needing", "no", "not", "awaiting", "await", "pending",
-    "for", "without", "requesting", "request", "asks", "ask",
+    "for", "without", "requesting", "request", "asks", "ask", "wants", "want",
 })
 
 
@@ -6774,30 +6780,40 @@ def _is_ruling_answer(body: str) -> bool:
     if not _RULING_ANSWER_LEAD_RE.match(line):
         return False
     for m in _RULING_ANSWER_WORD_RE.finditer(line):
-        before = re.findall(r"[A-Za-z]+", line[:m.start()])[-2:]
-        if not any(w.lower() in _RULING_ANSWER_NEGATORS for w in before):
+        clause = _RULING_CLAUSE_BREAK_RE.split(line[:m.start()])[-1]
+        if not any(w.lower() in _RULING_ANSWER_NEGATORS for w in re.findall(r"[A-Za-z]+", clause)):
             return True
     return False
 
 
 def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when an operator ruling comment is newer than the card's latest block event."""
+    """True when an operator ruling comment was written after the card's latest block."""
     from .kanban_worker_policy import RULING_AUTHORS
 
     row = conn.execute(
-        "SELECT MAX(created_at) AS at FROM task_events WHERE task_id = ? AND kind IN (?, ?)",
+        "SELECT MAX(id) AS id FROM task_events WHERE task_id = ? AND kind IN (?, ?)",
         (task_id, *_BLOCK_REASON_EVENTS),
     ).fetchone()
-    blocked_at = row["at"] if row else None
-    if blocked_at is None:
+    if row is None or row["id"] is None:
+        return False
+    # add_comment logs one ``commented`` event in the comment's own txn, so the
+    # newest N comments are the N written after the block. A comment written by a
+    # path that logs no event only shrinks that window (fails toward paging).
+    n = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
+        (task_id, row["id"]),
+    ).fetchone()[0]
+    if not n:
         return False
     for r in conn.execute(
-        "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at > ?",
-        (task_id, blocked_at),
+        "SELECT author, body, run_id FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+        (task_id, int(n)),
     ):
         author = (r["author"] or "").strip()
         if author.endswith(SUBAGENT_AUTHOR_MARKER.strip()) or author.lower() not in RULING_AUTHORS:
             continue
+        if r["run_id"] is not None:
+            continue  # a dispatched worker run on this card cannot answer its own block
         if _is_ruling_answer(r["body"] or ""):
             return True
     return False
