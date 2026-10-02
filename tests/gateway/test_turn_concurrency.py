@@ -311,7 +311,7 @@ async def test_semaphore_wait_does_not_claim_transcript_lease(
     monkeypatch, tmp_path, caplog,
 ):
     from gateway.turn_lease import SessionTurnLeaseRegistry
-    from tests.gateway.test_42039_duplicate_user_message import (
+    from tests.gateway.test_duplicate_user_message import (
         _bootstrap, _event, _source,
     )
 

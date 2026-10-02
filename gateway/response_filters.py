@@ -9,6 +9,9 @@ from __future__ import annotations
 import unicodedata
 from typing import Any, Optional
 
+# Canonical model-emitted control token for intentional silence (fork).
+SILENT_REPLY_TOKEN = "NO_REPLY"
+
 # Exact whole-response markers meaning "the agent intentionally chose not to
 # reply". Keep small and explicit; arbitrary empty output remains an
 # error/empty-response path, not silence. A lane that does not think in English

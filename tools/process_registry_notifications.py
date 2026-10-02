@@ -416,6 +416,18 @@ def format_process_notification(evt: dict) -> "str | None":
     # phantom "process exited (exit code ?)".
     if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released"):
         return f"[IMPORTANT: {evt.get('message', '')}]"
+    if evt_type == "async_delegation_restarted":
+        # Fork: durable async-delegation recovery after a gateway restart (async_delegation_store).
+        goals = evt.get("goals") or []
+        task_text = goals[0] if len(goals) == 1 else f"{len(goals)} parallel subagents"
+        return (
+            f"[ASYNC DELEGATION RESTARTED — {evt.get('delegation_id', 'unknown')}]\n"
+            "The gateway restarted while this background work was active. "
+            f"Hermes durably claimed and relaunched it (generation {evt.get('attempt_generation', '?')}, "
+            f"recovery launch {evt.get('redispatch_count', '?')}/2).\n"
+            f"Original task: {task_text}\n"
+            "No action is required; the terminal result will re-enter as a fresh turn."
+        )
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
     _sid, _cmd = evt.get("session_id", "unknown"), evt.get("command", "unknown")

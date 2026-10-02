@@ -41,7 +41,7 @@ class _NoopAgent:
 
     def run_conversation(self, user_message, conversation_history=None,
                          task_id=None, persist_user_message=None,
-                         persist_user_timestamp=None):
+                         persist_user_timestamp=None, **_kwargs):
         return {
             "final_response": "Hello from the agent.",
             "messages": [],

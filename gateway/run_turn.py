@@ -2265,7 +2265,28 @@ class GatewayTurnMixin:
         return None
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
-        """Inner handler that runs under the _running_agents sentinel guard."""
+        """Claim turn admission BEFORE the transcript lease, then run the admitted handler.
+
+        Pending sentinels stay visible to inbound coalescing, but queued work cannot become a stale
+        transcript-lease holder if /stop invalidates its generation while it waits for a slot. The
+        slot is re-entrant per task, so ``_run_agent`` reuses this permit (fork, gateway.max_concurrent_turns).
+        """
+        async with self._get_turn_admission().slot(
+            _quick_key, internal=getattr(event, "internal", False),
+            ack=lambda: self._ack_turn_slot_wait(source),
+        ):
+            # Production dispatch creates this state immediately before calling us. Direct/internal
+            # callers with no generation state keep the legacy path; queued turns invalidated by /stop
+            # after they began waiting for admission are dropped.
+            if (
+                self._peek_session_state(_quick_key) is not None
+                and not self._is_session_run_current(_quick_key, run_generation)
+            ):
+                return None
+            return await self._handle_message_with_agent_admitted(event, source, _quick_key, run_generation)
+
+    async def _handle_message_with_agent_admitted(self, event, source, _quick_key: str, run_generation: int):
+        """Inner handler that runs under the _running_agents sentinel guard and an admission slot."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
