@@ -12057,7 +12057,10 @@ def _request_review_txn(
                 "SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],),
             ).fetchone()
             implementer = arow["profile"] if arow else None
-        if implementer is None:
+        if implementer is None and trow["assignee"] != reviewer:
+            # Recording the reviewer as its own implementer is worse than recording
+            # nothing: request_changes() routes on this field and already refuses a
+            # handoff with no implementer provenance (upstream).
             implementer = trow["assignee"]
         reviewer_from_provenance = False
         if reviewer is None:

@@ -122,7 +122,9 @@ def test_request_changes_flag_to_other_profile_reassigns_after(board: Path) -> N
         task = kb.get_task(conn, tid)
         assert (task.status, task.assignee) == ("ready", "daedalus")
         assert len(_events(conn, tid, "changes_requested")) == 1
-        assert _events(conn, tid, "assigned")[-1] == {"assignee": "daedalus"}
+        # Upstream's ``assigned`` payload also carries ``from`` (the respawn guard
+        # tells a real dev->closer handoff from a no-op re-assign by it).
+        assert _events(conn, tid, "assigned")[-1] == {"assignee": "daedalus", "from": "builder"}
 
 
 def test_merged_pr_or_no_pr_or_not_review_is_unchanged(board: Path) -> None:
