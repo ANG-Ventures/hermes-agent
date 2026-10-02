@@ -382,7 +382,9 @@ class TestListAndCleanup:
         manager.save_session(state.session_id)
 
         db = manager._get_db()
-        messages = db.get_messages_as_conversation(state.session_id)
+        # include_timestamp: the fork's default projection is byte-stable (F01); the
+        # arrival timestamp is opt-in like every other transcript consumer.
+        messages = db.get_messages_as_conversation(state.session_id, include_timestamp=True)
         assert len(messages) == 1
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "original"

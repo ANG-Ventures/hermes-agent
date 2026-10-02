@@ -378,10 +378,9 @@ def _plugin_provider_enters_picker(pp) -> bool:
 def sync_plugin_provider_catalog() -> int:
     """Admit every registered plugin provider without a built-in row; return how many were added.
 
-    Runs at import and again from ``providers._sync_auth_registry`` whenever a profile is registered
-    after this module was imported. The import-time pass alone observes a *partial* registry: a
-    plugin whose own imports pull ``hermes_cli.models`` in mid-``_discover_providers()``, or a
-    profile registered later at runtime, would otherwise never reach the picker, ``hermes model``,
+    Called from ``providers._sync_auth_registry`` whenever a profile is registered after this
+    module was imported (NOT at import — see the note at the bottom of this module). A profile
+    registered later at runtime would otherwise never reach the picker, ``hermes model``,
     ``/model`` or the Desktop ``model.options`` list until restart — the catalog twin of the auth
     registry window (#102123). Idempotent by slug; built-in rows are never rewritten.
     """

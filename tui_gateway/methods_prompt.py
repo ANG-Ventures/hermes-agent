@@ -680,7 +680,10 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4009, "session busy")
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            display_kind=display_kind)
+            display_kind=display_kind,
+            # fork: a mid-turn submit carries its context in the queue envelope (never the live
+            # turn's session["turn_system_context"]); same-context text submits merge, others stay separate.
+            system_context=turn_system_context)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")

@@ -139,7 +139,12 @@ def test_minted_launcher_runs_relocated_and_forwards_exit_code(payload_tree, tmp
     shutil.move(str(payload_tree["root"]), str(moved))
     exe = moved / "bin" / "hermes.exe"
 
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX")}
+    # Drop every interpreter knob the test runner may have set: the fork's per-file runner
+    # (scripts/run_tests_parallel.py) exports PYTHONDONTWRITEBYTECODE=1 for its subprocesses, and
+    # this test asserts WHERE bytecode lands — inheriting a "write none" hint makes the pycache
+    # assertion below vacuously false (parity 2026-10-01, Windows-only lane).
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE")}
     env["LOCALAPPDATA"] = str(payload_tree["tmp"] / "lad")
     proc = subprocess.run([str(exe), "--version"], capture_output=True, text=True, cwd=tmp_path, env=env)
     assert proc.returncode == 7, proc.stderr[-800:]

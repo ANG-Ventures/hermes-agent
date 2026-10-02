@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -28,10 +29,21 @@ def _load_runner():
 def test_silent_child_failure_reports_exit_code(tmp_path, monkeypatch):
     from types import SimpleNamespace
     mod = _load_runner()
-    child = SimpleNamespace(pid=123, returncode=23, communicate=lambda **kwargs: ("", None))
+    # The fork runner drains ``proc.stdout`` live by fd (``_wait_with_progress``: the idle-hang
+    # detector) and polls ``proc.wait(timeout=...)`` instead of ``communicate()``; give the double
+    # a real EOF fd and a wait(). ``communicate`` stays for the upstream shape.
+    silent = open(os.devnull, "rb")
+    child = SimpleNamespace(
+        pid=123, returncode=23, stdout=silent,
+        communicate=lambda **kwargs: ("", None),
+        wait=lambda timeout=None: 23,
+    )
     monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: child)
     monkeypatch.setattr(mod, "_kill_tree", lambda *args, **kwargs: None)
-    _, code, output, counts, _ = mod._run_one_file_once(tmp_path / "test.py", [], tmp_path, 30)
+    try:
+        _, code, output, counts, _ = mod._run_one_file_once(tmp_path / "test.py", [], tmp_path, 30)
+    finally:
+        silent.close()
     assert code == 23
     assert "23" in output and "no output" in output.lower()
     assert counts == {}

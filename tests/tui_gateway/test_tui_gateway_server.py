@@ -7771,6 +7771,10 @@ def test_refused_completion_submission_preserves_durable_receipt(
     pending = queue.Queue()
     pending.put(event)
     monkeypatch.setattr(process_registry, "completion_queue", pending)
+    # The event is seeded on the queue by hand; upstream's once-per-process startup replay at poller
+    # start (#123265) would re-offer the persisted row and age-drop it (the shared fixture's
+    # completed_at is epoch-old), killing the claim before the refusal under test. Premise = already queued.
+    monkeypatch.setattr(process_registry, "_completions_restored", True)
     original = server._run_prompt_submit
     accepted = []
 
@@ -7873,6 +7877,7 @@ def test_completion_consumer_uses_event_profile(monkeypatch, tmp_path, phase, di
     pending = queue.Queue()
     pending.put(event)
     monkeypatch.setattr(process_registry, "completion_queue", pending)
+    monkeypatch.setattr(process_registry, "_completions_restored", True)  # seeded by hand; see above
     if phase == "post_turn":
         session["running"] = True
         assert server._run_prompt_submit("outer-rid", sid, session, "outer turn") is True
@@ -12113,7 +12118,11 @@ def test_session_compress_forwards_config_ceiling_budget_to_compute_host(monkeyp
     # #97948: the waiter follows compression.context_total_ceiling_seconds
     # (+30s slack) instead of a hard-coded 120s, and registers a late-ack
     # handler so a compress that outlives it is still adopted.
-    assert kwargs["timeout"] == 330.0
+    # fork (parity 2026-10-01): the ceiling is the fork reconciler's (agent/compression_timeout_floor
+    # lifts a non-operator ceiling so a stall-fallback attempt fits; upstream pinned 300 -> 330).
+    from agent.conversation_compression import resolve_context_compression_timeouts
+    _idle, reconciled = resolve_context_compression_timeouts({"context_total_ceiling_seconds": 300})
+    assert kwargs["timeout"] == reconciled + 30.0 >= 330.0
     assert callable(kwargs["on_late_ack"])
 
 

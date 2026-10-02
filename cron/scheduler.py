@@ -706,13 +706,14 @@ def _repeat_alert_withheld(incident: dict) -> bool:
 
 
 def _upsert_incident_for_failure(
-    job: dict, error: str, *, output_file: Optional[Any] = None
+    job: dict, error: str, *, output_file: Optional[Any] = None, escalation: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Record a durable failure incident (grouped by job + error signature). Returns
     ``(withheld, incident_id)``; withheld=True when the signature's incident is already ``closed``
     (operator ack) or ``alerted`` inside the ``cron.failure_repeat_alert_hours`` cooldown (a ping
-    already went out) -> suppress the per-run ping. Store errors log at debug; the caller delivers
-    as if none existed."""
+    already went out) -> suppress the per-run ping. ``escalation`` (the fork's one-time stuck page,
+    t_04822736) is a richer notice that fires exactly once, so only the operator ack withholds it,
+    never the reminder cooldown. Store errors log at debug; the caller delivers as if none existed."""
     try:
         from cron.incidents import get_incident, upsert_incident
 
@@ -720,7 +721,8 @@ def _upsert_incident_for_failure(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
-        withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
+        withheld = state == "closed" or (
+            not escalation and state == "alerted" and _repeat_alert_withheld(incident))
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
@@ -832,6 +834,16 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
             f"tool. Check `platform_toolsets.cron` in config.yaml (`hermes cron doctor`): {exc}"
         ) from exc
 
+def _pin_filter_bypassed(job: dict) -> bool:
+    """True when the pin filter is switched off: the global revert env var, or the per-job
+    ``allow_cross_provider_fallback`` opt-in (bool true or the common truthy strings "1"/"true"/
+    "yes", so a hand-edited jobs.json works either way)."""
+    if os.getenv("HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK", "").strip() in ("1", "true", "yes"):
+        return True
+    _opt_in = job.get("allow_cross_provider_fallback")
+    return _opt_in is True or (isinstance(_opt_in, str) and _opt_in.strip().lower() in ("1", "true", "yes"))
+
+
 def _filter_fallback_chain_for_pinned_job(
     job: dict, fallback_model, job_id: str
 ):
@@ -864,14 +876,7 @@ def _filter_fallback_chain_for_pinned_job(
     intentional fallback is never silent. Unlike the global env switch it does
     not re-open codex->opus drift for unrelated jobs.
     """
-    if os.getenv("HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK", "").strip() in ("1", "true", "yes"):
-        return fallback_model
-
-    # Per-job opt-in: this job's operator declared its cross-provider fallback
-    # intentional. Accept bool true or the common truthy strings ("1"/"true"/
-    # "yes") so a hand-edited jobs.json works either way.
-    _opt_in = job.get("allow_cross_provider_fallback")
-    if _opt_in is True or (isinstance(_opt_in, str) and _opt_in.strip().lower() in ("1", "true", "yes")):
+    if _pin_filter_bypassed(job):
         return fallback_model
 
     pinned = str(job.get("provider") or "").strip().lower()
@@ -915,6 +920,14 @@ def _resolve_job_fallback_chain(job: dict, global_chain, job_id: str):
     job_fb = job.get("fallback")
     if isinstance(job_fb, dict):
         job_fb = [job_fb]
+    if not job_fb and _job_route_pinned(job) and not str(job.get("provider") or "").strip():
+        # Upstream #100437 (``scoped_fallback_chain``): a job pinned by MODEL or ENDPOINT alone
+        # never borrows the global chain — every entry is a different route than the one the
+        # operator chose, and with no provider pin the same-provider filter below has nothing to
+        # keep. Provider-pinned jobs keep the fork's same-provider entries; the opt-in and the
+        # revert env var still re-open the chain.
+        if not _pin_filter_bypassed(job):
+            return None
     base = job_fb if job_fb else global_chain
     return _filter_fallback_chain_for_pinned_job(job, base, job_id)
 
@@ -4200,10 +4213,10 @@ def _compose_run_delivery(
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
         # Best-effort: a ledger failure never breaks delivery.
-        incident_acked, failure_incident_id = _upsert_incident_for_failure(
-            job, error or "", output_file=output_file
-        )
         _stuck_page = _repeated_script_error_page(job, error)
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(
+            job, error or "", output_file=output_file, escalation=bool(_stuck_page)
+        )
         if incident_acked:
             deliver_content = ""
         elif _stuck_page is not None:
@@ -4358,7 +4371,10 @@ def _save_compose_deliver(
         d.should_deliver = False
     # Fork: transient provider-capacity/rate/timeout blip on a self-healing recurring job — skip the
     # immediate per-run page (the run is still recorded; the consecutive-sample monitor owns loud).
-    if d.should_deliver and not d.success and _should_suppress_transient_failure_page(job, d.error):
+    # An agent-declared failure ([CRON_FAILURE]) is the agent's own evidence, not a provider blip —
+    # "the export subagent timed out" must reach the operator verbatim (tests/cron/test_run_one_job.py).
+    if (d.should_deliver and not d.success and not d.agent_declared
+            and _should_suppress_transient_failure_page(job, d.error)):
         logger.info(
             "Job '%s': transient failure (%s) — suppressing immediate page (recurring job re-fires next tick)",
             job["id"], (d.error or "")[:120])
@@ -4474,11 +4490,12 @@ def _deliver_crash_failure(
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
-    if incident_acked:
-        return None, "suppressed_acked"
     # Fork (t_04822736): stuck no_agent page once ("" = already paged this error, stay silent).
     _stuck_page = _repeated_script_error_page(job, err_text)
+    incident_acked, failure_incident_id = _upsert_incident_for_failure(
+        job, err_text, escalation=bool(_stuck_page))
+    if incident_acked:
+        return None, "suppressed_acked"
     if _stuck_page == "":
         return None, "suppressed_acked"
     delivery_error = None

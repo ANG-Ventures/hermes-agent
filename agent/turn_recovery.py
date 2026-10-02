@@ -20,7 +20,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE
 from agent.fast_mode import fast_mode_unprovisioned, mark_fast_mode_unavailable
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
-from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
+from agent.retry_utils import (
+    LOCAL_RELAY_MAX_RECOVERIES_PER_TURN,
+    is_local_relay_restart_candidate,
+    is_zai_coding_overload_error,
+    zai_coding_overload_retry_ceiling,
+)
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_sanitization import (
     _looks_like_corrupt_image_rejection, _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
@@ -1702,7 +1707,11 @@ _OVERFLOW_REASONS = frozenset({
 _RATE_LIMIT_REASONS = frozenset({
     FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit,
 })
-_TRANSPORT_FAILURE_REASONS = frozenset({FailoverReason.timeout, FailoverReason.overloaded})
+# ``stream_parse`` (fork, #605): an HTTP-200 stream whose bytes are not JSON/SSE is a
+# response-side transport fault — one same-route retry, then the chain.
+_TRANSPORT_FAILURE_REASONS = frozenset({
+    FailoverReason.timeout, FailoverReason.overloaded, FailoverReason.stream_parse,
+})
 
 
 _LONG_CONTEXT_TIER_CAP = 200000
@@ -1730,6 +1739,15 @@ def _cap_long_context_tier(agent: Any) -> int:
             f"{old_ctx:,} → {_LONG_CONTEXT_TIER_CAP:,} tokens"
         )
     return old_ctx
+
+
+def _wait_for_local_relay(base_url: str, budget_s: float, *, should_abort: Any) -> Tuple[bool, float]:
+    """Poll a restarting loopback relay. Read through the ``agent.conversation_loop`` facade at
+    call time: the fork's relay tests (and the live loop before upstream's phase split) patch
+    ``agent.conversation_loop.wait_for_local_relay``; a direct import here would bypass them."""
+    from agent import conversation_loop as _cl
+    from agent.retry_utils import wait_for_local_relay as _default
+    return getattr(_cl, "wait_for_local_relay", _default)(base_url, budget_s, should_abort=should_abort)
 
 
 def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_failure: bool) -> str:
@@ -1932,6 +1950,89 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+
+    # ── Relay draining for a deploy: wait, retry the SAME model (fork, t_826861ab) ──
+    # 503 {"error":"draining-for-deploy"} is provider-wide and self-clearing. Wall-clock
+    # budget ``fallback.relay_drain_wait_s``, same model, attempt NOT consumed. Budget
+    # spent -> the existing "max retries -> fallback" branch (single-sourced announce),
+    # where the chain walk skips same-provider entries.
+    if classified.reason == FailoverReason.relay_draining:
+        from agent.fallback_wiring import relay_drain_wait_s
+        from agent.retry_utils import relay_drain_wait
+
+        _drain_max = relay_drain_wait_s()
+        _drain_now = time.monotonic()
+        if _retry.relay_drain_started_at is None:
+            _retry.relay_drain_started_at = _drain_now
+        _drain_waited = _drain_now - _retry.relay_drain_started_at
+        _drain_headers = getattr(getattr(api_error, "response", None), "headers", None)
+        _drain_ra = None
+        if _drain_headers is not None and hasattr(_drain_headers, "get"):
+            _drain_ra = _drain_headers.get("retry-after") or _drain_headers.get("Retry-After")
+        _drain_wait = relay_drain_wait(
+            raw_retry_after=_drain_ra, waited_s=_drain_waited, max_wait_s=_drain_max,
+        )
+        if _drain_wait is not None:
+            if _drain_waited == 0:
+                agent._vprint(
+                    f"{agent.log_prefix}⏳ relay draining for deploy, waiting "
+                    f"(up to {_drain_max:.0f}s) to retry {model}…",
+                    force=True,
+                )
+            agent._touch_activity("waiting for relay deploy drain")
+            logger.warning(
+                "relay draining for deploy: retry %s in %.1fs (waited %.0fs of %.0fs, retry_after=%s) %s",
+                model, _drain_wait, _drain_waited, _drain_max, _drain_ra, agent._client_log_context(),
+            )
+            _drain_end = time.monotonic() + _drain_wait
+            while time.monotonic() < _drain_end and not agent._interrupt_requested:
+                time.sleep(min(0.2, max(_drain_end - time.monotonic(), 0.0)))
+            # Not an attempt: the relay refused before serving. An interrupt is handled
+            # by the checkpoint at loop top.
+            retry_count = max(retry_count - 1, 0)
+            return _verdict("continue")
+        logger.warning(
+            "relay drain outlived the %.0fs wait (waited %.0fs) → fallback %s",
+            _drain_max, _drain_waited, agent._client_log_context(),
+        )
+        retry_count = max_retries
+
+    # ── Loopback relay restarting: wait, retry the SAME model (fork, 2026-09-28) ──
+    # A connection error on a 127.0.0.1/localhost base_url is a local relay restart
+    # (relay-autodeploy: ~5 s listener gap). Poll the port (bounded by
+    # ``fallback.local_relay_restart_wait_s``); if it was down and came back, retry
+    # without consuming the attempt. Still down (or never down) -> existing policy.
+    if (
+        _is_transport_failure
+        and _retry.local_relay_recoveries < LOCAL_RELAY_MAX_RECOVERIES_PER_TURN
+        and is_local_relay_restart_candidate(api_error, base_url)
+    ):
+        from agent.fallback_wiring import local_relay_restart_wait_s
+
+        _relay_budget = local_relay_restart_wait_s() - _retry.local_relay_waited_s
+        if _relay_budget > 0:
+            if _retry.local_relay_recoveries == 0 and _retry.local_relay_waited_s == 0:
+                agent._vprint(
+                    f"{agent.log_prefix}⏳ local relay restarting, waiting "
+                    f"(up to {_relay_budget:.0f}s) to retry {model}…",
+                    force=True,
+                )
+            agent._touch_activity("waiting for local relay restart")
+            _relay_back, _relay_waited = _wait_for_local_relay(
+                str(base_url), _relay_budget,
+                should_abort=lambda: bool(agent._interrupt_requested),
+            )
+            _retry.local_relay_waited_s += _relay_waited
+            logger.warning(
+                "local relay %s %s after %.1fs (%s) %s",
+                base_url, "back" if _relay_back else "not recovered", _relay_waited,
+                type(api_error).__name__, agent._client_log_context(),
+            )
+            if _relay_back:
+                _retry.local_relay_recoveries += 1
+                retry_count = max(retry_count - 1, 0)
+                return _verdict("continue")
+
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)

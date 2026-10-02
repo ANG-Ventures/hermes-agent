@@ -142,6 +142,19 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             # are drained. Not reachable concurrently with writers.
             "__init__", "_connect_and_init",
             "_connect_and_init_with_lock_patience", "close",
+            # parity 2026-10-01: upstream split the __init__ connect path into
+            # helpers reachable ONLY from __init__ (verified: one call site each).
+            "_open_writer", "_open_read_only",
+            "_ensure_db_file_generation", "_record_db_file_identity",
+        }
+        # Helpers whose lock is held by the CALLER (upstream's ``*_locked`` contract,
+        # and the close-time-checkpoint pair reached from locked write/close paths).
+        # A lexical sweep cannot see that, so they are exempted here — and the
+        # caller check below proves every call to them is itself lock-held.
+        LOCK_HELD_BY_CALLER = {
+            "_reopen_after_close_locked", "_settle_lost_generation_locked",
+            "_disable_close_time_checkpoint", "_halt_if_db_generation_changed",
+            "_raise_if_db_replaced",
         }
 
         def is_lock_with(node):
@@ -156,6 +169,7 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             return False
 
         violations = []
+        unlocked_calls = []
 
         class Sweep(ast.NodeVisitor):
             def __init__(self):
@@ -171,14 +185,25 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                     self.lock_depth += 1
                 if is_func:
                     self.func_stack.append(node.name)
+                fn = self.func_stack[-1] if self.func_stack else "<module>"
                 if (isinstance(node, ast.Attribute)
                         and isinstance(node.value, ast.Name)
                         and node.value.id == "self"
                         and node.attr == "_conn"
                         and self.lock_depth == 0):
-                    fn = self.func_stack[-1] if self.func_stack else "<module>"
-                    if fn not in ALLOWED_FUNCS:
+                    if fn not in ALLOWED_FUNCS and fn not in LOCK_HELD_BY_CALLER:
                         violations.append((node.lineno, fn))
+                # Caller check for the lock-held-by-caller helpers: every
+                # ``self.<helper>(...)`` must sit inside ``with self._lock`` or
+                # inside another such helper (transitively lock-held).
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"
+                        and node.func.attr in LOCK_HELD_BY_CALLER
+                        and self.lock_depth == 0
+                        and fn not in LOCK_HELD_BY_CALLER):
+                    unlocked_calls.append((node.lineno, fn, node.func.attr))
                 super().generic_visit(node)
                 if locked:
                     self.lock_depth -= 1
@@ -186,6 +211,11 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                     self.func_stack.pop()
 
         Sweep().visit(tree)
+        assert unlocked_calls == [], (
+            "lock-held-by-caller helper called outside 'with self._lock' in: %r — "
+            "the helper touches self._conn and relies on its caller holding the "
+            "lock" % (unlocked_calls,)
+        )
         assert violations == [], (
             "self._conn used outside 'with self._lock' in: %r — route reads "
             "through _read_ctx() (or take the lock); an unlocked statement "

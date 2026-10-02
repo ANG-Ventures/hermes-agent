@@ -100,6 +100,19 @@ def _live_session_messages(session: dict) -> Optional[list]:
     return None
 
 
+def _format_live_prompt_output(sid: str, session: dict, arg: str) -> str:
+    """Fork: /prompt answered from the live session (compute-host metadata mirror first)."""
+    agent = session.get("agent")
+    mirror = _metadata_mirror(session)
+    if agent is None and "system_prompt" not in mirror:
+        return "No active agent -- send a message first."
+    prompt = (mirror.get("system_prompt") or getattr(agent, "ephemeral_system_prompt", None)
+              or getattr(agent, "_cached_system_prompt", None) or "")
+    if not prompt:
+        return "Current system prompt is not built yet; send a message first."
+    return f"Current system prompt:\n{prompt}"
+
+
 def _format_live_history_output(sid: str, session: dict, arg: str) -> str:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -204,6 +217,7 @@ _LIVE_SLASH_OUTPUT = {
     "usage": (_NO_AGENT_USAGE, _format_live_usage_output),
     "review": (None, _format_live_review_output),
     "history": ("No conversation history yet.", _format_live_history_output),
+    "prompt": (None, _format_live_prompt_output),  # fork: live /prompt (formatter handles no session)
     "status": (None, _format_live_status_output),
     "context": ("Conversation is empty (no messages yet).", _format_live_context_output),
     "tools": ("No tools available.", _format_live_tools_output),

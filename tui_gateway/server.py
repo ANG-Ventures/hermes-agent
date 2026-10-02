@@ -5045,6 +5045,11 @@ def _compress_session_history_core(
             # External mutation during compaction — drop the result so we don't clobber concurrent edits.
             finalize_context_engine_compression_notification(agent, committed=False)
             return 0, _get_usage(agent)
+        if result.after_messages is before_messages:
+            # fork: the compressor's lock-skip/no-op paths return the exact input list object. Do not
+            # swap the live history or bump the write-fence version for a no-op; a same-length but
+            # distinct rebuilt transcript still lands below.
+            return 0, _get_usage(agent)
         session["history"] = result.after_messages
         session["history_version"] = history_version + 1
     return result.removed, _get_usage(agent)

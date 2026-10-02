@@ -35,6 +35,9 @@ class PromptSubmitParams(SessionParams):
     queued: bool | None = None  # client queue drain — the busy path must hold it, never redirect/steer
     surface: str | None = None  # a ClientSurface value; unknown values clear the surface
     voice_context: str | None = None  # recent spoken transcript, model input only (voice-live)
+    # fork (turn_system_context capability, advertised on session.create/resume/info): per-turn trusted
+    # metadata appended to the ephemeral system prompt for THIS turn only — never in the user text.
+    system_context: str | None = None
     # Desktop-generated large-paste preview (first ~1000 chars); TITLE input only, never the model turn.
     title_preview: str | None = None
     truncate_before_user_ordinal: int | None = None

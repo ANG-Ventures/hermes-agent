@@ -122,6 +122,15 @@ def _set_model(rid, params, key, value, session):
         if session.get("running") or session.get("_compute_host_active"):
             return _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags)
         explicit_provider = parsed_flags.explicit_provider
+        # fork: a build already in flight (started, not ready, no error yet) must finish before we
+        # decide — if it fails, the failed-build recovery below has to replace it; switching against
+        # agent None while it runs would let it fail later with the stale overrides and no rebuild.
+        inflight_ready = session.get("agent_ready")
+        if (session.get("agent") is None and session.get("agent_error") is None
+                and session.get("agent_build_started") and inflight_ready is not None
+                and not inflight_ready.is_set()):
+            if not inflight_ready.wait(timeout=30.0):
+                return _err(rid, 5032, AGENT_STILL_STARTING)
         failed_agent_init = session.get("agent") is None and session.get("agent_error") is not None
         failed_ready = session.get("agent_ready") if failed_agent_init else None
         if failed_agent_init:
@@ -212,7 +221,7 @@ def _set_fast(rid, params, key, value, session):
             base_url=target_base_url,
             tier="ultrafast" if nv == "ultrafast" else None)
         if not capability.supported:
-            return _err(rid, 4002, f"{nv} mode is not available for this model")
+            return _err(rid, 4002, capability.reason or f"{nv} mode is not available for this route")
         overrides = dict(capability.request_overrides or {})
     if session is not None:
         # Session-scoped like `reasoning` (global = `--global` / Settings → Model): writing config.yaml
