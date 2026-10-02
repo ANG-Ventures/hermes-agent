@@ -120,8 +120,7 @@ async def test_stopped_handler_keeps_lease_until_its_executor_worker_exits():
         token = await registry.acquire(SESSION_ID, owner_key=qk, generation=generation, timeout=5)
         token.owner_task = asyncio.current_task()
         state = runner._session_state(qk).turn
-        state.lease_token = token
-        state.lease_generation = generation
+        state.lease_tokens[generation] = token  # upstream: tokens keyed by run generation
         bind_current_token(token)
         # _run_agent spawns the executor call as its own task (ensure_future).
         executor_task = asyncio.ensure_future(
@@ -184,8 +183,7 @@ async def test_old_turn_unwind_does_not_clear_newer_turns_running_agent():
         token = await registry.acquire(SESSION_ID, owner_key=qk, generation=generation, timeout=5)
         token.owner_task = asyncio.current_task()
         state = runner._session_state(qk).turn
-        state.lease_token = token
-        state.lease_generation = generation
+        state.lease_tokens[generation] = token  # upstream: tokens keyed by run generation
         setattr(ev, "_gateway_active_turn_session_key", qk)
         setattr(ev, "_gateway_active_turn_token", f"durable-{generation}")
         if ev.text == "first":

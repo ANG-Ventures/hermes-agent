@@ -639,7 +639,7 @@ def test_boot_claim_carries_prior_pid_and_heartbeat_for_a_sigkilled_life(tmp_pat
     hb = get_loop_heartbeat_path(tmp_path)
     hb.parent.mkdir(parents=True, exist_ok=True)
     hb.write_text(json.dumps({"pid": 99678, "updated_at": "2026-09-24T19:11:40+00:00"}))
-    monkeypatch.setattr(ll, "_pid_alive_with_start_time", lambda *a, **k: False)
+    monkeypatch.setattr(ll, "_pid_is_sentinel_owner", lambda *a, **k: False)  # upstream renamed the liveness probe
     evidence = ll.detect_unclean_exit(tmp_path)
     assert evidence is not None
     ll._claim_sentinel(evidence, tmp_path)
