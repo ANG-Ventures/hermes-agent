@@ -3282,6 +3282,9 @@ DEFAULT_CONFIG = {
         # subscriber. A needs_input block on a priority >= 100 card stays put.
         # Empty = post in the subscriber's chat.
         "lifecycle_channel": "",
+        # Seconds to batch lifecycle_channel lines into one digest post
+        # (0 = one post per line). The wake is never delayed.
+        "lifecycle_digest_seconds": 0,
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.

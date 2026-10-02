@@ -1212,6 +1212,13 @@ def _resolve_lifecycle_channel() -> "Optional[tuple[str, str]]":
         return None
 
 
+def _resolve_lifecycle_digest_seconds() -> int:
+    """``kanban.lifecycle_digest_seconds``, read per notifier tick. Errors -> 0 (off)."""
+    from gateway.kanban_lifecycle_digest import resolve_digest_seconds
+
+    return resolve_digest_seconds()
+
+
 def _needs_input_cards(results, include_dependency: bool = False
                        ) -> tuple[list[tuple[str, dict]], set[str]]:
     """Probe each ticked board; only successful probes can prove a card unblocked."""
@@ -1650,6 +1657,12 @@ class GatewayKanbanWatchersMixin:
 
         lane_dedupe: LaneFailureDedupe = getattr(self, "_kanban_lane_dedupe", None) or LaneFailureDedupe()
         self._kanban_lane_dedupe = lane_dedupe
+        from gateway.kanban_lifecycle_digest import LifecycleDigest
+
+        lifecycle_digest: LifecycleDigest = (
+            getattr(self, "_kanban_lifecycle_digest", None) or LifecycleDigest()
+        )
+        self._kanban_lifecycle_digest = lifecycle_digest
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -1885,6 +1898,10 @@ class GatewayKanbanWatchersMixin:
 
                 deliveries = await asyncio.to_thread(_collect)
                 lifecycle_channel = _resolve_lifecycle_channel() if deliveries else None
+                # kanban.lifecycle_digest_seconds (t_d62bd921): batch routed lines.
+                _digest_window = (
+                    _resolve_lifecycle_digest_seconds() if lifecycle_channel else 0
+                )
                 # One message per failure event, one per lane-wide cause.
                 lane_dedupe.plan(deliveries)
                 for d in deliveries:
@@ -2190,9 +2207,18 @@ class GatewayKanbanWatchersMixin:
                         # failure instead of burning MAX_SEND_FAILURES ticks.
                         _target_gone = False
                         try:
-                            _send_res = await send_adapter.send(
-                                send_chat_id, msg, metadata=metadata,
-                            )
+                            if _routed is not None and _digest_window > 0:
+                                # Held for the lifecycle digest: the line is
+                                # recorded, so the event counts as delivered
+                                # (cursor, wake and failure counter unchanged).
+                                lifecycle_digest.add(
+                                    _routed, send_adapter, msg, _digest_window, time.time(),
+                                )
+                                _send_res = None
+                            else:
+                                _send_res = await send_adapter.send(
+                                    send_chat_id, msg, metadata=metadata,
+                                )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
                             # transient failure) must count as a FAILED
@@ -2614,9 +2640,19 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+            if len(lifecycle_digest):
+                try:
+                    await lifecycle_digest.flush(time.time())
+                except Exception as exc:
+                    logger.warning("kanban lifecycle digest flush failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
+                    if len(lifecycle_digest):
+                        try:
+                            await lifecycle_digest.flush(time.time(), force=True)
+                        except Exception:
+                            pass
                     return
                 await asyncio.sleep(1)
 
