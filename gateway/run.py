@@ -10669,9 +10669,28 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
-        logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
+    # The wait MUST cover the old gateway's graceful stop budget: its SIGTERM handler drains
+    # in-flight turns for ``restart_drain_timeout`` (cron for ``cron_drain_timeout``), then
+    # checkpoints + closes SQLite. A fixed 10s grace SIGKILLed a draining gateway MID-WRITE on
+    # every busy restart (fork incident 2026-09-16: ``gateway.previous_unclean_exit`` then
+    # ``database disk image is malformed`` days later). Same budget ``TimeoutStopSec`` derives
+    # from (#94759), so --replace and systemd agree. Loaders resolve from the mixin, not the
+    # module-level ``GatewayRunner`` name (tests stub that with a bare runner).
+    try:
+        _drain_s = GatewayConfigLoadersMixin._load_restart_drain_timeout()
+        _cron_s = GatewayConfigLoadersMixin._load_cron_drain_timeout()
+    except Exception:  # config unreadable → same floor as systemd
+        _drain_s, _cron_s = 0.0, 0.0
+    grace_s = resolve_replace_takeover_grace_s(_drain_s, _cron_s)
+    logger.info(
+        "Waiting up to %.0fs for old gateway (PID %d) to drain and exit before force-kill",
+        grace_s, existing_pid,
+    )
+    if not await _wait_for_pid_exit(existing_pid, max(1, int(grace_s / 0.5)), 0.5):
+        logger.warning(
+            "Old gateway (PID %d) did not exit within %.0fs after SIGTERM, sending SIGKILL.",
+            existing_pid, grace_s,
+        )
         old_gateway_exited = False
         try:
             terminate_pid(existing_pid, force=True, expected_start_time=existing_start_time)
