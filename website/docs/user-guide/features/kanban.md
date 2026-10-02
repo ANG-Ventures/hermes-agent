@@ -1085,6 +1085,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `cli_auto_subscribe` | `false` | Same auto-subscribe, but for `hermes kanban create` run on the CLI. Off by default because scripts and cron jobs also drive the CLI. When on, only a create carrying a full gateway session identity (`HERMES_SESSION_PLATFORM` + `HERMES_SESSION_CHAT_ID`, which the gateway exports into terminal subprocesses) subscribes; a bare CLI/cron/script create stays silent either way. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `lifecycle_channel` | `""` | `platform:chat_id` that receives the notifier's done / ready-for-review / blocked lines instead of the subscriber's chat (e.g. a log channel). The subscriber's agent is still woken. A `needs_input` block on a priority >= 100 card, failure lines, review change requests and triage routing stay in the subscriber's chat. Empty = unchanged. |
 
 And the two auxiliary LLM slots:
 

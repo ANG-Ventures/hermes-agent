@@ -950,6 +950,55 @@ def _resolve_needs_input_pager_settings(load_config: Callable[[], Any]) -> "tupl
             bool(kcfg.get("needs_input_pager_dependency", False)))
 
 
+# Kinds whose passive line ``kanban.lifecycle_channel`` re-routes (t_f7bba206).
+# Failure lines (gave_up/crashed/timed_out/stalled), changes_requested and
+# triage routing stay in the subscriber's chat: they need a human.
+LIFECYCLE_CHANNEL_KINDS = frozenset({"completed", "review_requested", "blocked"})
+# A needs_input block on a card at or above this priority stays in the origin
+# chat (the needs-input pager pages there too).
+LIFECYCLE_CHANNEL_KEEP_PRIORITY = 100
+
+
+def parse_lifecycle_channel(value: Any) -> "Optional[tuple[str, str]]":
+    """``"platform:chat_id"`` -> ``(platform, chat_id)``; None when unset or malformed."""
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    platform, _, chat_id = value.strip().partition(":")
+    platform, chat_id = platform.strip().lower(), chat_id.strip()
+    if not platform or not chat_id:
+        return None
+    return platform, chat_id
+
+
+def lifecycle_channel_target(
+    channel: "Optional[tuple[str, str]]", kind: str, payload: Optional[dict], task: Any,
+) -> "Optional[tuple[str, str]]":
+    """Target for a done / ready-for-review / blocked line, or None to keep
+    the subscriber's own chat. A needs_input block on a priority >= 100 card
+    stays with the subscriber."""
+    if channel is None or kind not in LIFECYCLE_CHANNEL_KINDS:
+        return None
+    if kind == "blocked" and (payload or {}).get("kind") == "needs_input":
+        try:
+            priority = int(getattr(task, "priority", 0) or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        if priority >= LIFECYCLE_CHANNEL_KEEP_PRIORITY:
+            return None
+    return channel
+
+
+def _resolve_lifecycle_channel() -> "Optional[tuple[str, str]]":
+    """``kanban.lifecycle_channel``, read per notifier tick. Errors -> unset."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        kcfg = (load_config_readonly() or {}).get("kanban") or {}
+        return parse_lifecycle_channel(kcfg.get("lifecycle_channel") if isinstance(kcfg, dict) else None)
+    except Exception:
+        return None
+
+
 def _needs_input_cards(results, include_dependency: bool = False
                        ) -> tuple[list[tuple[str, dict]], set[str]]:
     """Probe each ticked board; only successful probes can prove a card unblocked."""
@@ -1311,6 +1360,8 @@ class GatewayKanbanWatchersMixin:
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
+            # Upstream decomposed the facade without re-exports: notify helpers live here.
+            from hermes_cli import kanban_db_notify as _kbn
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
@@ -1508,7 +1559,7 @@ class GatewayKanbanWatchersMixin:
                                 # blocks delivery; the next hourly gate
                                 # retries it.
                                 try:
-                                    _purged = _kb.purge_stale_done_notify_subs(
+                                    _purged = _kbn.purge_stale_done_notify_subs(
                                         conn,
                                         max_age_days=_gc_retention_days,
                                     )
@@ -1534,7 +1585,7 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(
+                            subs = _kbn.list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
@@ -1559,7 +1610,7 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                    old_cursor, cursor, events = _kbn.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
@@ -1604,6 +1655,7 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                lifecycle_channel = _resolve_lifecycle_channel() if deliveries else None
                 # One message per failure event, one per lane-wide cause.
                 lane_dedupe.plan(deliveries)
                 for d in deliveries:
@@ -1851,6 +1903,25 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        # kanban.lifecycle_channel (t_f7bba206): done / ready
+                        # for review / blocked lines go to a log channel; the
+                        # wake below still targets the subscriber.
+                        send_adapter, send_chat_id = adapter, sub["chat_id"]
+                        _routed = lifecycle_channel_target(
+                            lifecycle_channel, kind, ev.payload, task,
+                        )
+                        if _routed is not None:
+                            try:
+                                _routed_adapter = self._authorization_adapter(
+                                    _Platform(_routed[0]), sub_profile or None,
+                                )
+                            except ValueError:
+                                _routed_adapter = None
+                            if _routed_adapter is not None:
+                                send_adapter, send_chat_id = _routed_adapter, _routed[1]
+                                metadata = {}
+                            else:
+                                _routed = None
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -1890,8 +1961,8 @@ class GatewayKanbanWatchersMixin:
                         # failure instead of burning MAX_SEND_FAILURES ticks.
                         _target_gone = False
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            _send_res = await send_adapter.send(
+                                send_chat_id, msg, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -1901,7 +1972,9 @@ class GatewayKanbanWatchersMixin:
                             # None (or anything non-SendResult shaped) keep
                             # the legacy "no exception == delivered" contract.
                             if getattr(_send_res, "success", True) is False:
-                                _target_gone = (
+                                # A gone LOG channel must not drop the
+                                # subscriber's sub (its wake still matters).
+                                _target_gone = _routed is None and (
                                     getattr(_send_res, "error_kind", None) == "not_found"
                                 )
                                 raise RuntimeError(
@@ -1910,7 +1983,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                kind, sub["task_id"], platform_str, send_chat_id, board_slug,
                             )
                             _sent_event_ids.add(ev.id)
                             # After delivering the text notification, surface
@@ -1925,8 +1998,8 @@ class GatewayKanbanWatchersMixin:
                             if kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
+                                        adapter=send_adapter,
+                                        chat_id=send_chat_id,
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
@@ -2489,6 +2562,8 @@ class GatewayKanbanWatchersMixin:
 
         try:
             from hermes_cli import kanban_db as _kb
+            # Upstream decomposed the facade without re-exports: dispatch helpers live here.
+            from hermes_cli import kanban_db_dispatch as _kbd
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
@@ -2593,7 +2668,7 @@ class GatewayKanbanWatchersMixin:
         # hosted VMs has repeatedly swap-thrashed the whole machine. Explicit
         # config always wins; None stays None on hosts where total memory
         # can't be read (macOS/Windows dev machines).
-        effective_max_in_progress = _kb.resolve_max_in_progress(max_in_progress)
+        effective_max_in_progress = _kbd.resolve_max_in_progress(max_in_progress)
         if max_in_progress is None and effective_max_in_progress is not None:
             logger.info(
                 "kanban dispatcher: kanban.max_in_progress unset; using "
@@ -2921,7 +2996,7 @@ class GatewayKanbanWatchersMixin:
             _tick_spawned = 0
             _demand: list[tuple[str, int]] = []
             if _allowance is not None and not _spawn_paused:
-                _review_on = _kb.review_dispatch_enabled()
+                _review_on = _kbd.review_dispatch_enabled()
                 for b in _kb.enumerating_each(boards):
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
                     # A board quarantined as corrupt (same fingerprint, inside
@@ -3043,7 +3118,7 @@ class GatewayKanbanWatchersMixin:
             # waiting for a human, not a stuck dispatcher; probing it here would
             # fire a false "dispatcher stuck" warning that never clears. Shares
             # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
+            _review_probe = _kbd.review_dispatch_enabled()
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -3053,9 +3128,9 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if _kbd.has_spawnable_ready(conn):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _review_probe and _kbd.has_spawnable_review(conn):
                         return True
                 except Exception:
                     continue
@@ -3174,7 +3249,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
-                pids = await service(_kb.reap_worker_zombies)
+                pids = await service(_kbd.reap_worker_zombies)
                 if pids:
                     logger.info(
                         "kanban dispatcher: reaped %d zombie worker(s), pids=%s",

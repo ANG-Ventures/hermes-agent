@@ -4815,6 +4815,70 @@ def set_needs_input_page(
 
 
 _BLOCK_REASON_EVENTS = ("blocked", "block_loop_detected")
+# An operator comment that answers the block (t_dfc938c4: t_e6b3713d re-paged
+# "needs a ruling" 80 min after "APOLLO 14:45 — B4 RULED"). All of:
+#  * author is an operator/Ace author (kanban_worker_policy.RULING_AUTHORS, the
+#    same label trust find_ruled_parent uses), not a delegated child
+#    (SUBAGENT_AUTHOR_MARKER), and the comment carries no worker run_id (a
+#    dispatched run on this card stamps one; ``--author default`` cannot drop it);
+#  * the first line opens with ``APOLLO`` and carries an uppercase RULED /
+#    RULING(S) / ANSWERED whose clause (text since the last : ; , . ( ) or dash)
+#    holds no negator, so "NEEDS (AN OPERATOR) RULING", "NO RULING yet",
+#    "NOT ANSWERED" stay pending;
+#  * it was written after the card's latest block event, ordered by event id
+#    (``created_at`` is whole seconds; a same-second ruling must still count and
+#    a same-second re-block must still page).
+_RULING_ANSWER_LEAD_RE = re.compile(r"\AAPOLLO\b")
+_RULING_ANSWER_WORD_RE = re.compile(r"\b(?:RULED|RULINGS?|ANSWERED)\b")
+_RULING_CLAUSE_BREAK_RE = re.compile(r"[:;,.()\u2013\u2014]")
+_RULING_ANSWER_NEGATORS = frozenset({
+    "needs", "need", "needing", "no", "not", "awaiting", "await", "pending",
+    "for", "without", "requesting", "request", "asks", "ask", "wants", "want",
+})
+
+
+def _is_ruling_answer(body: str) -> bool:
+    line = (body or "").lstrip().split("\n", 1)[0]
+    if not _RULING_ANSWER_LEAD_RE.match(line):
+        return False
+    for m in _RULING_ANSWER_WORD_RE.finditer(line):
+        clause = _RULING_CLAUSE_BREAK_RE.split(line[:m.start()])[-1]
+        if not any(w.lower() in _RULING_ANSWER_NEGATORS for w in re.findall(r"[A-Za-z]+", clause)):
+            return True
+    return False
+
+
+def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when an operator ruling comment was written after the card's latest block."""
+    from .kanban_worker_policy import RULING_AUTHORS
+
+    row = conn.execute(
+        "SELECT MAX(id) AS id FROM task_events WHERE task_id = ? AND kind IN (?, ?)",
+        (task_id, *_BLOCK_REASON_EVENTS),
+    ).fetchone()
+    if row is None or row["id"] is None:
+        return False
+    # add_comment logs one ``commented`` event in the comment's own txn, so the
+    # newest N comments are the N written after the block. A comment written by a
+    # path that logs no event only shrinks that window (fails toward paging).
+    n = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
+        (task_id, row["id"]),
+    ).fetchone()[0]
+    if not n:
+        return False
+    for r in conn.execute(
+        "SELECT author, body, run_id FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+        (task_id, int(n)),
+    ):
+        author = (r["author"] or "").strip()
+        if author.endswith(SUBAGENT_AUTHOR_MARKER.strip()) or author.lower() not in RULING_AUTHORS:
+            continue
+        if r["run_id"] is not None:
+            continue  # a dispatched worker run on this card cannot answer its own block
+        if _is_ruling_answer(r["body"] or ""):
+            return True
+    return False
 
 
 def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
@@ -4842,7 +4906,9 @@ def needs_input_page_candidates(
     same-kind re-block escalates to ``triage`` and still waits on a human, so
     that counts too) or,
     with ``include_dependency``, waits as ``dependency`` on a parent that is
-    itself ``blocked``), was not opted out, and has ``priority >= min_priority``
+    itself ``blocked``), was not opted out, has no operator ``APOLLO … RULED``
+    comment newer than its latest block (answered, waiting on an unblock; see
+    ``_ruled_since_block``), and has ``priority >= min_priority``
     OR an ``origin:`` line naming a numeric Discord channel. Each item carries
     ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
     """
@@ -4866,6 +4932,8 @@ def needs_input_page_candidates(
         if priority < int(min_priority) and channel is None:
             continue
         if not needs_input_page_enabled(conn, row["id"]):
+            continue
+        if row["block_kind"] == "needs_input" and _ruled_since_block(conn, row["id"]):
             continue
         if row["block_kind"] == "dependency":
             parents = [

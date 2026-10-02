@@ -2350,6 +2350,12 @@ DEFAULT_CONFIG = {
         "needs_input_pager": True,
         # Also page a card parked as `dependency` on a parent that is blocked.
         "needs_input_pager_dependency": False,
+        # "platform:chat_id" (e.g. "discord:1480525090331561984"). When set,
+        # the notifier posts done / ready-for-review / blocked lines there
+        # instead of the subscriber's chat; the wake still goes to the
+        # subscriber. A needs_input block on a priority >= 100 card stays put.
+        # Empty = post in the subscriber's chat.
+        "lifecycle_channel": "",
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.
