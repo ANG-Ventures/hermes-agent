@@ -22,6 +22,11 @@ def _probe_home(seen: dict, key: str = "home"):
 
 
 def _mem0(seen, tmp_path):
+    # fork parity 2026-10-01: the fork's self-contained mem0 (docs/sync/review/mem0-resolution-
+    # decision.md) has no ``_sync_thread`` — sync_turn enqueues into a durable capture pipeline
+    # whose drain worker is bound to the home resolved when the pipeline is built, and the fleet
+    # runs one gateway per profile. Upstream's per-call spawn_context_thread shape has no subject.
+    pytest.skip("fork mem0 captures through capture_pipeline (no per-turn _sync_thread)")
     from plugins.memory.mem0 import Mem0MemoryProvider
 
     p = Mem0MemoryProvider()

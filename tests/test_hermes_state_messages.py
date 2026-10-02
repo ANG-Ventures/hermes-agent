@@ -483,6 +483,9 @@ class TestMessageStorage:
         db.create_session("root", "tui")
         db.append_message("root", role="user", content="ancestor prompt")
         db.append_message("root", role="assistant", content="ancestor reply")
+        # parity 2026-10-01: the lineage readers only cross VERIFIED compression hops (the parent
+        # ended 'compression', as publish_compression_child stamps); a bare parent link is a fork.
+        db.end_session("root", "compression")
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="tip prompt")
         db.append_message("child", role="assistant", content="tip reply")
@@ -539,6 +542,7 @@ class TestMessageStorage:
         db.append_message("root", role="user", content="same prompt")
         db.append_message("root", role="user", content="same prompt")
         db.append_message("root", role="assistant", content="answer")
+        db.end_session("root", "compression")  # verified compression hop (parity 2026-10-01)
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="next prompt")
 
@@ -550,6 +554,7 @@ class TestMessageStorage:
         db.create_session("root", "tui")
         db.append_message("root", role="user", content="first prompt")
         db.append_message("root", role="assistant", content="first answer")
+        db.end_session("root", "compression")  # verified compression hop (parity 2026-10-01)
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="second prompt")
         db.append_message("child", role="assistant", content="second answer")
@@ -624,6 +629,7 @@ class TestMessageStorage:
         db.append_message("root", role="user", content="same prompt")
         db.append_message("root", role="user", content="same prompt")
         db.append_message("root", role="assistant", content="answer")
+        db.end_session("root", "compression")  # verified compression hop (parity 2026-10-01)
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="next prompt")
 
@@ -649,6 +655,7 @@ class TestMessageStorage:
         db.create_session("root", "tui")
         db.append_message("root", role="user", content="first prompt")
         db.append_message("root", role="assistant", content="first answer")
+        db.end_session("root", "compression")  # verified compression hop (parity 2026-10-01)
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="second prompt")
         db.append_message(

@@ -18,7 +18,6 @@ Or via $HERMES_HOME/mem0.json.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-import concurrent.futures.thread as _threadpool
 import json
 import logging
 import math
@@ -30,10 +29,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
-import weakref
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import UnscopedSecretError, get_secret
+from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.registry import tool_error
 
 from .temporal_parse import created_at_in_window, parse_temporal_window
@@ -52,35 +51,11 @@ logger = logging.getLogger(__name__)
 _RERANK_DEFAULT_DEADLINE_MS = 8647.166891023517
 
 
-class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """ThreadPoolExecutor whose workers preserve the old daemon-thread behavior."""
-
-    def _adjust_thread_count(self):
-        # Copy of concurrent.futures.thread.ThreadPoolExecutor with daemon=True.
-        # Do not register in _threads_queues: those atexit joins would undo the
-        # previous daemon-thread semantics for a stuck network call.
-        if self._idle_semaphore.acquire(timeout=0):
-            return
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)  # type: ignore[arg-type]
-
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_threadpool._worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)  # type: ignore[attr-defined]
+# Daemon workers (tools.daemon_pool): the shared fleet executor whose workers neither block
+# interpreter exit nor register in ``_threads_queues``; it also tracks CPython 3.14's worker
+# signature (``_create_worker_context`` replaced ``_initializer``/``_initargs``), which the former
+# private copy here did not — every prefetch submit raised AttributeError on 3.14.
+_DaemonThreadPoolExecutor = DaemonThreadPoolExecutor
 
 # Circuit breaker: after this many consecutive failures, pause API calls
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
@@ -202,14 +177,14 @@ def _load_config() -> dict:
     from hermes_constants import get_hermes_home
 
     config = {
-        # parity 2026-08-07: fork dropped upstream's "mode" key (dead — 0 consumers in
-        # this module); ADOPTED upstream's get_secret() secret-scope routing for the
-        # credential (falls through to os.environ when no scope is installed).
+        # ADOPTED upstream's get_secret() secret-scope routing for the credential (falls through
+        # to os.environ when no scope is installed). ``mode`` is informational here (the fork has
+        # no OSS backend; 0 consumers in this module) but keeps the upstream config shape.
         "api_key": get_secret("MEM0_API_KEY", ""),
+        "mode": _scoped_env("MEM0_MODE") or "platform",
         "host": _scoped_env("MEM0_HOST"),
         "admin_api_key": get_secret("MEM0_ADMIN_API_KEY", ""),
         "ca_bundle": _scoped_env("MEM0_CA_BUNDLE"),
-        "user_id": _scoped_env("MEM0_USER_ID") or "hermes-user",
         "agent_id": _scoped_env("MEM0_AGENT_ID") or "hermes",
         # Default-off safety gate for single-user fleets that want one shared
         # user memory scope across Discord/Telegram/CLI sender ids. When false,
@@ -223,6 +198,11 @@ def _load_config() -> dict:
         "rerank_deadline_ms": _RERANK_DEFAULT_DEADLINE_MS,
         "keyword_search": False,
     }
+    # Only when explicitly configured (upstream a9838c2100 / multiplex invariant): initialize()
+    # falls back to the gateway-native sender id, then "hermes-user" — never the default
+    # profile's MEM0_USER_ID leaking through os.environ into a secondary profile.
+    if user_id := _scoped_env("MEM0_USER_ID"):
+        config["user_id"] = user_id
 
     config_path = get_hermes_home() / "mem0.json"
     if config_path.exists():
