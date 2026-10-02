@@ -34,8 +34,11 @@ logger = logging.getLogger(__name__)
 
 TRIGGER_CLASSES = (
     "conn", "pool_pressure", "quota_model", "quota_seat", "rate_upstream",
-    "refusal", "auth", "unclassified",
+    "refusal", "auth", "provider_invalid_response", "unclassified",
 )
+# A billed response the loop rejected (empty content / invalid shape), named
+# from the floor evidence ``stash_response_failure`` stashed (t_d35beb85).
+INVALID_RESPONSE_CLASS = "provider_invalid_response"
 # Relay-stated classes (spec D2). `upstream_passthrough` defers to the text
 # table; anything else unknown is `unclassified`.
 _RELAY_CLASSES = frozenset(
@@ -159,10 +162,14 @@ def classify_trigger(*, text: Optional[str] = None,
                      headers: Any = None,
                      body: Any = None,
                      exc_name: Optional[str] = None,
-                     reason: Optional[str] = None) -> Tuple[str, str]:
+                     reason: Optional[str] = None,
+                     floor: Any = None) -> Tuple[str, str]:
     """Return ``(trigger_class, class_source)``.
 
-    class_source is ``relay_header`` | ``relay_stream`` | ``text``.
+    class_source is ``relay_header`` | ``relay_stream`` | ``text`` |
+    ``floor``. ``floor`` is the evidence of a billed response the loop
+    rejected (:func:`stash_response_failure`): with no http/exc/text class it
+    names the failure ``provider_invalid_response`` instead of ``unclassified``.
     """
     h = _lower_headers(headers)
     rc = (h.get("x-relay-error-class") or "").strip().lower()
@@ -183,8 +190,47 @@ def classify_trigger(*, text: Optional[str] = None,
                 return s, "relay_stream"
             if s != "upstream_passthrough":
                 return "unclassified", "relay_stream"
-    return classify_text(text, http_status=http_status, exc_name=exc_name,
-                         reason=reason), "text"
+    cls = classify_text(text, http_status=http_status, exc_name=exc_name,
+                        reason=reason)
+    if (cls == "unclassified" and isinstance(floor, dict) and floor.get("site")
+            and not text and http_status is None and not exc_name):
+        return INVALID_RESPONSE_CLASS, "floor"
+    return cls, "text"
+
+
+def floor_err_hash(floor: Any) -> Optional[str]:
+    """err_hash of a rejected-response floor: hash(site, stop_reason,
+    content_blocks), so a repeat of the same empty shape is recognisable
+    (t_d35beb85). None without a floor site."""
+    if not isinstance(floor, dict) or not floor.get("site"):
+        return None
+    key = f"{floor.get('site')}|{floor.get('stop_reason')}|{floor.get('content_blocks')}"
+    return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def pending_err_hash(pending: Any) -> Optional[str]:
+    """err_hash of a stashed failing call: the text hash, else the floor hash."""
+    if not isinstance(pending, dict):
+        return None
+    if pending.get("text"):
+        return err_hash(pending.get("text"))
+    return floor_err_hash(pending.get("floor"))
+
+
+def empty_tool_use_floor(response: Any) -> bool:
+    """The retry-in-place shape (t_d35beb85): a parsed (HTTP 200) response
+    whose ``stop_reason`` is ``tool_use`` and whose ``content`` list is EMPTY.
+    Measured 17x in 24 h on claude-alr across 6 seats: a transient empty body
+    from the same model, so one same-route retry (warm cache) beats a
+    cross-provider failover (cold cache). Never raises."""
+    try:
+        if response is None:
+            return False
+        content = getattr(response, "content", None)
+        return (getattr(response, "stop_reason", None) == "tool_use"
+                and isinstance(content, list) and len(content) == 0)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 RELAY_PROVIDERS = frozenset(("claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"))
@@ -230,7 +276,7 @@ def pending_trigger_class(agent: Any) -> Optional[str]:
         cls, _src = classify_trigger(
             text=pending.get("text"), http_status=pending.get("status"),
             headers=pending.get("headers"), body=pending.get("body"),
-            exc_name=pending.get("exc"))
+            exc_name=pending.get("exc"), floor=pending.get("floor"))
         return cls
     except Exception:  # noqa: BLE001
         return None
@@ -244,6 +290,23 @@ def quota_seat_on_relay(agent: Any) -> bool:
     (claude-bpx-N / claude-apx-N) are excluded: there the seat IS the provider."""
     provider = (getattr(agent, "provider", "") or "").strip().lower()
     return provider in RELAY_PROVIDERS and pending_trigger_class(agent) == "quota_seat"
+
+
+def pending_floor_repeat(agent: Any) -> bool:
+    """True when the stashed failing call is a same-shape repeat of a
+    rejected response after a same-route retry (t_d35beb85). The failover then
+    skips entries on the failing provider: a provider-wide fault is never
+    answered with a model swap on that provider (2026-09-30). Peeked, not
+    consumed. Never raises."""
+    try:
+        pending = getattr(agent, "_pending_fallback_error", None)
+        if not isinstance(pending, dict):
+            return False
+        if time.monotonic() - float(pending.get("at") or 0) > _PENDING_MAX_AGE_S:
+            return False
+        return bool((pending.get("floor") or {}).get("repeat"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _scrub(text: str) -> str:
@@ -471,15 +534,18 @@ def socket_cause(exc: Any) -> Optional[str]:
 
 def stash_response_failure(agent: Any, site: str, response: Any = None, *,
                            detail: Optional[str] = None,
-                           elapsed_s: Optional[float] = None) -> None:
+                           elapsed_s: Optional[float] = None,
+                           repeat: bool = False) -> None:
     """Evidence for a reason-less floor failover off a BILLED response the
     loop rejected (invalid shape, empty content). t_b2e9ef12: the 2026-10-01
     11:25 alr fallback was a relay 200 rejected here, and the dead-letter
     row was all nulls because nothing was stashed.
 
-    Inert on routing: it sets no ``text``/``status``/``headers``/``exc``, so
-    the trigger class, err_hash, seat/hop and the rendered rider are exactly
-    what they were without it. Only the dead-letter row reads ``floor``.
+    It sets no ``text``/``status``/``headers``/``exc``; the ``floor`` alone
+    names the class (``provider_invalid_response``), the err_hash
+    (:func:`floor_err_hash`) and the seat (``served_by``) the rider renders
+    (t_d35beb85). ``repeat`` marks a same-shape repeat after a same-route
+    retry: the failover then skips entries on the failing provider.
     Never raises."""
     try:
         ph = _lower_headers(getattr(response, "pool_headers", None))
@@ -497,6 +563,7 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
             if usage is not None else None,
             "route_id": ph.get("x-pool-route-id"),
             "served_by": ph.get("x-pool-served-by"),
+            "repeat": True if repeat else None,
         }
         agent._pending_fallback_error = {
             "at": time.monotonic(),
@@ -519,6 +586,69 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
             _round_s(elapsed_s))
     except Exception:  # noqa: BLE001
         logger.debug("fallback ledger: response-failure stash failed", exc_info=True)
+
+
+INVALID_RETRY_OUTCOMES = ("retry_ok", "retry_same", "retry_other", "retry_error", "fallback")
+# Same-route retry backoff for the empty tool_use shape (card: <= 2 s; short
+# enough to land inside the relay's affinity window so the cache is warm).
+INVALID_RETRY_BACKOFF_S = 1.5
+
+
+def record_invalid_response(agent: Any, floor: Any, outcome: str, *,
+                            response: Any = None, path: Any = None) -> bool:
+    """Append ONE structured ``invalid_response`` line per occurrence to
+    ``$HERMES_HOME/state/model-route-changes.log`` (t_d35beb85), e.g.::
+
+        2026-10-02T08:33:30 invalid_response class=provider_invalid_response
+            provider=claude-alr model=claude-fable-5-1 served_by=sub-vps-2
+            route_id=9ed7... stop_reason=tool_use content_blocks=0
+            output_tokens=462 err_hash=... retry_outcome=retry_ok cache_read=231000
+
+    (one line; ``key=value`` tokens, values never contain spaces). The
+    ``failover|recovery`` parsers of this sink match on the second token and
+    skip it. ``outcome`` is one of :data:`INVALID_RETRY_OUTCOMES`;
+    ``cache_read`` is the retry's cache read when it came back valid (warm
+    retry ≈ prompt). Never raises; returns True when a line was written."""
+    try:
+        import os
+
+        fl = floor if isinstance(floor, dict) else {}
+        fields = [
+            ("class", INVALID_RESPONSE_CLASS),
+            ("provider", getattr(agent, "provider", None)),
+            ("model", getattr(agent, "model", None)),
+            ("served_by", fl.get("served_by")),
+            ("route_id", fl.get("route_id")),
+            ("site", fl.get("site")),
+            ("stop_reason", fl.get("stop_reason")),
+            ("content_blocks", fl.get("content_blocks")),
+            ("output_tokens", fl.get("output_tokens")),
+            ("err_hash", floor_err_hash(fl)),
+            ("session", getattr(agent, "session_id", None)),
+            ("retry_outcome", outcome if outcome in INVALID_RETRY_OUTCOMES else "fallback"),
+        ]
+        usage = getattr(response, "usage", None) if response is not None else None
+        cr = getattr(usage, "cache_read_input_tokens", None) if usage is not None else None
+        if isinstance(cr, int):
+            fields.append(("cache_read", cr))
+
+        def _tok(v: Any) -> str:
+            return re.sub(r"\s+", "_", str(v)) if v not in (None, "") else "-"
+
+        line = (time.strftime("%Y-%m-%dT%H:%M:%S") + " invalid_response "
+                + " ".join(f"{k}={_tok(v)}" for k, v in fields))
+        if path is None:
+            home = os.environ.get("HERMES_HOME") or os.path.join(
+                os.path.expanduser("~"), ".hermes")
+            path = os.path.join(home, "state", "model-route-changes.log")
+        os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        logger.warning("provider_invalid_response: %s", line.split(" ", 2)[2])
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("invalid_response count row failed", exc_info=True)
+        return False
 
 
 def _round_s(v: Any) -> Optional[float]:
@@ -823,7 +953,8 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
     if kind == "failover":
         trigger_class, class_source = classify_trigger(
             text=text, http_status=status, headers=headers, body=body,
-            exc_name=pending.get("exc") if pending else None, reason=reason_s)
+            exc_name=pending.get("exc") if pending else None, reason=reason_s,
+            floor=pending.get("floor") if pending else None)
         # Record the class the policy acted on: on a direct pin the seat IS
         # the provider, so a seat quota is quota_model (fp.lane_class; the
         # sticky writer already arms with it). Without this the ledger said
@@ -867,7 +998,9 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         "http_status": status,
         "relay_synthetic": 1 if (headers or {}).get("x-pool-unreachable") else 0,
         "route_id": (headers or {}).get("x-pool-route-id"),
-        "err_hash": err_hash(text) if kind == "failover" else None,
+        "err_hash": (floor_err_hash((pending or {}).get("floor"))
+                     if trigger_class == INVALID_RESPONSE_CLASS
+                     else err_hash(text) if kind == "failover" else None),
         "err_head": err_head,
         "cooldown_s": float(cooldown_s) if isinstance(cooldown_s, (int, float)) else None,
         # Phase 2 (sticky policy) fills this through ``extra``.
@@ -903,6 +1036,15 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         except Exception:  # noqa: BLE001
             logger.debug("fallback ledger: pin seat/hop fill failed", exc_info=True)
         _note_relay_conn(row, pending)
+        # t_d35beb85: a rejected billed response names its seat and route
+        # from the floor (x-pool-served-by / x-pool-route-id on the 200).
+        if trigger_class == INVALID_RESPONSE_CLASS:
+            fl = dict((pending or {}).get("floor") or {})
+            row["floor"] = fl
+            if fl.get("served_by") and (not row.get("seat") or row.get("seat") == "unknown"):
+                row["seat"] = fl["served_by"]
+            if fl.get("route_id") and not row.get("route_id"):
+                row["route_id"] = fl["route_id"]
         # t_b2e9ef12: name what a no-status / rejected-response call died of.
         if pending:
             row.setdefault("exc_name", pending.get("exc"))

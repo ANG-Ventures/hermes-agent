@@ -4463,21 +4463,58 @@ def run_conversation(
                     # upstream server error, or malformed response.
                     retry_count += 1
                     
-                    # Eager fallback: empty/malformed responses are a common
-                    # rate-limit symptom.  Switch to fallback immediately
-                    # rather than retrying with extended backoff.
-                    if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    # Floor site (by design, no reason=): an empty/malformed
-                    # response is not classified here, so let the failover
-                    # resolve to the honest "connection issue" floor rather than
-                    # fabricate a reason. (2026-07-12 reason-threading sweep.)
-                    # Dead-letter evidence only (t_b2e9ef12); class unchanged.
                     from agent import fallback_events as _fbe_floor
 
+                    # t_d35beb85: a billed 200 with stop_reason=tool_use and
+                    # an EMPTY content list is a transient empty body from the
+                    # same model (17x/24 h on claude-alr, 6 seats). Retry it
+                    # ONCE on the same route (warm cache) before failing over;
+                    # every other invalid shape keeps the eager fallback.
+                    _ir_prev = _retry.invalid_response_retry_floor
                     _fbe_floor.stash_response_failure(
                         agent, "invalid_response", response,
                         detail=", ".join(error_details), elapsed_s=api_duration)
+                    _ir_floor = dict(((getattr(agent, "_pending_fallback_error", None) or {})
+                                      .get("floor")) or {})
+                    if (_ir_prev is None and not _retry.invalid_response_retry_done
+                            and _fbe_floor.empty_tool_use_floor(response)):
+                        _retry.invalid_response_retry_floor = _ir_floor
+                        _retry.invalid_response_retry_done = True
+                        agent._buffer_status(
+                            "⚠️ Empty tool_use response — retrying once on the same route...")
+                        _ir_end = time.time() + _fbe_floor.INVALID_RETRY_BACKOFF_S
+                        while time.time() < _ir_end and not agent._interrupt_requested:
+                            time.sleep(0.1)
+                        # The retry is free of the retry budget: with
+                        # agent.api_max_retries=1 it must still happen, and
+                        # it must not leave the while loop with an invalid
+                        # response in hand.
+                        retry_count -= 1
+                        continue  # same provider/route; the loop-top checkpoint handles a stop
+                    if _ir_prev is not None:
+                        # The retry came back invalid too. Same shape (same
+                        # err_hash) => provider-wide for this turn: the
+                        # failover skips entries on this provider.
+                        _ir_same = (_fbe_floor.floor_err_hash(_ir_floor)
+                                    == _fbe_floor.floor_err_hash(_ir_prev))
+                        _retry.invalid_response_retry_floor = None
+                        _fbe_floor.record_invalid_response(
+                            agent, _ir_prev, "retry_same" if _ir_same else "retry_other")
+                        if _ir_same:
+                            _fbe_floor.stash_response_failure(
+                                agent, "invalid_response", response,
+                                detail=", ".join(error_details), elapsed_s=api_duration,
+                                repeat=True)
+                    elif _ir_floor.get("site") and agent._fallback_index < len(agent._fallback_chain):
+                        _fbe_floor.record_invalid_response(agent, _ir_floor, "fallback")
+
+                    # Eager fallback: an empty/malformed response (other than
+                    # the retried shape above) switches to fallback at once.
+                    if agent._fallback_index < len(agent._fallback_chain):
+                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                    # Floor site (by design, no reason=): no FailoverReason is
+                    # fabricated here; the stashed floor names the class
+                    # (provider_invalid_response) for the ledger and rider.
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -4634,6 +4671,14 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                if _retry.invalid_response_retry_floor is not None:
+                    # t_d35beb85: the same-route retry of an empty tool_use 200
+                    # came back valid (cache_read ~= prompt => it was warm).
+                    from agent import fallback_events as _fbe_ok
+
+                    _fbe_ok.record_invalid_response(
+                        agent, _retry.invalid_response_retry_floor, "retry_ok", response=response)
+                    _retry.invalid_response_retry_floor = None
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -6114,6 +6159,12 @@ def run_conversation(
                 # is set once per call, before the retry loop).
                 _fbe.stash_api_error(agent, api_error, status_code, error_context,
                                      elapsed_s=time.time() - api_start_time)
+                if _retry.invalid_response_retry_floor is not None:
+                    # t_d35beb85: the empty-tool_use retry raised instead; its
+                    # own error now drives the normal error path.
+                    _fbe.record_invalid_response(
+                        agent, _retry.invalid_response_retry_floor, "retry_error")
+                    _retry.invalid_response_retry_floor = None
                 # Stamp the quota window (5h vs 7d) so the failover announce can
                 # name WHICH limit bound. Consumed once by _quota_window_suffix;
                 # only set when the provider actually told us, so non-Anthropic
