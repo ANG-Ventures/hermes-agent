@@ -14,7 +14,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import (
+    automatic_compaction_status_message,
+    call_with_messages as _call_with_messages,
+    should_compress_request as _should_compress_request,
+    trigger_compare_tokens_for as _trigger_compare_tokens_for,
+)
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock, conversation_history_after_compression,
@@ -203,7 +208,8 @@ def _idle_compaction(
     if _idle_status:
         agent._emit_status(_idle_status)
     out.messages, out.active_system_prompt = agent._compress_context(
-        messages, system_message, approx_tokens=_idle_tokens, task_id=effective_task_id
+        messages, system_message, approx_tokens=_idle_tokens, task_id=effective_task_id,
+        trigger_reason="idle_resume",
     )
     # ``_compress_context`` returns the INPUT list object when it skips; only
     # re-baseline and re-anchor after a real compaction.
@@ -212,6 +218,21 @@ def _idle_compaction(
             agent, out.messages, out.conversation_history
         )
         out.current_turn_user_idx = _reanchor(agent, out.messages, user_message)
+        # Fork blackbox telemetry: record that idle compaction fired plus the before/after
+        # request size. Pure bookkeeping — a failing estimate must never cost the turn its
+        # re-derived history / re-anchored index (C5 #42).
+        try:
+            _comp = agent._blackbox_compaction
+            _comp["idle_compaction_fired"] = True
+            if _comp.get("compaction_tokens_before") is None:
+                _comp["compaction_tokens_before"] = _idle_tokens
+            if _comp.get("compaction_tokens_after") is None:
+                _comp["compaction_tokens_after"] = _tc.estimate_request_tokens_rough(
+                    out.messages, system_prompt=out.active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+        except Exception:
+            logger.debug("Idle compaction blackbox bookkeeping failed", exc_info=True)
 
 
 def _codex_native_auto_compaction(agent: Any) -> bool:
@@ -237,6 +258,7 @@ def _preflight_compression(
 
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
+    agent._prior_image_invariant_warned = False
     if not agent.compression_enabled:
         _rearm_uncompressed_overflow_warn(agent, out.messages, out.active_system_prompt)
         return
@@ -247,9 +269,36 @@ def _preflight_compression(
     ):
         return
 
-    _preflight_tokens = _tc._preflight_request_tokens(
-        agent, out.messages, out.active_system_prompt or ""
+    messages = out.messages
+    _preflight_tokens, _preflight_rough, _preflight_anchored = _tc._preflight_request_tokens_split(
+        agent, messages, out.active_system_prompt or ""
     )
+    # Fork P2 "compact on the truth": calibrate the ROUGH estimate by the provider's measured
+    # skew before triggering. note_rough_sent pairs THIS request's rough with the real
+    # prompt_tokens that come back; ``messages`` is threaded through so the calibration can
+    # CLASSIFY the request (prose / tool output / media) and apply the per-class ratio. Engines
+    # predating the kwarg are called with the old signature by ``_call_with_messages``. The skew
+    # scales rough input only: an anchored figure is already real and is never re-scaled.
+    _call_with_messages(_compressor.note_rough_sent, _preflight_rough, messages)
+    if _preflight_anchored is not None:
+        _calibrated = _preflight_anchored
+    else:
+        _calibrated = _call_with_messages(_compressor.calibrated_tokens, _preflight_rough, messages)
+    # Cold-start observability: on an empty skew history the DISPLAY calibration can read
+    # >= threshold while the TRIGGER decision defers on the conservative prior. Pure logging.
+    try:
+        _trig_cal = _trigger_compare_tokens_for(_compressor, _preflight_rough, messages, _preflight_anchored)
+        _thr = _compressor.threshold_tokens
+        if _calibrated >= _thr and _trig_cal < _thr:
+            logger.debug(
+                "Preflight compression DEFERRED (cold-start skew): display calibrated ~%s (skew %.3f) >= %s "
+                "threshold, but trigger calibrated ~%s (cold-start skew %.3f) < threshold — skew history "
+                "empty, using conservative prior until a real prompt_tokens pairs (model %s, ctx %s)",
+                f"{_calibrated:,}", _compressor._current_skew(), f"{_thr:,}", f"{_trig_cal:,}",
+                _compressor._trigger_skew(), agent.model, f"{_compressor.context_length:,}",
+            )
+    except Exception:
+        pass
     # getattr guard: compressor doubles and plugin engines lack this method — absence
     # means no snapshot and the finalizer's rollback stays disarmed.
     _snapshot_fn = getattr(_compressor, "snapshot_preflight_display_tokens", None)
@@ -303,7 +352,17 @@ def _preflight_compression(
             getattr(agent, "codex_app_server_auto_compaction", "native"),
         )
     else:
-        _should_compress_now = _compressor.should_compress(_preflight_tokens)
+        # Fork P2: trigger on the skew-CALIBRATED estimate (rough x measured rough/real ratio),
+        # anchored figures compared unscaled. ``should_compress_calibrated`` is fork-only, so a
+        # MagicMock compressor from an upstream test returns a truthy child mock — pin the type
+        # and fall back to the configured ``should_compress`` when the verdict is not a real bool.
+        _calibrated_verdict = _should_compress_request(
+            _compressor, _preflight_rough, messages, anchored_tokens=_preflight_anchored,
+        )
+        if isinstance(_calibrated_verdict, bool):
+            _should_compress_now = _calibrated_verdict
+        else:
+            _should_compress_now = bool(_compressor.should_compress(_preflight_tokens))
         if not _should_compress_now:
             _compress_block_reason = _blocked_compress_reason(_compressor, _preflight_tokens)
     if _should_compress_now:
@@ -381,7 +440,7 @@ def _run_preflight_passes(
         _orig_tokens = _preflight_tokens
         out.messages, out.active_system_prompt = agent._compress_context(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
-            task_id=effective_task_id,
+            task_id=effective_task_id, trigger_reason="threshold",
         )
         if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
             # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
@@ -398,8 +457,9 @@ def _run_preflight_passes(
             break
         # Re-estimate so size-only compression (same rows, fewer tokens) counts as
         # progress.
-        _preflight_tokens = _tc._preflight_request_tokens(
-            agent, out.messages, out.active_system_prompt or ""
+        messages = out.messages
+        _preflight_tokens, _preflight_rough, _preflight_anchored = _tc._preflight_request_tokens_split(
+            agent, messages, out.active_system_prompt or ""
         )
         if not _tc.compression_made_progress(
             _orig_len, len(out.messages), _orig_tokens, _preflight_tokens
@@ -412,7 +472,13 @@ def _run_preflight_passes(
             agent, out.messages, out.conversation_history
         )
         _reset_retry_state_after_compaction(agent)
-        if not _compressor.should_compress(_preflight_tokens):
+        # Fork P2 calibrated re-check: note this pass's rough so skew pairs correctly, then
+        # re-check on the calibrated value (non-bool doubles fall back to should_compress).
+        _call_with_messages(_compressor.note_rough_sent, _preflight_rough, messages)
+        _recheck = _should_compress_request(
+            _compressor, _preflight_rough, messages, anchored_tokens=_preflight_anchored,
+        )
+        if not (_recheck if isinstance(_recheck, bool) else _compressor.should_compress(_preflight_tokens)):
             break
         if not _tc._compression_warrants_another_preflight_pass(
             _orig_tokens, _preflight_tokens, _compressor.threshold_tokens
@@ -458,7 +524,8 @@ def _engine_preflight_maintenance(
     )
     _engine_input = out.messages
     out.messages, out.active_system_prompt = agent._compress_context(
-        _engine_input, system_message, approx_tokens=_preflight_tokens, task_id=effective_task_id
+        _engine_input, system_message, approx_tokens=_preflight_tokens, task_id=effective_task_id,
+        trigger_reason="engine_preflight_maintenance",
     )
     # ``_compress_context`` returns the INPUT list on every skip path and an engine
     # may no-op; re-baseline/re-anchor only after a REAL compaction.

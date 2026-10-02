@@ -2234,10 +2234,11 @@ def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path
 
     user_messages = [msg for msg in compressed if msg.get("role") == "user"]
     # parity 2026-08-30: the restored row is re-materialized from the DB and
-    # legitimately carries provenance markers (_db_persisted/_row_id). The
-    # contract is the CONTENT survives.
+    # legitimately carries provenance markers (_db_persisted/_row_id); parity
+    # 2026-10-01: upstream's durable per-message id stamps ``message_uid`` and
+    # ``timestamp`` on it too. The contract is the CONTENT survives.
     assert [
-        {k: v for k, v in m.items() if not k.startswith("_")}
+        {k: v for k, v in m.items() if k in ("role", "content")}
         for m in user_messages
     ] == [{"role": "user", "content": "please continue from here"}]
 

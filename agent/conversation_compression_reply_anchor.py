@@ -80,6 +80,7 @@ def _ensure_compressed_keeps_last_assistant_reply(
     reply_pos = next(i for i, m in enumerate(original_messages) if m is reply)
     index = _reply_insertion_index(
         original_messages[reply_pos + 1:], compressed, reused_ids=_reused_tool_call_ids(original_messages),
+        kept_head=_kept_head_len(original_messages[:reply_pos], compressed),
     )
     if index is None:
         logger.warning(
@@ -181,8 +182,46 @@ def _reused_tool_call_ids(messages: list) -> frozenset:
     return frozenset(call_id for call_id, count in seen.items() if count > 1)
 
 
-def _reply_insertion_index(followers: list, compressed: list, *, reused_ids: frozenset = frozenset()) -> Optional[int]:
+def _kept_head_len(predecessors: list, compressed: list) -> int:
+    """Length of the engine's verbatim-kept HEAD: leading ``compressed`` rows that align
+    positionally (role + visible content) with the original rows BEFORE the reply.
+
+    Engines keep a prefix and fold the rest, so a leading run that mirrors the original
+    head IS that head — never the reply's followers, even when a follower is a content twin
+    of a head row (fork #942 tool-notice placement applies the same head-first overlap rule;
+    see ``_reinsert_tool_notice_events``). A kept head row that happens to equal the
+    trailing user turn must not be read as that turn: the reply would be inserted BEFORE the
+    engine's head and surface out of order.
+    """
+    from agent.conversation_compression import _message_text
+
+    head = 0
+    while head < min(len(predecessors), len(compressed)):
+        source, candidate = predecessors[head], compressed[head]
+        if not isinstance(source, dict) or not isinstance(candidate, dict):
+            break
+        if source.get("role") != candidate.get("role"):
+            break
+        if source.get("tool_calls") or candidate.get("tool_calls"):
+            if _tool_call_ids(source) != _tool_call_ids(candidate):
+                break
+        elif source.get("role") == "tool":
+            if _tool_result_id(source) != _tool_result_id(candidate):
+                break
+        elif not _same_visible_content(candidate, source, _message_text(source).strip()):
+            break
+        head += 1
+    return head
+
+
+def _reply_insertion_index(
+    followers: list, compressed: list, *, reused_ids: frozenset = frozenset(), kept_head: int = 0,
+) -> Optional[int]:
     """Chronologically correct slot for the dropped reply inside ``compressed``.
+
+    ``kept_head`` rows at the front of ``compressed`` are the engine's verbatim-kept head
+    (see ``_kept_head_len``): they precede the reply chronologically, so they are neither
+    follower candidates nor the trailing real user turn.
 
     ``followers`` are the ORIGINAL rows after the reply (the next user turn, its
     tool rounds, ...). The slot is just before the surviving row that originally
@@ -220,7 +259,7 @@ def _reply_insertion_index(followers: list, compressed: list, *, reused_ids: fro
                 isinstance(m, dict) and _row_ids(m) & reused_ids for m in compressed
             )
             continue
-        for pos in range(len(compressed) - 1, -1, -1):
+        for pos in range(len(compressed) - 1, kept_head - 1, -1):
             message = compressed[pos]
             if not isinstance(message, dict) or message.get("role") != follower_role:
                 continue
@@ -244,7 +283,7 @@ def _reply_insertion_index(followers: list, compressed: list, *, reused_ids: fro
     if (
         followers
         and any(_is_real_user_message(f) for f in followers)
-        and compressed
+        and len(compressed) > kept_head
         and _is_real_user_message(compressed[-1])
     ):
         return len(compressed) - 1

@@ -17,6 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from agent.confab_notice import is_metadata_only_tool_notice
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -1363,6 +1364,10 @@ def build_api_messages(
     _omit_interrupt_close = provider_owns_transcript(agent.provider)
     for idx, msg in enumerate(canonical_messages):
         if _omit_interrupt_close and is_interrupt_close_row(msg):
+            continue
+        # Metadata-only provider events (fork, agent/confab_notice.py) are durable UI
+        # rows, never system instructions in the provider request.
+        if is_metadata_only_tool_notice(msg):
             continue
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.

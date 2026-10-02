@@ -183,6 +183,24 @@ def prepare_iteration(
             agent.session_id or "-",
         )
 
+    # Fork image-lifecycle invariant: image parts must not survive before the current-turn
+    # boundary (prior-turn media is degraded at turn start). Warn once per turn when they do —
+    # the byte-cap preflight then remediates them, but the leak itself is a bug to surface.
+    if (
+        not getattr(agent, "_prior_image_invariant_warned", False)
+        and isinstance(current_turn_user_idx, int) and current_turn_user_idx > 0
+    ):
+        from agent.tool_dispatch_helpers import _count_multimodal_image_parts
+
+        _stale_prior_images = _count_multimodal_image_parts(messages[:current_turn_user_idx])
+        if _stale_prior_images:
+            agent._prior_image_invariant_warned = True
+            logger.warning(
+                "%simage lifecycle invariant violated: %d image part(s) "
+                "remained before the current-turn boundary (session=%s)",
+                agent.log_prefix, _stale_prior_images, agent.session_id or "none",
+            )
+
     # Drop legacy hidden assistant placeholders carrying the raw interrupt scaffold
     # before repair: replayed, the model echoes/self-replicates.
     def _is_scaffold_ghost(msg: Dict[str, Any]) -> bool:

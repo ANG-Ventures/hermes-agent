@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Optional
 
+from agent.confab_notice import TOOL_CALL_NOTICE_TEXT
 from agent.message_metadata import append_message
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.turn_failure_copy import stamp_failure
@@ -49,6 +50,7 @@ class FinalResponseVerdict:
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
     api_call_count: int
+    failed: Any = False
     result: Optional[Dict[str, Any]] = None
 
 
@@ -59,7 +61,8 @@ def finish_text_response(
     _preflight_compression_blocked: Any, codex_ack_continuations: Any,
     truncated_response_parts: Any, length_continue_retries: Any,
     _pending_verification_response: Any, _pending_verification_response_previewed: Any,
-    effective_task_id: Any,
+    effective_task_id: Any, failed: Any = False, _confab_notice: Any = None,
+    _new_confab_notice: Any = False,
 ) -> FinalResponseVerdict:
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
@@ -81,6 +84,7 @@ def finish_text_response(
             _pending_verification_response=_pending_verification_response,
             _pending_verification_response_previewed=_pending_verification_response_previewed,
             api_call_count=api_call_count,
+            failed=failed,
             result=result,
         )
 
@@ -116,6 +120,50 @@ def finish_text_response(
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
+
+    # Tool-call notice (fork, agent/confab_notice.py): the bridge reports the model wrote a
+    # tool call as text / unparseable JSON. Re-prompt with the FIXED retry instruction BEFORE
+    # the empty-response ladder (the reply is usually empty once the bogus call is stripped),
+    # sharing the dropped-tool-call budget (3 consecutive stalls). The notice itself persists
+    # as a metadata-only system event row — a durable UI record, never a model instruction.
+    _tool_notice_nudge = TOOL_CALL_NOTICE_TEXT.get(
+        _confab_notice["kind"] if _confab_notice else None
+    )
+    if _tool_notice_nudge and _new_confab_notice:
+        _notice_msg = agent._build_assistant_message(assistant_message, finish_reason)
+        append_message(messages, {
+            "role": "system", "content": "",
+            "display_kind": _notice_msg["display_kind"],
+            "display_metadata": _notice_msg["display_metadata"],
+        })
+    if _tool_notice_nudge:
+        if getattr(agent, "_dropped_toolcall_retries", 0) < 3:
+            agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
+            logger.warning(
+                "Dropped tool call — re-prompting (retry %d/3, model=%s provider=%s)",
+                agent._dropped_toolcall_retries, agent.model, agent.provider,
+            )
+            agent._emit_status(
+                "↻ Model signaled a tool call but sent none — "
+                f"re-prompting ({agent._dropped_toolcall_retries}/3)"
+            )
+            interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+            interim_msg["_dropped_toolcall_nudge"] = True
+            append_message(messages, interim_msg)
+            append_message(messages, {
+                "role": "user",
+                "content": _tool_notice_nudge,
+                "_dropped_toolcall_nudge": True,
+            })
+            agent._session_messages = messages
+            final_response = None
+            return _verdict("continue")
+        agent._emit_status("⚠️ Tool-call recovery exhausted after 3 retries.")
+        _turn_exit_reason = "tool_call_recovery_exhausted"
+        failed = True
+        final_response = ""
+        agent._dropped_toolcall_retries = 0
+        return _verdict("break")
 
     # Think-block-only / empty content: recovery path.
     if not agent._has_content_after_think_block(final_response):

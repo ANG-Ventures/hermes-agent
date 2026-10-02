@@ -125,6 +125,9 @@ def compress_now(
     try:
         compressed, _ = agent._compress_context(
             head, system_message, approx_tokens=before_tokens, focus_topic=request.focus_topic, force=True,
+            # Attribution (2026-08-20 audit): every manual surface (CLI, TUI, ACP) routes here and carries the
+            # same trigger label as the gateway /compress path, so the core never logs trigger=UNATTRIBUTED.
+            trigger_reason="manual_compress_command",
             defer_context_engine_notification=True, **({"task_id": task_id} if task_id != "default" else {}),
             **({"verbatim_tail": tail_rows} if tail_rows else {}))
     except Exception:

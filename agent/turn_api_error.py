@@ -39,6 +39,7 @@ class ApiErrorVerdict:
     action: str
     thinking_spinner: Any
     messages: Any
+    api_messages: Any
     active_system_prompt: Any
     conversation_history: Any
     approx_tokens: Any
@@ -65,6 +66,7 @@ def handle_api_error(
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ApiErrorVerdict:
         return ApiErrorVerdict(
             action=action, thinking_spinner=thinking_spinner, messages=messages,
+            api_messages=api_messages,
             active_system_prompt=active_system_prompt, conversation_history=conversation_history,
             approx_tokens=approx_tokens, retry_count=retry_count, max_retries=max_retries,
             compression_attempts=compression_attempts,
@@ -155,6 +157,22 @@ def handle_api_error(
     )
     if _recovered:
         return _verdict("continue")
+
+    # Whole-body byte overflow is distinct from token/context overflow: never text compaction.
+    # One remediated retry when retained images can be shrunk/evicted, else fail actionably.
+    if classified.reason == FailoverReason.body_too_large:
+        from agent.turn_body_budget import body_budget_failure, recover_body_too_large
+
+        _remediated_messages, _body_error = recover_body_too_large(
+            agent, api_error, api_kwargs=api_kwargs, api_messages=api_messages, _retry=_retry,
+        )
+        if _remediated_messages is not None:
+            api_messages = _remediated_messages
+            return _verdict("continue")
+        return _verdict("return", body_budget_failure(
+            agent, _body_error, messages=messages, conversation_history=conversation_history,
+            api_call_count=api_call_count,
+        ))
 
     retry_count += 1
     elapsed_time = time.time() - api_start_time

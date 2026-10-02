@@ -125,13 +125,27 @@ class TestResolveContextCompressionTimeouts:
     def test_idle_is_floored_at_the_aux_compression_request_budget(self, monkeypatch):
         """The host must never judge silence before the summary request itself would time out; a budget
         above the ceiling raises the ceiling too, and a larger explicit idle is kept."""
+        # Fork contract (agent.compression_timeout_floor.reconcile_timeouts, pinned by
+        # tests/gateway/test_compress_abort_honesty.py): the DEFAULT idle is lifted STRICTLY above the
+        # aux deadline (+ headroom) so the fallback chain stays reachable, and the default ceiling admits
+        # a primary attempt plus one stall-fallback. Upstream #114594's exact equal-to-budget clamp is
+        # subsumed by that reconciler, so the invariants (not upstream's literal numbers) are asserted.
         import agent.auxiliary_client as aux
+        from agent.compression_timeout_floor import DERIVED_IDLE_CAP_SECONDS
+
         monkeypatch.setattr(aux, "_effective_aux_timeout", lambda task, timeout: 300.0)
-        assert resolve_context_compression_timeouts({}) == (300.0, 600.0)
-        assert resolve_context_compression_timeouts({"context_timeout_seconds": 900}) == (900.0, 900.0)
+        idle, ceiling = resolve_context_compression_timeouts({})
+        assert idle > 300.0 and ceiling >= idle + 300.0
+        # A larger explicit idle is kept verbatim; the ceiling still admits a fallback.
+        idle, ceiling = resolve_context_compression_timeouts({"context_timeout_seconds": 900})
+        assert idle == 900.0 and ceiling >= 900.0
+        # A budget above the default ceiling raises the ceiling too.
         monkeypatch.setattr(aux, "_effective_aux_timeout", lambda task, timeout: 900.0)
-        assert resolve_context_compression_timeouts({}) == (900.0, 900.0)
-        assert resolve_context_compression_timeouts({"context_timeout_seconds": 0}) == (0.0, 600.0)
+        idle, ceiling = resolve_context_compression_timeouts({})
+        assert idle == DERIVED_IDLE_CAP_SECONDS and ceiling >= idle
+        # Explicit 0 disables the wrapper regardless of the aux budget.
+        idle, ceiling = resolve_context_compression_timeouts({"context_timeout_seconds": 0})
+        assert idle == 0.0 and ceiling >= 600.0
 
     def test_defaults_when_empty_cfg(self, monkeypatch):
         # The DEFAULT no-progress guard is derived from the inner auxiliary
