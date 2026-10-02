@@ -62,9 +62,12 @@ def test_astra_whole_request_price_tier_includes_cache_writes():
     assert below.amount_usd < above.amount_usd
 
 
+# A Grok id absent from the fork's official-docs snapshot (grok-4.3 is bundled there,
+# _XAI_GROK_CASES), so the models.dev leg is what prices it.
+_UNLISTED_GROK = "grok-9-unlisted"
 _MODELS_DEV_REGISTRY = {
     "openai": {"models": {"gpt-5-nano": {"cost": {"input": 0.05, "output": 0.4, "cache_read": 0.005}}}},
-    "xai": {"models": {"grok-4.3": {"cost": {"input": 1.25, "output": 2.5, "cache_read": 0.2}}}},
+    "xai": {"models": {_UNLISTED_GROK: {"cost": {"input": 1.25, "output": 2.5, "cache_read": 0.2}}}},
 }
 _USAGE = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
 
@@ -81,14 +84,18 @@ def models_dev_registry(monkeypatch):
 @pytest.mark.parametrize(("provider", "base_url", "model", "expected"), [
     ("openai-api", "https://api.openai.com/v1", "gpt-5-nano", ("estimated", Decimal("0.455"))),
     ("openai", "", "gpt-5-nano", ("estimated", Decimal("0.455"))),
-    ("xai", "https://api.x.ai/v1", "grok-4.3", ("estimated", Decimal("3.95"))),
+    ("xai", "https://api.x.ai/v1", _UNLISTED_GROK, ("estimated", Decimal("3.95"))),
     # The vendor's list price needs the vendor's own API: same provider name on
-    # someone else's host, a downgraded origin, a subscription route or a custom
-    # endpoint keep ``unknown`` rather than inheriting it.
-    ("xai", "https://grok-relay.example.com/v1", "grok-4.3", ("unknown", None)),
-    ("xai", "http://api.x.ai/v1", "grok-4.3", ("unknown", None)),
-    ("xai-oauth", "https://api.x.ai/v1", "grok-4.3", ("unknown", None)),
-    ("custom", "https://api.x.ai/v1", "grok-4.3", ("unknown", None)),
+    # someone else's host or a downgraded origin keep ``unknown`` rather than
+    # inheriting it.
+    ("xai", "https://grok-relay.example.com/v1", _UNLISTED_GROK, ("unknown", None)),
+    ("xai", "http://api.x.ai/v1", _UNLISTED_GROK, ("unknown", None)),
+    # Fork contract: xai-oauth is the notional SuperGrok relay priced at xAI list rates for
+    # cost visibility (is_notional_xai_provider), and api.x.ai over HTTPS is the metered
+    # direct API whatever the lane is called (resolve_billing_route host match) — both
+    # resolve to the ``xai`` vendor route and so price from the vendor's rate card.
+    ("xai-oauth", "https://api.x.ai/v1", _UNLISTED_GROK, ("estimated", Decimal("3.95"))),
+    ("custom", "https://api.x.ai/v1", _UNLISTED_GROK, ("estimated", Decimal("3.95"))),
 ])
 def test_direct_first_party_route_prices_models_missing_from_snapshot(models_dev_registry, provider, base_url, model, expected):
     cost = estimate_usage_cost(model, _USAGE, provider=provider, base_url=base_url)

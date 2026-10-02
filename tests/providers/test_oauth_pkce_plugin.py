@@ -19,6 +19,18 @@ from providers import register_provider
 from providers.base import ProviderProfile
 from tests.providers.fake_pkce_idp import FakeIdP
 
+
+def _registry_restore():
+    """Teardown that undoes this test's ``register_provider`` calls.
+
+    The registries are additive seam facades (``hermes_cli.provider_seam``): ``pop`` is
+    refused, so the undo is a generation swap back to the snapshot taken here.
+    """
+    from hermes_cli import provider_seam
+
+    generation = provider_seam.current()
+    return lambda: provider_seam._restore(generation)
+
 PROVIDER = "example-pkce"
 
 
@@ -52,8 +64,7 @@ def test_pkce_handler_add_status_refresh_logout_against_fake_idp(idp, monkeypatc
     # Registered like a real plugin so the credential pool finds ``refresh_credential`` through the seam.
     register_provider(ProviderProfile(name=PROVIDER, auth_type="oauth_external", base_url="https://example.invalid/v1",
                                       auth_handler=handler, refresh_credential=refresh))
-    request.addfinalizer(lambda: (providers._REGISTRY.pop(PROVIDER, None),
-                                  hermes_cli.auth.PROVIDER_REGISTRY.pop(PROVIDER, None)))
+    request.addfinalizer(_registry_restore())
     args = SimpleNamespace(provider=PROVIDER, no_browser=False)
 
     assert handler("add", args) is True
@@ -118,8 +129,7 @@ def test_spent_refresh_token_is_grant_dead_and_marks_the_pool_row_dead(idp, monk
     register_provider(ProviderProfile(name=PROVIDER, auth_type="oauth_external",
                                       base_url="https://example.invalid/v1",
                                       auth_handler=handler, refresh_credential=refresh))
-    request.addfinalizer(lambda: (providers._REGISTRY.pop(PROVIDER, None),
-                                  hermes_cli.auth.PROVIDER_REGISTRY.pop(PROVIDER, None)))
+    request.addfinalizer(_registry_restore())
     args = SimpleNamespace(provider=PROVIDER, no_browser=False)
     assert handler("add", args) is True
     rows = json.loads((tmp_path / "hermes" / "auth.json").read_text())["credential_pool"][PROVIDER]
@@ -151,11 +161,7 @@ def test_alias_login_stores_the_row_under_the_canonical_profile_name(idp, monkey
         name=PROVIDER, aliases=(alias,), auth_type="oauth_external",
         base_url="https://example.invalid/v1",
         auth_handler=handler, refresh_credential=pkce.pkce_refresh_credential(cfg)))
-    request.addfinalizer(lambda: (
-        providers._REGISTRY.pop(PROVIDER, None),
-        providers._ALIASES.pop(alias, None),
-        hermes_cli.auth.PROVIDER_REGISTRY.pop(PROVIDER, None),
-        hermes_cli.auth.PROVIDER_REGISTRY.pop(alias, None)))
+    request.addfinalizer(_registry_restore())
     args = SimpleNamespace(provider=alias, no_browser=False)
     assert handler("add", args) is True
     pool = json.loads((tmp_path / "hermes" / "auth.json").read_text())["credential_pool"]

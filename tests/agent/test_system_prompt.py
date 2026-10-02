@@ -529,8 +529,8 @@ def test_prompt_prefix_boot_check_logs_once_per_identity(caplog, monkeypatch):
 
     with (
         patch("agent.prompt_builder.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints", return_value=""),
-        patch("run_agent.build_context_files_prompt", return_value="context"),
+        patch("agent.prompt_builder.build_environment_hints", return_value=""),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value="context"),
     ):
         a = _make_agent(model="m1", provider="p1", platform="telegram")
         build_system_prompt(a)
@@ -555,8 +555,8 @@ def test_prompt_prefix_boot_check_fails_open(monkeypatch):
     monkeypatch.setattr(sp, "_PREFIX_HASH_LOGGED", _Boom())
     with (
         patch("agent.prompt_builder.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints", return_value=""),
-        patch("run_agent.build_context_files_prompt", return_value="context"),
+        patch("agent.prompt_builder.build_environment_hints", return_value=""),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value="context"),
     ):
         agent = _make_agent()
         prompt = build_system_prompt(agent)

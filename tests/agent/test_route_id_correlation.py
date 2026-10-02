@@ -184,7 +184,8 @@ class _FakeStream:
         return False
 
     def __iter__(self):
-        return iter(())
+        # Upstream's _drain_stream treats a stream that never reaches message_stop as a drop.
+        return iter((SimpleNamespace(type="message_stop"),))
 
     def get_final_message(self):
         return SimpleNamespace(

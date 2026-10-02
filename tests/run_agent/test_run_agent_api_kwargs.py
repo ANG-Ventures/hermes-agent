@@ -1047,10 +1047,12 @@ class TestSystemPromptStability:
             if stored_prompt:
                 agent._cached_system_prompt = stored_prompt
             else:
+                # Should have built fresh, not queried the DB for a stored prompt. (The build
+                # itself may read the row: upstream 921ab7a163 seeds the workspace pin from the
+                # session's persisted prompt, which is not the lookup under test.)
+                mock_db.get_session.assert_not_called()
                 agent._cached_system_prompt = agent._build_system_prompt()
 
-        # Should have built fresh, not queried the DB
-        mock_db.get_session.assert_not_called()
         assert agent._cached_system_prompt is not None
         assert "Hermes Agent" in agent._cached_system_prompt
 

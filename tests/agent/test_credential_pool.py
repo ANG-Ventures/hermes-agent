@@ -1775,6 +1775,7 @@ def codex_sync_pool(tmp_path, monkeypatch):
     monkeypatch.setattr(auth_codex, "httpx", SimpleNamespace(
         Client=lambda **kw: client(transport=httpx.MockTransport(transport), **kw),
         Timeout=httpx.Timeout,
+        SyncByteStream=httpx.SyncByteStream,  # response-body cap hook subclasses it
     ))
 
     def build(*, store_account="account-A", entry_account="account-A",

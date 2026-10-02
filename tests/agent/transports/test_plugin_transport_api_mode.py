@@ -57,16 +57,18 @@ def install_dialect_plugin(tmp_path, monkeypatch):
             del sys.modules[mod]
         installed.append((name, mode))
 
+    # The provider registries are additive seam facades (``hermes_cli.provider_seam``):
+    # ``pop`` is refused, so the undo is a generation swap back to this snapshot.
+    from hermes_cli import provider_seam
+    generation = provider_seam.current()
+
     yield _install
 
     import providers as _pkg
     from agent.transports import _REGISTRY
-    for name, mode in installed:
-        _pkg._REGISTRY.pop(name, None)
+    for _name, mode in installed:
         _REGISTRY.pop(mode, None)
-        for alias, canonical in list(_pkg._ALIASES.items()):
-            if canonical == name:
-                _pkg._ALIASES.pop(alias, None)
+    provider_seam._restore(generation)
     _pkg._PROVIDER_LIST_CACHE = None
 
 

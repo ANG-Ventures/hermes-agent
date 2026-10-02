@@ -227,6 +227,11 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         return outcome
 
     clock = _FakeClock(sleeps)
+    # Upstream c5b99a3ee5 keeps should_use_direct_api_call() contexts on the STREAMING wire
+    # (inline, monitor thread), so that flag no longer lands the primary on
+    # ``_interruptible_api_call``. Disable streaming on the rig instead: the non-streaming
+    # path is ``relay_llm.execute(..., agent._interruptible_api_call)``, the fallback's seam.
+    agent._disable_streaming = True
     with (
         # Route the PRIMARY through the same seam as the fallback (the cron /
         # delegated-child inline path) so one script drives the whole turn.

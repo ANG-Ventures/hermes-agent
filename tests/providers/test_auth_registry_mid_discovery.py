@@ -122,22 +122,24 @@ LATE_ALIAS = "probe-102123-late-alias"
 
 @pytest.fixture()
 def _isolated_registries():
-    """Snapshot both registries; restore on teardown so nothing leaks."""
-    saved_registry = dict(providers._REGISTRY)
-    saved_aliases = dict(providers._ALIASES)
+    """Snapshot both registries; restore on teardown so nothing leaks.
+
+    The registries are additive seam facades (``hermes_cli.provider_seam``): ``clear`` /
+    ``del`` are refused, so isolation is a generation reset and the restore a generation
+    swap (the auth-side ``PROVIDER_REGISTRY`` mirror is part of the same generation).
+    """
+    from hermes_cli import provider_seam
+
+    generation = provider_seam.current()
     saved_discovered = providers._discovered
-    saved_auth_keys = set(auth_mod.PROVIDER_REGISTRY)
     saved_plugin_modules = {
         m for m in sys.modules if m.startswith("plugins.model_providers")
     }
-    providers._REGISTRY.clear()
-    providers._ALIASES.clear()
+    provider_seam._reset("_REGISTRY", "_ALIASES")
     providers._PROVIDER_LIST_CACHE = None
     providers._discovered = False
     providers._discovering = False
     yield
-    for key in set(auth_mod.PROVIDER_REGISTRY) - saved_auth_keys:
-        del auth_mod.PROVIDER_REGISTRY[key]
     for mod in [
         m
         for m in sys.modules
@@ -145,10 +147,7 @@ def _isolated_registries():
         and m not in saved_plugin_modules
     ]:
         del sys.modules[mod]
-    providers._REGISTRY.clear()
-    providers._REGISTRY.update(saved_registry)
-    providers._ALIASES.clear()
-    providers._ALIASES.update(saved_aliases)
+    provider_seam._restore(generation)
     providers._PROVIDER_LIST_CACHE = None
     providers._discovered = saved_discovered
     providers._discovering = False
