@@ -339,8 +339,14 @@ def start_loop_liveness_watchdog(
     starvation_load_factor: float = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
     starvation_max_hold_s: float = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    pre_exit: Optional[Callable[[], None]] = None,
+    pre_exit_timeout: float = 10.0,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes.
+
+    ``pre_exit`` runs on a daemon thread right before the hard exit, bounded
+    by ``pre_exit_timeout`` (the gateway records its in-flight turns there,
+    r31 G). It must not need the event loop, which is wedged by definition.
 
     The guard is on by default; operators opt out with
     ``gateway.loop_watchdog: false`` in config.yaml (enforced by the caller,
@@ -487,6 +493,17 @@ def start_loop_liveness_watchdog(
                 logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
             if stop_event.is_set():
                 return
+            if pre_exit is not None:
+                try:
+                    worker = threading.Thread(
+                        target=pre_exit, name="loop-watchdog-pre-exit", daemon=True
+                    )
+                    worker.start()
+                    worker.join(timeout=pre_exit_timeout)
+                except Exception:
+                    logger.debug("Loop liveness pre-exit hook failed", exc_info=True)
+                if stop_event.is_set():
+                    return
             # Record the watchdog exit in the lifecycle sentinel so the next
             # boot reports "watchdog hard-exit" instead of misclassifying
             # this as an unclean SIGKILL/OOM death (NS-608).
