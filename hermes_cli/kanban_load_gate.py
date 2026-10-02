@@ -48,6 +48,17 @@ The fix is admission against PROJECTED load, not current load:
   cost), still capped per tick. The state is ``cpu_headroom``. With no CPU
   sample, behaviour is the load1-only gate as before.
 
+2026-10-02 (t_b660edb6): the Studio ran out of per-uid process slots
+(kern.maxprocperuid 10666) while load1 sat at 7-8. A runaway self-recursing
+microbench under one worker climbed from 1.4k to 10.3k processes over 3 h;
+then every fork() returned EAGAIN, every hook failed closed, and the
+gateway's watchdog exited it. load1 never saw it, so nothing paused and
+nothing paged. The gate now also counts this user's processes against
+RLIMIT_NPROC: at ``proc_pause_fraction`` (default 0.80) of the limit it is
+``proc_paused`` (a hard pause CPU headroom cannot override), and it resumes
+below ``proc_resume_fraction`` (default 0.65). An unreadable count or
+limit leaves the gate load-only (fail open).
+
 ``kanban.max_spawn`` stays the hard concurrency ceiling; this gate is the
 governor that decides how fast the host is allowed to approach it.
 
@@ -76,6 +87,8 @@ SLOPE_MIN_SAMPLES = 5
 SLOPE_MIN_X_STDEV = 1.0
 SLOPE_MIN_R2 = 0.5
 DEFAULT_MAX_SPAWN_PER_TICK = 4
+DEFAULT_PROC_PAUSE_FRACTION = 0.80
+DEFAULT_PROC_RESUME_FRACTION = 0.65
 SUMMARY_INTERVAL_SECONDS = 300.0
 STATE_FILENAME = "load_gate.json"
 
@@ -136,6 +149,19 @@ class LoadGate:
         self.worker_cpu_cost = _num(
             cfg.get("worker_cpu_cost"), DEFAULT_WORKER_CPU_COST
         )
+        pf = _num(cfg.get("proc_pause_fraction"), DEFAULT_PROC_PAUSE_FRACTION)
+        self.proc_pause_fraction = pf if pf < 1.0 else DEFAULT_PROC_PAUSE_FRACTION
+        rf = _num(cfg.get("proc_resume_fraction"), DEFAULT_PROC_RESUME_FRACTION)
+        self.proc_resume_fraction = (
+            rf if rf < self.proc_pause_fraction else 0.8 * self.proc_pause_fraction
+        )
+        # Absolute override of the per-uid process limit (else RLIMIT_NPROC).
+        self.proc_limit_override: Optional[int] = (
+            _pos_int(cfg.get("proc_limit"), 1) if cfg.get("proc_limit") else None
+        )
+        self.procs: Optional[int] = None
+        self.proc_limit: Optional[int] = None
+        self.proc_paused = False
         self.ncpu = ncpu
         self.paused = False
         self.reason: Optional[str] = None
@@ -197,6 +223,51 @@ class LoadGate:
                 f"(ncpu={self.ncpu}); resumes below {self.resume_below:.1f}{tail}"
             )
         return self.reason
+
+    def update_procs(
+        self, procs: Optional[int], proc_limit: Optional[int]
+    ) -> Optional[str]:
+        """Process-slot hysteresis; return the pause reason (None = clear).
+
+        Pauses at ``proc_pause_fraction`` of the limit, resumes below
+        ``proc_resume_fraction``. Unknown count or limit: no process gate
+        (and a previous pause is held, not silently released).
+        """
+        limit = self.proc_limit_override or proc_limit
+        try:
+            procs = int(procs) if procs is not None else None
+            limit = int(limit) if limit else None
+        except (TypeError, ValueError):
+            procs, limit = None, None
+        self.procs, self.proc_limit = procs, limit
+        if procs is None or not limit or limit <= 0:
+            return self._proc_reason() if self.proc_paused else None
+        if self.proc_paused:
+            if procs < self.proc_resume_fraction * limit:
+                self.proc_paused = False
+        elif procs >= self.proc_pause_fraction * limit:
+            self.proc_paused = True
+        return self._proc_reason() if self.proc_paused else None
+
+    def _proc_reason(self) -> str:
+        limit = self.proc_limit or 0
+        procs = "?" if self.procs is None else str(self.procs)
+        return (
+            f"PROCESS SLOTS: uid procs={procs} of limit {limit} "
+            f">= {self.proc_pause_fraction:.0%}; fork() fails with EAGAIN at the "
+            f"limit; resumes below {int(self.proc_resume_fraction * limit)}"
+        )
+
+    def host_recovered(self) -> bool:
+        """True when this tick admitted on a healthy host (see requeue of
+        host-transient blocks): enabled, not paused for load or process
+        slots, and allowance > 0."""
+        return bool(
+            self.enabled
+            and self.state in ("admitting", "cpu_headroom")
+            and not self.proc_paused
+            and (self.allowance or 0) > 0
+        )
 
     # -- projected-load admission ------------------------------------------
     def _prune(self, now: float) -> None:
@@ -274,6 +345,8 @@ class LoadGate:
         now: Optional[float] = None,
         running: Optional[int] = None,
         cpu_busy: Optional[float] = None,
+        procs: Optional[int] = None,
+        proc_limit: Optional[int] = None,
     ) -> "tuple[Optional[int], Optional[str]]":
         """Return ``(allowance, reason)`` for this tick.
 
@@ -282,6 +355,8 @@ class LoadGate:
         when ``allowance == 0`` and explains why. ``running`` (workers
         running on the host) feeds the load-per-worker slope; ``cpu_busy``
         (0..1 of all cores) corroborates a load1 pause. Both are optional.
+        ``procs`` / ``proc_limit`` (this uid's process count and its limit)
+        drive the process-slot pause; either missing = no process gate.
         """
         if not self.enabled:
             self.state, self.allowance, self.reason = "disabled", None, None
@@ -310,6 +385,10 @@ class LoadGate:
         self.cost_source = "measured" if measured is not None else "prior"
         hard = self.update(load1, self.load5)
         self.pending_ramp = self.pending(now)
+        proc_hard = self.update_procs(procs, proc_limit)
+        if proc_hard:
+            self.state, self.allowance, self.last_reason = "proc_paused", 0, proc_hard
+            return 0, proc_hard
         if hard:
             if (
                 self.cpu_corroborate
@@ -398,7 +477,11 @@ class LoadGate:
         if load1 is None:
             return None, None
         busy, self._cpu_prev = sample_cpu_busy(self._cpu_prev, block=cpu_block)
-        return self.admit(load1, load5=load5, running=running, cpu_busy=busy)
+        procs, proc_limit = sample_user_procs() if self.enabled else (None, None)
+        return self.admit(
+            load1, load5=load5, running=running, cpu_busy=busy,
+            procs=procs, proc_limit=proc_limit,
+        )
 
     def finish_tick(self, spawned: int, logger=None, path=None) -> None:
         """Book spawns, emit gate lines, publish state for diagnostics."""
@@ -438,6 +521,9 @@ class LoadGate:
             "running": self.running,
             "cpu_busy": None if self.cpu_busy is None else round(self.cpu_busy, 3),
             "cpu_busy_pause": self.cpu_busy_pause,
+            "procs": self.procs,
+            "proc_limit": self.proc_limit,
+            "proc_pause_fraction": self.proc_pause_fraction,
             "ncpu": self.ncpu,
             "boards": self.boards,
             "updated_at": time.time(),
@@ -452,7 +538,9 @@ class LoadGate:
             f"allowance={self.allowance} admitted={self.admitted_last_tick} "
             f"pause_above={self.pause_above:.1f} cost={self.cost:.2f}/{self.cost_source} "
             f"running={'?' if self.running is None else self.running} "
-            f"cpu_busy={'?' if self.cpu_busy is None else f'{self.cpu_busy:.2f}'}"
+            f"cpu_busy={'?' if self.cpu_busy is None else f'{self.cpu_busy:.2f}'} "
+            f"procs={'?' if self.procs is None else self.procs}"
+            f"/{'?' if not self.proc_limit else self.proc_limit}"
         )
 
     def log_tick(self, logger, now: Optional[float] = None) -> None:
@@ -462,8 +550,11 @@ class LoadGate:
         now = time.monotonic() if now is None else float(now)
         if self.state != self._last_logged_state:
             level = logger.warning if self.state == "paused" else logger.info
-            level("kanban load gate: %s -> %s",
-                  self._last_logged_state or "start", self._line())
+            if self.state == "proc_paused":
+                level = logger.error
+            level("kanban load gate: %s -> %s%s",
+                  self._last_logged_state or "start", self._line(),
+                  f" -- {self.last_reason}" if self.state == "proc_paused" else "")
             self._last_logged_state = self.state
         if self._last_summary_at is None:
             self._last_summary_at = now
@@ -599,6 +690,53 @@ def sample_cpu_busy(prev=None, block: float = 0.0):
     return min(1.0, max(0.0, 1.0 - idle / total)), cur
 
 
+def sample_user_procs() -> "tuple[Optional[int], Optional[int]]":
+    """(this uid's process count, its process limit) or None for either.
+
+    Reads the process table through psutil (sysctl/proc, no fork), so it
+    still works when the host is out of process slots. The limit is the
+    soft RLIMIT_NPROC (kern.maxprocperuid on macOS); unlimited reads as None.
+    """
+    limit: Optional[int] = None
+    try:
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        if soft != resource.RLIM_INFINITY and soft > 0:
+            limit = int(soft)
+    except Exception:
+        limit = None
+    try:
+        import psutil
+
+        uid = os.getuid()
+        count = 0
+        for p in psutil.process_iter(["uids"]):
+            uids = p.info.get("uids")
+            if uids is not None and uids.real == uid:
+                count += 1
+    except Exception:
+        return None, limit
+    return count, limit
+
+
+def top_user_proc_families(n: int = 3) -> "list[tuple[str, int]]":
+    """The ``n`` most common process names for this uid (no fork)."""
+    try:
+        import psutil
+
+        uid = os.getuid()
+        counts: dict = {}
+        for p in psutil.process_iter(["uids", "name"]):
+            uids = p.info.get("uids")
+            if uids is not None and uids.real == uid:
+                name = p.info.get("name") or "?"
+                counts[name] = counts.get(name, 0) + 1
+    except Exception:
+        return []
+    return sorted(counts.items(), key=lambda kv: -kv[1])[:n]
+
+
 def count_running_workers() -> "Optional[int]":
     """Running tasks across every board on this host.
 
@@ -660,5 +798,6 @@ def format_state_line(state: Optional[dict], now: Optional[float] = None) -> str
         f"admitted_last_tick={state.get('admitted_last_tick')} "
         f"pause_above={state.get('pause_above')} "
         f"max_spawn_per_tick={state.get('max_spawn_per_tick')} "
+        f"procs={state.get('procs')}/{state.get('proc_limit')} "
         f"(updated {age:.0f}s ago)"
     )
