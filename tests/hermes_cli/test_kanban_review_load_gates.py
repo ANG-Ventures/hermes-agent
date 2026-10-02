@@ -209,7 +209,8 @@ def test_milestone_only_completes_slice_cards_in_place(kanban_home, monkeypatch)
         tid = kb.create_task(conn, title="slice: add flag", assignee="builder")
         claimed = kb.claim_task(conn, tid)
         ok, reason = kb.request_review(
-            conn, tid, summary="PR #1 green", expected_run_id=claimed.current_run_id,
+            conn, tid, summary="PR #1 green", metadata={"tests_run": 1},
+            expected_run_id=claimed.current_run_id,
             with_reason=True,
         )
         assert ok is True and "review skipped" in reason
@@ -245,6 +246,7 @@ def test_milestone_only_routes_marker_and_parent_cards(kanban_home, monkeypatch)
         leaf = kb.create_task(conn, title="slice with explicit reviewer", assignee="builder")
         claimed = kb.claim_task(conn, leaf)
         assert kb.request_review(conn, leaf, summary="s", reviewer="argus",
+                                 metadata={"tests_run": 1},
                                  expected_run_id=claimed.current_run_id) is True
         assert kb.get_task(conn, leaf).status == "done"
         # the explicit human sentinel still parks the card for a person
@@ -286,8 +288,8 @@ def _claim_and_request(conn, tid, **kw):
     claimed = kb.claim_task(conn, tid)
     assert claimed is not None
     return kb.request_review(
-        conn, tid, summary="PR green", expected_run_id=claimed.current_run_id,
-        with_reason=True, **kw,
+        conn, tid, summary="PR green", metadata={"tests_run": 1},
+        expected_run_id=claimed.current_run_id, with_reason=True, **kw,
     )
 
 
