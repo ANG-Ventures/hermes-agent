@@ -19,6 +19,8 @@ from gateway.config import (
     HomeChannel,
     Platform,
     PlatformConfig,
+    PLATFORM_TOKEN_ENV_NAMES,
+    _getenv,
     _getenv_str,
     _has_usable_api_server_key,
     SHARED_LISTENER_MIRROR_PLATFORMS,
@@ -502,6 +504,43 @@ def _relay(config: GatewayConfig) -> None:
         platform_config.enabled = False
 
 
+def _warn_configured_platforms_without_token(config: GatewayConfig) -> None:
+    """Log an ERROR when a messaging platform is wanted but its bot token is blank.
+
+    A blank token never enables the adapter (``_Cred`` only fires on a non-empty value), so the
+    "enabled but empty" warning in ``_validate_gateway_config`` cannot see this case and the
+    platform is skipped without a word. "Wanted" means: the token key is present but empty, a
+    ``<PREFIX>_HOME_CHANNEL`` is set, or config.yaml enables the platform with no token.
+    ``platforms.<name>.enabled: false`` is the explicit opt-out and stays silent. Reads the
+    ``_enabled_explicit`` marker, so it must run before ``_scrub_explicit_markers``.
+    """
+    for platform, env_name in PLATFORM_TOKEN_ENV_NAMES.items():
+        pconfig = config.platforms.get(platform)
+        if getenv(env_name).strip() or (pconfig is not None and (pconfig.token or "").strip()):
+            continue
+        if pconfig is not None and not pconfig.enabled and pconfig.extra.get("_enabled_explicit"):
+            continue  # explicitly disabled in config: a decision, not a fault
+        if pconfig is not None and pconfig.enabled and pconfig.token is not None:
+            continue  # enabled with an empty string: _validate_gateway_config already warns
+        prefix = env_name.split("_", 1)[0]
+        reasons = []
+        if _getenv(env_name, None) is not None:
+            reasons.append(f"{env_name} is present but empty")
+        if getenv(f"{prefix}_HOME_CHANNEL"):
+            reasons.append(f"{prefix}_HOME_CHANNEL is set")
+        if pconfig is not None and pconfig.enabled:
+            reasons.append(f"platforms.{platform.value}.enabled is true")
+        if not reasons:
+            continue
+        logger.error(
+            "PLATFORM TOKEN MISSING: %s is configured (%s) but %s is empty, so the %s adapter "
+            "will NOT start. Restore the token, or set platforms.%s.enabled: false if this "
+            "profile intentionally has no %s.",
+            platform.value, "; ".join(reasons), env_name, platform.value,
+            platform.value, platform.value,
+        )
+
+
 def _scrub_explicit_markers(config: GatewayConfig) -> None:
     for platform_config in config.platforms.values():
         platform_config.extra.pop("_enabled_explicit", None)
@@ -644,6 +683,7 @@ _ENV_STEPS: tuple = (
 
     _enable_plugin_platforms_from_env,
     _relay,
+    _warn_configured_platforms_without_token,
     _scrub_explicit_markers,
 )
 
