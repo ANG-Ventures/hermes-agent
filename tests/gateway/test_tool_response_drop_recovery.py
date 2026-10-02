@@ -324,7 +324,9 @@ class TestPostStopInterruptSwallow:
             # current session id (empty here — harness runner has no
             # session_store entry), scoping durable cancels to THIS session.
             "parent_session_id": "",
-            "reason": _INTERRUPT_REASON_STOP,
+            # parity 2026-10-01: upstream passes the machine-readable invalidation
+            # reason ("stop_command"), not the user-facing interrupt text.
+            "reason": "stop_command",
         }]
         assert released == [session_key]
         assert reaped_event.wait(1)

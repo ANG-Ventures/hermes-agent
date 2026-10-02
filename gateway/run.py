@@ -10758,8 +10758,13 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
         _stderr_handler = logging.StreamHandler(_safe_stderr())
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(_gateway_stderr_formatter())
+        # Under launchd stderr IS a file (logs/gateway.error.log); attached directly, every WARNING+
+        # on the event loop became a synchronous disk write (PHASE=event_loop_blocked seconds=10 in
+        # the Discord heartbeat path -> ack_stale reconnect, 2026-09-23). Route it through the async
+        # QueueListener the rotating file handlers already use (fork).
+        from hermes_logging import _register_queued_handler as _queue_handler
+        _queue_handler(_stderr_handler)
         root = logging.getLogger()
-        root.addHandler(_stderr_handler)
         if _stderr_level < root.level:  # so DEBUG records can reach the handler
             root.setLevel(_stderr_level)
 
