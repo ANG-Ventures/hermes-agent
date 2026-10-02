@@ -586,7 +586,10 @@ def _classify_child_outcome(result: Dict[str, Any]) -> Tuple[str, str]:
     summary = str(result.get("final_response") or "")
     if result.get("interrupted"):
         return "interrupted", "interrupted"
-    if result.get("failed"):
+    # Upstream (child_run._build_result_entry): a non-empty ``error`` with the ``failed`` key
+    # absent (legacy/partial result dicts) is still a failure — never report a provider
+    # rejection as "max_iterations"; that is only truthful for real budget exhaustion.
+    if result.get("failed") or result.get("error"):
         return "failed", "error"
     if summary and summary.strip() != "(empty)":
         return "completed", ("completed" if result.get("completed", False) else "max_iterations")
@@ -2226,7 +2229,30 @@ def _run_single_child(
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
             try:
-                leased_entry = child_pool.current()
+                # Upstream #68237 (child_run._lease_child_credential): resolve the leased entry by
+                # id — the pool is shared with the parent/siblings, so current() is a mutable cursor
+                # that may already point at someone else's pick — and the bound entry must serve the
+                # child's endpoint: on a mixed same-provider pool the least-leased pick may target
+                # another host, so it is released and an endpoint-matching entry is leased by id.
+                # Pools without a list-returning entries() (legacy adapters) fall back to current().
+                from agent.credential_pool import credential_pool_entry_serves_endpoint as _entry_serves_endpoint
+                _entries_fn = getattr(child_pool, "entries", None)
+                _entries = _entries_fn() if callable(_entries_fn) else None
+                if isinstance(_entries, list):
+                    _base_url = getattr(child, "base_url", None)
+                    leased_entry = next((e for e in _entries if getattr(e, "id", None) == leased_cred_id), None)
+                    if not _entry_serves_endpoint(leased_entry, _base_url):
+                        child_pool.release_lease(leased_cred_id)
+                        leased_entry = next(
+                            (e for e in _entries
+                             if getattr(e, "last_status", None) != "dead" and _entry_serves_endpoint(e, _base_url)),
+                            None,
+                        )
+                        leased_cred_id = (
+                            child_pool.acquire_lease(leased_entry.id) if leased_entry is not None else None
+                        )
+                else:
+                    leased_entry = child_pool.current()
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
                     outcome = child._swap_credential(leased_entry)
                     # ``_swap_credential`` refuses to install a keyless client and
@@ -2947,6 +2973,11 @@ def _run_single_child(
         )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+            # Upstream: the classified reason from the child loop (e.g. "rate_limit", "billing",
+            # "server_error") lets the parent tell a quota wall from a task error without parsing prose.
+            _failure_reason = result.get("failure_reason")
+            if isinstance(_failure_reason, str) and _failure_reason:
+                entry["failure_reason"] = _failure_reason
             # Same reap as the raise path below: a child that fails by
             # RETURNING must not leave its live subtree running.
             _reap_subtree(child, "error")
