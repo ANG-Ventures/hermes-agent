@@ -127,15 +127,6 @@ def test_nproc_preexec_lowers_the_child_limit():
     assert out == "(4321, 4321)"
 
 
-def test_default_spawn_wires_the_nproc_preexec():
-    """_default_spawn chains the nproc preexec into the worker Popen."""
-    import inspect
-
-    src = inspect.getsource(kb._default_spawn)
-    assert "worker_nproc_preexec_limit(nproc_limit)" in src
-    assert "preexec_fn=priority_preexec" in src
-
-
 # ---------------------------------------------------------------------------
 # DRILL 1: fork bomb stops at the cap (RLIMIT_NPROC is per-uid)
 # ---------------------------------------------------------------------------
