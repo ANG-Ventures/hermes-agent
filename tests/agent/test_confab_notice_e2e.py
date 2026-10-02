@@ -724,7 +724,11 @@ class TestConfabNoticeEndToEnd:
         event = next(m for m in db.get_messages_as_conversation(sid)
                      if is_metadata_only_tool_notice(m))
         user = {"role": "user", "content": "preserved head"}
-        history = [user, event, {"role": "assistant", "content": "dropped"},
+        # The folded middle carries real weight: upstream's commit path re-anchors the
+        # just-delivered reply (#118900) AND the last user turn behind the engine output, so a
+        # candidate built from one-word rows would not shrink and the commit-site anti-growth
+        # guard would refuse the whole compaction (fixture artefact, not the contract under test).
+        history = [user, event, {"role": "assistant", "content": "dropped " * 200},
                    {"role": "user", "content": "dropped too"},
                    {"role": "assistant", "content": "also dropped"}]
         agent = make_agent(stream=stream)
@@ -734,14 +738,15 @@ class TestConfabNoticeEndToEnd:
                 {"role": "assistant", "content": "summary"}]
         agent.context_compressor.compress = engine
         compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+        assert compressed is not history
         event_at = next(i for i, row in enumerate(compressed)
                         if is_metadata_only_tool_notice(row))
-        # The notice follows its surviving predecessor, or the engine's output when nothing
-        # survived. Rows upstream's commit path re-anchors AFTER the engine (#118900 keeps the
-        # last assistant reply; the user-turn anchor) land behind it, so pin the neighbour,
-        # not the list length.
-        assert event_at == 1
-        assert compressed[0]["content"] == ("preserved head" if survives == "predecessor" else "summary")
+        # The notice follows its surviving predecessor, or the engine's output (the summary
+        # boundary) when nothing survived. Rows the commit path re-anchors around the engine
+        # output (#118900 reply, the user-turn anchor) must never pull it off that neighbour.
+        assert event_at >= 1
+        assert compressed[event_at - 1]["content"] == (
+            "preserved head" if survives == "predecessor" else "summary")
 
     def test_compaction_notice_short_overlap_cannot_rebind_to_equal_tail(self, notice_env, stream):
         make_agent, handler, db, sid, _ = notice_env
