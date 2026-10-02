@@ -2409,6 +2409,16 @@ class GatewayTurnMixin:
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # Fork D-6 defense: a turn that ended via an exception/early-return BEFORE the clean-turn
+            # gate ran would leave its restart-initiator breadcrumb on disk for a later same-session
+            # turn to read. Consume (unlink) it here without recording a mark — a crashed turn made no
+            # loop progress to count. Idempotent: a no-op if the gate already consumed it.
+            try:
+                _sk_cleanup = locals().get("session_key")
+                if _sk_cleanup:
+                    self._consume_restart_initiated_breadcrumb(_sk_cleanup)
+            except Exception:
+                pass
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.
