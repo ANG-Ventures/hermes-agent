@@ -1304,16 +1304,29 @@ def discord_skill_commands_by_category(
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         from tools.skills_tool import SKILLS_DIR
 
-        _skills_dir = SKILLS_DIR.resolve()
-        _hub_dir = (SKILLS_DIR / ".hub").resolve()
-        # Build list of (resolved_root, is_local) tuples. Each external dir
-        # becomes its own scan root for category derivation — a skill at
-        # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
-        _scan_roots: list[_P] = [_skills_dir]
+        # Only the roots are realpath'd (a handful of syscalls). Each skill
+        # path is matched LEXICALLY first and resolve()d only on a miss:
+        # this runs on the gateway event-loop thread (Discord connect and
+        # /reload-skills), and ~1000 per-skill realpath walks are ~6000
+        # lstat() calls, each of which drops the GIL. With a busy thread
+        # holding the GIL (a kanban dispatcher tick), every re-acquire waits
+        # out the switch interval: measured 0.05s alone -> ~210s contended,
+        # which tripped the 120s loop-liveness watchdog on every boot
+        # (2026-10-01/02, t_620ba53d).
+        def _both(p) -> list[_P]:
+            lexical = _P(os.path.abspath(os.fspath(p)))
+            resolved = _P(p).resolve()
+            return [lexical] if resolved == lexical else [lexical, resolved]
+
+        _hub_dirs = _both(SKILLS_DIR / ".hub")
+        # Each external dir becomes its own scan root for category
+        # derivation — a skill at ``<external>/mlops/foo/SKILL.md`` is still
+        # categorized as "mlops".
+        _scan_roots: list[_P] = _both(SKILLS_DIR)
         try:
             for ext in get_external_skills_dirs():
                 try:
-                    _scan_roots.append(_P(ext).resolve())
+                    _scan_roots.extend(_both(ext))
                 except Exception:
                     continue
         except Exception:
@@ -1321,33 +1334,35 @@ def discord_skill_commands_by_category(
         try:
             for proj in get_project_skills_dirs():
                 try:
-                    _scan_roots.append(_P(proj).resolve())
+                    _scan_roots.extend(_both(proj))
                 except Exception:
                     continue
         except Exception:
             pass
         skill_cmds = get_skill_commands()
 
+        def _match_root(sp: _P) -> _P | None:
+            for root in _scan_roots:
+                if sp == root or root in sp.parents:
+                    return root
+            return None
+
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            sp = _P(skill_path).resolve()
-            # Hub skills are loaded via the skill hub, not surfaced as
-            # slash commands.
-            if str(sp).startswith(str(_hub_dir)):
-                continue
+            sp = _P(os.path.abspath(os.fspath(skill_path)))
             # Accept skill if it lives under any scan root; record the
             # matching root so we can derive the category correctly.
-            matched_root: _P | None = None
-            for root in _scan_roots:
-                try:
-                    sp.relative_to(root)
-                except ValueError:
-                    continue
-                matched_root = root
-                break
+            matched_root = _match_root(sp)
+            if matched_root is None:
+                sp = _P(skill_path).resolve()
+                matched_root = _match_root(sp)
+            # Hub skills are loaded via the skill hub, not surfaced as
+            # slash commands.
+            if any(h == sp or h in sp.parents for h in _hub_dirs):
+                continue
             if matched_root is None:
                 continue
 

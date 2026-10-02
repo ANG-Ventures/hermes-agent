@@ -2010,9 +2010,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         guild_id,
                     )
 
-            # Register slash commands
+            # Register slash commands. Off the event loop: it builds the
+            # /skill catalog (~1000 skill paths of filesystem work), and on
+            # the loop thread that convoys with any GIL-busy thread into a
+            # loop wedge the liveness watchdog kills (t_620ba53d). Safe in a
+            # worker thread: the client is not started yet, so nothing else
+            # touches the command tree until this returns.
             if self._slash_commands:
-                self._register_slash_commands()
+                await asyncio.to_thread(self._register_slash_commands)
 
             # Start the bot in background
             self._disconnecting = False
