@@ -40,6 +40,9 @@ def test_allowlisted_name_function_heredoc_stays_visible(tmp_path):
 def test_unquoted_heredoc_body_path_still_walked(tmp_path):
     """An expansion-capable body is not provably inert: the walk still sees it and fails closed."""
     big = _big_file(tmp_path)
+    # Fork (pc-fb1bd018): an oversized file WITHOUT the execute bit at command position is a data
+    # mention, never a script reference, so only an oversized EXECUTABLE proves the walk happened.
+    big.chmod(0o755)
     assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is True
 
 

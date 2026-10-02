@@ -241,7 +241,7 @@ class TestSyncMode:
                 "fire_claim": {"by": "test-owner", "at": "now"},
             },
         )
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: {})  # upstream: None = lost ownership
         monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
         # The fire-claim heartbeat re-verifies ownership against the real store
         # before run_job; stub it to keep the claim "owned" for the stub job.
