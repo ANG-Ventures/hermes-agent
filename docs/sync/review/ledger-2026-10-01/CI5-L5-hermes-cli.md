@@ -22,7 +22,7 @@ fail identically on fork/main. 64/66 reds fixed.
 | tests/hermes_cli/test_fast_command.py | FIXED-CODE+TEST | see fast_route row; proxy branch pins `{}` (fork `{}`-when-tier-set contract, same as sibling tests in the class). | 45 passed (group) |
 | tests/hermes_cli/test_gpt6_tiers_registration.py | FIXED-TEST | upstream-only test; gpt-6.1-sol IS -900k eligible on the fork (#1550, measured 922k): assertion flipped to the fork contract. | green |
 | tests/hermes_cli/test_lazy_canonical_providers.py | FIXED-CODE | hermes_cli/models_catalog_static.py: dropped the import-time `sync_plugin_provider_catalog()` (list_providers imports plugins that import hermes_cli.models -> partially initialised module); the post-discovery sync hook still runs it. | green |
-| tests/hermes_cli/test_lazy_command_exports.py | FIXED-TEST | tests/conftest `_no_stale_module_purge` honours `@real_concurrent_gate` (frozen updater surface test needs the real purge). | 36 passed (group) |
+| tests/hermes_cli/test_lazy_command_exports.py | FIXED-TEST | tests/hermes_cli/conftest `_no_stale_module_purge` honours `@real_concurrent_gate` (frozen updater surface test needs the real purge). | 36 passed (group) |
 | tests/hermes_cli/test_managed_scope_test_context.py | FIXED-CODE | hermes_state_guard.py re-exports the test-context predicate from the leaf `hermes_test_context` (one definition; hermes_state / managed_scope bind the same function). | green |
 | tests/hermes_cli/test_model_alias_entry_points.py | FIXED-CODE (2) + INHERITED (2) | tools/delegate_tool_config.py: `delegation.model` resolves model.aliases / provider prefix at read time (`resolve_model_pair_for_storage`) -> 2 delegation reds fixed. `test_kanban_stored_alias_reaches_worker_argv_resolved` + `test_kanban_edit_then_spawn_never_emits_a_mismatched_pair` fail on fork/main too (`$R/base`: 2 failed, 25 passed) -> INHERITED, not chased. | 2 failed (inherited), rest green |
 | tests/hermes_cli/test_model_prefix_routing.py | FIXED-TEST | upstream-only tests unpack the fork's `(merged, ok)` return of `_load_dict_model_aliases`. | 96 passed (group) |
@@ -51,7 +51,7 @@ hermes_cli/models_catalog_static.py, hermes_cli/models_validate.py,
 hermes_cli/session_schema_history.py, hermes_cli/web_server.py, hermes_state_guard.py,
 hermes_yaml.py, tools/bot_desktop/browser.py, tools/delegate_tool.py (7-line metrics hunk; L6
 owns this module), tools/delegate_tool_config.py, tui_gateway/methods_config_set.py,
-tui_gateway/server.py, tests/conftest.py.
+tui_gateway/server.py, tests/hermes_cli/conftest.py.
 
 ## Not chased (outside the manifest, noted while verifying)
 - tests/agent/test_codex_owner_*: unchanged red set (needs L2's hermes_cli/auth.py `_auth_lock_path`).
