@@ -265,6 +265,28 @@ def test_digest_single_line_posts_unchanged_and_bad_config_is_off():
     assert [parse_digest_seconds(v) for v in (None, "", "abc", -5, 0, "900", 900)] == [0, 0, 0, 0, 0, 900, 900]
 
 
+def test_digest_of_a_4h_batch_is_one_message():  # t_26d7df3d
+    """80 transitions (a busy 4 h window, census 2026-10-02) render to ONE <= 2000-char message
+    that still names the newest cards, never an adapter-split stream of ~9 posts."""
+    from gateway.kanban_lifecycle_digest import MAX_MESSAGE_CHARS, render
+
+    lines = [
+        f"{'✔👀⏸'[i % 3]} [{'default' if i % 4 else 'subs-ace'}] @human:apollo Kanban t_{i:08x} "
+        f"{('done', 'ready for review', 'blocked')[i % 3]} — " + "W3-6: a long card title " * 12
+        + "\nhandoff body that never reaches the digest"
+        for i in range(80)
+    ]
+    text = render(lines)
+    assert len(text) <= MAX_MESSAGE_CHARS < 2000
+    assert text.startswith("🗂 **kanban lifecycle** — 80 transition(s)")
+    assert "✔ t_00000000 [subs-ace] W3-6" in text   # board shown only off default
+    assert "👀 t_00000001 W3-6" in text and "⏸ t_00000002 W3-6" in text
+    assert "more (card events" in text and text.endswith("family=digest:kanban-lifecycle")
+    assert "handoff body" not in text
+    small = render(lines[:3])  # a short batch keeps the full header lines
+    assert "@human:apollo Kanban t_00000000 done" in small
+
+
 def _second_sub(conn, tid, chat):
     """A legacy/--also second subscriber row, written raw so the test does not
     depend on the admission rule it sits next to."""

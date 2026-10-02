@@ -12,10 +12,19 @@ behave exactly as for a delivered line; failure lines and anything that stays in
 never come here. A held line lives in memory: a gateway stop inside the window loses at most one
 window of #logs lines (the card events stay on the board). A failed send keeps the batch for the
 next tick; the buffer is capped so a dead channel cannot grow it without bound.
+
+t_26d7df3d (2026-10-02, alerts r33 G): #logs still carried 296 lifecycle lines in 24 h (one post
+each: the knob was never set). Ace's rule is one receipt line per batch / <= 4 h digest, so the
+fleet runs ``lifecycle_digest_seconds: 14400``. A 4 h batch held up to 80 lines; at 220 chars a
+line that rendered ~17 KB, which the Discord adapter splits into ~9 posts (the default stays 0). ``render`` is now
+bounded to ONE message (``MAX_MESSAGE_CHARS``): each line is compacted to its mark, card id and
+title, and lines past the budget fold into a "+N more" tally. Nothing is lost: every transition
+is a card event on the board (``hermes kanban show <id>``).
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -23,6 +32,10 @@ logger = logging.getLogger(__name__)
 FAMILY_TAG = "-# family=digest:kanban-lifecycle"
 MAX_HELD = 400  # lines per channel; oldest dropped (and counted) past this
 LINE_CHARS = 220
+MAX_MESSAGE_CHARS = 1900  # one Discord message (2000) with headroom; the digest never splits
+COMPACT_CHARS = 110
+# ``✔ [board] @who Kanban t_x done — title`` -> mark, board, card id, title.
+_LINE_RE = re.compile(r"^(\S+)\s+\[([^\]]+)\]\s+@\S+\s+Kanban\s+(t_[0-9a-f]+)\b.*?(?:—|:)\s*(.*)$")
 
 
 def parse_digest_seconds(value: Any) -> int:
@@ -50,8 +63,20 @@ def _one_line(msg: str) -> str:
     return first if len(first) <= LINE_CHARS else first[: LINE_CHARS - 1] + "…"
 
 
+def _compact(msg: str) -> str:
+    """``✔ t_x [board] title`` (board shown only off default), clipped to COMPACT_CHARS."""
+    first = _one_line(msg)
+    m = _LINE_RE.match(first)
+    if not m:
+        out = first
+    else:
+        mark, board, tid, title = m.groups()
+        out = f"{mark} {tid}" + ("" if board == "default" else f" [{board}]") + f" {title.strip()}"
+    return out if len(out) <= COMPACT_CHARS else out[: COMPACT_CHARS - 1] + "…"
+
+
 def render(lines: list[str], dropped: int = 0) -> str:
-    """One held line posts unchanged; two or more become one digest message."""
+    """One held line posts unchanged; two or more become ONE digest message (never split)."""
     if len(lines) == 1 and not dropped:
         return lines[0]
     counts: dict[str, int] = {}
@@ -59,12 +84,24 @@ def render(lines: list[str], dropped: int = 0) -> str:
         mark = (m.strip()[:1] or "?")
         counts[mark] = counts.get(mark, 0) + 1
     tally = " · ".join(f"{k} {v}" for k, v in counts.items())
-    body = [f"🗂 **kanban lifecycle** — {len(lines)} transition(s) ({tally})"]
-    body += [_one_line(m) for m in lines]
+    head = f"🗂 **kanban lifecycle** — {len(lines)} transition(s) ({tally})"
+    tail = []
     if dropped:
-        body.append(f"-# {dropped} older line(s) dropped while this channel was unreachable")
-    body.append(FAMILY_TAG)
-    return "\n".join(body)
+        tail.append(f"-# {dropped} older line(s) dropped while this channel was unreachable")
+    tail.append(FAMILY_TAG)
+    full = [_one_line(m) for m in lines]
+    if len("\n".join([head] + full + tail)) <= MAX_MESSAGE_CHARS:
+        return "\n".join([head] + full + tail)
+    budget = MAX_MESSAGE_CHARS - len(head) - sum(len(t) + 1 for t in tail) - 80
+    body: list[str] = []
+    for i, m in enumerate(lines):
+        c = _compact(m)
+        if budget - (len(c) + 1) < 0:
+            body.append(f"… +{len(lines) - i} more (card events: `hermes kanban show <id>`)")
+            break
+        body.append(c)
+        budget -= len(c) + 1
+    return "\n".join([head] + body + tail)
 
 
 class LifecycleDigest:
