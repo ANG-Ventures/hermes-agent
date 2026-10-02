@@ -494,9 +494,12 @@ def test_active_pr_is_one_episode_per_card_and_pr(tmp_path):
     assert notifier.observe([("default", item)], send, now=t0) == 1
     assert notifier.observe([("default", {**item, "guarded_since": 5_000})], send, now=t0 + 60) == 0
     assert notifier.observe([("default", {**item, "pr": pr + "0"})], send, now=t0 + 120) == 1
+    # r31 G (Ace): an active_pr episode pages ONCE; no 6h reminder for the same card + PR.
     assert notifier.observe([("default", {**item, "guarded_since": 9})], send,
-                            now=t0 + _GUARD_STUCK_REMIND_SECONDS) == 1  # the 6h reminder
-    assert sent == [pr, pr + "0", pr]
+                            now=t0 + _GUARD_STUCK_REMIND_SECONDS) == 0
+    assert notifier.observe([("default", item)], send,
+                            now=t0 + 10 * _GUARD_STUCK_REMIND_SECONDS) == 0
+    assert sent == [pr, pr + "0"]
 
 
 def test_active_pr_key_honours_pre_r19_ledger_entry(tmp_path):
@@ -519,8 +522,9 @@ def test_active_pr_key_honours_pre_r19_ledger_entry(tmp_path):
     # Prism #1530: a DIFFERENT streak/PR of the same card is not covered by it.
     other = {**item, "pr": "https://github.com/o/r/pull/10", "guarded_since": 1790745000}
     assert notifier.observe([("default", other)], send, now=10_000.0 + 700) == 1
+    # The migrated legacy page time still marks this (card, PR) as paged: no reminder (r31 G).
     assert notifier.observe([("default", item)], send,
-                            now=10_000.0 + _GUARD_STUCK_REMIND_SECONDS) == 1
+                            now=10_000.0 + _GUARD_STUCK_REMIND_SECONDS) == 0
 
 
 def test_legacy_entry_is_consumed_by_one_pr_of_the_streak(tmp_path):
