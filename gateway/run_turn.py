@@ -833,6 +833,19 @@ class GatewayTurnMixin:
                 )
             if session_entry.last_prompt_tokens > 0:
                 _approx_tokens, _token_source = session_entry.last_prompt_tokens, "actual"
+                if _approx_tokens >= _compress_token_threshold:
+                    # Fork: after a restart (no cached agent below) the stored figure may predate
+                    # the last compaction. Rough overestimates; a stored figure more than twice it
+                    # cannot describe this transcript -> treat it as absent.
+                    _rough_tokens = estimate_messages_tokens_rough(history)
+                    if _rough_tokens * 2 < session_entry.last_prompt_tokens:
+                        logger.info(
+                            "Session hygiene: stored last_prompt_tokens ~%s for %s predates the current "
+                            "transcript (rough ~%s); ignoring it",
+                            f"{session_entry.last_prompt_tokens:,}", session_entry.session_id,
+                            f"{_rough_tokens:,}",
+                        )
+                        _approx_tokens, _token_source = _rough_tokens, "estimated"
             elif _anchored is not None:
                 _approx_tokens, _token_source = _anchored, "anchored"
             else:
@@ -2141,13 +2154,33 @@ class GatewayTurnMixin:
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         )
 
-    def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
-        """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
+    async def _hmwa_discard_stale_result(self, source, _quick_key, run_generation, agent_result=None, session_entry=None):
+        """A newer run generation superseded this turn: drop its deferred post-delivery callback.
+
+        The reply is discarded, but the API calls this turn made are real: persist their last
+        prompt size so the next turn's hygiene valve does not read a figure from before an in-turn
+        compaction (fork, 2026-09-29: /stop after a queued follow-up left a pre-compaction ~1.02M
+        peak stored and hygiene compacted a 16% context). Guarded by the result's session_id so a
+        reset session is never written.
+        """
         logger.info(
             "Discarding stale agent result for %s — generation %d is no longer current",
             _quick_key or "?", run_generation,
         )
         self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        _stale_prompt_tokens = agent_result.get("last_prompt_tokens") if isinstance(agent_result, dict) else None
+        if isinstance(_stale_prompt_tokens, int) and session_entry is not None:
+            try:
+                await self.async_session_store.update_session(
+                    session_entry.session_key,
+                    last_prompt_tokens=_stale_prompt_tokens,
+                    touch_activity=False,
+                    expected_session_id=agent_result.get("session_id") or session_entry.session_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist last_prompt_tokens for stale result %s", _quick_key or "?", exc_info=True,
+                )
 
     @dataclasses.dataclass
     class _PreparedTurn:
@@ -2401,7 +2434,9 @@ class GatewayTurnMixin:
             await self._hmwa_stop_typing_for_turn(event, source)
 
             if not self._is_session_run_current(_quick_key, run_generation):
-                self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                await self._hmwa_discard_stale_result(
+                    source, _quick_key, run_generation, agent_result=agent_result, session_entry=session_entry,
+                )
                 return None
 
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
