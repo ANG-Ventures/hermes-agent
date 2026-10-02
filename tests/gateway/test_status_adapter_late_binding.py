@@ -152,8 +152,13 @@ def test_side_channel_closures_late_bind_the_adapter():
     assert not missing, f"expected side-channel methods not found (renamed?): {missing}"
 
     # The resolver itself is the ONE place allowed to read the turn-start snapshot (fallback).
+    # It reads the late-bind closure via getattr (bare test contexts lack it) — accept either form.
     resolver = defs["_status_adapter_now"]
-    assert _attr_refs(resolver, "_current_status_adapter"), "resolver must consult _current_status_adapter"
+    reads = _attr_refs(resolver, "_current_status_adapter") + [
+        n.lineno for n in ast.walk(resolver)
+        if isinstance(n, ast.Constant) and n.value == "_current_status_adapter"
+    ]
+    assert reads, "resolver must consult _current_status_adapter"
 
     offenders = {}
     for name in sorted(_SIDE_CHANNEL_METHODS):

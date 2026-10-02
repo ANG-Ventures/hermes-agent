@@ -266,8 +266,8 @@ class GatewayStatusCommandsMixin:
             # Fork rehydrate fails closed on a credential-unresolvable persisted identity (the turn
             # resolver must not run it); /status is display-only and still shows the user's
             # committed /model pin rather than the pre-switch DB row (upstream contract).
-            try:
-                _lookup = self._persisted_session_route_identity(session_key)
+            try:  # pins sqlite read: off-loop, as /fast does
+                _lookup = await asyncio.to_thread(self._persisted_session_route_identity, session_key)
             except Exception:
                 _lookup = None
             if _lookup is not None and _lookup.state == "valid" and _lookup.identity:
