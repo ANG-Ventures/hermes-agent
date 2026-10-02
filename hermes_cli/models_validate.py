@@ -465,10 +465,17 @@ def _validate_static_catalog(req: _Request) -> Optional[dict[str, Any]]:
                 # Valid variant a stale catalog hasn't synthesized yet.
                 return _accept()
             base_guess = req.lookup[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+            from agent.model_metadata import CODEX_CONTEXT_POLICY_LARGE, codex_context_policy
+
+            if codex_context_policy() == CODEX_CONTEXT_POLICY_LARGE:
+                # Bare eligible slugs already get the large window; the `-900k` suffix is a
+                # legacy alias, so point at the bare slug.
+                hint = "Pick the base model, or a large-window model from the `/model` picker (e.g. `gpt-6-sol`)."
+            else:
+                hint = "Pick the base model, or a verified variant from the `/model` picker (e.g. `gpt-5.6-sol-900k`)."
             return _reject(
                 f"`{req.requested}` is not a valid large-context variant — `{base_guess}` enforces the "
-                "standard 272K window on Codex, so no `-900k` option exists for it. Pick the base model, "
-                "or a verified variant from the `/model` picker (e.g. `gpt-5.6-sol-900k`)."
+                f"standard 272K window on Codex, so no `-900k` option exists for it. {hint}"
             )
     if not catalog:
         return None

@@ -1988,11 +1988,18 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 # carry the 5.6 verdict forward: they replace Sol/Terra/Luna on the same Codex route, and the live
 # catalog's ``max_context_window`` still caps the bump (#105443) if it publishes a lower ceiling.
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {
-    "gpt-5.6": 900_000, "gpt-6-sol": 900_000, "gpt-6-luna": 900_000,
+    "gpt-5.6": 900_000,   # sol / terra / luna — all three verified live at 900K
 }
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     "gpt-5.4": 900_000, "gpt-daybreak-blue-latest": 900_000,
-    "gpt-6-astra": 900_000,  # advertised 272K; 920,043 input OK, 1,000,043 rejected (live 2026-09-04)
+    # GPT-6 Astra advertises 272K on the codex-sub catalog but reports max_context_window=872,000
+    # (measured 2026-09-04). GPT-6 Sol/Luna: same shape, measured 2026-09-22 against
+    # chatgpt.com/backend-api/codex/models (client_version=0.156.0) — context_window=272,000,
+    # max_context_window=872,000 for both. Listed EXACTLY, not under a "gpt-6" family prefix: each
+    # gpt-6 slug earns its entry by its own catalog measurement, so an unprobed future gpt-6
+    # descendant can never inherit this cap (fork measurement; it supersedes upstream's carried-forward
+    # 900K 5.6 verdict, which the catalog ceiling would reject).
+    "gpt-6-astra": 872_000, "gpt-6-sol": 872_000, "gpt-6-luna": 872_000,
     # GPT-6.1 Sol: the codex-sub catalog did NOT list the slug at measurement time (no catalog
     # max_context_window). Measured by request bisection against chatgpt.com/backend-api/codex/responses
     # on 2026-09-30: 921,028 input tokens accepted, 921,998 rejected (context_length_exceeded) ->
@@ -2003,10 +2010,12 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000  # the only advertised value the bump may override
 CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"  # picker-only opt-in suffix; never sent on the wire
 # The ONLY bases eligible for ``-900k``: routable, live-verified. No family prefixing (it would synthesize
-# dead ``-pro`` variants); dated snapshots of the 5.6 / gpt-6 tier bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
-_CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna")
+# dead ``-pro`` variants); dated snapshots of the routable 5.6 bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
+# The gpt-6 tiers are EXACT entries (no dated-snapshot matching): each earns its place by its own catalog measurement.
+_CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 _CODEX_900K_ELIGIBLE_BASES = frozenset({
-    *_CODEX_900K_SNAPSHOT_BASES, "gpt-5.4", "gpt-daybreak-blue-latest", "gpt-6-astra",
+    *_CODEX_900K_SNAPSHOT_BASES, "gpt-5.4", "gpt-daybreak-blue-latest",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",  # measured max_context_window 872,000
     "gpt-6.1-sol",  # measured ceiling 922,000 (2026-09-30 bisection)
 })
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
