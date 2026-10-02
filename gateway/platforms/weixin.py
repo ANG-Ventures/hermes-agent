@@ -357,10 +357,6 @@ class ContextTokenStore:
     def __init__(self, hermes_home: str):
         self._root = _account_dir(hermes_home)
         self._cache: Dict[str, str] = {}
-        # Serializes the offloaded flushes so two concurrent set() calls
-        # cannot land their writes out of order (last-writer-wins would drop
-        # the newer token from disk).
-        self._persist_lock = asyncio.Lock()
 
     @staticmethod
     def _key(account_id: str, user_id: str) -> str:
@@ -383,16 +379,16 @@ class ContextTokenStore:
     def get(self, account_id: str, user_id: str) -> Optional[str]:
         return self._cache.get(self._key(account_id, user_id))
 
-    async def set(self, account_id: str, user_id: str, token: str) -> None:
+    def set(self, account_id: str, user_id: str, token: str) -> None:
         self._cache[self._key(account_id, user_id)] = token
-        # atomic_json_write() fsyncs, so the flush is offloaded off the loop; the payload is snapshotted
-        # here (the worker never iterates ``_cache`` mid-mutation) and the lock keeps flushes in order.
-        async with self._persist_lock:
-            prefix = f"{account_id}:"
-            payload = {key[len(prefix):]: value for key, value in self._cache.items() if key.startswith(prefix)}
-            await asyncio.to_thread(self._persist, account_id, payload)
+        self._persist(account_id)
 
-    def _persist(self, account_id: str, payload: Dict[str, str]) -> None:
+    def _persist(self, account_id: str) -> None:
+        # atomic_json_write() fsyncs, so the flush rides the single FIFO weixin
+        # write lane (ordered, fenced at disconnect/exit) instead of a to_thread
+        # per call: the caller never awaits, and call order IS on-disk order.
+        prefix = f"{account_id}:"
+        payload = {key[len(prefix):]: value for key, value in self._cache.items() if key.startswith(prefix)}
         try:
             # Reached per inbound message via ``_process_message`` -> ``set``.
             # The payload above is already a fresh dict built on the caller's
@@ -744,8 +740,12 @@ def _load_sync_buf(hermes_home: str, account_id: str) -> str:
     return data.get("get_updates_buf", "") if isinstance(data, dict) else ""
 
 
+def _sync_buf_path(hermes_home: str, account_id: str) -> Path:
+    return _account_dir(hermes_home) / f"{account_id}.sync.json"
+
+
 def _save_sync_buf(hermes_home: str, account_id: str, sync_buf: str) -> None:
-    _dispatch_weixin_json_write(_account_dir(hermes_home) / f"{account_id}.sync.json", {"get_updates_buf": sync_buf})
+    _dispatch_weixin_json_write(_sync_buf_path(hermes_home, account_id), {"get_updates_buf": sync_buf})
 
 
 async def _fetch_qr(session: "aiohttp.ClientSession", bot_type: str) -> Tuple[str, str]:
@@ -1073,7 +1073,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
-            await self._token_store.set(self._account_id, sender_id, context_token)
+            self._token_store.set(self._account_id, sender_id, context_token)
         if self._poll_session and self._token and not self._typing_cache.get(sender_id):
             asyncio.create_task(self._fetch_typing_ticket(self._poll_session, sender_id, context_token or None, "getConfig failed"))
         media_paths, media_types = [], []  # type: List[str], List[str]

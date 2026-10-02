@@ -11600,6 +11600,14 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         remove_pid_file()
         release_gateway_runtime_lock()
 
+    def _fence_lanes() -> None:
+        # os._exit skips shutdown_flush's atexit fences, and a queued durable write (transcript spool,
+        # pending flush, weixin cursor/credentials) that dies with the process is UNRECOVERABLE user data.
+        # The deadline-cancel path leaves a shielded write running with nobody awaiting it; this is the
+        # only thing that waits for it. Bounded at 10s; no-op when the lanes are empty or never created.
+        from gateway.shutdown_flush import fence_lanes_for_hard_exit
+        fence_lanes_for_hard_exit(timeout=10.0)
+
     def _mark_exited() -> None:
         # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
         # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
@@ -11614,7 +11622,7 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _fence_lanes, _mark_exited, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
 

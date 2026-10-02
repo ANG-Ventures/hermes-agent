@@ -169,7 +169,10 @@ class TestWeixinStatePersistence:
             write_threads.append(threading.get_ident())
 
         with patch("gateway.platforms.weixin.atomic_json_write", side_effect=fake_write):
-            await store.set("acct-1", "user-1", "ctx-token-abc")
+            # set() never awaits: the flush rides the FIFO weixin write lane
+            # (tests/gateway/test_weixin_state_write_off_loop.py); fence it to observe.
+            store.set("acct-1", "user-1", "ctx-token-abc")
+            assert await asyncio.to_thread(weixin.fence_weixin_write_lane, 10.0)
 
         assert store.get("acct-1", "user-1") == "ctx-token-abc"
         assert write_threads
@@ -195,10 +198,11 @@ class TestWeixinStatePersistence:
             writes.append(dict(data))
 
         with patch("gateway.platforms.weixin.atomic_json_write", side_effect=slow_first_write):
-            first = _asyncio.create_task(store.set("acct-1", "user-1", "t1"))
+            store.set("acct-1", "user-1", "t1")
             await _asyncio.sleep(0.005)
-            second = _asyncio.create_task(store.set("acct-1", "user-2", "t2"))
-            await _asyncio.gather(first, second)
+            store.set("acct-1", "user-2", "t2")
+            # One FIFO lane worker: on-disk order is call order, not thread scheduling.
+            assert await _asyncio.to_thread(weixin.fence_weixin_write_lane, 10.0)
 
         assert writes[-1] == {"user-1": "t1", "user-2": "t2"}
 
@@ -693,10 +697,11 @@ class TestWeixinApiTimeout:
 class TestWeixinPollLoopSyncBuf:
     """The long-poll cursor write (fsync + rename) must not run on the event loop."""
 
-    def _run_polls(self, monkeypatch, buffers):
+    def _run_polls(self, monkeypatch, tmp_path, buffers):
         import threading
 
         adapter = _make_adapter()
+        adapter._hermes_home = str(tmp_path)
         adapter._running = True
         adapter._poll_session = Mock()
         responses = iter(buffers)
@@ -709,27 +714,30 @@ class TestWeixinPollLoopSyncBuf:
                 adapter._running = False
                 return {"ret": 0, "msgs": []}
 
-        def _save(hermes_home, account_id, sync_buf):
-            saves.append((sync_buf, threading.get_ident()))
+        def _write(path, payload, *, chmod=0):
+            # The durable write itself (mkstemp + fsync + rename) is what must stay
+            # off the loop; _save_sync_buf dispatches it onto the FIFO weixin lane.
+            saves.append((payload["get_updates_buf"], threading.get_ident()))
 
         monkeypatch.setattr(weixin, "_get_updates", _get_updates)
         monkeypatch.setattr(weixin, "_load_sync_buf", lambda *a: "buf-0")
-        monkeypatch.setattr(weixin, "_save_sync_buf", _save)
+        monkeypatch.setattr(weixin, "_atomic_json_write_now", _write)
 
         async def scenario():
             await adapter._poll_loop()
+            assert await asyncio.to_thread(weixin.fence_weixin_write_lane, 10.0)
             return threading.get_ident()
 
         return saves, asyncio.run(scenario())
 
-    def test_cursor_write_runs_off_the_loop_thread(self, monkeypatch):
-        saves, loop_thread = self._run_polls(monkeypatch, ["buf-1"])
+    def test_cursor_write_runs_off_the_loop_thread(self, monkeypatch, tmp_path):
+        saves, loop_thread = self._run_polls(monkeypatch, tmp_path, ["buf-1"])
         assert [buf for buf, _ in saves] == ["buf-1"]
         assert all(thread != loop_thread for _, thread in saves)
 
-    def test_unchanged_cursor_is_not_rewritten(self, monkeypatch):
+    def test_unchanged_cursor_is_not_rewritten(self, monkeypatch, tmp_path):
         # Empty long-polls (and the timeout sentinel) echo the current buffer back.
-        saves, _ = self._run_polls(monkeypatch, ["buf-0", "buf-1", "buf-1", "buf-2"])
+        saves, _ = self._run_polls(monkeypatch, tmp_path, ["buf-0", "buf-1", "buf-1", "buf-2"])
         assert [buf for buf, _ in saves] == ["buf-1", "buf-2"]
 
 
