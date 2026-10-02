@@ -1583,9 +1583,18 @@ class TestForceReloadSymmetry:
         mgr._hook_timeout_suppression_seconds = 0.2
         mgr._hooks["pre_tool_call"] = [guard]
 
-        blocked = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-a") == blocked
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-b") == blocked  # in window
+        # Fork #819: the refusal is rendered per event (callback name, elapsed/budget for the
+        # timing-out call, remaining window for a suppressed one), so match its shape.
+        timeout_prefix = _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE.split("{callback}")[0]
+
+        def _is_block(result, marker):
+            return (len(result) == 1 and result[0]["action"] == "block"
+                    and result[0]["message"].startswith(timeout_prefix) and marker in result[0]["message"])
+
+        assert _is_block(mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-a"),
+                         "timed out after")
+        assert _is_block(mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-b"),
+                         "suppressed after an earlier timeout")  # in window
         time.sleep(0.3)  # suppression window passes; the first worker is still hung
         assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-c") == []
         assert len(starts) == 2
@@ -2044,9 +2053,10 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [policy]
 
-        assert mgr.invoke_hook("pre_tool_call") == [
-            {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
-        ]
+        # Fork #819: a worker that cannot start fails closed with a named "skipped" refusal.
+        [refusal] = mgr.invoke_hook("pre_tool_call")
+        assert refusal["action"] == "block"
+        assert "worker failed to start" in refusal["message"]
         assert mgr.invoke_hook("pre_tool_call") == []
         assert calls == [1]
 

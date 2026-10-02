@@ -21,7 +21,7 @@ turn N with the first request of turn N+1 using the blackbox comparator.
 
 import copy
 
-from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
+from agent.prompt_builder import STEER_MARKER_OPEN
 from agent.tool_dispatch_helpers import make_tool_result_message
 from plugins.blackbox.prefix_guard import compare, fingerprint_request
 from tests.agent.test_tool_call_incremental_persistence import (
@@ -113,15 +113,19 @@ def test_tool_turn_reload_replays_tool_rows_byte_identical(tmp_path):
 def test_steered_turn_reload_keeps_steer_and_prefix(tmp_path):
     sent_n, sent_n1, history = _two_turns(tmp_path, steer=STEER)
 
-    # The steer reached the model in turn N ...
-    tool_sent = [m for m in sent_n[-1]["messages"] if m.get("role") == "tool"]
-    assert tool_sent and tool_sent[-1]["content"].endswith(format_steer_marker(STEER))
-    # ... is durable user intent in the reloaded history: the clean tool
-    # output stays in ``content`` (append-only) and the sent bytes ride the
-    # api_content sidecar that replay substitutes ...
+    # The steer reached the model in turn N as a standalone user row right
+    # after the tool result (upstream #110979 delivery; the tool row is never
+    # rewritten) ...
+    msgs = sent_n[-1]["messages"]
+    tool_idx = max(i for i, m in enumerate(msgs) if m.get("role") == "tool")
+    assert msgs[tool_idx]["content"] == '{"output": "ok"}'
+    steer_row = msgs[tool_idx + 1]
+    assert steer_row["role"] == "user"
+    assert STEER_MARKER_OPEN in steer_row["content"] and STEER in steer_row["content"]
+    # ... is durable user intent in the reloaded history: the tool row is the
+    # clean output and the steer is its own persisted user row ...
     tool_rows = [m for m in history if m.get("role") == "tool"]
     assert tool_rows[-1]["content"] == '{"output": "ok"}'
-    assert tool_rows[-1]["api_content"] == tool_sent[-1]["content"]
-    assert STEER_MARKER_OPEN in tool_rows[-1]["api_content"]
+    assert any(m.get("role") == "user" and STEER in str(m.get("content")) for m in history)
     # ... and turn N+1 starts on the same cached prefix.
     assert _turn_boundary_violations(sent_n[-1], sent_n1[0]) == []
