@@ -247,13 +247,19 @@ def test_get_session_stats_offloads_sessiondb_read(monkeypatch):
     # fork parity NOTE (2026-08-07): the merge adopted upstream's
     # _open_session_db_for_profile(profile, *, read_only) -- read_only is
     # keyword-only REQUIRED, so the double must accept it.
+    # parity 2026-10-01: upstream moved the helper into hermes_cli.web_server_sessions
+    # (web_routers/sessions.py reads it from there through a late() proxy).
+    from hermes_cli import web_server_sessions
+
     monkeypatch.setattr(
-        web_server,
+        web_server_sessions,
         "_open_session_db_for_profile",
         lambda _profile=None, **_kw: _DB(),
     )
 
-    result = asyncio.run(web_server.get_session_stats())
+    from hermes_cli.web_routers.sessions import get_session_stats
+
+    result = asyncio.run(get_session_stats())
 
     assert result == {
         "total": 5,
