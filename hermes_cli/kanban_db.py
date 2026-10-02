@@ -3321,6 +3321,42 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+class KanbanNonCanonicalBoardPathError(RuntimeError):
+    """Raised when :func:`connect` is handed ``<...>/kanban/boards/default/kanban.db``.
+
+    The ``default`` board's DB is ``<root>/kanban.db``; ``boards/default/`` is
+    never a board. ``connect()`` creates and initializes whatever it is given,
+    so a guessed path there minted a full-schema, zero-card phantom board
+    (2026-10-02 09:02:00, a cron agent's ``kb.connect(<root>/kanban/boards/
+    default/kanban.db)`` one-liner; card t_1462ab0d). Earlier shapes left a
+    0-byte file (2026-09-18, 09-27, 09-29). Refusing before the mkdir means the
+    wrong guess costs one traceback instead of a phantom that enumerators trip on.
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        super().__init__(
+            f"{db_path} is not a kanban board path: the default board lives at "
+            f"<root>/kanban.db (kanban_db_path('default')). Refusing to create "
+            f"or open a phantom board here."
+        )
+
+
+def _refuse_noncanonical_board_path(path: Path) -> None:
+    """Raise :class:`KanbanNonCanonicalBoardPathError` for ``kanban/boards/default/kanban.db``.
+
+    Structural (path shape only), so it holds under any root, pin or sandbox.
+    """
+    p = Path(path)
+    if (
+        p.name == "kanban.db"
+        and p.parent.name == DEFAULT_BOARD
+        and p.parent.parent.name == "boards"
+        and p.parent.parent.parent.name == "kanban"
+    ):
+        raise KanbanNonCanonicalBoardPathError(p)
+
+
 class KanbanDbNotABoardError(RuntimeError):
     """Raised when a path opens as SQLite but holds no kanban board.
 
@@ -4212,6 +4248,7 @@ def connect(
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
     _assert_live_board_write_allowed(path)
+    _refuse_noncanonical_board_path(path)  # before the mkdir (t_1462ab0d)
     if _is_delegated_child():
         return _connect_delegated_child(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4402,6 +4439,7 @@ def init_db(
             pass
         return path
     _assert_live_board_write_allowed(path)  # before the mkdir, not after
+    _refuse_noncanonical_board_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
