@@ -46,11 +46,15 @@ def _wire(user_config):
         _runner=types.SimpleNamespace(
             _service_tier=None,
             _consume_pending_turn_sidecar_notes=lambda key: [],
+            # Fork fallback spec §4.2 / G2: a fresh (not cached) agent gets its re-init announce.
+            _announce_reinit_recovery=lambda **kw: None,
         ),
         _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
         _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
         _clarify_callback_sync=lambda *a, **k: None,
         _notice_callback_sync=lambda *a, **k: None,
+        # Fork (t_b2e9bb23): wiring redelivers a route-change line a previous send dropped.
+        _flush_route_notice_outbox=lambda: 0,
         _attach_session_title_callback=lambda agent, ctx: None,
     )
     TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)

@@ -2164,6 +2164,11 @@ def _bridge_config_to_env(_cfg: dict) -> None:
     # (e.g. HERMES_MAX_ITERATIONS=60 written by an old `hermes setup` run) silently shadow the user's
     # current config. See PR #18413 / the 60-vs-500 max_turns incident.
     _agent_cfg = _cfg.get("agent", {})
+    # Fork restart/resume knobs (restart_policy._AGENT_CONFIG_ENV_BRIDGE: resume_flag_stale_clear,
+    # resume_interrupted_turns, restart_loop_*, auto_resume_max_attempts, ...) bridge through the
+    # same config-wins rule; the funnel's str(None) max_turns is corrected by _bridge_max_turns_to_env.
+    from gateway.fork_ext.restart_policy import _bridge_agent_config_to_env
+    _bridge_agent_config_to_env(_agent_cfg)
     _bridge_max_turns_to_env(_agent_cfg)
     _bridge_section_to_env(_agent_cfg, _AGENT_ENV_BRIDGE)
     _bridge_section_to_env(_cfg.get("sessions", {}), _SESSIONS_ENV_BRIDGE)
@@ -8166,6 +8171,9 @@ class GatewayRunner(
                 str(source.user_id_alt) if source.user_id_alt else ""
             ),
             scope_id=str(source.scope_id) if source.scope_id else "",
+            # Upstream a247012dc11: the forum/thread parent is a route anchor Kanban callbacks
+            # need after the source is gone; bind it beside scope_id so a stale env never wins.
+            parent_chat_id=str(getattr(source, "parent_chat_id", "") or ""),
             user_name=str(source.user_name) if source.user_name else "",
             session_key=session_key or "",
             session_id=session_id or "",

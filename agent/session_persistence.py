@@ -220,6 +220,66 @@ def _db_flush_fork_state(agent) -> Tuple[Dict[int, int], Dict[int, Any], set]:
     return flushed_row_ids, content_refs, repersisted_ids
 
 
+# Fork flush helpers live beside the flush (upstream moved it here); a lazy `from run_agent import`
+# fails closed whenever run_agent is swapped in sys.modules, and the row is silently never written.
+# Fields the fork stamps onto an ALREADY-FLUSHED message dict in place. The
+# incremental flush's bounded prefix scan matches on object identity, which
+# proves "same object" but NOT "same content" — so a message carrying one of
+# these must never be skipped as part of the matched prefix, or the in-place
+# stamp is silently lost on re-flush (an interrupted turn then reads back as a
+# clean one). Keep this list in sync with any new in-place mutation site.
+_MUTABLE_FLUSH_STATE_FIELDS = ("finish_reason",)
+
+
+def _has_mutable_flush_state(msg: Any) -> bool:
+    """True when *msg* carries a field the fork may have stamped in place."""
+    return isinstance(msg, dict) and any(
+        msg.get(field) is not None for field in _MUTABLE_FLUSH_STATE_FIELDS
+    )
+
+
+def _persisted_content_projection(msg: Dict[str, Any], content: Any) -> Any:
+    """The ``content`` value the flush writes for *msg* (image-free text).
+
+    Shared by the first write and the in-place content re-persist so both
+    store the same projection of a multimodal list.
+    """
+    from agent.message_sanitization import _multimodal_message_text_projection
+
+    _multimodal_projection = _multimodal_message_text_projection(
+        {**msg, "content": content}
+    )
+    if _multimodal_projection is not None:
+        return _multimodal_projection
+    if isinstance(content, list):
+        # List of OpenAI-style content parts: strip images, keep text.
+        _txt = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                _txt.append(str(p.get("text", "")))
+            elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
+                _txt.append("[screenshot]")
+        return "\n".join(_txt) if _txt else None
+    return content
+
+
+def _tool_content_mutated_since_flush(msg: Any, content_refs: Dict[int, Any]) -> bool:
+    """True when a flushed ``role:"tool"`` row's live content was replaced.
+
+    The flush is append-only, but a mid-turn /steer and the run-budget notice
+    append text to the current turn's newest tool result AFTER the sequential
+    executor already flushed it. ``content_refs`` maps the row id to the exact
+    content object that was written; content is replaced (never edited in
+    place), so an identity check is O(1) and catches every such writer.
+    """
+    if not isinstance(msg, dict) or msg.get("role") != "tool":
+        return False
+    row_id = msg.get("_db_persisted_row_id")
+    if not isinstance(row_id, int) or row_id not in content_refs:
+        return False
+    return content_refs[row_id] is not msg.get("content")
+
+
 def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
     """Skip the identity-matched, still-marked prefix of the previous flush's snapshot.
 
@@ -228,7 +288,6 @@ def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
     /steer appends to the newest tool result). Stop the prefix skip at the first message carrying a
     mutation-sensitive field so those rows are always re-examined (parity merge 2026-08-08).
     """
-    from run_agent import _has_mutable_flush_state, _tool_content_mutated_since_flush
     _, content_refs, _ = _db_flush_fork_state(agent)
     scan_start = 0
     for prev, cur in zip(getattr(agent, "_db_flush_scan_prefix", None) or (), messages):
@@ -251,7 +310,6 @@ def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, in
       after the per-result flush): stamp the sent bytes as the row's ``api_content`` sidecar so replay
       sends what was sent and keeps the steer (t_a17e2305).
     """
-    from run_agent import _persisted_content_projection, _tool_content_mutated_since_flush
     msg_id = id(msg)
     if _tool_content_mutated_since_flush(msg, content_refs):
         row_id = msg["_db_persisted_row_id"]

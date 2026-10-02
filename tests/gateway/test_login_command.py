@@ -334,7 +334,9 @@ def _durable_sweep_runner(monkeypatch, tmp_path):
     runner = _runner(monkeypatch)
     store = SessionStore(sessions_dir=tmp_path, config=runner.config)
     key = store.get_or_create_session(_source()).session_key
-    override = {"model": anon_auth.GUEST_MODEL}
+    # Fork contract: a persisted route identity carries its provider, or the fail-closed precheck
+    # (lookup_persisted_route_identity -> "unavailable") refuses to rehydrate it.
+    override = {"model": anon_auth.GUEST_MODEL, "provider": "nous"}
     store.set_model_override(key, override)
     runner.session_store = store
     runner._async_session_store = AsyncSessionStore(store)
@@ -396,6 +398,11 @@ async def test_durable_clear_fails_twice_keeps_override_and_warns(monkeypatch, t
     reloaded = SessionStore(sessions_dir=tmp_path, config=runner.config)
     rebuilt = _runner(monkeypatch)
     rebuilt.session_store = reloaded
+    # Fork P3b/RC-3: rehydration re-resolves the persisted identity's credentials from provider
+    # config and fails closed when none resolve (a sandboxed home has no nous credential). The
+    # contract pinned here is that the un-cleared preference survives the restart, not credential
+    # resolution — resolve the identity as-is.
+    rebuilt._reresolve_model_override_credentials = lambda identity: dict(identity)
     for session_key in (key, second_key):
         assert runner._session_model_overrides[session_key] == override
         assert reloaded.get_model_override(session_key) == override

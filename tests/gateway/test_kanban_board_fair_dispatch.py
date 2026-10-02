@@ -16,6 +16,9 @@ import pytest
 
 from gateway import kanban_watchers as watchers
 from hermes_cli import config, kanban_db as kb
+# Upstream split the dispatcher surface out of kanban_db: the gateway reads dispatch_once /
+# has_spawnable_ready / reap_worker_zombies / resolve_max_in_progress from kanban_db_dispatch.
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_load_gate as klg
 
 from tests.gateway.test_kanban_dispatcher_standby import Clock, cancel, runner
@@ -33,7 +36,7 @@ def boards(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     cfg = {"kanban": {"dispatch_interval_seconds": 2, "auto_decompose": False}}
     monkeypatch.setattr(config, "load_config", lambda: cfg)
-    monkeypatch.setattr(kb, "resolve_max_in_progress", lambda value: value)
+    monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda value: value)
     kb.init_db()
 
     # "default" first in board order, exactly like the incident.
@@ -51,8 +54,8 @@ def boards(tmp_path, monkeypatch):
         kb, "count_spawnable_demand",
         lambda conn, **kw: ready[conn.slug],
     )
-    monkeypatch.setattr(kb, "has_spawnable_ready", lambda conn: True)
-    monkeypatch.setattr(kb, "reap_worker_zombies", Mock(return_value=[]))
+    monkeypatch.setattr(kbd, "has_spawnable_ready", lambda conn: True)
+    monkeypatch.setattr(kbd, "reap_worker_zombies", Mock(return_value=[]))
 
     def fake_dispatch(conn, *, board=None, spawn_paused=None, spawn_limit=None, **kw):
         res = kb.DispatchResult()
@@ -62,7 +65,7 @@ def boards(tmp_path, monkeypatch):
         calls.append((board, spawn_limit, spawn_paused, n))
         return res
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch)
     # Host has room for exactly 4 new workers every tick.
     monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self, **kw: (4, None))
     clock = Clock()
@@ -109,7 +112,7 @@ async def test_quota_a_board_cannot_use_passes_to_the_next_board(boards, monkeyp
     """Allowance 1; default gets the quota but its concurrency cap lets it
     spawn nothing. The unused quota must reach subs-ace this same tick."""
     monkeypatch.setattr(klg.LoadGate, "admit_now", lambda self, **kw: (1, None))
-    inner = kb.dispatch_once
+    inner = kbd.dispatch_once
 
     def capped(conn, *, board=None, spawn_paused=None, spawn_limit=None, **kw):
         if board == "default":
@@ -118,7 +121,7 @@ async def test_quota_a_board_cannot_use_passes_to_the_next_board(boards, monkeyp
         return inner(conn, board=board, spawn_paused=spawn_paused,
                      spawn_limit=spawn_limit, **kw)
 
-    monkeypatch.setattr(kb, "dispatch_once", capped)
+    monkeypatch.setattr(kbd, "dispatch_once", capped)
     b = runner()
     task = asyncio.create_task(b._kanban_dispatcher_watcher())
     try:
