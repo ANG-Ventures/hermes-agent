@@ -5246,6 +5246,9 @@ class GatewayRunner(
         base_url: Optional[str]
         api_key: Optional[str]
         data: Any
+        # Fork: ``compression.hygiene_failure_alert_after`` — escalate to the loud repeated-failure
+        # alert on the Nth consecutive hygiene failure (0 = never). See agent/hygiene_timeout.py.
+        failure_alert_after: int = 3
 
     @dataclasses.dataclass
     class _HygieneAttempt:
