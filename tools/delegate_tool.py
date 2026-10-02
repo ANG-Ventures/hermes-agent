@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (  # noqa: F401
-    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
+    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _child_last_event_age,
+    _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (  # noqa: F401
@@ -2782,6 +2783,9 @@ def _run_single_child(
                     else "after_llm_calls" if is_timeout
                     else None
                 ),
+                # upstream #116001: seconds since the child's activity clock last ticked, so an
+                # operator can tell a slow-but-live provider from a runaway without forensics.
+                "last_event_age": _child_last_event_age(child) if is_timeout else None,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -4309,14 +4313,19 @@ def delegate_task(
         # SYNCHRONOUS execution so the result returns in this same turn instead
         # of handing out a handle with no durable consumer. Mirrors the
         # pool-at-capacity inline fallback below.
+        # Finite chat (-Q/--oneshot/non-TTY stdio, HERMES_SINGLE_QUERY_SESSION=1) owns no later turn to
+        # consume a detached result; its lifecycle marker forces the inline join even when a
+        # wake-capable session id is bound (upstream 49ef015ca3).
+        _finite = False
         try:
-            from gateway.session_context import async_delivery_supported
-            _async_ok = async_delivery_supported()
+            from gateway.session_context import async_delivery_supported, get_session_env
+            _finite = get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"
+            _async_ok = (not _finite) and async_delivery_supported()
         except Exception:
             _async_ok = True
 
         _wake_sid = ""
-        if not _async_ok:
+        if not _async_ok and not _finite:
             # The adapter itself cannot push, but if a raw session id is
             # bound (the API server always binds one — see
             # ApiServerAdapter._bind_api_server_session), gateway.wake can
@@ -4348,7 +4357,7 @@ def delegate_task(
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
                     "receive a detached subagent result after the turn ends (a "
-                    "one-shot runner such as `hermes -z`, a cron job, a Kanban "
+                    "finite chat using -Q, --oneshot, or non-TTY stdio, `hermes -z`, a cron job, a Kanban "
                     "worker, or a stateless HTTP endpoint). The subagent(s) ran "
                     "SYNCHRONOUSLY and the result is included above."
                 )

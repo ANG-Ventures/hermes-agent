@@ -258,17 +258,35 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
         if not _owns_subagent_record(r, parent_agent):
             continue
         started = r.get("started_at")
+        agent = r.get("agent")
+        # fork: spawn depth (1 = direct child) so a lead sees a tree.
+        _spawn_depth = getattr(agent, "_delegate_depth", None)
+        if not isinstance(_spawn_depth, int) or isinstance(_spawn_depth, bool):
+            _rd = r.get("depth")
+            _spawn_depth = _rd + 1 if isinstance(_rd, int) else None
         entries.append({
             "subagent_id": r.get("subagent_id"),
             "parent_id": r.get("parent_id"),
+            "depth": _spawn_depth,
             "goal": r.get("goal"),
             "model": r.get("model"),
             "status": r.get("status"),
             "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
             "accepting_steer": bool(r.get("accepting_steer", False)),
-            "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
+            "live_transcript": getattr(agent, "_live_transcript_path", None),
         })
     payload: Dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
+    # fork (#1542): durable results of children that finished after a timed_out_running
+    # wait (the parent steer is only a nudge). Late-import: the late-result store lives
+    # in the facade.
+    try:
+        from tools.delegate_tool import _owned_late_results
+        _late = _owned_late_results(parent_agent)
+    except Exception:
+        logger.debug("late result listing failed", exc_info=True)
+        _late = []
+    if _late:
+        payload["late_results"] = _late
     if not entries:
         payload["note"] = (
             "No live subagents right now. Children that already finished "

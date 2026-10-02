@@ -25,7 +25,6 @@ from tools.delegate_tool import (
     _build_child_progress_callback,
     _build_child_system_prompt,
     _get_max_concurrent_children,
-    _inherit_parent_base_url,
     _load_config,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -2306,16 +2305,19 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], parent.base_url)
 
     def test_inherit_parent_base_url_prefers_client_kwargs(self):
+        # Parity sync 2026-10-01: upstream folded _inherit_parent_base_url into
+        # delegate_tool_config._inherit_parent_endpoint (returns the live
+        # (base_url, api_key) pair); the stale-attribute property is the same.
+        from tools.delegate_tool_config import _inherit_parent_endpoint
+
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://openrouter.ai/api/v1"
         parent._client_kwargs = {
             "api_key": "no-key-required",
             "base_url": "http://localhost:11434/v1",
         }
-        self.assertEqual(
-            _inherit_parent_base_url(parent, parent.base_url),
-            "http://localhost:11434/v1",
-        )
+        base_url, _api_key = _inherit_parent_endpoint(parent, parent.base_url, "stale-key")
+        self.assertEqual(base_url, "http://localhost:11434/v1")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

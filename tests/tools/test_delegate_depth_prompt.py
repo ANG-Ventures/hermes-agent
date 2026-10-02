@@ -61,7 +61,11 @@ def test_dispatched_child_prompt_matches_depth_capability(
     kwargs = agent_class.call_args.kwargs
     prompt = kwargs["ephemeral_system_prompt"]
     depth = parent_depth + 1
-    can_delegate = enabled and depth < max_depth
+    # Fork contract (#1541, parity 2026-10-01): orchestrator is explicit opt-in via
+    # role='orchestrator'; depth and orchestrator_enabled are only the ceiling and
+    # the kill switch. Upstream derived the role from depth alone, which fanned out
+    # every role-less child below the ceiling.
+    can_delegate = enabled and depth < max_depth and legacy_role == "orchestrator"
     assert child._delegate_depth == depth
     assert child._delegate_role == ("orchestrator" if can_delegate else "leaf")
     assert ("delegation" in kwargs["enabled_toolsets"]) == can_delegate
