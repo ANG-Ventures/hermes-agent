@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "新しい会話を開始します"
+        arg_name: "Optional title for the new session"
         followup: "新しい会話を開始しました~"
       reset:
         description: "Hermes セッションをリセットします"
+        arg_name: "Optional title for the new session"
         followup: "セッションをリセットしました~"
       model:
         description: "モデルを表示または変更します"
@@ -1155,6 +1157,7 @@ platform:
         followup: "再試行しています~"
       undo:
         description: "最後のやり取りを削除します"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Hermes セッションの状態を表示します"
         followup: "状態を送信しました~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "計画する内容。空欄で会話から推測します。"
       compress:
         description: "会話のコンテキストを圧縮します"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "セッションのタイトルを設定または表示します"
         arg_name: "セッションのタイトル。空欄で現在のタイトルを表示します。"
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "再開するセッション名。空欄でセッション一覧を表示します。"
       usage:
         description: "このセッションのトークン使用量を表示します"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "利用可能なコマンドを表示します"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "分析する日数 (デフォルト: 7)"
       reload_skills:

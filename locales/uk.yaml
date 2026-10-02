@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Почати нову розмову"
+        arg_name: "Optional title for the new session"
         followup: "Нову розмову почато~"
       reset:
         description: "Скинути ваш сеанс Hermes"
+        arg_name: "Optional title for the new session"
         followup: "Сеанс скинуто~"
       model:
         description: "Показати або змінити модель"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Повторюємо~"
       undo:
         description: "Видалити останній обмін"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Показати стан сеансу Hermes"
         followup: "Стан надіслано~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Що планувати. Залиште порожнім, щоб визначити з розмови."
       compress:
         description: "Стиснути контекст розмови"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Встановити або показати назву сеансу"
         arg_name: "Назва сеансу. Залиште порожнім, щоб показати поточну."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Назва сеансу для відновлення. Залиште порожнім, щоб показати список сеансів."
       usage:
         description: "Показати використання токенів у цьому сеансі"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Показати доступні команди"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Кількість днів для аналізу (за замовчуванням: 7)"
       reload_skills:

@@ -1182,9 +1182,11 @@ platform:
     command:
       new:
         description: "Start a new conversation"
+        arg_name: "Optional title for the new session"
         followup: "New conversation started~"
       reset:
         description: "Reset your Hermes session"
+        arg_name: "Optional title for the new session"
         followup: "Session reset~"
       model:
         description: "Show or change the model"
@@ -1205,6 +1207,7 @@ platform:
         followup: "Retrying~"
       undo:
         description: "Remove the last exchange"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Show Hermes session status"
         followup: "Status sent~"
@@ -1219,6 +1222,7 @@ platform:
         arg_task: "What to plan. Leave empty to infer from the conversation."
       compress:
         description: "Compress conversation context"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Set or show the session title"
         arg_name: "Session title. Leave empty to show current."
@@ -1226,8 +1230,10 @@ platform:
         arg_name: "Session name to resume. Leave empty to list sessions."
       usage:
         description: "Show token usage for this session"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Show available commands"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Number of days to analyze (default: 7)"
       reload_skills:

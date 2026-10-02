@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Yeni bir konuşma başlat"
+        arg_name: "Optional title for the new session"
         followup: "Yeni konuşma başlatıldı~"
       reset:
         description: "Hermes oturumunuzu sıfırla"
+        arg_name: "Optional title for the new session"
         followup: "Oturum sıfırlandı~"
       model:
         description: "Modeli göster veya değiştir"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Yeniden deneniyor~"
       undo:
         description: "Son alışverişi kaldır"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Hermes oturum durumunu göster"
         followup: "Durum gönderildi~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Ne planlanacağı. Konuşmadan çıkarılması için boş bırakın."
       compress:
         description: "Konuşma bağlamını sıkıştır"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Oturum başlığını ayarla veya göster"
         arg_name: "Oturum başlığı. Geçerli başlığı görmek için boş bırakın."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Devam edilecek oturum adı. Oturumları listelemek için boş bırakın."
       usage:
         description: "Bu oturumun token kullanımını göster"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Kullanılabilir komutları göster"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Analiz edilecek gün sayısı (varsayılan: 7)"
       reload_skills:

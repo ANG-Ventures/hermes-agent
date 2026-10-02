@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "Avvia una nuova conversazione"
+        arg_name: "Optional title for the new session"
         followup: "Nuova conversazione avviata~"
       reset:
         description: "Reimposta la tua sessione Hermes"
+        arg_name: "Optional title for the new session"
         followup: "Sessione reimpostata~"
       model:
         description: "Mostra o cambia il modello"
@@ -1155,6 +1157,7 @@ platform:
         followup: "Riprovo~"
       undo:
         description: "Rimuovi l'ultimo scambio"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "Mostra lo stato della sessione Hermes"
         followup: "Stato inviato~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "Cosa pianificare. Lascia vuoto per dedurlo dalla conversazione."
       compress:
         description: "Comprimi il contesto della conversazione"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "Imposta o mostra il titolo della sessione"
         arg_name: "Titolo della sessione. Lascia vuoto per mostrare quello attuale."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "Nome della sessione da riprendere. Lascia vuoto per elencare le sessioni."
       usage:
         description: "Mostra l'utilizzo di token per questa sessione"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "Mostra i comandi disponibili"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "Numero di giorni da analizzare (predefinito: 7)"
       reload_skills:

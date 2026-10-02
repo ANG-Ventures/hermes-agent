@@ -1132,9 +1132,11 @@ platform:
     command:
       new:
         description: "بدء محادثة جديدة"
+        arg_name: "Optional title for the new session"
         followup: "بدأت محادثة جديدة~"
       reset:
         description: "إعادة تعيين جلسة Hermes الخاصة بك"
+        arg_name: "Optional title for the new session"
         followup: "تمت إعادة تعيين الجلسة~"
       model:
         description: "عرض النموذج أو تغييره"
@@ -1155,6 +1157,7 @@ platform:
         followup: "جارٍ إعادة المحاولة~"
       undo:
         description: "إزالة آخر تبادل"
+        arg_count: "Half-turns to undo (default 1)"
       status:
         description: "عرض حالة جلسة Hermes"
         followup: "أُرسلت الحالة~"
@@ -1169,6 +1172,7 @@ platform:
         arg_task: "ما المطلوب التخطيط له. اتركه فارغًا للاستنتاج من المحادثة."
       compress:
         description: "ضغط سياق المحادثة"
+        arg_args: "Optional: here [N] | focus topic | --preview | --dry-run"
       title:
         description: "تعيين عنوان الجلسة أو عرضه"
         arg_name: "عنوان الجلسة. اتركه فارغًا لعرض الحالي."
@@ -1176,8 +1180,10 @@ platform:
         arg_name: "اسم الجلسة المراد استئنافها. اتركه فارغًا لعرض الجلسات."
       usage:
         description: "عرض استخدام الرموز لهذه الجلسة"
+        arg_args: "Optional: reset [--force]"
       help:
         description: "عرض الأوامر المتاحة"
+        arg_filter: "Optional: skills, or a filter term"
       insights:
         arg_days: "عدد الأيام المراد تحليلها (افتراضي: 7)"
       reload_skills:

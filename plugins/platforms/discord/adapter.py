@@ -198,13 +198,12 @@ _REQUIRED = object()
 _NATIVE_SLASH_COMMAND_SPECS: tuple = (
     # Fork: /new, /reset, /undo, /compress, /usage, /help carry the options their gateway handlers
     # parse (a native registration shadows the COMMAND_REGISTRY auto-registration, which would add
-    # an ``args`` field, so a missing option silently drops the user's argument). Literal
-    # descriptions resolve through ``t()`` as bare keys until the catalog carries them.
+    # an ``args`` field, so a missing option silently drops the user's argument).
     ("new", "platform.discord.command.new.description",
-     (("name", str, "", "Optional title for the new session", None),),
+     (("name", str, "", "platform.discord.command.new.arg_name", None),),
      "/reset {name}", "platform.discord.command.new.followup"),
     ("reset", "platform.discord.command.reset.description",
-     (("name", str, "", "Optional title for the new session", None),),
+     (("name", str, "", "platform.discord.command.reset.arg_name", None),),
      "/reset {name}", "platform.discord.command.reset.followup"),
     ("model", "platform.discord.command.model.description",
      (("name", str, "", "platform.discord.command.model.arg_name", None),),
@@ -224,7 +223,7 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
     ("retry", "platform.discord.command.retry.description", (), "/retry", "platform.discord.command.retry.followup"),
     ("undo", "platform.discord.command.undo.description",
      # A (type, lo, hi) tuple becomes ``discord.app_commands.Range`` in ``_slash_proxy``.
-     (("count", (int, 1, 50), 1, "Half-turns to undo (default 1)", None),),
+     (("count", (int, 1, 50), 1, "platform.discord.command.undo.arg_count", None),),
      "/undo {count}", None),
     ("status", "platform.discord.command.status.description", (), "/status", "platform.discord.command.status.followup"),
     ("sethome", "slash.sethome.description", (), "/sethome", None),
@@ -236,7 +235,7 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
      (("task", str, "", "platform.discord.command.plan.arg_task", None),),
      "/plan {task}", None),
     ("compress", "platform.discord.command.compress.description",
-     (("args", str, "", "Optional: here [N] | focus topic | --preview | --dry-run", None),),
+     (("args", str, "", "platform.discord.command.compress.arg_args", None),),
      "/compress {args}", None),
     ("title", "platform.discord.command.title.description",
      (("name", str, "", "platform.discord.command.title.arg_name", None),),
@@ -245,10 +244,10 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
      (("name", str, "", "platform.discord.command.resume.arg_name", None),),
      "/resume {name}", None),
     ("usage", "platform.discord.command.usage.description",
-     (("args", str, "", "Optional: reset [--force]", None),),
+     (("args", str, "", "platform.discord.command.usage.arg_args", None),),
      "/usage {args}", None),
     ("help", "platform.discord.command.help.description",
-     (("filter", str, "", "Optional: skills, or a filter term", None),),
+     (("filter", str, "", "platform.discord.command.help.arg_filter", None),),
      "/help {filter}", None),
     ("insights", "slash.insights.description",
      (("days", int, 7, "platform.discord.command.insights.arg_days", None),),
