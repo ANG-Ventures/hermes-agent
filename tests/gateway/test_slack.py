@@ -592,6 +592,10 @@ class TestSlackConnectCleanup:
 
         with patch("gateway.status.release_scoped_lock") as mock_release:
             await adapter.disconnect()
+            # Teardown queues the unlink on the ordered status lane (t_1fd05a3a).
+            from gateway.status import drain_runtime_status_lane
+
+            drain_runtime_status_lane()
 
         handler.close_async.assert_awaited_once_with()
         primary_client.close.assert_awaited_once_with()
