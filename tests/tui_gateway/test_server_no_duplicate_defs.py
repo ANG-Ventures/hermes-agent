@@ -61,7 +61,7 @@ def test_session_compress_reaches_supervisor_with_the_120_second_budget(monkeypa
     controls = []
 
     class _Supervisor:
-        def control(self, sid, *, route_name, payload=None, wait=True, timeout=30.0):
+        def control(self, sid, *, route_name, payload=None, wait=True, timeout=30.0, on_late_ack=None):
             controls.append(
                 {"sid": sid, "route_name": route_name, "wait": wait, "timeout": timeout}
             )
@@ -261,20 +261,26 @@ def test_no_module_level_name_is_bound_twice_in_server():
 def test_no_rpc_route_is_registered_twice_in_server():
     """``_`` is bound ~138 times on purpose (the ``@method('route')`` idiom).
     What must be unique is the ROUTE STRING each one registers.
+
+    Upstream decomposed the handlers out of ``server.py`` into sibling
+    ``tui_gateway/methods_*.py`` modules that all register into the ONE dispatch
+    table, so the scan covers every module in the package: a route registered in
+    two siblings is the same last-registration-wins defect as two in one file.
     """
-    tree = ast.parse(SERVER_PATH.read_text())
-    routes: dict[tuple[str, str], list[int]] = {}
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for deco in node.decorator_list:
-            if not (isinstance(deco, ast.Call) and isinstance(deco.func, ast.Name)):
+    routes: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    for path in sorted(SERVER_PATH.parent.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if not deco.args:
-                continue
-            route = _string_constant(deco.args[0])
-            if route is not None:
-                routes.setdefault((deco.func.id, route), []).append(node.lineno)
+            for deco in node.decorator_list:
+                if not (isinstance(deco, ast.Call) and isinstance(deco.func, ast.Name)):
+                    continue
+                if not deco.args:
+                    continue
+                route = _string_constant(deco.args[0])
+                if route is not None:
+                    routes.setdefault((deco.func.id, route), []).append((path.name, node.lineno))
 
     assert routes, "found no decorator-registered routes — the scan is vacuous"
     duplicates = {key: lines for key, lines in routes.items() if len(lines) > 1}

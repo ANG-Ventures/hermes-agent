@@ -8,14 +8,14 @@ from unittest.mock import patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, SessionResetPolicy
+from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _clear_stale_resume_pending_flags
 from gateway.session import AsyncSessionStore, SessionEntry, SessionStore
 from hermes_cli.config import DEFAULT_CONFIG
 
 
 def _store(tmp_path) -> SessionStore:
-    config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
+    config = GatewayConfig()
     with patch("hermes_state.SessionDB", side_effect=RuntimeError("JSON-only test")):
         store = SessionStore(sessions_dir=tmp_path, config=config)
     store._loaded = True
@@ -52,7 +52,9 @@ def test_resume_flag_stale_clear_defaults_on() -> None:
 
 
 def test_hourly_watcher_invokes_stale_flag_maintenance() -> None:
-    source = textwrap.dedent(inspect.getsource(GatewayRunner._session_expiry_watcher))
+    # Upstream split the watcher: the hourly prune block (and this call) now lives in
+    # ``_session_housekeeping`` (gateway/run_watchers.py), run by ``_session_housekeeping_watcher``.
+    source = textwrap.dedent(inspect.getsource(GatewayRunner._session_housekeeping))
     tree = ast.parse(source)
     call_names = {
         node.func.id

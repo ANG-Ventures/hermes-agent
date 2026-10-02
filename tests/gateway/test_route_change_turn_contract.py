@@ -56,16 +56,19 @@ def make_agent(monkeypatch):
             "model": {"announce_route_change": True, "announce_recovery": True},
         },
     )
+    # The retry loop now lives in agent/turn_recovery.py and resolves its
+    # backoff helpers lazily from agent.retry_utils, so patch the source
+    # module (patching the conversation_loop facade no longer intercepts).
     monkeypatch.setattr(
-        "agent.conversation_loop.jittered_backoff", lambda *a, **kw: 0.0
+        "agent.retry_utils.jittered_backoff", lambda *a, **kw: 0.0
     )
     # Pool-capacity 503s wait via capacity_retry_wait, not jittered_backoff
     # (~6s real sleep per 503). Keep its give-up decision (None), zero the wait.
-    import agent.conversation_loop as _loop
+    import agent.retry_utils as _ru
 
-    _capacity_wait = _loop.capacity_retry_wait
+    _capacity_wait = _ru.capacity_retry_wait
     monkeypatch.setattr(
-        _loop,
+        _ru,
         "capacity_retry_wait",
         lambda **kw: None if _capacity_wait(**kw) is None else 0.0,
     )
