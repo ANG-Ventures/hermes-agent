@@ -461,6 +461,7 @@ def _fire_dispatch_tick_hook(
             result.crashed,
             result.stale,
             result.timed_out,
+            result.process_capped,
             result.auto_blocked,
             result.rate_limited,
             result.infra_unavailable,
@@ -18747,6 +18748,9 @@ class DispatchResult:
     DIFFERENT board could otherwise mask it and reset the stuck-streak."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
+    process_capped: list[str] = field(default_factory=list)
+    """Task ids whose live worker tree exceeded
+    ``kanban.worker_max_procs_per_run`` and was terminated + blocked."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
@@ -23732,6 +23736,14 @@ def _dispatch_once_locked(
     if _crash_cohort:
         result.cohort_deaths.extend(_crash_cohort)
     result.timed_out = enforce_max_runtime(conn)
+    if not dry_run:
+        # A live worker whose tree outgrew the per-run cap (t_368e9873): the
+        # reapers above only act once a worker is gone.
+        try:
+            from hermes_cli.kanban_proc_bounds import enforce_worker_process_cap
+            result.process_capped = enforce_worker_process_cap(conn)
+        except Exception as exc:  # never break a dispatcher tick
+            _log.warning("kanban process cap check failed: %s", exc)
     # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
     # gate is already satisfied becomes spawnable in the SAME tick rather
     # than waiting for the next one. Bounded + cached + fail-safe: see
@@ -26083,18 +26095,28 @@ def _default_spawn(
     # the seam the 2026-09-20 load-538 incident escaped through.
     cpu_priority_mode, cpu_nice = worker_cpu_priority_config()
     priority_preexec = _build_worker_priority_preexec(cpu_nice)
+    # Process-table ceiling for the whole worker tree (t_368e9873): a
+    # self-respawning scratch script held 9,6xx of the uid's 10,666 slots on
+    # 2026-10-01 and every fork on the host failed. RLIMIT_NPROC counts the
+    # uid, so the worker tree stops at a reserve the gateways still own.
+    from hermes_cli import kanban_proc_bounds as _kpb
+    nproc_limit = _kpb.resolve_worker_nproc_limit()
+    priority_preexec = _kpb.chain_preexec(
+        priority_preexec, _kpb.worker_nproc_preexec_limit(nproc_limit),
+    )
     # macOS: nice alone leaves the worker in the gateway's own QoS class and
     # I/O tier, so worker pytest/git storms still starve the resident gateway
     # (t_14c130aa). Clamp QoS via exec-form taskpolicy; it keeps the pid.
     darwin_prefix = worker_darwin_qos_prefix(cpu_priority_mode)
     spawn_cmd = [*darwin_prefix, *cmd]
     _log.info(
-        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s",
+        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s nproc=%s",
         task.id,
         profile_arg,
         cpu_priority_mode,
         cpu_nice,
         " ".join(darwin_prefix[1:]) or "-",
+        nproc_limit if nproc_limit is not None else "-",
     )
     spawned_at = time.time()
     try:
