@@ -22,7 +22,7 @@ def test_submit_then_sweep_roundtrip(tmp_path: Path) -> None:
     path = _submit(tmp_path, "agent:main:discord:thread:1:1")
     assert path.exists()
     got = rr.sweep_resume_requests(tmp_path)
-    assert got == [("agent:main:discord:thread:1:1", "restart_interrupted", None)]
+    assert got == [("agent:main:discord:thread:1:1", "restart_interrupted", None, "caller")]
     # Consumed: file gone, second sweep empty.
     assert not path.exists()
     assert rr.sweep_resume_requests(tmp_path) == []
@@ -43,6 +43,7 @@ def test_handoff_rides_the_dropbox(tmp_path: Path) -> None:
         "agent:main:discord:thread:9:9",
         "restart_interrupted",
         "was deploying PR #610; verify it's live",
+        "caller",
     )]
 
 
@@ -57,7 +58,7 @@ def test_legacy_payload_without_handoff_still_sweeps(tmp_path: Path) -> None:
         "requested_at": time.time(),
     }))
     got = rr.sweep_resume_requests(tmp_path)
-    assert got == [("agent:main:telegram:dm:1:1", "reboot_interrupted", None)]
+    assert got == [("agent:main:telegram:dm:1:1", "reboot_interrupted", None, "caller")]
 
 
 def test_sweep_missing_dir_fast_path(tmp_path: Path) -> None:
@@ -135,7 +136,7 @@ def test_boot_sweep_marks_and_gates_via_session_store(tmp_path: Path, monkeypatc
     # against a stub store (the full _schedule_resume_pending_sessions needs
     # a live runner; the sweep block's contract is what we lock here).
     store = _Store()
-    for key, reason, handoff in rr.sweep_resume_requests(run_mod._hermes_home):
+    for key, reason, handoff, _role in rr.sweep_resume_requests(run_mod._hermes_home):
         store.mark_resume_pending(
             key, reason, resume_kind="self", resume_handoff=handoff
         )

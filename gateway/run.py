@@ -1576,6 +1576,15 @@ def _clear_resume_summary_only_for_human_turn(
         logger.debug("resume-summary interlock clear failed", exc_info=True)
 
 
+# One-line notice for a SIBLING turn the restart cut mid-flight (Ace ruling
+# 2026-10-03 01:43, t_04247008): it resumes where it left off and is told a
+# restart happened. Rides the API-only resume note, never a new user turn.
+_SIBLING_RESTART_NOTICE = (
+    "A gateway restart happened while this turn was running: resume where you "
+    "left off and complete the work."
+)
+
+
 def _build_resume_pending_message(
     *,
     agent_history,
@@ -1623,6 +1632,7 @@ def _build_resume_pending_message(
         _tail = ""
     elif resume_mode == "auto" and not message:
         _resume_guidance = (
+            f"{_SIBLING_RESTART_NOTICE} "
             "Auto-continuation mode=auto is active: continue your interrupted "
             "work now. Do NOT re-execute tool calls that already returned "
             "results — continue forward from the last completed step. Treat "
@@ -17154,29 +17164,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 request_key,
                 request_reason,
                 request_handoff,
+                request_role,
             ) in _resume_requests.sweep_resume_requests(_hermes_home):
                 try:
-                    # A dropbox request is by contract a DELIBERATE external
-                    # ask (the safe-restart/reboot watchers submitting a
-                    # self-resume for the initiating session) — never a
-                    # pre-drain hedge. Stamp kind=self so downstream gates
-                    # (the boot-resume finished-work check's SELF exemption,
-                    # auto-mode selection) can tell it apart from hedge
-                    # marks. Without this the mark carried kind=None, the
-                    # exemption never fired, and every by-the-book
-                    # safe-restart self-resume was skipped as
-                    # no_unfinished_work (2026-08-18).
+                    # role=caller (the session that invoked the restart, and
+                    # every legacy payload): stamp kind=self. The finished-work
+                    # gate exempts SELF, so the caller ALWAYS gets a new turn
+                    # driven by its handoff, mid-turn or already finished (Ace
+                    # 2026-10-03 01:43; the 2026-08-18 no_unfinished_work skip
+                    # was this gate firing on kind=None).
+                    # role=sibling: kind=sibling. It stays subject to the
+                    # finished-work gate, so an idle sibling gets nothing.
+                    _kind = (
+                        "self"
+                        if request_role == _resume_requests.ROLE_CALLER
+                        else "sibling"
+                    )
                     if self.session_store.mark_resume_pending(
                         request_key,
                         request_reason,
-                        resume_kind="self",
+                        resume_kind=_kind,
                         resume_handoff=request_handoff,
                     ):
                         logger.warning(
-                            "PHASE=dropbox_resume key=%s reason=%s kind=self "
-                            "handoff=%s (external resume request honored)",
+                            "PHASE=dropbox_resume key=%s reason=%s kind=%s "
+                            "role=%s handoff=%s (external resume request honored)",
                             request_key,
                             request_reason,
+                            _kind,
+                            request_role,
                             "yes" if request_handoff else "no",
                         )
                     else:
