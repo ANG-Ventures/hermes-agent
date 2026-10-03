@@ -64,11 +64,15 @@ jobs:
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
           HERMES_TEST_WORKERS: '6'
           HERMES_TEST_FILE_TIMEOUT: '2400'
-          # Six journeys each run install.ps1 (a cold PM toolchain + venv) on a
-          # 4-vCPU hosted runner, silent for minutes: the 240 s idle hang
-          # detector (scripts/run_tests_parallel.py --idle-timeout) killed all
-          # six at 269 s in run 37081194693. The wall ceiling still gates.
-          CI_TEST_IDLE_TIMEOUT: '1200'
+          # Six journeys each run install.ps1 (a cold PM toolchain + venv + Node deps) on a
+          # 4-vCPU hosted runner. A journey is one module-scoped fixture (install -> update
+          # -> turns) that runs BEFORE its first cell can print, so pytest is silent for the
+          # whole walk: 730-1025 s per file on upstream's 32-core pool (run 36307037128),
+          # longer here. The fork's idle hang detector (scripts/run_tests_parallel.py
+          # --idle-timeout; upstream has none on this job) killed all six at 269 s (240 s,
+          # run 37081194693) and again at 1229 s (1200 s, run 37094436303). Silence is not
+          # a hang signal for this suite: let the wall ceiling alone gate it, as upstream does.
+          CI_TEST_IDLE_TIMEOUT: '2400'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
