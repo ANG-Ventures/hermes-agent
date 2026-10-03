@@ -20,9 +20,13 @@ from agent.turn_context_compaction import CompactionOutcome, _run_preflight_pass
 
 
 def _agent(*, context_length):
+    # The fork's preflight pairs every pass's rough estimate with the engine's skew calibration
+    # (note_rough_sent / calibrated_tokens / should_compress_calibrated); identity doubles here.
     compressor = SimpleNamespace(
         protect_first_n=3, protect_last_n=3, threshold_tokens=65_536, context_length=context_length,
         summary_target_ratio=0.5, should_compress=lambda tokens: tokens >= 65_536,
+        note_rough_sent=lambda *_a, **_k: None, calibrated_tokens=lambda rough, *_a, **_k: rough,
+        should_compress_calibrated=lambda rough, *_a, **_k: rough >= 65_536,
     )
     agent = SimpleNamespace(
         context_compressor=compressor, session_id="s1", model="m", max_compression_attempts=3,
@@ -37,7 +41,9 @@ def _preflight(agent, request_tokens):
         messages=[{"role": "user", "content": "hi"}], active_system_prompt="sys",
         conversation_history=None, current_turn_user_idx=0,
     )
-    with patch("agent.turn_context._preflight_request_tokens", return_value=request_tokens), patch(
+    # The fork re-estimates through the (tokens, rough, anchored) split, not the scalar helper.
+    with patch("agent.turn_context._preflight_request_tokens_split",
+               return_value=(request_tokens, request_tokens, None)), patch(
         "agent.turn_context_compaction.automatic_compaction_status_message", return_value=""
     ):
         _run_preflight_passes(agent, out, agent.context_compressor, request_tokens, "sys", "t")

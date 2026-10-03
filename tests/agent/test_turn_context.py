@@ -200,6 +200,10 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
         should_compress=lambda tokens=None: True,
         should_compress_info=lambda tokens=None: (True, None),
         get_active_compression_failure_cooldown=lambda: None,
+        # Fork P2 skew-calibration seams the preflight pairs with every rough estimate.
+        note_rough_sent=lambda *_a, **_k: None,
+        calibrated_tokens=lambda rough, *_a, **_k: rough,
+        should_compress_calibrated=lambda *_a, **_k: True,
     )
 
     def stalled_compression(messages, *_args, **_kwargs):

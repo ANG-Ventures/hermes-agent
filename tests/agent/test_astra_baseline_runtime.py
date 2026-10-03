@@ -60,7 +60,9 @@ def test_astra_codex_oauth_fallback_uses_backend_context_limit():
     assert codex_ctx < DEFAULT_CONTEXT_LENGTHS["gpt-6-astra"]  # Codex caps below the direct API window
 
 
-@pytest.mark.parametrize("advertised,expected", [(272_000, 900_000), (200_000, 200_000), (1_050_000, 1_050_000)])
+# The fork lists gpt-6-astra EXACTLY at its catalog-measured 872K max_context_window
+# (2026-09-04), not upstream's carried-forward 900K (agent/model_metadata, d2acfa7f22).
+@pytest.mark.parametrize("advertised,expected", [(272_000, 872_000), (200_000, 200_000), (1_050_000, 1_050_000)])
 def test_astra_900k_opt_in_preserves_live_limits_and_wire_contract(monkeypatch, tmp_path, advertised, expected):
     """Only the known stale advertisement is lifted; the alias never reaches the wire."""
     from agent import model_metadata as metadata

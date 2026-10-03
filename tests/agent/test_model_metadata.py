@@ -884,9 +884,8 @@ class TestCodexOAuthContextLength:
     @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
     def test_gpt6_sol_luna_offline_fallback_also_bumped(self, slug):
         """With the live probe down, the 272K fallback-table entry for an
-        opted-in variant is bumped the same way. No catalog ``max_context_window``
-        is available offline, so the bump lands on the verified 900K cap
-        (upstream #105443 contract adopted by the 2026-10-01 parity sync)."""
+        opted-in variant is bumped the same way, onto the fork's EXACT
+        catalog-measured 872K entry (max_context_window=872,000, 2026-09-22)."""
         from agent.model_metadata import get_model_context_length
 
         fake_response = MagicMock()
@@ -903,7 +902,7 @@ class TestCodexOAuthContextLength:
                 api_key="expired-token",
                 provider="openai-codex",
             )
-        assert ctx == 900_000
+        assert ctx == 872_000
 
     @pytest.mark.parametrize("slug", ["gpt-5.6-sol-900k"])
     def test_fallback_table_resolution_also_bumped(self, slug):
@@ -952,11 +951,10 @@ class TestCodexOAuthContextLength:
     # (model_id, is_valid_variant, expected_ctx, expected_wire_model)
     _900K_TABLE = [
         ("gpt-5.6-sol-900k",              True,  900_000, "gpt-5.6-sol"),
-        # GPT-6 Sol/Luna: verified 900K; a live catalog max_context_window
-        # (872,000 measured 2026-09-22) caps the bump dynamically (#105443) —
-        # this table's mock catalog publishes none, so the verified cap holds.
-        ("gpt-6-sol-900k",                True,  900_000, "gpt-6-sol"),
-        ("gpt-6-luna-900k",               True,  900_000, "gpt-6-luna"),
+        # GPT-6 Sol/Luna: catalog-measured max_context_window 872,000
+        # (2026-09-22), so their opt-in variant resolves to 872K, not 900K.
+        ("gpt-6-sol-900k",                True,  872_000, "gpt-6-sol"),
+        ("gpt-6-luna-900k",               True,  872_000, "gpt-6-luna"),
         ("gpt-5.6-terra-900k",            True,  900_000, "gpt-5.6-terra"),
         ("gpt-5.6-luna-900k",             True,  900_000, "gpt-5.6-luna"),
         ("gpt-5.4-900k",                  True,  900_000, "gpt-5.4"),

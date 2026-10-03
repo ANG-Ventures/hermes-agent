@@ -66,6 +66,11 @@ def lifecycle(monkeypatch):
 
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
     monkeypatch.setattr("tools.delegate_tool._run_single_child", run)
+    # The worker's finalization fires ``subagent_stop`` through ``invoke_hook``, whose first call
+    # after the per-test plugin-manager reset runs plugin discovery INSIDE the 1s ``wait`` budget
+    # (CI 37081194693, py3.14 slice: wait returned CANCEL_REQUESTED). Discover up front instead.
+    from hermes_cli.plugins import _delivery_manager
+    _delivery_manager()
     return SubagentLifecycleService(lambda: parent)
 
 

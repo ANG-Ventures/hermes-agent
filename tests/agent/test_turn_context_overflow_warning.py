@@ -98,10 +98,12 @@ def _run_build(agent):
     The estimate is over the 72k threshold but under the 96k model window: the compression
     branch must run without tripping the over-window fail-closed (a no-progress pass on a request
     above the window ends the turn; that path is covered by
-    ``tests/agent/test_over_window_compression_fail_closed.py``)."""
+    ``tests/agent/test_over_window_compression_fail_closed.py``). It also sits at/over the
+    window's hard-frac ceiling (0.95 x 96k = 91,200): the fork's trigger compares the RAW rough
+    there, so the cold-start skew prior (empty skew history) cannot defer it below threshold."""
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
          patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=80_000):
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=92_000):
         return build_turn_context(
             agent=agent,
             user_message="hello",

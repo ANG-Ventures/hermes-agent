@@ -261,7 +261,8 @@ class TestWelcomeRouteCopy:
             log_prefix="",
             _buffer_vprint=buffered.append,
             _buffer_status=statuses.append,
-            _try_activate_fallback=lambda: False,
+            # The fork threads the failover reason (``reason=FailoverReason.rate_limit``).
+            _try_activate_fallback=lambda **_kw: False,
             _flush_status_buffer=lambda: None,
             _persist_session=lambda *_args: None,
         )

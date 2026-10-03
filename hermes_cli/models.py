@@ -1705,16 +1705,18 @@ def resolve_fast_mode_overrides(
     With ``provider``/``base_url`` the route is gated too (``_fast_mode_route_supported``) so proxies
     never see the params. Single fast-mode gate for ``/fast`` and ``agent.fast_mode`` windows."""
     normalized_tier = str(tier or "").strip().lower()
-    if normalized_tier == "ultrafast":
-        return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
-    if normalized_tier not in {"", "priority", "fast"}:
+    if normalized_tier not in {"", "priority", "fast", "ultrafast"}:
         # Fork (Prism t_62b562f6), same guard as resolve_fast_mode_capability: never substitute
         # a paid Priority/Fast override for some other requested tier (flex, default, scale, ...).
         return None
     if not model_supports_fast_mode(model_id):
         return None
+    # Route gate BEFORE the tier branch: ultrafast is still a first-party-only param and a proxy
+    # must never see it (the merge once short-circuited ultrafast ahead of this check).
     if (provider or base_url) and not _fast_mode_route_supported(model_id, provider, base_url):
         return None
+    if normalized_tier == "ultrafast":
+        return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None
     return {"speed": "fast"} if _is_anthropic_fast_model(model_id) else {"service_tier": "priority"}
 
 
