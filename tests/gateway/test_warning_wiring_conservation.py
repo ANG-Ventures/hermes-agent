@@ -22,6 +22,8 @@ def test_concrete_gateway_sinks_hide_all_freeform_muted_turn_output():
         holder = NS(_ctx=ctx, _status_live=lambda: True,
             _schedule=lambda coro, *args: scheduled.append(coro),
             _runner=NS(_deliver_platform_notice=lambda *args: "notice-send"))
+        # The send-time adapter resolver is a TurnRunner method; bind the real one to this holder.
+        holder._status_adapter_now = lambda: TurnRunner._status_adapter_now(holder)
         # Status lines go through ``safe_schedule_threadsafe`` (durable route notices track their
         # send result); platform notices still go through ``holder._schedule``.
         with patch("gateway.run._prepare_gateway_status_message", lambda *args: "prepared"), \

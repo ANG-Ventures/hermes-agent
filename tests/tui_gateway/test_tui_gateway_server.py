@@ -12643,7 +12643,7 @@ def test_slash_exec_live_read_commands_bypass_worker(monkeypatch):
     cases = {
         "usage": "Total tokens:                 140",
         "history": "live question",
-        "prompt": "live system prompt",
+        # /prompt is no longer a live read: it composes a seed in the worker (parity 2026-10-01).
         "status": "Tokens: 140",
         "model": "live-model (live-provider)",
         "clear": "left unchanged",

@@ -2885,6 +2885,8 @@ class TestBuzzAdapterLifecycle:
         adapter._platform_lock_scope = "buzz"
         adapter._platform_lock_identity = "wss://relay.example:" + SELF_PUBKEY
         await adapter.disconnect()
+        # Fork: teardown queues the unlink on the ordered status lane (t_1fd05a3a).
+        gateway_status.drain_runtime_status_lane()
         assert released == [("buzz", "wss://relay.example:" + SELF_PUBKEY)]
         assert adapter._platform_lock_identity is None
 

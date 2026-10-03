@@ -236,8 +236,12 @@ async def test_a_served_profiles_reconnect_replays_the_owed_notice(multiplex_run
     runner._secondary_reconnect_attempt = AsyncMock(return_value=(coder, True))
 
     await runner._run_secondary_profile_reconnect("coder", Platform.TELEGRAM)
-    for _ in range(50):
-        await asyncio.sleep(0)
+    # The replay runs on a background task with off-loop file I/O; 50 bare loop turns
+    # were not enough on a loaded CI runner (run 37081194693 flaked, retry green).
+    for _ in range(250):
+        if coder.send.await_count and not marker.exists():
+            break
+        await asyncio.sleep(0.02)
 
     assert runner._profile_adapters["coder"][Platform.TELEGRAM] is coder
     coder.send.assert_awaited_once()

@@ -4518,12 +4518,15 @@ class GatewaySlashCommandsMixin(
         # under a channel_overrides model the session override must stay.
         if persist_global and global_error is None and self._channel_override_for(source) is None:
             try:
-                await self.async_session_store.set_model_override(session_key, None)
+                # Fork single door (P3b/RC-2): clears the in-memory override AND the persisted
+                # identity off the loop; require_persistence surfaces a failed clear so the
+                # switch truthfully stays a session override (#100314).
+                await self._persist_session_model_override(
+                    session_key, None, require_persistence=True,
+                )
             except Exception as e:
                 logger.warning("Failed to clear persisted session model override: %s", e)
                 global_error = t("gateway.model.err_stale_override", error=e)
-            else:
-                self._session_model_overrides.pop(session_key, None)
         elif not one_turn:
             # Non-secret write-through so the override survives a restart (api_key/api_mode are
             # re-resolved on rehydration); a --once override must NOT outlive a restart (#29923).

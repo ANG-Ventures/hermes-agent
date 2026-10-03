@@ -339,6 +339,9 @@ def make_turn_owner(agent, prior, *, cached=True, effort="medium"):
     owner._pending_model_notes = {}
     owner._pending_skills_reload_notes = {}
     owner._override_target_just_changed = {}
+    # Upstream (parity 2026-10-01): run_sync counts consecutive transcript-lag turns here;
+    # on a MagicMock owner the getattr default never fires, so give it the real dict.
+    owner._transcript_lag_streaks = {}
     owner.session_store._lock = None
     entry = SimpleNamespace(
         last_served_identity=prior, model_override_identity=None, resume_pending=False
@@ -576,8 +579,10 @@ async def test_manual_model_switch_delivers_once_without_old_turn_callback(
         "hermes_cli.model_switch.resolve_display_context_length",
         lambda *a, **kw: 200000,
     )
+    # Upstream (parity 2026-10-01) extracted the picker listing into model_switch_providers;
+    # the gateway reads it from there.
     monkeypatch.setattr(
-        "hermes_cli.model_switch.list_picker_providers",
+        "hermes_cli.model_switch_providers.list_picker_providers",
         lambda **kw: [
             {"slug": "openrouter", "name": "OpenRouter", "models": ["gpt-5.5"]},
         ],

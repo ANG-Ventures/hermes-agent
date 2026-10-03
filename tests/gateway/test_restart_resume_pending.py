@@ -1830,6 +1830,16 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
 # ---------------------------------------------------------------------------
 
 
+async def _await_startup_replay_owner(runner) -> None:
+    """``_finish_startup_restore`` releases the gate and SCHEDULES the queued replay on its
+    own task. On Python 3.12+ ``asyncio.wait_for(coro)`` awaits the coroutine inline (no
+    wrapper task, no loop turn), so the replay owner has not run when the caller resumes;
+    3.11 happened to yield through the wrapper task. Wait for the owner, bounded."""
+    task = getattr(runner, "_startup_restore_replay_task", None)
+    if task is not None:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+
+
 @pytest.mark.asyncio
 async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
     monkeypatch,
@@ -1875,6 +1885,7 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
     # The gate must release on the bound even though the resume turn is
     # still running.
     await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+    await _await_startup_replay_owner(runner)
 
     assert seen == ["inbound:hello"], (
         "startup-restore gate never released: queued inbound was not drained "
@@ -1939,6 +1950,7 @@ async def test_startup_restore_gate_releases_when_boot_path_send_hangs(
         timeout=5,
     )
     await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+    await _await_startup_replay_owner(runner)
 
     assert seen == ["inbound:hello"], (
         "startup-restore gate never released: queued inbound was not drained "
