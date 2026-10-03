@@ -443,6 +443,7 @@ def test_p1r2_profile_gate_applies_to_the_owner_session(env):
     tid = _card(env, session=worker_owned.session_id)
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     assert _tick(env) == [], "an owner on a non-operator profile is not woken by an operator gateway"
+    assert env["runner"]._kanban_owner_wake_state.pending == {}, "dropped at the gate, not held"
 
 
 def test_p1r2_state_write_is_fsynced(env, monkeypatch):
@@ -451,3 +452,9 @@ def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     monkeypatch.setattr(ow.os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
     ow.WakeState(Path(get_hermes_home()) / "gateway" / "fs.json").write_owner_wake_state(1.0)
     assert len(synced) == 2, "file and directory are both fsynced"
+
+
+def test_worker_only_gateway_skips_the_scan(env, monkeypatch):
+    env["runner"]._active_profile_name = lambda: "daedalus"
+    monkeypatch.setattr(ow, "scan", lambda *a, **k: (_ for _ in ()).throw(AssertionError("scanned")))
+    assert asyncio.run(ow.tick(env["runner"], now=1.0, state=_held_state(env, 0))) == 0
