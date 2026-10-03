@@ -644,6 +644,15 @@ def build_turn_context(
         agent._turn_home = (turn_id, str(get_hermes_home()))
     except Exception:
         agent._turn_home = None
+    # A background-review fork binding its turn after a CLI exit fence was set
+    # records itself; the fence's snapshot may have missed it (t_ab5f2c3f).
+    if getattr(agent, "_review_request_admitted", False):
+        try:
+            from agent.background_review import record_review_turn_if_host_exiting
+
+            record_review_turn_if_host_exiting(agent)
+        except Exception:
+            pass
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()

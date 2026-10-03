@@ -126,6 +126,47 @@ def test_admitted_fork_that_binds_its_turn_after_cleanup_starts_is_recorded(ledg
     assert out_tok == 243  # the late call refreshed the provisional row
 
 
+def test_fork_binding_after_the_fence_wait_expired_records_itself(ledger, monkeypatch):
+    """Prism P1 (#1650 r1): a fork descheduled past the bind wait must not escape.
+
+    The fence times out with the fork unbound; when the fork later binds its
+    turn (turn_context), the bind side sees the exit flag and records it.
+    """
+    monkeypatch.setattr(br, "_EXIT_FENCE_BIND_WAIT_S", 0.0)
+    fork = _fork(OPUS)
+    fork._current_turn_id = None
+    br._live_review_agents[id(fork)] = fork
+    assert br.background_review_admitted(fork) is True
+
+    _cleanup(monkeypatch)
+    assert _row(ledger, OPUS) is None  # the fence could not see a turn id
+
+    fork._current_turn_id = OPUS  # turn_context binds the turn after the fence
+    assert br.record_review_turn_if_host_exiting(fork) is True
+    _call(OPUS)
+
+    assert _orphan_ids(ledger) == []
+    interrupted, out_tok = _row(ledger, OPUS)
+    assert (interrupted, out_tok) == (1, 243)
+
+
+def test_bind_side_is_inert_without_an_exit(ledger):
+    fork = _fork(OPUS)
+    fork._review_request_admitted = True
+    assert br.record_review_turn_if_host_exiting(fork) is False
+    assert _row(ledger, OPUS) is None
+
+
+def test_turn_context_bind_calls_the_bind_side_fence():
+    """The bind-side half only works if the real bind site calls it."""
+    import inspect
+    from agent import turn_context
+
+    src = inspect.getsource(turn_context)
+    bind = src.index("agent._current_turn_id = turn_id")
+    assert "record_review_turn_if_host_exiting(agent)" in src[bind:bind + 1500]
+
+
 def test_registered_fork_not_yet_admitted_is_refused_after_cleanup(ledger, monkeypatch):
     """daedalus-fable 09:54:51: cleanup at .345, the fork's turn began at .388."""
     fork = _fork(OPUS)

@@ -120,6 +120,25 @@ def fence_background_reviews_for_exit(
     return agents
 
 
+def record_review_turn_if_host_exiting(agent: Any) -> bool:
+    """Bind-side half of the exit fence; call right after ``_current_turn_id`` binds.
+
+    A fork admitted before the fence that binds its turn only after the
+    fence's bounded wait expired was missed by the exit snapshot. Whichever
+    side runs second records the turn: the fence (turn already bound) or this
+    (fence already set). The provisional row is deduped per turn, and later
+    calls of this turn refresh it. Never raises.
+    """
+    try:
+        if _host_exit_reason is None or not getattr(agent, "_review_request_admitted", False):
+            return False
+        from agent.turn_finalizer import emit_abandoned_session_ends
+
+        return bool(emit_abandoned_session_ends([agent], _host_exit_reason))
+    except Exception:
+        return False
+
+
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
 
 
