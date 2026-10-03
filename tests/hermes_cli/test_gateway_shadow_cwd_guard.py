@@ -84,6 +84,30 @@ def test_shadow_import_allows_trusted_checkout_with_external_env(tmp_path):
     ) is None
 
 
+def test_shadow_import_allows_own_pm_build_snapshot(tmp_path, monkeypatch):
+    """PM's generation venv keeps an editable pointer at the install's own build
+    snapshot (installs/<key>/environments/<gen>/workspace); that is the same
+    install, so a relaunch from the install root must not be refused."""
+    from pm import environments as pm_env
+
+    checkout = tmp_path / "home" / ".hermes" / "hermes-agent"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    state = tmp_path / "home" / ".hermes" / "installs" / "k1"
+    snapshot = state / "environments" / "gen1" / "workspace"
+    (snapshot / "hermes_cli").mkdir(parents=True)
+    monkeypatch.setattr(pm_env, "install_state_dir", lambda root: state)
+    assert gateway_cli._shadow_import_reason(
+        str(checkout), package_root=checkout, install_root=snapshot
+    ) is None
+    # a snapshot of a DIFFERENT install is still a shadow
+    other = tmp_path / "home" / ".hermes" / "installs" / "k2" / "environments" / "g" / "workspace"
+    (other / "hermes_cli").mkdir(parents=True)
+    reason = gateway_cli._shadow_import_reason(
+        str(checkout), package_root=checkout, install_root=other
+    )
+    assert reason is not None and "imported instead of the installed tree" in reason
+
+
 def test_install_root_without_cwd_ignores_cwd_entry(tmp_path, monkeypatch):
     """The probe must not count the cwd entry itself as 'another install'."""
     shadow = tmp_path / "shadow"

@@ -4650,9 +4650,27 @@ def _shadow_import_reason(
         other = Path(other).resolve()
     except (OSError, RuntimeError):
         return None
-    if other == root:
+    if other == root or _is_own_pm_build_snapshot(other, root):
         return None
     return f"{root} (the cwd) was imported instead of the installed tree {other}"
+
+
+def _is_own_pm_build_snapshot(other: Path, root: Path) -> bool:
+    """True when ``other`` is this install's own PM build snapshot.
+
+    PM builds each dependency generation from a writable copy of the checkout
+    (``installs/<key>/environments/<gen>/workspace``) and the generation venv
+    keeps an editable pointer at it, so the probe above finds that copy. It is
+    the same install's code, not a different install the cwd could shadow
+    (parity 2026-10-01: e2e-upgrade/handoff gateway relaunch refused).
+    """
+    try:
+        from pm.environments import install_state_dir
+
+        state = install_state_dir(root).resolve()
+    except Exception:
+        return False
+    return other.is_relative_to(state / "environments")
 
 
 def _guard_shadow_cwd() -> None:
