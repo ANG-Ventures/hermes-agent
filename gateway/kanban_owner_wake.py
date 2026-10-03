@@ -289,7 +289,8 @@ class WakeState:
             self.pending = dict(raw.get("pending") or {})
             self.last_wake = {str(k): float(v) for k, v in (raw.get("last_wake") or {}).items()}
 
-    def save(self, now: float) -> None:
+    def write_owner_wake_state(self, now: float) -> None:
+        """Blocking (fsync + rename): call via ``asyncio.to_thread`` only."""
         self.last_wake = {k: v for k, v in self.last_wake.items() if now - v < COALESCE_SECONDS * 6}
         data = {"cursors": self.cursors, "pending": self.pending, "last_wake": self.last_wake}
         try:
@@ -598,5 +599,5 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             ", ".join(f"{c['task_id']}({'+'.join(i['trigger'] for i in c['items'])})"
                       for _k, c in cards),
         )
-    state.save(now)
+    await asyncio.to_thread(state.write_owner_wake_state, now)
     return turns
