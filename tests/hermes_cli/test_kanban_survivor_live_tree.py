@@ -854,7 +854,7 @@ def test_over_attachment_limit_stores_pushed_ref_not_body(board, tmp_path, monke
     commit holds the bytes no published ref held (unpublished.py), read back from the remote."""
     tid = kb.create_task(board, title="oversized divergent work, pushable")
     ws, _, _, mirror = divergent_history(tmp_path)
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     (ws / "untracked_note.md").write_text("only on disk\n")
     monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
     assert kb.complete_task(board, tid, metadata={"changed_files": ["unpublished.py"]})

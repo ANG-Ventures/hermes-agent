@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_proc_bounds as kpb
 
 POSIX = hasattr(os, "getsid") and hasattr(os, "killpg")
@@ -264,7 +265,7 @@ def _spawn_worker(conn, tid: str, n: int) -> tuple[subprocess.Popen, list[int]]:
     _track(worker.pid)
     kids = [int(x) for x in worker.stdout.readline().split()]
     _track(*kids)
-    assert kb._set_worker_pid(conn, tid, worker.pid)
+    assert kbd._set_worker_pid(conn, tid, worker.pid)
     return worker, kids
 
 
@@ -325,7 +326,7 @@ def test_failed_block_is_not_reported_as_capped(conn, monkeypatch):
     assert kb.claim_task(conn, tid) is not None
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     _track(sleeper.pid)
-    assert kb._set_worker_pid(conn, tid, sleeper.pid)
+    assert kbd._set_worker_pid(conn, tid, sleeper.pid)
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
                         lambda *a, **k: {"terminated": True})
     pages: list = []
@@ -445,7 +446,7 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     with kb._worker_processes_lock:
         kb._worker_processes[worker.pid] = worker
     kb._register_worker_identity(worker.pid, tid, task.current_run_id, spawned_at)
-    assert kb._set_worker_pid(conn, tid, worker.pid)
+    assert kbd._set_worker_pid(conn, tid, worker.pid)
     browser = int(worker.stdout.readline())
     _track(browser)
     deadline = time.monotonic() + 15
@@ -460,13 +461,17 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     # Worker + at least one browser process (helpers come and go).
     assert kpb.census_worker_trees({key: worker.pid})[key]["procs"] >= 2
 
-    assert kb.complete_task(conn, tid, summary="done")
+    # The test plays the worker: complete under its own run with a structured
+    # handback (the merged tree fences a bare complete of a live claim with
+    # LiveClaimError, and a worker completion needs a receipt).
+    assert kb.complete_task(conn, tid, summary="done", expected_run_id=task.current_run_id,
+                            metadata={"drill": "chrome reaped with the card"})
     worker.stdin.write("go\n")
     worker.stdin.flush()
     deadline = time.monotonic() + 10
     exited: list[int] = []
     while time.monotonic() < deadline and worker.pid not in exited:
-        exited += kb.reap_worker_zombies()
+        exited += kbd.reap_worker_zombies()
         time.sleep(0.05)
     assert worker.pid in exited
     assert kb._pid_alive(browser), "Chrome died with its worker; drill proves nothing"
