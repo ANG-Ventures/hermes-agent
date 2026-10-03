@@ -17,6 +17,7 @@ This module decides, per notifier tick, which failure events speak:
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Iterable, Optional
 
@@ -130,6 +131,44 @@ class LaneFailureDedupe:
         """Open the quiet window once a lane notice was actually delivered."""
         if key is not None:
             self._sent[key] = time.time() if now is None else now
+
+
+def format_timed_out_notice(
+    payload,
+    *,
+    task_id: str,
+    board_tag: str,
+    tag: str,
+) -> str:
+    """Render a ``timed_out`` run event truthfully.
+
+    Two different things end a run with ``timed_out``: the wall-clock
+    ``max_runtime_seconds`` guard (payload carries ``limit_seconds``) and the
+    per-run iteration cap (``agent.max_turns``; payload ``error`` starts with
+    "Iteration budget exhausted"). The old line printed ``max_runtime=0s`` for
+    the second case, which reads as a broken timer and paged the operator for a
+    non-event. Name the cap, say the work is kept (the worker pushes before the
+    cap; the retry resumes from its branch), and say what happens next.
+    """
+    payload = payload or {}
+    error = str(payload.get("error") or "")
+    retry = str(payload.get("retry_status") or "")
+    nxt = f"; back to {retry}, dispatcher retries" if retry else "; will retry"
+    m = re.search(r"Iteration budget exhausted \((\d+)/(\d+)\)", error)
+    if m:
+        return (
+            f"⏱ {board_tag}{tag}Kanban {task_id} hit its iteration cap "
+            f"({m.group(2)} turns); work on its branch is kept{nxt}"
+        )
+    limit = 0
+    try:
+        limit = int(payload.get("limit_seconds") or 0)
+    except (TypeError, ValueError):
+        pass
+    if limit > 0:
+        return f"⏱ {board_tag}{tag}Kanban {task_id} exceeded max_runtime ({limit}s){nxt}"
+    tail = f": {error[:120]}" if error else ""
+    return f"⏱ {board_tag}{tag}Kanban {task_id} timed out{tail}{nxt}"
 
 
 def format_failure_notice(

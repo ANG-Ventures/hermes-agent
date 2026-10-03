@@ -35,6 +35,14 @@ what it references:
   test file selects it (fixtures, ``scripts/*.py`` loaded by path, shell
   scripts, JSON/YAML data).
 
+REPO-WIDE SCANNERS. A narrowed selection always carries every test file that
+walks the checkout itself (``rglob``/``os.walk``/``**`` glob/``git ls-files``
+anchored on ``__file__``): ratchets such as
+``tests/ci/test_no_new_source_proxy_asserts.py`` read EVERY file, so any diff
+can turn them red and no import edge points at them. Leaving them out let
+hermes-agent#1652 pass PR CI (646 files) and fail its own ratchet in two
+merge groups (runs 37094706789, 37096549914), ejecting #1655/#1656 behind it.
+
 Stdlib only: runs in the ``generate`` job before any venv exists.
 """
 
@@ -78,6 +86,15 @@ _DEFAULT_DURATION = 2.0
 _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".worktrees"}
 _TEST_SKIP_PARTS = {"integration", "e2e", "docker"}
 _DOTTED_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
+# A test that walks the repo tree (see REPO-WIDE SCANNERS above). Heuristic and
+# deliberately wide: a false hit only adds a file to the PR pre-filter.
+_TREE_WALK_RE = re.compile(
+    r"\.rglob\(|\bos\.walk\(|\.glob\(\s*[rf]?[\"']\*\*|[\"']ls-files[\"']"
+)
+
+
+def _scans_repo(text: str) -> bool:
+    return "__file__" in text and _TREE_WALK_RE.search(text) is not None
 
 
 def _module_name(rel: str) -> str:
@@ -163,6 +180,7 @@ class _Index:
         # every reference of a test file (imports anywhere + dotted strings)
         self.test_refs: dict[str, set[str]] = {}
         self.test_text: dict[str, str] = {}
+        self.repo_scanners: list[str] = []
         self.parse_failures: list[str] = []
         self._build()
 
@@ -206,6 +224,8 @@ class _Index:
                 self.test_text[rel] = text
                 if not any(part in _TEST_SKIP_PARTS for part in rel.split("/")[:-1]):
                     self.test_files.append(rel)
+                    if _scans_repo(text):
+                        self.repo_scanners.append(rel)
             else:
                 refs = set()
                 for node in _module_scope_nodes(tree.body):
@@ -301,6 +321,8 @@ def select(
             return None, f"{p}: no test depends on it statically"
     if not selected:
         return None, "no test file selected"
+    # Repo-wide scanners see every diff (module docstring, REPO-WIDE SCANNERS).
+    selected.update(idx.repo_scanners)
     durations = durations or {}
     total = sum(durations.get(t, _DEFAULT_DURATION) for t in idx.test_files) or 1.0
     chosen = sum(durations.get(t, _DEFAULT_DURATION) for t in selected)

@@ -236,6 +236,21 @@ def empty_tool_use_floor(response: Any) -> bool:
 RELAY_PROVIDERS = frozenset(("claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"))
 
 
+def relay_gave_up_empty(response: Any) -> bool:
+    """True when the pooled relay already retried this empty-content 200 and
+    gave up (``x-pool-empty-content-retried: gave_up``, claude-pool #193): it
+    re-sent the request on the same seat once, then on one OTHER seat, and
+    both came back empty. A harness same-route retry would re-enter the same
+    relay ladder (2 more billed calls on the same affinity seat); fail over
+    instead (t_9d411670: 0/13 different-seat or cross-provider retries
+    repeated the empty, vs 12/22 same-seat retries). Never raises."""
+    try:
+        ph = _lower_headers(getattr(response, "pool_headers", None))
+        return (ph.get("x-pool-empty-content-retried") or "").strip().lower() == "gave_up"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def relay_error_class(error: Any) -> Tuple[Optional[str], Optional[str]]:
     """``(class, source)`` the relay stated on ``error``, else ``(None, None)``.
 
@@ -588,7 +603,8 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
         logger.debug("fallback ledger: response-failure stash failed", exc_info=True)
 
 
-INVALID_RETRY_OUTCOMES = ("retry_ok", "retry_same", "retry_other", "retry_error", "fallback")
+INVALID_RETRY_OUTCOMES = ("retry_ok", "retry_same", "retry_other", "retry_error", "fallback",
+                          "relay_gave_up")
 # Same-route retry backoff for the empty tool_use shape (card: <= 2 s; short
 # enough to land inside the relay's affinity window so the cache is warm).
 INVALID_RETRY_BACKOFF_S = 1.5

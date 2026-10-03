@@ -102,6 +102,30 @@ def test_nested_conftest_selects_its_directory(repo: Path) -> None:
     assert _select(repo, "tests/sub/conftest.py") == ["tests/sub/test_in_sub.py"]
 
 
+def test_repo_wide_scanner_rides_every_narrowed_selection(repo: Path) -> None:
+    # hermes-agent#1652: a ratchet that walks tests/ shares no import edge with
+    # the diff, so the PR run skipped it and the merge group ejected the PR.
+    _write(
+        repo,
+        "tests/test_ratchet.py",
+        "from pathlib import Path\n"
+        "TESTS = Path(__file__).resolve().parent\n"
+        "def test_scan():\n"
+        "    assert list(TESTS.rglob('*.py'))\n",
+    )
+    # tmp-only tree walk: not a repo scanner
+    _write(
+        repo,
+        "tests/test_tmp_walk.py",
+        "def test_x(tmp_path):\n    assert not list(tmp_path.rglob('*'))\n",
+    )
+    selected = _select(repo, "pkg/other.py")
+    assert selected is not None
+    assert "tests/test_ratchet.py" in selected
+    assert "tests/test_tmp_walk.py" not in selected
+    assert "tests/test_core.py" not in selected
+
+
 @pytest.mark.parametrize(
     "changed",
     [

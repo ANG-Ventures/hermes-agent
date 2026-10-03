@@ -345,6 +345,12 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     task_id = sub.get("task_id", "")
     title = (getattr(task, "title", None) or task_id)[:120]
     who = getattr(task, "assignee", None) or ""
+    if getattr(ev, "kind", "") == "timed_out":
+        # One renderer for both notifiers: names the iteration cap instead of max_runtime=0s (#1652).
+        from gateway.kanban_notify_failures import format_timed_out_notice
+        return format_timed_out_notice(
+            getattr(ev, "payload", None) or {}, task_id=task_id,
+            board_tag=f"[{board_slug}] " if board_slug else "", tag=f"@{who} " if who else "")
     prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
     return f"{prefix}Kanban {task_id}{fmt(task, getattr(ev, 'payload', None) or {}, title)}"
 
