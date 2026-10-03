@@ -3298,6 +3298,15 @@ DEFAULT_CONFIG = {
         # Seconds to batch lifecycle_channel lines into one digest post
         # (0 = one post per line). The wake is never delayed.
         "lifecycle_digest_seconds": 0,
+        # With lifecycle_channel set: "home" (default, t_808bc8e6) posts each
+        # done / ready-for-review / blocked / changes-requested line in the
+        # card's HOME chat (its home session's origin); lifecycle_channel is
+        # the fallback, tagged [no-home] / [home-unreachable:<reason>].
+        # "channel" = every routed line to lifecycle_channel (pre-10-02).
+        "lifecycle_route": "home",
+        # Seconds to fold home-chat lines into one post per home chat (one
+        # operator batch = one line). 0 = one post per line.
+        "lifecycle_home_digest_seconds": 120,
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.
