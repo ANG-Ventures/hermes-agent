@@ -1069,6 +1069,15 @@ LIFECYCLE_CHANNEL_KINDS = frozenset({"completed", "review_requested", "blocked"}
 LIFECYCLE_CHANNEL_KEEP_PRIORITY = 100
 
 
+def kanban_artifact_names_tag(paths: list) -> str:
+    """``artifacts: a.txt, b.tgz`` for a line that carries no upload (t_4bfc46a3)."""
+    names = [os.path.basename(str(p)) for p in paths]
+    shown = ", ".join(names[:5])
+    if len(names) > 5:
+        shown += f" +{len(names) - 5} more"
+    return f"artifacts: {shown}"
+
+
 def parse_lifecycle_channel(value: Any) -> "Optional[tuple[str, str]]":
     """``"platform:chat_id"`` -> ``(platform, chat_id)``; None when unset or malformed."""
     if not isinstance(value, str) or ":" not in value:
@@ -2155,6 +2164,31 @@ class GatewayKanbanWatchersMixin:
                                 )
                             else:
                                 _routed = None
+                        # Handoff artifacts upload only beside a line posted
+                        # NOW to a conversation (subscriber chat or an
+                        # immediate home line). A log-channel line or a held
+                        # digest line names the files instead (t_4bfc46a3:
+                        # 45 empty-content uploads/24 h in #logs).
+                        _art_paths: list[str] = []
+                        _art_upload = False
+                        if kind in ("completed", "review_requested"):
+                            try:
+                                _art_paths = self._kanban_artifact_paths(
+                                    send_adapter, getattr(ev, "payload", None), task,
+                                )
+                            except Exception as art_exc:
+                                logger.debug(
+                                    "kanban notifier: artifact scan for %s failed: %s",
+                                    sub["task_id"], art_exc,
+                                )
+                            _art_upload = bool(_art_paths) and (
+                                _routed is None or (_route.is_home and _route_window <= 0)
+                            ) and (
+                                (_routed[0] if _routed else platform_str, str(send_chat_id))
+                                != lifecycle_channel
+                            )
+                            if _art_paths and not _art_upload:
+                                msg = _hr.tag_line(msg, kanban_artifact_names_tag(_art_paths))
                         if _routed is not None:
                             # Receipts land in exactly one place (t_484a3c72):
                             # a card with several subscribers routes the same
@@ -2247,6 +2281,13 @@ class GatewayKanbanWatchersMixin:
                                             _fallback[0][0], _fallback[0][1],
                                         )
                                         _fb_msg = _hr.tag_line(msg, _hr.unreachable_tag(_home_fail))
+                                        if _art_upload:
+                                            # The fallback is the log channel: name
+                                            # the files there, upload nothing.
+                                            _art_upload = False
+                                            _fb_msg = _hr.tag_line(
+                                                _fb_msg, kanban_artifact_names_tag(_art_paths),
+                                            )
                                         if _fallback[2] > 0:
                                             lifecycle_digest.add(
                                                 _fallback[0], _fallback[1], _fb_msg, _fallback[2],
@@ -2295,7 +2336,9 @@ class GatewayKanbanWatchersMixin:
                                 # human sees them at handoff time (f3357b5031).
                                 # Retry exposure matches ``completed`` (the sub
                                 # cursor is rewound only when a send failed).
-                                if kind in ("completed", "review_requested"):
+                                # Never into the log channel or under a held
+                                # line (t_4bfc46a3): ``_art_upload`` gates it.
+                                if _art_upload:
                                     try:
                                         await self._deliver_kanban_artifacts(
                                             adapter=send_adapter,
@@ -2303,6 +2346,7 @@ class GatewayKanbanWatchersMixin:
                                             metadata=metadata,
                                             event_payload=getattr(ev, "payload", None),
                                             task=task,
+                                            paths=_art_paths,
                                         )
                                     except Exception as art_exc:
                                         logger.debug(
@@ -2741,14 +2785,11 @@ class GatewayKanbanWatchersMixin:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
-    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
-        """Upload artifact files referenced by a completed kanban task.
-
-        Sources, in priority order: ``event_payload['artifacts']``,
-        ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
-        deduplicated, missing files are skipped (may be mentioned for
-        reference only), and upload errors are logged, never raised.
-        """
+    @staticmethod
+    def _kanban_artifact_paths(adapter, event_payload: Optional[dict], task) -> list:
+        """Existing, delivery-safe artifact paths of a handoff: the payload
+        ``artifacts`` list, then paths in the summary, then the legacy
+        ``task.result``. Deduplicated; missing files are skipped."""
         raw_paths: list[str] = []
         prose_paths: list[str] = []
         if isinstance(event_payload, dict):
@@ -2771,10 +2812,27 @@ class GatewayKanbanWatchersMixin:
             if expanded and expanded not in candidates and os.path.isfile(expanded):
                 candidates.append(expanded)
         if not candidates:
-            return
+            return []
 
         from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        return BasePlatformAdapter.filter_local_delivery_paths(candidates)
+
+    async def _deliver_kanban_artifacts(
+        self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task,
+        paths: Optional[list] = None,
+    ) -> None:
+        """Upload artifact files referenced by a completed kanban task.
+
+        Sources, in priority order: ``event_payload['artifacts']``,
+        ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
+        deduplicated, missing files are skipped (may be mentioned for
+        reference only), and upload errors are logged, never raised.
+        ``paths`` (from ``_kanban_artifact_paths``) skips the scan.
+        """
+        candidates = (
+            list(paths) if paths is not None
+            else self._kanban_artifact_paths(adapter, event_payload, task)
+        )
         if not candidates:
             return
 

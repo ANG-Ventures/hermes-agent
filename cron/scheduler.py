@@ -51,6 +51,7 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain, scoped_fallback_chain
 from hermes_time import now as _hermes_now, safe_strftime
 from cron.fork_ext import scheduler_ext
+from cron.fork_ext import logs_digest_gate  # noqa: F401  (re-export parity with fork/main)
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)

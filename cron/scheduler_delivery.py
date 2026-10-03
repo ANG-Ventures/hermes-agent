@@ -20,6 +20,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from cron.fork_ext import logs_digest_gate
+
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -2096,6 +2098,17 @@ def _deliver_result(
             f"{_host_down_prefix} {_unprefixed_delivery_content}"
             if _host_down_prefix else _unprefixed_delivery_content
         )
+        # #logs is a digest, not a stream (t_42a9c32b): a green no_agent run
+        # bound for #logs joins notify.py's digest spool while it is armed.
+        if logs_digest_gate.maybe_spool(
+            job, platform=target["platform"], chat_id=target["chat_id"],
+            thread_id=target.get("thread_id"),
+            success=success, has_media=bool(requested_media),
+            demoted=bool(_host_down_prefix), text=(content or "").strip(),
+            get_home=lambda: _sched.get_hermes_home(),
+        ):
+            logger.info("Job '%s': spooled for the #logs digest", job["id"])
+            continue
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
         from gateway.warning_notifications import warning_notifications_enabled
