@@ -1,5 +1,6 @@
 """Gateway intentional-silence token behavior."""
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -433,11 +434,53 @@ async def test_raw_text_surface_keeps_trailing_marker(monkeypatch, tmp_path):
     assert response == _KANBAN_DIGEST_NOTE
 
 
-def test_heartbeat_poller_event_is_internal():
-    """The /heartbeat tick is gateway-generated, not a human message."""
-    import inspect
+@pytest.mark.asyncio
+async def test_heartbeat_poller_event_is_internal(monkeypatch):
+    """The /heartbeat tick is gateway-generated, not a human message.
 
-    src = inspect.getsource(gateway_run.GatewayRunner._start_heartbeat_poller)
-    hb = src[src.index("hb_event = MessageEvent("):]
-    hb = hb[: hb.index("self._enqueue_fifo(")]
-    assert "internal=True" in hb
+    Drive one real poll iteration: the event handed to ``_enqueue_fifo`` must
+    be ``internal=True`` so the autonomous silence rule (and the no-sender-
+    prefix rule) applies to the tick's reply.
+    """
+    import hermes_cli.heartbeat as hb
+
+    monkeypatch.setattr(hb, "POLL_SECONDS", 0.0)
+
+    class _Mgr:
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        def has_heartbeat(self):
+            return True
+
+        def due_prompt(self, now=None):
+            return "[Heartbeat] check the deployment"
+
+    monkeypatch.setattr(hb, "HeartbeatManager", _Mgr)
+
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner._running = True
+    runner._background_tasks = set()
+    runner._heartbeat_poll_task = None
+    runner._running_agents = {}
+    runner._heartbeat_watch = {"agent:main:telegram:dm:1": (_source(), "sess-hb")}
+    runner._warm_goals_session_db = AsyncMock()
+    runner._adapter_for_source = lambda _s: object()
+    enqueued = []
+    runner._enqueue_fifo = lambda key, ev, adapter: enqueued.append((key, ev))
+
+    runner._start_heartbeat_poller()
+    try:
+        for _ in range(50):
+            if enqueued:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        runner._heartbeat_poll_task.cancel()
+        await asyncio.gather(runner._heartbeat_poll_task, return_exceptions=True)
+
+    assert enqueued, "poller never enqueued the due heartbeat"
+    key, ev = enqueued[0]
+    assert key == "agent:main:telegram:dm:1"
+    assert ev.text == "[Heartbeat] check the deployment"
+    assert ev.internal is True
