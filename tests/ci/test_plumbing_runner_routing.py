@@ -58,8 +58,10 @@ def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
         "&& needs.placement.outputs.e2e_runs_on || ("
         "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
         "&& format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) "
-        "|| format('[\"{0}\"]', vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404'))) }}"
+        "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]')) }}"
     )
+    # The static last resort is Blacksmith 4vCPU (2026-10-03): e2e took 26 min
+    # on 2-core ubuntu-latest; a literal, so an unset repo var can never route it.
     assert "hermes-ci" not in job["runs-on"]
 
 

@@ -255,7 +255,6 @@ def check_fallback(doc: dict) -> list[str]:
                     except (ValueError, SyntaxError, KeyError, TypeError) as exc:
                         errors.append(f"{where}: {exc}")
                         continue
-                    # fork #1664: the hosted e2e fallback is CI_E2E_RUNNER, default Blacksmith 4vCPU.
                     legacy_e2e = ["self-hosted", "hermes-ci", "X64"] if labels else ["blacksmith-4vcpu-ubuntu-2404"]
                     if event != "merge_group" or not enabled:
                         want, want_e2e = GEN_MATRIX, legacy_e2e
@@ -328,10 +327,10 @@ def test_mutating_no_plan_fallback_to_local_matrix_fails_integration():
 def test_mutating_no_plan_e2e_fallback_to_local_pool_fails_integration():
     doc = _tests_yml()
     expr = doc["jobs"]["e2e"]["runs-on"]
-    static_tail = "|| format('[\"{0}\"]', vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404'))) }}"
+    static_tail = "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]')) }}"
     assert expr.rstrip().endswith(static_tail)
     doc["jobs"]["e2e"]["runs-on"] = (expr.rstrip()[:-len(static_tail)]
-                                     + "|| '[\"ubuntu-latest\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
+                                     + "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
     assert any("invalid/labels=None: e2e runs-on" in e for e in check_fallback(doc)), check_fallback(doc)
 
 
@@ -534,7 +533,7 @@ def test_fromjson_never_fed_a_possibly_missing_output():
         assert arg[0] == "op" and arg[1] == "||", expr
         last = _refs(arg[3])
         assert last and not any(r.startswith("needs.placement") for r in last), last
-        assert last <= {"needs.generate.outputs.matrix", "vars.CI_RUNNER_LABELS", "vars.CI_E2E_RUNNER"}, last
+        assert last <= {"needs.generate.outputs.matrix", "vars.CI_RUNNER_LABELS"}, last
 
 
 def test_gate_cli_reads_results_from_env(tmp_path):

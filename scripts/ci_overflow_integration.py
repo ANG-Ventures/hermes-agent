@@ -42,12 +42,6 @@ _PLANNER_JOBS = ("Generate slices", "Placement")
 
 
 # -- pure gates (unit-tested; take data, not the network) ---------------------------------------
-# The no-plan e2e fallback ends in a HOSTED runner: the literal ubuntu-latest, or (fork #1664)
-# the CI_E2E_RUNNER repo var defaulting to Blacksmith 4vCPU. Either is static, never the local pool.
-_E2E_HOSTED_TAILS = ("|| '[\"ubuntu-latest\"]'))",
-                     "|| format('[\"{0}\"]', vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404')))")
-
-
 def _jobs(workflow_text: str) -> dict:
     data = yaml.safe_load(workflow_text)
     return data["jobs"]
@@ -76,7 +70,7 @@ def fallback_predicate(workflow_text: str) -> CheckResult:
         if gate not in matrix:
             problems.append(f"placement matrix not gated by {gate!r}")
     e2e_runs_on = str((jobs.get("e2e") or {}).get("runs-on", ""))
-    if not e2e_runs_on.rstrip("} ").endswith(_E2E_HOSTED_TAILS) or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
+    if not e2e_runs_on.rstrip("} ").endswith("|| '[\"blacksmith-4vcpu-ubuntu-2404\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
         problems.append("e2e runs-on does not end in the static CI_RUNNER_LABELS fallback")
     if json.dumps(LOCAL_LABELS).replace(" ", "") in e2e_runs_on.replace(" ", "").replace("'", ""):
         problems.append("e2e runs-on can select the fixed local pool")

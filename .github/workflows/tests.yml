@@ -481,22 +481,18 @@ jobs:
     # Managed mode with a validated, attempt-bound plan uses its labels; every
     # other case (static routing, switch OFF, or no plan) uses the legacy X64
     # expression over CI_RUNNER_LABELS — never a fixed local pool (t_42bed567).
-    # The hosted fallback is Blacksmith 4vCPU (CI_E2E_RUNNER overrides): e2e
-    # ran 26 min on 2-core ubuntu-latest across #1624 rounds 4-7 (2026-10-03).
+    # The static last-resort label is Blacksmith 4vCPU (a literal, never a
+    # vars.* expression: ci_overflow_integration.fallback_predicate and
+    # tests/ci/test_plumbing_runner_routing pin it so the fallback can never
+    # resolve to an unset variable). e2e ran 26 min on 2-core ubuntu-latest
+    # across #1624 rounds 4-7 (2026-10-03).
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || format('["{0}"]', vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404'))) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-
-      - name: Neutralize Blacksmith login-shell HOME reset
-        # Blacksmith VMs ship /etc/profile.d/blacksmith.sh, which sets HOME=/home/runner in every
-        # login shell. The e2e suites drive real `bash -lic` sessions under a sandbox HOME, so the
-        # installed ~/.local/bin/hermes vanished (#1624 run 37110864809: e2e-upgrade core + hosts).
-        # Steps run --noprofile, so nothing else reads it. No-op off Blacksmith.
-        run: if [ -f /etc/profile.d/blacksmith.sh ]; then sudo mv /etc/profile.d/blacksmith.sh /etc/profile.d/blacksmith.sh.disabled; fi
 
       - name: Set up locked Python, Node and test dependencies
         # toolchain: all puts PM's locked Node in the runner's PM store, not
@@ -565,12 +561,16 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e-upgrade-plan:
-    # One e2e-upgrade shard per suite directory: the files directly under
-    # tests/e2e/core/upgrade ("core") plus every subdirectory that holds
-    # test_*.py (pm, git, handoff, network, hosts, ...). A new suite
-    # directory gets its own shard without editing this file, and no shard
-    # carries the whole tree's wall time against the 60-minute timeout.
-    # Skipping this job skips every e2e-upgrade shard with it.
+    # One e2e-upgrade shard per TEST FILE: "<suite>/<file-stem>" for every
+    # test_*.py directly under tests/e2e/core/upgrade (suite "core") and under
+    # each suite subdirectory (pm, git, handoff, network, hosts, ...). A new
+    # file or directory gets its own shard without editing this file. Per-file
+    # because the lane runs on Blacksmith, which bills vCPU-minutes, not jobs
+    # (Ace 2026-10-03): N short jobs cost what one long one does, and the lane's
+    # wall time becomes its slowest FILE (~3-5 min) instead of its slowest
+    # directory (pm, 11 min on 4 vCPU; git was 48 min on 2-core ubuntu-latest).
+    # The run step still accepts a bare directory name, so a hand-dispatched
+    # "git" shard keeps working. Skipping this job skips every shard with it.
     if: inputs.e2e_upgrade
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -588,9 +588,11 @@ jobs:
           shards=$(python3 - <<'PY'
           import json, pathlib
           root = pathlib.Path("tests/e2e/core/upgrade")
-          shards = ["core"] if any(root.glob("test_*.py")) else []
-          shards += sorted(d.name for d in root.iterdir()
-                           if d.is_dir() and not d.name.startswith(("_", ".")) and any(d.rglob("test_*.py")))
+          shards = sorted(f"core/{f.stem}" for f in root.glob("test_*.py"))
+          for d in sorted(root.iterdir()):
+              if d.is_dir() and not d.name.startswith(("_", ".")):
+                  shards += sorted(f"{d.name}/{f.relative_to(d).with_suffix('').as_posix()}"
+                                   for f in d.rglob("test_*.py"))
           print(json.dumps(shards))
           PY
           )
@@ -625,13 +627,6 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Neutralize Blacksmith login-shell HOME reset
-        # Blacksmith VMs ship /etc/profile.d/blacksmith.sh, which sets HOME=/home/runner in every
-        # login shell. The e2e suites drive real `bash -lic` sessions under a sandbox HOME, so the
-        # installed ~/.local/bin/hermes vanished (#1624 run 37110864809: e2e-upgrade core + hosts).
-        # Steps run --noprofile, so nothing else reads it. No-op off Blacksmith.
-        run: if [ -f /etc/profile.d/blacksmith.sh ]; then sudo mv /etc/profile.d/blacksmith.sh /etc/profile.d/blacksmith.sh.disabled; fi
 
       - name: Fetch upstream release tags
         # Fork: the release tags (v2026.*) are cut on NousResearch/hermes-agent and this
@@ -722,11 +717,14 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          if [ "$SHARD" = core ]; then
-            mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort)
-          else
-            mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort)
-          fi
+          # SHARD is "<suite>/<file-stem>" (per-file, the plan's default) or a
+          # bare suite directory name (hand dispatch / older plans).
+          case "$SHARD" in
+            core/*)  mapfile -t files < <(ls "tests/e2e/core/upgrade/${SHARD#core/}.py") ;;
+            */*)     mapfile -t files < <(ls "tests/e2e/core/upgrade/$SHARD.py") ;;
+            core)    mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort) ;;
+            *)       mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort) ;;
+          esac
           # A shard that collects nothing is a wiring bug, not a pass.
           [ "${#files[@]}" -gt 0 ] || { echo "no test files for shard $SHARD" >&2; exit 1; }
           printf 'shard %s: %s\n' "$SHARD" "${files[*]}"
@@ -735,7 +733,8 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
-          # shard holds at most ~7 files, so this runs each shard in one wave.
+          # a per-file shard holds one file; 6 keeps a hand-dispatched suite
+          # shard (<=7 files) in one wave. A single file never forks more.
           HERMES_TEST_WORKERS: "6"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           # The hang detector (scripts/run_tests_parallel.py --idle-timeout,

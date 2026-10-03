@@ -33,6 +33,8 @@ UID = os.getuid()
 
 _ENV_ALLOW = ("LANG", "LC_ALL", "TZ", "TERM", "SHELL", "USER", "LOGNAME", "TMPDIR", "SSL_CERT_FILE")
 _SHIMMED = ("systemctl", "launchctl", "sudo", "loginctl", "journalctl")
+# Host-image startup files that rewrite HOME/PATH in login shells and exist on no user machine.
+_VENUE_PROFILE_OVERRIDES = (Path("/etc/profile.d/blacksmith.sh"),)
 
 
 def _bwrap_usable() -> bool:
@@ -166,6 +168,16 @@ def sandbox_argv(argv: Sequence[str], *, writable: Iterable[Path], unshare_net: 
         cmd += ["--tmpfs", str(run_user)]
     for src, dest in ro_binds:
         cmd += ["--ro-bind", str(src), str(dest)]
+    # Venue artifact (Blacksmith runner image, measured 2026-10-03): its
+    # /etc/profile.d/blacksmith.sh re-exports HOME to the runner user's real
+    # home inside EVERY login shell, so a `bash -lic` probe run with HOME at a
+    # sandbox never reads the rc files install.sh wrote there and `hermes` is
+    # not on PATH (4 tests red on blacksmith-4vcpu, green on ubuntu-latest).
+    # No user machine has this file; mask it so the login-shell contract is
+    # tested against the distro's startup chain, not the CI venue's.
+    for venue_file in _VENUE_PROFILE_OVERRIDES:
+        if venue_file.is_file():
+            cmd += ["--ro-bind", "/dev/null", str(venue_file)]
     if unshare_net:
         cmd += ["--unshare-net"]
     cmd += ["--unshare-pid", "--proc", "/proc", "--die-with-parent", "--"]
