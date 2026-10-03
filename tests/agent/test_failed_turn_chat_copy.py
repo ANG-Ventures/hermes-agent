@@ -17,6 +17,7 @@ from agent.turn_loop_errors import handle_outer_loop_error
 from agent.turn_recovery import max_retries_exhausted_result, nonretryable_client_error_result
 from agent.turn_failure_copy import SITE_FAILURE_CODES
 from agent.turn_response_check import retry_invalid_response
+from agent.turn_retry_state import TurnRetryState
 
 
 class _Agent:
@@ -40,7 +41,11 @@ class _Agent:
     def _has_pending_fallback(self):
         return False
 
-    def _try_activate_fallback(self):
+    # Fork: the quota-registry gate reads this; the catch-all __getattr__ below would hand it a
+    # truthy lambda and turn the short-wait copy into "the soonest resets in <lambda>".
+    _quota_gate_soonest_reset_text = None
+
+    def _try_activate_fallback(self, **_kwargs):
         return False
 
     def __getattr__(self, name):
@@ -155,7 +160,9 @@ def test_invalid_response_stamps_reason_from_embedded_provider_code():
     response = SimpleNamespace(error=SimpleNamespace(code=429, metadata={"provider_name": "Acme"}), choices=[])
     verdict = retry_invalid_response(
         agent, response=response, error_details=["no choices"],
-        _retry=SimpleNamespace(restart_with_redirected_messages=False), thinking_spinner=None,
+        # Fork retry state carries more one-shot guards than this test's SimpleNamespace stand-in
+        # (invalid_response_retry_floor/_done); use the real per-attempt state.
+        _retry=TurnRetryState(), thinking_spinner=None,
         messages=[], api_messages=[], api_kwargs=None, active_system_prompt=None, conversation_history=None,
         retry_count=2, max_retries=3, compression_attempts=0, api_call_count=1, api_request_id="r",
         api_start_time=0.0, api_duration=0.4, effective_task_id="t", turn_id="turn",

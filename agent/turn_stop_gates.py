@@ -162,8 +162,16 @@ def apply_stop_gates(
     if _kanban_nudge:
         agent._kanban_stop_nudges = getattr(agent, "_kanban_stop_nudges", 0) + 1
         final_msg["finish_reason"] = "kanban_terminal_required"
-        final_msg["_kanban_stop_synthetic"] = True
+        # The assistant candidate is real model output — persist it (same contract as
+        # verify-on-stop, #65919 §7). Only the nudge is flagged synthetic and stripped from the
+        # durable transcript; dropping the candidate left a forensic hole in state.db where the
+        # next row (often a bare kanban_block) appeared to answer nothing (t_4eeb0202). On resume,
+        # repair_message_sequence collapses it into the following assistant turn.
         append_message(messages, final_msg)
+        try:
+            agent._flush_messages_to_session_db(messages, conversation_history)
+        except Exception:
+            logger.debug("kanban stop-guard interim flush failed", exc_info=True)
         verdict = _continue(_kanban_nudge, "_kanban_stop_synthetic")
         logger.info(
             "kanban stop-loop nudge issued (attempt %d) task=%s",

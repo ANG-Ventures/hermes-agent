@@ -278,7 +278,11 @@ def should_compress_request(
             return compressor.should_compress(rough_tokens)
         return compressor.should_compress(anchored_tokens)
     if callable(gate):
-        return call_with_messages(gate, rough_tokens, messages)
+        verdict = call_with_messages(gate, rough_tokens, messages)
+        if isinstance(verdict, bool):
+            return verdict
+        # Non-bool double (a MagicMock compressor from an upstream test returns a truthy child
+        # mock): fall back to the configured threshold, as the anchored path does.
     return compressor.should_compress(rough_tokens)
 
 
