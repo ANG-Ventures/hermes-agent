@@ -414,10 +414,12 @@ async def test_global_switch_reports_failed_stale_override_cleanup(tmp_path, mon
     session_key = runner._session_key_for_source(source)
     runner.session_store.get_or_create_session(source)
 
-    def _locked(key, override):
+    def _locked(key):
         raise OSError("store locked")
 
-    monkeypatch.setattr(runner.session_store, "set_model_override", _locked)
+    # Fork: the --global clear goes through the single door, whose store write is the
+    # atomic identity + mirror clear (clear_model_route_override), not set_model_override.
+    monkeypatch.setattr(runner.session_store, "clear_model_route_override", _locked)
 
     confirmation = await _typed_global(runner)
 
