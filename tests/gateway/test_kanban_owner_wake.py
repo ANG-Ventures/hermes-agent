@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gateway import kanban_home_route as hr
 from gateway import kanban_owner_wake as ow
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
@@ -59,6 +60,10 @@ def env(tmp_path, monkeypatch):
     runner.session_store = store
     runner._active_profile_name = lambda: "default"
     health: dict = {}
+    # The one state.db read: worker / cron rows have no gateway session key.
+    rows = {"20261003_cron_000000": {"source": "cron", "session_key": None},
+            "20261003_110000_worker": {"source": "kanban", "session_key": None}}
+    monkeypatch.setattr(hr, "read_session_row", lambda sid: rows.get(sid))
     monkeypatch.setattr(ow, "default_pr_health", lambda: (lambda repo, n: health.get((repo, n))))
     return {"store": store, "owner": owner, "adapter": adapter, "runner": runner,
             "health": health, "monkeypatch": monkeypatch}
@@ -234,8 +239,13 @@ def test_burst_is_one_turn_and_window_holds_then_lists(env):
                                      "20261003_110000_worker"])
 def test_card_without_live_operator_home_gets_line_only(env, session):
     tid = _card(env, session=session)
+    with kb.connect_closing() as conn:
+        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=OTHER_CHAT,
+                          chat_type="group", user_id=HUMAN, delivery_mode="notify")
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
-    assert _tick(env) == []
+    assert _tick(env) == [], "no turn for a card with no live operator home"
+    assert [m["chat_id"] for m in env["adapter"].sent] == [OTHER_CHAT], "today's line still posts"
+    assert env["runner"]._kanban_owner_wake_state.pending == {}, "dropped, not held for retry"
 
 
 def test_non_operator_gateway_never_wakes(env):
@@ -309,3 +319,9 @@ def test_pr_red_or_dirty_pure():
     assert ow.pr_is_red_or_dirty({"state": "merged", "failing": ["x"]}) is None
     assert ow.pr_is_red_or_dirty(None) is None
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["lint"]}) == "red: lint"
+
+
+def test_heartbeat_is_never_a_trigger_pure():
+    assert "heartbeat" not in ow.SCAN_KINDS
+    assert ow.is_stuck("heartbeat", {}) is False
+    assert ow.is_stuck("reclaimed", {"heartbeat_stale": False}) is False
