@@ -22,7 +22,13 @@ REPO = Path(__file__).resolve().parents[4]
 PY = sys.executable
 
 # Clocks shrunk through the documented env knobs, never by patching code.
-KANBAN_FAST_CONFIG = "kanban:\n  rate_limit_cooldown_seconds: 0\n  receipt_gate: false\n"
+KANBAN_FAST_CONFIG = (
+    "kanban:\n"
+    "  rate_limit_cooldown_seconds: 0\n"
+    "  receipt_gate: false\n"
+    "  dispatch_load_gate:\n"
+    "    enabled: false\n"
+)
 FAST_ENV = {
     "HERMES_KANBAN_CRASH_GRACE_SECONDS": "0",
     "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS": "0",
@@ -84,6 +90,12 @@ class Board:
             #   fills the documented default (300s) when unset — pin the next-tick retry.
             # - ``kanban.receipt_gate`` (#1621, default on) refuses a worker's prose-only
             #   ``kanban_complete``; these rigs script exactly that, so opt out.
+            # - ``kanban.dispatch_load_gate`` (default on, pause_above = ncpu, 2.0 load per
+            #   worker ramping over 600 s) sizes a tick's spawns from the HOST's load1. On a
+            #   4-core runner one spawn books 2.0 of pending ramp for 10 min, so every later
+            #   one-shot ``kanban dispatch`` is ``saturated`` (allowance 0) and the respawn /
+            #   reviewer these rigs expect on the NEXT tick never comes. The gate guards a
+            #   shared production host; a scratch board whose ticks are the test is not one.
             + ("" if "kanban:" in self.extra_config else KANBAN_FAST_CONFIG)
             + self.extra_config,
             encoding="utf-8",

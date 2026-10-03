@@ -278,7 +278,16 @@ def run(column: str, root: Path) -> SimpleNamespace:
     o = SimpleNamespace(column=column)
     model = Model(f"CRON-HANDOFF-{secrets.token_hex(4)}")
     with FakeLLMServer(model) as srv, X.cell(
-            column, root, srv.base_url, extra={"kanban": {"dispatch_interval_seconds": 3}}) as inst:
+            column, root, srv.base_url, extra={"kanban": {
+                "dispatch_interval_seconds": 3,
+                # Fork pins (see tests/e2e/core/kanban/_helpers.KANBAN_FAST_CONFIG): the receipt
+                # gate (#1621) refuses this model's prose-only ``kanban_complete``, and the host
+                # load gate (pause_above = ncpu, 2.0 per worker over a 600 s ramp) leaves the
+                # 4-core runner ``saturated`` after one spawn, so the card created after the
+                # update is never started. N-1 (upstream) ignores both keys.
+                "receipt_gate": False,
+                "dispatch_load_gate": {"enabled": False},
+            }}) as inst:
         before = X.start_gateway(inst)
         o.old_pid = before["pid"]
         with X.FileWatch(inst.hermes_home / "gateway.pid") as watch:
