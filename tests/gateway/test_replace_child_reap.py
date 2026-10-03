@@ -96,12 +96,10 @@ class TestReapGatewayChildren:
         """
         import os
 
-        real_psutil = pytest.importorskip("psutil")
-        ancestors = [p.pid for p in real_psutil.Process().parents()]
         fake = _fake_psutil(monkeypatch)
-        fake.Process.side_effect = real_psutil.Process
+        fake.Process.return_value.parents.return_value = [_FakeChild(777)]
         me = _FakeChild(os.getpid(), ppid=1)
-        kin = [_FakeChild(pid, ppid=1) for pid in ancestors[:1]]
+        kin = [_FakeChild(777, ppid=1)]
         stranger = _FakeChild(999_999, ppid=1)
 
         reaped = status.reap_gateway_children([me, *kin, stranger], parent_pid=42)
