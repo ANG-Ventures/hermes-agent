@@ -329,8 +329,13 @@ print("LEFTOVER:" + repr(buf), flush=True)
 """
 
 
-def _run_osc11_child(reply_fn, repo_root, timeout=8.0):
+def _run_osc11_child(reply_fn, repo_root, timeout=30.0):
     """Fork a PTY child running _query_osc11_background().
+
+    fork (parity 2026-10-01 CI): wall 8 s -> 30 s. A mute terminal costs the child two 1 s OSC deadlines
+    (import-time probe + explicit call) + a 0.6 s drain on top of `import cli`; on a loaded slice
+    (#1624 run 37111967162, file 65 s) the 8 s wall cut it after RESULT, before LEFTOVER. The loop
+    still exits the moment LEFTOVER arrives.
 
     reply_fn(query_age_seconds) -> bytes to write once, or None to wait.
     Returns (result_line, leftover_line).
