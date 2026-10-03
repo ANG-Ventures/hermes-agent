@@ -33,6 +33,7 @@ def ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(blackbox, "_provisional_turns", {})
     monkeypatch.setattr(cli_mod, "_handed_off_session_ids", set())
     monkeypatch.setattr(br, "_live_review_agents", {})
+    monkeypatch.setattr(br, "_host_exit_reason", None)
     store._connect().close()
     HOOKS.clear()
 

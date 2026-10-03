@@ -55,6 +55,71 @@ def live_background_review_agents() -> list:
         return list(_live_review_agents.values())
 
 
+# Set once by a host that is exiting (CLI cleanup / signal). After it is set no
+# review fork is spawned or admitted to its request phase. Without it a fork
+# registered above but not yet in its turn has no ``_current_turn_id`` when the
+# exit path snapshots it, so nothing records it, and its first call lands after
+# the snapshot with no ``turns`` row (blackbox-orphan-guard 2026-10-02: 7 of 8
+# orphans, fork turn starting 43-124 ms around CLI cleanup; t_ab5f2c3f).
+_host_exit_reason: Optional[str] = None
+# How long the exit path waits for an admitted fork to bind its turn id.
+_EXIT_FENCE_BIND_WAIT_S = 2.0
+
+
+def host_exit_reason() -> Optional[str]:
+    return _host_exit_reason
+
+
+def background_review_admitted(review_agent: Any) -> bool:
+    """Admit a fork to its request phase unless the host is exiting.
+
+    Shares the registry lock with :func:`fence_background_reviews_for_exit`,
+    so a fork is either refused here or visible to the fence as admitted.
+    """
+    with _live_review_agents_lock:
+        if _host_exit_reason is not None:
+            return False
+        try:
+            review_agent._review_request_admitted = True
+        except (AttributeError, TypeError):
+            pass
+        return True
+
+
+def fence_background_reviews_for_exit(
+    reason: str, bind_wait_s: Optional[float] = None
+) -> list:
+    """Close review admission for an exiting host and return the live forks.
+
+    A fork admitted before the fence may not have bound its turn id yet; wait
+    (bounded) until it has, or has left the registry, so the caller can
+    record its turn as abandoned.
+    """
+    global _host_exit_reason
+    import time
+
+    with _live_review_agents_lock:
+        if _host_exit_reason is None:
+            _host_exit_reason = str(reason or "exit")
+        agents = list(_live_review_agents.values())
+    wait_s = _EXIT_FENCE_BIND_WAIT_S if bind_wait_s is None else bind_wait_s
+    deadline = time.monotonic() + max(0.0, wait_s)
+
+    def _unbound(a: Any) -> bool:
+        if not getattr(a, "_review_request_admitted", False):
+            return False
+        if getattr(a, "_current_turn_id", None):
+            return False
+        with _live_review_agents_lock:
+            return _live_review_agents.get(id(a)) is a
+
+    pending = [a for a in agents if _unbound(a)]
+    while pending and time.monotonic() < deadline:
+        time.sleep(0.02)
+        pending = [a for a in pending if _unbound(a)]
+    return agents
+
+
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
 
 
@@ -98,6 +163,8 @@ class _BackgroundReviewRun:
 
 def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
     """Install a unique run token on the parent before ``Thread.start()``."""
+    if _host_exit_reason is not None:
+        return None  # host is exiting: a fork started now would be orphaned
     lock = getattr(agent, "_background_review_lock", None)
     if lock is None:
         try:
@@ -1693,7 +1760,7 @@ def _run_review_in_thread(
             try:
                 request_admitted = (
                     review_run is None or review_run.begin_request(review_agent)
-                )
+                ) and background_review_admitted(review_agent)
                 _review_result = None
                 if request_admitted:
                     # Routed to a different model -> replay a digest (cache is cold
