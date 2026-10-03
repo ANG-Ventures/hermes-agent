@@ -3224,6 +3224,18 @@ def _worktree_commit(repo, task_id):
                 f"kanban survivor: {task_id} workspace (was NOT PUSHED)", env=identity).stdout.decode().strip()
 
 
+def _oversize_branch(task_id, key):
+    """``kanban-survivor/<task>`` for the workspace root, else ``.../<readable key>-<sha1(key)[:12]>``. The
+    readable part alone collides (``a/b`` and ``a-b`` both sanitise to ``a-b``) and a second forced push
+    would silently replace the first repo's snapshot (Prism P1 on hermes-agent#1636); the digest of the
+    raw key keeps distinct keys on distinct refs."""
+    if key == ".":
+        return f"{SURVIVOR_BRANCH_PREFIX}{task_id}"
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", key).strip("-.") or "repo"
+    digest = hashlib.sha1(key.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    return f"{SURVIVOR_BRANCH_PREFIX}{task_id}/{readable}-{digest}"
+
+
 def _push_oversize(repo, key, task_id, workspace):
     """``(ref, None)`` once the whole working tree of ``repo`` is a commit on a durable remote, read back
     by ``ls-remote``; else ``(None, why)``. The commit holds what ``_snapshot`` would have (tracked +
@@ -3233,8 +3245,7 @@ def _push_oversize(repo, key, task_id, workspace):
         return None, "no push remote configured"
     if not _durable_remote(repo, name, workspace):
         return None, f"push remote {name} is not durable"
-    suffix = "" if key == "." else "/" + re.sub(r"[^A-Za-z0-9._-]+", "-", key)
-    branch = f"{SURVIVOR_BRANCH_PREFIX}{task_id}{suffix}"
+    branch = _oversize_branch(task_id, key)
     try:
         sha = _worktree_commit(repo, task_id)
         pushed = _git(repo, "push", "--force", "--no-verify", url, f"{sha}:refs/heads/{branch}",
