@@ -131,9 +131,10 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # The runner's own documented environment knobs must survive the hermetic
 # `env -i` below, or they are silent no-ops for anyone invoking this script:
 #
-#   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE are
-#     read by run_tests_parallel.py at argparse-default time — inside the
-#     stripped environment.
+#   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE and
+#     CI_TEST_IDLE_TIMEOUT (the hang detector) are read by
+#     run_tests_parallel.py at argparse-default time — inside the stripped
+#     environment.
 #   * HERMES_TEST_IMAGE is read by tests/docker/conftest.py to skip its
 #     session-scoped `docker build`. CI's docker.yml sets it to the image
 #     the build step just loaded; stripping it made every per-file pytest
@@ -160,7 +161,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_WORKERS_FORCE \
   HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE CI_TEST_IDLE_TIMEOUT \
   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS; do
   if [ -n "${!_test_var:-}" ]; then
