@@ -345,6 +345,14 @@ _KANBAN_DIGEST_NOTE_STRIPPED = (
         ("Mode:\n**Silent**", "Mode:\n**Silent**"),
         ("note\nno_reply", "note\nno_reply"),
         ("line one\nline two\n\nNO_REPLY\n\n", "line one\nline two"),
+        # Repeated trailing tokens all go (t_21da8a38, Prism c7fca8d2bc4c).
+        ("note\nNO_REPLY\nNO_REPLY", "note"),
+        ("note\n\nNO_REPLY\n\n[SILENT]\n", "note"),
+        ("note\n*NO_REPLY*\n`[SILENT]`", "note"),
+        # Token-only multi-line reply: left for the silence rules.
+        ("NO_REPLY\nNO_REPLY", "NO_REPLY\nNO_REPLY"),
+        # Prose last line above a token is kept (strict matching).
+        ("note\nNo reply.\nNO_REPLY", "note\nNo reply."),
         # Whole-response marker: left for the silence rules, not stripped.
         ("NO_REPLY", "NO_REPLY"),
         ("\n\nNO_REPLY\n", "\n\nNO_REPLY\n"),
@@ -358,6 +366,8 @@ _KANBAN_DIGEST_NOTE_STRIPPED = (
 )
 def test_strip_trailing_silence_marker(raw, expected):
     assert strip_trailing_silence_marker(raw) == expected
+    # Idempotent: double-cleaning paths deliver what single-cleaning ones do.
+    assert strip_trailing_silence_marker(expected) == expected
 
 
 def test_trailing_strip_tokens_are_silence_markers():

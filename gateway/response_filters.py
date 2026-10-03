@@ -187,18 +187,27 @@ def strip_trailing_silence_marker(response: Any) -> Any:
     edge punctuation) is safe only when the WHOLE reply must be the marker;
     on the last line of a longer human reply it would delete real prose such
     as ``"No reply."`` or ``"Silent."`` (Prism #1668 c7fca8d2bc4c).
+
+    Every consecutive trailing token line goes (``"note\\nNO_REPLY\\nNO_REPLY"``
+    loses both), so the strip is idempotent: a path that cleans a reply twice
+    delivers what a path that cleans it once does (Prism #1668 c7fca8d2bc4c).
     """
     if not isinstance(response, str):
         return response
+
+    def _is_strip_token(line: str) -> bool:
+        t = line.strip()
+        while len(t) >= 2 and t[0] == t[-1] and t[0] in "*_`":
+            t = t[1:-1].strip()
+        return t in TRAILING_STRIP_TOKENS
+
     lines = response.rstrip().split("\n")
-    if len(lines) < 2:
+    end = len(lines)
+    while end > 0 and (not lines[end - 1].strip() or _is_strip_token(lines[end - 1])):
+        end -= 1
+    if end == len(lines):
         return response
-    last = lines[-1].strip()
-    while len(last) >= 2 and last[0] == last[-1] and last[0] in "*_`":
-        last = last[1:-1].strip()
-    if last not in TRAILING_STRIP_TOKENS:
-        return response
-    head = "\n".join(lines[:-1]).rstrip()
+    head = "\n".join(lines[:end]).rstrip()
     if not head.strip():
         return response
     return head
