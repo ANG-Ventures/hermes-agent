@@ -19053,9 +19053,13 @@ class DispatchResult:
     """Mount or persisted-workspace failures, refused BEFORE claiming a run."""
     skill_refused: list[tuple[str, list[str]]] = field(default_factory=list)
     """``(task_id, missing_skills)`` for cards blocked BEFORE claiming a run
-    because a card skill does not resolve for the assignee profile (the worker
-    would exit ``Unknown skill(s)`` at startup). See
+    because NO skill the worker would be given resolves for the assignee
+    profile (the worker would exit ``Unknown skill(s)`` at startup). See
     :func:`_card_skills_refused`."""
+    skill_degraded: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(task_id, missing_skills)`` for cards dispatched although SOME card
+    skill does not resolve: the worker loads the rest and skips these with a
+    warning, so the dispatcher comments on the card instead of blocking it."""
     spawn_failed: list[str] = field(default_factory=list)
     """Task ids whose spawn attempt failed THIS tick — recorded on every
     failure (workspace resolution or worker launch), whether or not it was
@@ -25707,19 +25711,33 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
 
 
 def _card_skills_refused(conn, task_id, assignee, result, *, dry_run) -> bool:
-    """Block a card whose ``skills`` the assignee profile cannot load.
+    """Block a card whose ``skills`` would crash the assignee's worker.
 
-    The worker resolves ``--skills`` against its own profile home; when none
-    resolve it exits 1 at startup, the crash counter retries it and gives up
-    (t_0b786d9b, three spawns). Refusing here names the missing skill and the
-    directory it lives in, before any run is claimed. Fails open on any error.
+    The worker resolves ``--skills`` against its own profile home. Its
+    contract (``cli.py`` ``finalize_preloaded_skills`` / ``tui_gateway``
+    ``server.py``) is all-or-nothing: when NO requested skill loads it exits 1
+    at startup (``Unknown skill(s)``), the crash counter retries it and gives
+    up (t_0b786d9b, three spawns); when at least one loads it logs a warning
+    and runs without the rest. ``_default_spawn`` adds ``--skills
+    kanban-worker`` whenever that skill resolves for the profile, so that
+    counts as a loaded skill too.
+
+    This mirrors the split exactly: a card whose worker would crash is blocked
+    (kind=capability) with the missing skill and the directory it lives in,
+    before any run is claimed; a card whose worker would run degraded is
+    dispatched and gets ONE dispatcher comment naming what it runs without
+    (the worker's own warning only reaches its log). Fails open on any error.
     """
     task = get_task(conn, task_id)
     if task is None or not task.skills or not assignee:
         return False
     try:
         from pathlib import Path as _Path
-        from hermes_cli.kanban_skill_resolve import refusal_reason, unresolved_skills
+        from hermes_cli.kanban_skill_resolve import (
+            degraded_reason,
+            refusal_reason,
+            unresolved_skills,
+        )
         from hermes_cli.profiles import get_profile_dir
 
         home = _Path(get_profile_dir(assignee))
@@ -25729,18 +25747,45 @@ def _card_skills_refused(conn, task_id, assignee, result, *, dry_run) -> bool:
         if task.workspace_path and (task.workspace_kind or "scratch") != "scratch":
             ws = _Path(task.workspace_path).expanduser()
             extra = [ws / ".hermes" / "skills", ws / ".agents" / "skills"]
-        names = [s for s in task.skills if s and s != "kanban-worker"]
+        # The exact ``--skills`` list the worker gets (see ``_default_spawn``):
+        # kanban-worker when it resolves for the profile, then the card's
+        # skills minus kanban-worker.
+        names = [s for s in dict.fromkeys(task.skills) if s and s != "kanban-worker"]
+        injected = ["kanban-worker"] if _kanban_worker_skill_available(str(home)) else []
         missing = unresolved_skills(names, home, extra_dirs=extra)
         if not missing:
             return False
+        # Unjudgeable identifiers (plugin-qualified, absolute) never appear in
+        # ``missing`` and so count as loadable here -- failing open.
+        loaded = injected + [n for n in names if n not in missing]
         try:
             root_home = _Path(get_profile_dir("default"))
         except Exception:
             root_home = None
-        reason = refusal_reason(assignee, home, missing, root_home)
+        if loaded:
+            reason = degraded_reason(assignee, home, missing, root_home, loaded)
+        else:
+            reason = refusal_reason(assignee, home, missing, root_home)
     except Exception:
         _log.debug("kanban dispatch: card skill check failed open for %s",
                    task_id, exc_info=True)
+        return False
+    if loaded:
+        result.skill_degraded.append((task_id, missing))
+        if dry_run:
+            return False
+        _log.warning("PHASE=kanban_skill_degraded task=%s assignee=%s missing=%s loaded=%s",
+                     task_id, assignee, ",".join(missing), ",".join(loaded))
+        already_logged = conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? AND body = ? LIMIT 1",
+            (task_id, reason),
+        ).fetchone()
+        if not already_logged:
+            with write_txn(conn):
+                add_comment(conn, task_id, "dispatcher", reason)
+                _append_event(conn, task_id, "skill_degraded",
+                              {"assignee": assignee, "missing": missing,
+                               "loaded": loaded})
         return False
     result.skill_refused.append((task_id, missing))
     if dry_run:

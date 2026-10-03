@@ -7,7 +7,12 @@ When every requested skill is missing the worker exits 1 at startup
 (``Error: Unknown skill(s): ...``), the dispatcher counts a crash, retries,
 and gives up -- three wasted spawns for a config gap that was knowable before
 the first one (2026-10-03, card t_0b786d9b: ``power-outage-recovery`` and
-``ups-nut-fleet`` live in an external dir the assignee did not list).
+``ups-nut-fleet`` live in an external dir the assignee did not list). When at
+least one skill loads the worker only logs ``Unknown skill(s) requested,
+skipping`` and runs without the rest (``cli.py`` /
+``tui_gateway/server.py``); the dispatcher mirrors that split -- it blocks
+only the card that would crash and comments on the card that would run
+degraded -- so no card is blocked that the worker would have run.
 
 This module answers, without importing the profile's process-global config:
 which card skills does profile X fail to resolve, and where do they live
@@ -225,13 +230,13 @@ def locate_skill(name: str, roots: Iterable[Path]) -> list[Path]:
     return hits
 
 
-def refusal_reason(
+def _unresolved_summary(
     assignee: str,
     home: Path,
     missing: list[str],
     root_home: Optional[Path],
 ) -> str:
-    """One-line block reason naming each missing skill and where it lives."""
+    """``card skill(s) unresolvable for assignee ...: <name> (lives in ...)``."""
     roots = [r for r in candidate_roots(home, root_home)
              if r not in profile_skill_dirs(home)]
     parts: list[str] = []
@@ -245,6 +250,43 @@ def refusal_reason(
     return (
         f"card skill(s) unresolvable for assignee {assignee!r} "
         f"({home / 'config.yaml'}): " + "; ".join(parts)
+    )
+
+
+def refusal_reason(
+    assignee: str,
+    home: Path,
+    missing: list[str],
+    root_home: Optional[Path],
+) -> str:
+    """One-line block reason for a card whose worker would crash at startup.
+
+    Only correct when EVERY skill the worker would be given is missing; for
+    the partial case use :func:`degraded_reason`.
+    """
+    return (
+        _unresolved_summary(assignee, home, missing, root_home)
         + ". The worker would exit 'Unknown skill(s)' at startup. Fix the "
         "profile's skills.external_dirs (or the card's skills), then unblock."
+    )
+
+
+def degraded_reason(
+    assignee: str,
+    home: Path,
+    missing: list[str],
+    root_home: Optional[Path],
+    loaded: list[str],
+) -> str:
+    """One-line card comment for a worker that runs WITHOUT some card skills.
+
+    The CLI skips unknown skills when at least one requested skill loads, so
+    the card is dispatched; this names what the worker is running without and
+    where it lives, which the worker's own log line never surfaces.
+    """
+    return (
+        _unresolved_summary(assignee, home, missing, root_home)
+        + ". The worker runs WITHOUT them (it loads " + ", ".join(loaded)
+        + " and skips unknown skills). Fix the profile's skills.external_dirs "
+        "(or the card's skills) before the next dispatch to load them."
     )

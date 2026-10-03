@@ -101,8 +101,12 @@ def test_external_dir_expands_home_var_as_the_worker(tmp_path, monkeypatch):
 
 
 def test_dispatch_blocks_card_naming_the_missing_category(kanban_home):
+    """No skill the worker would be given resolves -> it would exit
+    ``Unknown skill(s)``; block before claiming a run (t_0b786d9b)."""
     shared = kanban_home / "skills-shared"
-    _profile(kanban_home, "worker", [shared / "general"])
+    _skill(shared / "smart-home", "hue")
+    # lists a category, but not general (kanban-worker) nor devops
+    _profile(kanban_home, "worker", [shared / "smart-home"])
     spawned = []
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -115,10 +119,93 @@ def test_dispatch_blocks_card_naming_the_missing_category(kanban_home):
         events = [e.kind for e in kb.list_events(conn, tid)]
     assert spawned == []
     assert res.skill_refused == [(tid, ["power-outage-recovery", "ups-nut-fleet"])]
+    assert res.skill_degraded == []
     assert task.status == "blocked"
     assert str((shared / "devops").resolve()) in reason, reason
     assert "power-outage-recovery" in reason and "worker" in reason
+    assert "would exit 'Unknown skill(s)'" in reason
     assert "skill_refused" in events
+
+
+def test_dispatch_runs_degraded_when_kanban_worker_loads(kanban_home):
+    """Prism P1 (#1677 r2): the worker only crashes when EVERY ``--skills``
+    is unknown (cli.py finalize_preloaded_skills). ``_default_spawn`` injects
+    kanban-worker when it resolves, so this worker would have started and
+    run without the card skills -- the card must dispatch, not block, and
+    the dispatcher names what the worker runs without."""
+    shared = kanban_home / "skills-shared"
+    _profile(kanban_home, "worker", [shared / "general"])
+    spawned = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="power blip", assignee="worker",
+            skills=["power-outage-recovery", "ups-nut-fleet"],
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda t, ws: spawned.append(t.id))
+        task = kb.get_task(conn, tid)
+        comments = [c.body for c in kb.list_comments(conn, tid)]
+        events = [e.kind for e in kb.list_events(conn, tid)]
+    assert spawned == [tid]
+    assert task.status == "running"
+    assert res.skill_refused == []
+    assert res.skill_degraded == [(tid, ["power-outage-recovery", "ups-nut-fleet"])]
+    assert "skill_refused" not in events and "skill_degraded" in events
+    assert len(comments) == 1, comments
+    assert str((shared / "devops").resolve()) in comments[0]
+    assert "runs WITHOUT" in comments[0] and "kanban-worker" in comments[0]
+
+
+def test_dispatch_runs_degraded_when_one_card_skill_loads(kanban_home):
+    """One of two card skills unknown, no kanban-worker: still at least one
+    loads, so the worker runs (with a warning) -> dispatch + comment."""
+    shared = kanban_home / "skills-shared"
+    _profile(kanban_home, "worker", [shared / "devops"])
+    spawned = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="t", assignee="worker",
+            skills=["ups-nut-fleet", "no-such-skill"],
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda t, ws: spawned.append(t.id))
+        comments = [c.body for c in kb.list_comments(conn, tid)]
+    assert spawned == [tid]
+    assert res.skill_refused == []
+    assert res.skill_degraded == [(tid, ["no-such-skill"])]
+    assert len(comments) == 1 and "no-such-skill (not found" in comments[0]
+    assert "it loads ups-nut-fleet" in comments[0]
+
+
+def test_degraded_comment_is_posted_once(kanban_home):
+    shared = kanban_home / "skills-shared"
+    _profile(kanban_home, "worker", [shared / "general"])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker", skills=["ups-nut-fleet"])
+        for _ in range(2):
+            refused = kb._card_skills_refused(
+                conn, tid, "worker", kb.DispatchResult(), dry_run=False
+            )
+            assert refused is False
+        comments = kb.list_comments(conn, tid)
+        task = kb.get_task(conn, tid)
+    assert len(comments) == 1
+    assert task.status == "ready"
+
+
+def test_dispatch_spawns_nested_legacy_flat_markdown(kanban_home):
+    """Prism P1 (#1677 r1/r2), through dispatch: ``<profile>/skills/devops/
+    recovery.md`` requested as ``recovery`` loads via skill_view strategy 3,
+    so the card is neither blocked nor degraded."""
+    prof = _profile(kanban_home, "worker", [])
+    (prof / "skills" / "devops").mkdir(parents=True)
+    (prof / "skills" / "devops" / "recovery.md").write_text("# legacy\n")
+    spawned = []
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker", skills=["recovery"])
+        res = kb.dispatch_once(conn, spawn_fn=lambda t, ws: spawned.append(t.id))
+        comments = kb.list_comments(conn, tid)
+    assert spawned == [tid]
+    assert res.skill_refused == [] and res.skill_degraded == []
+    assert comments == []
 
 
 def test_dispatch_spawns_when_category_is_listed(kanban_home):
@@ -143,3 +230,16 @@ def test_dispatch_dry_run_reports_without_blocking(kanban_home):
         task = kb.get_task(conn, tid)
     assert res.skill_refused == [(tid, ["ups-nut-fleet"])]
     assert task.status == "ready"
+
+
+def test_dispatch_dry_run_reports_degraded_without_commenting(kanban_home):
+    shared = kanban_home / "skills-shared"
+    _profile(kanban_home, "worker", [shared / "general"])
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker", skills=["ups-nut-fleet"])
+        res = kb.dispatch_once(conn, dry_run=True)
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert res.skill_degraded == [(tid, ["ups-nut-fleet"])]
+    assert res.skill_refused == []
+    assert task.status == "ready" and comments == []
