@@ -1113,7 +1113,10 @@ def test_bare_script_hook_path_executes_on_windows(tmp_path):
     assert result["returncode"] == 7, "the script's own exit code must reach a fail_closed gate"
     assert "ran" in result["stderr"]
 
-    missing = shell_hooks._spawn(spec(str(tmp_path / "gone.sh")), "{}")
+    # The CreateProcess path under test is the single subprocess site. On the fork ``_spawn``
+    # wraps it in the absent-hook self-heal (agent/shell_hooks_missing, #1000), which classifies a
+    # missing script as an infra failure ("hook files missing") before any spawn happens.
+    missing = shell_hooks._spawn_once(spec(str(tmp_path / "gone.sh")), "{}")
     assert missing["error"] == "command not found"
 
 

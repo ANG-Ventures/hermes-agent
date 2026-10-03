@@ -21,6 +21,10 @@ from unittest.mock import patch
 import pytest
 
 import agent.conversation_compression as cc
+# Pre-warm: compress() lazily imports agent.conversation_loop (~34 modules) from inside the
+# summary worker thread, ahead of the stubbed call_llm. On a loaded CI runner that cold import
+# alone ate the 0.4s idle budget, so the first stall unwound with ``calls == []``.
+import agent.conversation_loop  # noqa: F401
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor import SUMMARY_PREFIX, pin_summary_route
 from agent.conversation_compression import CompressionCommitFence, run_compress_context_with_progress_timeout
