@@ -1916,18 +1916,28 @@ def test_approval_for_a_ws_client_that_never_advertised_settles_the_queue_entry(
 
     peer = _silent_ws()
     _ws_session(server, "ws-old-approval", peer)
+    # Hang guard only (the mutated code idles here); the witness below is what gates.
     monkeypatch.setattr(wait_mod._ctx, "_get_approval_timeout", lambda: 3)
     monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
+    # The fact a stopwatch stood in for: the notify path withdraws the entry synchronously, so the
+    # wait loop is entered with its event ALREADY set and never idles. A wall-clock bound here measured
+    # the cold `gateway.run` import inside `_approval_request_payload` instead (1.97 s on an 8-way CI shard).
+    real_poll = wait_mod._poll_event
+    entered_with_event_set: list[bool] = []
+
+    def witnessed_poll(event, session_key, *, interrupt_log):
+        entered_with_event_set.append(event.is_set())
+        return real_poll(event, session_key, interrupt_log=interrupt_log)
+
+    monkeypatch.setattr(wait_mod, "_poll_event", witnessed_poll)
     approval_mod.register_gateway_notify("ws-old-approval", lambda data: server._emit_approval_request("ws-old-approval", data))
     try:
-        t0 = time.monotonic()
         decision = wait_mod._await_gateway_decision(
             "ws-old-approval", approval_mod._gateway_notify_cbs["ws-old-approval"],
             {"command": "rm -rf build", "description": "", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]})
-        waited = time.monotonic() - t0
     finally:
         approval_mod.unregister_gateway_notify("ws-old-approval")
-    assert waited < 1, decision
+    assert entered_with_event_set == [True], ("the wait loop idled on an entry nobody withdrew", decision)
     assert decision["choice"] is None and decision["cancelled"]
     assert peer.frames == []
     assert "ws-old-approval" not in approval_mod._gateway_queues
