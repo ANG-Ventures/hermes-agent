@@ -24,9 +24,13 @@ def test_windows_update_writes_locale_independent_marker_and_result(tmp_path, mo
         "& $env:HERMES_TIMESTAMP_TEST_SCRIPT -InstallRoot $env:HERMES_HOME -NoUi -NoMarkerCleanup -SelfTestMarker"
     )
     started = int(time.time())
+    # 300 s, not upstream's 60: the fork's lane is hosted windows-latest (4 vCPU, 8 files
+    # in flight), not windows-latest-32-core, and the self-test outran 60 s there
+    # (run 37081194693, TimeoutExpired). The marker/receipt bounds below are the contract;
+    # the deadline only has to outlast a loaded runner.
     result = subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
                             env={**os.environ, "HERMES_TIMESTAMP_TEST_SCRIPT": str(script)},
-                            capture_output=True, text=True, timeout=60)
+                            capture_output=True, text=True, timeout=300)
     finished = int(time.time())
     assert result.returncode == 0, result.stdout + result.stderr
     marker = (tmp_path / ".hermes-update-in-progress").read_text(encoding="utf-8-sig").splitlines()
