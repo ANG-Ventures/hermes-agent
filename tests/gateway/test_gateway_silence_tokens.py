@@ -334,8 +334,16 @@ _KANBAN_DIGEST_NOTE_STRIPPED = (
         (_KANBAN_DIGEST_NOTE, _KANBAN_DIGEST_NOTE_STRIPPED),
         ("note\nNO_REPLY", "note"),
         ("note\n[SILENT]", "note"),
-        ("note\nno reply\n", "note"),
         ("note\n*NO_REPLY*", "note"),
+        ("note\n`[SILENT]`", "note"),
+        # Prose that canonicalizes to a marker is NOT a control token on the
+        # last line of a longer reply (Prism #1668 c7fca8d2bc4c).
+        ("note\nno reply\n", "note\nno reply\n"),
+        ("Checked Alice's thread for a response:\n\nNo reply.",
+         "Checked Alice's thread for a response:\n\nNo reply."),
+        ("Status of the alarm:\nSilent.", "Status of the alarm:\nSilent."),
+        ("Mode:\n**Silent**", "Mode:\n**Silent**"),
+        ("note\nno_reply", "note\nno_reply"),
         ("line one\nline two\n\nNO_REPLY\n\n", "line one\nline two"),
         # Whole-response marker: left for the silence rules, not stripped.
         ("NO_REPLY", "NO_REPLY"),
@@ -350,6 +358,32 @@ _KANBAN_DIGEST_NOTE_STRIPPED = (
 )
 def test_strip_trailing_silence_marker(raw, expected):
     assert strip_trailing_silence_marker(raw) == expected
+
+
+def test_trailing_strip_tokens_are_silence_markers():
+    from gateway.response_filters import (
+        LIVE_GATEWAY_SILENT_MARKERS,
+        TRAILING_STRIP_TOKENS,
+    )
+
+    assert TRAILING_STRIP_TOKENS <= LIVE_GATEWAY_SILENT_MARKERS
+
+
+def test_stream_consumer_config_strip_follows_raw_text_surface_gate():
+    """The streaming strip uses the same surface gate as the completed turn."""
+    from gateway.run import GatewayRunner, _GATEWAY_RAW_TEXT_PLATFORMS
+    from gateway.config import StreamingConfig
+
+    runner = object.__new__(GatewayRunner)
+    adapter = MagicMock()
+    for plat in (Platform.TELEGRAM, Platform.API_SERVER, Platform.WEBHOOK):
+        src = SessionSource(platform=plat, chat_id="c", chat_type="dm")
+        cfg, _ = GatewayRunner._build_stream_consumer_config(
+            runner, src, StreamingConfig(), adapter, on_missing_cursor="fallback",
+        )
+        raw = plat.value in _GATEWAY_RAW_TEXT_PLATFORMS
+        assert cfg.strip_trailing_silence_marker is (not raw), plat
+
 
 
 def _kanban_digest_event(*, internal):

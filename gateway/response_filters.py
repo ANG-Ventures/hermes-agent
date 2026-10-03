@@ -160,6 +160,12 @@ def is_intentional_silence_agent_result(
     return is_intentional_silence_response(response)
 
 
+# Literal model-emitted control tokens the trailing-line strip removes.  A
+# subset of LIVE_GATEWAY_SILENT_MARKERS: the English-word forms ("SILENT",
+# "NO REPLY") are excluded because a last line can legitimately say them.
+TRAILING_STRIP_TOKENS = frozenset({SILENT_REPLY_TOKEN, "[SILENT]"})
+
+
 def strip_trailing_silence_marker(response: Any) -> Any:
     """Drop a silence marker sitting alone on the LAST line of a delivered reply.
 
@@ -172,17 +178,25 @@ def strip_trailing_silence_marker(response: Any) -> Any:
 
     Only a marker on its own final line is removed, and only when other
     content precedes it — a reply that IS the marker is left for the silence
-    rules to suppress, and a token buried mid-sentence is untouched.  Shares
-    the marker set / canonicalization with the silence predicates so the
-    two never drift.
+    rules to suppress, and a token buried mid-sentence is untouched.
+
+    Matching is STRICT, unlike the whole-response predicates: the last line
+    must be a literal control token (:data:`TRAILING_STRIP_TOKENS`, exact
+    case), optionally wrapped in symmetric markdown emphasis or backticks.
+    The loose canonicalization (case-folding, ``NO REPLY`` / ``SILENT``,
+    edge punctuation) is safe only when the WHOLE reply must be the marker;
+    on the last line of a longer human reply it would delete real prose such
+    as ``"No reply."`` or ``"Silent."`` (Prism #1668 c7fca8d2bc4c).
     """
     if not isinstance(response, str):
         return response
     lines = response.rstrip().split("\n")
     if len(lines) < 2:
         return response
-    last = lines[-1]
-    if not any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(last)):
+    last = lines[-1].strip()
+    while len(last) >= 2 and last[0] == last[-1] and last[0] in "*_`":
+        last = last[1:-1].strip()
+    if last not in TRAILING_STRIP_TOKENS:
         return response
     head = "\n".join(lines[:-1]).rstrip()
     if not head.strip():
