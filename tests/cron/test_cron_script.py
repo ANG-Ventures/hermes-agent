@@ -722,7 +722,7 @@ class TestCronjobToolScriptValidation:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
-        inline = "#!/bin/bash\nexport PATH=/usr/bin\ngh pr merge 145 --squash\n"
+        inline = "#!/usr/bin/env bash\nexport PATH=/usr/bin\ngh pr merge 145 --squash\n"
         result = json.loads(cronjob(
             action="create",
             schedule="every 6m",

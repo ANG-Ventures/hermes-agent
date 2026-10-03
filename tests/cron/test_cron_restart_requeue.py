@@ -41,7 +41,7 @@ def hermes_env(tmp_path, monkeypatch):
     return home
 
 
-SCRIPT = """#!/bin/bash
+SCRIPT = """#!/usr/bin/env bash
 # First fire: long-running (killed by the drain). Re-fire: finishes fast.
 if [ -f "$(dirname "$0")/first-ran" ]; then
   echo second-run-ok

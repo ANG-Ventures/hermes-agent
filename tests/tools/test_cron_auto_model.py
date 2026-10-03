@@ -595,7 +595,7 @@ class TestCreateAutoModelE2E:
         # and model="auto"; the persisted job must carry NO model.
         scripts_dir = tmp_path / "scripts"
         scripts_dir.mkdir()
-        (scripts_dir / "noop.sh").write_text("#!/bin/bash\necho hi\n")
+        (scripts_dir / "noop.sh").write_text("#!/usr/bin/env bash\necho hi\n")
         monkeypatch.setattr("tools.cronjob_tools.HERMES", tmp_path, raising=False)
         ct.set_current_agent_model("openai-codex", "gpt-5.6-terra")
         created = json.loads(ct.cronjob(

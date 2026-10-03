@@ -78,7 +78,7 @@ def test_script_refuses_to_start_once_shutdown_signalled(make_script, tmp_path):
     before SIGTERM and hand the drain brand-new work to wait on.
     """
     marker = tmp_path / "RAN"
-    script = make_script("canary.sh", f"#!/bin/bash\ntouch {marker}\n")
+    script = make_script("canary.sh", f"#!/usr/bin/env bash\ntouch {marker}\n")
 
     sched.signal_shutdown("test")
     ok, output = sched._run_job_script(str(script))
@@ -97,7 +97,7 @@ def test_running_script_is_terminated_by_shutdown(make_script):
     This is the measured production failure — a `no_agent` script sleeping far
     past the drain deadline, with the gateway unable to do anything but wait.
     """
-    script = make_script("slow.sh", "#!/bin/bash\nsleep 120\n")
+    script = make_script("slow.sh", "#!/usr/bin/env bash\nsleep 120\n")
 
     result = {}
 
@@ -141,7 +141,7 @@ def test_completed_script_is_deregistered(make_script):
     A stale entry would make a later drain try to signal a dead pid, and
     (worse) could let a recycled pid be terminated.
     """
-    script = make_script("quick.sh", "#!/bin/bash\necho hi\n")
+    script = make_script("quick.sh", "#!/usr/bin/env bash\necho hi\n")
 
     ok, out = sched._run_job_script(str(script))
 
@@ -153,7 +153,7 @@ def test_completed_script_is_deregistered(make_script):
 
 def test_failing_script_is_also_deregistered(make_script):
     """The registry must drain on the ERROR path too, not just success."""
-    script = make_script("boom.sh", "#!/bin/bash\nexit 3\n")
+    script = make_script("boom.sh", "#!/usr/bin/env bash\nexit 3\n")
 
     ok, out = sched._run_job_script(str(script))
 
@@ -166,7 +166,7 @@ def test_failing_script_is_also_deregistered(make_script):
 
 def test_normal_runs_are_unaffected_when_not_draining(make_script):
     """Negative control — the guard must not disturb ordinary operation."""
-    script = make_script("ok.sh", "#!/bin/bash\necho normal\n")
+    script = make_script("ok.sh", "#!/usr/bin/env bash\necho normal\n")
 
     ok, out = sched._run_job_script(str(script))
 
