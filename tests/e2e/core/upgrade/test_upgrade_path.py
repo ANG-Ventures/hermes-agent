@@ -101,6 +101,21 @@ class _Refs(NamedTuple):
     base: str
 
 
+def _nearest_release_tag() -> str:
+    """Release N-1: the nearest release tag of HEAD, or of HEAD~1 when HEAD is itself that tag.
+
+    Fork: on a parity-merge ref HEAD~1 is the fork's pre-sync main, whose nearest tag can be
+    months old (v2026.8.3 on the 2026-10-01 sync: an N-1 whose ``hermes update`` has no stale-lock
+    sweep and resets into the lock), while HEAD (the merge) reaches upstream's latest release.
+    On linear history this equals ``describe HEAD~1``. Same resolver as handoff/_handoff.py.
+    """
+    match = ("describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0")
+    tag = _git(*match, "HEAD", cwd=H.WORKTREE)
+    if _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE) == _git("rev-parse", "HEAD", cwd=H.WORKTREE):
+        tag = _git(*match, "HEAD~1", cwd=H.WORKTREE)
+    return tag
+
+
 @functools.cache
 def _refs() -> _Refs:
     """HEAD and release N-1, resolved on first use: collection (every CI shard) runs no git.
@@ -111,10 +126,7 @@ def _refs() -> _Refs:
     """
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
     try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git(
-            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", "HEAD~1",
-            cwd=H.WORKTREE,
-        )
+        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _nearest_release_tag()
         return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
     except AssertionError:  # shallow CI checkout without tags
         return _Refs(head, "", "")
