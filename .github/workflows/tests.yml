@@ -491,6 +491,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
 
+      - name: Neutralize Blacksmith login-shell HOME reset
+        # Blacksmith VMs ship /etc/profile.d/blacksmith.sh, which sets HOME=/home/runner in every
+        # login shell. The e2e suites drive real `bash -lic` sessions under a sandbox HOME, so the
+        # installed ~/.local/bin/hermes vanished (#1624 run 37110864809: e2e-upgrade core + hosts).
+        # Steps run --noprofile, so nothing else reads it. No-op off Blacksmith.
+        run: if [ -f /etc/profile.d/blacksmith.sh ]; then sudo mv /etc/profile.d/blacksmith.sh /etc/profile.d/blacksmith.sh.disabled; fi
+
       - name: Set up locked Python, Node and test dependencies
         # toolchain: all puts PM's locked Node in the runner's PM store, not
         # only on PATH. The E2E sandboxes copy node from that store
@@ -618,6 +625,13 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Neutralize Blacksmith login-shell HOME reset
+        # Blacksmith VMs ship /etc/profile.d/blacksmith.sh, which sets HOME=/home/runner in every
+        # login shell. The e2e suites drive real `bash -lic` sessions under a sandbox HOME, so the
+        # installed ~/.local/bin/hermes vanished (#1624 run 37110864809: e2e-upgrade core + hosts).
+        # Steps run --noprofile, so nothing else reads it. No-op off Blacksmith.
+        run: if [ -f /etc/profile.d/blacksmith.sh ]; then sudo mv /etc/profile.d/blacksmith.sh /etc/profile.d/blacksmith.sh.disabled; fi
 
       - name: Fetch upstream release tags
         # Fork: the release tags (v2026.*) are cut on NousResearch/hermes-agent and this
