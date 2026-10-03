@@ -785,7 +785,7 @@ def _parent_mutation_contract(source: str) -> Tuple[Set[str], Set[str]]:
     return sites, maintained
 
 
-def test_all_six_session_parent_mutation_sites_are_maintenance_adjacent():
+def test_all_six_session_parent_mutation_sites_are_maintenance_adjacent():  # noqa: source-proxy structural census of parent_session_id writers
     # fork-parity: upstream's parity merge SPLIT the hermes_state monolith into
     # hermes_state{,_portability,_schema,_search,_common}.py. The 6th mutation
     # site (import_sessions' parent re-link) now lives in hermes_state_portability,

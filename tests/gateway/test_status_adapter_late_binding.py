@@ -123,7 +123,7 @@ def _attr_refs(node, attr):
             and not isinstance(n.ctx, ast.Store)]
 
 
-def test_turn_binding_publishes_the_late_bind_resolver():
+def test_turn_binding_publishes_the_late_bind_resolver():  # noqa: source-proxy structural AST census of the late-bind resolver
     import gateway.run_turn as bind_mod
 
     tree = ast.parse(inspect.getsource(bind_mod))
