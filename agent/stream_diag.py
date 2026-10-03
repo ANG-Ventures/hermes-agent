@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
 from agent.message_sanitization import _SURROGATE_RE
 
 logger = logging.getLogger(__name__)
+
+# jiter / pydantic-core parse errors end ``<reason> at line N column M``.
+# json.JSONDecodeError ("...: line N column M (char K)") is excluded upstream.
+_JITER_PARSE_ERROR_RE = re.compile(r" at line \d+ column \d+$")
 
 # Lowercased upstream headers captured per attempt for post-hoc analysis.
 STREAM_DIAG_HEADERS = (
@@ -49,12 +54,17 @@ def is_provider_stream_parse_error(
     message = str(error).strip().lower()
     if "expected ident at line" in message:
         return True
-    # pydantic-core/jiter's broader ``expected value`` wording is only
-    # response-side evidence after a successful provider response opened.
+    # Any other pydantic-core/jiter parser message (``expected value``,
+    # ``key must be a string``, ``trailing comma``, ``EOF while parsing`` ...,
+    # all ending ``at line N column M``) is only response-side evidence after a
+    # successful provider response opened.  The SDK's tool-input accumulator
+    # (``jiter.from_json(json_buf, partial_mode=True)``) raises these when a
+    # streamed ``input_json_delta`` is not valid JSON; misread as a local
+    # ValueError it aborted the turn non-retryably (t_6b01c2d1).
     return (
         http_status is not None
         and 200 <= http_status < 300
-        and "expected value at line" in message
+        and _JITER_PARSE_ERROR_RE.search(message) is not None
     )
 
 

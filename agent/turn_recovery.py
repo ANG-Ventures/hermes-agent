@@ -14,6 +14,7 @@ import locale
 import math
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1118,6 +1119,11 @@ def nonretryable_client_error_result(
     result.update({
         "failure_reason": classified.reason.value,
         "failure_retryable": bool(classified.retryable),
+        # Kanban workers print this on exit 1 so the run log
+        # names the failing frame, not one bare line (t_6b01c2d1).
+        "error_traceback": "".join(
+            traceback.format_exception(type(api_error), api_error, api_error.__traceback__)
+        ),
     })
     if _keep_partial:
         result["partial"] = True

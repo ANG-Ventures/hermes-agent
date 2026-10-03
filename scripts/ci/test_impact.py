@@ -89,7 +89,7 @@ _DOTTED_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
 # A test that walks the repo tree (see REPO-WIDE SCANNERS above). Heuristic and
 # deliberately wide: a false hit only adds a file to the PR pre-filter.
 _TREE_WALK_RE = re.compile(
-    r"\.rglob\(|\bos\.walk\(|\.glob\(\s*[rf]?[\"']\*\*|[\"']ls-files[\"']"
+    r"\.rglob\(|\bos\.walk\(|\.glob\(\s*[rf]?[\"'][^\"'\n]*\*\*|[\"']ls-files[\"']"
 )
 
 

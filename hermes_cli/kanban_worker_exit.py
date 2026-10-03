@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 
@@ -163,7 +164,26 @@ class WorkerExit(SystemExit):
             ):
                 code = KANBAN_RATE_LIMIT_EXIT_CODE
                 self.exit_class = exit_class
+        if code == 1 and os.environ.get("HERMES_KANBAN_TASK"):
+            _print_failure_traceback(result)
         super().__init__(code)
+
+
+def _print_failure_traceback(result) -> None:
+    """Write the failing exception's traceback to the worker log (stderr).
+
+    Without it an exit-1 worker log holds one bare error line before the run
+    boundary and the cause needs archaeology in the profile errors.log
+    (t_6b01c2d1).
+    """
+    tb = result.get("error_traceback") if isinstance(result, dict) else None
+    if not isinstance(tb, str) or not tb.strip():
+        return
+    try:
+        sys.stderr.write("kanban worker exit 1, failing exception:\n" + tb.rstrip() + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def report_exit(exc: BaseException | None) -> None:
