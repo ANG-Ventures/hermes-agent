@@ -572,5 +572,50 @@
       "cron",
       "desktop"
     ]
+  },
+  {
+    "feature": "OpenAI Ultrafast tier (agent.service_tier / /fast ultrafast, route-gated)",
+    "tests": [
+      "tests/cli/test_service_tier_parse.py",
+      "tests/cli/test_fast_mode_overrides.py::test_capability_matrix",
+      "tests/cli/test_fast_mode_overrides.py::test_non_fast_tier_is_never_upgraded_to_priority"
+    ],
+    "paths": [
+      "hermes_cli/fast_mode_contracts.py",
+      "hermes_cli/models.py"
+    ],
+    "why": "ABSORBED 2026-09-29. Fork #1511 (merge b19fa4f741) re-applied upstream bdde674296 (feat(fast): /fast ultrafast for GPT-6 Astra, priced at the served tier) onto the fork's fast_mode_contracts layout. At the next parity sync, collapse the fork twin toward upstream's shape: agent/fast_mode.py STATIC_TIERS + parse_service_tier and models.resolve_fast_mode_overrides(tier=...) are canonical; drop the fork's duplicate tier table in fast_mode_contracts once its contract gating is re-threaded. KNOWN DIVERGENCES to keep or adjudicate at that sync: (1) fork sends service_tier='fast' for priority on openai-codex (codex_fast contract, developers.openai.com/codex/speed); upstream sends 'priority'. (2) fork never ported upstream's 6x Ultrafast pricing row (agent/usage_pricing.py _OPENAI_ULTRAFAST_PRICING); decision: do NOT port separately, take upstream's row at the sync (no fork conflict in that region; fleet Astra runs on openai-codex subscription, so API-metered under-costing is not live). The fork-only residual deltas are tracked in the next entry.",
+    "lifecycle": "absorbed",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/commit/bdde674296e97beba2ac10a5d4eb21a975e4c2ab",
+    "absorbed_date": "2026-09-29",
+    "surfaces": [
+      "cli",
+      "gateway",
+      "tui"
+    ]
+  },
+  {
+    "feature": "static service_tier reaches the wire on serve/-z/api_server; requested+served tier reporting",
+    "tests": [
+      "tests/cli/test_fast_mode_overrides.py::test_serve_path_request_carries_ultrafast_to_outbound_request",
+      "tests/cli/test_fast_mode_overrides.py::test_record_served_tier_warns_on_downgrade",
+      "tests/cli/test_fast_mode_overrides.py::test_record_served_tier_codex_echo_is_recorded_but_not_judged"
+    ],
+    "paths": [
+      "hermes_cli/models.py",
+      "hermes_cli/oneshot.py",
+      "tui_gateway/server.py",
+      "gateway/platforms/api_server.py",
+      "agent/turn_finalizer.py"
+    ],
+    "why": "Fork-only deltas of #1511, behaviourally reproduced on upstream origin/main 57a22675ef (2026-09-29): serve/TUI _make_agent, `-z` and the api_server per-request tier set only agent.service_tier, which never reaches responses.create (outbound kwargs captured: ABSENT); turn result service_tier read only extra_body (None for /fast's top-level tier) and no served tier / downgrade WARN existed. Upstream fixes prepared on ANG-Ventures branches fix/fast-static-tier-on-wire and fix/usage-served-service-tier (central fix in agent.fast_mode.effective_request_overrides rather than the fork's per-site service_tier_request_overrides). When they merge: lifecycle -> absorbed, drop the per-site attach calls at the sync.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "tui",
+      "api_server"
+    ]
   }
 ]
