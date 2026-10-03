@@ -1689,6 +1689,10 @@ class GatewayKanbanWatchersMixin:
             getattr(self, "_kanban_lifecycle_digest", None) or LifecycleDigest()
         )
         self._kanban_lifecycle_digest = lifecycle_digest
+        from gateway import kanban_home_route as _hr
+
+        home_cache: _hr.HomeCache = getattr(self, "_kanban_home_cache", None) or _hr.HomeCache()
+        self._kanban_home_cache = home_cache
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -1893,9 +1897,11 @@ class GatewayKanbanWatchersMixin:
                                     # receiving a forwarded ping can tell whether
                                     # the card is its own. Resolved here (worker
                                     # thread), never on the event loop.
-                                    home_line = _resolve_home_line(
-                                        getattr(task, "session_id", None) if task else None
-                                    )
+                                    # t_808bc8e6: the same read also resolves the
+                                    # card's home CHAT, cached per card.
+                                    _home_sid = getattr(task, "session_id", None) if task else None
+                                    _home_row, home_res = home_cache.get(slug, sub["task_id"], _home_sid)
+                                    home_line = format_home_line(_home_sid, _home_row)
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -1908,6 +1914,7 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "home": home_line,
+                                        "home_res": home_res,
                                         "self_event_ids": self_caused_event_ids(sub, events),
                                     })
                                 except Exception as sub_exc:
@@ -1927,6 +1934,12 @@ class GatewayKanbanWatchersMixin:
                 # kanban.lifecycle_digest_seconds (t_d62bd921): batch routed lines.
                 _digest_window = (
                     _resolve_lifecycle_digest_seconds() if lifecycle_channel else 0
+                )
+                # t_808bc8e6: routed lines go to the card's home chat; the
+                # lifecycle channel is the fallback. Home lines fold on their
+                # own (short) window, one digest per home chat.
+                _route_mode, _home_window = (
+                    _hr.resolve_route_config() if lifecycle_channel else (_hr.ROUTE_CHANNEL, 0)
                 )
                 # (board, task, event id, channel) already posted to the
                 # lifecycle channel; bounded, survives across ticks so a
@@ -2186,19 +2199,36 @@ class GatewayKanbanWatchersMixin:
                         # for review / blocked lines go to a log channel; the
                         # wake below still targets the subscriber.
                         send_adapter, send_chat_id = adapter, sub["chat_id"]
-                        _routed = lifecycle_channel_target(
-                            lifecycle_channel, kind, ev.payload, task,
+                        _route = _hr.route_lifecycle_line(
+                            lifecycle_channel, _route_mode, kind, ev.payload, task,
+                            d.get("home_res"),
                         )
+                        _routed = _route.target
+                        _route_tag = _route.tag
+                        _route_window = _home_window if _route.is_home else _digest_window
+                        # (target, adapter, window) for a home whose send fails.
+                        _fallback = None
                         if _routed is not None:
-                            try:
-                                _routed_adapter = self._authorization_adapter(
-                                    _Platform(_routed[0]), sub_profile or None,
+                            _routed_adapter = self._kanban_route_adapter(_routed[0], sub_profile)
+                            if _route.is_home and _route.fallback is not None:
+                                _fb_adapter = self._kanban_route_adapter(
+                                    _route.fallback[0], sub_profile,
                                 )
-                            except ValueError:
-                                _routed_adapter = None
+                                if _fb_adapter is not None:
+                                    _fallback = (_route.fallback, _fb_adapter, _digest_window)
+                                if _routed_adapter is None and _fallback is not None:
+                                    # This gateway cannot post to the home
+                                    # platform at all: fall back now.
+                                    _routed, _routed_adapter, _route_window = _fallback
+                                    _route_tag = _hr.unreachable_tag("no-adapter")
+                                    _fallback = None
+                                    _route = _route._replace(is_home=False, thread_id="")
                             if _routed_adapter is not None:
                                 send_adapter, send_chat_id = _routed_adapter, _routed[1]
-                                metadata = {}
+                                metadata = {"thread_id": _route.thread_id} if _route.thread_id else {}
+                                msg = _hr.format_for_platform(
+                                    _routed[0], _hr.tag_line(msg, _route_tag),
+                                )
                             else:
                                 _routed = None
                         if _routed is not None:
@@ -2251,18 +2281,43 @@ class GatewayKanbanWatchersMixin:
                         # failure instead of burning MAX_SEND_FAILURES ticks.
                         _target_gone = False
                         try:
-                            if _routed is not None and _digest_window > 0:
+                            if _routed is not None and _route_window > 0:
                                 # Held for the lifecycle digest: the line is
                                 # recorded, so the event counts as delivered
                                 # (cursor, wake and failure counter unchanged).
+                                # One batch per destination (t_808bc8e6).
                                 lifecycle_digest.add(
-                                    _routed, send_adapter, msg, _digest_window, time.time(),
+                                    _routed, send_adapter, msg, _route_window, time.time(),
+                                    metadata=metadata, fallback=_fallback,
                                 )
                                 _send_res = None
                             else:
                                 _send_res = await send_adapter.send(
                                     send_chat_id, msg, metadata=metadata,
                                 )
+                                _home_fail = (
+                                    _hr.send_failed(_send_res) if _fallback is not None else None
+                                )
+                                if _home_fail is not None:
+                                    # Home chat gone / bot cannot post: the
+                                    # same line goes to the fallback, tagged.
+                                    logger.warning(
+                                        "kanban notifier: home %s:%s unreachable for %s (%s); "
+                                        "falling back to %s:%s",
+                                        _routed[0], _routed[1], sub["task_id"], _home_fail,
+                                        _fallback[0][0], _fallback[0][1],
+                                    )
+                                    _fb_msg = _hr.tag_line(msg, _hr.unreachable_tag(_home_fail))
+                                    if _fallback[2] > 0:
+                                        lifecycle_digest.add(
+                                            _fallback[0], _fallback[1], _fb_msg, _fallback[2],
+                                            time.time(),
+                                        )
+                                        _send_res = None
+                                    else:
+                                        _send_res = await _fallback[1].send(
+                                            _fallback[0][1], _fb_msg, metadata={},
+                                        )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
                             # transient failure) must count as a FAILED
@@ -2703,6 +2758,15 @@ class GatewayKanbanWatchersMixin:
                             pass
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_route_adapter(self, platform: str, profile: Optional[str]):
+        """Live adapter for a lifecycle-line destination platform, or None."""
+        from gateway.config import Platform
+
+        try:
+            return self._authorization_adapter(Platform(platform), profile or None)
+        except ValueError:
+            return None
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
