@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -63,7 +64,15 @@ _SKIP_PARTS = {"tests", "evals", "scripts", "venv", ".venv", "node_modules", ".g
 
 def _modules_constructing_aiagent() -> set[str]:
     found: set[str] = set()
-    for path in REPO.rglob("*.py"):
+    # os.walk, not Path.rglob: rglob raises FileNotFoundError when a concurrent test (xdist) removes a
+    # __pycache__ mid-walk (heavy-ci 37033036338); os.walk skips a dir that vanished. Pruning in place
+    # also keeps the walk out of venv/.git/node_modules.
+    paths = []
+    for root, dirs, files in os.walk(REPO):
+        top = Path(root) == REPO
+        dirs[:] = [d for d in dirs if d not in _SKIP_PARTS and d != "__pycache__" and not (top and d.startswith("."))]
+        paths.extend(Path(root) / f for f in files if f.endswith(".py"))
+    for path in paths:
         rel = path.relative_to(REPO)
         if set(rel.parts) & _SKIP_PARTS or rel.parts[0].startswith("."):
             continue
