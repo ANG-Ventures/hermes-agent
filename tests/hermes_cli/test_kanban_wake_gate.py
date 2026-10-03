@@ -83,3 +83,17 @@ def test_disabled_gate_never_downgrades(tmp_path):
                       "wake_load_gate": {"enabled": False}}}
     g = _gate(Load(200), tmp_path, cfg=cfg, lane=lambda p: "capped")
     assert g.downgrade_reason("athena", now=0) is None
+
+
+def test_no_configured_band_means_no_host_downgrade(tmp_path):
+    """The ncpu fallback is not a measured band: no pause_above, no host gate."""
+    g = _gate(Load(500), tmp_path, cfg={"kanban": {}})
+    assert g.downgrade_reason(None, now=0) is None
+    assert g.snapshot()["mode"] == "off"
+
+
+def test_wake_gate_block_overrides_dispatch_band(tmp_path):
+    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                      "wake_load_gate": {"pause_above": 20, "resume_below": 10}}}
+    g = _gate(Load(25), tmp_path, cfg=cfg)
+    assert g.downgrade_reason(None, now=0) == "host load 25"

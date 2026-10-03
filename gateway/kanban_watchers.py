@@ -1780,6 +1780,21 @@ class GatewayKanbanWatchersMixin:
             )
         if not adapter_supports_push(adapter):
             return _fail(f"{platform_str} adapter cannot push a wake turn")
+        # Same contention gate as the kanban notifier (t_74bf5296): under
+        # host load or a capped requester lane the caller sends a notify.
+        downgrade = await _to_thread_process_service(
+            _wake_downgrade_reason, self, profile or "default",
+        )
+        if downgrade:
+            logger.info(
+                "control wake downgraded to notify on %s/%s: %s",
+                platform_str, chat_id, downgrade,
+            )
+            return {
+                "delivered": False,
+                "error": f"downgraded: {downgrade}",
+                "downgraded": downgrade,
+            }
         sub = {
             "chat_id": chat_id,
             "chat_type": chat_type,

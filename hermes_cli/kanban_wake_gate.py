@@ -19,7 +19,10 @@ for one EVENT when either is true at delivery time:
 
 The subscription row is never changed. Config: ``kanban.wake_load_gate``
 (``enabled``, ``pause_above``, ``resume_below``, ``lane_headroom``,
-``sample_seconds``); unset thresholds inherit ``dispatch_load_gate``.
+``sample_seconds``); unset thresholds inherit ``dispatch_load_gate``. With no
+``pause_above`` configured in either block the HOST half is off: the
+dispatcher's ncpu fallback is a spawn heuristic, not a measured band, and on
+a 4-core box it would silence every wake whenever load1 > 4.
 
 State is written to ``<kanban_home>/wake_gate.json`` on every transition and
 summary so ``hermes kanban notify-status`` can show the live mode.
@@ -76,6 +79,7 @@ class WakeGate:
     ) -> None:
         cfg = _merged_cfg(config)
         self.enabled = bool(cfg["enabled"])
+        self.host_gate = self.enabled and cfg["pause_above"] is not None
         self.lane_headroom = bool(cfg["lane_headroom"])
         try:
             self.sample_seconds = max(0.0, float(cfg["sample_seconds"]))
@@ -83,7 +87,7 @@ class WakeGate:
             self.sample_seconds = DEFAULT_SAMPLE_SECONDS
         self._gate = LoadGate(
             {
-                "enabled": self.enabled,
+                "enabled": self.host_gate,
                 "pause_above": cfg["pause_above"],
                 "resume_below": cfg["resume_below"],
                 "load5_floor": cfg["load5_floor"],
@@ -110,7 +114,7 @@ class WakeGate:
     # -- host load ---------------------------------------------------------
     def host_contended(self, now: Optional[float] = None) -> Optional[str]:
         """``"host load 71"`` while the load band is tripped, else None."""
-        if not self.enabled:
+        if not self.host_gate:
             return None
         now = time.monotonic() if now is None else float(now)
         if self._sampled_at is None or now - self._sampled_at >= self.sample_seconds:
@@ -151,7 +155,7 @@ class WakeGate:
 
     # -- observability -----------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
-        mode = "off" if not self.enabled else ("notify" if self._gate.paused else "wake")
+        mode = "off" if not self.host_gate else ("notify" if self._gate.paused else "wake")
         return {
             "mode": mode,
             "load1": self.load1,
