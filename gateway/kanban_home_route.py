@@ -28,6 +28,13 @@ HOME_ROUTE_KINDS = frozenset({"completed", "review_requested", "blocked", "chang
 HOME_CACHE_MAX = 4096
 HOME_CACHE_TTL = 600.0  # a session row written after the card's first tick is picked up
 DEFAULT_HOME_DIGEST_SECONDS = 120
+# state.db could not be read (lock, I/O, import): the home is UNKNOWN, not absent.
+# Never cached; the notifier leaves the claim unacked so the next tick retries.
+LOOKUP_FAILED = "lookup-failed"
+
+
+class SessionLookupError(RuntimeError):
+    """state.db could not be read. Distinct from a missing row (``None``)."""
 
 
 class HomeTarget(NamedTuple):
@@ -77,7 +84,10 @@ def home_from_row(session_id: Optional[str], row: Optional[dict]) -> HomeResolut
 
 
 def read_session_row(session_id: str) -> Optional[dict]:
-    """Blocking, READ-ONLY state.db lookup (FleetReview #987); worker thread only."""
+    """Blocking, READ-ONLY state.db lookup (FleetReview #987); worker thread only.
+
+    ``None`` = the read worked and no such session exists. A failed read raises
+    :class:`SessionLookupError`, so a locked state.db never looks like no home."""
     try:
         from hermes_state import SessionDB
 
@@ -88,8 +98,8 @@ def read_session_row(session_id: str) -> Optional[dict]:
             close = getattr(db, "close", None)
             if callable(close):
                 close()
-    except Exception:
-        return None
+    except Exception as exc:
+        raise SessionLookupError(f"state.db lookup for {session_id} failed: {exc}") from exc
 
 
 class HomeCache:
@@ -109,7 +119,10 @@ class HomeCache:
         if hit is not None and now - hit[0] < HOME_CACHE_TTL:
             return hit[1], hit[2]
         sid = key[2]
-        row = read_session_row(sid) if sid and not sid.startswith("operator:") else None
+        try:
+            row = read_session_row(sid) if sid and not sid.startswith("operator:") else None
+        except SessionLookupError:
+            return None, HomeResolution(None, LOOKUP_FAILED)  # not cached: retried next tick
         res = home_from_row(sid, row)
         self._d.pop(key, None)
         self._d[key] = (now, row, res)
@@ -197,6 +210,10 @@ def resolve_route_config() -> tuple[str, int]:
         kcfg = {}
     raw = kcfg.get("lifecycle_home_digest_seconds", DEFAULT_HOME_DIGEST_SECONDS)
     return parse_route_mode(kcfg.get("lifecycle_route")), parse_digest_seconds(raw)
+
+
+def home_lookup_failed(home: Optional[HomeResolution]) -> bool:
+    return home is not None and home.target is None and home.reason == LOOKUP_FAILED
 
 
 def send_failed(res: Any) -> Optional[str]:

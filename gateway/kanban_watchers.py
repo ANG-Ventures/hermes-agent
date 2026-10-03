@@ -1988,6 +1988,27 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
+                    if (
+                        lifecycle_channel is not None
+                        and _route_mode == _hr.ROUTE_HOME
+                        and _hr.home_lookup_failed(d.get("home_res"))
+                        and any(ev.kind in _hr.HOME_ROUTE_KINDS for ev in d["events"])
+                    ):
+                        # state.db unreadable: the home is unknown, not absent.
+                        # Leave the claim unacked (never [no-home]); the next
+                        # tick re-resolves (Prism P1, t_04013ffa).
+                        logger.warning(
+                            "kanban notifier: home lookup for %s failed; rewinding claim to retry",
+                            sub["task_id"],
+                        )
+                        await _to_thread_process_service(
+                            self._kanban_rewind,
+                            sub,
+                            d["cursor"],
+                            d.get("old_cursor", 0),
+                            board_slug,
+                        )
+                        continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     # Per-subscription failure-counter key. Hoisted out of the
@@ -2292,12 +2313,22 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 _send_res = None
                             else:
-                                _send_res = await send_adapter.send(
-                                    send_chat_id, msg, metadata=metadata,
-                                )
-                                _home_fail = (
-                                    _hr.send_failed(_send_res) if _fallback is not None else None
-                                )
+                                try:
+                                    _send_res = await send_adapter.send(
+                                        send_chat_id, msg, metadata=metadata,
+                                    )
+                                    _home_fail = (
+                                        _hr.send_failed(_send_res) if _fallback is not None else None
+                                    )
+                                except Exception as _home_exc:
+                                    # A raised home send is a failed home send:
+                                    # fall back like success=False (the digest
+                                    # path does the same). No fallback: re-raise
+                                    # into the failure counter below.
+                                    if _fallback is None:
+                                        raise
+                                    _send_res = None
+                                    _home_fail = type(_home_exc).__name__
                                 if _home_fail is not None:
                                     # Home chat gone / bot cannot post: the
                                     # same line goes to the fallback, tagged.
