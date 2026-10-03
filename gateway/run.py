@@ -41080,8 +41080,28 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 "drain_timeout": _drain,
             }
 
+        # wake (t_0fe12e34): a detached process (dispatch-agent.sh --wake)
+        # starts an agent turn in a chat this gateway serves. Same routing
+        # and delivery as the kanban notifier's wake; the coroutine runs on
+        # the loop thread and the verb answers delivered/failed.
+        def _wake_handler(params: dict) -> dict:
+            from gateway.control_socket import WAKE_SERVER_TIMEOUT
+
+            fut = asyncio.run_coroutine_threadsafe(
+                runner._deliver_control_wake(params), _main_loop
+            )
+            try:
+                return fut.result(timeout=WAKE_SERVER_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                fut.cancel()
+                return {
+                    "delivered": False,
+                    "error": f"wake not dispatched within {WAKE_SERVER_TIMEOUT:.0f}s",
+                }
+
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler}
+            verb_handlers={"pause-for-update": _pause_for_update_handler},
+            request_handlers={"wake": _wake_handler},
         )
         if not await _control_server.start():
             _control_server = None

@@ -1,0 +1,252 @@
+"""Control-socket ``wake`` verb (t_0fe12e34).
+
+A detached process starts an agent turn in a chat through the gateway's own
+control socket instead of minting a carrier kanban card. Routing must be the
+kanban notifier's (``_build_wake_source``): the same live-routing identity
+fill and phantom refusal, so a wake lands in the human's real session.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform
+from gateway.control_socket import (
+    GatewayControlServer,
+    wake_gateway_session,
+)
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource, SessionStore
+from hermes_state import SessionDB
+
+CHAT = "1535189663533506600"
+HUMAN = "117431298246705156"
+OTHER = "220000000000000001"
+
+
+class RecordingAdapter:
+    def __init__(self) -> None:
+        self.handled: list = []
+
+    async def send(self, chat_id, text, metadata=None):  # pragma: no cover
+        return None
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+
+
+class RaisingAdapter(RecordingAdapter):
+    async def handle_message(self, event):
+        raise RuntimeError("adapter refused")
+
+
+class NonPushAdapter(RecordingAdapter):
+    supports_async_delivery = False
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    s = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    s._db = SessionDB(db_path=tmp_path / "state.db")
+    return s
+
+
+def _runner(store, adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.session_store = store
+    return runner
+
+
+def _human_turn(store, user_id=HUMAN):
+    return store.get_or_create_session(
+        SessionSource(
+            platform=Platform.DISCORD, chat_id=CHAT, chat_type="group",
+            user_id=user_id,
+        )
+    )
+
+
+def _params(**kw):
+    p = {"platform": "discord", "chat_id": CHAT, "chat_type": "group",
+         "text": "dispatch finished: brief at /tmp/x.md"}
+    p.update(kw)
+    return p
+
+
+# -- routing through the shared helper ---------------------------------------
+
+def test_wake_lands_in_the_humans_own_session(store):
+    human = _human_turn(store)
+    adapter = RecordingAdapter()
+    result = asyncio.run(_runner(store, adapter)._deliver_control_wake(_params()))
+
+    assert result["delivered"] is True, result
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.internal is True
+    assert event.text == "dispatch finished: brief at /tmp/x.md"
+    assert event.source.user_id == HUMAN
+    woken = store.get_or_create_session(event.source)
+    assert woken.session_key == human.session_key
+    assert woken.session_id == human.session_id
+
+
+def test_named_user_is_authoritative_over_live_evidence(store):
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    result = asyncio.run(
+        _runner(store, adapter)._deliver_control_wake(_params(user_id=OTHER))
+    )
+    assert result["delivered"] is True
+    assert adapter.handled[0].source.user_id == OTHER
+
+
+def test_two_humans_refuse_to_pick_a_participant(store):
+    _human_turn(store, HUMAN)
+    _human_turn(store, OTHER)
+    adapter = RecordingAdapter()
+    result = asyncio.run(_runner(store, adapter)._deliver_control_wake(_params()))
+    assert result["delivered"] is True
+    assert adapter.handled[0].source.user_id is None
+
+
+def test_thread_id_and_profile_reach_the_source(store):
+    adapter = RecordingAdapter()
+    result = asyncio.run(
+        _runner(store, adapter)._deliver_control_wake(
+            _params(chat_type="thread", thread_id="999", user_id=HUMAN)
+        )
+    )
+    assert result["delivered"] is True
+    src = adapter.handled[0].source
+    assert src.thread_id == "999"
+    assert src.chat_type == "thread"
+
+
+@pytest.mark.parametrize("missing", ["platform", "chat_id", "text", "chat_type"])
+def test_missing_required_field_is_refused_without_delivery(store, missing):
+    adapter = RecordingAdapter()
+    params = _params()
+    params[missing] = ""
+    result = asyncio.run(_runner(store, adapter)._deliver_control_wake(params))
+    assert result["delivered"] is False
+    assert result["error"]
+    assert adapter.handled == []
+
+
+def test_unknown_platform_and_missing_adapter_fail(store):
+    runner = _runner(store, RecordingAdapter())
+    r1 = asyncio.run(runner._deliver_control_wake(_params(platform="nope")))
+    assert r1["delivered"] is False and "unknown platform" in r1["error"]
+    r2 = asyncio.run(runner._deliver_control_wake(_params(platform="telegram")))
+    assert r2["delivered"] is False and "no connected telegram adapter" in r2["error"]
+
+
+def test_non_push_adapter_is_refused(store):
+    adapter = NonPushAdapter()
+    result = asyncio.run(_runner(store, adapter)._deliver_control_wake(_params()))
+    assert result["delivered"] is False
+    assert adapter.handled == []
+
+
+def test_adapter_exception_reports_failed(store):
+    result = asyncio.run(
+        _runner(store, RaisingAdapter())._deliver_control_wake(_params(user_id=HUMAN))
+    )
+    assert result["delivered"] is False
+    assert "adapter refused" in result["error"]
+
+
+# -- the verb on the socket ---------------------------------------------------
+
+def test_request_handler_receives_params(tmp_path):
+    seen = []
+    server = GatewayControlServer(
+        home=tmp_path,
+        request_handlers={"wake": lambda p: seen.append(p) or {"delivered": True}},
+    )
+    raw = json.dumps({"verb": "wake", "id": 3, "params": {"a": 1}}).encode()
+    response = json.loads(server.handle_request_line(raw).decode())
+    assert response == {"ok": True, "protocol": 1, "result": {"delivered": True}, "id": 3}
+    assert seen == [{"a": 1}]
+
+
+def test_non_object_params_is_an_error(tmp_path):
+    server = GatewayControlServer(
+        home=tmp_path, request_handlers={"wake": lambda p: {"delivered": True}},
+    )
+    raw = json.dumps({"verb": "wake", "params": [1]}).encode()
+    response = json.loads(server.handle_request_line(raw).decode())
+    assert response["ok"] is False
+
+
+def test_unknown_verb_lists_wake(tmp_path):
+    server = GatewayControlServer(
+        home=tmp_path, request_handlers={"wake": lambda p: {}},
+    )
+    response = json.loads(server.handle_request_line(b'{"verb": "x"}').decode())
+    assert "wake" in response["supported_verbs"]
+    assert "identify" in response["supported_verbs"]
+
+
+def test_client_returns_none_without_a_gateway(tmp_path):
+    assert wake_gateway_session(
+        tmp_path, platform="discord", chat_id=CHAT, chat_type="group", text="hi",
+        timeout=0.5,
+    ) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="unix socket transport")
+def test_wake_roundtrip_over_real_socket_into_runner(tmp_path, store):
+    """client -> real unix socket -> executor-thread handler -> loop coroutine
+    -> runner._deliver_control_wake -> adapter.handle_message, the same
+    marshalling gateway/run.py wires."""
+    human = _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        def handler(params):
+            fut = asyncio.run_coroutine_threadsafe(
+                runner._deliver_control_wake(params), loop
+            )
+            return fut.result(timeout=10)
+
+        server = GatewayControlServer(
+            home=tmp_path / "gw", request_handlers={"wake": handler}
+        )
+        (tmp_path / "gw").mkdir()
+        assert await server.start()
+        try:
+            return await loop.run_in_executor(
+                None,
+                lambda: wake_gateway_session(
+                    tmp_path / "gw", platform="discord", chat_id=CHAT,
+                    chat_type="group", text="woken over the socket", timeout=10,
+                ),
+            )
+        finally:
+            await server.stop()
+
+    result = asyncio.run(scenario())
+    assert result is not None and result["delivered"] is True, result
+    assert adapter.handled[0].text == "woken over the socket"
+    woken = store.get_or_create_session(adapter.handled[0].source)
+    assert woken.session_id == human.session_id
+
+
+def test_query_without_params_is_unchanged_for_observation_verbs(tmp_path):
+    server = GatewayControlServer(home=tmp_path, verb_handlers={"status": lambda: {"x": 1}})
+    raw = json.dumps({"verb": "status"}).encode()
+    assert json.loads(server.handle_request_line(raw).decode())["result"] == {"x": 1}

@@ -10,13 +10,18 @@ gateway process creates at startup and removes on clean shutdown, answering
 versioned JSON verbs. A connectable socket with a well-formed ``identify``
 answer IS liveness — no PID-reuse heuristics.
 
-v1 verbs (observation only — no behavior change for the gateway):
+v1 verbs (observation; ``pause-for-update`` and ``wake`` are the only
+actuators, wired by gateway/run.py):
 
 - ``identify`` → pid, profile label, hermes_home, code_sha/code_version
   (the #91283 stamps, now queryable live), supervisor kind, served profiles,
   start_time, protocol version.
 - ``status``   → the live runtime-status payload (what ``gateway_state.json``
   holds today, but answered by the process itself, race-free).
+- ``wake``     → start an agent turn in a chat this gateway serves (request
+  ``params``: platform, chat_id, thread_id, chat_type, user_id, profile,
+  text). Same routing as the kanban notifier's wake; answers
+  ``{"delivered": bool, "error": str}`` synchronously.
 
 Transport:
 
@@ -238,6 +243,9 @@ class GatewayControlServer:
         home: Optional[Path] = None,
         *,
         verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        request_handlers: Optional[
+            dict[str, Callable[[dict[str, Any]], dict[str, Any]]]
+        ] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -254,6 +262,12 @@ class GatewayControlServer:
         }
         if verb_handlers:
             self._handlers.update(verb_handlers)
+        # Verbs that need the request body (e.g. ``wake``) receive the
+        # request's ``params`` object. Kept separate from ``verb_handlers`` so
+        # the zero-arg observation verbs keep their signature.
+        self._request_handlers: dict[
+            str, Callable[[dict[str, Any]], dict[str, Any]]
+        ] = dict(request_handlers or {})
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -353,12 +367,28 @@ class GatewayControlServer:
             request_id = request.get("id")
             verb = request.get("verb")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
-            if handler is None:
+            request_handler = (
+                self._request_handlers.get(verb) if isinstance(verb, str) else None
+            )
+            if request_handler is not None:
+                params = request.get("params")
+                if params is None:
+                    params = {}
+                if not isinstance(params, dict):
+                    raise ValueError("params must be a JSON object")
                 response: dict[str, Any] = {
+                    "ok": True,
+                    "protocol": CONTROL_PROTOCOL_VERSION,
+                    "result": request_handler(params),
+                }
+            elif handler is None:
+                response = {
                     "ok": False,
                     "error": f"unknown verb: {verb!r}",
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "supported_verbs": sorted(self._handlers),
+                    "supported_verbs": sorted(
+                        set(self._handlers) | set(self._request_handlers)
+                    ),
                 }
             else:
                 response = {
@@ -442,19 +472,24 @@ def query_gateway_control(
     verb: str,
     *,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+    params: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
+
+    ``params`` is sent as the request's ``params`` object (request-aware verbs
+    such as ``wake``).
 
     Returns the verb's ``result`` payload on success. Any failure — no
     socket, stale socket nobody accepts on, timeout, malformed answer,
     ``ok: false`` — returns None so callers fall back to the scan layer.
     Never raises.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
+    body: dict[str, Any] = {
+        "verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION,
+    }
+    if params is not None:
+        body["params"] = params
+    request = json.dumps(body).encode("utf-8") + b"\n"
     try:
         if _IS_WINDOWS:
             raw = _query_windows_pipe(Path(home), request, timeout)
@@ -558,3 +593,49 @@ def pause_gateway_for_update(
     exactly as before this verb existed.
     """
     return query_gateway_control(home, "pause-for-update", timeout=timeout)
+
+
+# Wake budget: the gateway resolves the adapter and hands the synthetic event
+# to ``adapter.handle_message`` (which returns once the turn is dispatched);
+# the non-push (api_server) self-post can take longer, so the client waits a
+# little past the server's own deadline.
+WAKE_SERVER_TIMEOUT = 20.0
+WAKE_CLIENT_TIMEOUT = WAKE_SERVER_TIMEOUT + 5.0
+
+
+def wake_gateway_session(
+    home: Path,
+    *,
+    platform: str,
+    chat_id: str,
+    text: str,
+    chat_type: str,
+    thread_id: str = "",
+    user_id: str = "",
+    user_id_alt: str = "",
+    scope_id: str = "",
+    profile: str = "",
+    timeout: float = WAKE_CLIENT_TIMEOUT,
+) -> Optional[dict[str, Any]]:
+    """Start an agent turn in a chat served by the gateway at ``home``.
+
+    Returns the gateway's answer ``{"delivered": bool, "error": str, ...}``,
+    or None when no gateway answers the ``wake`` verb (no socket, older
+    gateway) so the caller can use its fallback path.
+    """
+    return query_gateway_control(
+        home,
+        "wake",
+        timeout=timeout,
+        params={
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "chat_type": chat_type,
+            "user_id": user_id,
+            "user_id_alt": user_id_alt,
+            "scope_id": scope_id,
+            "profile": profile,
+            "text": text,
+        },
+    )

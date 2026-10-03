@@ -1604,6 +1604,147 @@ class GatewayKanbanWatchersMixin:
         # (#562) — the caller still refuses on 0 or >1.
         return creator_found or found
 
+    def _build_wake_source(
+        self,
+        plat: Any,
+        adapter: Any,
+        sub: dict,
+        *,
+        profile: Optional[str] = None,
+        creator_session_key: Optional[str] = None,
+    ) -> "tuple[Any, _WakeRoutingIdentity]":
+        """Build the ``SessionSource`` a push wake is delivered as.
+
+        One routing rule for every wake entry point: the kanban notifier's
+        ``_push_wake`` (``sub`` = a ``kanban_notify_subs`` row) and the
+        control-socket ``wake`` verb (``sub`` = the request's origin fields).
+        Returns ``(source, identity)`` so callers can log an adopted identity.
+        """
+        from gateway.session import SessionSource
+
+        # Rebuild the creator's real session scope from the chat_type
+        # persisted on the subscription row (#56580). build_session_key()
+        # keys DMs (":dm:<chat_id>") on a wholly different shape from
+        # group/thread, so the old hardcoded "group" mis-routed DM/thread
+        # creators into a fresh session. Legacy rows written before the
+        # column existed may still carry chat_type in delivery_metadata
+        # (#60600 rows) — fall back to that, then to "group" (the historical
+        # default that suits the dashboard/group flows). handle_message()
+        # get_or_create_session's the target, so a mismatch only ever
+        # degrades to a fresh session, never an exception.
+        chat_type = str(sub.get("chat_type") or "").strip()
+        if not chat_type:
+            delivery_meta = sub.get("delivery_metadata")
+            if isinstance(delivery_meta, dict):
+                chat_type = str(delivery_meta.get("chat_type") or "").strip()
+        chat_type = chat_type or "group"
+        # PREVENTION (card 5 / #555 follow-up): a row with no participant
+        # makes build_session_key() drop the participant segment, so the
+        # wake opens a SECOND, chat-unreachable session key for this chat —
+        # the phantom. #555 can only repair such a row after the fact; by
+        # then the phantom already exists. Resolve it here instead, from the
+        # gateway's own live routing index, before the key is ever built.
+        # Refuses (leaves user_id None, delivering to the shared per-chat
+        # session) unless exactly one per-user participant is known for this
+        # chat — see resolve_wake_participant. The subscription's own scope
+        # falls back to the adapter/metadata scope (upstream's
+        # _wake_scope_id) so Slack wakes key the workspace either way.
+        identity = resolve_wake_identity(
+            sub.get("user_id"),
+            sub.get("user_id_alt"),
+            sub.get("scope_id") or _wake_scope_id(adapter, sub),
+            self._live_chat_participants(
+                plat,
+                sub["chat_id"],
+                sub.get("thread_id") or None,
+                chat_type,
+                creator_session_key,
+            ),
+        )
+        source = SessionSource(
+            platform=plat,
+            chat_id=sub["chat_id"],
+            chat_type=chat_type,
+            thread_id=sub.get("thread_id") or None,
+            user_id=identity.user_id or None,
+            user_id_alt=identity.user_id_alt or None,
+            profile=profile or None,
+            scope_id=identity.scope_id or None,
+        )
+        return source, identity
+
+    async def _deliver_control_wake(self, params: dict) -> dict:
+        """Run one cross-process wake (control-socket ``wake`` verb).
+
+        ``params``: platform, chat_id, chat_type, text (required); thread_id,
+        user_id, user_id_alt, scope_id, profile (optional). Routing is the
+        notifier's (``_build_wake_source``: live-routing identity fill,
+        phantom refusal), delivery is ``gateway.wake.deliver_wake``. Answers
+        ``{"delivered": bool, "error": str}`` and never raises.
+        """
+        from gateway.config import Platform as _Platform
+        from gateway.wake import adapter_supports_push, deliver_wake
+
+        def _fail(error: str) -> dict:
+            logger.warning("control wake refused: %s", error)
+            return {"delivered": False, "error": error}
+
+        platform_str = str(params.get("platform") or "").strip().lower()
+        chat_id = str(params.get("chat_id") or "").strip()
+        chat_type = str(params.get("chat_type") or "").strip()
+        text = str(params.get("text") or "")
+        profile = str(params.get("profile") or "").strip()
+        if not platform_str or not chat_id or not text.strip():
+            return _fail("platform, chat_id and text are required")
+        if not chat_type:
+            # A guessed chat_type keys a different session shape (DM vs
+            # group) and wakes a phantom; the caller must know it.
+            return _fail("chat_type is required")
+        try:
+            plat = _Platform(platform_str)
+        except ValueError:
+            return _fail(f"unknown platform {platform_str!r}")
+        adapter = self._authorization_adapter(
+            plat, None if profile in ("", "default") else profile
+        )
+        if adapter is None:
+            return _fail(
+                f"no connected {platform_str} adapter for profile "
+                f"{profile or 'default'}"
+            )
+        if not adapter_supports_push(adapter):
+            return _fail(f"{platform_str} adapter cannot push a wake turn")
+        sub = {
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "thread_id": str(params.get("thread_id") or "").strip(),
+            "user_id": str(params.get("user_id") or "").strip(),
+            "user_id_alt": str(params.get("user_id_alt") or "").strip(),
+            "scope_id": str(params.get("scope_id") or "").strip(),
+        }
+        try:
+            source, identity = self._build_wake_source(
+                plat, adapter, sub, profile=profile or None,
+            )
+            await deliver_wake(adapter, text=text, source=source)
+        except Exception as exc:
+            logger.warning(
+                "control wake failed on %s/%s: %s", platform_str, chat_id, exc,
+                exc_info=True,
+            )
+            return {"delivered": False, "error": f"{type(exc).__name__}: {exc}"}
+        logger.info(
+            "control wake: woke %s/%s thread=%s profile=%s participant=%s",
+            platform_str, chat_id, sub["thread_id"] or "-",
+            profile or "default", identity.participant or "-",
+        )
+        return {
+            "delivered": True,
+            "error": "",
+            "chat_type": source.chat_type,
+            "user_id": source.user_id or "",
+        }
+
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -2683,57 +2824,12 @@ class GatewayKanbanWatchersMixin:
                             branches below; raises on failure so the caller
                             decides whether to rewind or merely log.
                             """
-                            from gateway.session import SessionSource
                             from gateway.wake import deliver_wake
-                            # Rebuild the creator's real session scope from
-                            # the chat_type persisted on the subscription
-                            # row (#56580). build_session_key() keys DMs
-                            # (":dm:<chat_id>") on a wholly different shape
-                            # from group/thread, so the old hardcoded
-                            # "group" mis-routed DM/thread creators into a
-                            # fresh session. Legacy rows written before the
-                            # column existed may still carry chat_type in
-                            # delivery_metadata (#60600 rows) — fall back
-                            # to that, then to "group" (the historical
-                            # default that suits the dashboard/group flows).
-                            # handle_message() get_or_create_session's the
-                            # target, so a mismatch only ever degrades to a
-                            # fresh session, never an exception.
-                            _chat_type = str(sub.get("chat_type") or "").strip()
-                            if not _chat_type:
-                                _delivery_meta = sub.get("delivery_metadata")
-                                if isinstance(_delivery_meta, dict):
-                                    _chat_type = str(
-                                        _delivery_meta.get("chat_type") or ""
-                                    ).strip()
-                            _chat_type = _chat_type or "group"
-                            # PREVENTION (card 5 / #555 follow-up): a row
-                            # with no participant makes build_session_key()
-                            # drop the participant segment, so the wake
-                            # opens a SECOND, chat-unreachable session key
-                            # for this chat — the phantom. #555 can only
-                            # repair such a row after the fact; by then the
-                            # phantom already exists. Resolve it here
-                            # instead, from the gateway's own live routing
-                            # index, before the key is ever built. Refuses
-                            # (leaves user_id None, delivering to the shared
-                            # per-chat session) unless exactly one per-user
-                            # participant is known for this chat — see
-                            # resolve_wake_participant. The subscription's
-                            # own scope falls back to the adapter/metadata
-                            # scope (upstream's _wake_scope_id) so Slack
-                            # wakes key the workspace either way.
-                            _wake_identity = resolve_wake_identity(
-                                sub.get("user_id"),
-                                sub.get("user_id_alt"),
-                                sub.get("scope_id") or _wake_scope_id(adapter, sub),
-                                self._live_chat_participants(
-                                    plat,
-                                    sub["chat_id"],
-                                    sub.get("thread_id") or None,
-                                    _chat_type,
-                                    _session_key,
-                                ),
+
+                            _source, _wake_identity = self._build_wake_source(
+                                plat, adapter, sub,
+                                profile=sub_profile or None,
+                                creator_session_key=_session_key,
                             )
                             if _wake_identity.participant and not (
                                 sub.get("user_id") or sub.get("user_id_alt")
@@ -2746,16 +2842,6 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], platform_str,
                                     sub["chat_id"], _wake_identity.participant,
                                 )
-                            _source = SessionSource(
-                                platform=plat,
-                                chat_id=sub["chat_id"],
-                                chat_type=_chat_type,
-                                thread_id=sub.get("thread_id") or None,
-                                user_id=_wake_identity.user_id or None,
-                                user_id_alt=_wake_identity.user_id_alt or None,
-                                profile=sub_profile or None,
-                                scope_id=_wake_identity.scope_id or None,
-                            )
                             # deliver_wake preserves the synthetic
                             # MessageEvent/handle_message path for
                             # push-capable adapters (the non-push /
