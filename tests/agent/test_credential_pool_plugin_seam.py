@@ -46,6 +46,11 @@ def test_plugin_metadata_survives_load_save_load():
 
 @pytest.fixture
 def plugin_profiles():
+    # The fork's provider registry is an additive seam (hermes_cli.provider_seam): entries cannot
+    # be popped, so isolate by restoring the pre-test generation instead of deleting rows.
+    from hermes_cli import provider_seam
+
+    generation = provider_seam.current()
     seen = []
 
     def refresh_credential(entry):
@@ -58,8 +63,7 @@ def plugin_profiles():
     providers.register_provider(ProviderProfile(name="example-oauth-nohook", auth_type="oauth_external",
                                                 base_url="https://example.invalid/v1"))
     yield seen
-    for name in ("example-oauth", "example-oauth-nohook"):
-        providers._REGISTRY.pop(name, None)
+    provider_seam._restore(generation)
     providers._PROVIDER_LIST_CACHE = None
 
 
