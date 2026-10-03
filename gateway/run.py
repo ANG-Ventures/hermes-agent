@@ -8022,6 +8022,12 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            # Stamp the inbound platform id on the persisted user row. Every
+            # transcript dedupe gate (Discord restart backfill, Telegram
+            # re-delivery, #47237) asks has_platform_message_id; without it
+            # they all answer "absent" and replay answered turns (t_3956b96e).
+            if ctx.persist_user_platform_id is not None:
+                _conversation_kwargs["persist_user_platform_id"] = ctx.persist_user_platform_id
             # Stop-during-pre-flight gate (2026-09-24 incident, Discord
             # #claude-bridge): a /stop that lands while this turn is still
             # in pre-flight (agent not yet built, slot holds the PENDING
@@ -28151,6 +28157,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                persist_user_platform_id=(
+                    str(event.message_id) if event.message_id else None
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -37767,6 +37776,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        persist_user_platform_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Session-binding and profile-scoping wrapper around the agent run.
 
@@ -37807,6 +37817,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                persist_user_platform_id=persist_user_platform_id,
             )
             if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 return await self._run_agent_inner(
@@ -38012,6 +38023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        persist_user_platform_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -38335,6 +38347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            persist_user_platform_id=persist_user_platform_id,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -39639,6 +39652,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     persist_user_display_kind=(
                         "internal_notification"
                         if getattr(pending_event, "internal", False)
+                        else None
+                    ),
+                    persist_user_platform_id=(
+                        str(pending_event.message_id)
+                        if getattr(pending_event, "message_id", None)
                         else None
                     ),
                 )
