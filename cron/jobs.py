@@ -1427,6 +1427,64 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
 # --- Ticker heartbeat (liveness signal for `hermes cron status`) ---
 
+# Key on a recurring ``interval`` job: the instant the in-flight fire started
+# (the tick/claim time that consumed a due ``next_run_at``). Written by the fire
+# paths (``advance_next_runs`` for the ticker, ``claim_job_for_fire`` for
+# external providers) and consumed + cleared by ``mark_job_run``, which re-arms
+# the job at the first ``fire_at + k*interval`` after the run finished.
+#
+# Why not the finish time (the pre-t_b2f58c48 behaviour): ``finish + N`` always
+# lands a few seconds AFTER tick k+N (the ticker waits 60 s between scans), so
+# the job was only due on tick k+N+1 and every ``every N m`` job ran every N+1
+# minutes. Why not the old ``next_run_at`` value: its phase is arbitrary, so a
+# slot a few seconds after the tick phase fires ~1 tick late and the skip rule
+# below then drops the next slot. The fire time IS a tick, and successive scans
+# are >= 60 s apart, so ``fire_at + N`` is due no later than tick k+N.
+INTERVAL_FIRE_AT_KEY = "interval_fire_at"
+
+
+def _record_interval_fire(job: Dict[str, Any], now: datetime) -> None:
+    """Stash when an interval fire started (see INTERVAL_FIRE_AT_KEY).
+
+    Only recorded when the job is actually due (``next_run_at <= now``), so a
+    second fire-path call for the same fire (the ticker advances, then claims)
+    sees the already-advanced future value and keeps the first stamp.
+    """
+    if (job.get("schedule") or {}).get("kind") != "interval":
+        return
+    slot = job.get("next_run_at")
+    if not slot:
+        return
+    try:
+        if _ensure_aware(datetime.fromisoformat(slot)) <= now:
+            job[INTERVAL_FIRE_AT_KEY] = now.isoformat()
+    except (TypeError, ValueError):
+        pass
+
+
+def _next_interval_slot(
+    schedule: Dict[str, Any], fire_at: Optional[str], now: datetime
+) -> Optional[str]:
+    """First ``fire_at + k*interval`` (k >= 1) strictly after ``now``.
+
+    Slots that elapsed while an over-long run was in flight are skipped, never
+    fired, so a slot cannot fire twice and missed slots do not burst. Returns
+    None when the anchor or interval is unusable (caller falls back to
+    ``compute_next_run``).
+    """
+    if not fire_at:
+        return None
+    try:
+        period = timedelta(minutes=float(schedule.get("minutes")))
+        anchor = _ensure_aware(datetime.fromisoformat(fire_at))
+    except (TypeError, ValueError):
+        return None
+    if period <= timedelta(0):
+        return None
+    k = int((now - anchor) // period) + 1 if now >= anchor else 1
+    return (anchor + k * period).isoformat()
+
+
 def _write_marker(name: str, text: str, tmp_prefix: str) -> None:
     """Atomic (never torn) best-effort marker write; failures swallowed so markers never break the
     tick."""
@@ -3252,7 +3310,12 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
             _complete_job_record(job)
             return
 
-    job["next_run_at"] = compute_next_run(job["schedule"], now)
+    # An interval fire re-arms off the instant it started, not off this finish time (t_b2f58c48).
+    fire_at = job.pop(INTERVAL_FIRE_AT_KEY, None)
+    next_slot = None
+    if kind == "interval":
+        next_slot = _next_interval_slot(job["schedule"], fire_at, datetime.fromisoformat(now))
+    job["next_run_at"] = next_slot or compute_next_run(job["schedule"], now)
     if job["next_run_at"] is not None:
         if job.get("state") != "paused":
             job["state"] = "scheduled"
@@ -3554,7 +3617,8 @@ def advance_next_runs(job_ids) -> int:
         return 0
     with _jobs_lock():
         jobs = load_jobs()
-        now = _hermes_now().isoformat()
+        now_dt = _hermes_now()
+        now = now_dt.isoformat()
         advanced = 0
         for job in jobs:
             if (
@@ -3565,6 +3629,7 @@ def advance_next_runs(job_ids) -> int:
                 continue
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
+                _record_interval_fire(job, now_dt)
                 job["next_run_at"] = new_next
                 advanced += 1
         if advanced:
@@ -3656,6 +3721,7 @@ def claim_job_for_fire(
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
+                _record_interval_fire(job, now)
                 job["next_run_at"] = nxt
         save_jobs(jobs)
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
