@@ -11,12 +11,22 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import hermes_cli.local_runtime.load_progress as lp
 
 
 def setup_function(_fn):
     with lp._lock:
         lp._snapshot.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_watcher(monkeypatch):
+    """get_loading_progress() starts the real SSE watcher; with no managed router its first
+    loop is _clear_snapshot(), which races the snapshot these tests just built (red on
+    #1624 slice 14: assert 'm1' in {})."""
+    monkeypatch.setattr(lp, "_ensure_watcher", lambda: None)
 
 
 # ── composite percent ────────────────────────────────────────
