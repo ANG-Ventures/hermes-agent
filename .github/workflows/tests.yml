@@ -710,31 +710,6 @@ jobs:
           source .venv/bin/activate
           python -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
-      - name: Login-shell diagnostic (venue probe, 2026-10-03)
-        # Two upgrade tests resolve `hermes` through a NEW login shell
-        # (bash -lic) whose PATH must come from the rc files install.sh
-        # wrote. On blacksmith-4vcpu the probe read PATH=/usr/local/bin:
-        # /usr/bin:/bin:/snap/bin (no ~/.local/bin) where ubuntu-latest
-        # passed. Print what a login shell sources here so the fix is
-        # measured, not guessed. Harmless on every venue.
-        run: |
-          set -u
-          echo "SHELL=$SHELL HOME=$HOME user=$(id -un)"
-          ls -la "$HOME"/.bash_profile "$HOME"/.bash_login "$HOME"/.profile "$HOME"/.bashrc 2>&1 | sed 's/^/rc: /'
-          grep -nE 'PATH|bashrc|interactive|case \$-' "$HOME"/.profile "$HOME"/.bashrc 2>/dev/null | head -20 | sed 's/^/rcline: /'
-          grep -nE 'PATH' /etc/profile /etc/bash.bashrc 2>/dev/null | head -8 | sed 's/^/etc: /'
-          ls /etc/profile.d/ 2>/dev/null | tr '\n' ' ' | sed 's/^/profile.d: /'; echo
-          T=$(mktemp -d); printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' > "$T/.profile"
-          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "probe PATH=$PATH"' 2>&1 | sed 's/^/tmp-home: /'
-          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "BASH_ENV=${BASH_ENV:-} ENV=${ENV:-}"; shopt login_shell' 2>&1 | sed 's/^/tmp-home: /'
-          echo "--- /etc/profile.d/blacksmith.sh ---"; cat /etc/profile.d/blacksmith.sh 2>/dev/null | sed 's/^/bs: /'
-          echo "--- /etc/profile ---"; cat /etc/profile | sed 's/^/etcp: /'
-          echo "--- trace: does ~/.profile run, and what is PATH right after it? ---"
-          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'true' 2>&1 >/dev/null | head -3
-          printf '%s\n' 'echo "IN-PROFILE PATH=$PATH"; export PATH="$HOME/.local/bin:$PATH"; echo "AFTER-PROFILE PATH=$PATH"' > "$T/.profile"
-          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "FINAL PATH=$PATH"' 2>/dev/null | sed 's/^/trace: /'
-          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lc 'echo "NONINTERACTIVE-LOGIN PATH=$PATH"' 2>/dev/null | sed 's/^/trace: /'
-
       - name: Run upgrade e2e tests (${{ matrix.shard }})
         run: |
           set -euo pipefail
