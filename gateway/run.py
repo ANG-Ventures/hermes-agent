@@ -24902,6 +24902,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
+            # An internal event (kanban / control-socket wake) reaching an IDLE
+            # session mid-restart-drain: its producer has already advanced its
+            # cursor, so refusing it here loses it (t_cff27691). Spool it for
+            # the next boot like a busy session's follow-up.
+            if is_internal and self._queue_during_drain_enabled(
+                self._effective_busy_input_mode(source)
+            ):
+                await self._preserve_followup_across_restart(
+                    self._session_key_for_source(source), event, None
+                )
+                return None
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # User-defined quick commands (bypass agent loop, no LLM call)
