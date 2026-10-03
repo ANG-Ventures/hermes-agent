@@ -12858,12 +12858,8 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     if kind == "crashed":
         return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
     if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        from gateway.kanban_notify_failures import format_timed_out_notice
+        return format_timed_out_notice(payload, task_id=task_id, board_tag=board_tag, tag=tag)
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None
