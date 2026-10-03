@@ -469,6 +469,24 @@ class TestNestedDictModelDefaultPairing:
         assert cli.requested_provider == "anthropic"
         assert cli.provider == "anthropic"
 
+    def test_builtin_gpt55_alias_does_not_reroute_config_default(self):
+        # Fork built-in alias gpt-5.5 -> openai-codex is for a TYPED model; a config
+        # default beside an explicit provider keeps that provider (parity 2026-10-01:
+        # upstream's startup route also runs on the config default; the codex
+        # app-server e2e config `provider: openai, default: gpt-5.5` hit the OAuth rung).
+        cli = _make_cli(config_overrides={
+            "model": {"default": "gpt-5.5", "provider": "openai"},
+        })
+        assert cli.model == "gpt-5.5"
+        assert cli.requested_provider == "openai"
+
+    def test_builtin_gpt55_alias_still_routes_explicit_model_arg(self):
+        cli = _make_cli(config_overrides={
+            "model": {"default": "other-model", "provider": "openai"},
+        }, model="gpt-5.5")
+        assert cli.model == "gpt-5.5"
+        assert cli.requested_provider == "openai-codex"
+
     def test_whoami_command_is_dispatched_and_prints_cli_access(self, capsys):
         """/whoami is advertised in classic CLI help and must not fall through.
 

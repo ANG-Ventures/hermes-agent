@@ -119,7 +119,12 @@ class CLIInitMixin:
         self.model = model or _config_model or ""
         _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
-        if self.model:
+        from hermes_cli.model_switch import is_builtin_only_direct_alias
+        # Fork: the built-in ``gpt-5.5`` alias is for a typed model; a config default next to
+        # a configured provider keeps that provider (upstream's startup route also runs on the
+        # config default, which fork/main never did).
+        if self.model and (model or not (_cfg_provider or _nested_provider)
+                           or not is_builtin_only_direct_alias(self.model)):
             from hermes_cli.model_switch import resolve_startup_model_route
 
             _startup_route = resolve_startup_model_route(

@@ -209,6 +209,21 @@ _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
 }
 
 
+def is_builtin_only_direct_alias(name: str) -> bool:
+    """True when ``name`` resolves ONLY through a fork built-in alias (no user override).
+
+    The built-ins encode a fleet convention for an explicitly TYPED model (``/model gpt-5.5``,
+    ``-m gpt-5.5``). They must not re-route a config ``model.default`` that already sits beside
+    an explicit ``model.provider`` (``provider: openai`` + ``default: gpt-5.5`` stays on openai).
+    """
+    key = _clean(name).lower()
+    if key not in _BUILTIN_DIRECT_ALIASES:
+        return False
+    # Read-only: never prime or mutate the process-global DIRECT_ALIASES cache here.
+    fresh, _ok = _load_direct_aliases()
+    return fresh.get(key) == _BUILTIN_DIRECT_ALIASES[key]
+
+
 def _clean(value: Any) -> str:
     """``str(value or "").strip()`` — the config-field normaliser used throughout this module."""
     return str(value or "").strip()
