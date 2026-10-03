@@ -21,5 +21,7 @@ N-1 tags fetched from NousResearch as the e2e-upgrade job does). Narrow runs onl
 - ace-ai, synthetic PR-merge checkout (parents fork/main 508d20c8c3 + lane cdab0d8c4f, `describe HEAD~1`=v2026.8.3):
   `tests/e2e/core/upgrade/test_upgrade_path.py` whole file: 7 passed in 421.4 s (lock-only and torn-tree included).
 - ace-ai, lane branch: `tests/e2e/core/chaos/test_gateway_turn_liveness.py` whole file: 12 passed in 39.8 s.
-- Windows install + update E2E, lane head 6ecfea33ab via `wine2e-install/t_a85e52b5-p2`: run 37105724870 — see the
-  line appended below when it finished.
+- Windows install + update E2E, lane head 6ecfea33ab via `wine2e-install/t_a85e52b5-p2`: run 37105724870 **success**,
+  `6 files, 19 tests passed, 0 failed in 3270.4s (2 workers)` (per file 817-1216 s; job 07:15-08:19Z = 64 min inside
+  the 90 min wall; 100 artifact files uploaded). Same 19 passed + 1 xfail (`test_git_and_holders`) as upstream's
+  green run 36307037128.
