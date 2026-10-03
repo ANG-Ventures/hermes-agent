@@ -171,3 +171,49 @@ def test_cli_assign_and_reassign(board: Path, monkeypatch, capsys, verb) -> None
         assert (task.status, task.assignee) == ("ready", "builder")
         [changed] = _events(conn, tid, "changes_requested")
         assert changed["operator"].startswith("apollo: ")
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_cli_assign_on_review_card_warns_it_stays_parked(board: Path, monkeypatch, capsys, verb) -> None:
+    """t_78ea7580: assign on a review card succeeds but nothing dispatches it: say so, name the verb.
+
+    Measured 2026-10-02/03 (t_3bd70b59, t_a57274a4, t_82169667): an operator
+    posted GO + ``assign <card> <worker>``; the cards sat in ``review`` 4-8 h
+    with no worker. The assign still exits 0 (unchanged behaviour); the
+    WARNING on stderr names the status and ``request-changes --coverage``.
+    """
+    monkeypatch.setattr(_open_pr, "_default_query", lambda: _state("MERGED"))
+    with kb.connect() as conn:
+        tid = _review_with_pr(conn)
+    cmd = kc._cmd_assign if verb == "assign" else kc._cmd_reassign
+    base = dict(task_id=tid, profile="daedalus", reclaim=False, reason=None, request_changes=None)
+    assert cmd(argparse.Namespace(**base)) == 0
+    out, err = capsys.readouterr()
+    assert tid in out
+    assert "WARNING" in err and "'review'" in err and "does NOT dispatch" in err
+    assert f"request-changes {tid}" in err and "--coverage" in err
+    assert f"complete {tid}" in err
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.assignee) == ("review", "daedalus")
+
+    # A human sentinel on a review card is a deliberate parked lane: no warning.
+    assert cmd(argparse.Namespace(**dict(base, profile="human:apollo"))) == 0
+    assert "WARNING" not in capsys.readouterr().err
+    # A card that is not in review dispatches normally: no warning.
+    with kb.connect() as conn:
+        plain = kb.create_task(conn, title="plain", assignee="builder")
+    assert cmd(argparse.Namespace(**dict(base, task_id=plain))) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_triage_resolve_on_review_card_names_request_changes(board: Path) -> None:
+    """t_78ea7580: the refusal names the working verb, not just 'complete'."""
+    with kb.connect() as conn:
+        tid = _review_with_pr(conn)
+        ok, err = kb.triage_resolve_task(conn, tid, to="todo", reason="re-queue", actor="apollo")
+    assert ok is False
+    assert "is 'review'" in err
+    assert "request-changes <id>" in err and "--coverage" in err
+    assert "complete <id>" in err
+    assert "assign/reassign alone leaves it in review" in err
