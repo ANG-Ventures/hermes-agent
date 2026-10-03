@@ -5,7 +5,17 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
 from gateway.run import GatewayRunner
-from gateway.status import read_runtime_status
+from gateway.status import drain_runtime_status_lane, flush_runtime_status
+from gateway.status import read_runtime_status as _read_runtime_status
+
+
+def read_runtime_status():
+    # fork (parity 2026-10-01 CI): platform-state writes go through the ordered status lane and the
+    # background writer; read only once both have settled (red on Blacksmith, run 37113322684:
+    # telegram still 'connecting' while gateway_state was already 'startup_failed').
+    drain_runtime_status_lane()
+    flush_runtime_status(timeout=5.0)
+    return _read_runtime_status()
 
 
 @pytest.fixture(autouse=True)
