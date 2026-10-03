@@ -82,6 +82,9 @@ _POOL_HEADER_NAMES = (
     "x-pool-served-by",
     "x-pool-route-id",
     "x-pool-unreachable",
+    # claude-pool #193: "gave_up" = the relay already retried an empty-content
+    # 200 on the same seat AND one other seat (t_9d411670).
+    "x-pool-empty-content-retried",
 )
 # Relay-pool providers whose responses carry the x-pool-* attribution headers.
 _POOLED_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"})
