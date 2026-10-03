@@ -89,6 +89,9 @@ const compressionYaml = (thresholdTokens: number) =>
     'compression:',
     '  in_place: true',
     `  threshold_tokens: ${thresholdTokens}`,
+    // The scripted provider reports prompt_tokens=10, so the trigger skew sits at skew_floor;
+    // 1.0 makes the trigger compare raw rough tokens against the threshold this spec sizes.
+    '  skew_floor: 1.0',
     '  tail_mode: legacy',
     '  protect_first_n: 0',
     '  protect_last_n: 2',

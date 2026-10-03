@@ -146,7 +146,7 @@ test('lineage: a real compression rotation is one sidebar row per conversation (
   writeProviderHome(
     sandbox.hermesHome,
     provider.url,
-    'compression:\n  in_place: false\n  protect_first_n: 1\n  protect_last_n: 1\n  threshold_tokens: 24000\n'
+    'compression:\n  in_place: false\n  protect_first_n: 1\n  protect_last_n: 1\n  threshold_tokens: 24000\n  skew_floor: 1.0\n'
   )
   const { app, page } = await launchCoreApp(coreAppEnv(sandbox))
   const ws = recordWebSockets(page)
