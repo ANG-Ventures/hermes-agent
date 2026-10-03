@@ -161,6 +161,34 @@ def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
 _REGEX_NEWLINE_ESCAPE_RE = re.compile(r"(?<!\\)(?:\\\\)*\\n")
 
 
+# fork (#615, da284c032a): rg's default engine is Rust `regex` (finite automata,
+# no look-around/backrefs); a valid PCRE like ``(?<!def )foo`` hard-errors instead
+# of searching. rg ships ``--pcre2``, so detect the syntax up front, and retry once
+# on rg's PCRE2-only error text for constructs the detector does not know yet.
+_LOOKAROUND_RE = re.compile(r"\(\?<[=!]|\(\?<\w+>|\\K|\(\?[=!]")
+
+_PCRE2_ONLY_ERROR_MARKERS = (
+    "look-around, including look-ahead and look-behind, is not supported",
+    "unrecognized flag",
+    "backreferences are not supported",
+)
+
+
+def _pattern_needs_pcre2(pattern: str) -> bool:
+    """Return True when a regex uses syntax only rg's PCRE2 engine supports."""
+    return bool(_LOOKAROUND_RE.search(pattern))
+
+
+def _is_pcre2_only_syntax_error(text: Optional[str]) -> bool:
+    """Return True for rg's error when a pattern needs the PCRE2 engine."""
+    if not text:
+        return False
+    lowered = text.lower()
+    if "regex parse error" not in lowered and "error:" not in lowered:
+        return False
+    return any(marker in lowered for marker in _PCRE2_ONLY_ERROR_MARKERS)
+
+
 def _pattern_has_regex_newline(pattern: str) -> bool:
     """True when a content regex wants to match a newline: a literal newline or a
     ``\\n`` escape with an ODD number of backslashes (``\\\\n`` is a literal
@@ -865,6 +893,15 @@ class SearchMixin:
         else:
             result = self._run_rg_bounded(cmd_parts, fetch_limit, timeout=60, merge_stderr=True,
                                           shell_prefix="set -o pipefail; ")
+            # fork (#615): belt-and-braces — rg rejected PCRE2-only syntax the detector
+            # does not know; retry once on the PCRE2 engine instead of surfacing a parse error.
+            if "--pcre2" not in cmd_parts and _is_pcre2_only_syntax_error(
+                getattr(result, "stdout", "") or ""
+            ):
+                retry_parts = list(cmd_parts)
+                retry_parts.insert(1, "--pcre2")
+                result = self._run_rg_bounded(retry_parts, fetch_limit, timeout=60, merge_stderr=True,
+                                              shell_prefix="set -o pipefail; ")
         return _parse_search_output(result, output_mode, limit, offset, context, warning=warning)
 
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
@@ -886,6 +923,9 @@ class SearchMixin:
         multiline = _pattern_has_regex_newline(pattern)
         if multiline:
             cmd_parts.append("--multiline")
+        # fork (#615): look-around/backrefs need rg's PCRE2 engine; switch up front.
+        if _pattern_needs_pcre2(pattern):
+            cmd_parts.append("--pcre2")
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
         cmd_parts.extend(self._rg_exclusion_globs(path))

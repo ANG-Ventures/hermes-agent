@@ -171,6 +171,8 @@ def test_non_deliverable_failure_mirror_is_profile_local(monkeypatch, tmp_path):
 
     identifier, _, _ = dispatch(monkeypatch)
     foreign = tmp_path / "profiles/foreign"
+    # upstream: mkdir_under_hermes_home refuses to materialize a missing named profile home.
+    foreign.mkdir(parents=True)
     token = set_hermes_home_override(foreign)
     try:
         legacy(identifier, "delivered")
@@ -390,7 +392,7 @@ def test_optional_archive_failure_keeps_real_completion(monkeypatch, batch, extr
 def test_mixed_corruption_both_replay_rails(monkeypatch, rail, caplog):
     import asyncio
     from unittest.mock import AsyncMock
-    from tests.gateway.test_completion_delivery import _runner
+    from tests.gateway.test_completion_delivery import AdmittingHandler, _runner
 
     route = "agent:main:telegram:dm:12345:678"
     good, _ = failed_mirror(monkeypatch, session_key=route)
@@ -412,10 +414,13 @@ def test_mixed_corruption_both_replay_rails(monkeypatch, rail, caplog):
     events = list(q.queue)
     assert {e["delegation_id"] for e in events} == {good, sibling}
     assert semantic in caplog.text and checksum in caplog.text
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    # upstream admit_internal_event requires the adapter to stamp ``_gateway_accepted``; a bare
+    # AsyncMock is "not accepted" and the group requeues.
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
-    assert asyncio.run(runner._deliver_async_delegation_group(events)) == "delivered"
+    # merged bool/None delivery vocabulary (699b314dac): True is adapter acceptance.
+    assert asyncio.run(runner._deliver_async_delegation_group(events)) is True
     adapter.handle_message.assert_awaited_once()
     for identifier in (good, sibling):
         assert row(identifier)["delivery_state"] == "delivered"

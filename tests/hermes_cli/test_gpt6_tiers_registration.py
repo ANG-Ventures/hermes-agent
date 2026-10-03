@@ -33,9 +33,13 @@ def test_gpt6_tiers_share_the_codex_900k_contract_with_56():
     for base in GPT6_TIERS:
         assert ids.index(f"{base}-900k") == ids.index(base) + 1, base
         assert f"{base}-pro-900k" not in ids
-        assert is_codex_900k_base(f"{base}-2026-09-22"), base  # dated snapshots inherit eligibility
+        # fork: gpt-6 tiers are EXACT entries (d2acfa7f22, fork/main); only the 5.6 bases take dated snapshots.
+        assert not is_codex_900k_base(f"{base}-2026-09-22"), base
+        assert is_codex_900k_base("gpt-5.6-sol-2026-09-22")
         assert strip_codex_context_variant_suffix(f"openai/{base}-900k") == f"openai/{base}"
-        assert _verified_codex_ctx_for_slug(f"{base}-900k") == _verified_codex_ctx_for_slug("gpt-5.6-sol-900k")
+        # fork: gpt-6 tiers carry their own measured 872K window (tests/agent/test_codex_context_policy.py),
+        # not the 5.6 900K one.
+        assert _verified_codex_ctx_for_slug(f"{base}-900k") == 872_000
         assert _compression_threshold_for_model(base, provider="openai-codex") == \
             _compression_threshold_for_model("gpt-5.6-sol", provider="openai-codex")
         assert _compression_threshold_for_model(f"{base}-900k", provider="openai-codex") is None

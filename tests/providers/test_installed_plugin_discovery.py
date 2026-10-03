@@ -28,9 +28,11 @@ _PROFILE_SOURCE = textwrap.dedent(
 
 def _clear_provider_caches():
     import providers as _pkg
+    from hermes_cli import provider_seam
 
-    _pkg._REGISTRY.clear()
-    _pkg._ALIASES.clear()
+    # fork: ``_REGISTRY`` / ``_ALIASES`` are additive provider_seam facades (no clear()); empty them
+    # through the seam's test-isolation reset instead.
+    provider_seam._reset("_REGISTRY", "_ALIASES")
     _pkg._PROVIDER_LIST_CACHE = None
     _pkg._discovered = False
     for mod in list(sys.modules):
