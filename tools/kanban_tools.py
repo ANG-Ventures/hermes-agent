@@ -1789,7 +1789,8 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(
-                conn, new_tid, wake=args.get("wake") is True,
+                conn, new_tid,
+                wake=args.get("wake") if isinstance(args.get("wake"), bool) else None,
             )
             return _ok(
                 task_id=new_tid,
@@ -1814,7 +1815,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: bool = False) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any, task_id: str, *, wake: Optional[bool] = None,
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1869,7 +1872,8 @@ def subscribe_calling_session(
     task_id: str,
     *,
     require_platform_identity: bool = False,
-    wake: bool = False,
+    wake: Optional[bool] = None,
+    takeover: bool = False,
 ) -> bool:
     """Resolve the calling session's delivery identity and write a notify sub.
 
@@ -1886,10 +1890,14 @@ def subscribe_calling_session(
     ``HERMES_SESSION_KEY`` fallback below: a bare CLI/cron/script create
     has no delivery channel and must stay silent (#19718).
 
-    Delivery mode defaults to ``'notify'`` (passive completion line, no
-    agent turn). ``wake=True`` is the only way to get ``'notify+wake'`` for
-    a gateway session: every wake is a full big-context turn that queues
-    the human's messages, so it must be an explicit opt-in (t_6d6e9467).
+    Delivery mode for a gateway session (Ace 2026-10-03 13:28, t_74bf5296):
+    ``wake=None`` follows ``kanban.auto_subscribe_wake`` (default True, so
+    ``'notify+wake'``); ``wake=False`` is notify-only; ``wake=True`` forces
+    wake. The store grants the wake only to ONE chat per card
+    (``kanban_db._claim_wake``); a second subscriber is stored ``notify``.
+    ``takeover=True`` moves the card's wake to this chat. Under measured host
+    contention the notifier downgrades a wake to a notify per EVENT
+    (``kanban_wake_gate``); the subscription is not changed.
 
     Returns True if a subscription row was written; any exception is
     logged at WARNING and swallowed (returns False).
@@ -1947,6 +1955,13 @@ def subscribe_calling_session(
                 pass
         # None → add_notify_sub's platform default: 'notify' everywhere except
         # api_server, whose only delivery mechanism is the wake self-post.
+        if wake is None:
+            try:
+                wake = bool(cfg_get(
+                    load_config(), "kanban", "auto_subscribe_wake", default=True,
+                ))
+            except Exception:
+                wake = True
         delivery_mode = "notify+wake" if (wake and is_gateway_session) else None
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
@@ -2000,6 +2015,7 @@ def subscribe_calling_session(
             notifier_profile=notifier_profile,
             delivery_mode=delivery_mode,
             delivery_metadata=delivery_metadata or None,
+            takeover=takeover,
         )
         return True
     except Exception as _exc:
@@ -2817,10 +2833,11 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "Only with a gateway auto-subscription: also WAKE this "
-                    "chat's agent (a full turn) on terminal events instead "
-                    "of just posting the passive notification line. "
-                    "Defaults to false — wakes queue the human's messages, "
-                    "so opt in only when this session must act on the result."
+                    "chat's agent (a full turn) on terminal events, besides "
+                    "the passive notification line. Default: wake "
+                    "(kanban.auto_subscribe_wake); pass false for notify-only. "
+                    "One waker per card; under host load a wake is sent as a "
+                    "notify."
                 ),
             },
             "goal_mode": {
