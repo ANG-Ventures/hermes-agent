@@ -1,0 +1,25 @@
+# CI round-8 lane P2-upgrade-gateway — ledger
+
+Branch `sync/upstream-2026-10-01-ci-P2-upgrade-gateway` off `ea18906c0a` (round-8 fold). Red source: CI run
+37094436303 (jobs 111121677199 e2e-upgrade/core, 111121599046 e2e, 111121507407 Windows install + update E2E).
+Baseline `fm-base` = fork/main 0410ed1b35 (its push CI 37093419421 is green; it runs neither the chaos cell nor
+the e2e-upgrade shards nor the Windows install journey, so none of these reds can be shown INHERITED by CI).
+
+Linux cells reproduced on ace-ai (`/srv/ci/scratch/t_a85e52b5/repo`, lane branch, venv from uv.lock, bwrap ok,
+N-1 tags fetched from NousResearch as the e2e-upgrade job does). Narrow runs only (one nodeid / one file).
+
+## Per red
+
+| red | verdict | cause / fix | narrow result |
+|---|---|---|---|
+| tests/e2e/core/upgrade/test_upgrade_path.py::test_kill_mid_pull_then_retry_heals[lock-only] | FIXED-TEST (UPSTREAM-TEST-vs-FORK-HISTORY) | Not the lock sweep. The PR job checks out `refs/pull/1624/merge`; its `HEAD~1` is fork/main `6ef7753370`, and `_refs()` resolved N-1 as `git describe HEAD~1` = **v2026.8.3** (CI log: `Found 28066 new commit(s)` = exactly `rev-list v2026.8.3..<merge>`). v2026.8.3's `hermes update` has no `hermes_cli/gitlock.py`, no `merge-base --is-ancestor` guard and no `_release_dead_index_lock`: the aged `index.lock` fails `merge --ff-only`, which it reads as divergence, and `reset --hard` then dies on the same lock. Round 7 (N4) fixed the identical pick in `handoff/_handoff.py::_nearest_release_tag` (describe HEAD; HEAD~1 only when HEAD is the tag itself). Same resolver ported here (commit cdab0d8c4f). | ace-ai, lane head: `HERMES_E2E_UPGRADE_BASE=v2026.8.3` -> 1 failed in 36 s with CI's exact stdout; default (v2026.9.24) -> 1 passed 110.8 s. Synthetic PR-merge checkout (parents fork/main 508d20c8c3 + lane cdab0d8c4f): `describe HEAD~1`=v2026.8.3, `describe HEAD`=v2026.9.24, resolver -> v2026.9.24, cell 1 passed 119.5 s. Whole file: see "Final re-proof". |
+| tests/e2e/core/chaos/test_gateway_turn_liveness.py::test_gateway_turn_stays_live_under_fault[sigterm_during_provider_hang] | FIXED-TEST (UPSTREAM-TEST-vs-FORK-CONTRACT) | Fork `agent.restart_drain_timeout` defaults to **180 s** (upstream 0; parity marker 2026-08-07, kept by R11). The scenario hangs the provider with `LONG_TIMEOUT_S=600` and SIGTERMs; the fork drains the live turn for 180 s, past the harness `SHUTDOWN_DEADLINE_S=60` (gateway.log ends at `Shutdown phase: pending boot-resume cancel`, then nothing until the SIGKILL). Upstream's harness never set the knob because upstream's default interrupts at once. `chaos_config()` now pins `agent.restart_drain_timeout: 2` beside the other liveness knobs (parser treats 0 as "default", so the pin is positive). Fork default untouched; no fork guard weakened (commit 71388c9d32). | ace-ai: before 1 failed in 65.6 s; after 1 passed in 7.7 s, gateway.log `Gateway drain timed out after 2.0s ... interrupting remaining work`. Whole file (12 scenarios): 12 passed in 39.8 s. |
+| tests/e2e/core/windows_update/*.py (6 files, all HUNG 1200 s at the first cell) | FIXED-CI (two layers) | `scripts/install.ps1` and `pm/` are byte-identical to upstream 612d8e44; the tests are upstream's. (1) Each file is one module-scoped journey fixture (install.ps1 -> update -> turns) that runs before the first cell prints, so pytest is silent for the whole walk by design; the fork's idle hang detector (the parallel runner's `--idle-timeout`; upstream has none on this job) killed all six at 1229 s as it had at 269 s in round 7. `CI_TEST_IDLE_TIMEOUT` 1200 -> 2400 (= wall), commit 2b9a02aa1a. (2) With the detector out of the way the real red showed (proof lane `wine2e-install/t_a85e52b5-p2`, run 37100414187, artifact 11265793725): every journey's install.ps1 hit `INSTALL_TIMEOUT=1500` at `Preparing Node dependencies`. Per-step offsets vs upstream's green 32-core run 36307037128 (artifact 10928177338): clone done 328-391 s (upstream 64-80), npm unpacked 777-794 (~180), venv 971-1053 (~222), node-deps reached 1246-1405 (187-248). Six parallel installs on the org's 4-vCPU `windows-latest` (no 32-core pool) are CPU-bound ~5x. Measured `HERMES_TEST_WORKERS=2` (run 37102491348): install 870-1015 s, files 1048-1359 s, 15/15 cells green over the 4 files that finished before the 50 min job wall cancelled the last pair mid-install. `HERMES_TEST_WORKERS` 6 -> 2, `timeout-minutes` 50 -> 90, commit 6ecfea33ab. No test/product change; `INSTALL_TIMEOUT`/`UPDATE_TIMEOUT` unchanged. | Final proof: run 37105724870 on lane head 6ecfea33ab, result in "Final re-proof". |
+
+## Final re-proof
+
+- ace-ai, synthetic PR-merge checkout (parents fork/main 508d20c8c3 + lane cdab0d8c4f, `describe HEAD~1`=v2026.8.3):
+  `tests/e2e/core/upgrade/test_upgrade_path.py` whole file: 7 passed in 421.4 s (lock-only and torn-tree included).
+- ace-ai, lane branch: `tests/e2e/core/chaos/test_gateway_turn_liveness.py` whole file: 12 passed in 39.8 s.
+- Windows install + update E2E, lane head 6ecfea33ab via `wine2e-install/t_a85e52b5-p2`: run 37105724870 — see the
+  line appended below when it finished.
