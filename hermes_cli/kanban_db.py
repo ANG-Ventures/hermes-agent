@@ -15568,8 +15568,24 @@ def _dead_claimer_release_at(
         (task_id, int(run["id"])),
     ).fetchone()
     if evidence is None:
+        bound = _dead_claimer_launch_bound_seconds()
+        # The claim's OWN window (``claim --ttl N``, recorded as the ``claimed`` event's
+        # ``expires``) is the same operator statement the env var is: holding a 1 s claim for
+        # the 900 s default strands the card past every tick that could reclaim it. Dispatcher
+        # claims pass no TTL, so their window IS the default and nothing changes for them.
+        claimed_ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, int(run["id"])),
+        ).fetchone()
+        try:
+            claim_window = int(json.loads(claimed_ev["payload"]).get("expires")) - int(run["started_at"])
+        except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+            claim_window = 0
+        if 0 < claim_window < bound:
+            bound = claim_window
         return (
-            int(run["started_at"]) + _dead_claimer_launch_bound_seconds(),
+            int(run["started_at"]) + bound,
             "launch_bound",
             None,
         )

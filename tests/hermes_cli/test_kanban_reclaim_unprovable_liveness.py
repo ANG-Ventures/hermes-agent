@@ -287,6 +287,30 @@ def test_dead_claimer_inside_launch_bound_is_held(conn):
     assert _row(conn, tid)["claim_lock"] == lock
 
 
+def test_dead_claimer_launch_bound_follows_the_claims_own_ttl(conn):
+    """``claim --ttl N`` states how long the claim may hold without evidence; a pid-less
+    claim whose claimer exited is released once THAT window has passed, not after the
+    900 s default (upstream e2e test_kanban_worker_sigkill: claim --ttl 1, then a tick)."""
+    tid = kb.create_task(conn, title="operator short claim", assignee="daedalus-opus")
+    task = kb.claim_task(conn, tid, ttl_seconds=5)
+    assert task is not None
+    run_id = task.current_run_id
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    conn.execute("UPDATE tasks SET claim_lock=? WHERE id=?", (lock, tid))
+    conn.execute("UPDATE task_runs SET claim_lock=? WHERE id=?", (lock, run_id))
+    conn.commit()
+    started = conn.execute("SELECT started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
+    release_at, basis, _ = kb._dead_claimer_release_at(conn, tid)
+    assert basis == "launch_bound"
+    assert release_at == int(started) + 5
+    # A default-TTL claim keeps the full launch bound (dispatcher claims pass no TTL).
+    tid2 = kb.create_task(conn, title="default claim", assignee="daedalus-opus")
+    task2 = kb.claim_task(conn, tid2)
+    started2 = conn.execute(
+        "SELECT started_at FROM task_runs WHERE id=?", (task2.current_run_id,)).fetchone()[0]
+    assert kb._dead_claimer_release_at(conn, tid2)[0] == int(started2) + kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS
+
+
 def test_missing_run_context_fails_closed_for_dead_claimer(conn):
     """Omitting conn/task_id can never turn a dead claimer into a release."""
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
