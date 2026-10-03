@@ -61,6 +61,7 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from cron.fork_ext import scheduler_ext
+from cron.fork_ext import logs_digest_gate
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
@@ -3940,6 +3941,17 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        # #logs is a digest, not a stream (t_42a9c32b): a green no_agent run
+        # bound for #logs joins notify.py's digest spool while it is armed.
+        if logs_digest_gate.maybe_spool(
+            job, platform=platform_name, chat_id=chat_id, thread_id=thread_id,
+            success=success, has_media=bool(requested_media),
+            demoted=bool(_host_down_prefix), text=(content or "").strip(),
+            get_home=get_hermes_home,
+        ):
+            logger.info("Job '%s': spooled for the #logs digest", job["id"])
+            continue
 
         # bot-chat targets don't ride a gateway adapter: the output becomes a
         # real inbound turn in the target profile's canonical Bot Chat via the
