@@ -481,9 +481,11 @@ jobs:
     # Managed mode with a validated, attempt-bound plan uses its labels; every
     # other case (static routing, switch OFF, or no plan) uses the legacy X64
     # expression over CI_RUNNER_LABELS — never a fixed local pool (t_42bed567).
+    # The hosted fallback is Blacksmith 4vCPU (CI_E2E_RUNNER overrides): e2e
+    # ran 26 min on 2-core ubuntu-latest across #1624 rounds 4-7 (2026-10-03).
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || format('["{0}"]', vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404'))) }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -598,8 +600,12 @@ jobs:
     needs: e2e-upgrade-plan
     # Hosted by design: installs bubblewrap with sudo apt-get and relaxes the
     # unprivileged-userns sysctl; the self-hosted pool runs no-new-privileges
-    # containers (see the RUNNERS note in ci.yaml).
-    runs-on: ubuntu-latest
+    # containers (see the RUNNERS note in ci.yaml). Blacksmith VMs allow both
+    # (hermes-home runs apt on them). Measured 2026-10-03 on #1624 rounds 4-7:
+    # the (git) shard took 48 min on 2-core ubuntu-latest and set every round's
+    # wall clock (52 min); upstream runs this job on a 32-core pool. Repo var
+    # CI_E2E_RUNNER overrides (outage fallback: set it to ubuntu-latest).
+    runs-on: ${{ vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
