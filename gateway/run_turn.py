@@ -2951,6 +2951,7 @@ class GatewayTurnMixin:
         """Build the shared ``StreamConsumerConfig`` and optional Telegram pause-typing closure.
         For non-editing adapters ``on_missing_cursor="fallback"`` streams with an empty cursor;
         ``"raise"`` raises ``RuntimeError`` so the caller skips streaming entirely."""
+        from gateway.run import _gateway_surface_passes_raw_text
         from gateway.stream_consumer import StreamConsumerConfig
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
@@ -2979,6 +2980,9 @@ class GatewayTurnMixin:
             cursor=_effective_cursor,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            # Same surface gate as the completed-turn strip in _hmwa_shape_agent_response: programmatic
+            # surfaces keep raw text.
+            strip_trailing_silence_marker=not _gateway_surface_passes_raw_text(source.platform),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 

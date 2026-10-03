@@ -81,6 +81,10 @@ class StreamConsumerConfig:
     # autonomous rule (is_autonomous_silence_response) and hold mid-stream previews until the
     # final text is known.  Human turns are unaffected.
     internal_event: bool = False
+    # Drop a silence marker alone on the last line of the completed turn (``note\nNO_REPLY``
+    # delivered under the exact-marker rule).  Set by the gateway for chat surfaces only; raw-text
+    # surfaces (api_server, webhook, local) keep the token.  Applied to the whole turn, never per chunk.
+    strip_trailing_silence_marker: bool = False
 
 
 @dataclass
@@ -350,7 +354,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             return None
         if self._delivered_final_text is not None:
             # A segment break / commentary may have delivered it under another record.
-            return (self._delivered_final_text.strip() == target
+            # Compared modulo a trailing control-token line: the gateway may hand over the stripped
+            # response while the consumer kept the token (sealed outside the live tail), or the reverse.
+            return (self._final_marker_strip(self._delivered_final_text.strip()).strip()
+                    == self._final_marker_strip(target).strip()
                     or self.has_delivered_text(final_text))
         if self._turn_split_delivery:
             return False
@@ -371,10 +378,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
-        target = self._clean_for_display(text or "").strip()
+        target = self._final_marker_strip(self._clean_for_display(text or "").strip()).strip()
         seen = (self._visible_prefix(), *self._delivered_commentary_texts,
                 *self._delivered_segment_texts)
-        return bool(target) and any(sent.strip() == target for sent in seen)
+        return bool(target) and any(
+            self._final_marker_strip(sent.strip()).strip() == target for sent in seen)
 
     def has_durably_delivered_text(self, text: str) -> bool:
         """``has_delivered_text`` restricted to deliveries that outlive the turn: commentary and
@@ -588,7 +596,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # first/last line), human turns the exact rule.
                     _silence_fn = (_is_autonomous_silence_response if self.cfg.internal_event
                                    else _is_intentional_silence_response)
-                    if _silence_fn(self._clean_for_silence_check(self._accumulated)):
+                    if _silence_fn(self._clean_for_display(self._accumulated)):
                         self._internal_held = []
                         await self._suppress_silence_marker()
                         return
@@ -596,10 +604,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                         # Nothing streamed after the last held boundary: the gateway delivers
                         # (or silences) the final itself, so judge the held interim by that final.
                         if (not self._accumulated.strip() and self._internal_final_text is not None
-                                and _silence_fn(self._clean_for_silence_check(self._internal_final_text))):
+                                and _silence_fn(self._clean_for_display(self._internal_final_text))):
                             self._internal_held = []
                         else:
                             await self._release_internal_held()
+                    self._strip_turn_final_marker()
 
                 if self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)
@@ -784,7 +793,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # replies are short and may end in a marker on its own line: hold every interval tick.
         return should_edit and not (
             self.cfg.internal_event
-            or _is_partial_silence_marker(self._clean_for_silence_check(self._accumulated)))
+            or _is_partial_silence_marker(self._clean_for_display(self._accumulated)))
 
     async def _split_first_send(self, tick: "_Tick") -> bool:
         """No message to edit yet and the buffer overflows: seal only the head chunks; the
@@ -1034,19 +1043,41 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _clean_for_display(text: str) -> str:
         """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream.
 
-        A silence marker alone on the final line of an otherwise-delivered
-        reply is dropped too (``strip_trailing_silence_marker``): a human turn
-        resolves ``"note\\nNO_REPLY"`` as prose under the exact-marker rule,
-        and the control token must not be edited onto the screen.  The
-        silence predicates read :meth:`_clean_for_silence_check` instead, so
-        a reply that IS (or ends in) a marker is still judged on its raw form.
+        Media-only on purpose: this runs on every chunk, including sealed non-final overflow
+        chunks, so it must never remove text.  The trailing silence-marker strip is a turn-final
+        decision (:meth:`_strip_turn_final_marker`).
         """
-        return _strip_trailing_silence_marker(
-            _BasePlatformAdapter.strip_media_directives_for_display(text)
-        )
-
-    @staticmethod
-    def _clean_for_silence_check(text: str) -> str:
-        """``_clean_for_display`` minus the trailing-marker strip, for the
-        silence predicates (they need to see the marker to suppress on it)."""
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
+
+    def _final_marker_strip(self, text: str) -> str:
+        """Apply the turn-final trailing-marker strip when this surface wants it."""
+        if self.cfg.strip_trailing_silence_marker:
+            return _strip_trailing_silence_marker(text)
+        return text
+
+    def _strip_turn_final_marker(self) -> None:
+        """Drop a trailing silence-marker line from the COMPLETED turn text.
+
+        Runs once at stream end, on the whole turn (the split-stable ledger), never on an
+        individual chunk: a token line that a platform split left at the end of a non-final chunk
+        is ordinary content (Prism #1668 f2a2a5636e1e).  Only the live tail can still be changed,
+        so the strip is applied only when the removed lines sit entirely inside ``_accumulated``
+        and some of the tail survives; otherwise the token is delivered (content kept, never
+        lost).  The ledger is trimmed in step so ``delivered_final_matches`` reconciles.
+        """
+        if not self.cfg.strip_trailing_silence_marker:
+            return
+        full = (self._stream_ledger or self._accumulated).rstrip()
+        stripped = _strip_trailing_silence_marker(full)
+        if stripped == full:
+            return
+        removed = full[len(stripped):]
+        tail = self._accumulated.rstrip()
+        if not tail.endswith(removed):
+            return
+        kept = tail[: len(tail) - len(removed)].rstrip()
+        if not kept.strip():
+            return
+        self._accumulated = kept
+        if self._stream_ledger:
+            self._stream_ledger = stripped
