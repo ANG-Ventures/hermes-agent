@@ -7930,7 +7930,7 @@ def _inherit_notify_subs(
         # child already has a waker (else INSERT OR IGNORE would drop the
         # whole row on the one-waker index).
         inherited_mode = prow["delivery_mode"] or "notify"
-        if inherited_mode in NOTIFY_WAKE_MODES and card_waker(
+        if inherited_mode in NOTIFY_WAKE_MODES and prow["platform"] != "api_server" and card_waker(
             conn, child_id,
             exclude=(prow["platform"], prow["chat_id"], prow["thread_id"] or ""),
         ) is not None:
@@ -27115,8 +27115,13 @@ _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 NOTIFY_WAKE_MODES = ("notify+wake", "wake")
 # One waker per card (Ace 2026-10-03 13:28, t_74bf5296): a partial UNIQUE
 # index over the wake rows, so a second wake row on a card cannot be written
-# by ANY writer, not only by add_notify_sub's own bookkeeping.
+# by ANY writer, not only by add_notify_sub's own bookkeeping. api_server is
+# exempt: it has no push channel, its wake self-post IS the delivery (one per
+# origin), so demoting it would deliver nothing.
 ONE_WAKER_INDEX = "idx_notify_one_waker"
+_WAKER_PREDICATE = (
+    "delivery_mode IN ('notify+wake', 'wake') AND platform != 'api_server'"
+)
 
 
 def _encode_notify_delivery_metadata(
@@ -27349,10 +27354,7 @@ def card_waker(
     row being written). The ``idx_notify_one_waker`` index guarantees at most
     one such row; ``ORDER BY`` only makes a pre-index legacy DB deterministic.
     """
-    sql = (
-        "SELECT * FROM kanban_notify_subs WHERE task_id = ?"
-        " AND delivery_mode IN ('notify+wake', 'wake')"
-    )
+    sql = f"SELECT * FROM kanban_notify_subs WHERE task_id = ? AND {_WAKER_PREDICATE}"
     params: list[Any] = [task_id]
     if exclude is not None:
         sql += " AND NOT (platform = ? AND chat_id = ? AND thread_id = ?)"
@@ -27381,6 +27383,8 @@ def _claim_wake(
     new home through here), or the holder's session has been idle 24 h
     (:func:`notify_chat_is_live`). Otherwise the requester gets ``notify``.
     """
+    if platform == "api_server":
+        return mode  # exempt: see ONE_WAKER_INDEX
     holder = card_waker(conn, task_id, exclude=(platform, chat_id, thread_id))
     if holder is None:
         return mode
@@ -27430,16 +27434,14 @@ def _ensure_single_waker_index(conn: sqlite3.Connection) -> None:
         return
     dupes = [
         r[0] for r in conn.execute(
-            "SELECT task_id FROM kanban_notify_subs"
-            " WHERE delivery_mode IN ('notify+wake', 'wake')"
+            f"SELECT task_id FROM kanban_notify_subs WHERE {_WAKER_PREDICATE}"
             " GROUP BY task_id HAVING COUNT(*) > 1"
         )
     ]
     for task_id in dupes:
         rows = [
             dict(r) for r in conn.execute(
-                "SELECT * FROM kanban_notify_subs WHERE task_id = ?"
-                " AND delivery_mode IN ('notify+wake', 'wake')"
+                f"SELECT * FROM kanban_notify_subs WHERE task_id = ? AND {_WAKER_PREDICATE}"
                 " ORDER BY created_at, rowid",
                 (task_id,),
             )
@@ -27461,8 +27463,7 @@ def _ensure_single_waker_index(conn: sqlite3.Connection) -> None:
                   task_id, keep["platform"], keep["chat_id"], len(rows) - 1)
     conn.execute(
         f"CREATE UNIQUE INDEX IF NOT EXISTS {ONE_WAKER_INDEX}"
-        " ON kanban_notify_subs(task_id)"
-        " WHERE delivery_mode IN ('notify+wake', 'wake')"
+        f" ON kanban_notify_subs(task_id) WHERE {_WAKER_PREDICATE}"
     )
 
 

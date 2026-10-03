@@ -6882,7 +6882,11 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
         ctype = s.get("chat_type") or "dm"
         ct = "" if ctype == "dm" else f"  chat_type={ctype}"
         uid_alt = f"  user_id_alt={s['user_id_alt']}" if s.get("user_id_alt") else ""
-        waker = "  [waker]" if dmode in kb.NOTIFY_WAKE_MODES else ""
+        waker = (
+            "  [waker]"
+            if dmode in kb.NOTIFY_WAKE_MODES and s.get("platform") != "api_server"
+            else ""
+        )
         print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}"
               f"  (since event {s['last_event_id']}){owner}{ct}{uid_alt}{mode}{waker}")
     return 0
