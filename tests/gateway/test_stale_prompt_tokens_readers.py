@@ -153,7 +153,7 @@ def test_footer_renders_post_compaction_estimate_marked():
     ) == ""
 
 
-def test_turn_result_carries_footer_display_figure():
+def test_turn_result_carries_footer_display_figure():  # noqa: source-proxy structural: both run_sync result paths share one usage dict
     """Both run_sync result dicts carry the resolved footer figure (source contract,
     same pattern as test_footer_provider_in_turn_result)."""
     import inspect

@@ -57,7 +57,6 @@
  "tests/run_agent/test_run_agent_streaming.py::TestAnthropicInterruptHandler::test_interruptible_has_anthropic_branch",
  "tests/run_agent/test_run_agent_streaming.py::TestAnthropicInterruptHandler::test_interruptible_rebuilds_anthropic_client",
  "tests/run_agent/test_run_agent_streaming.py::TestAnthropicInterruptHandler::test_streaming_has_anthropic_branch",
- "tests/test_hermes_state_search.py::TestConcurrentWriteSafety::test_sqlite_timeout_is_at_least_30s",
  "tests/test_restore_ids.py::test_restore_ids_uses_bounded_parameterized_in_clause",
  "tests/test_undo_redo_stack.py::test_redo_uses_public_bump_redo_count_not_private_execute_write",
  "tests/tools/test_delegate_blackbox_attr.py::test_attribution_is_best_effort_guarded",

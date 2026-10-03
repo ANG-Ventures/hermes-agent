@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 LEDGER = "ci-overflow-ledger"
 IF_PREDICATE = "always() && !cancelled() && needs.generate.result == 'success'"
+# e2e is a slow lane (upstream 2026-10-01): same fallback predicate, plus the caller's switch.
+E2E_IF_PREDICATE = IF_PREDICATE + " && inputs.e2e"
 
 
 def _load(path: Path) -> dict:
@@ -206,6 +208,7 @@ PLACEMENT_OUTCOMES = {
 def _ctx(event, placement, runner_labels, enabled=False):
     return {"github": {"event_name": event, "run_attempt": RUN_ATTEMPT}, "vars": {"CI_RUNNER_LABELS": runner_labels,
                                                        "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
+            "inputs": {"e2e": True, "e2e_upgrade": True},  # every slow lane requested (ci.yaml on push)
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
                                                # not a real output any more (placement's INPUT artifact
@@ -360,8 +363,9 @@ def test_static_routing_switch_mutation_fails_integration():
 
 def test_if_predicates_exact():
     jobs = _tests_yml()["jobs"]
+    assert jobs["test"]["if"] == IF_PREDICATE
+    assert jobs["e2e"]["if"] == E2E_IF_PREDICATE
     for name in ("test", "e2e"):
-        assert jobs[name]["if"] == IF_PREDICATE
         assert jobs[name]["needs"] == ["generate", "placement"]
     assert jobs["placement"]["if"] == "github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'"
 
@@ -539,9 +543,16 @@ def test_gate_cli_reads_results_from_env(tmp_path):
     assert run(base) == 0
     assert run({**base, "TEST_RESULT": "skipped"}) == 1
     assert run({**base, "E2E_RESULT": ""}) == 1
-    step = _tests_yml()["jobs"]["tests-complete"]["steps"][-1]
+    # inputs.e2e=false: the e2e lane was never asked for, so its skip is not a problem...
+    assert run({**base, "E2E_RESULT": "skipped", "E2E_REQUESTED": "false"}) == 0
+    # ...but a requested (or unspecified) lane that skipped still fails the gate.
+    assert run({**base, "E2E_RESULT": "skipped", "E2E_REQUESTED": "true"}) == 1
+    assert run({**base, "E2E_RESULT": "skipped", "E2E_REQUESTED": ""}) == 1
+    step = next(s for s in _tests_yml()["jobs"]["tests-complete"]["steps"]
+                if s.get("name") == "Fail on skipped or failed required tests")
+    assert step["run"] == "python3 scripts/ci_overflow_placement.py gate"
     assert step["env"] == {"GENERATE_RESULT": "${{ needs.generate.result }}", "TEST_RESULT": "${{ needs.test.result }}",
-                           "E2E_RESULT": "${{ needs.e2e.result }}"}
+                           "E2E_RESULT": "${{ needs.e2e.result }}", "E2E_REQUESTED": "${{ inputs.e2e }}"}
 
 
 def test_aggregate_fails_skipped_required_work():
@@ -556,6 +567,8 @@ def test_aggregate_fails_skipped_required_work():
             bad = copy.deepcopy(ok)
             bad[job_name]["result"] = result
             assert gate(bad), (job_name, result)
+            # An unrequested e2e lane may skip; nothing else gets looser.
+            assert bool(gate(bad, e2e_requested=False)) == (job_name != "e2e"), (job_name, result)
 
 
 def test_one_tests_call_site_and_no_secrets_on_candidate_surfaces():

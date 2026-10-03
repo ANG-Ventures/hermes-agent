@@ -64,6 +64,11 @@ jobs:
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
           HERMES_TEST_WORKERS: '6'
           HERMES_TEST_FILE_TIMEOUT: '2400'
+          # Six journeys each run install.ps1 (a cold PM toolchain + venv) on a
+          # 4-vCPU hosted runner, silent for minutes: the 240 s idle hang
+          # detector (scripts/run_tests_parallel.py --idle-timeout) killed all
+          # six at 269 s in run 37081194693. The wall ceiling still gates.
+          CI_TEST_IDLE_TIMEOUT: '1200'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''

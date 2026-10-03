@@ -14,6 +14,11 @@ pytestmark = pytest.mark.platforms("windows")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WINDOWS_UPDATE_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
+# Upstream runs this lane on windows-latest-32-core and gives each self-test 60 s. The
+# fork's lane is hosted windows-latest (4 vCPU) with 8 pytest files in flight, where the
+# first attempt hit the 60 s deadline and the retry passed (run 37081194693, FLAKY).
+# A slow deadline, not a hang detector: the asserted self-test verdict is unchanged.
+SELF_TEST_TIMEOUT = 300
 
 
 def _run_cwd_self_test(
@@ -46,7 +51,7 @@ def _run_cwd_self_test(
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=60,
+        timeout=SELF_TEST_TIMEOUT,
         check=False,
     )
 
@@ -87,7 +92,7 @@ def test_handoff_children_cannot_read_the_handoff_console(tmp_path: Path) -> Non
         [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
         env=env,
         creationflags=subprocess.CREATE_NEW_CONSOLE,
-        timeout=60,
+        timeout=SELF_TEST_TIMEOUT,
         check=False,
     )
 

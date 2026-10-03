@@ -206,6 +206,7 @@ jobs:
             scripts/ci_overflow_plan.py
             scripts/ci_overflow_request.py
             scripts/run_tests_parallel.py
+            scripts/ci/list_os_marked_tests.py
           if-no-files-found: error
           retention-days: 1
 
@@ -350,7 +351,7 @@ jobs:
           scripts/run_tests.sh --files '${{ matrix.slice.files }}' \
             --junit-dir ci-junit --result-file ci-junit/slice-result.json -- -v
         env:
-          HERMES_TEST_FILE_TIMEOUT: 600
+          HERMES_TEST_FILE_TIMEOUT: "600"
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -612,6 +613,18 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Fetch upstream release tags
+        # Fork: the release tags (v2026.*) are cut on NousResearch/hermes-agent and this
+        # repo's own tag list stops at v2026.5.7, so `git describe` on a parity ref named a
+        # release whose uv.lock the pinned uv no longer resolves (`--locked` refused it in
+        # run 37081194693). The nearest UPSTREAM release is the N-1 a user actually has.
+        if: github.repository != 'NousResearch/hermes-agent'
+        uses: ./.github/actions/retry
+        with:
+          command: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
+          attempts: "5"
+          delay: "30"
+
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
@@ -643,7 +656,13 @@ jobs:
             uv.lock
 
       - name: Set up Python 3.14
-        run: uv python install 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+          # python-build-standalone release assets 500 for minutes at a time
+          # (merge group 36463111043, main push 36457723085; t_9081913e).
+          attempts: "5"
+          delay: "30"
 
       - name: Install dependencies
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
@@ -699,6 +718,13 @@ jobs:
           # shard holds at most ~7 files, so this runs each shard in one wave.
           HERMES_TEST_WORKERS: "6"
           HERMES_TEST_FILE_TIMEOUT: "3000"
+          # The hang detector (scripts/run_tests_parallel.py --idle-timeout,
+          # default 240 s) measures SILENCE, and these files are silent for
+          # long stretches by design: an N-1 `uv sync` from a cold cache, the
+          # sandboxed updater's own dependency sync, the 1.8k-module import
+          # sweep. In run 37081194693 it killed 3 files that pass alone in
+          # 200-250 s. The wall ceiling above still gates a real hang.
+          CI_TEST_IDLE_TIMEOUT: "1200"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
@@ -752,10 +778,13 @@ jobs:
       - name: Fail on skipped or failed required tests
         # Results only: toJSON(needs) carries both matrices (~700 KB) and
         # exceeds the 128 KB per-env-string limit (E2BIG, run 35892732551).
+        # e2e is a slow lane gated by inputs.e2e (ci.yaml passes the
+        # classifier's answer): required when requested, a skip otherwise.
         env:
           GENERATE_RESULT: ${{ needs.generate.result }}
           TEST_RESULT: ${{ needs.test.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
+          E2E_REQUESTED: ${{ inputs.e2e }}
         run: python3 scripts/ci_overflow_placement.py gate
       - name: Fail on skipped or failed e2e-upgrade shards
         # The upgrade shards are gated by inputs.e2e_upgrade (ci.yaml passes

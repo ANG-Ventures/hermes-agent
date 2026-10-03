@@ -13,6 +13,9 @@ on:
   workflow_run:
     workflows: ['Stable Release']
     types: [completed]
+    # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
+    branches-ignore:
+      - ci-overflow-ledger
 
 # Shared with Stable Release so publication never races a build. The requested
 # rerun waits as pending behind this job instead of deadlocking it: the
