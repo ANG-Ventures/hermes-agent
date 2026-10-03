@@ -16168,7 +16168,11 @@ def triage_resolve_task(
                 "scheduled": "use 'hermes kanban unblock' instead",
                 "todo": "use 'hermes kanban promote' instead",
                 "review": (
-                    "use 'hermes kanban complete' / 'request-changes' instead"
+                    "a review card is parked until a reviewer verdict moves it: "
+                    "'hermes kanban request-changes <id> \"<asks>\" --coverage "
+                    "'<json>'' sends it back to the worker (status ready, "
+                    "dispatchable); 'hermes kanban complete <id>' closes it. "
+                    "assign/reassign alone leaves it in review, undispatched"
                 ),
                 "running": "use 'hermes kanban complete' instead",
                 "ready": "use 'hermes kanban complete' instead",
