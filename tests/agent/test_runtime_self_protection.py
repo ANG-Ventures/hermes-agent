@@ -135,10 +135,12 @@ def test_file_safety_allows_unrelated_paths(fake_runtime, tmp_path):
     assert _classify_write_denial(str(scratch)) is None
 
 
+# The fork's yolo check is ``tools.approval.is_approval_bypass_active`` (process ``--yolo``,
+# session ``/yolo``, ``approvals.mode: off``); upstream's ``_yolo_active`` never existed here.
 def test_approval_floor_blocks_runtime_delete_even_under_yolo(fake_runtime, monkeypatch):
     from tools import approval
 
-    monkeypatch.setattr(approval, "_yolo_active", lambda: True)
+    monkeypatch.setattr(approval, "is_approval_bypass_active", lambda: True)
     result = approval._floor_block(f'rm -rf "{fake_runtime["venv"]}"')
     assert result is not None
     assert result.get("approved") is False
@@ -149,7 +151,7 @@ def test_check_all_guards_blocks_runtime_delete(fake_runtime, monkeypatch):
 
     # Outside CLI/gateway/ask contexts with yolo on, the floor is the only
     # thing standing; it must still block.
-    monkeypatch.setattr(approval, "_yolo_active", lambda: True)
+    monkeypatch.setattr(approval, "is_approval_bypass_active", lambda: True)
     result = approval.check_all_command_guards(f'rm "{fake_runtime["exe"]}"', "local")
     assert result.get("approved") is False
 
@@ -157,5 +159,5 @@ def test_check_all_guards_blocks_runtime_delete(fake_runtime, monkeypatch):
 def test_normal_command_unaffected(fake_runtime, monkeypatch):
     from tools import approval
 
-    monkeypatch.setattr(approval, "_yolo_active", lambda: True)
+    monkeypatch.setattr(approval, "is_approval_bypass_active", lambda: True)
     assert approval.check_all_command_guards("ls /tmp", "local").get("approved") is True
