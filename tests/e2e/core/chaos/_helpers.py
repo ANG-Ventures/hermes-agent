@@ -81,6 +81,11 @@ def chaos_config(
         f"  api_max_retries: {api_max_retries}\n"
         "  auto_recovery_cycles: 0\n"
         f"  max_turns: {max_turns}\n"
+        # Fork: ``agent.restart_drain_timeout`` defaults to 180 s here (upstream 0, parity
+        # 2026-08-07), so a SIGTERM during a hung LONG_TIMEOUT_S turn would drain past the
+        # harness's 60 s SHUTDOWN_DEADLINE_S. Pin it short like every other liveness knob
+        # (the parser reads ``0`` as "use the default", so the pin must be positive).
+        "  restart_drain_timeout: 2\n"
         "providers:\n"
         "  custom:\n"
         f"    request_timeout_seconds: {request_timeout}\n"
