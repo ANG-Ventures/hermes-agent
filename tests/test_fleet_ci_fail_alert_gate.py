@@ -388,6 +388,24 @@ def test_other_pr_same_test_still_pages(tmp_path):
     assert got["route"] == "alerts"
 
 
+def test_red_queue_run_of_already_merged_pr_goes_to_logs(tmp_path):
+    # hermes-agent#1652 2026-10-03: its own group run went red, the stacked group
+    # behind it passed, both merged; "ejected" was false. It must not page.
+    api = _api([QTEST])
+    api["pulls/1328"] = {"merged": True}
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "merged-anyway"
+    assert got["summary"] == f"PR #1328 merged anyway; its own queue run was red: {QTEST}"
+
+
+def test_red_queue_run_of_unmerged_pr_still_pages(tmp_path):
+    api = _api([QTEST])
+    api["pulls/1328"] = {"merged": False}
+    assert _queue_route(tmp_path, api)["route"] == "alerts"
+    del api["pulls/1328"]  # lookup error -> fail loud
+    assert _queue_route(tmp_path, api)["route"] == "alerts"
+
+
 def test_queue_dedupe_api_error_fails_loud(tmp_path):
     api = _api([QTEST], prior_runs=[(30, "1328", "aaa")])
     del api["actions/workflows/7/runs"]
