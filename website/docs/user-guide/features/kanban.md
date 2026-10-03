@@ -870,6 +870,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `lifecycle_digest_seconds` | `0` | With `lifecycle_channel` set: hold its lines and post them as ONE digest message (bounded to one Discord message; overflow folds into a "+N more" tally) once the oldest held line is this many seconds old (`14400` = one post per 4 h). The subscriber's wake is not delayed. `0` = one post per line. |
 | `lifecycle_route` | `"home"` | With `lifecycle_channel` set: `home` posts done / ready-for-review / blocked / changes-requested lines in the card's HOME chat (the origin chat of its home session); `lifecycle_channel` gets a line only when the card has no home (`[no-home]`) or the home cannot be reached (`[home-unreachable:<reason>]`). `channel` sends every routed line to `lifecycle_channel`. Re-home a card with `hermes kanban rehome <id> --session <sid>`. |
 | `lifecycle_home_digest_seconds` | `120` | Fold home-chat lines into one post per home chat once the oldest is this old. `0` = one post per line. |
+| `wake_owner_session` | `true` | A card event that needs its owner enqueues a handoff TURN into the card's home session when that session is live in an operator gateway: a `needs_input` block, a block whose reason names a time or precondition, a stalled/crashed/gave-up/timed-out worker, the last blocker of open children going done, or a review handback whose PR is red or dirty. One wake per card per 10 min; all cards due for one session go in one turn. The lifecycle line still posts. A card body line `wake: off` opts that card out. |
+| `wake_owner_profiles` | `["default", "aegis"]` | Gateway profiles whose sessions count as operator sessions for `wake_owner_session`. |
 
 And the two auxiliary LLM slots:
 

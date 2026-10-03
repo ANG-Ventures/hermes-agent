@@ -2992,6 +2992,15 @@ class GatewayKanbanWatchersMixin:
                     await lifecycle_digest.flush(time.time())
                 except Exception as exc:
                     logger.warning("kanban lifecycle digest flush failed: %s", exc)
+            # t_1ae0c35b: needs_input / precondition blocks, stuck workers,
+            # last-blocker-done and red handbacks wake the OWNING operator
+            # session with a handoff turn; the lines above still post.
+            try:
+                from gateway import kanban_owner_wake as _owner_wake
+
+                await _owner_wake.tick(self)
+            except Exception as exc:
+                logger.warning("kanban owner-wake tick failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
