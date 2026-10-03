@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_workspace_policy as policy
 
 FIRMLINK = Path('/System/Volumes/Data')
@@ -172,6 +173,6 @@ def test_dispatcher_strands_aliased_task_instead_of_spawning(layout, monkeypatch
             workspace_kind='dir', workspace_path=spell(path, axis),
         )
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: calls.append(a))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: calls.append(a))
         assert not calls
         assert task_id in result.stranded_by_mount_loss

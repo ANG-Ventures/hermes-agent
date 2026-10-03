@@ -154,7 +154,7 @@ async def test_plain_stop_still_kills_durable_child(registry):
     await _stop()
 
     assert _wait(lambda: not _alive(s), timeout=5), "plain stop must kill (#8202)"
-    assert s.termination_source == "kill_all"
+    assert s.termination_source == "gateway_shutdown"  # upstream #41225: lifecycle sweep names its source
     assert s.id not in _checkpoint_ids()
     _boot_reg, recovered = _boot()
     assert recovered == 0
@@ -167,5 +167,5 @@ async def test_restart_kills_child_without_routable_origin(registry):
     await _stop(restart=True)
 
     assert _wait(lambda: not _alive(s), timeout=5)
-    assert s.termination_source == "kill_all"
+    assert s.termination_source == "gateway_shutdown"  # upstream #41225: lifecycle sweep names its source
     assert s.id not in _checkpoint_ids()

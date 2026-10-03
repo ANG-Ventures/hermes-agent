@@ -56,7 +56,7 @@ def captured_turn_usage(monkeypatch):
 
 def _make_agent():
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):

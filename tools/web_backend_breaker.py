@@ -106,7 +106,7 @@ def _locked_state():
             except (ImportError, OSError):  # Windows / odd FS: thread lock only
                 pass
             try:
-                state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                state = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
                 if not isinstance(state, dict):
                     state = {}
             except (OSError, ValueError):

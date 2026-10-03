@@ -40,6 +40,7 @@ from tests.agent.test_pre_api_steer_drain_turn_bound import (
     _history,
     _make_agent,
     _response,
+    _steer_after_tool,
     _tool_call,
 )
 
@@ -164,22 +165,28 @@ def test_cache_prefix_byte_identical_across_all_injection_channels():
         assert _serialize(body[:prior_len]) == prior_bytes, f"API call {i}"
     assert _serialize(result["messages"][:prior_len]) == prior_bytes
 
-    # Every injection reached the model inside the CURRENT turn.
+    # Every injection reached the model inside the CURRENT turn. Steers are delivered as a
+    # standalone user row right after the current turn's newest tool result (upstream #110979
+    # delivery shape, adopted on the fork; the tool row itself is never rewritten); the run-budget
+    # notice still appends into that tool result.
     current = _content_text(
         [m for m in sent[2] if m.get("tool_call_id") == "c2"][0]["content"]
     )
     earlier = _content_text(
         [m for m in sent[1] if m.get("tool_call_id") == "c1"][0]["content"]
     )
-    assert STEER in earlier  # t=0 steer: deferred, then pre-API into c1
-    assert "second steer" in current  # between iterations: pre-API into c2
+    assert STEER not in earlier and "second steer" not in current
+    assert STEER in _steer_after_tool(sent[1], "c1")  # t=0 steer: deferred, then pre-API after c1
+    assert "second steer" in _steer_after_tool(sent[2], "c2")  # between iterations: pre-API after c2
     from agent.conversation_loop import RUN_BUDGET_WRAPUP_NOTICE
     assert RUN_BUDGET_WRAPUP_NOTICE in current
     assert agent._run_budget_wrapup_injected is True
     assert not result.get("pending_steer")
 
 
-_INJECTED_NAMES = {"format_steer_marker", "RUN_BUDGET_WRAPUP_NOTICE"}
+# Two injection shapes: appending text into an existing message's ``content`` (the run-budget
+# notice) and inserting the standalone steer row (``steer_user_row``) after a tool result.
+_INJECTED_NAMES = {"format_steer_marker", "RUN_BUDGET_WRAPUP_NOTICE", "steer_user_row"}
 
 
 def _functions_injecting(tree):
@@ -195,7 +202,19 @@ def _functions_injecting(tree):
             if isinstance(a, ast.Assign)
             for t in a.targets
         )
-        if writes_content and names & _INJECTED_NAMES:
+        inserts_steer_row = any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute)
+            and c.func.attr in {"insert", "append"}
+            and any(
+                isinstance(arg, ast.Call)
+                and isinstance(arg.func, ast.Name)
+                and arg.func.id == "steer_user_row"
+                for arg in c.args
+            )
+            for c in ast.walk(node)
+        )
+        if (writes_content or inserts_steer_row) and names & _INJECTED_NAMES:
             yield node, names
 
 
@@ -212,5 +231,6 @@ def test_every_history_injection_site_uses_the_turn_bound():
     # The lint must see the known channels, or it proves nothing.
     assert "agent_runtime_helpers.py:apply_pending_steer_to_tool_results" in seen
     assert "conversation_loop.py:_maybe_inject_run_budget_wrapup" in seen
-    assert "conversation_loop.py:run_conversation" in seen, seen
+    # The pre-API drain moved out of run_conversation into upstream's extracted helper.
+    assert "turn_iteration_prep.py:_inject_steer_after_newest_tool_result" in seen, seen
     assert offenders == []

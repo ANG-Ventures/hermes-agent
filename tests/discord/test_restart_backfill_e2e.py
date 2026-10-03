@@ -156,7 +156,7 @@ async def test_variantA_incident_recovers_exactly_once(_tmp_home):
 
     adapter._handle_message = _handle
     adapter._dispatch_incoming_message = DiscordAdapter._dispatch_incoming_message.__get__(adapter)
-    adapter._is_allowed_user = lambda uid, a=None, guild=None, is_dm=False: True
+    adapter._is_allowed_user = lambda uid, a=None, guild=None, is_dm=False, channel_ids=None: True
 
     # (3) Reconnect → backfill sweep recovers the message exactly once.
     with patch.dict(os.environ, {"DISCORD_IGNORE_NO_MENTION": "false"}):
@@ -191,7 +191,7 @@ async def test_variantA_mutation_backfill_off_recovers_nothing(_tmp_home):
         handled.append(message.id)
     adapter._handle_message = _handle
     adapter._dispatch_incoming_message = DiscordAdapter._dispatch_incoming_message.__get__(adapter)
-    adapter._is_allowed_user = lambda uid, a=None, guild=None, is_dm=False: True
+    adapter._is_allowed_user = lambda uid, a=None, guild=None, is_dm=False, channel_ids=None: True
 
     with patch.dict(os.environ, {"DISCORD_RESTART_BACKFILL": "false",
                                  "DISCORD_IGNORE_NO_MENTION": "false"}):
@@ -215,7 +215,7 @@ async def test_variantB_cold_channel_recovered_via_inbound_mark(_tmp_home):
         user=bot, get_channel=lambda _id: channel if int(_id) == channel.id else None,
         fetch_channel=AsyncMock(return_value=channel),
     )
-    adapter._is_allowed_user = lambda uid, a=None, guild=None, is_dm=False: True
+    adapter._is_allowed_user = lambda uid, a=None, guild=None, is_dm=False, channel_ids=None: True
 
     # (1) A user messages the cold channel DURING the drain. The gateway drops
     # it (handler raises, as during drain), but the inbound mark at the top of

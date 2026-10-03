@@ -55,8 +55,8 @@ def cron_home(tmp_path):
     home = tmp_path / "hermes"
     scripts = home / "scripts"
     scripts.mkdir(parents=True)
-    (scripts / "ok.sh").write_text("#!/bin/bash\necho hello-ok\n")
-    (scripts / "bad.sh").write_text("#!/bin/bash\necho boom >&2\nexit 3\n")
+    (scripts / "ok.sh").write_text("#!/usr/bin/env bash\necho hello-ok\n")
+    (scripts / "bad.sh").write_text("#!/usr/bin/env bash\necho boom >&2\nexit 3\n")
     for name in ("ok.sh", "bad.sh"):
         (scripts / name).chmod(0o755)
     return home

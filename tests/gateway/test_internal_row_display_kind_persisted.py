@@ -246,11 +246,17 @@ async def test_real_user_turn_row_stays_untyped(monkeypatch, tmp_path, real_agen
 def test_queued_followup_carries_internal_marker():
     """The in-band drained follow-up (``_run_agent`` recursing on the dequeued
     ``pending_event``) must derive ``persist_user_display_kind`` from that
-    event's ``internal`` flag, or a wake drained while busy persists untyped."""
-    import ast
+    event's ``internal`` flag, or a wake drained while busy persists untyped.
 
-    gateway_run = importlib.import_module("gateway.run")
-    tree = ast.parse(Path(gateway_run.__file__).read_text(encoding="utf-8"))
+    The recursion lives in ``gateway/run_turn.py`` (upstream turn decomposition) and derives the
+    kind through ``display_kind_for_event(pending_event)``; pin both the wiring and the helper."""
+    import ast
+    from types import SimpleNamespace
+
+    from gateway.response_filters import display_kind_for_event
+
+    run_turn = importlib.import_module("gateway.run_turn")
+    tree = ast.parse(Path(run_turn.__file__).read_text(encoding="utf-8"))
 
     calls = []
     for node in ast.walk(tree):
@@ -264,9 +270,16 @@ def test_queued_followup_carries_internal_marker():
             calls.append(kw)
 
     assert calls, "in-band queued follow-up _run_agent call not found"
+    assigned = {
+        node.targets[0].id: ast.unparse(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
     for kw in calls:
         kind = kw.get("persist_user_display_kind")
-        assert isinstance(kind, ast.IfExp), "follow-up drops persist_user_display_kind"
-        src = ast.unparse(kind)
-        assert "'internal_notification'" in src
-        assert "getattr(pending_event, 'internal'" in src
+        assert isinstance(kind, ast.Name), "follow-up drops persist_user_display_kind"
+        assert assigned.get(kind.id) == "display_kind_for_event(pending_event)"
+
+    assert display_kind_for_event(SimpleNamespace(internal=True)) == "internal_notification"
+    assert display_kind_for_event(SimpleNamespace(internal=False)) is None

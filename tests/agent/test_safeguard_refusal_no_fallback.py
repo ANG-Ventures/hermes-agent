@@ -196,7 +196,7 @@ def test_partial_stream_safeguard_refusal_is_reraised_not_stubbed(monkeypatch):
     # safeguard refusal must re-raise so the exception path ends the turn. Driven
     # through the real streaming call (harness of test_partial_stream_finish_reason).
     from unittest.mock import MagicMock, patch
-    from tests.run_agent.test_partial_stream_finish_reason import (
+    from tests.agent.test_partial_stream_finish_reason import (
         _make_agent, _make_stream_chunk, PARTIAL_STREAM_STUB_ID,
     )
 
@@ -227,3 +227,26 @@ def test_partial_stream_safeguard_refusal_is_reraised_not_stubbed(monkeypatch):
             else:
                 # Negative control: an ordinary mid-stream drop still becomes the stub.
                 assert agent._interruptible_streaming_api_call({}).id == PARTIAL_STREAM_STUB_ID
+
+
+def test_nonretryable_terminal_result_carries_the_refusal_contract():
+    """The fork's terminal non-retryable path (agent/turn_recovery.py, where the sync split moved
+    run_conversation's content-policy branch) must carry the same-model hint and the
+    failure_reason/error_code the kanban worker exit reads (parity 2026-10-01 re-thread)."""
+    from tests.agent.test_failed_turn_chat_copy import _Agent, _Http
+    from agent.turn_recovery import nonretryable_client_error_result
+
+    error = _Http(400, "safeguard_refusal: flagged")
+    error.body = {"error": {"type": "invalid_request_error", "error_code": "safeguard_refusal",
+                            "message": "flagged"}}
+    classified = classify_api_error(error, provider="claude-bpx", model="claude-opus-5-5")
+    assert is_safeguard_refusal(classified)
+    result = nonretryable_client_error_result(
+        _Agent(), error, classified, status_code=400, api_kwargs=None, api_messages=[], messages=[],
+        conversation_history=None, api_call_count=1, approx_tokens=10, provider="claude-bpx",
+        base_url="http://127.0.0.1:18801", model="claude-opus-5-5",
+    )
+    assert result["error_code"] == "safeguard_refusal"
+    assert result["failure_reason"] == "content_policy_blocked"
+    assert "same model" in result["final_response"]
+    assert "fallback add" not in result["final_response"]

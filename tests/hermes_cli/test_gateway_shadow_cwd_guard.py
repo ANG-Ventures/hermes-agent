@@ -84,6 +84,30 @@ def test_shadow_import_allows_trusted_checkout_with_external_env(tmp_path):
     ) is None
 
 
+def test_shadow_import_allows_own_pm_build_snapshot(tmp_path, monkeypatch):
+    """PM's generation venv keeps an editable pointer at the install's own build
+    snapshot (installs/<key>/environments/<gen>/workspace); that is the same
+    install, so a relaunch from the install root must not be refused."""
+    from pm import environments as pm_env
+
+    checkout = tmp_path / "home" / ".hermes" / "hermes-agent"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    state = tmp_path / "home" / ".hermes" / "installs" / "k1"
+    snapshot = state / "environments" / "gen1" / "workspace"
+    (snapshot / "hermes_cli").mkdir(parents=True)
+    monkeypatch.setattr(pm_env, "install_state_dir", lambda root: state)
+    assert gateway_cli._shadow_import_reason(
+        str(checkout), package_root=checkout, install_root=snapshot
+    ) is None
+    # a snapshot of a DIFFERENT install is still a shadow
+    other = tmp_path / "home" / ".hermes" / "installs" / "k2" / "environments" / "g" / "workspace"
+    (other / "hermes_cli").mkdir(parents=True)
+    reason = gateway_cli._shadow_import_reason(
+        str(checkout), package_root=checkout, install_root=other
+    )
+    assert reason is not None and "imported instead of the installed tree" in reason
+
+
 def test_install_root_without_cwd_ignores_cwd_entry(tmp_path, monkeypatch):
     """The probe must not count the cwd entry itself as 'another install'."""
     shadow = tmp_path / "shadow"
@@ -92,6 +116,15 @@ def test_install_root_without_cwd_ignores_cwd_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_cli.sys, "path", ["", str(shadow), str(REPO_ROOT)])
     found = gateway_cli._install_root_without_cwd(shadow.resolve())
     assert found is None or found != shadow.resolve()
+
+
+
+def _keeps_cwd_off_path(argv) -> bool:
+    """The interpreter flags before the entry point keep the cwd off ``sys.path``: ``-P``, or
+    upstream's ``-I -c <bootstrap>`` launcher (``-I`` implies ``-P`` on 3.11+ and the bootstrap
+    inserts the install root explicitly) — the parity sync converged on upstream's launcher."""
+    entry = next((i for i, a in enumerate(argv) if a in ("-m", "-c")), len(argv))
+    return bool({"-P", "-I"} & set(argv[1:entry]))
 
 
 def test_launcher_argvs_keep_cwd_off_sys_path(monkeypatch, tmp_path):
@@ -113,8 +146,7 @@ def test_launcher_argvs_keep_cwd_off_sys_path(monkeypatch, tmp_path):
         ),
     ]
     for argv in argvs:
-        m = argv.index("-m")
-        assert "-P" in argv[1:m], argv
+        assert _keeps_cwd_off_path(argv), argv
     tmp_home = tmp_path / "home"
     tmp_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(tmp_home))
@@ -122,9 +154,8 @@ def test_launcher_argvs_keep_cwd_off_sys_path(monkeypatch, tmp_path):
     exec_start = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
     assert exec_start, unit
     for line in exec_start:
-        parts = line.split()
-        m = parts.index("-m")
-        assert "-P" in parts[1:m], line
+        parts = [p.strip('"') for p in line[len("ExecStart="):].split()]
+        assert _keeps_cwd_off_path(parts), line
 
 
 def test_guard_exits_nonzero_not_75(tmp_path, monkeypatch):
@@ -146,6 +177,8 @@ def test_guard_escape_hatch(tmp_path, monkeypatch):
     gateway_cli._guard_shadow_cwd()  # no SystemExit
 
 
+# The child is refused by the shadow-cwd guard (or is the shadow stub itself), never a real gateway.
+@pytest.mark.spawns_gateway_lookalike
 def test_gateway_run_subprocess_refuses_shadow_cwd(tmp_path):
     shadow = tmp_path / "kanban-ws"
     (shadow / "hermes_cli").mkdir(parents=True)
@@ -186,6 +219,8 @@ def _write_shadow_package(root: Path, marker: Path) -> None:
     )
 
 
+# The child is refused by the shadow-cwd guard (or is the shadow stub itself), never a real gateway.
+@pytest.mark.spawns_gateway_lookalike
 def test_real_shadow_package_executes_without_launcher_flag(tmp_path):
     """Red-on-base proof for Prism r1/r2 Late guard: without -P a regular
     shadow package in the cwd runs before run_gateway() can refuse it."""
@@ -201,6 +236,8 @@ def test_real_shadow_package_executes_without_launcher_flag(tmp_path):
     assert marker.exists()
 
 
+# The child is refused by the shadow-cwd guard (or is the shadow stub itself), never a real gateway.
+@pytest.mark.spawns_gateway_lookalike
 def test_launcher_argv_never_executes_real_shadow_package(tmp_path, monkeypatch):
     """The generated launcher argv (-P) imports the install, not a regular
     shadow package in the cwd; the install's guard then refuses the cwd."""

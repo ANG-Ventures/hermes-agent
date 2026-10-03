@@ -5,7 +5,7 @@ substring) and the agent marker, so sandbox git fell back to the global
 ``gh auth git-credential`` helper and the gh shim could not resolve a profile.
 """
 
-from tools.code_execution_tool import _scrub_child_env
+from tools.code_execution_env import _scrub_child_env  # moved out of code_execution_tool upstream
 
 SHIM = "/home/u/.h/var/gh-shim/gh"
 

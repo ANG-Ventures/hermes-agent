@@ -91,8 +91,10 @@ def test_slash_command_chat_type_is_not_trapped_in_the_metadata_branch():
     same row to end up wrong.
     """
     source = (ROOT / "gateway/slash_commands.py").read_text(encoding="utf-8")
-    assign = source.index('chat_type = str(getattr(source, "chat_type"')
-    branch = source.index("if isinstance(delivery_metadata, dict):", assign - 2000)
+    # Upstream compacted the writer: the field reads go through a local ``_field`` helper and
+    # the metadata branch gained an ``and chat_type`` guard; anchor on both spellings.
+    assign = source.index('chat_type = _field("chat_id"), _field("chat_type")')
+    branch = source.index("if isinstance(delivery_metadata, dict)", assign - 2000)
     assert assign < branch, (
         "chat_type must be resolved BEFORE the delivery_metadata branch, or a "
         "subscription written with metadata=None carries no chat_type at all"

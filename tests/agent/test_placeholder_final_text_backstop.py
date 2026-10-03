@@ -74,7 +74,7 @@ def test_nonbridge_proceeding_with_no_assistant_closer_remains_a_reply():
 
 def test_switch_seam_passes_retained_history():
     src = _loop_source()
-    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = assistant_message.content or ""'))
+    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = _promoted or assistant_message.content or ""'))
     assert "history=messages" in src[i:i + 450]
 
 
@@ -87,7 +87,7 @@ def test_cli_closer_stays_global_for_every_provider():
 
 def test_seam_passes_the_agent_provider():
     src = _loop_source()
-    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = assistant_message.content or ""'))
+    i = src.index("classify_placeholder_final_text(\n", src.index('final_response = _promoted or assistant_message.content or ""'))
     assert 'provider=getattr(agent, "provider", None)' in src[i:i + 400]
 
 
@@ -137,7 +137,11 @@ def test_notice_text_is_the_documented_string():
 
 
 def _loop_source():
-    return pathlib.Path(cl.__file__).read_text()
+    # The final-text seam lives in agent/turn_final_response.py since upstream
+    # decomposed run_conversation into turn_* phase modules (parity 2026-10-01).
+    from agent import turn_final_response
+
+    return pathlib.Path(turn_final_response.__file__).read_text()
 
 
 def test_backstop_is_wired_at_the_final_text_seam():
@@ -147,19 +151,22 @@ def test_backstop_is_wired_at_the_final_text_seam():
     cannot resurrect the placeholder. Mutation-proven: remove the wiring block
     and this fails."""
     src = _loop_source()
-    seam = 'final_response = assistant_message.content or ""'
+    seam = 'final_response = _promoted or assistant_message.content or ""'
     i = src.index(seam)
     window = src[i:i + 2500]
     assert "classify_placeholder_final_text(" in window, "classifier not called at the final-text seam"
     assert "_TURN_ENDED_WITHOUT_REPLY" in window, "notice route not wired"
     assert 'agent._current_streamed_assistant_text = ""' in window, "streamed buffer not cleared (partial-stream recovery would resurrect the placeholder)"
-    # the wiring precedes the partial-stream recovery block (which is the
-    # first consumer of the streamed buffer after the seam)
+    # the wiring precedes the empty-response recovery call (recover_empty_response
+    # in agent/turn_empty_response.py hosts the partial-stream recovery, the first
+    # consumer of the streamed buffer after the seam)
     call_at = i + window.index("classify_placeholder_final_text(")
-    assert call_at < src.index("Partial stream recovery", i)
+    assert call_at < src.index("recover_empty_response(", i)
+    from agent import turn_empty_response
+    assert "Partial stream recovery" in pathlib.Path(turn_empty_response.__file__).read_text()
 
 
 def test_classifier_signature_is_keyword_only():
-    tree = ast.parse(_loop_source())
+    tree = ast.parse(pathlib.Path(cl.__file__).read_text())  # the classifier itself stays on the facade
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "classify_placeholder_final_text")
     assert [a.arg for a in fn.args.kwonlyargs] == ["prior_was_tool", "already_nudged", "provider", "history"]

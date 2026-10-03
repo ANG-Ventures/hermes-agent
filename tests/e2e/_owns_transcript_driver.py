@@ -52,7 +52,9 @@ def main() -> int:
 
     if os.environ.get("OWNS_TRANSCRIPT_E2E_SABOTAGE"):
         # Negative control only: the pre-#1101 send path (omit branch off).
-        import agent.conversation_loop as _loop
+        # parity 2026-10-01: upstream extracted the request builder (the one reader of this
+        # name) from agent.conversation_loop into agent.turn_context; patch where it is read.
+        import agent.turn_context as _loop
 
         _loop.provider_owns_transcript = lambda _provider: False
 

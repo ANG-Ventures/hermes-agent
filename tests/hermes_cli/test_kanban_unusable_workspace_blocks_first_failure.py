@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -76,7 +77,7 @@ def test_bare_repo_worktree_blocks_capability_on_first_failure(conn, tmp_path):
         workspace_path=_bare_repo(tmp_path),
     )
 
-    result = kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    result = kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
 
     assert task_id in result.spawn_failed
     row = _task_row(conn, task_id)
@@ -105,7 +106,7 @@ def test_capability_block_reason_names_the_fix(conn, tmp_path):
         workspace_path=_bare_repo(tmp_path),
     )
 
-    kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
 
     row = conn.execute(
         "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -141,7 +142,7 @@ def test_transient_spawn_failure_still_gets_its_retry_budget(conn, tmp_path):
     def flaky_spawn(task, workspace_path, board=None):
         raise RuntimeError("fork: Resource temporarily unavailable")
 
-    kb.dispatch_once(conn, spawn_fn=flaky_spawn)
+    kbd.dispatch_once(conn, spawn_fn=flaky_spawn)
 
     row = _task_row(conn, task_id)
     assert row["consecutive_failures"] == 1
@@ -188,7 +189,7 @@ def test_capability_block_is_sticky_against_recompute_ready(conn, tmp_path):
         workspace_path=_bare_repo(tmp_path),
     )
 
-    kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
     assert _task_row(conn, task_id)["status"] == "blocked"
 
     kb.recompute_ready(conn)
@@ -213,7 +214,7 @@ def test_capability_block_emits_a_sticky_blocked_event(conn, tmp_path):
         workspace_path=_bare_repo(tmp_path),
     )
 
-    kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
 
     assert _events(conn, task_id, ("blocked", "unblocked"))[-1:] == ["blocked"], (
         "the capability block must emit a 'blocked' event so _has_sticky_block "
@@ -238,14 +239,14 @@ def test_capability_block_arms_the_unblock_loop_breaker(conn, tmp_path):
         workspace_path=_bare_repo(tmp_path),
     )
 
-    kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
     assert _task_row(conn, task_id)["block_recurrences"] == 1, (
         "the first capability block must arm the recurrence counter"
     )
 
     # Operator unblocks without fixing the anchor; the card re-fails.
     kb.unblock_task(conn, task_id)
-    kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
 
     row = _task_row(conn, task_id)
     assert row["block_recurrences"] >= kb.BLOCK_RECURRENCE_LIMIT
@@ -291,7 +292,7 @@ def test_operator_fix_survives_the_500_char_truncation(conn, tmp_path):
         workspace_path=str(repo),
     )
 
-    kb.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
 
     stored = _task_row(conn, task_id)["last_failure_error"]
     assert len(stored) <= 500

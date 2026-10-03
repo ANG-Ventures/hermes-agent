@@ -107,8 +107,10 @@ def test_cli_init_wires_resolver_into_requested_provider():
 
     import cli as cli_mod
 
-    src = textwrap.dedent(inspect.getsource(cli_mod.HermesCLI.__init__))
-    assert "resolve_startup_model_arg(" in src, "startup -m alias resolution not called in HermesCLI.__init__"
+    # Upstream split HermesCLI.__init__ into hermes_cli/cli_init_mixin.py; the model/provider
+    # resolution (incl. the fork's startup -m alias wiring) lives in _init_model_and_provider.
+    src = textwrap.dedent(inspect.getsource(cli_mod.HermesCLI._init_model_and_provider))
+    assert "resolve_startup_model_arg(" in src, "startup -m alias resolution not called in HermesCLI._init_model_and_provider"
     tree = ast.parse(src)
     order = None
     for node in ast.walk(tree):

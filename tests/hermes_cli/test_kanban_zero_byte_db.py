@@ -220,7 +220,7 @@ def test_connect_leaves_no_zero_byte_stub_when_init_fails(kanban_root):
     _forget(db_path)
 
     with mock.patch(
-        "hermes_state.apply_wal_with_fallback",
+        "hermes_state_wal.apply_wal_with_fallback",
         side_effect=RuntimeError("simulated init failure"),
     ):
         with pytest.raises(RuntimeError, match="simulated init failure"):
@@ -239,7 +239,7 @@ def test_connect_failure_leaves_no_zero_byte_sidecars(kanban_root):
     _forget(db_path)
 
     with mock.patch(
-        "hermes_state.apply_wal_with_fallback",
+        "hermes_state_wal.apply_wal_with_fallback",
         side_effect=RuntimeError("simulated init failure"),
     ):
         with pytest.raises(RuntimeError):
@@ -265,7 +265,7 @@ def test_connect_failure_preserves_an_existing_populated_db(kanban_root):
     _forget(db_path)
 
     with mock.patch(
-        "hermes_state.apply_wal_with_fallback",
+        "hermes_state_wal.apply_wal_with_fallback",
         side_effect=RuntimeError("simulated init failure"),
     ):
         with pytest.raises(RuntimeError):

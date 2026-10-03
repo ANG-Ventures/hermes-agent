@@ -16,6 +16,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 OWNER = "1553876718639390760"   # card's home chat (#cc-native)
 OTHER = "1552754415428177980"   # a second session's chat (#prism)
@@ -29,7 +30,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
-    kb._CHAT_LIVENESS_CACHE.clear() if hasattr(kb, "_CHAT_LIVENESS_CACHE") else None
+    kbn._CHAT_LIVENESS_CACHE.clear()
     kb.init_db()
     db = sqlite3.connect(home / "state.db")
     db.execute(
@@ -61,11 +62,11 @@ def _card(conn, home_sid: str = "sess-owner") -> str:
 
 
 def _chats(conn, tid):
-    return sorted(s["chat_id"] for s in kb.list_notify_subs(conn, tid))
+    return sorted(s["chat_id"] for s in kbn.list_notify_subs(conn, tid))
 
 
 def _sub(conn, tid, chat, **kw):
-    return kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat,
+    return kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat,
                              chat_type="group", **kw)
 
 

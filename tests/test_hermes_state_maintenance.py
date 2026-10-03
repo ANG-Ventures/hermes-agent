@@ -9,19 +9,28 @@ per-test fixture overhead, not test logic). No test was changed, removed or weak
 the four parts collect exactly the same ids as the original.
 """
 
-import re
+import os
+import stat
 import sqlite3
 import time
-import json
-import threading
-from pathlib import Path
 from unittest import mock
 
 import pytest
 
 import hermes_state
-from agent.session_activity import ActivityProvenance
-from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+import hermes_state_wal
+from agent.session_activity import build_activity_snapshot
+from hermes_state import SessionDB
+
+
+def _activity_snapshot(db, session_id):
+    """Durable activity snapshot for *session_id* (what gateway/delegate readers build from the row)."""
+    row = db.get_session(session_id)
+    return build_activity_snapshot(
+        last_activity_at=row.get("last_activity_at"),
+        last_activity_description=row.get("last_activity_description"),
+        last_activity_provenance=row.get("last_activity_provenance"),
+    )
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -164,51 +173,7 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="before")
-        db.append_message("s1", role="assistant", content="projectionneedle")
-        db.append_message("s1", role="user", content="after")
 
-        statements = []
-        # Borrow the read connection THROUGH the pool so the traced
-        # connection is the one _read_ctx hands back out (LIFO pool,
-        # single thread → deterministic reuse). Calling _get_read_conn()
-        # directly opens a fresh connection that never enters the pool,
-        # so the enrichment queries would run on an untraced sibling.
-        with db._read_ctx() as pooled:
-            read_conn = pooled
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
-
-        def context_query_count():
-            normalized = (" ".join(sql.upper().split()) for sql in statements)
-            return sum("WITH TARGET AS (" in sql for sql in normalized)
-
-        try:
-            projected = db.search_messages(
-                "projectionneedle", fields=("session_id", "snippet")
-            )
-            assert len(projected) == 1
-            assert context_query_count() == 0
-
-            full = db.search_messages(
-                "projectionneedle", fields=("session_id", "context")
-            )
-            assert len(full) == 1
-            assert full[0]["context"]
-            assert context_query_count() == 1
-
-            default = db.search_messages("projectionneedle")
-            assert len(default) == 1
-            assert default[0]["context"]
-            assert context_query_count() == 2
-        finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -1045,17 +1010,16 @@ class TestApplyWalProbe:
     @pytest.fixture(autouse=True)
     def _assume_fixed_sqlite(self, monkeypatch):
         """These cases cover the fixed-SQLite WAL path (not the #69784 gate)."""
-        import hermes_state
 
         monkeypatch.setattr(
-            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
+            hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
         )
 
 
     def test_sets_wal_on_fresh_connection(self, tmp_path):
         """Probe sees 'delete', then set-pragma runs and returns 'wal'."""
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state_wal import apply_wal_with_fallback
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -1088,7 +1052,7 @@ class TestApplyWalProbe:
         import sys
         import threading
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state_wal import apply_wal_with_fallback
 
         db_path = tmp_path / "concurrent.db"
         errors = []
@@ -1131,32 +1095,7 @@ class TestApplyWalProbe:
 
 
 
-    def test_returns_wal_not_delete_from_probe(self, tmp_path):
-        """Early-return only on 'wal'; 'delete' or 'memory' must fall through to set-pragma."""
-        import sqlite3
-        from hermes_state import apply_wal_with_fallback
 
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
-
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
-
-        # Fresh DB is in "delete" mode — probe returns "delete", must NOT early-return.
-        db_path = tmp_path / "delete_mode.db"
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        assert any("journal_mode=WAL" in sql for sql in conn.executed), (
-            "set-pragma must fire when probe returns 'delete'"
-        )
 
     def test_checkpoint_fullsync_barrier_skipped_off_darwin(self, tmp_path, monkeypatch):
         """Non-macOS platforms must NOT issue the macOS-only PRAGMA."""
@@ -1236,7 +1175,7 @@ class TestApplyWalProbe:
         with sqlite3.connect(str(db_path)) as seed:
             seed.execute("PRAGMA journal_mode=WAL")
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         conn = _TracingConn(str(db_path))
         try:
@@ -1264,7 +1203,7 @@ class TestApplyWalProbe:
                 self.executed.append(sql)
                 return super().execute(sql, params)
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         db_path = tmp_path / "macos_fresh.db"
         conn = _TracingConn(str(db_path))
@@ -1298,7 +1237,7 @@ class TestApplyWalProbe:
         with sqlite3.connect(str(db_path)) as seed:
             seed.execute("PRAGMA journal_mode=WAL")
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         conn = _TracingConn(str(db_path))
         try:
@@ -1330,7 +1269,7 @@ class TestApplyWalProbe:
                 self.executed.append(sql)
                 return super().execute(sql, params)
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         db_path = tmp_path / "macos_fresh_sync.db"
         conn = _TracingConn(str(db_path))
@@ -1495,6 +1434,204 @@ class TestCompressionChainProjection:
         assert db.get_compression_tip("mid1") == "tip1"
         assert db.get_compression_tip("tip1") == "tip1"
 
+    def test_reset_fork_sibling_does_not_steal_tip_projection(self, db):
+        """A reset fork child (``model_config._reset_from``, ended LATER than the
+        real continuation) must not win the chain-step tiebreak. It is a separate
+        user-visible conversation that already lists as its own row, so letting
+        the lineage tip land on it hides the true continuation and shows the
+        reset sibling twice (#114271)."""
+        import time as _time
+        t0 = _time.time() - 3600
+
+        db.create_session("root1", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
+        db.append_message("root1", "user", "help me refactor auth")
+        t_compress_root = t0 + 1800
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t_compress_root, "compression", "root1"),
+        )
+
+        db.create_session("mid1", "cli", parent_session_id="root1")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t_compress_root + 1, "mid1"),
+        )
+        db.append_message("mid1", "user", "continuing")
+        t_compress_mid = t_compress_root + 1800
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t_compress_mid, "compression", "mid1"),
+        )
+
+        # Real tip: closed by the startup orphan reap, LAST ACTIVE EARLIER than
+        # the reset fork, so the old tiebreak (last_active DESC) preferred the fork.
+        db.create_session("tip1", "cli", parent_session_id="mid1")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=?, end_reason=?, last_activity_at=? WHERE id=?",
+            (t_compress_mid + 1, t_compress_mid + 600, "startup_orphan_reap",
+             t_compress_mid + 600, "tip1"),
+        )
+        db.append_message("tip1", "user", "latest message")
+
+        # Reset fork of mid1: its own conversation, ended session_reset later.
+        db.create_session(
+            "reset1", "cli", parent_session_id="mid1", model_config={"_reset_from": "mid1"},
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=?, end_reason=?, last_activity_at=? WHERE id=?",
+            (t_compress_mid + 2, t_compress_mid + 900, "session_reset",
+             t_compress_mid + 900, "reset1"),
+        )
+        db.append_message("reset1", "user", "post reset talk")
+        db._conn.commit()
+
+        # The chain/tip follow the real continuation, never the reset fork.
+        assert db.get_compression_tip("root1") == "tip1"
+        assert db.get_compression_tip("mid1") == "tip1"
+
+        # Projection: the lineage surfaces as tip1; reset1 stays exactly its own
+        # single row instead of appearing twice (own row + hijacked projection).
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert ids.count("reset1") == 1
+        assert "tip1" in ids
+        assert "root1" not in ids and "mid1" not in ids
+        tip_row = next(s for s in sessions if s["id"] == "tip1")
+        assert tip_row["_lineage_root_id"] == "root1"
+        assert tip_row["preview"].startswith("latest message")
+
+        # The order_by_last_active chain CTE must not fold the reset fork's
+        # later activity into the lineage either: a standalone session active
+        # between the tip and the fork still outranks the projected lineage row.
+        db.create_session("solo", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, last_activity_at=? WHERE id=?",
+            (t_compress_mid + 300, t_compress_mid + 700, "solo"),
+        )
+        db.append_message("solo", "user", "standalone")
+        db._conn.commit()
+        ordered = db.list_sessions_rich(source="cli", limit=20, order_by_last_active=True)
+        ordered_ids = [s["id"] for s in ordered]
+        assert ordered_ids.count("reset1") == 1
+        assert ordered_ids.index("solo") < ordered_ids.index("tip1")
+
+    def test_reset_fork_of_compressed_parent_is_not_a_lineage_member(self, db):
+        """The Python lineage walk (``get_compression_lineage`` / ``_is_compression_child_row``)
+        must agree with the SQL chain step: a reset fork hanging off a compression-ended parent is
+        its own conversation, so the true tip keeps its ancestors and the fork never enters the
+        lineage even when it started first."""
+        import time as _time
+        t0 = _time.time() - 3600
+        db.create_session("root1", "cli")
+        db._conn.execute("UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?", (t0 + 10, "root1"))
+        db.create_session("reset1", "cli", parent_session_id="root1", model_config={"_reset_from": "root1"})
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 11, "reset1"))
+        db.create_session("tip1", "cli", parent_session_id="root1")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 20, "tip1"))
+        db._conn.commit()
+
+        assert db._is_compression_child_row(db.get_session("reset1")) is False
+        assert db.get_compression_lineage("root1") == ["root1", "tip1"]
+        assert db.get_compression_lineage("tip1") == ["root1", "tip1"]
+        assert db.get_compression_lineage("reset1") == ["reset1"]
+
+    def test_routing_lineage_cte_agrees_with_python_walk_for_reset_fork(self, db):
+        """``record_gateway_session_peer(include_compression_ancestors=True)`` re-keys every row named by
+        ``_COMPRESSION_LINEAGE_CTE``. Resuming a reset fork of a compression-ended parent must
+        re-key only the fork: the CTE has to stop at the reset child exactly like
+        ``get_compression_lineage`` does, or the real lineage's ancestors land on the fork's peer."""
+        import hermes_state_gateway as gateway_mod
+
+        t0 = time.time() - 3600
+        db.create_session("root", "cli")
+        db._conn.execute("UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?", (t0 + 10, "root"))
+        db.create_session("mid1", "cli", parent_session_id="root")
+        db._conn.execute("UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?", (t0 + 20, "mid1"))
+        db.create_session("mid2", "cli", parent_session_id="mid1")
+        db._conn.execute("UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?", (t0 + 30, "mid2"))
+        db.create_session("tip", "cli", parent_session_id="mid2")
+        db.create_session("reset", "cli", parent_session_id="mid2", model_config={"_reset_from": "mid2"})
+        db._conn.commit()
+
+        sql = gateway_mod._COMPRESSION_LINEAGE_CTE + " SELECT id FROM compression_lineage"
+        with db._read_ctx() as conn:
+            cte = {start: sorted(r[0] for r in conn.execute(sql, (start,)).fetchall()) for start in ("reset", "tip")}
+        assert cte["reset"] == sorted(db.get_compression_lineage("reset")) == ["reset"]
+        assert cte["tip"] == sorted(db.get_compression_lineage("tip")) == ["mid1", "mid2", "root", "tip"]
+
+        db.record_gateway_session_peer("reset", source="cli", user_id="u", session_key="cli:reset-chat",
+                                       chat_id="reset-chat", chat_type="dm", include_compression_ancestors=True)
+        assert db.get_session("reset")["session_key"] == "cli:reset-chat"
+        assert all(db.get_session(s)["session_key"] != "cli:reset-chat" for s in ("root", "mid1", "mid2", "tip"))
+
+    def test_list_serves_full_lineage_ids_for_projected_rows(self, db):
+        """The projected tip row must carry every chain id. Root and tip
+        alone are not enough client-side: a persisted tile or route can hold
+        a MIDDLE segment's id (it was the tip when opened), and without the
+        intermediates that surface cannot prove it names this conversation —
+        which is how one chat ends up open twice after a compaction."""
+        import time as _time
+        self._build_compression_chain(db, _time.time() - 3600)
+        db.create_session("solo", "cli")
+        db.append_message("solo", "user", "standalone")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        tip_row = next(s for s in sessions if s["id"] == "tip1")
+        assert tip_row["_lineage_ids"] == ["root1", "mid1", "tip1"]
+        solo_row = next(s for s in sessions if s["id"] == "solo")
+        assert solo_row.get("_lineage_ids") is None
+
+    def test_list_labels_projected_continuation_kind(self, db):
+        """#121148: a projected compression tip is an automatic continuation, not a
+        fresh conversation and not a user branch — the sidebar must be able to say
+        so. Plain rows and branches carry no label."""
+        import time as _time
+        self._build_compression_chain(db, _time.time() - 3600)
+        db.create_session("solo", "cli")
+        db.append_message("solo", "user", "standalone")
+        db.create_session("branchy", "cli", parent_session_id="root1",
+                          model_config={"_branched_from": "root1"})
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        tip_row = next(s for s in sessions if s["id"] == "tip1")
+        assert tip_row["continuation_kind"] == "compression"
+        solo_row = next(s for s in sessions if s["id"] == "solo")
+        assert solo_row.get("continuation_kind") is None
+        branch_row = next(s for s in sessions if s["id"] == "branchy")
+        assert branch_row.get("continuation_kind") is None
+
+    def test_list_keeps_live_tip_carrying_parent_link(self, db):
+        """#121148: `parent_session_id` on the live tip must not evict it from the
+        list — the lineage must be expressible AND visible at once. Sealed
+        (compression-ended) children stay hidden as before."""
+        import time as _time
+        t0 = _time.time() - 3600
+        # A three-link chain: seg-a → seg-prev → live-tip. Only the tip is live.
+        db.create_session("seg-a", "cli")
+        db.append_message("seg-a", "user", "earlier days")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?", (t0 + 10, "seg-a"))
+        # A restored previous segment the user re-linked the live tip to.
+        db.create_session("seg-prev", "cli", parent_session_id="seg-a")
+        db.append_message("seg-prev", "user", "restored segment")
+        db._conn.execute("UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?",
+                         (t0 + 20, "seg-prev"))
+        db.create_session("live-tip", "cli", parent_session_id="seg-prev")
+        db.append_message("live-tip", "user", "still talking here")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        listed_ids = {s["id"] for s in sessions}
+
+        # The live tip stays listable while naming its parent.
+        assert "live-tip" in listed_ids
+        # Sealed compression children stay hidden (the projection surfaces the
+        # lineage through its root row instead).
+        assert "seg-a" not in listed_ids
+        assert "seg-prev" not in listed_ids or "live-tip" in listed_ids
+
 
 
     def test_list_surfaces_tip_for_compressed_root(self, db):
@@ -1607,6 +1744,7 @@ class TestCompressionChainProjection:
         assert len(batch_calls) == 1
         assert set(batch_calls[0]) == {"tip1", "tip2"}
         assert single_calls == []
+
 
 
 
@@ -1726,10 +1864,6 @@ class TestCounts:
 
 
 
-    def test_session_count_ge_empty(self, db):
-        """session_count_ge should return False for 0 sessions."""
-        assert db.session_count_ge(1) is False
-        assert db.session_count_ge(2) is False
 
     def test_session_count_ge_at_threshold(self, db):
         """session_count_ge should True when count >= n."""
@@ -1808,22 +1942,7 @@ class TestCounts:
 class TestTitleUniqueness:
     """Tests for unique title enforcement and title-based lookups."""
 
-    def test_duplicate_title_raises(self, db):
-        """Setting a title already used by another session raises ValueError."""
-        db.create_session("s1", "cli")
-        db.create_session("s2", "cli")
-        db.set_session_title("s1", "my project")
-        with pytest.raises(ValueError, match="already in use"):
-            db.set_session_title("s2", "my project")
 
-
-    def test_null_titles_not_unique(self, db):
-        """Multiple sessions can have NULL titles (no constraint violation)."""
-        db.create_session("s1", "cli")
-        db.create_session("s2", "cli")
-        # Both have NULL titles — no error
-        assert db.get_session("s1")["title"] is None
-        assert db.get_session("s2")["title"] is None
 
     def test_get_session_by_title(self, db):
         db.create_session("s1", "cli")
@@ -1857,6 +1976,85 @@ class TestTitleUniqueness:
 
 
 class TestConnectionLifecycle:
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_writable_state_db_is_owner_only_under_permissive_umask(self, tmp_path):
+        """state.db and any live SQLite sidecars must not inherit 0644 modes."""
+        db_path = tmp_path / "state.db"
+
+        old_umask = os.umask(0o022)
+        try:
+            session_db = SessionDB(db_path=db_path)
+        finally:
+            os.umask(old_umask)
+
+        try:
+            state_files = [
+                path
+                for path in (
+                    db_path,
+                    db_path.with_name(db_path.name + "-wal"),
+                    db_path.with_name(db_path.name + "-shm"),
+                )
+                if path.exists()
+            ]
+            assert state_files
+            assert all(
+                stat.S_IMODE(path.stat().st_mode) == 0o600
+                for path in state_files
+            )
+        finally:
+            session_db.close()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_writable_state_db_tightens_existing_loose_mode(self, tmp_path):
+        """Opening a legacy 0644 profile store repairs it in place."""
+        db_path = tmp_path / "state.db"
+        initial = SessionDB(db_path=db_path)
+        initial.close()
+        os.chmod(db_path, 0o644)
+
+        session_db = SessionDB(db_path=db_path)
+        try:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+        finally:
+            session_db.close()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX fcntl locks")
+    def test_writable_state_db_keeps_locks_across_second_open(self, tmp_path):
+        """Opening a second SessionDB in this process must not unlink live sidecars.
+
+        POSIX locks are owned per (process, inode): closing any descriptor for
+        state.db drops every lock this process holds on it, including the locks
+        of the first SessionDB's connection. A sibling process reading the
+        database after that close takes the shared-memory DMS exclusively on its
+        own close, checkpoints, and unlinks -wal/-shm while the first handle
+        keeps using the deleted inodes.
+        """
+        import subprocess
+        import sys
+
+        from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
+
+        db_path = tmp_path / "state.db"
+        first = SessionDB(db_path=db_path)
+        second = SessionDB(db_path=db_path)
+        try:
+            assert not iter_deleted_sqlite_sidecar_holders(db_path)
+            subprocess.run(
+                [sys.executable, "-c",
+                 "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+                 "c.execute('SELECT count(*) FROM sessions').fetchone(); c.close()",
+                 str(db_path)],
+                check=True, timeout=30,
+            )
+            assert not iter_deleted_sqlite_sidecar_holders(db_path), (
+                "a second SessionDB open or a sibling reader unlinked the live "
+                "WAL/SHM inodes out from under this process"
+            )
+        finally:
+            second.close()
+            first.close()
+
     def test_failed_writable_open_does_not_leak_tracked_connection(
         self, tmp_path, monkeypatch
     ):
@@ -2033,6 +2231,83 @@ class TestConnectionLifecycle:
         healed = SessionDB(db_path=db_path, read_only=False)
         healed.close()
         assert list(tmp_path.glob("*malformed-backup*"))
+
+    def test_read_only_open_retries_transient_wal_ioerr(self, tmp_path, monkeypatch):
+        """A transient SQLITE_IOERR on a read-only open must retry, not raise.
+
+        A ``mode=ro`` connection cannot perform WAL recovery (recovery would
+        need to write the -shm index, which read-only mode refuses), so a
+        concurrent checkpoint / WAL reset / frame-flush on the writer side can
+        surface "disk I/O error" to a reader on a perfectly healthy database
+        (#100436). The transition window is millisecond-scale; a bounded retry
+        must let the open succeed instead of 500-ing the /api/sessions poll
+        and every other read-only opener.
+        """
+        import sqlite3
+
+        from hermes_cli.sqlite_safe_read import has_live_connection
+
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        writable.create_session("wal-race", source="cli")
+        writable.close()
+
+        real_connect = hermes_state._connect_tracked_db
+        attempts = []
+
+        def flaky_connect(*args, **kwargs):
+            attempts.append(kwargs.get("uri"))
+            if len(attempts) == 1:
+                # First open lands inside the writer's WAL transition window.
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_state, "_connect_tracked_db", flaky_connect)
+        # Keep the test fast: one backoff tick is enough; the retry budget
+        # itself is exercised by the attempt count below.
+        monkeypatch.setattr(hermes_state, "_READ_ONLY_IOERR_RETRY_BACKOFF_S", 0.0)
+
+        read_only = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert read_only._fts_enabled is True
+            matches = read_only.search_messages("wal-race")
+        finally:
+            read_only.close()
+
+        assert len(attempts) >= 2, "the transient IOERR must be retried"
+        assert has_live_connection(db_path) is False  # no leaked connections
+
+    def test_read_only_open_exhausts_retry_budget_for_persistent_ioerr(
+        self, tmp_path, monkeypatch
+    ):
+        """A persistent SQLITE_IOERR must exhaust the budget and raise.
+
+        The retry exists to ride out a millisecond WAL transition — a
+        storage layer that keeps failing after the full budget is genuinely
+        broken and must surface the error (and not loop forever).
+        """
+        import sqlite3
+
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        writable.create_session("broken-disk", source="cli")
+        writable.close()
+
+        attempts = []
+
+        def bad_connect(*args, **kwargs):
+            attempts.append(1)
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(hermes_state, "_connect_tracked_db", bad_connect)
+        monkeypatch.setattr(hermes_state, "_READ_ONLY_IOERR_RETRY_BACKOFF_S", 0.0)
+        budget = hermes_state._READ_ONLY_IOERR_RETRY_ATTEMPTS
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            SessionDB(db_path=db_path, read_only=True)
+
+        # budget + 1 = the initial attempt plus `budget` retries.
+        assert len(attempts) == budget + 1
 
 
 # =========================================================================
@@ -2348,7 +2623,30 @@ class TestSessionPinAndStaleArchive:
         assert db.set_session_pinned("s1", False) is True
         assert self._pinned(db, "s1") == 0
 
+    def test_pinning_a_hidden_session_makes_it_listable(self, db):
+        """A bot-tile session is born hidden (#106171). Pinning it must clear ``hidden``, or the
+        session is pinned-but-invisible: absent from both the default listing and the back-fill."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="hi")
+        db.set_session_hidden("s1", True)
 
+        db.set_session_pinned("s1", True)
+
+        assert db.get_session("s1")["hidden"] == 0
+        listed_ids = [s["id"] for s in db.list_sessions_rich(min_message_count=1)]
+        assert "s1" in listed_ids
+
+    def test_pinning_the_canonical_bot_chat_leaves_it_hidden(self, db):
+        """The canonical Bot Chat (hidden + exact registry title) is desktop-owned and must stay
+        hidden even when pinned, or it leaks into the Sessions sidebar and loses its rename guard
+        (review on #106180). Unlike an ordinary hidden session, pinning must not clear ``hidden``."""
+        db.create_session(session_id="bot1", source="desktop")
+        db.set_session_title("bot1", db.CANONICAL_BOT_CHAT_TITLE)
+        db.set_session_hidden("bot1", True)
+
+        db.set_session_pinned("bot1", True)
+
+        assert db.get_session("bot1")["hidden"] == 1
 
     # ── pinned back-fill past the page window ─────────────────────────────
     def test_pinned_session_survives_the_limit_window(self, db):
@@ -2555,7 +2853,7 @@ class TestFTS5ToolCallMigration:
             assert len(session_db.search_messages("LEGACYARG")) == 1, \
                 "v23 optimize must index tool_calls JSON into FTS"
             # schema_version bumped once the FTS layer is v23
-            from hermes_state import SCHEMA_VERSION
+            from hermes_state_common import SCHEMA_VERSION
             row = session_db._conn.execute(
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()

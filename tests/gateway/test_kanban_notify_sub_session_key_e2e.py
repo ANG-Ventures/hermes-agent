@@ -24,6 +24,7 @@ from gateway.config import Platform
 from gateway.session import SessionSource, build_session_key
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 CHAT = "1535189663533506600"
 USER = "117431298246705156"
@@ -82,7 +83,7 @@ def _creator_key() -> str:
 def _only_sub(task_id: str) -> dict:
     conn = kb.connect()
     try:
-        subs = kb.list_notify_subs(conn, task_id)
+        subs = kbn.list_notify_subs(conn, task_id)
         assert len(subs) == 1, subs
         return subs[0]
     finally:
@@ -125,7 +126,7 @@ def test_repairing_a_legacy_row_collapses_two_keys_into_one(kanban_home, monkeyp
             conn, title="legacy row", assignee="worker",
             session_id=_creator_key(),
         )
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT, chat_type="group",
         )
     finally:
@@ -157,7 +158,7 @@ def test_userless_subscription_keeps_delivering_to_the_shared_session(kanban_hom
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cron origin", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT, chat_type="group",
         )
     finally:

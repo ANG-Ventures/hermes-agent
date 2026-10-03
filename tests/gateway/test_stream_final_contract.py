@@ -266,3 +266,26 @@ class TestQueuedLaneReconcile:
         )
         assert adapter.edit_calls == []
         assert len(adapter.send_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_queued_first_response_drops_trailing_silence_marker(self):
+        """A queued human-turn reply ending in a NO_REPLY line is delivered without the token."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        adapter = _make_draft_adapter()
+        sc = SimpleNamespace(message_id="sealed_ts_9", _turn_split_delivery=False)
+        source = SimpleNamespace(chat_id="D1")
+        await GatewayRunner._deliver_queued_first_response(
+            runner,
+            "noted, nothing to do\nNO_REPLY",
+            source=source,
+            adapter=adapter,
+            metadata=None,
+            text_already_delivered=False,
+            deliver_media=False,
+            stream_consumer=sc,
+        )
+        assert adapter.edit_calls == [
+            {"message_id": "sealed_ts_9", "content": "noted, nothing to do"}
+        ]

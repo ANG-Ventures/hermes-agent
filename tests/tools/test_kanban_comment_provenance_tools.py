@@ -155,14 +155,24 @@ def test_caller_cannot_forge_session_ref_or_run_id(worker_env, monkeypatch):
     from tools import kanban_tools as kt
 
     monkeypatch.setenv("HERMES_SESSION_ID", "apollo-session-A")
-    out = kt._handle_comment({
+    forged = json.loads(kt._handle_comment({
         "task_id": worker_env,
         "body": "innocuous",
         "session_ref": "ffffffffffff",
         "run_id": 999999,
         "author": "hermes-system",
-    })
-    assert json.loads(out)["ok"] is True
+    }))
+    # Upstream's strict-parameter gate refuses the forged attribution outright (the fork
+    # used to drop the keys silently); either way nothing forged may land.
+    assert "ok" not in forged and "unknown parameter" in forged["error"], forged
+    conn = kb.connect()
+    try:
+        assert kb.list_comments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+    out = kt._handle_comment({"task_id": worker_env, "body": "innocuous"})
+    assert json.loads(out)["ok"] is True, out
 
     c = _only_comment(worker_env)
     assert c.author == "apollo"

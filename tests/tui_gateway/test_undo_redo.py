@@ -31,13 +31,21 @@ def server(hermes_home):
         },
     ):
         mod = importlib.import_module("tui_gateway.server")
-        yield mod
-        mod._sessions.clear()
-        mod._pending.clear()
-        mod._answers.clear()
-        mod._methods.clear()
-        hermes_undo.clear_state()
-        importlib.reload(mod)
+
+    methods = dict(mod._methods)
+    yield mod
+    # Restore in place instead of clear+reload (same idiom as test_undo_command.py): re-executing
+    # server.py re-binds every split sibling onto a namespace that already carries their owner
+    # tags, which upstream's bind_module collision guard rejects (change_watcher._active_pet vs
+    # methods_session._active_pet), and a reload re-registers atexit hooks.
+    mod._methods.clear()
+    mod._methods.update(methods)
+    mod._sessions.clear()
+    # Upstream moved the open server->client request tables out of server.py.
+    from tui_gateway import server_requests
+    server_requests.reset_for_tests()
+    hermes_undo.clear_state()
+    mod._db = None
 
 
 @pytest.fixture()
@@ -120,7 +128,7 @@ def test_prompt_submit_clears_redo_stack_on_user_send(server, db, monkeypatch):
     assert state.redo_stack
 
     monkeypatch.setattr(server, "_start_agent_build", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda sess, text: None)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda sess, text, **_kw: None)  # upstream added display_kind/display_metadata kwargs
 
     class NoThread:
         def __init__(self, *args, **kwargs):

@@ -29,6 +29,8 @@ import pytest
 
 from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -342,7 +344,7 @@ def test_worktree_removal_writes_an_audit_line(kanban_home, linked_worktree):
         conn.commit()
 
     with kb.connect_closing() as conn:
-        kb._cleanup_worktree_workspace(
+        kbw._cleanup_worktree_workspace(
             task_id, str(wt), None, conn=conn, reason="complete_task"
         )
 
@@ -374,7 +376,7 @@ def test_worktree_removal_refuses_a_running_card_and_audits_it(
             (str(wt), task_id),
         )
         conn.commit()
-        kb._cleanup_worktree_workspace(
+        kbw._cleanup_worktree_workspace(
             task_id, str(wt), None, conn=conn, reason="complete_task"
         )
 
@@ -399,7 +401,7 @@ def test_worktree_removal_refuses_an_unexpired_claim_lock(
             (str(wt), int(time.time()) + 900, task_id),
         )
         conn.commit()
-        kb._cleanup_worktree_workspace(
+        kbw._cleanup_worktree_workspace(
             task_id, str(wt), None, conn=conn, reason="complete_task"
         )
 
@@ -813,7 +815,7 @@ def test_worktree_lane_records_attempt_then_delete(kanban_home, linked_worktree)
             (str(wt), task_id),
         )
         conn.commit()
-        kb._cleanup_worktree_workspace(
+        kbw._cleanup_worktree_workspace(
             task_id, str(wt), None, conn=conn, reason="unit"
         )
 
@@ -988,7 +990,7 @@ def test_worktree_lane_refuses_a_live_card_checkout_named_by_a_non_owner(
 
     monkeypatch.setattr(kanban_survivor, "remove_workspace_dir", _tripwire)
 
-    kb._cleanup_worktree_workspace(
+    kbw._cleanup_worktree_workspace(
         idle_id, str(wt), None, reason="unit_crossowner_wt",
     )
 
@@ -1107,7 +1109,7 @@ def _lane_deferred_parent(live_id, caller_id, victim):
         kb.link_tasks(conn, caller_id, child_id)
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (child_id,))
         conn.commit()
-        kb._try_cleanup_parent_workspaces(conn, child_id)
+        kbw._try_cleanup_parent_workspaces(conn, child_id)
 
 
 DELETION_LANES = {
@@ -1306,17 +1308,17 @@ def test_rotate_worker_log_refuses_the_audit_even_with_backup_count_zero(
     audit, _ordinary = _seed_aged_logs()
     audit.write_text("x" * 5000, encoding="utf-8")
 
-    kb._rotate_worker_log(audit, max_bytes=10, backup_count=0)
+    kbd._rotate_worker_log(audit, max_bytes=10, backup_count=0)
     assert audit.is_file(), "rotation with backup_count=0 unlinked the audit"
 
-    kb._rotate_worker_log(audit, max_bytes=10, backup_count=3)
+    kbd._rotate_worker_log(audit, max_bytes=10, backup_count=3)
     assert audit.is_file(), "rotation renamed the audit out from under readers"
     assert not audit.with_name(audit.name + ".1").exists()
 
     # ALLOW control -- an ordinary oversized worker log still rotates.
     plain = kb.worker_logs_dir() / "t_rotateme.log"
     plain.write_text("y" * 5000, encoding="utf-8")
-    kb._rotate_worker_log(plain, max_bytes=10, backup_count=1)
+    kbd._rotate_worker_log(plain, max_bytes=10, backup_count=1)
     assert not plain.exists(), "rotation stopped rotating ordinary worker logs"
     assert plain.with_name(plain.name + ".1").is_file()
 

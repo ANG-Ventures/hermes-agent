@@ -12,6 +12,7 @@ import subprocess
 from types import SimpleNamespace
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 
 
@@ -44,8 +45,8 @@ def _capture_spawn_env(monkeypatch, tmp_path) -> dict[str, str]:
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: None)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: None)
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: False)
 
     captured: dict[str, object] = {}
@@ -61,7 +62,7 @@ def _capture_spawn_env(monkeypatch, tmp_path) -> dict[str, str]:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    assert kb._default_spawn(_task(), str(workspace), board="identity-board") == 4242
+    assert kbd._default_spawn(_task(), str(workspace), board="identity-board") == 4242
     return captured["env"]  # type: ignore[return-value]
 
 
@@ -110,6 +111,9 @@ def _fake_cli() -> _FakeCLI:
         _openrouter_min_coding_score=None,
         session_id="session-test",
         _clarify_callback=noop,
+        _connection_callback=noop,
+        _agent_status_print=noop,
+        _active_agent_route_signature=None,
         _fallback_model=[],
         _on_thinking=noop,
         checkpoints_enabled=False,
@@ -151,7 +155,10 @@ def test_dispatcher_env_reaches_chat_q_agent_identity(monkeypatch, tmp_path):
         captured.update(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr(cli_mod, "AIAgent", fake_agent)
+    # ``_init_agent`` (hermes_cli/cli_agent_setup_mixin.py) imports ``AIAgent`` from
+    # ``run_agent`` at call time; ``cli`` no longer re-exports it.
+    import run_agent as run_agent_mod
+    monkeypatch.setattr(run_agent_mod, "AIAgent", fake_agent)
     monkeypatch.setattr(cli_mod, "_active_agent_ref", None)
     monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
     monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", lambda: None)

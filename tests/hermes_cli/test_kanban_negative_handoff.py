@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_negative_handoff as neg
 from hermes_cli import kanban_open_pr as op
 
@@ -159,8 +160,8 @@ def test_result_alone_is_still_scanned(conn, armed):
 
 def _scratch_task(conn):
     tid = kb.create_task(conn, title="arm + readout", assignee="daedalus")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
-    kb.set_workspace_path(conn, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+    kbw.set_workspace_path(conn, tid, ws)
     kb.claim_task(conn, tid)
     artifact = ws / "readout.md"
     artifact.write_bytes(b"readout-bytes")

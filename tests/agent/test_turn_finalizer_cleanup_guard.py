@@ -8,6 +8,8 @@ for must still be returned.  Previously any of those raised straight out of
 traceback and lost the whole turn.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from agent.turn_finalizer import finalize_turn
@@ -23,7 +25,10 @@ class _StubCompressor:
     last_prompt_tokens = 0
 
 
-class _StubAgent:
+from agent.status_output import StatusOutputMixin
+
+
+class _StubAgent(StatusOutputMixin):
     """Minimal agent surface that ``finalize_turn`` reads from."""
 
     def __init__(self, *, raise_in):
@@ -164,3 +169,35 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert "cleanup_errors" not in result
 
 
+@pytest.mark.parametrize(
+    ("persist_disabled", "expected_calls"),
+    [
+        # Fork (#1056): on_session_end fires for EVERY turn, detached review forks included,
+        # so each Blackbox call-ledger row gets its turns row; only post_llm_call (which
+        # publishes the turn under the parent's session id) is suppressed by _persist_disabled.
+        (True, ["transform_llm_output", "on_session_end"]),
+        (False, ["transform_llm_output", "post_llm_call", "on_session_end"]),
+    ],
+)
+def test_persist_disabled_turn_skips_post_llm_call_hook_but_emits_session_end(
+    persist_disabled, expected_calls
+):
+    agent = _StubAgent(raise_in=())
+    agent._persist_disabled = persist_disabled
+    calls = []
+
+    def capture(name, **_kwargs):
+        calls.append(name)
+        return []
+
+    # Both _invoke_hook_safely and emit_session_end import invoke_hook lazily from here.
+    with patch("hermes_cli.lifecycle.invoke_hook", side_effect=capture):
+        _run(
+            agent,
+            final_response="done",
+            api_call_count=1,
+            turn_exit_reason="text_response(stop)",
+        )
+
+    assert ("on_session_end" in calls) == ("on_session_end" in expected_calls)
+    assert ("post_llm_call" in calls) == ("post_llm_call" in expected_calls)

@@ -350,7 +350,7 @@ def load_registry_snapshot(path: Optional[Path] = None) -> Dict[str, Any]:
     """
     target = Path(path) if path is not None else default_snapshot_path()
     try:
-        raw = json.loads(target.read_text(encoding="utf-8"))
+        raw = json.loads(target.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return {}
     except Exception:

@@ -195,7 +195,7 @@ def parse_from_file(path: str, *, stdin: TextIO | None = None) -> list[str]:
     if path == "-":
         text = (stdin or sys.stdin).read()
     else:
-        text = Path(path).read_text(encoding="utf-8")
+        text = Path(path).read_text(encoding="utf-8-sig")
     return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 

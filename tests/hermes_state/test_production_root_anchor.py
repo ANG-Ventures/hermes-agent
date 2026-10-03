@@ -118,6 +118,7 @@ def test_the_real_account_root_survives_a_redirected_home(tmp_path, monkeypatch)
     assert hermes_state._real_platform_state_root() == expected
 
 
+@pytest.mark.allow_real_home_io  # resolves the REAL board path on purpose (read-only)
 def test_live_board_under_the_real_root_is_still_refused_from_a_test(
     tmp_path, monkeypatch
 ):

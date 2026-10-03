@@ -42,7 +42,7 @@ def _marker_path():
 
 def _load_marker() -> list:
     try:
-        text = _marker_path().read_text(encoding="utf-8")
+        text = _marker_path().read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
         return []
     return [line.strip() for line in text.splitlines() if line.strip()]

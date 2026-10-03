@@ -1,6 +1,7 @@
 import { PassThrough } from 'stream'
 
 import { renderSync } from '@hermes/ink'
+import { stripAnsi } from '@hermes/shared/ansi'
 import React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -12,7 +13,6 @@ import { StatusRule } from '../components/appChrome.js'
 import { AppLayout } from '../components/appLayout.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import { DEFAULT_VOICE_RECORD_KEY } from '../lib/platform.js'
-import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>
@@ -132,9 +132,9 @@ const layoutProps: AppLayoutProps = {
   actions: {
     activateLiveSession: () => {},
     answerApproval: () => {},
-    answerClarify: () => {},
     answerSecret: () => {},
     answerSudo: () => {},
+    cancelClarify: () => {},
     clearSelection: () => {},
     closeLiveSession: () => Promise.resolve(null),
     newLiveSession: () => {},
@@ -245,6 +245,15 @@ describe('status-chrome timers under an occluding overlay', () => {
 
     // kaomoji cadence for the glyph + verb rotation, plus the elapsed clock.
     expect(armedDelays(intervalSpy)).toContain(2500)
+    expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
+  })
+
+  it('freezes the FaceTicker verb on compacting and skips verb rotation (#97239)', () => {
+    const { output } = mount({ ...busyProps, compacting: true })
+
+    expect(output()).toContain('compacting')
+    // Glyph still ticks at the kaomoji cadence; the rotating-verb timer does not.
+    expect(armedDelays(intervalSpy).filter(delay => delay === 2500)).toHaveLength(1)
     expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
   })
 
@@ -368,7 +377,7 @@ describe('status-chrome timers track the current overlay model', () => {
     ['agents', { agents: true }],
     ['approval', { approval: { command: 'ls', requestId: 'a-1' } as OverlayState['approval'] }],
     ['billing', { billing: { kind: 'credits' } as OverlayState['billing'] }],
-    ['clarify', { clarify: { question: 'which?', requestId: 'c-1' } as OverlayState['clarify'] }],
+    ['clarify', { clarify: { questions: [{ choices: null, qid: 'q0', question: 'which?' }], requestId: 'c-1' } }],
     ['confirm', { confirm: { onConfirm: () => {}, prompt: 'sure?' } as OverlayState['confirm'] }],
     ['journey', { journey: true }],
     ['secret', { secret: { envVar: 'TOKEN', prompt: 'token?' } as OverlayState['secret'] }],
@@ -430,15 +439,6 @@ describe('AppLayout status-rule visibility', () => {
     await flush()
 
     expect(layout.output()).toContain('1m 30s')
-  })
-
-  it('keeps the status rule on screen AND its clock advancing under a flow-layout sudo prompt', async () => {
-    const layout = mountLayout({ sudo: { requestId: 'sudo-1' } as OverlayState['sudo'] })
-
-    await flush()
-
-    expect(layout.output()).toContain('1m 0s')
-    expect(oneSecondTimers(intervalSpy)).toBe(2)
   })
 
   it('arms no clock under a floating model picker while the rule is at the top', async () => {

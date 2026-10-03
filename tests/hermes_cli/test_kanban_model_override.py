@@ -23,6 +23,8 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -182,7 +184,7 @@ def _spawn_argv_for(monkeypatch, task) -> list:
     # injects a spurious first `-m` and defeats the single-`-m` round-trip
     # assertions (env-dependent test artifact, not a dispatch bug — the model
     # override is still added exactly once after the entrypoint). (2026-06-29)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -193,8 +195,8 @@ def _spawn_argv_for(monkeypatch, task) -> list:
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
-    workspace = kb.resolve_workspace(task)
-    pid = kb._default_spawn(task, str(workspace))
+    workspace = kbw.resolve_workspace(task)
+    pid = kbd._default_spawn(task, str(workspace))
     assert pid == 4242
     return captured["cmd"]
 
@@ -310,7 +312,7 @@ def test_model_reread_on_retry_spawn(kanban_home, monkeypatch, all_assignees_spa
             model_override="claude-sonnet-4-5",
         )
         # First dispatch → spawn #1 with the original model.
-        kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        kbd.dispatch_once(conn, spawn_fn=_stub_spawn)
         assert len(spawns) == 1
         assert spawns[0][-2:] == ["-m", "claude-sonnet-4-5"]
 
@@ -329,7 +331,7 @@ def test_model_reread_on_retry_spawn(kanban_home, monkeypatch, all_assignees_spa
         assert kb.set_task_model(conn, tid, "claude-opus-4-8") == 1
 
         # Second dispatch → spawn #2 must occur AND carry the new model.
-        kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        kbd.dispatch_once(conn, spawn_fn=_stub_spawn)
         assert len(spawns) == 2, "retry must re-invoke the spawn fn"
         assert spawns[1][-2:] == ["-m", "claude-opus-4-8"]
     finally:
@@ -354,10 +356,10 @@ def test_spawn_logs_override_when_set(kanban_home, monkeypatch, caplog):
             model_override="claude-opus-4-8",
         )
         task = kb.get_task(conn, tid)
-        workspace = kb.resolve_workspace(task)
+        workspace = kbw.resolve_workspace(task)
 
     with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db"):
-        kb._default_spawn(task, str(workspace))
+        kbd._default_spawn(task, str(workspace))
 
     msgs = [r.getMessage() for r in caplog.records]
     assert any(
@@ -378,10 +380,10 @@ def test_spawn_no_log_when_no_override(kanban_home, monkeypatch, caplog):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
         task = kb.get_task(conn, tid)
-        workspace = kb.resolve_workspace(task)
+        workspace = kbw.resolve_workspace(task)
 
     with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db"):
-        kb._default_spawn(task, str(workspace))
+        kbd._default_spawn(task, str(workspace))
 
     msgs = [r.getMessage() for r in caplog.records]
     assert not any("model_override=" in m for m in msgs), (

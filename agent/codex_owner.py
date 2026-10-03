@@ -131,6 +131,10 @@ def resolve_runtime(*, force_refresh, refresh_if_expiring, refresh_skew_seconds)
                         relogin_required=False,
                     )
                     continue
+                # The probe refreshes an expired stored token first (#89415) and adopts the
+                # rotated pair into the pool; clear the cooldown on THAT row, not the stale
+                # snapshot, or the expired access token is written back over the fresh one.
+                entry = pool._find(lambda e, _id=entry.id: e.id == _id) or entry
                 cleared = replace(
                     entry,
                     last_status=None,
@@ -334,12 +338,15 @@ def _current(pool, entry):
 
     store = auth._load_auth_store(pool._auth_owner)
     matches = [r for r in _rows(store) if r.get("id") == entry.id]
-    if len(matches) != 1 or matches[0].get("source") != entry.source:
+    # Compare the hydrated source, not the raw column: a row written without ``source`` (profile
+    # rows seeded by hand, upstream fixtures) loads as SOURCE_MANUAL on both sides and is the same
+    # generation, not a replaced row.
+    current = PooledCredential.from_dict(PROVIDER, matches[0]) if len(matches) == 1 else None
+    if current is None or current.source != entry.source:
         raise _error(
             "Codex credential was removed or replaced; reload the pool.",
             "codex_row_removed",
         )
-    current = PooledCredential.from_dict(PROVIDER, matches[0])
     if _receipt(pool._auth_owner, current).exists():
         raise _error(
             "Codex refresh outcome is uncertain; authenticate a new grant at its owner."
@@ -388,6 +395,11 @@ def refresh(pool, entry, force):
                 pool._replace_entry(entry, current)
                 pool._owner_baseline[current.id] = _snapshot(current)
                 pool._mark_exhausted(current, 429)
+                # The failed POST spends this token's one refresh attempt per probe interval:
+                # the mid-cooldown pre-probe refresh (#89415) must not re-POST the same
+                # single-use refresh token on the very next selection.
+                from hermes_cli.auth_codex import _reserve_codex_quota_probe_slot
+                _reserve_codex_quota_probe_slot(current.access_token)
                 receipt.unlink()
                 _sync_dir(receipt.parent)
             raise

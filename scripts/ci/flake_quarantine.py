@@ -437,7 +437,7 @@ def _read(path: str | None) -> str | None:
     if not path:
         return None
     p = Path(path)
-    return p.read_text(encoding="utf-8") if p.is_file() else None
+    return p.read_text(encoding="utf-8-sig") if p.is_file() else None
 
 
 def _today(args) -> dt.date:

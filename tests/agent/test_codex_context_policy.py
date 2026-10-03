@@ -46,6 +46,20 @@ def advertised(monkeypatch, tmp_path):
     _use_config(monkeypatch, tmp_path, "model:\n  codex_context_policy: advertised\n")
 
 
+def _codex_jwt(subject: str) -> str:
+    """JWT-shaped test stand-in: the live-probe path gates on the token parsing as a JWT
+    (a gateway key is not a ChatGPT credential and must stay off chatgpt.com, #121486);
+    the signature itself is never verified client-side."""
+    import base64 as _b64
+    import json as _json
+
+    def _enc(raw: bytes) -> str:
+        return _b64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    header = _enc(b'{"alg":"RS256"}')
+    payload = _enc(_json.dumps({"sub": subject}).encode())
+    return f"{header}.{payload}.sig"
+
+
 def _codex_ctx(model: str) -> int:
     """Resolve through get_model_context_length with the catalog unreachable
     (static fallback table = advertised 272K for every slug)."""
@@ -53,7 +67,7 @@ def _codex_ctx(model: str) -> int:
     fake.status_code = 401
     fake.json.return_value = {}
     mm._codex_oauth_context_cache = {}
-    with patch("agent.model_metadata.requests.get", return_value=fake), \
+    with patch("agent.model_metadata.model_metadata_http.get", return_value=fake), \
          patch("agent.model_metadata.get_cached_context_length", return_value=None), \
          patch("agent.model_metadata.save_context_length"):
         return mm.get_model_context_length(
@@ -118,11 +132,13 @@ def test_large_policy_non_stale_advertisement_still_trusted(large):
             "models": [{"slug": "gpt-6-sol", "context_window": advertised_ctx}]
         }
         mm._codex_oauth_context_cache = {}
-        with patch("agent.model_metadata.requests.get", return_value=fake), \
+        with patch("agent.model_metadata.model_metadata_http.get", return_value=fake), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = mm.get_model_context_length(
-                model="gpt-6-sol", base_url=_CODEX_URL, api_key="tok",
+                # JWT-shaped: the live probe refuses a non-JWT credential aimed at chatgpt.com
+                # (#121486), and this test needs the live catalog to be read.
+                model="gpt-6-sol", base_url=_CODEX_URL, api_key=_codex_jwt("tok"),
                 provider="openai-codex",
             )
         assert ctx == advertised_ctx
@@ -253,7 +269,7 @@ def test_compressor_sees_policy_window(request, policy_fixture, model, expected)
     fake.status_code = 401
     fake.json.return_value = {}
     mm._codex_oauth_context_cache = {}
-    with patch("agent.model_metadata.requests.get", return_value=fake), \
+    with patch("agent.model_metadata.model_metadata_http.get", return_value=fake), \
          patch("agent.model_metadata.get_cached_context_length", return_value=None), \
          patch("agent.model_metadata.save_context_length"):
         comp = ContextCompressor(
@@ -303,7 +319,7 @@ def test_advertised_policy_picker_mints_900k_entries(advertised):
 
 @pytest.mark.parametrize("pin", ["gpt-6-sol-900k", "gpt-6.1-sol-900k", "gpt-5.6-sol-900k"])
 def test_large_policy_legacy_900k_pin_still_validates(large, pin):
-    from hermes_cli.models import validate_requested_model
+    from hermes_cli.models_validate import validate_requested_model
 
     catalog = ["gpt-6-sol", "gpt-6.1-sol", "gpt-5.6-sol", "gpt-5.5"]
     with patch("hermes_cli.models.provider_model_ids", return_value=catalog):
@@ -313,7 +329,7 @@ def test_large_policy_legacy_900k_pin_still_validates(large, pin):
 
 
 def test_large_policy_ineligible_alias_hint_points_at_bare_slug(large):
-    from hermes_cli.models import validate_requested_model
+    from hermes_cli.models_validate import validate_requested_model
 
     with patch("hermes_cli.models.provider_model_ids", return_value=["gpt-6-sol", "gpt-5.5"]):
         result = validate_requested_model("gpt-5.5-900k", "openai-codex")

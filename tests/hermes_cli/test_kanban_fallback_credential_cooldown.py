@@ -17,6 +17,7 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from tests.hermes_cli.test_kanban_pool_ratelimit_gates import (  # noqa: F401
     _Pool, _events, _running_run, _urls, home,
 )
@@ -79,7 +80,7 @@ def _cap_bpr(conn, bpr):
 
 
 def _dispatch(conn, seen):
-    return kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+    return kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                             max_in_progress=100)
 
 

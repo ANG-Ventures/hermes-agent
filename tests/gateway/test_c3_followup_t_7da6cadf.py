@@ -25,8 +25,11 @@ def test_976_hygiene_agent_build_uses_the_session_id_snapshot():
     """_build_hyg_agent runs in a worker thread after awaits: it must read the
     _hyg_old_sid snapshot, never the live session_entry (a /new or rotation can
     move session_entry.session_id meanwhile)."""
-    tree = ast.parse((REPO / "gateway" / "run.py").read_text(encoding="utf-8"))
-    builds = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_build_hyg_agent"]
+    # Upstream moved the hygiene turn body from gateway/run.py into gateway/run_turn.py.
+    builds = []
+    for mod in ("run.py", "run_turn.py"):
+        tree = ast.parse((REPO / "gateway" / mod).read_text(encoding="utf-8"))
+        builds += [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_build_hyg_agent"]
     assert len(builds) == 1
     live = [n.lineno for n in ast.walk(builds[0])
             if isinstance(n, ast.Name) and n.id == "session_entry"]
@@ -66,7 +69,7 @@ def test_1043_gate_passes_the_turn_start_mark(tmp_path):
     assert store.clear_resume_pending(key) is True  # legacy path unchanged
     store.mark_resume_pending(key, "restart_timeout")
     assert store.clear_resume_pending(key, marked_at=fresh - timedelta(seconds=1)) is False
-    src = (REPO / "gateway" / "run.py").read_text(encoding="utf-8")
+    src = "".join((REPO / "gateway" / mod).read_text(encoding="utf-8") for mod in ("run.py", "run_turn.py"))
     assert "marked_at=_run_start_resume_marked_at" in src
 
 

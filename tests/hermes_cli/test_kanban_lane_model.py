@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -135,7 +136,7 @@ def test_dispatch_precedence_card_then_lane_then_profile(
         )
 
         monkeypatch.setattr(kb.time, "time", lambda: 101)
-        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert seen == {
         "card": ("card-provider", "card-model"),
@@ -164,12 +165,12 @@ def test_dispatch_expiry_falls_back_and_reports_once(
         )
         kb.create_task(conn, title="first", assignee="worker")
         monkeypatch.setattr(kb.time, "time", lambda: 100)
-        first = kb.dispatch_once(conn, spawn_fn=spawn)
+        first = kbd.dispatch_once(conn, spawn_fn=spawn)
         assert first.expired_lane_models
         assert seen == [(None, None)]
 
         kb.create_task(conn, title="second", assignee="worker")
-        second = kb.dispatch_once(conn, spawn_fn=spawn)
+        second = kbd.dispatch_once(conn, spawn_fn=spawn)
         assert second.expired_lane_models == []
 
 

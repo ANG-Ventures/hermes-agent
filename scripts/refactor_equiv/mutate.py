@@ -20,7 +20,7 @@ class MutationMissed(AssertionError):
 
 
 def replace_once(path: Path, old: str, new: str) -> None:
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     if text.count(old) != 1:
         raise ValueError(f"expected exactly one occurrence of {old!r} in {path}")
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
@@ -28,7 +28,7 @@ def replace_once(path: Path, old: str, new: str) -> None:
 
 def run_mutations(module_path: str | Path, mutations: list[Mutation], verify_cmd: list[str]) -> None:
     path = Path(module_path)
-    original = path.read_text(encoding="utf-8")
+    original = path.read_text(encoding="utf-8-sig")
     for mutation in mutations:
         try:
             _clear_bytecode(path)

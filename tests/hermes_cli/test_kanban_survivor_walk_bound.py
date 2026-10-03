@@ -41,6 +41,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as survivor
 
 
@@ -335,7 +336,7 @@ def test_unmaterialised_gitlink_does_not_hold_the_card(board, tmp_path):
     git(ws, "commit", "-m", "worker output")
 
     tid = kb.create_task(board, title="worktree card with an empty gitlink")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     survivor.record_baseline(board, tid, ws)
 
     survivor.preserve(board, tid, {"changed_files": ["worker.py"]}, workspace=ws)
@@ -356,7 +357,7 @@ def test_home_shaped_workspace_refuses_fast(board, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_SURVIVOR_WALK_BUDGET", "64")
 
     tid = kb.create_task(board, title="home as workspace")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
 
     started = time.monotonic()
     with pytest.raises(survivor.SurvivorUnavailable) as caught:

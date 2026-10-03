@@ -71,6 +71,10 @@ class _BudgetAgent:
     def _emit_status(self, *_a, **_kw):
         pass
 
+    def _emit_diagnostic_status(self, *_a, **_kw):
+        # Upstream routes the budget-exhausted notice through the diagnostic channel.
+        pass
+
     def _safe_print(self, *_a, **_kw):
         pass
 
@@ -135,8 +139,10 @@ def test_background_review_fork_does_not_fail_parent_task():
     """The 16-iteration review fork must not touch the parent's card."""
     agent = _BudgetAgent(max_iterations=16, memory_write_origin="background_review")
 
-    with patch("hermes_cli.kanban_db._record_task_failure") as rec, \
-         patch("hermes_cli.kanban_db.connect"):
+    # Upstream split kanban_db; finalize_turn reads connect/_record_task_failure from the
+    # split modules (same targets as test_turn_finalizer_iteration_limit_exit).
+    with patch("hermes_cli.kanban_db_dispatch._record_task_failure") as rec, \
+         patch("hermes_cli.kanban_db_connect.connect"):
         _finalize(agent, api_call_count=16)
 
     assert rec.call_count == 0, (
@@ -149,8 +155,10 @@ def test_real_worker_still_records_failure():
     """Negative control: a genuine worker must still trip the circuit."""
     agent = _BudgetAgent(max_iterations=300)
 
-    with patch("hermes_cli.kanban_db._record_task_failure") as rec, \
-         patch("hermes_cli.kanban_db.connect"):
+    # Upstream split kanban_db; finalize_turn reads connect/_record_task_failure from the
+    # split modules (same targets as test_turn_finalizer_iteration_limit_exit).
+    with patch("hermes_cli.kanban_db_dispatch._record_task_failure") as rec, \
+         patch("hermes_cli.kanban_db_connect.connect"):
         _finalize(agent, api_call_count=300)
 
     assert rec.call_count == 1, (

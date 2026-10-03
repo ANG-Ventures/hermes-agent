@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -40,7 +41,7 @@ def board(tmp_path, monkeypatch):
 def scratch_under_tripwire(conn):
     """A scratch workspace whose parent carries the live tripwire gitfile."""
     tid = kb.create_task(conn, title="scratch card under the tripwire")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(parents=True, exist_ok=True)
     (ws.parent / ".git").write_text(
         "gitdir: /nonexistent/kanban-scratch-workspace-is-not-a-repo (repo tripwire)\n"
@@ -49,7 +50,7 @@ def scratch_under_tripwire(conn):
     probe = subprocess.run(["git", "-C", str(ws), "rev-parse", "--show-toplevel"],
                            capture_output=True)
     assert probe.returncode == 128
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws
 
 
@@ -119,10 +120,10 @@ def test_c_a_nested_repo_with_a_corrupt_object_store_still_fails_closed(board):
 def test_only_a_dangling_gitfile_is_excused_not_a_broken_enclosing_repo(board):
     """A `.git` DIRECTORY that git cannot use is not the tripwire: stay closed."""
     tid = kb.create_task(board, title="scratch under a broken repo")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     (ws.parent / ".git").mkdir()
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     probe = subprocess.run(["git", "-C", str(ws), "rev-parse", "--show-toplevel"],
                            capture_output=True)
     if probe.returncode == 0:
@@ -138,10 +139,10 @@ def test_only_a_dangling_gitfile_is_excused_not_a_broken_enclosing_repo(board):
 def scratch_under_gitfile(conn, target):
     """A scratch workspace whose parent `.git` is a gitfile naming ``target``."""
     tid = kb.create_task(conn, title="scratch under a gitfile whose target exists")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(parents=True, exist_ok=True)
     (ws.parent / ".git").write_text(f"gitdir: {target}\n")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     # Precondition: git refuses from the workspace exactly as it does under
     # the tripwire, so only the target's EXISTENCE tells the two apart.
     probe = subprocess.run(["git", "-C", str(ws), "rev-parse", "--show-toplevel"],

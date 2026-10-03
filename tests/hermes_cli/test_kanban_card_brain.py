@@ -16,6 +16,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -192,5 +193,5 @@ def test_spawn_env_exports_claimed_brain(kanban_home, monkeypatch):
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="x", assignee="cc-worker", brain=brain)
             task = kb.get_task(conn, tid)
-        kb._default_spawn(task, str(ws))
+        kbd._default_spawn(task, str(ws))
         assert captured["env"][kb.CARD_BRAIN_ENV] == want

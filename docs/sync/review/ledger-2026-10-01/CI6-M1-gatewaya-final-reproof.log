@@ -1,0 +1,27 @@
+## batch 1: tests/gateway/test_active_agent_keys_persist_on_promotion.py tests/gateway/test_adapter_split_tail_siblings.py tests/gateway/test_async_delegation_restart_recovery.py
+27 passed, 7 warnings in 15.38s
+## batch 2: tests/gateway/test_branch_thread_command.py tests/gateway/test_c3_followup_t_7da6cadf.py tests/gateway/test_cached_agent_history_guard.py
+15 passed, 7 warnings in 12.67s
+## batch 3: tests/gateway/test_choice_picker.py tests/gateway/test_coalesced_receipt_cancellation.py tests/gateway/test_commentary_send_kind.py
+17 passed, 7 warnings in 9.03s
+## batch 4: tests/gateway/test_completion_session_boundary.py tests/gateway/test_completion_silence_hint.py tests/gateway/test_compress_abort_honesty.py
+86 passed, 7 warnings in 30.18s
+## batch 5: tests/gateway/test_compress_command.py tests/gateway/test_compression_failure_session_sync.py tests/gateway/test_deferred_restart_arm_off_loop.py
+43 passed, 7 warnings in 50.15s
+## batch 6: tests/gateway/test_delete_session_no_resurrect.py tests/gateway/test_discord_connect.py tests/gateway/test_discord_event_silence.py
+26 passed, 8 warnings in 14.92s
+/Users/alexgierczyk/.hermes/hermes-agent/venv/lib/python3.11/site-packages/_pytest/pathlib.py:96: PytestWarning: (rm_rf) error removing /private/tmp/pytest-of-alexgierczyk/garbage-4b523e25-0c3f-48ad-911e-c5b033c8d7b4
+## batch 7: tests/gateway/test_discord_free_response.py tests/gateway/test_discord_liveness.py tests/gateway/test_discord_producer_matrix.py
+65 passed, 7 warnings in 22.62s
+## batch 8: tests/gateway/test_discord_slash_commands.py tests/gateway/test_evict_release_never_on_loop.py tests/gateway/test_fast_command.py
+69 passed, 11 warnings in 70.23s (0:01:10)
+## batch 9: tests/gateway/test_footer_provider_in_turn_result.py tests/gateway/test_gateway_command_handler_parity.py tests/gateway/test_gateway_silence_tokens.py
+27 passed, 7 warnings in 12.18s
+## batch 10: tests/gateway/test_hygiene_stale_prompt_tokens.py tests/gateway/test_idle_compaction_gateway_gap.py tests/gateway/test_kanban_multiplex_served_profile_parity.py
+16 passed, 7 warnings in 28.85s
+## batch 11: tests/gateway/test_kanban_notifier_served_apiserver_wake.py tests/gateway/test_launchd_exit_timeout_drain_cap.py tests/gateway/test_model_command_discord_name_form.py
+100 passed, 7 warnings in 39.99s
+## batch 12: tests/gateway/test_model_command_flat_string_config.py tests/gateway/test_model_picker_persist.py tests/gateway/test_model_switch_persistence.py
+26 passed, 7 warnings in 11.26s
+## batch 13: tests/gateway/test_model_switch_session_reasoning.py tests/gateway/test_multiplex_residue_parity.py tests/gateway/test_native_stream_warning_composition.py
+19 passed, 7 warnings in 11.13s
