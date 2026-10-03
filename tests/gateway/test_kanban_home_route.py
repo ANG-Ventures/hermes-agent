@@ -402,3 +402,103 @@ def test_rehome_is_a_home_guarded_verb():
     kc.build_parser(parser.add_subparsers(dest="cmd"))
     ns = parser.parse_args(["kanban", "rehome", "t_1", "--session", "s"])
     assert (ns.task_id, ns.session) == ("t_1", "s")
+
+
+# --- Prism P1 residue (t_04013ffa) -------------------------------------------
+
+
+def test_digest_batches_are_per_thread_not_per_chat():
+    from gateway.kanban_lifecycle_digest import LifecycleDigest
+
+    ad = Adapter()
+    dg = LifecycleDigest()
+    dg.add(("telegram", "-100"), ad, "✔ [default] @w Kanban t_a done — a", 60, 0.0,
+           metadata={"thread_id": "7"})
+    dg.add(("telegram", "-100"), ad, "✔ [default] @w Kanban t_b done — b", 60, 0.0,
+           metadata={"thread_id": "9"})
+    dg.add(("telegram", "-100"), ad, "✔ [default] @w Kanban t_c done — c", 60, 0.0)
+    assert asyncio.run(dg.flush(61.0)) == 3
+    by_thread = {(m["metadata"] or {}).get("thread_id", ""): m["text"] for m in ad.sent}
+    assert set(by_thread) == {"7", "9", ""}
+    assert "t_a" in by_thread["7"] and "t_b" not in by_thread["7"]
+    assert "t_b" in by_thread["9"] and "t_c" in by_thread[""]
+
+
+class RaisingAdapter(Adapter):
+    async def send(self, chat_id, text, metadata=None):
+        if chat_id in self.fail_chats:
+            raise ConnectionError("dead chat")
+        return await super().send(chat_id, text, metadata)
+
+
+def test_window0_raised_home_send_falls_back_to_logs(tmp_path, monkeypatch):
+    def make(conn):
+        tid = _card(conn, S_APOLLO)
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, ad, runner = _run(tmp_path, monkeypatch, make,
+                           discord=RaisingAdapter(fail_chats={APOLLO}))
+    sent = ad[Platform.DISCORD].sent
+    assert [m["chat_id"] for m in sent] == [LOGS], sent
+    assert "[home-unreachable:connectionerror]" in sent[0]["text"].splitlines()[0]
+    assert not runner._kanban_sub_fail_counts, "a delivered fallback is a delivery"
+
+
+def test_lookup_failure_is_not_cached_and_not_no_home(monkeypatch):
+    calls = []
+
+    def broken(sid):
+        calls.append(sid)
+        raise hr.SessionLookupError("database is locked")
+
+    monkeypatch.setattr(hr, "read_session_row", broken)
+    c = hr.HomeCache()
+    row, res = c.get("default", "t_1", S_APOLLO, now=0)
+    assert row is None and res.target is None and res.reason == hr.LOOKUP_FAILED
+    assert hr.home_lookup_failed(res)
+    c.get("default", "t_1", S_APOLLO, now=1)
+    assert calls == [S_APOLLO, S_APOLLO], "a failed lookup is never cached"
+    monkeypatch.setattr(hr, "read_session_row", lambda sid: SESSIONS.get(sid))
+    assert c.get("default", "t_1", S_APOLLO, now=2)[1].target.chat_id == APOLLO
+
+
+def test_read_session_row_raises_on_db_error(monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.undo()  # real read_session_row, not the autouse stub
+    real = hr
+
+    class Boom:
+        def __init__(self, *a, **k):
+            raise OSError("disk I/O error")
+
+    monkeypatch.setitem(sys.modules, "hermes_state", types.SimpleNamespace(SessionDB=Boom))
+    with pytest.raises(real.SessionLookupError):
+        real.read_session_row("s")
+
+
+def test_lookup_failure_leaves_event_unacked_then_routes_home(tmp_path, monkeypatch):
+    state = {"broken": True}
+
+    def flaky(sid):
+        if state["broken"]:
+            raise hr.SessionLookupError("database is locked")
+        return SESSIONS.get(sid)
+
+    monkeypatch.setattr(hr, "read_session_row", flaky)
+
+    def make(conn):
+        tid = _card(conn, S_APOLLO)
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, ad, runner = _run(tmp_path, monkeypatch, make)
+    assert ad[Platform.DISCORD].sent == [], "no [no-home] line while state.db is unreadable"
+    state["broken"] = False
+    runner._running = True
+    asyncio.run(_tick(monkeypatch, runner))
+    sent = ad[Platform.DISCORD].sent
+    assert [m["chat_id"] for m in sent] == [APOLLO], sent
+    assert f"{tid} done" in sent[0]["text"]

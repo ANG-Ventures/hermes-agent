@@ -105,7 +105,7 @@ def render(lines: list[str], dropped: int = 0) -> str:
 
 
 class LifecycleDigest:
-    """Per-target buffer: ``(platform, chat_id) -> held lines``. Not thread-safe; the notifier is
+    """Per-target buffer: ``(platform, chat_id, thread_id) -> held lines``. Not thread-safe; the notifier is
     a single coroutine."""
 
     def __init__(self) -> None:
@@ -118,11 +118,15 @@ class LifecycleDigest:
             metadata: Optional[dict] = None, fallback: Optional[tuple] = None) -> None:
         """``fallback=((platform, chat_id), adapter, window)``: where the batch goes, each line
         tagged ``[home-unreachable:<reason>]``, if the send to ``target`` fails (t_808bc8e6)."""
-        b = self._held.setdefault(target, {"lines": [], "first": now, "adapter": adapter,
-                                           "window": window, "dropped": 0})
+        # One batch per destination THREAD: lines for two threads/topics of one chat
+        # never share a batch (their metadata would overwrite each other).
+        meta = dict(metadata or {})
+        key = (target[0], target[1], str(meta.get("thread_id") or ""))
+        b = self._held.setdefault(key, {"lines": [], "first": now, "adapter": adapter,
+                                        "window": window, "dropped": 0})
         b["adapter"] = adapter
         b["window"] = window
-        b["metadata"] = dict(metadata or {})
+        b["metadata"] = meta
         b["fallback"] = fallback
         b["lines"].append(msg)
         if len(b["lines"]) > MAX_HELD:
@@ -130,7 +134,7 @@ class LifecycleDigest:
             del b["lines"][:over]
             b["dropped"] += over
 
-    def due(self, now: float) -> list[tuple[str, str]]:
+    def due(self, now: float) -> list[tuple[str, str, str]]:
         return [t for t, b in self._held.items() if b["lines"] and now - b["first"] >= b["window"]]
 
     async def flush(self, now: float, force: bool = False) -> int:
