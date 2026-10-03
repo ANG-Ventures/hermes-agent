@@ -86,3 +86,76 @@ def test_dotdot_that_leaves_boards_default_still_opens(home):
     with kb.connect_closing(ok) as conn:
         conn.execute("SELECT count(*) FROM tasks").fetchone()
     assert (home / "kanban" / "boards" / "alpha" / "kanban.db").is_file()
+
+
+# Prism P1 f836c7bad244 (card t_a9a00731): resolving BEFORE the shape check lost
+# the refusal when a structural ancestor (``kanban/`` or ``boards/``) is itself a
+# symlink -- the resolved target no longer carries the ``kanban/boards/default``
+# names. The guard must refuse the logical spelling AND the resolved target of
+# this home's ``board_dir("default")/kanban.db``.
+
+
+@pytest.mark.parametrize("linked", ["kanban", "boards"])
+def test_symlinked_structural_ancestor_logical_path_refused(home, tmp_path_factory, linked):
+    real = tmp_path_factory.mktemp("task-data")
+    if linked == "kanban":
+        (home / "kanban").symlink_to(real, target_is_directory=True)
+    else:
+        (home / "kanban").mkdir()
+        (home / "kanban" / "boards").symlink_to(real, target_is_directory=True)
+    phantom = home / "kanban" / "boards" / "default" / "kanban.db"
+    for fn in (kb.connect, kb.init_db):
+        with pytest.raises(kb.KanbanNonCanonicalBoardPathError):
+            fn(phantom)
+    assert not any(real.rglob("kanban.db"))
+
+
+@pytest.mark.parametrize("linked", ["kanban", "boards"])
+def test_symlinked_structural_ancestor_resolved_target_refused(home, tmp_path_factory, linked):
+    real = tmp_path_factory.mktemp("task-data")
+    if linked == "kanban":
+        (home / "kanban").symlink_to(real, target_is_directory=True)
+        target = real / "boards" / "default" / "kanban.db"
+    else:
+        (home / "kanban").mkdir()
+        (home / "kanban" / "boards").symlink_to(real, target_is_directory=True)
+        target = real / "default" / "kanban.db"
+    for fn in (kb.connect, kb.init_db):
+        with pytest.raises(kb.KanbanNonCanonicalBoardPathError):
+            fn(target)
+    assert not any(real.rglob("kanban.db"))
+
+
+def test_symlinked_kanban_dir_named_boards_still_open(home, tmp_path_factory):
+    real = tmp_path_factory.mktemp("task-data")
+    (home / "kanban").symlink_to(real, target_is_directory=True)
+    with kb.connect_closing(board="alpha") as conn:
+        conn.execute("SELECT count(*) FROM tasks").fetchone()
+    assert (real / "boards" / "alpha" / "kanban.db").is_file()
+    with kb.connect_closing() as conn:  # default stays <root>/kanban.db
+        conn.execute("SELECT count(*) FROM tasks").fetchone()
+    assert (home / "kanban.db").is_file()
+
+
+def test_symlinked_kanban_under_foreign_root_refused(home, tmp_path_factory):
+    # Not this process's kanban_home(): only the logical-spelling view sees it.
+    other = tmp_path_factory.mktemp("other-root")
+    real = tmp_path_factory.mktemp("task-data")
+    (other / "kanban").symlink_to(real, target_is_directory=True)
+    for fn in (kb.connect, kb.init_db):
+        with pytest.raises(kb.KanbanNonCanonicalBoardPathError):
+            fn(other / "kanban" / "boards" / "default" / "kanban.db")
+    assert not any(real.rglob("kanban.db"))
+
+
+def test_symlinked_parent_into_foreign_boards_default_refused(home, tmp_path_factory):
+    # Spelling has no kanban/boards names and the root is not kanban_home():
+    # only the resolved-target shape view sees it (Prism d0894d0cbe77 class).
+    meta = tmp_path_factory.mktemp("other-root") / "kanban" / "boards" / "default"
+    meta.mkdir(parents=True)
+    link = tmp_path_factory.mktemp("links") / "elsewhere"
+    link.symlink_to(meta, target_is_directory=True)
+    for fn in (kb.connect, kb.init_db):
+        with pytest.raises(kb.KanbanNonCanonicalBoardPathError):
+            fn(link / "kanban.db")
+    assert not (meta / "kanban.db").exists()
