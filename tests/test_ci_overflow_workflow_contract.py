@@ -255,7 +255,7 @@ def check_fallback(doc: dict) -> list[str]:
                     except (ValueError, SyntaxError, KeyError, TypeError) as exc:
                         errors.append(f"{where}: {exc}")
                         continue
-                    legacy_e2e = ["self-hosted", "hermes-ci", "X64"] if labels else ["ubuntu-latest"]
+                    legacy_e2e = ["self-hosted", "hermes-ci", "X64"] if labels else ["blacksmith-4vcpu-ubuntu-2404"]
                     if event != "merge_group" or not enabled:
                         want, want_e2e = GEN_MATRIX, legacy_e2e
                     elif outcome == "valid":
@@ -327,10 +327,10 @@ def test_mutating_no_plan_fallback_to_local_matrix_fails_integration():
 def test_mutating_no_plan_e2e_fallback_to_local_pool_fails_integration():
     doc = _tests_yml()
     expr = doc["jobs"]["e2e"]["runs-on"]
-    static_tail = "|| '[\"ubuntu-latest\"]')) }}"
+    static_tail = "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]')) }}"
     assert expr.rstrip().endswith(static_tail)
     doc["jobs"]["e2e"]["runs-on"] = (expr.rstrip()[:-len(static_tail)]
-                                     + "|| '[\"ubuntu-latest\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
+                                     + "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
     assert any("invalid/labels=None: e2e runs-on" in e for e in check_fallback(doc)), check_fallback(doc)
 
 

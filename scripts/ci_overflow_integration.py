@@ -70,7 +70,7 @@ def fallback_predicate(workflow_text: str) -> CheckResult:
         if gate not in matrix:
             problems.append(f"placement matrix not gated by {gate!r}")
     e2e_runs_on = str((jobs.get("e2e") or {}).get("runs-on", ""))
-    if not e2e_runs_on.rstrip("} ").endswith("|| '[\"ubuntu-latest\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
+    if not e2e_runs_on.rstrip("} ").endswith("|| '[\"blacksmith-4vcpu-ubuntu-2404\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
         problems.append("e2e runs-on does not end in the static CI_RUNNER_LABELS fallback")
     if json.dumps(LOCAL_LABELS).replace(" ", "") in e2e_runs_on.replace(" ", "").replace("'", ""):
         problems.append("e2e runs-on can select the fixed local pool")
