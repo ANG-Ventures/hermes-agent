@@ -1688,6 +1688,7 @@ class GatewayKanbanWatchersMixin:
         from gateway.kanban_notify_failures import (
             LaneFailureDedupe,
             format_failure_notice,
+            format_timed_out_notice,
         )
 
         lane_dedupe: LaneFailureDedupe = getattr(self, "_kanban_lane_dedupe", None) or LaneFailureDedupe()
@@ -2152,12 +2153,9 @@ class GatewayKanbanWatchersMixin:
                             )
                             lane_key = directive.get("lane_key")
                         elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                            msg = format_timed_out_notice(
+                                ev.payload, task_id=sub["task_id"],
+                                board_tag=board_tag, tag=tag,
                             )
                         elif kind == "stalled":
                             age = int((ev.payload or {}).get("progress_age_seconds") or 0)
