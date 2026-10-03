@@ -464,6 +464,14 @@ _SPECS = [
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
+    # rehome (t_808bc8e6)
+    _cmd("rehome", [
+        _arg("task_id"),
+        _arg("--session", required=True, metavar="SESSION_ID",
+             help="The session the card belongs to; its origin chat becomes the "
+                  "card's home channel (refused when that session has no chat)"),
+    ], help="Give a card a home: stamp its home session and subscribe that "
+            "session's chat, so its lifecycle lines land there"),
     _cmd("link", [
         _arg("parent_id"), _arg("child_id"),
         _arg("--kind", default=kb.DEFAULT_LINK_KIND, choices=sorted(kb.VALID_LINK_KINDS),

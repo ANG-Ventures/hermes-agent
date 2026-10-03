@@ -1270,6 +1270,44 @@ def test_worker_lifecycle_through_tools(worker_env):
 # ---------------------------------------------------------------------------
 
 
+def test_kanban_guidance_prompt_size_bounded():
+    """KANBAN_GUIDANCE is injected into every kanban-capable process's system
+    prompt and resolved once at agent init, so its size is a per-worker token
+    tax paid on every spawn. Bound it as an invariant, not a change-detector:
+    the ceiling (8000 chars, roughly 2000 tokens) leaves headroom above the
+    current ~6.2k chars for tight additions, while catching accidental bloat
+    (pasted docs, duplicated sections) before it ships to every worker.
+    """
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert len(KANBAN_GUIDANCE) < 8000, (
+        f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
+        "every kanban worker's system prompt — trim it or consciously re-bound "
+        "this invariant with justification."
+    )
+
+
+def test_kanban_guidance_orchestrator_decision_ownership():
+    """The orchestrator section must carry the split-brain prevention
+    contract: decisions are made by the orchestrator before fan-out and
+    stamped into every dependent card body."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
+    assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
+    assert "workers cannot see sibling context" in KANBAN_GUIDANCE
+
+
+def test_kanban_guidance_names_alerts_pager_rule():
+    """Workers twice staged raw #alerts senders that home-autocommit then
+    quarantined (t_9056981b, t_5685054a). The one paging rule must reach every
+    worker through the injected guidance, not a skill it may not load."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "scripts/lib/episode_pager.py" in KANBAN_GUIDANCE
+    assert "# alerts-pager-ok: <reason>" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------

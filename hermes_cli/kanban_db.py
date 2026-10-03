@@ -2671,19 +2671,36 @@ class KanbanNonCanonicalBoardPathError(RuntimeError):
 def _refuse_noncanonical_board_path(path: Path) -> None:
     """Raise :class:`KanbanNonCanonicalBoardPathError` for ``kanban/boards/default/kanban.db``.
 
-    Structural (path shape only), so it holds under any root, pin or sandbox.
-    Judged on the RESOLVED target, not the spelling: a relative ``kanban.db``
-    from a ``boards/default`` cwd, a ``boards/default/../default/kanban.db``
-    and a symlinked parent all land on the same file (Prism d0894d0cbe77).
+    Structural, so it holds under any root, pin or sandbox. Refused when ANY
+    of three views of the path is the phantom:
+
+    * the LOGICAL spelling (absolute + ``..``-collapsed, symlinks kept): a
+      symlinked ``kanban/`` or ``boards/`` ancestor relocates storage but does
+      not make ``boards/default/kanban.db`` a board (Prism f836c7bad244);
+    * the RESOLVED target: a relative ``kanban.db`` from a ``boards/default``
+      cwd or a symlinked parent dir lands on the same file (Prism d0894d0cbe77);
+    * the resolved target of this home's ``board_dir("default")/kanban.db``,
+      for a caller that hands over the already-resolved path behind a
+      symlinked ancestor, whose names no longer spell ``kanban/boards``.
     """
-    p = Path(path).expanduser().resolve(strict=False)
-    if (
-        p.name == "kanban.db"
-        and p.parent.name == DEFAULT_BOARD
-        and p.parent.parent.name == "boards"
-        and p.parent.parent.parent.name == "kanban"
-    ):
-        raise KanbanNonCanonicalBoardPathError(p)
+    raw = Path(path).expanduser()
+    resolved = raw.resolve(strict=False)
+    for p in (Path(os.path.normpath(os.path.abspath(raw))), resolved):
+        if (
+            p.name == "kanban.db"
+            and p.parent.name == DEFAULT_BOARD
+            and p.parent.parent.name == "boards"
+            and p.parent.parent.parent.name == "kanban"
+        ):
+            raise KanbanNonCanonicalBoardPathError(raw)
+    if resolved.name != "kanban.db":
+        return
+    try:
+        phantom = (kanban_home() / "kanban" / "boards" / DEFAULT_BOARD / "kanban.db").resolve(strict=False)
+    except Exception:  # best-effort third view; the two above already ran
+        return
+    if resolved == phantom:
+        raise KanbanNonCanonicalBoardPathError(raw)
 
 
 class KanbanDbNotABoardError(RuntimeError):

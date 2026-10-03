@@ -868,6 +868,20 @@ def test_over_attachment_limit_stores_pushed_ref_not_body(board, tmp_path, monke
     assert not any(a.filename.endswith((".bundle", ".patch")) for a in kb.list_attachments(board, tid))
 
 
+def test_oversize_branch_distinct_keys_never_share_a_ref():
+    """Prism P1 on hermes-agent#1636: ``a/b`` and ``a-b`` sanitised to the same branch, so the second
+    forced push replaced the first repo's survivor ref while both read-backs passed."""
+    from hermes_cli.kanban_survivor import _oversize_branch
+
+    keys = [".", "a/b", "a-b", "a b", "a//b", "ha", "hh"]
+    branches = [_oversize_branch("t_1", k) for k in keys]
+    assert len(set(branches)) == len(keys)
+    assert branches[0] == "kanban-survivor/t_1"
+    for b in branches:  # a valid ref name: no '//', no '..', no trailing '/', '.' or '.lock'
+        assert "//" not in b and ".." not in b and not b.endswith(("/", ".", ".lock"))
+    assert _oversize_branch("t_1", "a/b") == _oversize_branch("t_1", "a/b")  # stable across runs
+
+
 def stored_survivor(conn, tid):
     """The DURABLE recovery row -- what a later recovery actually reads."""
     import hermes_cli.kanban_survivor as survivor_mod

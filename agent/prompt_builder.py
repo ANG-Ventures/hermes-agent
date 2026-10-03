@@ -343,6 +343,8 @@ KANBAN_GUIDANCE = (
     "Workers may only attach to their own task.\n"
     "- **Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
     "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id.\n"
+    "- **Paging #alerts.** Only via `scripts/lib/episode_pager.py` or a whole-line `# alerts-pager-ok: <reason>`; else "
+    "quarantined.\n"
     "- **Orchestrating: discover profiles first.** The dispatcher SILENTLY drops a card with an unknown assignee (it "
     "sits in `ready` forever). Ground every assignee in a real profile (`hermes profile list`, or ask the user), and "
     "express dependencies via `parents=[...]` on `kanban_create`, not prose.\n"

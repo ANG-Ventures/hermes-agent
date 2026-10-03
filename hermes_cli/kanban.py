@@ -429,6 +429,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "reclaim", "set-model", "priority", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
     "request-changes", "link", "unlink", "specify", "decompose", "workspace",
+    "rehome",
 })
 
 
@@ -3783,6 +3784,52 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rehome(args: argparse.Namespace) -> int:
+    """Re-home a card (t_808bc8e6): stamp ``--session`` as its home and
+    subscribe that session's origin chat. The orphan alert names this verb."""
+    from gateway.kanban_home_route import home_from_row, read_session_row
+
+    sid = (args.session or "").strip()
+    if not sid:
+        print("kanban rehome: --session is empty", file=sys.stderr)
+        return 2
+    row = None if kb.is_operator_home(sid) else read_session_row(sid)
+    home = home_from_row(sid, row)
+    if home.target is None:
+        print(
+            f"kanban rehome: session {sid} has no chat to route to ({home.reason}); "
+            "pass the session the card is discussed in",
+            file=sys.stderr,
+        )
+        return 1
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        if not kb.set_task_session(conn, args.task_id, sid):
+            print(f"cannot rehome {args.task_id} (unknown id)", file=sys.stderr)
+            return 1
+        try:
+            origin = json.loads((row or {}).get("origin_json") or "{}")
+        except (TypeError, ValueError):
+            origin = {}
+        origin = origin if isinstance(origin, dict) else {}
+        target = home.target
+        kbn.add_notify_sub(
+            conn, task_id=args.task_id,
+            platform=target.platform, chat_id=target.chat_id,
+            thread_id=target.thread_id or None,
+            chat_type=origin.get("chat_type") or None,
+            user_id=origin.get("user_id") or None,
+            scope_id=origin.get("scope_id") or None,
+            notifier_profile=origin.get("profile") or _profile_author(),
+        )
+    print(f"Re-homed {args.task_id} to session {sid} "
+          f"({target.platform}:{target.chat_id}"
+          + (f":{target.thread_id}" if target.thread_id else "") + ")")
+    return 0
+
+
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     delivery_metadata = {
         key: value
@@ -4323,7 +4370,7 @@ _HANDLERS = {
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
-    "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+    "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "update": _cmd_edit, "block": _cmd_block,
