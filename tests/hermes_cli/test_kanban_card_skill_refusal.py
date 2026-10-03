@@ -76,6 +76,27 @@ def test_kanban_worker_gate_honours_external_dirs(kanban_home):
     assert kb._kanban_worker_skill_available(str(archived_only)) is False
 
 
+def test_resolver_finds_nested_legacy_flat_markdown(tmp_path):
+    """Prism P1 (#1677 r1): skill_view strategy 3 loads <root>/**/<name>.md."""
+    home = tmp_path / "h"
+    (home / "skills" / "devops").mkdir(parents=True)
+    (home / "skills" / "devops" / "recovery.md").write_text("# legacy\n")
+    assert ksr.unresolved_skills(["recovery"], home) == []
+
+
+def test_external_dir_expands_home_var_as_the_worker(tmp_path, monkeypatch):
+    """Prism P1 (#1677 r1): ${HERMES_HOME} expands to the PROFILE home, as in the child."""
+    dispatcher_home = tmp_path / "dispatcher"
+    dispatcher_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(dispatcher_home))
+    prof = tmp_path / "prof"
+    _skill(prof / "shared-skills", "only-in-profile")
+    (prof / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - ${HERMES_HOME}/shared-skills\n"
+    )
+    assert ksr.unresolved_skills(["only-in-profile"], prof) == []
+
+
 # ---------------------------------------------------------------- dispatcher
 
 

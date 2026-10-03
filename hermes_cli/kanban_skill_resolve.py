@@ -26,10 +26,32 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Iterable, Optional
 
 _log = logging.getLogger(__name__)
+
+
+_VAR_RE = re.compile(r"\$(\w+)|\$\{([^}]+)\}")
+
+
+def _expandvars_as_worker(value: str, home: Path) -> str:
+    """``os.path.expandvars`` as the WORKER sees it, without touching os.environ.
+
+    ``_default_spawn`` sets the child's HERMES_HOME to the profile home before the
+    worker reads its config, so ``${HERMES_HOME}`` in a profile's external_dirs must
+    expand to that profile, not to the dispatcher's own home. Unknown variables
+    are left as written, like ``os.path.expandvars``.
+    """
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+
+    def _sub(m: "re.Match[str]") -> str:
+        key = m.group(1) or m.group(2)
+        return env.get(key, m.group(0))
+
+    return _VAR_RE.sub(_sub, value)
 
 
 def _read_external_dirs(home: Path) -> list[Path]:
@@ -60,7 +82,7 @@ def _read_external_dirs(home: Path) -> list[Path]:
         entry = str(entry or "").strip()
         if not entry:
             continue
-        p = Path(os.path.expanduser(os.path.expandvars(entry)))
+        p = Path(os.path.expanduser(_expandvars_as_worker(entry, home)))
         if not p.is_absolute():
             p = home / p
         try:
@@ -120,6 +142,15 @@ def skill_resolves(name: str, dirs: Iterable[Path]) -> bool:
                 continue
             if isinstance(fm, dict) and fm.get("name") == name:
                 return True
+    # Legacy flat ``<name>.md`` anywhere below a root (skill_view strategy 3),
+    # with the same support-path exclusion.
+    for d in dirs:
+        try:
+            for found in d.rglob(f"{leaf}.md"):
+                if found.name != "SKILL.md" and not is_skill_support_path(found):
+                    return True
+        except OSError:
+            continue
     return False
 
 
