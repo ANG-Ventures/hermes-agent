@@ -1481,8 +1481,13 @@ def _next_interval_slot(
         return None
     if period <= timedelta(0):
         return None
-    k = int((now - anchor) // period) + 1 if now >= anchor else 1
-    return (anchor + k * period).isoformat()
+    # Step in UTC (same rule as compute_next_run): aware-datetime + timedelta is
+    # wall-clock arithmetic, so across a DST fall-back the local sum lands an hour
+    # short of ``k * interval`` of real time.
+    anchor_utc = anchor.astimezone(timezone.utc)
+    now_utc = now.astimezone(timezone.utc)
+    k = int((now_utc - anchor_utc) // period) + 1 if now_utc >= anchor_utc else 1
+    return (anchor_utc + k * period).astimezone(anchor.tzinfo).isoformat()
 
 
 def _write_marker(name: str, text: str, tmp_prefix: str) -> None:
