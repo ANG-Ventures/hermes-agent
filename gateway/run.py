@@ -30573,7 +30573,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Deliver a queued response using the normal text+attachment split."""
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
-            if text_content and not _gateway_surface_passes_raw_text(source.platform):
+            if text_content and not _gateway_surface_passes_raw_text(
+                getattr(source, "platform", None)
+            ):
                 # Same defensive strip as the completed-turn path: a reply
                 # delivered under the exact-marker rule must not carry a
                 # trailing NO_REPLY line into the chat.
