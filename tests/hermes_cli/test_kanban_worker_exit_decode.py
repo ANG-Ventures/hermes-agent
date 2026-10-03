@@ -31,10 +31,12 @@ def test_native_windows_reaper_and_decode(monkeypatch):
     """Native Windows, nothing patched: ``_IS_WINDOWS`` selects the Popen-poll
     reaper and the decode runs where ``os.WIFEXITED`` does not exist, so the
     rate-limit sentinel exit is a requeue, not a crash."""
-    monkeypatch.setattr(kbd, "_live_worker_procs", {})
-    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
+    # fork: _default_spawn parks every worker Popen in kanban_db._worker_processes (all hosts)
+    # and reap_worker_zombies polls that registry; exits land in kanban_db._recent_worker_exits.
+    monkeypatch.setattr(kb, "_worker_processes", {})
+    monkeypatch.setattr(kb, "_recent_worker_exits", {})
     assert not hasattr(os, "WIFEXITED")
     proc = _spawn_exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-    kbd._live_worker_procs[proc.pid] = proc
+    kb._worker_processes[proc.pid] = proc
     assert kbd.reap_worker_zombies() == [proc.pid]
     assert kbd._classify_worker_exit(proc.pid) == ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE)
