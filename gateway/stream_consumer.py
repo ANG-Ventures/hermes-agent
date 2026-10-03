@@ -39,6 +39,7 @@ from gateway.response_filters import (
     is_autonomous_silence_response as _is_autonomous_silence_response,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
+    strip_trailing_silence_marker as _strip_trailing_silence_marker,
 )
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -1499,7 +1500,7 @@ class GatewayStreamConsumer:
                         else _is_intentional_silence_response
                     )
                     if _silence_fn(
-                        self._clean_for_display(self._accumulated)
+                        self._clean_for_silence_check(self._accumulated)
                     ):
                         self._internal_held = []
                         await self._suppress_silence_marker()
@@ -1512,7 +1513,7 @@ class GatewayStreamConsumer:
                             not self._accumulated.strip()
                             and self._internal_final_text is not None
                             and _silence_fn(
-                                self._clean_for_display(self._internal_final_text)
+                                self._clean_for_silence_check(self._internal_final_text)
                             )
                         ):
                             self._internal_held = []
@@ -1573,7 +1574,7 @@ class GatewayStreamConsumer:
                         # tick until got_done decides.
                         self.cfg.internal_event
                         or _is_partial_silence_marker(
-                            self._clean_for_display(self._accumulated)
+                            self._clean_for_silence_check(self._accumulated)
                         )
                     )
                 ):
@@ -2090,7 +2091,22 @@ class GatewayStreamConsumer:
         delivered separately via ``_deliver_media_from_response()`` after the
         stream finishes — we just need to hide the raw directives from the
         user.
+
+        A silence marker alone on the final line of an otherwise-delivered
+        reply is dropped too (``strip_trailing_silence_marker``): a human turn
+        resolves ``"note\\nNO_REPLY"`` as prose under the exact-marker rule,
+        and the control token must not be edited onto the screen.  The
+        silence predicates read :meth:`_clean_for_silence_check` instead, so
+        a reply that IS (or ends in) a marker is still judged on its raw form.
         """
+        return _strip_trailing_silence_marker(
+            _BasePlatformAdapter.strip_media_directives_for_display(text)
+        )
+
+    @staticmethod
+    def _clean_for_silence_check(text: str) -> str:
+        """``_clean_for_display`` minus the trailing-marker strip, for the
+        silence predicates (they need to see the marker to suppress on it)."""
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
     async def _send_new_chunk(

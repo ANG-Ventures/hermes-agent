@@ -28288,6 +28288,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
+                # Defensive: a reply the exact-marker rule delivers may still
+                # end in a NO_REPLY line (a human pasted an automated digest
+                # and the model answered as if the turn were internal,
+                # 2026-10-03).  The note is delivered, the token is not.
+                # Delivery-only: the transcript below keeps the raw turn.
+                if not _gateway_surface_passes_raw_text(source.platform):
+                    from gateway.response_filters import strip_trailing_silence_marker
+                    response = strip_trailing_silence_marker(response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -29618,6 +29626,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             message_id=None,
                             channel_prompt=None,
+                            # Gateway-generated recurring tick, not a human
+                            # message: same classification as the /goal
+                            # continuation above (no sender-prefix stamping,
+                            # autonomous silence rule for a "nothing changed"
+                            # note that ends in NO_REPLY).
+                            internal=True,
                         )
                         self._enqueue_fifo(quick_key, hb_event, adapter)
                     except Exception as exc:
@@ -30559,6 +30573,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Deliver a queued response using the normal text+attachment split."""
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            if text_content and not _gateway_surface_passes_raw_text(source.platform):
+                # Same defensive strip as the completed-turn path: a reply
+                # delivered under the exact-marker rule must not carry a
+                # trailing NO_REPLY line into the chat.
+                from gateway.response_filters import strip_trailing_silence_marker
+                text_content = strip_trailing_silence_marker(text_content)
             if text_content:
                 # Reconcile-by-edit first (live finding, 2026-08-16 canary):
                 # when the stream consumer delivered/sealed a message but its
