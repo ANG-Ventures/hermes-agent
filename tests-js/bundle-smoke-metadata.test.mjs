@@ -109,7 +109,10 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       expect(run('identity').status).not.toBe(0)
     }
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
-}, 15_000)
+  // fork: upstream runs JS & TS checks on ubuntu-latest-32-core; the fork pins 4-vCPU ubuntu-latest
+  // (js-tests.yml). This test spawns node 12x serially while 8 sibling checks run: measured on #1624
+  // 11.6/12.9/14.8 s green, 15.8/17.0/17.8 s red at upstream's 15 s cap (runs 37092352826..37106153435).
+}, 60_000)
 
 test('workspace admission rejects reuse and symlink escapes before creating anything outside runner temp', () => {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-paths-')))
