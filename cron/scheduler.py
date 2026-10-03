@@ -3066,6 +3066,12 @@ def _run_agent_with_watchdog(
                     break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
+                # fork: inline idle check as well (the daemon watchdog above is the guarantee when
+                # THIS loop is blocked, #94285; this keeps the limit firing from the poll loop too,
+                # tests/cron/test_scheduler.py::test_run_job_timeout_finalizes_original_session).
+                if _cron_inactivity_limit is not None and _idle_seconds() >= _cron_inactivity_limit:
+                    _inactivity_timeout = True
+                    break
     except Exception:
         _cron_pool.shutdown(wait=False, cancel_futures=True)
         raise

@@ -809,7 +809,10 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
-    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    # Fork: ``kanban.rate_limit_cooldown_seconds`` (config, default 300) is authoritative over the
+    # HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS env bridge (#655), so drive the cooldown through the resolver seam.
+    cooldown = {"seconds": 0}
+    monkeypatch.setattr(kb, "_resolve_rate_limit_cooldown_seconds", lambda: cooldown["seconds"])
 
     def spawn_via_real_boundary(task, workspace, board=None):
         kbd._restart_safe_worker_argv(task, ["hermes", "chat"])  # raises: real probe verdict, real _degrade()
@@ -831,11 +834,11 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
         assert [r["outcome"] for r in runs] == ["spawn_failed"] * 3
         assert all(json.loads(r["metadata"])["infrastructure"] is True for r in runs)
 
-        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+        cooldown["seconds"] = 300
         assert kbd.check_respawn_guard(conn, tid) == "infrastructure_cooldown"
 
         # Control: an ordinary spawn failure on the same card still spends budget.
-        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+        cooldown["seconds"] = 0
 
         def spawn_broken(task, workspace, board=None):
             raise RuntimeError("profile launcher exploded")
