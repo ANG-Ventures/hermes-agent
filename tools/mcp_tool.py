@@ -610,6 +610,14 @@ def _jittered(seconds: float) -> float:
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
+# In-flight HTTP session probe (MCPServerTask._watch_http_session). A call
+# still running after this many seconds gets one ``ping`` per interval, so a
+# server restart fails the call in about this long, not after the full tool
+# timeout. 2 s: clanker's hacr p50 is 0.09 s (1400 calls), so almost no call
+# is ever probed, and a restart surfaces "within a few seconds".
+_HTTP_INFLIGHT_PROBE_INTERVAL = 2.0
+_HTTP_INFLIGHT_PROBE_TIMEOUT = 5.0
+
 # Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
 # immediately; cancellation-resistant tasks must not hang process exit.
@@ -3019,6 +3027,71 @@ class MCPServerTask:
             if self._stdio_children_dead():
                 return
             await asyncio.sleep(0.25)
+
+    async def _watch_http_session(self, session: Any) -> BaseException:
+        """Probe the HTTP session a tool call is riding while it is in flight.
+
+        HTTP counterpart of :meth:`_watch_stdio_children`. When a
+        streamable-http server restarts mid-call, mcp 1.x drops the
+        response stream without resolving the request (no event id to
+        resume from), so the call rides the full tool timeout while holding
+        ``_rpc_lock`` and every other call to this server queues behind it.
+        Measured on clanker 2026-10-02: 300 s hang, other sessions' calls
+        queued up to 260 s. The idle keepalive cannot catch it because it
+        skips probing while an RPC is in flight.
+
+        ``session`` is the session the call was sent on. Returns an
+        exception describing the loss when (a) the server task replaced or
+        dropped that session (transport crash + reconnect), or (b) a
+        ``ping`` on it fails with a session-loss error. HTTP requests are
+        independent POSTs, so a concurrent ``ping`` is safe here (unlike
+        stdio). A slow or timed-out ping does not count as loss: a busy
+        server is not a dead one.
+        """
+        loop = asyncio.get_running_loop()
+        next_ping = loop.time() + _HTTP_INFLIGHT_PROBE_INTERVAL
+        ping_task: Optional[asyncio.Task] = None
+        ping_deadline = 0.0
+        try:
+            while True:
+                # Identity is checked every tick, even while a ping is still
+                # pending: a ping on a dead mcp 1.x session can hang for its
+                # whole timeout, but the server task swaps the session the
+                # moment the transport crashes.
+                await asyncio.sleep(0.25)
+                if self.session is not session:
+                    return ConnectionError("session replaced by a reconnect")
+                now = loop.time()
+                if ping_task is None:
+                    if self._ping_unsupported or now < next_ping:
+                        continue
+                    ping_task = asyncio.ensure_future(session.send_ping())
+                    ping_deadline = now + _HTTP_INFLIGHT_PROBE_TIMEOUT
+                    continue
+                if not ping_task.done():
+                    if now >= ping_deadline:
+                        # Slow is not dead: a busy server may queue the ping.
+                        ping_task.cancel()
+                        ping_task = None
+                        next_ping = now + _HTTP_INFLIGHT_PROBE_INTERVAL
+                    continue
+                done_task, ping_task = ping_task, None
+                next_ping = now + _HTTP_INFLIGHT_PROBE_INTERVAL
+                if done_task.cancelled():
+                    # mcp 1.x: a transport task-group crash (e.g. ConnectError
+                    # while the server is down) cancels the ping from inside.
+                    return ConnectionError("ping cancelled by transport teardown")
+                exc = done_task.exception()
+                if exc is None:
+                    continue
+                if _is_method_not_found_error(exc):
+                    self._ping_unsupported = True
+                    continue
+                if _is_session_expired_error(exc):
+                    return exc
+        finally:
+            if ping_task is not None and not ping_task.done():
+                ping_task.cancel()
 
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
@@ -6183,13 +6256,31 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"waiting {float(tool_timeout):.0f}s"
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
-                    _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # Fast-fail watcher per transport: stdio watches child
+                    # PIDs (#81995); HTTP pings the session (server restart
+                    # mid-call, t_f2e3f8d4).
+                    _is_http_fn = getattr(server, "_is_http", None)
+                    _http = callable(_is_http_fn) and _is_http_fn() is True
+                    _watch_children = getattr(
+                        server,
+                        "_watch_http_session" if _http else "_watch_stdio_children",
+                        None,
+                    )
+                    # Build the watcher coroutine ONCE: probing it with a
+                    # throwaway call leaked a never-awaited coroutine per call.
+                    _watch_coro = (
+                        None if _watch_children is None
+                        else _watch_children(server.session) if _http
+                        else _watch_children()
+                    )
                     _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        _watch_coro is not None
+                        and inspect.isawaitable(_watch_coro)
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
+                        if asyncio.iscoroutine(_watch_coro):
+                            _watch_coro.close()
                         # Stubbed sessions (MagicMock in tests) return a
                         # non-awaitable, or there is no child-watcher to race
                         # against: plain await is exactly the pre-#81995
@@ -6201,11 +6292,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     else:
                         # Fast-fail machinery (#81995): the RPC races a
-                        # stdio-children watcher so a dead subprocess fails
-                        # the call immediately instead of riding out the full
-                        # tool timeout.
+                        # transport watcher so a dead subprocess / lost HTTP
+                        # session fails the call immediately instead of
+                        # riding out the full tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_coro)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
@@ -6214,11 +6305,27 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             if watch_task in done and not rpc_task.done():
                                 rpc_task.cancel()
                                 # Same stale-session problem as the pre-call
-                                # gate above: the subprocess died mid-call but
+                                # gate above: the transport died mid-call but
                                 # nothing clears server.session, so without a
                                 # reconnect signal the server would stay dead
                                 # until the idle keepalive probe notices.
                                 _signal_reconnect(server)
+                                if _http:
+                                    _lost = watch_task.result()
+                                    # Deliberately NOT a session-expired
+                                    # marker string: the server may already
+                                    # have run the tool, so the handler must
+                                    # not auto-retry a possibly side-effecting
+                                    # call. Fail fast and let the model decide.
+                                    raise ConnectionError(
+                                        f"MCP server '{server_name}' lost the "
+                                        f"HTTP session mid-call "
+                                        f"({type(_lost).__name__}); "
+                                        f"failing fast instead of waiting "
+                                        f"{float(tool_timeout):.0f}s. Reconnect "
+                                        f"requested. The tool may or may not "
+                                        f"have run: check state before retrying"
+                                    )
                                 raise TimeoutError(
                                     f"MCP stdio subprocess for '{server_name}' "
                                     f"exited mid-call; failing the call fast "
