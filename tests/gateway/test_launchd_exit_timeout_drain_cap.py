@@ -95,10 +95,12 @@ def test_parse_exit_timeout_ignores_lookalike_keys():
 
 
 def test_service_label_from_xpc_env():
-    assert launchd_service_label({"XPC_SERVICE_NAME": "ai.hermes.gateway"}) == "ai.hermes.gateway"
-    assert launchd_service_label({"XPC_SERVICE_NAME": "0"}) is None
-    assert launchd_service_label({"XPC_SERVICE_NAME": ""}) is None
-    assert launchd_service_label({}) is None
+    # Upstream made the host platform data (``None`` off darwin); pin darwin so the
+    # fork's label mapping is exercised on Linux CI too.
+    assert launchd_service_label({"XPC_SERVICE_NAME": "ai.hermes.gateway"}, platform="darwin") == "ai.hermes.gateway"
+    assert launchd_service_label({"XPC_SERVICE_NAME": "0"}, platform="darwin") is None
+    assert launchd_service_label({"XPC_SERVICE_NAME": ""}, platform="darwin") is None
+    assert launchd_service_label({}, platform="darwin") is None
 
 
 def test_read_exit_timeout_queries_gui_domain_for_label():
@@ -110,7 +112,7 @@ def test_read_exit_timeout_queries_gui_domain_for_label():
         return subprocess.CompletedProcess(argv, 0, stdout=_PRINT_OUTPUT, stderr="")
 
     value = read_launchd_exit_timeout_s(
-        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway-aegis"}, uid=501, run=fake_run
+        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway-aegis"}, uid=501, run=fake_run, platform="darwin"
     )
     assert value == 60.0
     assert calls == [["launchctl", "print", "gui/501/ai.hermes.gateway-aegis"]]
@@ -124,7 +126,7 @@ def test_read_exit_timeout_uses_system_domain_for_root():
         return subprocess.CompletedProcess(argv, 0, stdout=_PRINT_OUTPUT, stderr="")
 
     read_launchd_exit_timeout_s(
-        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway"}, uid=0, run=fake_run
+        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway"}, uid=0, run=fake_run, platform="darwin"
     )
     assert calls == [["launchctl", "print", "system/ai.hermes.gateway"]]
 
