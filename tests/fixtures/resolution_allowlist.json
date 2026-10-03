@@ -565,6 +565,11 @@
     "kind": "bare_which"
   },
   {
+    "path": "tools/skills_hub_github.py",
+    "symbol": "GitHubAuth._try_gh_cli",
+    "kind": "bare_which"
+  },
+  {
     "path": "tools/terminal_tool_backends.py",
     "symbol": "<module>",
     "kind": "bare_which"

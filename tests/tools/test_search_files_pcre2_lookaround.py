@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from tools.file_operations import (
+from tools.file_operations_search import (
     _is_pcre2_only_syntax_error,
     _pattern_needs_pcre2,
 )
