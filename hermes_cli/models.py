@@ -158,8 +158,9 @@ def _extend_canonical_from_plugins() -> None:
             for _pp in _list_providers_for_canonical():
                 if _pp.name in known:
                     continue
-                if _pp.auth_type in {"oauth_device_code", "oauth_external", "external_process", "aws_sdk", "copilot", "vertex"}:
-                    continue  # non-api-key flows need bespoke picker UX; skip auto-inject
+                # Admission is by slug, not auth_type (upstream #102421, parity 2026-10-01): an
+                # out-of-tree external-process / OAuth profile must reach every shared picker;
+                # visibility is gated downstream by credentials (``_provider_has_credentials``).
                 _label = _pp.display_name or _pp.name
                 _desc = _pp.description or f"{_label} (direct API)"
                 entry = ProviderEntry(_pp.name, _label, _desc)

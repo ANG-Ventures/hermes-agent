@@ -464,9 +464,13 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
                                  "kanban notification dispatch failed",
                                  **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
-    if not accepted:
+    if accepted is False:
         # fork: the events are cursor-claimed and never re-queued — this buffer is the only copy. A refused
         # turn (session closing / replaced) must keep the batch, not silently eat the notification.
+        # Only an explicit False is a refusal (fork/main _restore_kanban_batch contract): a None return
+        # means "submitted" for callers/doubles that predate the boolean, and re-buffering it would
+        # duplicate an ALREADY-DELIVERED batch on the next idle turn. An exception above leaves
+        # ``accepted`` False too: _notif_submit released the turn without running it, so the batch stays.
         with session["history_lock"]:
             session["_kanban_pending"] = list(batch) + list(session.get("_kanban_pending") or [])
 
