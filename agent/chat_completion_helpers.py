@@ -7533,6 +7533,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        # A Claude bridge ``safeguard_refusal`` is terminal and must never reach
+        # another model (t_997efe88, Ace ruling 2026-10-02). The partial-stream
+        # stub below would turn it into a length continuation / content-filter
+        # fallback; re-raise it instead so the loop's exception path classifies
+        # it (content_policy_blocked, should_fallback=False) and ends the turn.
+        try:
+            from agent.error_classifier import classify_api_error as _sgr_classify, is_safeguard_refusal as _sgr_is
+            _sgr_cls = _sgr_classify(
+                result["error"],
+                provider=str(getattr(agent, "provider", "") or ""),
+                model=str(getattr(agent, "model", "") or ""),
+            )
+        except Exception:
+            _sgr_cls = None
+        if _sgr_cls is not None and _sgr_is(_sgr_cls):
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
