@@ -764,3 +764,30 @@ def test_active_pr_failed_land_request_pages_once_without_re_enqueue(tmp_path, m
     assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=3000) == 0
     assert len(calls) == 2
     assert not [a for a in calls[1:] if "enqueue" in a]
+
+
+def test_active_pr_paged_while_red_still_enqueues_once_green(tmp_path, monkeypatch):
+    """Prism #1631 7279b2c05f7a: the once-only active_pr page must not also stop
+    the land-request. Paged while red; once mergeable it is enqueued (no page),
+    and a later queue failure stays silent (the episode already paged)."""
+    import json
+
+    from gateway.kanban_watchers import _GuardStuckNotifier, _send_guard_stuck_alert
+
+    root, calls = _land_rig(tmp_path, monkeypatch)
+    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
+    red = _mergeable_hold(guarded_since=100, hold="PR has a red check", merge_state="BLOCKED")
+    assert notifier.observe([("default", red)], _send_guard_stuck_alert, now=1000) == 1
+    assert len(calls) == 1 and str(calls[0][1]).endswith("notify.py")
+    green = _mergeable_hold(guarded_since=100)
+    assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=1060) == 0
+    assert len(calls) == 2 and "enqueue" in calls[1]
+    # Pending in the queue: no second enqueue, no page.
+    assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=1120) == 0
+    assert len(calls) == 2
+    done = root / "state" / "apollo-land-queue.done"
+    done.mkdir(parents=True)
+    (done / "1-x.json").write_text(json.dumps(
+        {"repo": "ANG-Ventures/prism-router", "pr": 281, "status": "failed"}), encoding="utf-8")
+    assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=2000) == 0
+    assert len(calls) == 2

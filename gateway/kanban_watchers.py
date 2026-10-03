@@ -920,9 +920,12 @@ class _GuardStuckNotifier:
             # An active_pr episode (card + PR) pages ONCE: the hold is correct and
             # the verb does not change, so a 6h reminder restates the same page
             # (Ace r31 G: house-voice t_82169667 paged 19:02, 02:39, 08:40).
-            if last is not None and "|active_pr|pr=" in key:
+            # The land-request still runs: a PR paged while red/unfinished must
+            # be enqueued once it turns mergeable (Prism #1631 7279b2c05f7a).
+            land_only = last is not None and "|active_pr|pr=" in key
+            if land_only and not _land_candidate(item):
                 continue
-            if last is not None and now - last < self._remind:
+            if not land_only and last is not None and now - last < self._remind:
                 continue
             if time.monotonic() >= deadline:
                 break
@@ -931,6 +934,11 @@ class _GuardStuckNotifier:
             probe = dict(item)
             if land_at is not None and now - land_at < self._remind:
                 probe["land_enqueued_at"] = land_at
+            if land_only:
+                probe["land_only"] = True
+                if send(board, probe) and probe.get("land_request") == "enqueued":
+                    self._sent[land_key] = now
+                continue
             if send(board, probe):
                 if probe.get("land_request") == "enqueued":
                     # Enqueued, nobody paged: a later non-merged queue outcome
@@ -1105,12 +1113,25 @@ def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
     return True
 
 
+def _land_candidate(item: dict) -> bool:
+    """Cheap pre-check: could ``_enqueue_active_pr_land`` act on this hold?"""
+    from hermes_cli import kanban_db as kb
+
+    return (item.get("reason") in (None, "active_pr")
+            and item.get("hold") == kb.RESPAWN_GUARD_HOLD_MERGEABLE
+            and item.get("last_outcome") in _FINISHED_RUN_OUTCOMES
+            and item.get("pr_owned") is True)
+
+
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
-    """Land a finished card's mergeable PR, else page #alerts with the verb."""
+    """Land a finished card's mergeable PR, else page #alerts with the verb.
+
+    ``land_only``: the (card, PR) episode already paged; try the land-request,
+    never page again."""
     if item.get("reason") != "prior_worker_still_alive":
         enqueued = _enqueue_active_pr_land(board, item)
-        if enqueued:
-            return True
+        if enqueued or item.get("land_only"):
+            return bool(enqueued)
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
