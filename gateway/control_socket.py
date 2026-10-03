@@ -51,6 +51,7 @@ deleted.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -79,6 +80,7 @@ _MAX_UNIX_PATH = 100
 # peer can't balloon gateway memory.
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
+_HANDLER_WORKERS = 4  # concurrent control requests; more queue, they never block the loop pool
 
 _DEFAULT_CLIENT_TIMEOUT = 2.0
 
@@ -268,6 +270,22 @@ class GatewayControlServer:
         self._request_handlers: dict[
             str, Callable[[dict[str, Any]], dict[str, Any]]
         ] = dict(request_handlers or {})
+        # Handlers run on a pool of their own, never the loop's default
+        # executor: a wake handler parks its thread for up to
+        # WAKE_SERVER_TIMEOUT on a loop coroutine, and that coroutine may need
+        # the default pool itself (asyncio.to_thread in handle_message). Sharing
+        # the pool let a few concurrent wakes starve the very work they wait on
+        # (t_51b6e95f).
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def _run_handler(self, line: bytes) -> "asyncio.Future[bytes]":
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_HANDLER_WORKERS, thread_name_prefix="gw-control"
+            )
+        return asyncio.get_running_loop().run_in_executor(
+            self._executor, self.handle_request_line, line
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -340,6 +358,9 @@ class GatewayControlServer:
             with contextlib.suppress(Exception):
                 self._pipe_server.close()
             self._pipe_server = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
         self.cleanup_files()
 
     def cleanup_files(self) -> None:
@@ -424,10 +445,7 @@ class GatewayControlServer:
             # Handlers read state files from disk; keep that off the
             # gateway's event loop (the same loop drives every platform
             # adapter), so a fast-polling consumer can't stall heartbeats.
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n")
-            )
+            response = await self._run_handler(raw.rstrip(b"\n"))
             writer.write(response)
             await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, OSError):
@@ -471,9 +489,7 @@ class _PipeControlProtocol(asyncio.Protocol):
 
     async def _respond(self, line: bytes) -> None:
         try:
-            response = await asyncio.get_running_loop().run_in_executor(
-                None, self._server.handle_request_line, line
-            )
+            response = await self._server._run_handler(line)  # noqa: SLF001
             if not self._transport.is_closing():
                 self._transport.write(response)
         except Exception:

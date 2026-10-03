@@ -355,3 +355,80 @@ def test_windows_pipe_runs_request_handlers_off_the_loop():
     seen, written, loop_thread = asyncio.run(main())
     assert seen["thread"] != loop_thread
     assert json.loads(written[0])["result"] == {"delivered": "ran"}
+
+
+# -- t_51b6e95f (Prism round 2 on #1675) --------------------------------------
+
+def test_profile_route_resolved_before_participant_lookup(tmp_path, monkeypatch):
+    """No profile in the request, chat routed to coder: the lookup must search
+    coder's namespace and stamp coder, so the wake continues coder's human."""
+    store = _mux_store(tmp_path, monkeypatch)
+    coder = _profile_turn(store, HUMAN, "coder")
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._active_profile_name = lambda: "default"
+    runner._profile_name_for_source = (
+        lambda src: "coder" if src.chat_id == CHAT else None
+    )
+    result = asyncio.run(runner._deliver_control_wake(_params()))
+    assert result["delivered"] is True, result
+    src = adapter.handled[0].source
+    assert src.profile == "coder"
+    assert src.user_id == HUMAN
+    assert store.get_or_create_session(src).session_key == coder.session_key
+
+
+def test_rejected_profile_route_fails_the_wake(store):
+    from gateway.profile_routing import ProfileRouteRejected
+
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+
+    def _reject(src):
+        raise ProfileRouteRejected("r")
+
+    runner._profile_name_for_source = _reject
+    result = asyncio.run(runner._deliver_control_wake(_params()))
+    assert result["delivered"] is False
+    assert adapter.handled == []
+
+
+def test_handlers_never_run_on_the_loops_default_executor(tmp_path):
+    """A blocked handler must not occupy the default pool its coroutine needs.
+
+    Shrink the loop's default executor to ONE thread. The handler blocks on a
+    loop coroutine that itself does asyncio.to_thread (as handle_message can).
+    On the shared default pool that deadlocks until the handler's timeout.
+    """
+    import concurrent.futures as cf
+    import threading
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(cf.ThreadPoolExecutor(max_workers=1))
+        names = {}
+
+        async def needs_default_pool():
+            return await asyncio.to_thread(lambda: "pooled")
+
+        def handler(params):
+            names["handler"] = threading.current_thread().name
+            fut = asyncio.run_coroutine_threadsafe(needs_default_pool(), loop)
+            return {"v": fut.result(timeout=3)}
+
+        server = GatewayControlServer(home=tmp_path / "gw", request_handlers={"wake": handler})
+        (tmp_path / "gw").mkdir()
+        assert await server.start()
+        try:
+            from gateway.control_socket import query_gateway_control
+            reply = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
+                cf.ThreadPoolExecutor(max_workers=1),
+                lambda: query_gateway_control(tmp_path / "gw", "wake", params={}, timeout=8),
+            ), 10)
+        finally:
+            await server.stop()
+        return reply, names
+
+    reply, names = asyncio.run(scenario())
+    assert names["handler"].startswith("gw-control")
+    assert reply == {"v": "pooled"}, reply

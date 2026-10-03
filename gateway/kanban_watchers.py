@@ -1646,8 +1646,27 @@ class GatewayKanbanWatchersMixin:
         ``_push_wake`` (``sub`` = a ``kanban_notify_subs`` row) and the
         control-socket ``wake`` verb (``sub`` = the request's origin fields).
         Returns ``(source, identity)`` so callers can log an adopted identity.
+
+        With no ``profile``, the chat's ``profile_routes`` match is resolved
+        HERE and stamped on the source, so participant lookup and the eventual
+        dispatch key into the same namespace. Left unset, the lookup searched
+        the default namespace while ingress routed the wake to the route's
+        profile and keyed a participant-less phantom there (t_51b6e95f). A
+        route to an unserved profile raises ``ProfileRouteRejected``, the
+        same fail-closed outcome inbound traffic gets.
         """
         from gateway.session import SessionSource
+
+        if not profile:
+            route_profile = getattr(self, "_profile_name_for_source", None)
+            if callable(route_profile):
+                profile = route_profile(SessionSource(
+                    platform=plat,
+                    chat_id=sub["chat_id"],
+                    chat_type=str(sub.get("chat_type") or "") or "group",
+                    thread_id=sub.get("thread_id") or None,
+                    scope_id=sub.get("scope_id") or None,
+                )) or None
 
         # Rebuild the creator's real session scope from the chat_type
         # persisted on the subscription row (#56580). build_session_key()
