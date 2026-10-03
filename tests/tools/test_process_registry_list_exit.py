@@ -99,7 +99,16 @@ def _probe(root):
         assert [entry["session_id"] for entry in listed] == [owner.id]
         assert listed[0]["status"] == "exited"
         assert listed[0]["exit_code"] == 0
-        event = registry.completion_queue.get(timeout=2)
+        # List asked the live reader to finish; the reader owns the completion and publishes
+        # it on its way out (``_finish_reader`` -> ``_move_to_finished``), so the ordering fact
+        # is "the event is queued by the time the reader thread has exited". The join bound is
+        # a hang guard, not a stopwatch: the first publish pays a cold ``transform_terminal_output``
+        # hook import (~0.25 s idle; slice 7 missed a 2 s ``get(timeout=2)`` on an 8-way shard),
+        # while a reader that keeps draining the grandchild's pipe only ends with the writer's
+        # 15 s deadline, so the bound must stay below that.
+        owner._reader_thread.join(timeout=10)
+        assert not owner._reader_thread.is_alive(), "reader did not finish after list requested it"
+        event = registry.completion_queue.get_nowait()
         assert (event["session_id"], event["session_key"], event["task_id"], event["owner_task_id"]) == (
             owner.id, "owner-session", "owner-task", "owner-owner")
         assert event["exit_code"] == 0 and "owner-output" in event["output"]

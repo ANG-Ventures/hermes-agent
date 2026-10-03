@@ -27,6 +27,14 @@ def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
         raise AssertionError("timed out waiting for compute host JSON") from exc
 
 
+# Hang guard for the FIRST frame only: ``hello`` is emitted after a cold interpreter imports
+# the gateway stack (``tui_gateway.server``: ~0.9 s idle on a 24-core Linux box, ~0.5 s of it
+# ``hermes_cli.auth_constants`` shelling out to git for the version banner). A 2 s bound sits
+# inside that boot's spread on an 8-way CI shard (slice 2 red at 2 s); the frames after hello
+# come from a warm process and keep the tight bound.
+_HELLO_TIMEOUT_S = 30.0
+
+
 @pytest.mark.platforms("linux")
 def test_compute_host_line_json_hello_and_shutdown():
     repo = Path(__file__).resolve().parents[2]
@@ -45,7 +53,7 @@ def test_compute_host_line_json_hello_and_shutdown():
     assert proc.stdin is not None
     out = _stdout_queue(proc)
     try:
-        hello = _read_json_line(out)
+        hello = _read_json_line(out, timeout=_HELLO_TIMEOUT_S)
         assert hello["type"] == "hello"
         assert hello["host_pid"] == proc.pid
 
