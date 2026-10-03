@@ -548,19 +548,12 @@ def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path)
     with patch("hermes_cli.config.get_config_path", return_value=cfg):
         before = _tool_defs_cache_key(None, None, False)
         st = cfg.stat()
-        # fork (parity 2026-10-01 CI): ctime has coarse-clock granularity. On Blacksmith the write, the
-        # in-place copy2 and the utime landed in one tick, so (mtime, size, ino, ctime) was unchanged.
-        # The scenario under test is a later swap, so let the ctime clock move first.
-        import time
-        probe = tmp_path / "tick"
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            probe.write_text("x", encoding="utf-8")
-            if probe.stat().st_ctime_ns != st.st_ctime_ns:
-                break
-            time.sleep(0.005)
         other = tmp_path / "other.yaml"
         other.write_text("mcp_servers:\n  bb: {command: b}\n", encoding="utf-8")
+        # ctime ticks at the kernel's coarse clock (~4 ms): an in-place rewrite inside the tick of the
+        # cached read leaves every stat field equal. Wait until the fs clock has passed that ctime.
+        while other.stat().st_ctime_ns <= st.st_ctime_ns:
+            os.utime(other)
         shutil.copy2(other, cfg)
         os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
         assert _tool_defs_cache_key(None, None, False) != before
