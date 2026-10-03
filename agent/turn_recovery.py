@@ -46,6 +46,14 @@ from utils import base_url_host_matches
 logger = logging.getLogger("agent.conversation_loop")
 
 
+
+# A Claude bridge/relay ``safeguard_refusal`` (t_997efe88, Ace ruling 2026-10-02): another model
+# must never answer the turn, so the hint names the one recovery that is allowed.
+_SAFEGUARD_REFUSAL_RECOVERY_HINT = (
+    "safeguard_refusal: rephrase the request and retry on the same model "
+    "(do not switch model)."
+)
+
 def _runtime_uses_ascii_encoding() -> bool:
     """Return whether the process genuinely needs an ASCII-only request fallback."""
     encoding = locale.getpreferredencoding(False).strip().lower().replace("_", "-")
@@ -1060,6 +1068,24 @@ def nonretryable_client_error_result(
     else:
         agent._persist_session(messages, conversation_history)
     if classified.reason == FailoverReason.content_policy_blocked:
+        from agent.error_classifier import is_safeguard_refusal as _is_sgr
+        if _is_sgr(classified):
+            # A Claude bridge/relay ``safeguard_refusal`` (t_997efe88, #1660): another model must
+            # never answer the turn, so the copy names the one allowed recovery, and kanban
+            # workers park the card needs_input on it (hermes_cli/kanban_worker_exit.py).
+            _policy_result = _content_policy_blocked_result(
+                messages, api_call_count,
+                final_response=(
+                    "⚠️  The model provider's safety filter blocked this request "
+                    "(not a Hermes/gateway failure).\n\n"
+                    f"Provider message: {_nonretryable_summary}\n\n"
+                    f"{_SAFEGUARD_REFUSAL_RECOVERY_HINT}"
+                ),
+                error_detail=_nonretryable_summary,
+            )
+            _policy_result["failure_reason"] = classified.reason.value
+            _policy_result["error_code"] = "safeguard_refusal"
+            return _policy_result
         return _content_policy_blocked_result(
             messages, api_call_count,
             final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),

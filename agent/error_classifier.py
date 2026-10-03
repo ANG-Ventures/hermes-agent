@@ -1037,6 +1037,15 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     welcome = _nous_welcome_tier(c)
     if welcome is not None:
         return welcome
+    # Claude bridge / relay lanes (claude-bpx, claude-bpr) egress a safeguard refusal as HTTP 400
+    # with the machine code ``safeguard_refusal`` (sdk lane: ``error.error_code``; tui lane:
+    # ``error.code``). Ace ruling 2026-10-02 (t_997efe88, #1660): a refused turn is NEVER answered
+    # by another model (no fallback-chain walk, no retry) and the refusal surfaces in the chat that
+    # owns the turn. Without this it fell to the generic-400 format_error bucket with
+    # should_fallback=True, i.e. a silent client-side model switch.
+    if _is_safeguard_refusal(c.error_code, c.body):
+        return _v(_R.content_policy_blocked, retryable=False, should_fallback=False,
+                  error_context={"error_code": SAFEGUARD_REFUSAL_ERROR_CODE})
     # Safety refusal before status classification so a 400 block isn't downgraded
     # to format_error and a status-less block isn't left retryable (#18028).
     if any(p in msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
@@ -1727,6 +1736,37 @@ def _code_from_payload(payload: Any, top_keys: Sequence[str], peek_message: bool
     code = next((payload.get(k) for k in top_keys if payload.get(k)), "")
     text = str(code).strip() if isinstance(code, (str, int)) else ""
     return text if text and text != "400" else ""
+
+
+SAFEGUARD_REFUSAL_ERROR_CODE = "safeguard_refusal"
+
+
+def _is_safeguard_refusal(error_code: str, body) -> bool:
+    """True for a bridge/relay ``safeguard_refusal`` (t_997efe88).
+
+    ``_extract_error_code`` prefers ``error.code``/``error.type``, so the sdk lane's
+    ``error.error_code`` (beside ``type: invalid_request_error``) is read here directly.
+    """
+    if (error_code or "").strip().lower() == SAFEGUARD_REFUSAL_ERROR_CODE:
+        return True
+    if not isinstance(body, dict):
+        return False
+    # Both shapes: the HTTP envelope ``{"error": {...}}`` and the unwrapped error object some SDKs
+    # expose as ``exc.body`` (``{"type": ..., "error_code": ...}``).
+    for obj in (body.get("error"), body):
+        if not isinstance(obj, dict):
+            continue
+        for key in ("error_code", "code"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip().lower() == SAFEGUARD_REFUSAL_ERROR_CODE:
+                return True
+    return False
+
+
+def is_safeguard_refusal(classified) -> bool:
+    """Whether a ClassifiedError is a bridge safeguard refusal (never switch model)."""
+    ctx = getattr(classified, "error_context", None) or {}
+    return ctx.get("error_code") == SAFEGUARD_REFUSAL_ERROR_CODE
 
 
 def _extract_error_code(body: dict) -> str:

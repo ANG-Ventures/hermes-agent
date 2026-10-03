@@ -59,6 +59,7 @@ from agent.turn_iteration_prep import (
     prepare_iteration,
 )
 from agent.turn_loop_errors import handle_outer_loop_error
+from agent.turn_recovery import _SAFEGUARD_REFUSAL_RECOVERY_HINT  # noqa: F401  (re-export; #1660 test reads it here)
 from agent.turn_preflight_gate import run_preflight_gate
 from agent.turn_request_assembly import assemble_api_request
 from agent.turn_response_check import check_api_response

@@ -6116,6 +6116,21 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
+            # A Claude bridge ``safeguard_refusal`` is terminal and must never reach another model
+            # (t_997efe88, #1660). The partial-stream stub below would turn it into a length
+            # continuation / content-filter fallback; re-raise it so the loop's exception path
+            # classifies it (content_policy_blocked, should_fallback=False) and ends the turn.
+            try:
+                from agent.error_classifier import classify_api_error as _sgr_classify, is_safeguard_refusal as _sgr_is
+                _sgr_cls = _sgr_classify(
+                    self.result["error"],
+                    provider=str(getattr(self.agent, "provider", "") or ""),
+                    model=str(getattr(self.agent, "model", "") or ""),
+                )
+            except Exception:
+                _sgr_cls = None
+            if _sgr_cls is not None and _sgr_is(_sgr_cls):
+                raise self.result["error"]
             if self.deltas_were_sent["yes"]:
                 return self._partial_stream_stub()
             raise self.result["error"]
