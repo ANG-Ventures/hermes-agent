@@ -250,3 +250,108 @@ def test_query_without_params_is_unchanged_for_observation_verbs(tmp_path):
     server = GatewayControlServer(home=tmp_path, verb_handlers={"status": lambda: {"x": 1}})
     raw = json.dumps({"verb": "status"}).encode()
     assert json.loads(server.handle_request_line(raw).decode())["result"] == {"x": 1}
+
+
+# -- t_51b6e95f (Prism round 1 on #1675) --------------------------------------
+
+def _mux_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    s = SessionStore(sessions_dir=tmp_path / "sessions",
+                     config=GatewayConfig(multiplex_profiles=True))
+    s._db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(SessionStore, "_active_profile_name",
+                        staticmethod(lambda: "default"))
+    return s
+
+
+def _profile_turn(store, user_id, profile=None):
+    return store.get_or_create_session(
+        SessionSource(platform=Platform.DISCORD, chat_id=CHAT, chat_type="group",
+                      user_id=user_id, profile=profile)
+    )
+
+
+def _mux_runner(store, adapter):
+    runner = _runner(store, RecordingAdapter())
+    runner._profile_adapters = {"coder": {Platform.DISCORD: adapter}}
+    runner._active_profile_name = lambda: "default"
+    return runner
+
+
+def test_wake_identity_ignores_other_profiles_participants(tmp_path, monkeypatch):
+    """Two profiles, two humans, one channel: the coder wake adopts coder's human."""
+    store = _mux_store(tmp_path, monkeypatch)
+    _profile_turn(store, OTHER)                     # default profile's human
+    coder = _profile_turn(store, HUMAN, "coder")
+    assert coder.session_key.startswith("agent:coder:")
+    adapter = RecordingAdapter()
+    result = asyncio.run(
+        _mux_runner(store, adapter)._deliver_control_wake(_params(profile="coder"))
+    )
+    assert result["delivered"] is True, result
+    src = adapter.handled[0].source
+    assert src.user_id == HUMAN
+    assert store.get_or_create_session(src).session_key == coder.session_key
+
+
+def test_wake_never_adopts_another_profiles_participant(tmp_path, monkeypatch):
+    store = _mux_store(tmp_path, monkeypatch)
+    _profile_turn(store, OTHER)                     # only default has evidence
+    adapter = RecordingAdapter()
+    result = asyncio.run(
+        _mux_runner(store, adapter)._deliver_control_wake(_params(profile="coder"))
+    )
+    assert result["delivered"] is True, result
+    assert adapter.handled[0].source.user_id is None
+
+
+class _PipeTransport:
+    def __init__(self) -> None:
+        self.written: list = []
+        self.closed = asyncio.Event()
+
+    def write(self, data):
+        self.written.append(data)
+
+    def is_closing(self):
+        return self.closed.is_set()
+
+    def close(self):
+        self.closed.set()
+
+
+def test_windows_pipe_runs_request_handlers_off_the_loop():
+    """The pipe protocol must not call a (possibly blocking) handler on the loop.
+
+    The handler is the wake shape: it schedules a coroutine on the gateway
+    loop and blocks for its result. Inline on the loop thread that deadlocks
+    and freezes the loop until the timeout.
+    """
+    import threading
+    from gateway.control_socket import _PipeControlProtocol
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        seen = {}
+
+        async def on_loop():
+            return "ran"
+
+        def handler(params):
+            seen["thread"] = threading.get_ident()
+            fut = asyncio.run_coroutine_threadsafe(on_loop(), loop)
+            return {"delivered": fut.result(timeout=2)}
+
+        server = GatewayControlServer(Path("/nonexistent"), request_handlers={"wake": handler})
+        proto = _PipeControlProtocol(server)
+        transport = _PipeTransport()
+        proto.connection_made(transport)
+        proto.data_received(json.dumps({"verb": "wake", "params": {}}).encode() + b"\n")
+        await asyncio.wait_for(transport.closed.wait(), 5)
+        return seen, transport.written, threading.get_ident()
+
+    seen, written, loop_thread = asyncio.run(main())
+    assert seen["thread"] != loop_thread
+    assert json.loads(written[0])["result"] == {"delivered": "ran"}

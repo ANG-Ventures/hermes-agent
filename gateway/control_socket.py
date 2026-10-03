@@ -440,26 +440,46 @@ class GatewayControlServer:
 
 
 class _PipeControlProtocol(asyncio.Protocol):
-    """One-shot request/response protocol for the Windows named pipe."""
+    """One-shot request/response protocol for the Windows named pipe.
+
+    Protocol callbacks run ON the gateway event loop. The request is handed
+    to the executor exactly like the POSIX ``_handle_connection`` path:
+    request handlers may block (``wake`` waits on a coroutine it schedules on
+    this very loop), and running one inline would freeze every adapter for
+    the length of that wait and deadlock the wake itself (t_51b6e95f).
+    """
 
     def __init__(self, server: GatewayControlServer) -> None:
         self._server = server
         self._transport: Any = None
         self._buffer = bytearray()
+        self._task: Optional[asyncio.Task] = None
 
     def connection_made(self, transport) -> None:  # pragma: no cover - windows
         self._transport = transport
 
-    def data_received(self, data: bytes) -> None:  # pragma: no cover - windows
+    def data_received(self, data: bytes) -> None:
+        if self._task is not None:
+            return  # one request per connection; already dispatched
         self._buffer.extend(data)
         if len(self._buffer) > _MAX_REQUEST_BYTES:
             self._transport.close()
             return
         if b"\n" in self._buffer:
             line, _, _ = bytes(self._buffer).partition(b"\n")
-            try:
-                self._transport.write(self._server.handle_request_line(line))
-            finally:
+            self._task = asyncio.get_running_loop().create_task(self._respond(line))
+
+    async def _respond(self, line: bytes) -> None:
+        try:
+            response = await asyncio.get_running_loop().run_in_executor(
+                None, self._server.handle_request_line, line
+            )
+            if not self._transport.is_closing():
+                self._transport.write(response)
+        except Exception:
+            logger.debug("Control pipe request handler error", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
                 self._transport.close()
 
 

@@ -1451,6 +1451,7 @@ class GatewayKanbanWatchersMixin:
         self, platform: Any, chat_id: str, thread_id: Optional[str] = None,
         chat_type: Optional[str] = None,
         creator_session_key: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> set[_WakeRoutingIdentity]:
         """Complete identities the gateway has resolved for this chat.
 
@@ -1478,6 +1479,14 @@ class GatewayKanbanWatchersMixin:
         The key's own shape is the honest test — reading config flags would
         ignore ``thread_sessions_per_user`` and the DM/thread branches of
         ``build_session_key``.
+
+        * the entry's key must sit in the namespace the wake will key into
+          (``profile``; ``agent:main`` for the default). In a multiplexed
+          gateway two profiles can hold different participants in one chat;
+          another profile's participant is not evidence for this one, and
+          counting it turns a single real match into a 2-way refusal or adopts
+          a foreign identity (t_51b6e95f). With multiplexing off every key is
+          ``agent:main`` and nothing is filtered.
 
         Returns complete ``(user_id, user_id_alt, scope_id)`` tuples rather than
         participant strings so alternate ids and Slack workspace scope cannot be
@@ -1510,6 +1519,22 @@ class GatewayKanbanWatchersMixin:
             thread_id=want_thread,
         )
         want_creator_key = str(creator_session_key or "")
+        want_ns_prefix = ""
+        resolve_key_profile = getattr(store, "_resolve_profile_for_key", None)
+        try:
+            from gateway.session import SessionSource, _session_key_namespace
+            key_profile = resolve_key_profile(
+                SessionSource(platform=platform, chat_id=want_chat,
+                              profile=profile or None)
+            ) if callable(resolve_key_profile) else None
+            if key_profile is not None:
+                want_ns_prefix = _session_key_namespace(key_profile) + ":"
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: profile namespace unresolved for %s/%s: %s",
+                platform_value, want_chat, exc,
+            )
+            return set()
         found: set[_WakeRoutingIdentity] = set()
         try:
             with store._lock:  # noqa: SLF001 -- documented private access
@@ -1537,6 +1562,8 @@ class GatewayKanbanWatchersMixin:
         #   refuses on 0 or >1 participants.
         creator_is_key = creator_stamp_is_session_key(want_creator_key)
         for key, entry in entries.items():
+            if want_ns_prefix and not str(key).startswith(want_ns_prefix):
+                continue
             is_creator = bool(want_creator_key) and (
                 str(key) == want_creator_key
                 if creator_is_key
@@ -1659,6 +1686,7 @@ class GatewayKanbanWatchersMixin:
                 sub.get("thread_id") or None,
                 chat_type,
                 creator_session_key,
+                profile,
             ),
         )
         source = SessionSource(

@@ -41087,6 +41087,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         def _wake_handler(params: dict) -> dict:
             from gateway.control_socket import WAKE_SERVER_TIMEOUT
 
+            try:
+                _on_loop = asyncio.get_running_loop() is _main_loop
+            except RuntimeError:
+                _on_loop = False
+            if _on_loop:
+                # Waiting below on the loop's own thread would block every
+                # adapter and deadlock the wake (t_51b6e95f). Transports must
+                # call request handlers from an executor thread.
+                return {
+                    "delivered": False,
+                    "error": "wake handler called on the gateway loop thread",
+                }
             fut = asyncio.run_coroutine_threadsafe(
                 runner._deliver_control_wake(params), _main_loop
             )
