@@ -308,6 +308,15 @@ class DispatchResult:
     stranded_by_mount_loss: list[str] = field(default_factory=list)
     workspace_refused: list[tuple[str, str]] = field(default_factory=list)
     """Mount or persisted-workspace failures, refused BEFORE claiming a run."""
+    skill_refused: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(task_id, missing_skills)`` for cards blocked BEFORE claiming a run
+    because NO skill the worker would be given resolves for the assignee
+    profile (the worker would exit ``Unknown skill(s)`` at startup). See
+    :func:`_card_skills_refused`."""
+    skill_degraded: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(task_id, missing_skills)`` for cards dispatched although SOME card
+    skill does not resolve: the worker loads the rest and skips these with a
+    warning, so the dispatcher comments on the card instead of blocking it."""
     spawn_failed: list[str] = field(default_factory=list)
     """Task ids whose spawn attempt failed THIS tick — recorded on every
     failure (workspace resolution or worker launch), whether or not it was
@@ -4758,6 +4767,8 @@ def _dispatch_once_locked(
                     "dispatch continues",
                     row["id"],
                 )
+        if _kb._card_skills_refused(conn, row["id"], row_assignee, result, dry_run=dry_run):
+            continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
         if dry_run:
@@ -5010,6 +5021,8 @@ def _dispatch_once_locked(
             continue
         deferred, fallback_selection = provider_admission(row["id"], row["assignee"])
         if deferred:
+            continue
+        if _kb._card_skills_refused(conn, row["id"], row["assignee"], result, dry_run=dry_run):
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
