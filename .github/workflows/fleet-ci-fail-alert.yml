@@ -301,6 +301,21 @@ jobs:
               fi
             fi
           fi
+          # MERGED-ANYWAY (t_4e93bc97). A stacked queue merges PR A together with a
+          # later group B that contains it, so A can land while A's own group run
+          # is red (hermes-agent#1652, 2026-10-03: run 37099128739 red on a uv
+          # install timeout, #1658's group 37099129489 green, both merged
+          # 05:21:44Z, and the page "PR #1652 ejected" went out at 05:22:17).
+          # A red whose PR is already merged ejected nothing: it goes to #logs.
+          # Any API error keeps the page (fail loud).
+          if [ "$ROUTE" = alerts ] && [ -n "$PR_NUM" ]; then
+            MERGED="$(api "pulls/$PR_NUM" | jq -r '.merged // false')" || MERGED=error
+            if [ "$MERGED" = true ]; then
+              ROUTE=logs; CARD="merged-anyway"; echo "no page: PR #$PR_NUM already merged; nothing was ejected -> #logs"
+            elif [ "$MERGED" = error ]; then
+              echo "::warning::merged lookup for PR #$PR_NUM failed; paging"
+            fi
+          fi
           # PLACEMENT PROBE (t_c58e7200). ci-placement-probe.yml is dispatched by
           # p4_bench.py inside a bench window, and each wave is graded by
           # p4_gates.py; the nightly bench cron pages #alerts + files a card on a
@@ -340,6 +355,7 @@ jobs:
           if [ -n "$PR_NUM" ]; then
             SUMMARY="PR #$PR_NUM ejected from the merge queue: ${SIG:-failing job unknown}"
             [ -n "$FOLD_RUN" ] && SUMMARY="PR #$PR_NUM ejected on an already-red test (also failed run $FOLD_RUN): $SIG"
+            [ "$CARD" = merged-anyway ] && SUMMARY="PR #$PR_NUM merged anyway; its own queue run was red: ${SIG:-failing job unknown}"
             [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
           elif [ -n "$FOLD_RUN" ]; then
             SUMMARY="main red on an already-red test (also failed run $FOLD_RUN): $SIG"

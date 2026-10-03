@@ -127,6 +127,25 @@ def test_repo_wide_scanner_rides_every_narrowed_selection(repo: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "walk",
+    ["ROOT.glob('tests/**/*.py')", "ROOT.glob(\"**/*.py\")", "ROOT.glob(f'{SUB}/**/x.py')"],
+)
+def test_prefixed_recursive_glob_is_a_repo_scanner(repo: Path, walk: str) -> None:
+    # Prism P1 on #1658: a recursive glob with a directory prefix was missed.
+    _write(
+        repo,
+        "tests/test_glob_ratchet.py",
+        "from pathlib import Path\n"
+        "ROOT = Path(__file__).resolve().parents[1]\n"
+        "SUB = 'tests'\n"
+        f"def test_scan():\n    assert list({walk})\n",
+    )
+    selected = _select(repo, "pkg/other.py")
+    assert selected is not None
+    assert "tests/test_glob_ratchet.py" in selected
+
+
+@pytest.mark.parametrize(
     "changed",
     [
         ["tests/conftest.py"],
