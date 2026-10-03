@@ -10,13 +10,18 @@ gateway process creates at startup and removes on clean shutdown, answering
 versioned JSON verbs. A connectable socket with a well-formed ``identify``
 answer IS liveness — no PID-reuse heuristics.
 
-v1 verbs (observation only — no behavior change for the gateway):
+v1 verbs (observation; ``pause-for-update`` and ``wake`` are the only
+actuators, wired by gateway/run.py):
 
 - ``identify`` → pid, profile label, hermes_home, code_sha/code_version
   (the #91283 stamps, now queryable live), supervisor kind, served profiles,
   start_time, protocol version.
 - ``status``   → the live runtime-status payload (what ``gateway_state.json``
   holds today, but answered by the process itself, race-free).
+- ``wake``     → start an agent turn in a chat this gateway serves (request
+  ``params``: platform, chat_id, thread_id, chat_type, user_id, profile,
+  text). Same routing as the kanban notifier's wake; answers
+  ``{"delivered": bool, "error": str}`` synchronously.
 
 Transport:
 
@@ -46,6 +51,7 @@ deleted.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -74,6 +80,7 @@ _MAX_UNIX_PATH = 100
 # peer can't balloon gateway memory.
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
+_HANDLER_WORKERS = 4  # concurrent control requests; more queue, they never block the loop pool
 
 _DEFAULT_CLIENT_TIMEOUT = 2.0
 
@@ -238,6 +245,9 @@ class GatewayControlServer:
         home: Optional[Path] = None,
         *,
         verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        request_handlers: Optional[
+            dict[str, Callable[[dict[str, Any]], dict[str, Any]]]
+        ] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -254,6 +264,28 @@ class GatewayControlServer:
         }
         if verb_handlers:
             self._handlers.update(verb_handlers)
+        # Verbs that need the request body (e.g. ``wake``) receive the
+        # request's ``params`` object. Kept separate from ``verb_handlers`` so
+        # the zero-arg observation verbs keep their signature.
+        self._request_handlers: dict[
+            str, Callable[[dict[str, Any]], dict[str, Any]]
+        ] = dict(request_handlers or {})
+        # Handlers run on a pool of their own, never the loop's default
+        # executor: a wake handler parks its thread for up to
+        # WAKE_SERVER_TIMEOUT on a loop coroutine, and that coroutine may need
+        # the default pool itself (asyncio.to_thread in handle_message). Sharing
+        # the pool let a few concurrent wakes starve the very work they wait on
+        # (t_51b6e95f).
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def _run_handler(self, line: bytes) -> "asyncio.Future[bytes]":
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_HANDLER_WORKERS, thread_name_prefix="gw-control"
+            )
+        return asyncio.get_running_loop().run_in_executor(
+            self._executor, self.handle_request_line, line
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -326,6 +358,9 @@ class GatewayControlServer:
             with contextlib.suppress(Exception):
                 self._pipe_server.close()
             self._pipe_server = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
         self.cleanup_files()
 
     def cleanup_files(self) -> None:
@@ -353,12 +388,28 @@ class GatewayControlServer:
             request_id = request.get("id")
             verb = request.get("verb")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
-            if handler is None:
+            request_handler = (
+                self._request_handlers.get(verb) if isinstance(verb, str) else None
+            )
+            if request_handler is not None:
+                params = request.get("params")
+                if params is None:
+                    params = {}
+                if not isinstance(params, dict):
+                    raise ValueError("params must be a JSON object")
                 response: dict[str, Any] = {
+                    "ok": True,
+                    "protocol": CONTROL_PROTOCOL_VERSION,
+                    "result": request_handler(params),
+                }
+            elif handler is None:
+                response = {
                     "ok": False,
                     "error": f"unknown verb: {verb!r}",
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "supported_verbs": sorted(self._handlers),
+                    "supported_verbs": sorted(
+                        set(self._handlers) | set(self._request_handlers)
+                    ),
                 }
             else:
                 response = {
@@ -394,10 +445,7 @@ class GatewayControlServer:
             # Handlers read state files from disk; keep that off the
             # gateway's event loop (the same loop drives every platform
             # adapter), so a fast-polling consumer can't stall heartbeats.
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n")
-            )
+            response = await self._run_handler(raw.rstrip(b"\n"))
             writer.write(response)
             await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, OSError):
@@ -410,26 +458,44 @@ class GatewayControlServer:
 
 
 class _PipeControlProtocol(asyncio.Protocol):
-    """One-shot request/response protocol for the Windows named pipe."""
+    """One-shot request/response protocol for the Windows named pipe.
+
+    Protocol callbacks run ON the gateway event loop. The request is handed
+    to the executor exactly like the POSIX ``_handle_connection`` path:
+    request handlers may block (``wake`` waits on a coroutine it schedules on
+    this very loop), and running one inline would freeze every adapter for
+    the length of that wait and deadlock the wake itself (t_51b6e95f).
+    """
 
     def __init__(self, server: GatewayControlServer) -> None:
         self._server = server
         self._transport: Any = None
         self._buffer = bytearray()
+        self._task: Optional[asyncio.Task] = None
 
     def connection_made(self, transport) -> None:  # pragma: no cover - windows
         self._transport = transport
 
-    def data_received(self, data: bytes) -> None:  # pragma: no cover - windows
+    def data_received(self, data: bytes) -> None:
+        if self._task is not None:
+            return  # one request per connection; already dispatched
         self._buffer.extend(data)
         if len(self._buffer) > _MAX_REQUEST_BYTES:
             self._transport.close()
             return
         if b"\n" in self._buffer:
             line, _, _ = bytes(self._buffer).partition(b"\n")
-            try:
-                self._transport.write(self._server.handle_request_line(line))
-            finally:
+            self._task = asyncio.get_running_loop().create_task(self._respond(line))
+
+    async def _respond(self, line: bytes) -> None:
+        try:
+            response = await self._server._run_handler(line)  # noqa: SLF001
+            if not self._transport.is_closing():
+                self._transport.write(response)
+        except Exception:
+            logger.debug("Control pipe request handler error", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
                 self._transport.close()
 
 
@@ -442,19 +508,24 @@ def query_gateway_control(
     verb: str,
     *,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+    params: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
+
+    ``params`` is sent as the request's ``params`` object (request-aware verbs
+    such as ``wake``).
 
     Returns the verb's ``result`` payload on success. Any failure — no
     socket, stale socket nobody accepts on, timeout, malformed answer,
     ``ok: false`` — returns None so callers fall back to the scan layer.
     Never raises.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
+    body: dict[str, Any] = {
+        "verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION,
+    }
+    if params is not None:
+        body["params"] = params
+    request = json.dumps(body).encode("utf-8") + b"\n"
     try:
         if _IS_WINDOWS:
             raw = _query_windows_pipe(Path(home), request, timeout)
@@ -558,3 +629,49 @@ def pause_gateway_for_update(
     exactly as before this verb existed.
     """
     return query_gateway_control(home, "pause-for-update", timeout=timeout)
+
+
+# Wake budget: the gateway resolves the adapter and hands the synthetic event
+# to ``adapter.handle_message`` (which returns once the turn is dispatched);
+# the non-push (api_server) self-post can take longer, so the client waits a
+# little past the server's own deadline.
+WAKE_SERVER_TIMEOUT = 20.0
+WAKE_CLIENT_TIMEOUT = WAKE_SERVER_TIMEOUT + 5.0
+
+
+def wake_gateway_session(
+    home: Path,
+    *,
+    platform: str,
+    chat_id: str,
+    text: str,
+    chat_type: str,
+    thread_id: str = "",
+    user_id: str = "",
+    user_id_alt: str = "",
+    scope_id: str = "",
+    profile: str = "",
+    timeout: float = WAKE_CLIENT_TIMEOUT,
+) -> Optional[dict[str, Any]]:
+    """Start an agent turn in a chat served by the gateway at ``home``.
+
+    Returns the gateway's answer ``{"delivered": bool, "error": str, ...}``,
+    or None when no gateway answers the ``wake`` verb (no socket, older
+    gateway) so the caller can use its fallback path.
+    """
+    return query_gateway_control(
+        home,
+        "wake",
+        timeout=timeout,
+        params={
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "chat_type": chat_type,
+            "user_id": user_id,
+            "user_id_alt": user_id_alt,
+            "scope_id": scope_id,
+            "profile": profile,
+            "text": text,
+        },
+    )
