@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 COALESCE_SECONDS = 600.0
 FIRST_RUN_LOOKBACK_SECONDS = 600
 PENDING_MAX_AGE_SECONDS = 3600.0
+ROW_RETRY_LIMIT = 10  # ~10 ticks: a row that keeps failing to classify is skipped, loudly
 SCAN_LIMIT = 500
 REASON_MAX = 1500
 DEFAULT_OWNER_PROFILES = ("default", "aegis")
@@ -95,6 +96,11 @@ _RED_CONCLUSIONS = frozenset({
 })
 
 PrHealthFn = Callable[[str, int], Optional[dict]]
+
+
+class PrHealthUnknown(RuntimeError):
+    """A fleet PR's health could not be read (timeout, rate limit). The event is
+    retried on later ticks, not consumed as a green handback (Prism P1)."""
 
 
 # --- pure classification ----------------------------------------------------
@@ -245,6 +251,8 @@ def handback_pr_state(kb: Any, conn: Any, task: dict, payload: Optional[dict],
                 memo[key] = pr_health(ref.repo, int(ref.number))
             except Exception:
                 memo[key] = None
+        if memo[key] is None:
+            raise PrHealthUnknown(f"{ref.repo}#{ref.number}")
         bad = pr_is_red_or_dirty(memo[key])
         if bad:
             states.append(f"{ref.repo}#{ref.number} {bad}")
@@ -277,6 +285,7 @@ class WakeState:
         self.cursors: dict[str, int] = {}
         self.pending: dict[str, dict] = {}   # "board|task" -> card dict
         self.last_wake: dict[str, float] = {}
+        self.row_failures: dict[str, int] = {}  # "board|event" -> failed classifications
         self._load()
 
     def _load(self) -> None:
@@ -298,7 +307,14 @@ class WakeState:
             fd, tmp = tempfile.mkstemp(prefix=".owner-wake-", dir=str(self.path.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            dfd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         except OSError as exc:
             logger.warning("kanban owner-wake: cannot persist state %s: %s", self.path, exc)
 
@@ -386,18 +402,33 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
                 (cursor, *SCAN_KINDS, SCAN_LIMIT),
             ).fetchall()
             for r in rows:
+                # The cursor moves past a row only once it is classified and
+                # queued; a failure leaves it for the next tick (Prism P1).
+                fkey = f"{slug}|{r['id']}"
+                try:
+                    item = _classify_row(kb, conn, r, pr_health, memo)
+                except Exception as exc:
+                    n = state.row_failures.get(fkey, 0) + 1
+                    state.row_failures[fkey] = n
+                    if n < ROW_RETRY_LIMIT:
+                        logger.warning("kanban owner-wake: event %s on %s failed to classify "
+                                       "(%s); retrying next tick", r["id"], slug, exc)
+                        break
+                    logger.warning("kanban owner-wake: event %s on %s failed %d times (%s); "
+                                   "skipping it", r["id"], slug, n, exc)
+                    item = None
+                state.row_failures.pop(fkey, None)
+                if item is not None:
+                    item["queued_at"] = now
+                    key = f"{slug}|{r['task_id']}"
+                    card = state.pending.setdefault(key, {
+                        "board": slug, "task_id": r["task_id"], "home_sid": r["home_sid"] or "",
+                        "title": r["title"] or "", "items": [],
+                    })
+                    card["home_sid"] = r["home_sid"] or card.get("home_sid") or ""
+                    card["items"].append(item)
+                    queued += 1
                 state.cursors[slug] = max(state.cursors[slug], int(r["id"]))
-                item = _classify_row(kb, conn, r, pr_health, memo)
-                if item is None:
-                    continue
-                key = f"{slug}|{r['task_id']}"
-                card = state.pending.setdefault(key, {
-                    "board": slug, "task_id": r["task_id"], "home_sid": r["home_sid"] or "",
-                    "title": r["title"] or "", "items": [], "first_at": now,
-                })
-                card["home_sid"] = r["home_sid"] or card.get("home_sid") or ""
-                card["items"].append(item)
-                queued += 1
             # A busy board drains over several ticks, LIMIT rows at a time.
         except Exception as exc:
             logger.warning("kanban owner-wake: scan of board %s failed: %s", slug, exc)
@@ -443,6 +474,21 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
 # --- owner resolution + delivery (event loop) -------------------------------
 
 
+def read_card(kb: Any, board: str, task_id: str) -> Optional[dict]:
+    """Current ``{session_id, body, title}`` of a card, or None if it is gone.
+
+    Read at DELIVERY time: a held event must follow a re-homed card and honour a
+    ``wake: off`` added after it was queued (Prism P1s)."""
+    conn = kb.connect_readonly(board=board)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT session_id, body, title FROM tasks WHERE id = ?",
+                           (task_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
 def resolve_owner(store: Any, home_sid: str, read_row: Callable[[str], Optional[dict]]):
     """The live session-store entry that owns a card, or None.
 
@@ -471,8 +517,14 @@ def is_chat_origin(entry: Any) -> bool:
     return plat.lower() not in _NON_CHAT_PLATFORMS
 
 
-def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any) -> bool:
-    """A notify+wake / wake sub on the owner's own chat already wakes it."""
+def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -> bool:
+    """A notify+wake / wake sub already wakes the OWNER's session for this card.
+
+    Only a sub that positively names the owner (same platform, chat, thread,
+    participant and notifier profile) counts. A sub naming another participant
+    wakes that participant's session, and an identity-less sub resolves at wake
+    time; neither proves the owner was woken, so the owner wake stays (a
+    duplicate turn is the safe failure, a lost one is not)."""
     try:
         conn = kb.connect_readonly(board=board)
     except Exception:
@@ -480,20 +532,35 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any) -> bool:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT platform, chat_id, delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ?",
             (task_id,),
         ).fetchall()
     except Exception:
         return False
     finally:
         conn.close()
-    plat = str(getattr(getattr(origin, "platform", None), "value", "")).lower()
-    chat = str(getattr(origin, "chat_id", "") or "")
-    return any(
-        str(r["delivery_mode"] or "") in ("notify+wake", "wake")
-        and str(r["platform"] or "").lower() == plat and str(r["chat_id"] or "") == chat
-        for r in rows
-    )
+    def _s(v: Any) -> str:
+        return str(v or "").strip()
+
+    plat = _s(getattr(getattr(origin, "platform", None), "value", "")).lower()
+    chat = _s(getattr(origin, "chat_id", ""))
+    thread = _s(getattr(origin, "thread_id", ""))
+    if thread == chat:
+        thread = ""
+    who = {_s(getattr(origin, "user_id", "")), _s(getattr(origin, "user_id_alt", ""))} - {""}
+    for r in rows:
+        r = dict(r)
+        if _s(r.get("delivery_mode")) not in ("notify+wake", "wake"):
+            continue
+        sub_thread = _s(r.get("thread_id"))
+        if sub_thread == chat:
+            sub_thread = ""
+        sub_who = {_s(r.get("user_id")), _s(r.get("user_id_alt"))} - {""}
+        if (_s(r.get("platform")).lower() == plat and _s(r.get("chat_id")) == chat
+                and sub_thread == thread and sub_who and sub_who & who
+                and (_s(r.get("notifier_profile")) or "default") == (profile or "default")):
+            return True
+    return False
 
 
 async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
@@ -513,8 +580,11 @@ async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
         metadata={
             "kanban_owner_wake": True,
             "gateway_session_key": entry.session_key,
+            # Not strict: a turn queued behind a busy session survives a
+            # compression rotation. run.py follows the pinned id through its
+            # verified compression lineage and still drops it after a /new
+            # (_resolve_async_delegation_session; Prism P1).
             "gateway_session_id": entry.session_id,
-            "gateway_session_strict": True,
         },
     )
     await adapter.handle_message(event)
@@ -536,8 +606,9 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         active = runner._active_profile_name()  # noqa: SLF001
     except Exception:
         active = "default"
-    if active not in profiles:
-        return 0
+    hosted = {active} | {str(p) for p in (getattr(runner, "_profile_adapters", None) or {})}
+    if not hosted & set(profiles):
+        return 0  # a worker-only gateway hosts no operator session: skip the scan
     if getattr(runner, "_draining", False):
         return 0
     now = time.time() if now is None else now
@@ -553,26 +624,46 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     store = getattr(runner, "session_store", None)
     by_session: dict[str, tuple[Any, list[tuple[str, dict]]]] = {}
     for key, card in list(state.pending.items()):
-        if now - float(card.get("first_at") or now) > PENDING_MAX_AGE_SECONDS:
-            logger.warning("kanban owner-wake: dropping %s held > %ds", key, PENDING_MAX_AGE_SECONDS)
+        # Expire ITEMS by their own age, never a fresh event with an old card.
+        fresh = [i for i in card.get("items") or []
+                 if now - float(i.get("queued_at", now)) <= PENDING_MAX_AGE_SECONDS]
+        if len(fresh) != len(card.get("items") or []):
+            logger.warning("kanban owner-wake: dropping %d event(s) of %s held > %ds",
+                           len(card["items"]) - len(fresh), key, PENDING_MAX_AGE_SECONDS)
+            card["items"] = fresh
+        if not fresh:
             state.pending.pop(key, None)
             continue
         if now - state.last_wake.get(key, 0.0) < COALESCE_SECONDS:
             continue  # held: the next turn after the window lists it
         try:
-            entry = await asyncio.to_thread(resolve_owner, store, str(card.get("home_sid") or ""),
+            current = await asyncio.to_thread(read_card, kb, card["board"], card["task_id"])
+        except Exception as exc:
+            logger.warning("kanban owner-wake: cannot re-read %s (%s); retrying", key, exc)
+            continue
+        if current is None or wake_off(current.get("body")):
+            state.pending.pop(key, None)  # card gone, or opted out while held
+            continue
+        card["home_sid"] = str(current.get("session_id") or "")
+        card["title"] = current.get("title") or card.get("title") or ""
+        try:
+            entry = await asyncio.to_thread(resolve_owner, store, card["home_sid"],
                                             _hr.read_session_row)
         except _hr.SessionLookupError as exc:
             logger.warning("kanban owner-wake: home of %s unknown (%s); retrying", key, exc)
             continue
-        if entry is None or not is_chat_origin(entry):
+        # The operator gate applies to the OWNER's profile: one multiplexing
+        # gateway serves several profiles from one store (Prism P1).
+        owner_profile = str(getattr(getattr(entry, "origin", None), "profile", None)
+                            or active or "default")
+        if entry is None or not is_chat_origin(entry) or owner_profile not in profiles:
             logger.debug("kanban owner-wake: %s has no live operator home here; line only", key)
             state.pending.pop(key, None)
             continue
         own = {str(card.get("home_sid") or ""), str(getattr(entry, "session_id", "") or "")}
         items = [i for i in card["items"] if not (i.get("actor_sid") and i["actor_sid"] in own)]
         if items and await asyncio.to_thread(has_wake_sub, kb, card["board"], card["task_id"],
-                                             entry.origin):
+                                             entry.origin, owner_profile):
             items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS]
         if not items:
             state.pending.pop(key, None)

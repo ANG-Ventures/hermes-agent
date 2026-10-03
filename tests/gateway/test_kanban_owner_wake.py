@@ -8,6 +8,7 @@ the adapter the wake hands it to. PR health is the one stub (no GitHub).
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,8 @@ def _one_turn(env, handled):
     assert ev.internal and ev.allow_gateway_control is False
     assert ev.metadata["gateway_session_key"] == env["owner"].session_key
     assert ev.metadata["gateway_session_id"] == env["owner"].session_id
+    assert not ev.metadata.get("gateway_session_strict"), (
+        "strict pin drops a queued wake after a compression rotation (Prism P1)")
     assert ev.source.chat_id == CHAT
     assert "Resolve it and get the chain back on track; reply in the home chat" in ev.text
     return ev.text
@@ -325,3 +328,126 @@ def test_heartbeat_is_never_a_trigger_pure():
     assert "heartbeat" not in ow.SCAN_KINDS
     assert ow.is_stuck("heartbeat", {}) is False
     assert ow.is_stuck("reclaimed", {"heartbeat_stale": False}) is False
+
+
+# --- Prism round 1 (P1s) ------------------------------------------------------
+
+
+def _held_state(env, t0):
+    state = ow.WakeState(Path(get_hermes_home()) / "gateway" / "held.json")
+    state.cursors = {"default": 0}
+    return state
+
+
+def test_p1_classification_failure_does_not_advance_cursor(env, monkeypatch):
+    tid = _card(env)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    state = _held_state(env, 0)
+    real = ow._classify_row
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(ow, "_classify_row", flaky)
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0, state=state)) == 0
+    assert asyncio.run(ow.tick(env["runner"], now=1001.0, state=state)) == 1, "retried, not lost"
+    assert "ruling?" in env["adapter"].handled[-1].text
+
+
+def test_p1_rehomed_while_held_does_not_wake_old_owner(env):
+    tid = _card(env)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "first"})
+    state = _held_state(env, 0)
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0, state=state)) == 1
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "second"})
+    asyncio.run(ow.tick(env["runner"], now=1001.0, state=state))  # held in the window
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?", ("20261003_cron_000000", tid))
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0 + ow.COALESCE_SECONDS + 1, state=state)) == 0
+    assert len(env["adapter"].handled) == 1, "the former owner is not told it owns the card"
+
+
+def test_p1_wake_off_added_while_held_is_honoured(env):
+    tid = _card(env)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "first"})
+    state = _held_state(env, 0)
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0, state=state)) == 1
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "second"})
+    asyncio.run(ow.tick(env["runner"], now=1001.0, state=state))
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("x\nwake: off\n", tid))
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0 + ow.COALESCE_SECONDS + 1, state=state)) == 0
+    assert state.pending == {}
+
+
+def test_p1_fresh_event_survives_expiry_of_old_ones(env):
+    tid = _card(env)
+    state = _held_state(env, 0)
+    key = f"default|{tid}"
+    state.pending[key] = {"board": "default", "task_id": tid, "home_sid": env["owner"].session_id,
+                          "title": "card", "items": [{"event_id": 1, "kind": "crashed",
+                                                      "actor_sid": "", "trigger": "stuck",
+                                                      "reason": "old", "queued_at": 0.0}]}
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "fresh ask"})
+    now = ow.PENDING_MAX_AGE_SECONDS + 100.0
+    assert asyncio.run(ow.tick(env["runner"], now=now, state=state)) == 1
+    text = env["adapter"].handled[-1].text
+    assert "fresh ask" in text and "old" not in text
+
+
+def test_p1_sub_for_another_participant_does_not_suppress_owner_wake(env):
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
+                          chat_type="group", user_id="220000000000000001",
+                          delivery_mode="notify+wake")
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    handled = _tick(env)
+    owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
+    assert len(owner_turns) == 1, "a sub naming another participant wakes THAT session, not the owner"
+
+
+def test_wake_off_card_is_never_queued(env):
+    tid = _card(env, body="wake: off")
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    state = _held_state(env, 0)
+    ow.scan(state, 1000.0, None)
+    assert state.pending == {}, "an opted-out card is filtered at scan, not just at delivery"
+
+
+# --- Prism round 2 (P1s) ------------------------------------------------------
+
+
+def test_p1r2_unknown_pr_health_is_retried_not_consumed(env):
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary="PR ANG-Ventures/hermes-agent#1702")
+    state = _held_state(env, 0)
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0, state=state)) == 0, "GitHub down"
+    env["health"][("ANG-Ventures/hermes-agent", 1702)] = {
+        "state": "open", "mergeable_state": "dirty", "failing": []}
+    assert asyncio.run(ow.tick(env["runner"], now=1001.0, state=state)) == 1, "retried once readable"
+    assert "dirty" in env["adapter"].handled[-1].text
+
+
+def test_p1r2_profile_gate_applies_to_the_owner_session(env):
+    store = env["store"]
+    worker_owned = store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=OTHER_CHAT, chat_type="group", user_id=HUMAN,
+        profile="daedalus",
+    ))
+    tid = _card(env, session=worker_owned.session_id)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    assert _tick(env) == [], "an owner on a non-operator profile is not woken by an operator gateway"
+
+
+def test_p1r2_state_write_is_fsynced(env, monkeypatch):
+    synced = []
+    real = ow.os.fsync
+    monkeypatch.setattr(ow.os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
+    ow.WakeState(Path(get_hermes_home()) / "gateway" / "fs.json").write_owner_wake_state(1.0)
+    assert len(synced) == 2, "file and directory are both fsynced"
