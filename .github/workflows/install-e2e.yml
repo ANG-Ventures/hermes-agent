@@ -192,11 +192,15 @@ jobs:
         # repo's own tag list stops at v2026.5.7, so the picked OLD baseline was a
         # 5-month-old release whose install never finished inside the job wall (seven
         # #1624 runs, e.g. 37116332959). Upstream's newest release is the N-1 a user
-        # actually has. Same step as tests.yml e2e-upgrade.
+        # actually has. Same step as tests.yml e2e-upgrade, but this checkout is
+        # blob:none + shallow, so the fetch must stay filtered and shallow too: a
+        # plain fetch pulls every blob reachable from every tag (647 MB after 90 s
+        # locally) and ate the 5-min job wall in run 37120703678. Tag names and
+        # the tag trees (`git ls-tree`) are all this job reads.
         if: github.repository != 'NousResearch/hermes-agent'
         uses: ./.github/actions/retry
         with:
-          command: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
+          command: git fetch --no-tags --depth=1 --filter=blob:none https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
           attempts: "5"
           delay: "30"
       - id: pick
