@@ -36,6 +36,17 @@ logger = logging.getLogger(__name__)
 
 DROPBOX_DIRNAME = "resume_requests"
 
+# Who a request speaks for (Ace ruling 2026-10-03 01:43, t_04247008).
+# ``caller``: the session that INVOKED the restart. It ALWAYS gets a new turn
+# driven by its handoff on the next boot, finished or not -- the handoff IS the
+# continuation. ``sibling``: any other session. It resumes only when its turn
+# was genuinely cut (the finished-work gate decides); an idle sibling gets
+# nothing. A payload without ``role`` is a legacy watcher's request for its own
+# initiating session, i.e. ``caller``.
+ROLE_CALLER = "caller"
+ROLE_SIBLING = "sibling"
+_ROLES = frozenset({ROLE_CALLER, ROLE_SIBLING})
+
 # A resume request is a point-in-time ask; honoring one long after it was
 # written would wake a session nobody is waiting on. One hour is generous for
 # any restart/reconnect window while still bounded.
@@ -53,6 +64,7 @@ def submit_resume_request(
     session_key: str,
     reason: str = "restart_interrupted",
     handoff: str | None = None,
+    role: str = ROLE_CALLER,
 ) -> Path:
     """Write a resume request for *session_key*. For EXTERNAL writers.
 
@@ -69,6 +81,8 @@ def submit_resume_request(
     """
     if not session_key:
         raise ValueError("session_key is required")
+    if role not in _ROLES:
+        raise ValueError(f"role must be one of {sorted(_ROLES)}, got {role!r}")
     directory = dropbox_dir(hermes_home)
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -78,6 +92,7 @@ def submit_resume_request(
     }
     if handoff:
         payload["handoff"] = str(handoff)
+    payload["role"] = role
     stem = _KEY_SANITIZE_RE.sub("_", str(session_key))[:120]
     final = directory / f"{stem}-{os.getpid()}-{time.monotonic_ns()}.json"
     fd, tmp_name = tempfile.mkstemp(prefix=".resume-req-", dir=str(directory))
@@ -97,11 +112,13 @@ def sweep_resume_requests(
     hermes_home: Path,
     *,
     max_age_seconds: float = MAX_AGE_SECONDS,
-) -> List[Tuple[str, str, "str | None"]]:
+) -> List[Tuple[str, str, "str | None", str]]:
     """Consume all pending requests. For the GATEWAY (single consumer).
 
-    Returns deduped ``[(session_key, reason, handoff_or_None)]`` (first
-    request wins per key). Consumed files are deleted; malformed files are
+    Returns deduped ``[(session_key, reason, handoff_or_None, role)]`` (first
+    request wins per key). ``role`` is ``caller`` or ``sibling``; a missing or
+    unknown role reads as ``caller`` (legacy watchers only ever wrote requests
+    for their own initiating session). Consumed files are deleted; malformed files are
     renamed ``*.rejected`` so they are never re-parsed; stale files (older
     than *max_age_seconds*) are deleted without being returned. Fail-open:
     any per-file error skips that file, never raises out of the sweep.
@@ -116,7 +133,7 @@ def sweep_resume_requests(
         return []
 
     now = time.time()
-    results: List[Tuple[str, str, "str | None"]] = []
+    results: List[Tuple[str, str, "str | None", str]] = []
     seen: set[str] = set()
     for name in names:
         if not name.endswith(".json"):
@@ -134,6 +151,9 @@ def sweep_resume_requests(
             requested_at = float(payload.get("requested_at") or 0.0)
             raw_handoff = payload.get("handoff")
             handoff = str(raw_handoff) if raw_handoff else None
+            role = str(payload.get("role") or ROLE_CALLER)
+            if role not in _ROLES:
+                role = ROLE_CALLER
         except Exception as exc:  # noqa: BLE001 — quarantine, don't crash
             logger.warning("resume request %s malformed (%s) — quarantining", name, exc)
             try:
@@ -155,5 +175,5 @@ def sweep_resume_requests(
         if session_key in seen:
             continue
         seen.add(session_key)
-        results.append((session_key, reason, handoff))
+        results.append((session_key, reason, handoff, role))
     return results

@@ -1097,6 +1097,16 @@ agent:
 
 `agent.resume_interrupted_turns` controls gateway restart recovery for interrupted turns. Valid values are `off`, `prompt`, `auto`, and `always`; the default is `prompt`. `auto` continues an interrupted turn once, unattended, when its persisted tail is mechanically safe — a turn cut in the middle of a mutating tool call (`terminal`, `write_file`, …) still falls back to `prompt`. `always` continues once even past an incomplete or unclassified tool call at the tail (for operators who want every interrupted sibling turn to resume without being asked); the structural guards — messaging surfaces only, a stable assistant rowid, once-ever per interrupted turn, and the finished-work skip — still apply in every mode.
 
+**Who gets a turn after a restart.** When an external tool restarts the gateway, it can drop a resume request into `<HERMES_HOME>/gateway/resume_requests/` naming the session that asked for the restart (`"role": "caller"`, plus an optional `"handoff"` note). On the next boot:
+
+| Session | What happens |
+|---|---|
+| The caller (`role: caller`, or a request with no `role`) | Always gets a new turn driven by its handoff, whether its turn was still running or had already finished. |
+| Another session whose turn the restart cut | Resumes under `agent.resume_interrupted_turns`. In `auto`/`always` mode the resume note tells it a gateway restart happened and to finish the work. |
+| Another session that was idle | Nothing happens. No turn, no notice. |
+
+A `role: sibling` request gets no exemption: it resumes only if its persisted turn was actually unfinished.
+
 ## Wall-Clock Run Budget
 
 Separate from the iteration budget, you can give each conversation run an optional **wall-clock** budget. This is designed for one-shot and eval-harness invocations that run under a hard external ceiling (e.g. a 900-second per-task limit): without it, a run can time out with the work essentially done — one generation short of emitting the final answer, or stuck in a single hung provider call.
