@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+import traceback
 from typing import Any, cast, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -8215,6 +8216,13 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        # Kanban workers print this on exit 1 so the run log
+                        # names the failing frame, not one bare line (t_6b01c2d1).
+                        "error_traceback": "".join(
+                            traceback.format_exception(
+                                type(api_error), api_error, api_error.__traceback__
+                            )
+                        ),
                     }
 
                 if retry_count >= max_retries:
