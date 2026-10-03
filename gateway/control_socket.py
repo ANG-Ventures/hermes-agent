@@ -1,5 +1,7 @@
 """Gateway control socket — the gateway-owned local coordination surface: a local-only socket answering
-versioned JSON verbs (``identify``, ``status``). A connectable socket with a well-formed ``identify``
+versioned JSON verbs (``identify``, ``status``; ``pause-for-update`` and ``wake`` are actuators
+wired by gateway/run.py — ``wake`` starts an agent turn in a served chat, same routing as the kanban
+notifier's wake, answering ``{"delivered": bool, "error": str}``). A connectable socket with a well-formed ``identify``
 answer IS liveness — no PID-reuse heuristics. Never a TCP port: filesystem/pipe ACLs are the auth
 boundary. POSIX: ``$HERMES_HOME/gateway.sock`` (or a temp-dir socket + ``gateway.sock.path`` pointer
 file when the home path exceeds ``sun_path``); Windows: named pipe ``\\\\.\\pipe\\hermes-gateway-<hash>``.
@@ -10,6 +12,7 @@ Consumers PREFER the socket and fall back to the state-file/scan layer when it d
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import inspect
@@ -33,6 +36,8 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 # Single-line JSON in/out; bounded so a misbehaving peer can't balloon memory.
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
+_HANDLER_WORKERS = 4  # concurrent control requests; more queue, they never block the loop pool
+
 _DEFAULT_CLIENT_TIMEOUT = 2.0
 
 
@@ -125,7 +130,8 @@ class GatewayControlServer:
     because its control socket couldn't bind; consumers fall back to the scan layer."""
 
     def __init__(self, home: Optional[Path] = None, *,
-                 verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None) -> None:
+                 verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None,
+                 request_handlers: Optional[dict[str, Callable[[dict[str, Any]], dict[str, Any]]]] = None) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
             home = _get_process_hermes_home()
@@ -136,6 +142,20 @@ class GatewayControlServer:
         self._pointer_file: Optional[Path] = None
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
+        # Verbs that need the request body (e.g. ``wake``) receive the request's ``params`` object. Kept
+        # separate from ``verb_handlers`` so the zero-arg observation verbs keep their signature.
+        self._request_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = dict(request_handlers or {})
+        # Handlers run on a pool of their own, never the loop's default executor: a wake handler parks its
+        # thread for up to WAKE_SERVER_TIMEOUT on a loop coroutine, and that coroutine may need the default
+        # pool itself (asyncio.to_thread in handle_message). Sharing the pool let a few concurrent wakes
+        # starve the very work they wait on (t_51b6e95f).
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def _run_handler(self, line: bytes) -> "asyncio.Future[bytes]":
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_HANDLER_WORKERS, thread_name_prefix="gw-control")
+        return asyncio.get_running_loop().run_in_executor(self._executor, self.handle_request_line, line)
 
     async def start(self) -> bool:
         """Bind and start serving. Returns True on success, False otherwise."""
@@ -190,6 +210,9 @@ class GatewayControlServer:
             with contextlib.suppress(Exception):
                 self._pipe_server.close()
         self._server = self._pipe_server = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
         self.cleanup_files()
 
     def cleanup_files(self) -> None:
@@ -207,9 +230,19 @@ class GatewayControlServer:
                 raise ValueError("request must be a JSON object")
             request_id, verb = request.get("id"), request.get("verb")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
-            if handler is None:
-                response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
-                                            "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
+            request_handler = self._request_handlers.get(verb) if isinstance(verb, str) else None
+            if request_handler is not None:
+                params = request.get("params")
+                if params is None:
+                    params = {}
+                if not isinstance(params, dict):
+                    raise ValueError("params must be a JSON object")
+                response: dict[str, Any] = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
+                                            "result": request_handler(params)}
+            elif handler is None:
+                response = {"ok": False, "error": f"unknown verb: {verb!r}",
+                            "protocol": CONTROL_PROTOCOL_VERSION,
+                            "supported_verbs": sorted(set(self._handlers) | set(self._request_handlers))}
             else:
                 # Verbs that carry arguments (e.g. migrate-profile-identity) declare a ``params``
                 # parameter; argument-less verbs (identify/status/rescan) keep their bare signature.
@@ -236,8 +269,7 @@ class GatewayControlServer:
                 return
             # Handlers read disk; keep that off the loop that drives every platform
             # adapter so a fast-polling consumer can't stall heartbeats.
-            response = await asyncio.get_running_loop().run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n"))
+            response = await self._run_handler(raw.rstrip(b"\n"))
             writer.write(response)
             await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, OSError):
@@ -250,23 +282,43 @@ class GatewayControlServer:
 
 
 class _PipeControlProtocol(asyncio.Protocol):
-    """One-shot request/response protocol for the Windows named pipe."""
+    """One-shot request/response protocol for the Windows named pipe.
+
+    Protocol callbacks run ON the gateway event loop. The request is handed
+    to the executor exactly like the POSIX ``_handle_connection`` path:
+    request handlers may block (``wake`` waits on a coroutine it schedules on
+    this very loop), and running one inline would freeze every adapter for
+    the length of that wait and deadlock the wake itself (t_51b6e95f).
+    """
+
     def __init__(self, server: GatewayControlServer) -> None:
         self._server = server
         self._transport: Any = None
         self._buffer = bytearray()
+        self._task: Optional[asyncio.Task] = None
 
     def connection_made(self, transport) -> None:  # pragma: no cover - windows
         self._transport = transport
 
-    def data_received(self, data: bytes) -> None:  # pragma: no cover - windows
+    def data_received(self, data: bytes) -> None:
+        if self._task is not None:
+            return  # one request per connection; already dispatched
         self._buffer.extend(data)
         if len(self._buffer) > _MAX_REQUEST_BYTES:
             self._transport.close()
         elif b"\n" in self._buffer:
-            try:
-                self._transport.write(self._server.handle_request_line(bytes(self._buffer).partition(b"\n")[0]))
-            finally:
+            line, _, _ = bytes(self._buffer).partition(b"\n")
+            self._task = asyncio.get_running_loop().create_task(self._respond(line))
+
+    async def _respond(self, line: bytes) -> None:
+        try:
+            response = await self._server._run_handler(line)  # noqa: SLF001
+            if not self._transport.is_closing():
+                self._transport.write(response)
+        except Exception:
+            logger.debug("Control pipe request handler error", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
                 self._transport.close()
 
 
@@ -397,3 +449,49 @@ def reload_gateway_plugins(home: Path, *, profile_home: Optional[Path] = None,
     session; only handlers go live."""
     params = {"home": str(profile_home or home)}
     return query_gateway_control(home, "reload-plugins", params=params, timeout=timeout)
+
+
+# Wake budget: the gateway resolves the adapter and hands the synthetic event
+# to ``adapter.handle_message`` (which returns once the turn is dispatched);
+# the non-push (api_server) self-post can take longer, so the client waits a
+# little past the server's own deadline.
+WAKE_SERVER_TIMEOUT = 20.0
+WAKE_CLIENT_TIMEOUT = WAKE_SERVER_TIMEOUT + 5.0
+
+
+def wake_gateway_session(
+    home: Path,
+    *,
+    platform: str,
+    chat_id: str,
+    text: str,
+    chat_type: str,
+    thread_id: str = "",
+    user_id: str = "",
+    user_id_alt: str = "",
+    scope_id: str = "",
+    profile: str = "",
+    timeout: float = WAKE_CLIENT_TIMEOUT,
+) -> Optional[dict[str, Any]]:
+    """Start an agent turn in a chat served by the gateway at ``home``.
+
+    Returns the gateway's answer ``{"delivered": bool, "error": str, ...}``,
+    or None when no gateway answers the ``wake`` verb (no socket, older
+    gateway) so the caller can use its fallback path.
+    """
+    return query_gateway_control(
+        home,
+        "wake",
+        timeout=timeout,
+        params={
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "chat_type": chat_type,
+            "user_id": user_id,
+            "user_id_alt": user_id_alt,
+            "scope_id": scope_id,
+            "profile": profile,
+            "text": text,
+        },
+    )

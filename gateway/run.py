@@ -11202,6 +11202,37 @@ async def _start_gateway_start_control_socket(runner):
             except concurrent.futures.TimeoutError:
                 return {"multiplex": True, "pending": True, "served_profiles": runner.served_profile_names()}
 
+        # wake (t_0fe12e34): a detached process (dispatch-agent.sh --wake)
+        # starts an agent turn in a chat this gateway serves. Same routing
+        # and delivery as the kanban notifier's wake; the coroutine runs on
+        # the loop thread and the verb answers delivered/failed.
+        def _wake_handler(params: dict) -> dict:
+            from gateway.control_socket import WAKE_SERVER_TIMEOUT
+
+            try:
+                _on_loop = asyncio.get_running_loop() is _main_loop
+            except RuntimeError:
+                _on_loop = False
+            if _on_loop:
+                # Waiting below on the loop's own thread would block every
+                # adapter and deadlock the wake (t_51b6e95f). Transports must
+                # call request handlers from an executor thread.
+                return {
+                    "delivered": False,
+                    "error": "wake handler called on the gateway loop thread",
+                }
+            fut = asyncio.run_coroutine_threadsafe(
+                runner._deliver_control_wake(params), _main_loop
+            )
+            try:
+                return fut.result(timeout=WAKE_SERVER_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                fut.cancel()
+                return {
+                    "delivered": False,
+                    "error": f"wake not dispatched within {WAKE_SERVER_TIMEOUT:.0f}s",
+                }
+
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
@@ -11211,7 +11242,8 @@ async def _start_gateway_start_control_socket(runner):
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop)},
+            request_handlers={"wake": _wake_handler})
         if not await _control_server.start():
             _control_server = None
         else:
