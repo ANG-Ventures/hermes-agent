@@ -1732,6 +1732,12 @@ class GatewayKanbanWatchersMixin:
 
                 def _collect():
                     deliveries: list[dict] = []
+                    # t_dcc4ed08: one memoised REST oracle per tick for the
+                    # landed-close-gate check on changes_requested events.
+                    from gateway import kanban_close_gate as _cg
+                    from hermes_cli import kanban_open_pr as _open_pr
+
+                    _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
                     include_unowned = self._owns_kanban_dispatcher_lock()
                     notifier_profiles = {notifier_profile}
                     notifier_profiles.update(
@@ -1902,6 +1908,18 @@ class GatewayKanbanWatchersMixin:
                                     _home_sid = getattr(task, "session_id", None) if task else None
                                     _home_row, home_res = home_cache.get(slug, sub["task_id"], _home_sid)
                                     home_line = format_home_line(_home_sid, _home_row)
+                                    close_gates: dict = {}
+                                    for _ev in events:
+                                        if _ev.kind != "changes_requested":
+                                            continue
+                                        try:
+                                            _g = _cg.classify(_kb, conn, sub["task_id"], _ev, _cg_query)
+                                        except Exception as _cg_exc:
+                                            logger.debug("kanban notifier: close-gate read failed for %s: %s",
+                                                         sub["task_id"], _cg_exc)
+                                            _g = None
+                                        if _g:
+                                            close_gates[_ev.id] = _g
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -1915,6 +1933,7 @@ class GatewayKanbanWatchersMixin:
                                         "board": slug,
                                         "home": home_line,
                                         "home_res": home_res,
+                                        "close_gates": close_gates,
                                         "self_event_ids": self_caused_event_ids(sub, events),
                                     })
                                 except Exception as sub_exc:
@@ -2034,6 +2053,7 @@ class GatewayKanbanWatchersMixin:
                     for ev in d["events"]:
                         kind = ev.kind
                         lane_key = None
+                        _fold = None  # t_dcc4ed08: operator-batch fold key for the digest
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -2167,16 +2187,34 @@ class GatewayKanbanWatchersMixin:
                             reviewer = _safe_review_reason(payload.get("reviewer"), 48)
                             implementer = _safe_review_reason(payload.get("implementer"), 48)
                             reason_text = reason or "reviewer feedback requires changes"
-                            provenance = ""
-                            if reviewer:
-                                provenance += f" — reviewer @{reviewer}"
-                            if implementer:
-                                provenance += f" → implementer @{implementer}"
-                            msg = (
-                                f"🛑 {board_tag}Kanban {sub['task_id']} review requested "
-                                f"changes/BLOCK: {reason_text}{provenance}"
-                            )
-                            wake_review_detail = reason_text
+                            _gate = (d.get("close_gates") or {}).get(ev.id)
+                            if _gate:
+                                # t_dcc4ed08: the PR landed; the card waits on a
+                                # native close gate. Not a block, not a send-back.
+                                gate_text = _safe_review_reason(_gate.get("gate")) or reason_text
+                                msg = (
+                                    f"⏳ {board_tag}Kanban {sub['task_id']} landed · close on: "
+                                    f"{gate_text}"
+                                    + (f" — implementer @{implementer}" if implementer else "")
+                                )
+                                _fold = {
+                                    "key": f"close-gate:{_gate['batch']}" if _gate.get("batch") else None,
+                                    "task_id": sub["task_id"], "gate": gate_text,
+                                    "implementer": implementer, "board_tag": board_tag,
+                                    "batch": _gate.get("batch") or "",
+                                }
+                                wake_review_detail = f"landed; close on: {gate_text}"
+                            else:
+                                provenance = ""
+                                if reviewer:
+                                    provenance += f" — reviewer @{reviewer}"
+                                if implementer:
+                                    provenance += f" → implementer @{implementer}"
+                                msg = (
+                                    f"🛑 {board_tag}Kanban {sub['task_id']} review requested "
+                                    f"changes/BLOCK: {reason_text}{provenance}"
+                                )
+                                wake_review_detail = reason_text
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -2310,6 +2348,7 @@ class GatewayKanbanWatchersMixin:
                                 lifecycle_digest.add(
                                     _routed, send_adapter, msg, _route_window, time.time(),
                                     metadata=metadata, fallback=_fallback,
+                                    fold=_fold if _fold and _fold.get("key") else None,
                                 )
                                 _send_res = None
                             else:
