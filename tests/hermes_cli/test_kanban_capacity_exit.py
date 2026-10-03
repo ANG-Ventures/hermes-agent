@@ -198,3 +198,33 @@ def test_exit_one_receipt_with_capacity_class_is_still_a_crash(board, monkeypatc
     assert current.consecutive_failures == 1
     run = board.execute("SELECT * FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()
     assert run["outcome"] == "crashed"
+
+
+# t_6b01c2d1: an exit-1 worker printed one bare error line before the run
+# boundary; the failing frame lived only in the profile errors.log.
+def test_exit_1_prints_failing_traceback_to_worker_log(worker_env, capsys):
+    tb = (
+        "Traceback (most recent call last):\n"
+        '  File "anthropic/lib/streaming/_messages.py", line 480, in accumulate_event\n'
+        "ValueError: key must be a string at line 1 column 27\n"
+    )
+    exc = WorkerExit({
+        "failed": True,
+        "error": "key must be a string at line 1 column 27",
+        "error_traceback": tb,
+    })
+    assert exc.code == 1
+    err = capsys.readouterr().err
+    assert "kanban worker exit 1, failing exception:" in err
+    assert "in accumulate_event" in err
+
+
+def test_retry_preserving_exit_does_not_print_traceback(worker_env, capsys):
+    exc = WorkerExit({
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": "429 rate limited",
+        "error_traceback": "Traceback (most recent call last):\nX\n",
+    })
+    assert exc.code != 1
+    assert "failing exception" not in capsys.readouterr().err
