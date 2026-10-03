@@ -222,6 +222,7 @@ def handle_api_error(
     is_rate_limited = _ce.is_rate_limited
     _wrapped_output_cap_budget = _ce.wrapped_output_cap_budget
     _is_zai_coding_overload = _ce.is_zai_coding_overload
+    _capacity_wait = _ce.capacity_wait if _ce.is_pool_capacity else None
     if _ce.provider_overflow_recovery_pending:
         _provider_overflow_recovery_pending = True
     if _ce.action != "fallthrough":
@@ -252,6 +253,7 @@ def handle_api_error(
         error_msg=error_msg, error_context=error_context,
         is_context_length_error=is_context_length_error,
         is_rate_limited=is_rate_limited, _is_zai_coding_overload=_is_zai_coding_overload,
+        _capacity_wait=_capacity_wait,
         _provider=_provider, _base=_base, _model=_model, messages=messages,
         api_messages=api_messages, api_kwargs=api_kwargs, active_system_prompt=active_system_prompt,
         conversation_history=conversation_history, approx_tokens=approx_tokens,
@@ -299,7 +301,7 @@ def settle_unrecovered_error(
     _provider: Any, _base: Any, _model: Any, messages: Any, api_messages: Any, api_kwargs: Any,
     active_system_prompt: Any, conversation_history: Any, approx_tokens: Any, retry_count: Any,
     max_retries: Any, compression_attempts: Any, api_call_count: Any, error_context: Any = None,
-    current_turn_user_idx: Any = None,
+    current_turn_user_idx: Any = None, _capacity_wait: Optional[float] = None,
 ) -> UnrecoveredErrorVerdict:
     """Decide the fate of an API error that every recovery chain declined: local validation /
     non-retryable client errors (Copilot stale-credential self-heal first, then fallback, then a
@@ -455,7 +457,7 @@ def settle_unrecovered_error(
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,
         is_rate_limited=is_rate_limited, is_zai_coding_overload=_is_zai_coding_overload,
-        base_url=_base, model=_model,
+        base_url=_base, model=_model, capacity_wait=_capacity_wait, _retry=_retry,
     )
     # Same preserve-redirect rule as the invalid-response wait: a steering correction
     # must survive backoff, not die as "Operation interrupted".

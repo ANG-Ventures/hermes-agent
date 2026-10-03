@@ -257,12 +257,18 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         ),
         # Generic path jitter (pre-policy) vs the capacity schedule. Pin both
         # so the test asserts on POLICY, not RNG: a 2.0 sleep is the generic
-        # path, a 5.0 sleep is the capacity path.
-        patch("agent.retry_utils.jittered_backoff", return_value=2.0),
-        patch("agent.retry_utils.jittered_backoff", return_value=5.0),
+        # path, a 5.0 sleep is the capacity path. Both now read the ONE
+        # ``agent.retry_utils.jittered_backoff`` (the generic backoff moved into
+        # agent.turn_recovery and imports it lazily), so key on ``base_delay``:
+        # 2.0 is the generic schedule, 5.0 is CAPACITY_RETRY_BASE_DELAY_S.
+        patch("agent.retry_utils.jittered_backoff",
+              side_effect=lambda *_a, base_delay=2.0, **_k: 5.0 if base_delay == 5.0 else 2.0),
         # The loop sleeps in 0.2s ticks until ``time.time() >= sleep_end``;
         # the fake clock advances on sleep so the wait is recorded, not served.
-        patch("agent.conversation_loop.time", clock),
+        # Upstream split the retry wait out of conversation_loop into
+        # agent.turn_recovery (interruptible_backoff_sleep + the capacity budget's
+        # monotonic reads); patch the clock where it is read.
+        patch("agent.turn_recovery.time", clock),
     ):
         result = agent.run_conversation("hello")
     return result, activate, call

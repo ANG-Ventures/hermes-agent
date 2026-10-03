@@ -1411,12 +1411,14 @@ def reset_hint(api_error: Exception) -> str:
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
     is_zai_coding_overload: bool, base_url: Any, model: Any,
+    capacity_wait: Optional[float] = None, _retry: Optional[TurnRetryState] = None,
 ) -> float:
     """Pick the wait before the next API retry and announce it. Retry-After wins for
     rate limits and any other retryable error (capped at 600s: Anthropic Tier 1 buckets
     reset in ~171s, so a 120s cap re-tripped the limit); otherwise jittered backoff,
     replaced by the adaptive policy for 429s / Z.AI overloads. Normal retries are
-    buffered; long Z.AI Coding waits surface immediately."""
+    buffered; long Z.AI Coding waits surface immediately. ``capacity_wait`` (fork pool-capacity
+    503 policy, already bounded by ``capacity_retry_wait``) wins over the generic jitter."""
     # Imported lazily so tests that patch ``agent.retry_utils.jittered_backoff`` /
     # ``adaptive_rate_limit_backoff`` (incl. the run_agent conftest fast-backoff fixture) intercept.
     from agent.retry_utils import (
@@ -1481,8 +1483,22 @@ def compute_error_backoff(
             _retry_after = None
     wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
     _backoff_policy = None
+    if capacity_wait is not None:
+        # Pool-capacity policy wins over the generic jitter: the wait was already bounded
+        # (attempts + wall-clock budget, relay Retry-After honoured) by ``capacity_retry_wait``.
+        wait_time = capacity_wait
+        _backoff_policy = "pool_capacity"
+        _cap_waited = 0.0
+        if _retry is not None:
+            _retry.capacity_waited_s += float(wait_time)
+            _cap_waited = _retry.capacity_waited_s
+        logger.warning(
+            "capacity 503 on %s: retry %d/%d in %.1fs (waited %.0fs of %.0fs budget) %s",
+            getattr(agent, "provider", "?"), retry_count + 1, max_retries, wait_time, _cap_waited,
+            float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0), agent._client_log_context(),
+        )
     _adaptive = is_rate_limited or is_zai_coding_overload
-    if _adaptive and _retry_after is None:
+    if _adaptive and _retry_after is None and capacity_wait is None:
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
         )
@@ -1499,9 +1515,17 @@ def compute_error_backoff(
         else:
             agent._buffer_diagnostic_status(_rate_limit_status)
     else:
-        _retry_status = (
-            f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})..."
-        )
+        if _backoff_policy == "pool_capacity":
+            # Say what we are waiting FOR: a pooled seat on the same provider, not a generic
+            # retry — so the trace reads "capped → waited → served" rather than "flaky".
+            _retry_status = (
+                f"⏱️ Sub pool capped — waiting {wait_time:.1f}s for a seat before "
+                f"switching providers (attempt {retry_count + 1}/{max_retries})..."
+            )
+        else:
+            _retry_status = (
+                f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})..."
+            )
         if _retry_after is not None and _retry_after > 60:
             # A 5xx Retry-After can now reach the 600s cap; buffering that wait
             # would leave the user silent for minutes, so surface long provider
@@ -1699,6 +1723,11 @@ class ClassifiedErrorVerdict:
     is_rate_limited: bool
     wrapped_output_cap_budget: Optional[int]
     is_zai_coding_overload: bool
+    # Fork pool-capacity 503 policy (``FailoverReason.pool_exhausted``): the bounded
+    # same-provider wait ``capacity_retry_wait`` chose for this attempt, ``None`` when the
+    # policy is off or its budget is spent (the attempt was handed to the fallback branch).
+    is_pool_capacity: bool = False
+    capacity_wait: Optional[float] = None
 
 
 _OVERFLOW_REASONS = frozenset({
@@ -1848,6 +1877,8 @@ def route_classified_error(
     is_rate_limited = False
     _wrapped_output_cap_budget = None
     _is_zai_coding_overload = False
+    _is_pool_capacity = False
+    _capacity_wait: Optional[float] = None
     status_code = getattr(api_error, "status_code", None)
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ClassifiedErrorVerdict:
@@ -1859,6 +1890,7 @@ def route_classified_error(
             provider_overflow_recovery_pending=_provider_overflow_recovery_pending,
             is_rate_limited=is_rate_limited, wrapped_output_cap_budget=_wrapped_output_cap_budget,
             is_zai_coding_overload=_is_zai_coding_overload,
+            is_pool_capacity=_is_pool_capacity, capacity_wait=_capacity_wait,
         )
 
     def _fallback_break() -> ClassifiedErrorVerdict:
@@ -1950,6 +1982,55 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+
+    # ── Pool-capacity 503: wait for a seat before a host move (fork, 2026-09-24) ──
+    # A relay "no eligible sub" 503 (``pool_exhausted``) is a CAPACITY signal, not
+    # auth/transport. Leaving the provider here is a host move for a bridge-backed session:
+    # the next box has no CLI session and replays the whole history (168 replays on one sub
+    # in 10h). Stay on the same provider for up to ``capacity_retry_attempts`` tries /
+    # ``capacity_retry_max_wait_s`` seconds, honouring the relay's Retry-After, THEN walk the
+    # chain. Policy is the pure ``capacity_retry_wait``; this block only widens the retry
+    # ceiling and, when the budget is spent, hands the attempt to the existing "max retries
+    # -> fallback" branch so the failover announce stays single-sourced. ``attempts: 0`` =
+    # pre-policy behaviour.
+    _is_pool_capacity = (
+        classified.reason == FailoverReason.pool_exhausted
+        and int(getattr(agent, "_capacity_retry_attempts", 0) or 0) > 0
+    )
+    if _is_pool_capacity:
+        from agent.retry_utils import capacity_retry_wait
+
+        _cap_attempts = int(agent._capacity_retry_attempts)
+        max_retries = max(max_retries, _cap_attempts)
+        # The wall-clock budget counts time since the first pool 503 of this block,
+        # request time included, not just our own sleeps (FleetReview #84).
+        _cap_now = time.monotonic()
+        if _retry.capacity_started_at is None:
+            _retry.capacity_started_at = _cap_now
+        _retry.capacity_waited_s = max(_retry.capacity_waited_s, _cap_now - _retry.capacity_started_at)
+        _cap_headers = getattr(getattr(api_error, "response", None), "headers", None)
+        _cap_ra_raw = None
+        if _cap_headers and hasattr(_cap_headers, "get"):
+            _cap_ra_raw = _cap_headers.get("retry-after") or _cap_headers.get("Retry-After")
+        _cap_max_wait = float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0)
+        _capacity_wait = capacity_retry_wait(
+            retry_count=retry_count,
+            # The capacity path's OWN attempt budget: a larger generic api_max_retries
+            # must not widen it (#29).
+            max_retries=_cap_attempts,
+            raw_retry_after=_cap_ra_raw,
+            waited_s=_retry.capacity_waited_s,
+            max_wait_s=_cap_max_wait,
+        )
+        if _capacity_wait is None:
+            logger.warning(
+                "capacity 503 on %s: budget exhausted after %.0fs / %d attempt(s) "
+                "(limits attempts=%d max_wait=%.0fs, retry_after=%s) → fallback %s",
+                getattr(agent, "provider", "?"), _retry.capacity_waited_s, retry_count,
+                _cap_attempts, _cap_max_wait, _cap_ra_raw, agent._client_log_context(),
+            )
+            # Hand off to the retries-exhausted → fallback branch.
+            retry_count = max_retries
 
     # ── Relay draining for a deploy: wait, retry the SAME model (fork, t_826861ab) ──
     # 503 {"error":"draining-for-deploy"} is provider-wide and self-clearing. Wall-clock
