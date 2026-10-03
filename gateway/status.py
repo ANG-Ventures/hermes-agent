@@ -2164,9 +2164,20 @@ def reap_gateway_children(children: list, *, parent_pid: int, timeout: float = 5
     reaped = 0
     try:
         import psutil  # type: ignore
+        # Never signal ourselves or our own ancestors.  A replacer launched
+        # from inside the old gateway (e.g. its terminal tool) is in the
+        # snapshot and is reparented once the owner exits, so the ppid check
+        # below no longer protects it.
+        protected = {os.getpid()}
+        try:
+            protected.update(p.pid for p in psutil.Process().parents())
+        except Exception:
+            pass
         live = []
         for child in children:
             try:
+                if getattr(child, "pid", None) in protected:
+                    continue
                 if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
                     continue
                 if child.ppid() == parent_pid:

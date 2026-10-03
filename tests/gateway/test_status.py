@@ -1293,6 +1293,10 @@ class TestScopedLockTakeover:
             calls.append((pid, force))
 
         monkeypatch.setattr(status, "terminate_pid", terminate)
+        # 4242 is fake, but it can be a real PID on the host (it was an
+        # ancestor of pytest on the heavy-CI runner): never walk/reap a real
+        # process tree from here.
+        monkeypatch.setattr(status, "_snapshot_gateway_children", lambda _pid: [])
 
         owner_pid = status.take_over_scoped_lock_holder(
             record, graceful_attempts=1

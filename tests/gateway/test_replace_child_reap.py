@@ -87,6 +87,29 @@ class TestReapGatewayChildren:
         assert stubborn.killed
         assert reaped == 1
 
+    def test_never_signals_self_or_ancestors(self, monkeypatch):
+        """A replacer inside the old gateway's tree must not reap itself.
+
+        Heavy-CI 2026-10-02: test_status.py used fake owner PID 4242, which
+        was a real ancestor of the pytest process on the runner. The snapshot
+        held the pytest process (reparented, so ppid != 4242) and the reap
+        SIGTERMed it mid-file.
+        """
+        import os
+
+        fake = _fake_psutil(monkeypatch)
+        fake.Process.return_value.parents.return_value = [_FakeChild(777)]
+        me = _FakeChild(os.getpid(), ppid=1)
+        kin = [_FakeChild(777, ppid=1)]
+        stranger = _FakeChild(999_999, ppid=1)
+
+        reaped = status.reap_gateway_children([me, *kin, stranger], parent_pid=42)
+
+        assert not me.terminated and not me.killed
+        assert not any(c.terminated or c.killed for c in kin)
+        assert stranger.terminated
+        assert reaped == 1
+
 
 @pytest.mark.platforms("linux")
 class TestSnapshotGatewayChildren:

@@ -434,3 +434,80 @@ class TestTrailingMarkerStripIsTurnFinalOnly:
         consumer.finish(text)
         await consumer.run()
         assert _sent_and_edited(adapter)[-1].rstrip().endswith("No reply.")
+
+
+class TestOverflowSplitKeepsNonterminalMarker:
+    """A token line that ends a sealed overflow HEAD chunk is mid-response.
+
+    Prism #1668 0ed312b03e71 (fixed by #1669; regression guard from
+    t_21da8a38): the strip must apply to the completed reply, never to a
+    non-final split chunk, or the sealed head loses a line the ledger keeps.
+    """
+
+    @staticmethod
+    def _reply():
+        # safe_limit = 700: head + token fits, the first tail line crosses it,
+        # so the newline split lands right after ``NO_REPLY``.
+        head = "\n".join(f"line {i:03d} " + "x" * 40 for i in range(12))
+        tail = "\n".join(f"tail {i:03d} " + "y" * 100 for i in range(8))
+        return head + "\nNO_REPLY\n" + tail
+
+    @staticmethod
+    def _consumer():
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 800
+        ids = iter(f"m{i}" for i in range(100))
+        adapter.send = AsyncMock(side_effect=lambda **kw: SimpleNamespace(
+            success=True, message_id=next(ids),
+        ))
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(
+                edit_interval=0.0, buffer_threshold=1, cursor="",
+                strip_trailing_silence_marker=True,
+            ),
+        )
+        return adapter, consumer
+
+    @pytest.mark.asyncio
+    async def test_existing_preview_split_keeps_marker_line(self):
+        reply = self._reply()
+        split_head = reply[:reply.index("\nNO_REPLY\n") + len("\nNO_REPLY")]
+        assert len(split_head) < 700 < len(split_head) + 110
+        adapter, consumer = self._consumer()
+        consumer._message_id = "m_prev"
+        consumer._last_sent_text = "line 000"
+        consumer._already_sent = True
+        consumer.on_delta(reply)
+        consumer.finish()
+        await consumer.run()
+
+        texts = _sent_and_edited(adapter)
+        assert sum("NO_REPLY" in t for t in texts) == 1, texts
+        assert consumer.delivered_final_matches(reply) is True
+
+    @pytest.mark.asyncio
+    async def test_first_send_split_keeps_marker_line(self):
+        reply = self._reply()
+        adapter, consumer = self._consumer()
+        consumer.on_delta(reply)
+        consumer.finish()
+        await consumer.run()
+
+        assert any("NO_REPLY" in t for t in _sent_and_edited(adapter))
+        assert consumer.delivered_final_matches(reply) is True
+
+    @pytest.mark.asyncio
+    async def test_repeated_trailing_tokens_stream_without_token(self):
+        """Turn-final strip removes every trailing token line (c7fca8d2bc4c)."""
+        adapter, consumer = self._consumer()
+        reply = "short note\nNO_REPLY\nNO_REPLY"
+        consumer.on_delta(reply)
+        consumer.finish()
+        await consumer.run()
+
+        texts = _sent_and_edited(adapter)
+        assert any("short note" in t for t in texts)
+        for text in texts:
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+        assert consumer.delivered_final_matches(reply) is True
