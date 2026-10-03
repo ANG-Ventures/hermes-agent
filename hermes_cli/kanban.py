@@ -3886,7 +3886,23 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             ),
             delivery_metadata=delivery_metadata or None,
             also=bool(getattr(args, "also", False)),
+            takeover=bool(getattr(args, "takeover", False)),
         )
+        waker = kbn.card_waker(conn, args.task_id)
+        wants_wake = (
+            getattr(args, "delivery_mode", None) in kbn.NOTIFY_WAKE_MODES
+            or getattr(args, "wake", False)
+        )
+        thread = args.thread_id or ""
+        if wants_wake and outcome != "kept" and waker is not None and not (
+            waker["platform"] == args.platform and waker["chat_id"] == args.chat_id
+            and (waker.get("thread_id") or "") == thread
+        ):
+            print(f"wake held by {waker['platform']}:{waker['chat_id']}"
+                  + (f" (profile {waker['notifier_profile']})"
+                     if waker.get("notifier_profile") else "")
+                  + f"; {args.platform}:{args.chat_id} subscribed notify. "
+                  "Pass --takeover to move the wake.")
         if outcome == "kept":
             owners = [
                 s for s in kbn.list_notify_subs(conn, args.task_id)
@@ -3919,8 +3935,32 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
             "" if ctype == "dm" else f"  chat_type={ctype}",
             f"  user_id_alt={s['user_id_alt']}" if s.get("user_id_alt") else "",
             "" if dmode == "notify" else f"  mode={dmode}",
+            "  [waker]" if dmode in kbn.NOTIFY_WAKE_MODES and s.get("platform") != "api_server" else "",
         ))
         print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}  (since event {s['last_event_id']}){extras}")
+    return 0
+
+
+def _cmd_notify_status(args: argparse.Namespace) -> int:
+    """Current wake-gate mode as last written by the delivering gateway."""
+    from hermes_cli import kanban_wake_gate as _kwg
+
+    state = _kwg.read_state()
+    if getattr(args, "json", False):
+        print(json.dumps(state or {}, indent=2, sort_keys=True))
+        return 0 if state else 1
+    if not state:
+        print(f"wake gate: no state at {_kwg.state_path()} "
+              "(no gateway has delivered a wake since this build loaded)")
+        return 1
+    age = int(time.time()) - int(state.get("updated_at") or 0)
+    load1 = state.get("load1")
+    load = f"{load1:.1f}" if isinstance(load1, (int, float)) else "?"
+    print(f"wake gate: mode={state.get('mode')}  load1={load}  "
+          f"pause_above={state.get('pause_above')}  "
+          f"resume_below={state.get('resume_below')}  (updated {age}s ago)")
+    for prof, reason in (state.get("lanes_capped") or {}).items():
+        print(f"  {prof}: {reason} -> wakes sent as notify")
     return 0
 
 
@@ -4417,7 +4457,8 @@ _HANDLERS = {
     "home-index": _cmd_home_index,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
-    "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+    "notify-list": _cmd_notify_list, "notify-status": _cmd_notify_status,
+    "notify-unsubscribe": _cmd_notify_unsubscribe,
     "notify-repair": _cmd_notify_repair,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
     "gc": _cmd_gc, "home-lint": _cmd_home_lint,

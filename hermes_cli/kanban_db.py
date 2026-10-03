@@ -4791,7 +4791,8 @@ def _subscribe_new_home(conn: sqlite3.Connection, task_id: str) -> None:
     try:
         from tools.kanban_tools import subscribe_calling_session
 
-        subscribe_calling_session(conn, task_id)
+        # takeover=True: the wake MOVES to the taker (t_74bf5296).
+        subscribe_calling_session(conn, task_id, takeover=True)
     except Exception:
         pass
 
@@ -5957,6 +5958,15 @@ def _inherit_notify_subs(
             continue
         if decision == "replace":
             _drop_notify_subs(conn, others)
+        # One waker per card: an inherited wake row becomes notify when the
+        # child already has a waker (else INSERT OR IGNORE would drop the
+        # whole row on the one-waker index).
+        inherited_mode = prow["delivery_mode"] or "notify"
+        if inherited_mode in NOTIFY_WAKE_MODES and prow["platform"] != "api_server" and card_waker(
+            conn, child_id,
+            exclude=(prow["platform"], prow["chat_id"], prow["thread_id"] or ""),
+        ) is not None:
+            inherited_mode = "notify"
         conn.execute(
             f"""
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -5965,12 +5975,13 @@ def _inherit_notify_subs(
                  delivery_metadata, created_at, last_event_id)
             SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                    scope_id, COALESCE(chat_type, 'dm'), notifier_profile,
-                   COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+                   ?, delivery_metadata, ?, ?
               FROM kanban_notify_subs
              WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
             """,
             (
                 child_id,
+                inherited_mode,
                 int(created_at if created_at is not None else time.time()),
                 cursor,
                 prow["task_id"], prow["platform"], prow["chat_id"],
@@ -19380,6 +19391,10 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
 )
 from hermes_cli.kanban_db_notify import (  # noqa: E402
     NOTIFY_SUB_OWNER_LIVE_SECONDS,
+    NOTIFY_WAKE_MODES,
+    ONE_WAKER_INDEX,
+    _ensure_single_waker_index,
+    card_waker,
     _decode_notify_delivery_metadata,
     _drop_notify_subs,
     _log_sub_kept,

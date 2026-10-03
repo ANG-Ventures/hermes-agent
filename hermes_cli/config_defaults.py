@@ -2497,6 +2497,20 @@ DEFAULT_CONFIG = {
         # CLI create stays silent regardless of this knob, so enabling it
         # only affects agent-session creates that have a delivery channel.
         "cli_auto_subscribe": False,
+        # Auto-subscriptions (agent tool + CLI create) wake the creating
+        # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
+        # card is enforced in the store; false = notify-only.
+        "auto_subscribe_wake": True,
+        # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
+        # Unset thresholds inherit dispatch_load_gate. lane_headroom: also
+        # downgrade while the waker profile's model lane is capped.
+        "wake_load_gate": {
+            "enabled": True,
+            "pause_above": None,
+            "resume_below": None,
+            "lane_headroom": True,
+            "sample_seconds": 15,
+        },
         "reconcile_orphans": True,
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no

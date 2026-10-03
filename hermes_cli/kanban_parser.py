@@ -763,8 +763,11 @@ _SPECS = [
                   "'wake' (wake the agent only, no passive message). Omit to leave an "
                   "existing subscription's mode unchanged (new subs default to 'notify')."),
         _arg("--wake", action="store_true",
-             help="Shorthand for --delivery-mode notify+wake. Wake is opt-in only: "
-                  "each wake is a full agent turn that queues the human's messages."),
+             help="Shorthand for --delivery-mode notify+wake. One waker per card: "
+                  "when another chat holds the wake this sub is stored notify "
+                  "(use --takeover to move it)."),
+        _arg("--takeover", action="store_true",
+             help="Move the card's wake to this chat; the old waker drops to notify."),
         _arg("--also", action="store_true",
              help="Add this chat even when another live chat already subscribes to "
                   "the card. Default: one subscriber chat per card and platform; a "
@@ -772,6 +775,8 @@ _SPECS = [
     ], help="Subscribe a gateway source to a task's terminal events (used by /kanban subscribe in the gateway adapter)"),
     _cmd("notify-list", [_arg("task_id", nargs="?"), _json_flag()],
          help="List notification subscriptions (optionally for a single task)"),
+    _cmd("notify-status", [_json_flag()],
+         help="Show the wake gate: wake or notify (host load / lane headroom)"),
     _cmd("notify-unsubscribe", [_TASK_ID, *_NOTIFY_TARGET], help="Remove a gateway subscription from a task"),
     _cmd("notify-repair", [
         _arg("--dry-run", action="store_true", help="Report what would change without writing"),

@@ -701,10 +701,11 @@ _FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'t
                           'wake': {'type': 'boolean',
                                    'description': 'Only with a gateway auto-subscription: also '
                                                   "WAKE this chat's agent (a full turn) on "
-                                                  'terminal events instead of just posting the '
-                                                  'passive notification line. Defaults to false — '
-                                                  "wakes queue the human's messages, so opt in "
-                                                  'only when this session must act on the result.'},
+                                                  'terminal events, besides the passive '
+                                                  'notification line. Default: wake '
+                                                  '(kanban.auto_subscribe_wake); pass false for '
+                                                  'notify-only. One waker per card; under host '
+                                                  'load a wake is sent as a notify.'},
                           'model_override': {'type': 'string',
                                              'description': 'Per-task model override. Pins the '
                                                             'dispatched worker to this model '

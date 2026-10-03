@@ -934,7 +934,9 @@ def test_migration_backfills_legacy_gateway_subs_to_notify_wake(kanban_home):
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="legacy sub upgrade")
         # Simulate a pre-delivery_mode database: drop the column entirely,
-        # then insert legacy-shaped rows (one gateway, one tui).
+        # then insert legacy-shaped rows (one gateway, one tui). Such a DB
+        # predates the one-waker index on that column (t_74bf5296) too.
+        conn.execute(f"DROP INDEX IF EXISTS {kb.ONE_WAKER_INDEX}")
         conn.execute("ALTER TABLE kanban_notify_subs DROP COLUMN delivery_mode")
         conn.execute(
             "INSERT INTO kanban_notify_subs "
@@ -963,6 +965,11 @@ def test_migration_backfills_legacy_gateway_subs_to_notify_wake(kanban_home):
         "Legacy gateway subscription lost active wake across the upgrade"
     )
     assert rows["tui"] == "notify"
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            (kb.ONE_WAKER_INDEX,),
+        ).fetchone(), "the migration re-creates the one-waker index"
 
 def test_migration_backfill_runs_only_on_first_add(kanban_home):
     from hermes_cli.kanban_db_connect import _migrate_add_optional_columns

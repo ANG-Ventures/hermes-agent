@@ -1114,6 +1114,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _kb._backfill_no_worker_from_body(conn)
 
     _rebuild_drifted_tables(conn)
+    # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
+    _kb._ensure_single_waker_index(conn)
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

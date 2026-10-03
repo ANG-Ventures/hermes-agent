@@ -435,3 +435,24 @@ def test_handlers_never_run_on_the_loops_default_executor(tmp_path):
     reply, names = asyncio.run(scenario())
     assert names["handler"].startswith("gw-control")
     assert reply == {"v": "pooled"}, reply
+
+
+# -- contention gate (t_74bf5296) ---------------------------------------------
+
+def test_wake_downgraded_under_host_contention(store, tmp_path):
+    """Athena/advisor wakes ride this verb: under load the caller gets
+    ``downgraded`` and sends a plain notify; no turn runs."""
+    from hermes_cli.kanban_wake_gate import WakeGate
+
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = WakeGate(
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        ncpu=32, loadavg=lambda: (71.0, 70.0, 60.0), lane_probe=lambda p: None,
+        state_file=tmp_path / "wake_gate.json",
+    )
+    result = asyncio.run(runner._deliver_control_wake(_params()))
+    assert result["delivered"] is False
+    assert result["downgraded"] == "host load 71"
+    assert adapter.handled == []

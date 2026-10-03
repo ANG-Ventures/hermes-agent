@@ -1381,13 +1381,15 @@ def _handle_create(args: dict, **kw) -> str:
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid, wake=args.get("wake") is True),
+                   subscribed=_maybe_auto_subscribe(
+                       conn, new_tid,
+                       wake=args.get("wake") if isinstance(args.get("wake"), bool) else None),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}))
 
 
 def _resolve_notify_target(*, require_platform_identity: bool = False,
-                           wake: bool = False) -> Optional[dict[str, Any]]:
+                           wake: Optional[bool] = None) -> Optional[dict[str, Any]]:
     """``kanban_db.add_notify_sub`` kwargs for the calling session, or None (CLI/cron/tests).
     Gateway sessions: ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` ContextVars. TUI/desktop:
     those are cleared but the subprocess inherits ``HERMES_SESSION_KEY`` -> ``platform="tui"``
@@ -1396,10 +1398,14 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
 
     ``require_platform_identity=True`` (the CLI create path) accepts only a full gateway
     identity and skips the TUI fallback: a bare CLI/cron/script create has no delivery
-    channel and must stay silent (#19718). Delivery mode defaults to ``'notify'`` (passive
-    completion line, no agent turn); ``wake=True`` is the only way to get
-    ``'notify+wake'`` for a gateway session — every wake is a full big-context turn that
-    queues the human's messages, so it must be an explicit opt-in (t_6d6e9467)."""
+    channel and must stay silent (#19718).
+
+    Delivery mode for a gateway session (Ace 2026-10-03 13:28, t_74bf5296): ``wake=None``
+    follows ``kanban.auto_subscribe_wake`` (default True, so ``'notify+wake'``);
+    ``wake=False`` is notify-only; ``wake=True`` forces wake. The store grants the wake only
+    to ONE chat per card (``kanban_db_notify._claim_wake``); a second subscriber is stored
+    ``notify``. Under measured host contention the notifier downgrades a wake to a notify
+    per EVENT (``kanban_wake_gate``); the subscription is not changed."""
     from gateway.session_context import get_session_env as env
     platform, chat_id = env("HERMES_SESSION_PLATFORM", ""), env("HERMES_SESSION_CHAT_ID", "")
     if not platform or not chat_id:
@@ -1446,11 +1452,21 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
         notifier_profile=notifier_profile,
         # None -> add_notify_sub's platform default: 'notify' everywhere except
         # api_server, whose only delivery mechanism is the wake self-post.
-        delivery_mode="notify+wake" if (wake and platform != "tui") else None,
+        delivery_mode="notify+wake" if (_auto_wake(wake) and platform != "tui") else None,
         delivery_metadata=delivery_metadata or None)
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: bool = False) -> bool:
+def _auto_wake(wake: Optional[bool]) -> bool:
+    """``wake=None`` -> ``kanban.auto_subscribe_wake`` (default True, t_74bf5296)."""
+    if wake is not None:
+        return bool(wake)
+    try:
+        return bool(cfg_get(load_config(), "kanban", "auto_subscribe_wake", default=True))
+    except Exception:
+        return True
+
+
+def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = None) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
@@ -1464,7 +1480,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: bool = False) -> boo
 
 
 def subscribe_calling_session(
-    conn: Any, task_id: str, *, require_platform_identity: bool = False, wake: bool = False,
+    conn: Any, task_id: str, *, require_platform_identity: bool = False,
+    wake: Optional[bool] = None, takeover: bool = False,
 ) -> bool:
     """Resolve the calling session's delivery identity and write a notify sub.
     Shared by the agent-tool auto-subscribe path (:func:`_maybe_auto_subscribe`) and
@@ -1484,7 +1501,7 @@ def subscribe_calling_session(
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
             return True
-        _kbn.add_notify_sub(conn, task_id=task_id, **target)
+        _kbn.add_notify_sub(conn, task_id=task_id, takeover=takeover, **target)
         return True
     except Exception as _exc:
         logger.warning(
