@@ -1295,6 +1295,31 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_review_assign_parked(task_id: str, profile: Optional[str]) -> None:
+    """Warn when an assign landed on a ``review`` card: nothing dispatches it.
+
+    Measured 2026-10-02/03 (t_3bd70b59, t_a57274a4, t_82169667): an operator
+    posted a GO comment and ran ``assign <card> <worker>``; the card stayed in
+    ``review`` for 4-8 h and the dispatcher never spawned anyone, because it
+    only claims ``ready`` cards. The assign itself still succeeds (exit 0) --
+    this names the status and the verb that actually moves the card.
+    """
+    if not kb.is_worker_assignee(profile):
+        return
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    if task is None or task.status != "review":
+        return
+    print(
+        f"WARNING: {task_id} is in status 'review'; assigning {profile!r} does NOT "
+        f"dispatch it (the dispatcher only claims 'ready' cards), so the card stays "
+        f"parked. To send it back to the worker run: hermes kanban request-changes "
+        f"{task_id} \"<asks>\" --coverage '<json>'  (or: hermes kanban complete "
+        f"{task_id} to close it).",
+        file=sys.stderr,
+    )
+
+
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
@@ -1307,8 +1332,11 @@ def _cmd_assign(args: argparse.Namespace) -> int:
             )
         except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet) as exc:
             return _err(str(exc))
-    return _ok_or_err(ok, f"no such task: {args.task_id}",
-                      f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+    rc = _ok_or_err(ok, f"no such task: {args.task_id}",
+                    f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+    if rc == 0:
+        _warn_review_assign_parked(args.task_id, profile)
+    return rc
 
 
 _ACTIVE_STATUSES = ("ready", "running", "todo", "blocked", "triage", "scheduled", "review")
@@ -2333,6 +2361,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         f"{profile or '(unassigned)'}"
         + (" (claim reclaimed)" if reclaimed else "")
     )
+    _warn_review_assign_parked(args.task_id, profile)
     return 0
 
 
