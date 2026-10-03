@@ -391,19 +391,36 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
-    _watch_children = getattr(server, "_watch_stdio_children", None)
+    _session = server.session
+    _call_coro = _session.call_tool(tool_name, arguments=args)
+    # Fast-fail watcher per transport: stdio watches child PIDs (#81995); HTTP pings the session
+    # (server restart mid-call, #1659 / t_f2e3f8d4).
+    _is_http_fn = getattr(server, "_is_http", None)
+    _http = callable(_is_http_fn) and _is_http_fn() is True
+    _watch_children = getattr(server, "_watch_http_session" if _http else "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
         return await _call_coro if asyncio.iscoroutine(_call_coro) else _call_coro
-    # Fast-fail machinery (#81995): the RPC races a stdio-children watcher so a dead subprocess fails the
-    # call immediately instead of riding out the full tool timeout.
+    # Fast-fail machinery (#81995): the RPC races a transport watcher so a dead subprocess / lost HTTP
+    # session fails the call immediately instead of riding out the full tool timeout.
     rpc_task = asyncio.ensure_future(_call_coro)
-    watch_task = asyncio.ensure_future(_watch_children())
+    watch_task = asyncio.ensure_future(_watch_children(_session) if _http else _watch_children())
     try:
         done, _pending = await asyncio.wait({rpc_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
         if watch_task in done and not rpc_task.done():
             rpc_task.cancel()
+            if _http:
+                # Nothing clears server.session on a lost HTTP session; without a reconnect signal the
+                # server stays dead until the idle keepalive notices. Deliberately NOT a session-expired
+                # marker: the server may already have run the tool, so no handler may auto-retry a
+                # possibly side-effecting call. Fail fast and let the model decide.
+                _loop._signal_reconnect(server)
+                _lost = watch_task.result()
+                raise ConnectionError(
+                    f"MCP server '{server_name}' lost the HTTP session mid-call "
+                    f"({type(_lost).__name__}); failing fast instead of waiting out the tool timeout. "
+                    f"Reconnect requested. The tool may or may not have run: check state before retrying"
+                )
             raise _StdioChildExited(
                 f"MCP stdio subprocess for '{server_name}' exited mid-call",
                 in_flight=True,

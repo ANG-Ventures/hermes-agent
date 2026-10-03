@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from typing import Iterable, Optional
-from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
+from tools.mcp_tool_errors import _is_method_not_found_error, _is_session_expired_error, _unwrap_exception_group
 from tools.mcp_tool_schema import mcp_prefixed_tool_name
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_registration as _registration
@@ -293,3 +293,61 @@ class MCPServerHealthMixin:
         while not self._stdio_children_dead():
             # Async context — never block the loop (#36163).
             await asyncio.sleep(0.25)
+
+    async def _watch_http_session(self, session) -> BaseException:
+        """Probe the HTTP session a tool call is riding while it is in flight (#1659).
+
+        HTTP counterpart of :meth:`_watch_stdio_children`. When a streamable-http server restarts
+        mid-call, mcp 1.x drops the response stream without resolving the request, so the call
+        rides the full tool timeout while holding ``_rpc_lock`` and every other call to this
+        server queues behind it (clanker 2026-10-02: 300 s hang, others queued up to 260 s). The
+        idle keepalive cannot catch it because it skips probing while an RPC is in flight.
+
+        Returns an exception describing the loss when (a) the server task replaced or dropped
+        ``session`` (transport crash + reconnect), or (b) a ``ping`` on it fails with a
+        session-loss error. HTTP requests are independent POSTs, so a concurrent ``ping`` is safe
+        (unlike stdio). A slow or timed-out ping does not count as loss: busy is not dead.
+        """
+        loop = asyncio.get_running_loop()
+        next_ping = loop.time() + _core._HTTP_INFLIGHT_PROBE_INTERVAL
+        ping_task: Optional[asyncio.Task] = None
+        ping_deadline = 0.0
+        try:
+            while True:
+                # Identity is checked every tick, even while a ping is pending: a ping on a dead
+                # mcp 1.x session can hang for its whole timeout, but the server task swaps the
+                # session the moment the transport crashes.
+                await asyncio.sleep(0.25)
+                if self.session is not session:
+                    return ConnectionError("session replaced by a reconnect")
+                now = loop.time()
+                if ping_task is None:
+                    if self._ping_unsupported or now < next_ping:
+                        continue
+                    ping_task = asyncio.ensure_future(session.send_ping())
+                    ping_deadline = now + _core._HTTP_INFLIGHT_PROBE_TIMEOUT
+                    continue
+                if not ping_task.done():
+                    if now >= ping_deadline:
+                        # Slow is not dead: a busy server may queue the ping.
+                        ping_task.cancel()
+                        ping_task = None
+                        next_ping = now + _core._HTTP_INFLIGHT_PROBE_INTERVAL
+                    continue
+                done_task, ping_task = ping_task, None
+                next_ping = now + _core._HTTP_INFLIGHT_PROBE_INTERVAL
+                if done_task.cancelled():
+                    # mcp 1.x: a transport task-group crash (e.g. ConnectError while the server
+                    # is down) cancels the ping from inside.
+                    return ConnectionError("ping cancelled by transport teardown")
+                exc = done_task.exception()
+                if exc is None:
+                    continue
+                if _is_method_not_found_error(exc):
+                    self._ping_unsupported = True
+                    continue
+                if _is_session_expired_error(exc):
+                    return exc
+        finally:
+            if ping_task is not None and not ping_task.done():
+                ping_task.cancel()
