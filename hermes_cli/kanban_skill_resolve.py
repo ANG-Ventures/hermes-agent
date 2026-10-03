@@ -69,10 +69,12 @@ def _read_external_dirs(home: Path) -> list[Path]:
     cfg_path = home / "config.yaml"
     if not cfg_path.is_file():
         return []
-    import yaml  # local: the dispatcher hot path never pays for it otherwise
+    # Raw read of ANOTHER profile's file (a raw-file diagnostic): no defaults
+    # merge, matching what the worker's own skill_utils reads for external_dirs.
+    from hermes_cli.config import read_user_config_raw
 
     try:
-        parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        parsed = read_user_config_raw(cfg_path) or {}
     except Exception:
         _log.debug("kanban skill resolve: unreadable %s", cfg_path, exc_info=True)
         return []
