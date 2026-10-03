@@ -29,8 +29,11 @@ jobs:
     name: Windows install.ps1 + hermes update E2E
     # Fork: no windows-latest-32-core pool in this org.
     runs-on: windows-latest
-    # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 50
+    # Upstream's 32-core pool: ~17 min (one slow runner 28 min, run 36295230146). On hosted
+    # 4-vCPU windows-latest with 2 workers (below) a file takes 1048-1359 s, so three batches
+    # of two are ~65 min (measured run 37102491348, cancelled by the previous 50 min wall with
+    # 4/6 files green and the last pair mid-install).
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -61,8 +64,13 @@ jobs:
           HERMES_E2E_MACHINE_ROOT: ${{ runner.temp }}\wm
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-          # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
+          # Upstream runs one journey per file, all six in parallel, on a 32-core pool. On the
+          # 4-vCPU hosted runner six concurrent install.ps1 (toolchain unpack + uv sync + npm ci)
+          # are CPU-bound: install.ps1 reached "Preparing Node dependencies" at 1246-1405 s and
+          # every journey hit INSTALL_TIMEOUT=1500 (run 37100414187, 0/18). With 2 workers the
+          # install takes 870-1015 s and the cells pass (run 37102491348: 15/15 across the 4
+          # files that finished inside the old job wall).
+          HERMES_TEST_WORKERS: '2'
           HERMES_TEST_FILE_TIMEOUT: '2400'
           # Six journeys each run install.ps1 (a cold PM toolchain + venv + Node deps) on a
           # 4-vCPU hosted runner. A journey is one module-scoped fixture (install -> update
