@@ -49,9 +49,12 @@ class _APIError(Exception):
         self.response = SimpleNamespace(headers={})
 
 
-@pytest.mark.parametrize("body", [SDK_BODY, TUI_BODY], ids=["sdk-error_code", "tui-code"])
+@pytest.mark.parametrize("body", [SDK_BODY, TUI_BODY, SDK_BODY["error"], TUI_BODY["error"]],
+                         ids=["sdk-error_code", "tui-code", "sdk-unwrapped", "tui-unwrapped"])
 def test_bridge_safeguard_refusal_never_falls_back(body):
-    err = _APIError(body["error"]["message"], status_code=400, body=body)
+    # Prism r2: the unwrapped SDK body ({"type":..., "error_code":...}) is covered too.
+    msg = (body.get("error") or body)["message"]
+    err = _APIError(msg, status_code=400, body=body)
     c = classify_api_error(err, provider="claude-btpr", model="claude-opus-5-5")
     assert c.reason == FailoverReason.content_policy_blocked
     assert c.should_fallback is False, "a refused turn must never be answered by another model"

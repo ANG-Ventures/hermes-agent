@@ -2496,10 +2496,15 @@ def _is_safeguard_refusal(error_code: str, body) -> bool:
     """
     if (error_code or "").strip().lower() == SAFEGUARD_REFUSAL_ERROR_CODE:
         return True
-    err = body.get("error") if isinstance(body, dict) else None
-    if isinstance(err, dict):
+    if not isinstance(body, dict):
+        return False
+    # Both shapes: the HTTP envelope ``{"error": {...}}`` and the unwrapped error
+    # object some SDKs expose as ``exc.body`` (``{"type": ..., "error_code": ...}``).
+    for obj in (body.get("error"), body):
+        if not isinstance(obj, dict):
+            continue
         for key in ("error_code", "code"):
-            value = err.get(key)
+            value = obj.get(key)
             if isinstance(value, str) and value.strip().lower() == SAFEGUARD_REFUSAL_ERROR_CODE:
                 return True
     return False
