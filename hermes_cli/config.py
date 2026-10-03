@@ -3773,7 +3773,7 @@ def _render_config_set(config_path: Path, key: str, value: Any, new_config: dict
     """
     from utils import roundtrip_yaml_render
 
-    original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    original = config_path.read_text(encoding="utf-8-sig") if config_path.exists() else ""
     if original.strip():
         edited = _targeted_config_edit(original, key, value, new_config)
         if edited is not None:
@@ -3805,7 +3805,7 @@ def _write_config_set_text(config_path: Path, key: str, value: Any, user_config:
     from utils import atomic_write_text
     from hermes_cli.observability.shared_metrics_disabled import recording_raw_config_write
 
-    original_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    original_text = config_path.read_text(encoding="utf-8-sig") if config_path.exists() else ""
     new_text = _render_config_set(config_path, key, value, user_config)
     dropped = _yaml_comment_lines(original_text) - _yaml_comment_lines(new_text)
     if dropped and not force:

@@ -160,7 +160,7 @@ def _notify_priority_starved(
 
         marker = _kb.board_state_dir(board) / _PRIORITY_STARVATION_MARKER
         try:
-            seen = json.loads(marker.read_text(encoding="utf-8"))
+            seen = json.loads(marker.read_text(encoding="utf-8-sig"))
         except Exception:
             seen = {}
         if not isinstance(seen, dict):
