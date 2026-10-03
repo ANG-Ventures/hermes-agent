@@ -6,6 +6,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 """
 from __future__ import annotations
 import contextlib
+import json
 import os
 import re
 import signal
@@ -74,6 +75,131 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # wall, burning a worker slot every tick for hours. Overridable via
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+
+# Priority-starvation guard (t_24d20798). The ready loop already admits
+# ``priority DESC, created_at ASC``; a high-priority card that sits in ready
+# while lower-priority cards spawn is therefore being HELD by a per-card gate
+# (respawn guard, pool deferral, overlap hold, ...). On 2026-10-02 t_2f8b03ac
+# (p62) sat ready 10:05 -> 15:40 behind ``respawn_guarded: active_pr`` (247
+# events) while 110 lower-priority claims went through, and nothing said so.
+# 2 h is the threshold the card set; measured p90 ready-dwell of every band
+# over the prior 48 h was <= 30 min for unheld cards.
+PRIORITY_STARVATION_SECONDS = 2 * 3600
+_PRIORITY_STARVATION_MARKER = ".priority_starvation.json"
+_PRIORITY_STARVATION_HOLD_KINDS = ("respawn_guarded", "deferred", "parked_by_policy")
+
+
+def find_priority_starved(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+    threshold_seconds: int = PRIORITY_STARVATION_SECONDS,
+) -> list[dict]:
+    """Ready cards held past ``threshold_seconds`` while lower priority ran.
+
+    A card qualifies when it has been ``ready`` (since its latest entry into
+    ready, else ``created_at``) for longer than the threshold AND at least
+    one run on a strictly lower-priority card started after that entry.
+    Each hit names the card, its dwell, the newest hold reason recorded
+    since it went ready, and one lower-priority card admitted meanwhile.
+    """
+    now = int(time.time()) if now is None else int(now)
+    hits: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, priority, assignee, created_at FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL"
+    ).fetchall():
+        entered = conn.execute(
+            "SELECT MAX(changed_at) FROM task_status_audit WHERE task_id = ? "
+            "AND new_status = 'ready' AND old_status IS NOT 'ready'",
+            (row["id"],),
+        ).fetchone()[0]
+        since = int(entered if entered is not None else row["created_at"])
+        if now - since <= threshold_seconds:
+            continue
+        prio = int(row["priority"] or 0)
+        lower = conn.execute(
+            "SELECT r.task_id, t.priority FROM task_runs r "
+            "JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.started_at >= ? AND r.task_id != ? "
+            "AND COALESCE(t.priority, 0) < ? ORDER BY r.id DESC LIMIT 1",
+            (since, row["id"], prio),
+        ).fetchone()
+        if lower is None:
+            continue
+        hold = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN (%s) ORDER BY id DESC LIMIT 1"
+            % ",".join("?" * len(_PRIORITY_STARVATION_HOLD_KINDS)),
+            (row["id"], since, *_PRIORITY_STARVATION_HOLD_KINDS),
+        ).fetchone()
+        reason = "none recorded"
+        if hold is not None:
+            try:
+                reason = str((json.loads(hold[0] or "null") or {}).get("reason") or reason)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        hits.append({
+            "task_id": row["id"], "priority": prio, "assignee": row["assignee"],
+            "ready_since": since, "ready_seconds": now - since, "reason": reason,
+            "lower_task_id": lower["task_id"], "lower_priority": int(lower["priority"] or 0),
+        })
+    return hits
+
+
+def _notify_priority_starved(
+    conn: sqlite3.Connection, board: Optional[str], hits: list[dict],
+) -> None:
+    """One #logs line + one ``priority_starved`` event per card ready-episode.
+
+    Latched per ``(task_id, ready_since)`` in the board state dir, and only
+    once the line went out, so a failed send retries next tick and a card
+    that leaves ready and comes back starved again is reported again.
+    """
+    try:
+        from hermes_cli import kanban_budget as _kbudget
+
+        marker = _kb.board_state_dir(board) / _PRIORITY_STARVATION_MARKER
+        try:
+            seen = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            seen = {}
+        if not isinstance(seen, dict):
+            seen = {}
+        current = {h["task_id"]: h["ready_since"] for h in hits}
+        latched = {k: v for k, v in seen.items() if current.get(k) == v}
+        changed = latched != seen
+        script = _kbudget._notify_script_path()
+        import sys as _sys
+        for h in hits:
+            if latched.get(h["task_id"]) == h["ready_since"]:
+                continue
+            body = (
+                f"⏳ Kanban '{board or 'default'}': {h['task_id']} (p{h['priority']}, "
+                f"{h['assignee'] or 'unassigned'}) READY {h['ready_seconds'] // 60} min "
+                f"while lower priority was admitted (e.g. {h['lower_task_id']} "
+                f"p{h['lower_priority']}). Held by: {h['reason']}."
+            )
+            _kb._log.warning("PHASE=kanban_priority_starved %s", body)
+            delivered = None
+            if script is not None:
+                delivered = _kbudget._run_notify([
+                    _sys.executable, script, "--channel", "discord",
+                    "--target", _kbudget.RECOVERY_TARGET, "--send", body,
+                ])
+            if delivered is False:
+                continue
+            with _kbc.write_txn(conn):
+                _kb._append_event(conn, h["task_id"], "priority_starved", {
+                    k: h[k] for k in ("ready_seconds", "reason", "lower_task_id",
+                                      "lower_priority")
+                })
+            latched[h["task_id"]] = h["ready_since"]
+            changed = True
+        if changed:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(latched), encoding="utf-8")
+    except Exception as exc:
+        _kb._log.warning("kanban priority-starvation notify failed (%s: %s)", type(exc).__name__, exc)
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -252,6 +378,10 @@ class DispatchResult:
     woken_scheduled: list[str] = field(default_factory=list)
     """``scheduled`` task ids whose timed wake (``next_eligible_at``) passed
     this tick and were returned to ``ready``/``todo`` by ``wake_due_scheduled``."""
+    priority_starved: list[tuple[str, int, str]] = field(default_factory=list)
+    """``(task_id, ready_seconds, hold_reason)`` for ready cards past
+    ``PRIORITY_STARVATION_SECONDS`` while a lower-priority card was admitted
+    since they went ready; see :func:`find_priority_starved`."""
     unwoken_scheduled: list[tuple[str, int]] = field(default_factory=list)
     """``(task_id, parked_seconds)`` for ``scheduled`` cards with NO timed wake
     parked past ``SCHEDULED_UNWOKEN_THRESHOLD_SECONDS`` — nothing will ever
@@ -5021,6 +5151,16 @@ def _dispatch_once_locked(
             result.spawn_failed.append(claimed.id)
             if auto:
                 result.auto_blocked.append(claimed.id)
+    if not dry_run:
+        try:
+            starved = find_priority_starved(conn, now=_tick_now)
+            result.priority_starved = [
+                (h["task_id"], h["ready_seconds"], h["reason"]) for h in starved
+            ]
+            if starved:
+                _notify_priority_starved(conn, board, starved)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban priority-starvation check failed: %s", exc)
     return result
 
 

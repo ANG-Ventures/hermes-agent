@@ -308,10 +308,17 @@ def start_loop_liveness_watchdog(
     starvation_load_factor: float = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
     starvation_max_hold_s: float = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    pre_exit: Optional[Callable[[], None]] = None,
+    pre_exit_timeout: float = 10.0,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes. The caller
     (``GatewayRunner._start_loop_liveness_guards``) enforces the ``gateway.loop_watchdog: false``
-    opt-out."""
+    opt-out.
+
+    ``pre_exit`` runs on a daemon thread right before the hard exit, bounded
+    by ``pre_exit_timeout`` (the gateway records its in-flight turns there,
+    r31 G). It must not need the event loop, which is wedged by definition.
+    """
     stop_event = threading.Event()
     # The thread whose stack names the blocking site when probes go unanswered.
     try:
@@ -435,6 +442,17 @@ def start_loop_liveness_watchdog(
                 logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
             if stop_event.is_set():
                 return
+            if pre_exit is not None:
+                try:
+                    worker = threading.Thread(
+                        target=pre_exit, name="loop-watchdog-pre-exit", daemon=True
+                    )
+                    worker.start()
+                    worker.join(timeout=pre_exit_timeout)
+                except Exception:
+                    logger.debug("Loop liveness pre-exit hook failed", exc_info=True)
+                if stop_event.is_set():
+                    return
             _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
             _hard_exit(exit_code)
     thread = threading.Thread(target=_watchdog, daemon=True, name="gateway-loop-liveness-watchdog")

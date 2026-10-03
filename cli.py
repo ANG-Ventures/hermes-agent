@@ -611,10 +611,12 @@ def _record_abandoned_review_turns(reason: str) -> None:
     shutdown; a fork whose turn already emitted is skipped. Never raises.
     """
     try:
-        from agent.background_review import live_background_review_agents
+        from agent.background_review import fence_background_reviews_and_snapshot
         from agent.turn_finalizer import emit_abandoned_session_ends
 
-        agents = live_background_review_agents()
+        # Fence first: a fork still being built (not yet registered) must not
+        # start a provider call after this snapshot (r31 G).
+        agents = fence_background_reviews_and_snapshot()
         if agents:
             emit_abandoned_session_ends(agents, reason)
     except Exception:

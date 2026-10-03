@@ -1086,7 +1086,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 | `lifecycle_channel` | `""` | `platform:chat_id` that receives the notifier's done / ready-for-review / blocked lines instead of the subscriber's chat (e.g. a log channel). The subscriber's agent is still woken. A `needs_input` block on a priority >= 100 card, failure lines, review change requests and triage routing stay in the subscriber's chat. Empty = unchanged. |
-| `lifecycle_digest_seconds` | `0` | With `lifecycle_channel` set: hold its lines and post them as one digest message once the oldest held line is this many seconds old. The subscriber's wake is not delayed. `0` = one post per line. |
+| `lifecycle_digest_seconds` | `0` | With `lifecycle_channel` set: hold its lines and post them as ONE digest message (bounded to one Discord message; overflow folds into a "+N more" tally) once the oldest held line is this many seconds old (`14400` = one post per 4 h). The subscriber's wake is not delayed. `0` = one post per line. |
 
 And the two auxiliary LLM slots:
 

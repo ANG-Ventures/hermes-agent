@@ -1040,6 +1040,8 @@ class GatewayStartupMixin:
                         config, "liveness_starvation_max_hold_s",
                         DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
                     )),
+                    # Record in-flight turns before the hard exit (r31 G, t_2f8b03ac).
+                    pre_exit=self._record_abandoned_turns_before_watchdog_exit,
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
