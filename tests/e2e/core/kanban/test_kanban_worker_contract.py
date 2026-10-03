@@ -171,7 +171,22 @@ def test_worker_with_unresolvable_pinned_skill_still_starts_its_session(tmp_path
             tid = board.create("stale pin card", "--skill", "e2e-archived")
             # The operator removes the skill after the pin was written.
             shutil.rmtree(board.hermes_home / "skills" / "e2e-archived")
-            _run_one_card(board, tid)
+            board.dispatch()
+            # Fork resolution of #119619 (#1677, t_0b786d9b): the dispatcher refuses a card whose
+            # every --skill is unresolvable BEFORE claiming a run, blocking it kind=capability
+            # with the missing name, instead of spawning a worker that dies at startup. That is a
+            # loud, unclaimed outcome, which is the property this test protects.
+            task = board.task(tid)
+            refused = board.events(tid, "skill_refused")
+            if not task["worker_pid"] and refused:
+                assert task["status"] == "blocked" and task["block_kind"] == "capability", board.diag(tid)
+                assert refused[-1]["payload"]["missing"] == ["e2e-archived"], board.diag(tid)
+                assert not board.runs(tid) or board.runs(tid)[-1]["worker_pid"] is None, board.diag(tid)
+                assert not srv.main_requests(), "no worker session for a refused card"
+                return
+            pid = task["worker_pid"]
+            assert pid, board.diag(tid)
+            board.wait_worker_exit(tid, int(pid))
             log = wait_until(lambda: board.worker_log(tid), 10, "worker log")
             exits = [int(rc) for rc in _EXIT_RE.findall(log)]
             # The bug's own signature: no model call at all, and the worker died of the stale pin
