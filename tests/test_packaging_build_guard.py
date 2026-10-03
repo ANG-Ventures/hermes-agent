@@ -39,6 +39,19 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
         encoding="utf-8",
     )
     env["DIST_EXTRA_CONFIG"] = str(extra_cfg)
+    # build_sdist writes its release tree (hermes_agent-<ver>/, a full copy of
+    # the source) into the CWD and deletes it afterwards. With cwd=PROJECT_ROOT
+    # every repo-wide rglob("*.py") guard running in a parallel worker saw that
+    # tree appear and vanish mid-scan (FileNotFoundError, main CI d5032fe98).
+    # Build from a tmp root that symlinks the checkout's top-level entries, so
+    # the release tree lands under tmp_path and never inside the repo.
+    src = tmp_path / "src"
+    src.mkdir()
+    for entry in PROJECT_ROOT.iterdir():
+        name = entry.name
+        if name in ("build", "dist") or name.endswith(".egg-info") or name.startswith("hermes_agent-"):
+            continue
+        (src / name).symlink_to(entry, target_is_directory=entry.is_dir())
     return subprocess.run(
         [
             sys.executable,
@@ -47,7 +60,7 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
                 kind=kind, out=tmp_path
             ),
         ],
-        cwd=PROJECT_ROOT,
+        cwd=src,
         env=env,
         text=True,
         capture_output=True,
