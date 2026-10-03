@@ -727,6 +727,13 @@ jobs:
           T=$(mktemp -d); printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' > "$T/.profile"
           env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "probe PATH=$PATH"' 2>&1 | sed 's/^/tmp-home: /'
           env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "BASH_ENV=${BASH_ENV:-} ENV=${ENV:-}"; shopt login_shell' 2>&1 | sed 's/^/tmp-home: /'
+          echo "--- /etc/profile.d/blacksmith.sh ---"; cat /etc/profile.d/blacksmith.sh 2>/dev/null | sed 's/^/bs: /'
+          echo "--- /etc/profile ---"; cat /etc/profile | sed 's/^/etcp: /'
+          echo "--- trace: does ~/.profile run, and what is PATH right after it? ---"
+          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'true' 2>&1 >/dev/null | head -3
+          printf '%s\n' 'echo "IN-PROFILE PATH=$PATH"; export PATH="$HOME/.local/bin:$PATH"; echo "AFTER-PROFILE PATH=$PATH"' > "$T/.profile"
+          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "FINAL PATH=$PATH"' 2>/dev/null | sed 's/^/trace: /'
+          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lc 'echo "NONINTERACTIVE-LOGIN PATH=$PATH"' 2>/dev/null | sed 's/^/trace: /'
 
       - name: Run upgrade e2e tests (${{ matrix.shard }})
         run: |
