@@ -1919,6 +1919,13 @@ _CONTENT_POLICY_RECOVERY_HINT = (
     "Try rephrasing the request, narrowing the context, or "
     "adding a fallback provider with `hermes fallback add`."
 )
+# A Claude bridge/relay ``safeguard_refusal`` (t_997efe88, Ace ruling
+# 2026-10-02): another model must never answer the turn, so the hint names
+# the one recovery that is allowed.
+_SAFEGUARD_REFUSAL_RECOVERY_HINT = (
+    "safeguard_refusal: rephrase the request and retry on the same model "
+    "(do not switch model)."
+)
 
 
 # Memo for the send-path tool-call argument canonicalization inside
@@ -8168,18 +8175,25 @@ def run_conversation(
                     else:
                         agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.content_policy_blocked:
+                        from agent.error_classifier import is_safeguard_refusal as _is_sgr
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
                             "(not a Hermes/gateway failure).\n\n"
                             f"Provider message: {_nonretryable_summary}\n\n"
-                            f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                            f"{_SAFEGUARD_REFUSAL_RECOVERY_HINT if _is_sgr(classified) else _CONTENT_POLICY_RECOVERY_HINT}"
                         )
-                        return _content_policy_blocked_result(
+                        _policy_result = _content_policy_blocked_result(
                             messages,
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
                         )
+                        if _is_sgr(classified):
+                            # Kanban workers park the card needs_input on this
+                            # (hermes_cli/kanban_worker_exit.py, t_997efe88).
+                            _policy_result["failure_reason"] = classified.reason.value
+                            _policy_result["error_code"] = "safeguard_refusal"
+                        return _policy_result
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
                     # the max-retries path so every surface (CLI, TUI, desktop)

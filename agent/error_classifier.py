@@ -1342,6 +1342,22 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # Claude bridge / relay lanes (claude-bpx, claude-bpr) egress a safeguard
+    # refusal as HTTP 400 with the machine code ``safeguard_refusal`` (sdk lane:
+    # ``error.error_code``; tui lane: ``error.code``). Ace ruling 2026-10-02
+    # (t_997efe88): a refused turn is NEVER answered by another model — no
+    # fallback-chain walk, no retry — and the refusal surfaces in the chat that
+    # owns the turn so the request gets rephrased. Before this branch it fell
+    # through to the generic-400 ``format_error`` bucket with
+    # ``should_fallback=True``, i.e. a silent client-side model switch.
+    if _is_safeguard_refusal(error_code, body):
+        return _result(
+            FailoverReason.content_policy_blocked,
+            retryable=False,
+            should_fallback=False,
+            error_context={"error_code": SAFEGUARD_REFUSAL_ERROR_CODE},
+        )
+
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged
     # just reproduces the same refusal and burns paid attempts. Must run
@@ -2467,6 +2483,33 @@ def _classify_400(
 
 
 # ── Error code classification ───────────────────────────────────────────
+
+SAFEGUARD_REFUSAL_ERROR_CODE = "safeguard_refusal"
+
+
+def _is_safeguard_refusal(error_code: str, body) -> bool:
+    """True for a bridge/relay ``safeguard_refusal`` (t_997efe88).
+
+    ``_extract_error_code`` prefers ``error.code``/``error.type``, so the sdk
+    lane's ``error.error_code`` (beside ``type: invalid_request_error``) is
+    read here directly.
+    """
+    if (error_code or "").strip().lower() == SAFEGUARD_REFUSAL_ERROR_CODE:
+        return True
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        for key in ("error_code", "code"):
+            value = err.get(key)
+            if isinstance(value, str) and value.strip().lower() == SAFEGUARD_REFUSAL_ERROR_CODE:
+                return True
+    return False
+
+
+def is_safeguard_refusal(classified) -> bool:
+    """Whether a ClassifiedError is a bridge safeguard refusal (never switch model)."""
+    ctx = getattr(classified, "error_context", None) or {}
+    return ctx.get("error_code") == SAFEGUARD_REFUSAL_ERROR_CODE
+
 
 def _classify_by_error_code(
     error_code: str, error_msg: str, result_fn,

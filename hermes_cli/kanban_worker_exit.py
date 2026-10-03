@@ -83,6 +83,52 @@ def worker_exit_class(failure_reason: str | None, error: str = "") -> str | None
     return None
 
 
+SAFEGUARD_REFUSAL_MARK = "safeguard_refusal"
+
+
+def block_on_safeguard_refusal(result) -> bool:
+    """Park this worker's card as ``needs_input`` when its turn was refused.
+
+    Ace ruling 2026-10-02 (t_997efe88): a Claude bridge/relay safeguard refusal
+    is never answered by another model, and a respawn would re-send the same
+    flagged content. The card goes ``needs_input`` with the refusal line as the
+    block reason, so the EXISTING needs_input pager (#1612) posts it to the
+    card's origin chat, where the request gets rephrased. Only the owning
+    worker of a running card acts; anything else is a no-op. Never raises.
+    """
+    try:
+        if not (isinstance(result, dict) and result.get("failed")):
+            return False
+        if result.get("error_code") != SAFEGUARD_REFUSAL_MARK:
+            return False
+        error = str(result.get("error") or "")
+        task_id = os.environ.get("HERMES_KANBAN_TASK")
+        from agent.delegation_context import owns_kanban_worker_authority
+        if not task_id or not owns_kanban_worker_authority():
+            return False
+        from hermes_cli import kanban_db as kb
+        run_id = None
+        try:
+            run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+        except ValueError:
+            run_id = None
+        detail = error.replace("content_policy_blocked:", "", 1).strip()[:400]
+        reason = (
+            "safeguard_refusal: the model's safeguards refused this card's turn "
+            "(no other model answers it, by ruling). Rephrase the card body/request "
+            f"and unblock. Refusal: {detail}"
+        )
+        conn = kb.connect()
+        try:
+            return bool(kb.block_task(conn, task_id, reason=reason, kind="needs_input",
+                                      expected_run_id=run_id))
+        finally:
+            conn.close()
+    except Exception:
+        logging.getLogger(__name__).warning("safeguard-refusal block failed", exc_info=True)
+        return False
+
+
 class WorkerExit(SystemExit):
     """Carry the final provider reason through CLI cleanup without error text."""
 
@@ -102,6 +148,9 @@ class WorkerExit(SystemExit):
             and result.get("final_response")
         )
         code = 0
+        # t_997efe88: a refused turn parks the card needs_input (refusal line in
+        # the reason -> the needs_input pager posts it to the origin chat).
+        self.blocked_on_refusal = block_on_safeguard_refusal(result)
         if isinstance(result, dict) and result.get("failed"):
             code = 1
             exit_class = worker_exit_class(self.failure_reason, result.get("error", ""))
