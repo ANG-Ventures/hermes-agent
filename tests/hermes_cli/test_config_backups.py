@@ -1,4 +1,5 @@
 """config.yaml backups: one dir, deduped, bounded — never a pile of siblings in HERMES_HOME."""
+import os
 from pathlib import Path
 
 from hermes_cli.config_backups import backup_config, list_config_backups
@@ -22,6 +23,21 @@ def test_repeat_backups_dedupe_and_rotate(tmp_path: Path, monkeypatch):
     # Nothing left beside config.yaml in the home root.
     assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["config.yaml"]
 
+
+
+def test_same_size_rewrite_in_one_mtime_tick_is_backed_up(tmp_path: Path, monkeypatch):
+    # fork (parity 2026-10-01 CI): filecmp.cmp's (size, mtime) cache made this skip on Blacksmith.
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model: a\n")
+    stamps = iter(f"2026010100000{i}" for i in range(10))
+    monkeypatch.setattr("hermes_cli.config_backups.time.strftime", lambda _fmt: next(stamps))
+    first = backup_config(cfg, "pre-setup")
+    assert backup_config(cfg, "pre-setup") is None
+    tick = cfg.stat()
+    cfg.write_text("model: b\n")
+    os.utime(cfg, ns=(tick.st_atime_ns, tick.st_mtime_ns))
+    second = backup_config(cfg, "pre-setup")
+    assert second is not None and second != first and second.read_text() == "model: b\n"
 
 def test_legacy_siblings_move_but_user_named_copies_stay(tmp_path: Path):
     cfg = tmp_path / "config.yaml"

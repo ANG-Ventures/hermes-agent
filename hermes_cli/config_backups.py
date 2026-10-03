@@ -10,7 +10,6 @@ for the same reason is skipped, and only the newest ``keep`` per reason survive,
 
 from __future__ import annotations
 
-import filecmp
 import logging
 import shutil
 import time
@@ -55,7 +54,9 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         root.mkdir(parents=True, exist_ok=True)
         _sweep_legacy_siblings(config_path, root)
         existing = list_config_backups(config_path, reason)
-        if existing and filecmp.cmp(config_path, existing[0], shallow=False):
+        # Bytes, not filecmp.cmp: its cache keys on (size, mtime), so a same-size rewrite inside one
+        # mtime tick compared equal to the previous copy and the backup was silently skipped.
+        if existing and existing[0].read_bytes() == config_path.read_bytes():
             return None
         dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
         if dest.is_symlink() or dest.exists():  # never write through a planted link

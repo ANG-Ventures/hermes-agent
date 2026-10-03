@@ -61,7 +61,11 @@ def _wire(home: Path, runs: int = 1) -> None:
 
 
 def _login_path(home: Path) -> list[str]:
-    result = subprocess.run(["bash", "-lc", 'printf %s "$PATH"'],
+    # fork (parity 2026-10-01 CI): not `bash -lc`. A login shell reads the HOST /etc/profile first, and
+    # Blacksmith's /etc/profile.d/blacksmith.sh resets HOME=/home/runner for the runner user, so the
+    # user's ~/.bash_profile was never read (PATH lacked ~/.local/bin; slice 14/16 red). Skip the
+    # system files and source the user's login file, which is the part under test.
+    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", '. "$HOME/.bash_profile"; printf %s "$PATH"'],
                             env={"HOME": str(home), "PATH": "/usr/local/bin:/usr/bin:/bin"},
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
