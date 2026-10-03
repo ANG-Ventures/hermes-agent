@@ -107,11 +107,13 @@ def block_on_safeguard_refusal(result) -> bool:
         if not task_id or not owns_kanban_worker_authority():
             return False
         from hermes_cli import kanban_db as kb
-        run_id = None
+        # Fenced to THIS run: block_task's run CAS is off when expected_run_id is
+        # None, so a missing/malformed run id must not mutate the card (a stale
+        # worker could otherwise park a newer run).
         try:
             run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
         except ValueError:
-            run_id = None
+            return False
         detail = error.replace("content_policy_blocked:", "", 1).strip()[:400]
         reason = (
             "safeguard_refusal: the model's safeguards refused this card's turn "

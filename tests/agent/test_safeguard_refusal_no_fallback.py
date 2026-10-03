@@ -146,3 +146,81 @@ def test_worker_refusal_hook_needs_worker_authority(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
     monkeypatch.setattr("agent.delegation_context.owns_kanban_worker_authority", lambda: False)
     assert kwe.block_on_safeguard_refusal(_refused_result()) is False
+
+
+def test_worker_refusal_hook_needs_a_run_id(monkeypatch):
+    # Prism P1 (round 1): block_task's run CAS is disabled when expected_run_id is
+    # None, so no run id = no mutation.
+    from hermes_cli import kanban_worker_exit as kwe
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
+    monkeypatch.setattr("agent.delegation_context.owns_kanban_worker_authority", lambda: True)
+    called = []
+    monkeypatch.setattr("hermes_cli.kanban_db.block_task", lambda *a, **k: called.append(k) or True)
+    for bad in (None, "", "not-a-number"):
+        if bad is None:
+            monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", bad)
+        assert kwe.block_on_safeguard_refusal(_refused_result()) is False, bad
+    assert called == []
+
+
+def test_worker_refusal_hook_stale_run_cannot_park_newer_run(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_worker_exit as kwe
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="stale run probe", assignee="daedalus")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id + 999))  # not the live run
+    monkeypatch.setattr("agent.delegation_context.owns_kanban_worker_authority", lambda: True)
+    assert kwe.block_on_safeguard_refusal(_refused_result()) is False
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_partial_stream_safeguard_refusal_is_reraised_not_stubbed(monkeypatch):
+    # Prism P1 (round 1): after deltas were sent, a stream error used to become a
+    # finish_reason=length stub (-> content-filter fallback / continuation). A
+    # safeguard refusal must re-raise so the exception path ends the turn. Driven
+    # through the real streaming call (harness of test_partial_stream_finish_reason).
+    from unittest.mock import MagicMock, patch
+    from tests.run_agent.test_partial_stream_finish_reason import (
+        _make_agent, _make_stream_chunk, PARTIAL_STREAM_STUB_ID,
+    )
+
+    class _Refused(Exception):
+        def __init__(self):
+            super().__init__(SDK_BODY["error"]["message"])
+            self.status_code = 400
+            self.body = SDK_BODY
+            self.response = SimpleNamespace(headers={})
+
+    def _stream(refusal):
+        yield _make_stream_chunk(content="Looking at the ")
+        raise refusal
+
+    for make_err, expect_reraise in ((_Refused, True), (lambda: RuntimeError("peer closed connection"), False)):
+        err = make_err()
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = lambda *a, err=err, **kw: _stream(err)
+        with patch("run_agent.AIAgent._create_request_openai_client", return_value=mock_client), \
+                patch("run_agent.AIAgent._close_request_openai_client"):
+            agent = _make_agent()
+            agent._fire_stream_delta = lambda text: None
+            agent._current_streamed_assistant_text = "Looking at the "
+            monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+            if expect_reraise:
+                with pytest.raises(_Refused):
+                    agent._interruptible_streaming_api_call({})
+            else:
+                # Negative control: an ordinary mid-stream drop still becomes the stub.
+                assert agent._interruptible_streaming_api_call({}).id == PARTIAL_STREAM_STUB_ID
