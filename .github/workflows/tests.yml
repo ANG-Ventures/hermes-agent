@@ -558,12 +558,16 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e-upgrade-plan:
-    # One e2e-upgrade shard per suite directory: the files directly under
-    # tests/e2e/core/upgrade ("core") plus every subdirectory that holds
-    # test_*.py (pm, git, handoff, network, hosts, ...). A new suite
-    # directory gets its own shard without editing this file, and no shard
-    # carries the whole tree's wall time against the 60-minute timeout.
-    # Skipping this job skips every e2e-upgrade shard with it.
+    # One e2e-upgrade shard per TEST FILE: "<suite>/<file-stem>" for every
+    # test_*.py directly under tests/e2e/core/upgrade (suite "core") and under
+    # each suite subdirectory (pm, git, handoff, network, hosts, ...). A new
+    # file or directory gets its own shard without editing this file. Per-file
+    # because the lane runs on Blacksmith, which bills vCPU-minutes, not jobs
+    # (Ace 2026-10-03): N short jobs cost what one long one does, and the lane's
+    # wall time becomes its slowest FILE (~3-5 min) instead of its slowest
+    # directory (pm, 11 min on 4 vCPU; git was 48 min on 2-core ubuntu-latest).
+    # The run step still accepts a bare directory name, so a hand-dispatched
+    # "git" shard keeps working. Skipping this job skips every shard with it.
     if: inputs.e2e_upgrade
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -581,9 +585,11 @@ jobs:
           shards=$(python3 - <<'PY'
           import json, pathlib
           root = pathlib.Path("tests/e2e/core/upgrade")
-          shards = ["core"] if any(root.glob("test_*.py")) else []
-          shards += sorted(d.name for d in root.iterdir()
-                           if d.is_dir() and not d.name.startswith(("_", ".")) and any(d.rglob("test_*.py")))
+          shards = sorted(f"core/{f.stem}" for f in root.glob("test_*.py"))
+          for d in sorted(root.iterdir()):
+              if d.is_dir() and not d.name.startswith(("_", ".")):
+                  shards += sorted(f"{d.name}/{f.relative_to(d).with_suffix('').as_posix()}"
+                                   for f in d.rglob("test_*.py"))
           print(json.dumps(shards))
           PY
           )
@@ -704,15 +710,36 @@ jobs:
           source .venv/bin/activate
           python -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
+      - name: Login-shell diagnostic (venue probe, 2026-10-03)
+        # Two upgrade tests resolve `hermes` through a NEW login shell
+        # (bash -lic) whose PATH must come from the rc files install.sh
+        # wrote. On blacksmith-4vcpu the probe read PATH=/usr/local/bin:
+        # /usr/bin:/bin:/snap/bin (no ~/.local/bin) where ubuntu-latest
+        # passed. Print what a login shell sources here so the fix is
+        # measured, not guessed. Harmless on every venue.
+        run: |
+          set -u
+          echo "SHELL=$SHELL HOME=$HOME user=$(id -un)"
+          ls -la "$HOME"/.bash_profile "$HOME"/.bash_login "$HOME"/.profile "$HOME"/.bashrc 2>&1 | sed 's/^/rc: /'
+          grep -nE 'PATH|bashrc|interactive|case \$-' "$HOME"/.profile "$HOME"/.bashrc 2>/dev/null | head -20 | sed 's/^/rcline: /'
+          grep -nE 'PATH' /etc/profile /etc/bash.bashrc 2>/dev/null | head -8 | sed 's/^/etc: /'
+          ls /etc/profile.d/ 2>/dev/null | tr '\n' ' ' | sed 's/^/profile.d: /'; echo
+          T=$(mktemp -d); printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' > "$T/.profile"
+          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "probe PATH=$PATH"' 2>&1 | sed 's/^/tmp-home: /'
+          env -i HOME="$T" SHELL=/bin/bash TERM=dumb PATH=/usr/local/bin:/usr/bin:/bin bash -lic 'echo "BASH_ENV=${BASH_ENV:-} ENV=${ENV:-}"; shopt login_shell' 2>&1 | sed 's/^/tmp-home: /'
+
       - name: Run upgrade e2e tests (${{ matrix.shard }})
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          if [ "$SHARD" = core ]; then
-            mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort)
-          else
-            mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort)
-          fi
+          # SHARD is "<suite>/<file-stem>" (per-file, the plan's default) or a
+          # bare suite directory name (hand dispatch / older plans).
+          case "$SHARD" in
+            core/*)  mapfile -t files < <(ls "tests/e2e/core/upgrade/${SHARD#core/}.py") ;;
+            */*)     mapfile -t files < <(ls "tests/e2e/core/upgrade/$SHARD.py") ;;
+            core)    mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort) ;;
+            *)       mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort) ;;
+          esac
           # A shard that collects nothing is a wiring bug, not a pass.
           [ "${#files[@]}" -gt 0 ] || { echo "no test files for shard $SHARD" >&2; exit 1; }
           printf 'shard %s: %s\n' "$SHARD" "${files[*]}"
@@ -721,7 +748,8 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
-          # shard holds at most ~7 files, so this runs each shard in one wave.
+          # a per-file shard holds one file; 6 keeps a hand-dispatched suite
+          # shard (<=7 files) in one wave. A single file never forks more.
           HERMES_TEST_WORKERS: "6"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           # The hang detector (scripts/run_tests_parallel.py --idle-timeout,
