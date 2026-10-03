@@ -30,7 +30,8 @@ from gateway.config import (
 from gateway.response_filters import (
     is_autonomous_silence_response as _is_autonomous_silence_response,
     is_intentional_silence_response as _is_intentional_silence_response,
-    is_partial_silence_marker as _is_partial_silence_marker)
+    is_partial_silence_marker as _is_partial_silence_marker,
+    strip_trailing_silence_marker as _strip_trailing_silence_marker)
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -587,7 +588,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # first/last line), human turns the exact rule.
                     _silence_fn = (_is_autonomous_silence_response if self.cfg.internal_event
                                    else _is_intentional_silence_response)
-                    if _silence_fn(self._clean_for_display(self._accumulated)):
+                    if _silence_fn(self._clean_for_silence_check(self._accumulated)):
                         self._internal_held = []
                         await self._suppress_silence_marker()
                         return
@@ -595,7 +596,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                         # Nothing streamed after the last held boundary: the gateway delivers
                         # (or silences) the final itself, so judge the held interim by that final.
                         if (not self._accumulated.strip() and self._internal_final_text is not None
-                                and _silence_fn(self._clean_for_display(self._internal_final_text))):
+                                and _silence_fn(self._clean_for_silence_check(self._internal_final_text))):
                             self._internal_held = []
                         else:
                             await self._release_internal_held()
@@ -783,7 +784,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # replies are short and may end in a marker on its own line: hold every interval tick.
         return should_edit and not (
             self.cfg.internal_event
-            or _is_partial_silence_marker(self._clean_for_display(self._accumulated)))
+            or _is_partial_silence_marker(self._clean_for_silence_check(self._accumulated)))
 
     async def _split_first_send(self, tick: "_Tick") -> bool:
         """No message to edit yet and the buffer overflows: seal only the head chunks; the
@@ -1031,5 +1032,21 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
     def _clean_for_display(text: str) -> str:
-        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream."""
+        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream.
+
+        A silence marker alone on the final line of an otherwise-delivered
+        reply is dropped too (``strip_trailing_silence_marker``): a human turn
+        resolves ``"note\\nNO_REPLY"`` as prose under the exact-marker rule,
+        and the control token must not be edited onto the screen.  The
+        silence predicates read :meth:`_clean_for_silence_check` instead, so
+        a reply that IS (or ends in) a marker is still judged on its raw form.
+        """
+        return _strip_trailing_silence_marker(
+            _BasePlatformAdapter.strip_media_directives_for_display(text)
+        )
+
+    @staticmethod
+    def _clean_for_silence_check(text: str) -> str:
+        """``_clean_for_display`` minus the trailing-marker strip, for the
+        silence predicates (they need to see the marker to suppress on it)."""
         return _BasePlatformAdapter.strip_media_directives_for_display(text)

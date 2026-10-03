@@ -144,6 +144,10 @@ Supported tokens:
 
 Whitespace and case are normalized, but the whole final response must be the token. A sentence like "Use `[SILENT]` when nothing changed" is delivered normally.
 
+Turns the gateway injects itself — background-process completions, async-delegation batch results, `/goal` continuations, `/heartbeat` ticks, kanban board wakes, restart-resume replays, plugin message injections — are marked `internal`. No human is waiting on those, so they use the looser autonomous rule: a short note with a silence token on its own first or last line (for example `Nothing changed since the last check.\nNO_REPLY`) is suppressed as a whole. Human turns keep the exact-marker rule.
+
+When a human turn's reply is delivered but still ends in a silence token on its own last line, that trailing line is dropped before the send: the note reaches the chat, the control token does not. The stored transcript keeps the raw assistant turn.
+
 Silence is a delivery decision only. Hermes keeps the assistant silence turn in the session transcript, so the conversation still alternates normally:
 
 ```text

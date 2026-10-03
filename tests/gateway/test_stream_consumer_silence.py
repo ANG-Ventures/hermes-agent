@@ -273,3 +273,75 @@ class TestInternalEventHoldAcrossBoundaries:
         pre = next(i for i, t in enumerate(sends) if "Preamble" in t)
         ctx = next(i for i, t in enumerate(sends) if "Question context" in t)
         assert pre < ctx
+
+
+class TestHumanTurnTrailingMarkerStrip:
+    """Human turn, exact-marker rule: the note streams, the trailing token does not.
+
+    2026-10-03: a kanban lifecycle line pasted into a Telegram DM drew a
+    "note + NO_REPLY" reply.  Not internal, so delivery is right — but the
+    literal token was edited onto the screen.  ``_clean_for_display`` drops a
+    marker alone on the final line; the silence predicates keep reading the
+    raw buffer so an exact / autonomous marker is still suppressed.
+    """
+
+    NOTE = "Routine closer digest, nothing for you.\n\nNO_REPLY"
+
+    def test_clean_for_display_drops_trailing_marker_only(self):
+        assert GatewayStreamConsumer._clean_for_display(self.NOTE) == (
+            "Routine closer digest, nothing for you."
+        )
+        # Whole-response marker is NOT stripped by display cleaning — the
+        # silence suppression path owns it.
+        assert GatewayStreamConsumer._clean_for_display("NO_REPLY") == "NO_REPLY"
+        assert GatewayStreamConsumer._clean_for_silence_check(self.NOTE) == self.NOTE
+
+    @pytest.mark.asyncio
+    async def test_human_note_plus_marker_streams_without_token(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta(self.NOTE)
+        consumer.finish()
+        await consumer.run()
+
+        texts = _sent_and_edited(adapter)
+        assert any("nothing for you" in t for t in texts)
+        for text in texts:
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+        assert consumer.final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_human_note_plus_marker_authoritative_final_reconciles(self):
+        """The gateway's delivered_final_matches sees the same stripped text."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta(self.NOTE)
+        consumer.finish(self.NOTE)
+        await consumer.run()
+
+        assert consumer.delivered_final_matches(self.NOTE) is True
+        for text in _sent_and_edited(adapter):
+            assert "NO_REPLY" not in text
+
+    @pytest.mark.asyncio
+    async def test_internal_note_plus_marker_still_fully_suppressed(self):
+        """Regression guard: the display strip must not defeat autonomous silence."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(
+                edit_interval=0.01, buffer_threshold=1, internal_event=True,
+            ),
+        )
+        consumer.on_delta(self.NOTE)
+        consumer.finish()
+        await consumer.run()
+
+        assert _sent_and_edited(adapter) == []
+        assert consumer.final_content_delivered is False

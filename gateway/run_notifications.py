@@ -443,6 +443,12 @@ class GatewayNotificationsMixin:
         from gateway.run import _strip_response_attachments_for_direct_send
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            from gateway.run import _gateway_surface_passes_raw_text
+            if text_content and not _gateway_surface_passes_raw_text(getattr(source, "platform", None)):
+                # Same defensive strip as the completed-turn path: a reply delivered under the
+                # exact-marker rule must not carry a trailing NO_REPLY line into the chat.
+                from gateway.response_filters import strip_trailing_silence_marker
+                text_content = strip_trailing_silence_marker(text_content)
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.

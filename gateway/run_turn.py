@@ -1713,6 +1713,14 @@ class GatewayTurnMixin:
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
+            # Defensive: a reply the exact-marker rule delivers may still end in a NO_REPLY line
+            # (a human pasted an automated digest and the model answered as if the turn were
+            # internal, 2026-10-03). The note is delivered, the token is not. Delivery-only: the
+            # transcript keeps the raw turn.
+            from gateway.run import _gateway_surface_passes_raw_text
+            if not _gateway_surface_passes_raw_text(source.platform):
+                from gateway.response_filters import strip_trailing_silence_marker
+                response = strip_trailing_silence_marker(response)
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
