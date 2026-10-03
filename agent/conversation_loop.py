@@ -3147,6 +3147,7 @@ def run_conversation(
             # timestamp, platform message id, observed flag. These are carried
             # on the message dict for persistence/replay bookkeeping only.
             api_msg.pop("timestamp", None)
+            api_msg.pop("platform_message_id", None)
             # _thinking_prefill survives here intentionally: the drop pass below
             # needs it. The transport strips all underscore keys before the wire.
             # Strip length-continuation marks; not every transport drops underscore keys.
