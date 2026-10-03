@@ -19051,6 +19051,11 @@ class DispatchResult:
     stranded_by_mount_loss: list[str] = field(default_factory=list)
     workspace_refused: list[tuple[str, str]] = field(default_factory=list)
     """Mount or persisted-workspace failures, refused BEFORE claiming a run."""
+    skill_refused: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(task_id, missing_skills)`` for cards blocked BEFORE claiming a run
+    because a card skill does not resolve for the assignee profile (the worker
+    would exit ``Unknown skill(s)`` at startup). See
+    :func:`_card_skills_refused`."""
     spawn_failed: list[str] = field(default_factory=list)
     """Task ids whose spawn attempt failed THIS tick — recorded on every
     failure (workspace resolution or worker launch), whether or not it was
@@ -24969,6 +24974,8 @@ def _dispatch_once_locked(
                     "dispatch continues",
                     row["id"],
                 )
+        if _card_skills_refused(conn, row["id"], row_assignee, result, dry_run=dry_run):
+            continue
         if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
         if dry_run:
@@ -25211,6 +25218,8 @@ def _dispatch_once_locked(
             continue
         deferred, fallback_selection = provider_admission(row["id"], row["assignee"])
         if deferred:
+            continue
+        if _card_skills_refused(conn, row["id"], row["assignee"], result, dry_run=dry_run):
             continue
         if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
@@ -25683,20 +25692,66 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     omitting the flag only drops the supplementary pattern library.
     """
     from pathlib import Path as _Path
+    from hermes_cli.kanban_skill_resolve import profile_skill_dirs, skill_resolves
 
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
+    # Same roots the worker's skill_view walks: <home>/skills AND
+    # skills.external_dirs, with .archive/.hub/support dirs excluded. A bare
+    # ``rglob`` of <home>/skills missed external dirs (fleets that ship
+    # kanban-worker from a shared dir never got the flag) and matched archived
+    # copies the worker cannot load.
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
-    return False
+        return skill_resolves("kanban-worker", profile_skill_dirs(base))
+    except Exception:
+        return False
+
+
+def _card_skills_refused(conn, task_id, assignee, result, *, dry_run) -> bool:
+    """Block a card whose ``skills`` the assignee profile cannot load.
+
+    The worker resolves ``--skills`` against its own profile home; when none
+    resolve it exits 1 at startup, the crash counter retries it and gives up
+    (t_0b786d9b, three spawns). Refusing here names the missing skill and the
+    directory it lives in, before any run is claimed. Fails open on any error.
+    """
+    task = get_task(conn, task_id)
+    if task is None or not task.skills or not assignee:
+        return False
+    try:
+        from pathlib import Path as _Path
+        from hermes_cli.kanban_skill_resolve import refusal_reason, unresolved_skills
+        from hermes_cli.profiles import get_profile_dir
+
+        home = _Path(get_profile_dir(assignee))
+        if not home.is_dir():
+            return False
+        extra = []
+        if task.workspace_path and (task.workspace_kind or "scratch") != "scratch":
+            ws = _Path(task.workspace_path).expanduser()
+            extra = [ws / ".hermes" / "skills", ws / ".agents" / "skills"]
+        names = [s for s in task.skills if s and s != "kanban-worker"]
+        missing = unresolved_skills(names, home, extra_dirs=extra)
+        if not missing:
+            return False
+        try:
+            root_home = _Path(get_profile_dir("default"))
+        except Exception:
+            root_home = None
+        reason = refusal_reason(assignee, home, missing, root_home)
+    except Exception:
+        _log.debug("kanban dispatch: card skill check failed open for %s",
+                   task_id, exc_info=True)
+        return False
+    result.skill_refused.append((task_id, missing))
+    if dry_run:
+        return True
+    _log.warning("PHASE=kanban_skill_refused task=%s assignee=%s missing=%s",
+                 task_id, assignee, ",".join(missing))
+    if block_task(conn, task_id, reason=reason, kind="capability"):
+        with write_txn(conn):
+            _append_event(conn, task_id, "skill_refused",
+                          {"assignee": assignee, "missing": missing})
+    return True
 
 
 def _worker_terminal_timeout_env(
