@@ -15,7 +15,7 @@ A send-back is a LANDED CLOSE GATE when either of these holds:
 Either way the line renders ``⏳ [board] Kanban t_x landed · close on: <gate> — implementer @who``.
 Anything else (PR open, code findings) keeps the 🛑 shape.
 
-``classify`` runs in the notifier's collect thread (never on the event loop). PR state comes
+``classify`` runs in the notifier's collect thread, off the event loop. PR state comes
 from one REST read per own PR (``kanban_open_pr.query_pr_state``), memoised per tick. With no
 oracle (pytest, or a ``gh`` failure) the merged rule is skipped and only the marker rule runs.
 """
