@@ -20,6 +20,11 @@ line that rendered ~17 KB, which the Discord adapter splits into ~9 posts (the d
 bounded to ONE message (``MAX_MESSAGE_CHARS``): each line is compacted to its mark, card id and
 title, and lines past the budget fold into a "+N more" tally. Nothing is lost: every transition
 is a card event on the board (``hermes kanban show <id>``).
+
+t_dcc4ed08 (2026-10-02): Apollo's 17:18 operator batch sent 8 landed-close-gate send-backs, which
+posted as 8 lines. A line added with ``fold={"key": ...}`` (the coverage ``batch_id``) is rendered
+together with the other held lines that share its key, as ONE line:
+``⏳ [board] Kanban 8 cards landed (batch apollo-1700) · close on: t_a <gate>; t_b <gate>; ...``.
 """
 from __future__ import annotations
 
@@ -34,6 +39,7 @@ MAX_HELD = 400  # lines per channel; oldest dropped (and counted) past this
 LINE_CHARS = 220
 MAX_MESSAGE_CHARS = 1900  # one Discord message (2000) with headroom; the digest never splits
 COMPACT_CHARS = 110
+FOLD_CHARS = 900  # one folded operator-batch line; cards past it tally as "+N more"
 # ``✔ [board] @who Kanban t_x done — title`` -> mark, board, card id, title.
 _LINE_RE = re.compile(r"^(\S+)\s+\[([^\]]+)\]\s+@\S+\s+Kanban\s+(t_[0-9a-f]+)\b.*?(?:—|:)\s*(.*)$")
 
@@ -75,8 +81,47 @@ def _compact(msg: str) -> str:
     return out if len(out) <= COMPACT_CHARS else out[: COMPACT_CHARS - 1] + "…"
 
 
-def render(lines: list[str], dropped: int = 0) -> str:
+def _fold_line(folds: list[dict]) -> str:
+    """ONE line for an operator batch of landed close-gate send-backs (t_dcc4ed08)."""
+    f0 = folds[0]
+    head = f"⏳ {f0.get('board_tag') or ''}Kanban {len(folds)} cards landed"
+    if f0.get("batch"):
+        head += f" (batch {f0['batch']})"
+    head += " · close on: "
+    parts: list[str] = []
+    for i, f in enumerate(folds):
+        who = f" @{f['implementer']}" if f.get("implementer") else ""
+        part = f"{f['task_id']} {f.get('gate') or ''}{who}".strip()
+        if len(head) + len("; ".join(parts + [part])) > FOLD_CHARS:
+            parts.append(f"+{len(folds) - i} more")
+            break
+        parts.append(part)
+    return head + "; ".join(parts)
+
+
+def fold_batches(lines: list[str], folds: Optional[list] = None) -> list[str]:
+    """Replace every group of 2+ held lines sharing a fold key by ONE line at the first's position."""
+    if not folds or not any(folds):
+        return list(lines)
+    groups: dict[str, list[dict]] = {}
+    for f in folds:
+        if f and f.get("key"):
+            groups.setdefault(f["key"], []).append(f)
+    out: list[str] = []
+    done: set[str] = set()
+    for msg, f in zip(lines, list(folds) + [None] * (len(lines) - len(folds))):
+        key = (f or {}).get("key")
+        if not key or len(groups.get(key, ())) < 2:
+            out.append(msg)
+        elif key not in done:
+            done.add(key)
+            out.append(_fold_line(groups[key]))
+    return out
+
+
+def render(lines: list[str], dropped: int = 0, folds: Optional[list] = None) -> str:
     """One held line posts unchanged; two or more become ONE digest message that fits one post."""
+    lines = fold_batches(lines, folds)
     if len(lines) == 1 and not dropped:
         return lines[0]
     counts: dict[str, int] = {}
@@ -89,7 +134,7 @@ def render(lines: list[str], dropped: int = 0) -> str:
     if dropped:
         tail.append(f"-# {dropped} older line(s) dropped while this channel was unreachable")
     tail.append(FAMILY_TAG)
-    full = [_one_line(m) for m in lines]
+    full = [m if m.startswith("⏳") and " cards landed" in m else _one_line(m) for m in lines]
     if len("\n".join([head] + full + tail)) <= MAX_MESSAGE_CHARS:
         return "\n".join([head] + full + tail)
     budget = MAX_MESSAGE_CHARS - len(head) - sum(len(t) + 1 for t in tail) - 80
@@ -115,7 +160,8 @@ class LifecycleDigest:
         return sum(len(b["lines"]) for b in self._held.values())
 
     def add(self, target: tuple[str, str], adapter: Any, msg: str, window: int, now: float,
-            metadata: Optional[dict] = None, fallback: Optional[tuple] = None) -> None:
+            metadata: Optional[dict] = None, fallback: Optional[tuple] = None,
+            fold: Optional[dict] = None) -> None:
         """``fallback=((platform, chat_id), adapter, window)``: where the batch goes, each line
         tagged ``[home-unreachable:<reason>]``, if the send to ``target`` fails (t_808bc8e6)."""
         # One batch per destination THREAD: lines for two threads/topics of one chat
@@ -123,15 +169,17 @@ class LifecycleDigest:
         meta = dict(metadata or {})
         key = (target[0], target[1], str(meta.get("thread_id") or ""))
         b = self._held.setdefault(key, {"lines": [], "first": now, "adapter": adapter,
-                                        "window": window, "dropped": 0})
+                                        "window": window, "dropped": 0, "folds": []})
         b["adapter"] = adapter
         b["window"] = window
         b["metadata"] = meta
         b["fallback"] = fallback
         b["lines"].append(msg)
+        b.setdefault("folds", []).append(fold)
         if len(b["lines"]) > MAX_HELD:
             over = len(b["lines"]) - MAX_HELD
             del b["lines"][:over]
+            del b["folds"][:over]
             b["dropped"] += over
 
     def due(self, now: float) -> list[tuple[str, str, str]]:
@@ -147,7 +195,7 @@ class LifecycleDigest:
                 continue
             from gateway.kanban_home_route import format_for_platform, tag_line, unreachable_tag
 
-            text = format_for_platform(target[0], render(b["lines"], b["dropped"]))
+            text = format_for_platform(target[0], render(b["lines"], b["dropped"], b.get("folds")))
             reason = None
             try:
                 res = await b["adapter"].send(target[1], text, metadata=dict(b.get("metadata") or {}))
@@ -165,8 +213,8 @@ class LifecycleDigest:
                                    " -> %s:%s", target[0], target[1], exc, len(b["lines"]),
                                    fb_target[0], fb_target[1])
                     self._held.pop(target, None)
-                    for line in b["lines"]:
-                        self.add(fb_target, fb_adapter, tag_line(line, tag), fb_window, now)
+                    for line, fold in zip(b["lines"], b.get("folds") or [None] * len(b["lines"])):
+                        self.add(fb_target, fb_adapter, tag_line(line, tag), fb_window, now, fold=fold)
                     continue
                 logger.warning("kanban lifecycle digest: send to %s:%s failed (%d line(s) kept): %s",
                                target[0], target[1], len(b["lines"]), exc)
