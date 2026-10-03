@@ -6721,13 +6721,17 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 def _cmd_rehome(args: argparse.Namespace) -> int:
     """Re-home a card (t_808bc8e6): stamp ``--session`` as its home and
     subscribe that session's origin chat. The orphan alert names this verb."""
-    from gateway.kanban_home_route import home_from_row, read_session_row
+    from gateway.kanban_home_route import SessionLookupError, home_from_row, read_session_row
 
     sid = (args.session or "").strip()
     if not sid:
         print("kanban rehome: --session is empty", file=sys.stderr)
         return 2
-    row = None if kb.is_operator_home(sid) else read_session_row(sid)
+    try:
+        row = None if kb.is_operator_home(sid) else read_session_row(sid)
+    except SessionLookupError as exc:
+        print(f"kanban rehome: {exc}", file=sys.stderr)
+        return 1
     home = home_from_row(sid, row)
     if home.target is None:
         print(
