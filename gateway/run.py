@@ -37457,6 +37457,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             fresh_final_after_seconds=_fresh_final_secs,
             transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            # Same surface gate as the completed-turn strip in
+            # _handle_message_with_agent: programmatic surfaces keep raw text.
+            strip_trailing_silence_marker=not _gateway_surface_passes_raw_text(
+                source.platform
+            ),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
