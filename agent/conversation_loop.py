@@ -4476,7 +4476,11 @@ def run_conversation(
                         detail=", ".join(error_details), elapsed_s=api_duration)
                     _ir_floor = dict(((getattr(agent, "_pending_fallback_error", None) or {})
                                       .get("floor")) or {})
+                    _ir_relay_gave_up = (_ir_prev is None
+                                         and _fbe_floor.empty_tool_use_floor(response)
+                                         and _fbe_floor.relay_gave_up_empty(response))
                     if (_ir_prev is None and not _retry.invalid_response_retry_done
+                            and not _ir_relay_gave_up
                             and _fbe_floor.empty_tool_use_floor(response)):
                         _retry.invalid_response_retry_floor = _ir_floor
                         _retry.invalid_response_retry_done = True
@@ -4505,6 +4509,17 @@ def run_conversation(
                                 agent, "invalid_response", response,
                                 detail=", ".join(error_details), elapsed_s=api_duration,
                                 repeat=True)
+                    elif _ir_relay_gave_up:
+                        # t_9d411670: the relay already spent the same-seat
+                        # retry and a seat rotation on this request. The empty
+                        # is sticky to seat/cache, so another same-route call
+                        # only re-runs that ladder; skip this provider.
+                        _retry.invalid_response_retry_done = True
+                        _fbe_floor.record_invalid_response(agent, _ir_floor, "relay_gave_up")
+                        _fbe_floor.stash_response_failure(
+                            agent, "invalid_response", response,
+                            detail=", ".join(error_details), elapsed_s=api_duration,
+                            repeat=True)
                     elif _ir_floor.get("site") and agent._fallback_index < len(agent._fallback_chain):
                         _fbe_floor.record_invalid_response(agent, _ir_floor, "fallback")
 
