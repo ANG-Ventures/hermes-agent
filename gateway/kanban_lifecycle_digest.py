@@ -114,11 +114,16 @@ class LifecycleDigest:
     def __len__(self) -> int:
         return sum(len(b["lines"]) for b in self._held.values())
 
-    def add(self, target: tuple[str, str], adapter: Any, msg: str, window: int, now: float) -> None:
+    def add(self, target: tuple[str, str], adapter: Any, msg: str, window: int, now: float,
+            metadata: Optional[dict] = None, fallback: Optional[tuple] = None) -> None:
+        """``fallback=((platform, chat_id), adapter, window)``: where the batch goes, each line
+        tagged ``[home-unreachable:<reason>]``, if the send to ``target`` fails (t_808bc8e6)."""
         b = self._held.setdefault(target, {"lines": [], "first": now, "adapter": adapter,
                                            "window": window, "dropped": 0})
         b["adapter"] = adapter
         b["window"] = window
+        b["metadata"] = dict(metadata or {})
+        b["fallback"] = fallback
         b["lines"].append(msg)
         if len(b["lines"]) > MAX_HELD:
             over = len(b["lines"]) - MAX_HELD
@@ -136,12 +141,29 @@ class LifecycleDigest:
             if not b or not b["lines"]:
                 self._held.pop(target, None)
                 continue
-            text = render(b["lines"], b["dropped"])
+            from gateway.kanban_home_route import format_for_platform, tag_line, unreachable_tag
+
+            text = format_for_platform(target[0], render(b["lines"], b["dropped"]))
+            reason = None
             try:
-                res = await b["adapter"].send(target[1], text, metadata={})
+                res = await b["adapter"].send(target[1], text, metadata=dict(b.get("metadata") or {}))
                 if getattr(res, "success", True) is False:
+                    reason = getattr(res, "error_kind", None) or "send-failed"
                     raise RuntimeError(getattr(res, "error", None) or "send reported failure")
             except Exception as exc:
+                fb = b.get("fallback")
+                if fb is not None:
+                    # Home unreachable: the batch moves to the fallback (#logs), tagged, and
+                    # posts there on its own window; the home is not retried for these lines.
+                    fb_target, fb_adapter, fb_window = fb
+                    tag = unreachable_tag(reason or type(exc).__name__)
+                    logger.warning("kanban lifecycle digest: home %s:%s unreachable (%s); %d line(s)"
+                                   " -> %s:%s", target[0], target[1], exc, len(b["lines"]),
+                                   fb_target[0], fb_target[1])
+                    self._held.pop(target, None)
+                    for line in b["lines"]:
+                        self.add(fb_target, fb_adapter, tag_line(line, tag), fb_window, now)
+                    continue
                 logger.warning("kanban lifecycle digest: send to %s:%s failed (%d line(s) kept): %s",
                                target[0], target[1], len(b["lines"]), exc)
                 continue
