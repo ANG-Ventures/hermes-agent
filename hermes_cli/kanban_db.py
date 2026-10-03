@@ -4874,6 +4874,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _backfill_no_worker_from_body(conn)
 
     _rebuild_drifted_tables(conn)
+    # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
+    _ensure_single_waker_index(conn)
 
 
 NO_WORKER_BODY_RE = re.compile(r"do not dispatch a worker", re.IGNORECASE)
@@ -6715,7 +6717,8 @@ def _subscribe_new_home(conn: sqlite3.Connection, task_id: str) -> None:
     try:
         from tools.kanban_tools import subscribe_calling_session
 
-        subscribe_calling_session(conn, task_id)
+        # takeover=True: the wake MOVES to the taker (t_74bf5296).
+        subscribe_calling_session(conn, task_id, takeover=True)
     except Exception:
         pass
 
@@ -7923,6 +7926,15 @@ def _inherit_notify_subs(
             continue
         if decision == "replace":
             _drop_notify_subs(conn, others)
+        # One waker per card: an inherited wake row becomes notify when the
+        # child already has a waker (else INSERT OR IGNORE would drop the
+        # whole row on the one-waker index).
+        inherited_mode = prow["delivery_mode"] or "notify"
+        if inherited_mode in NOTIFY_WAKE_MODES and card_waker(
+            conn, child_id,
+            exclude=(prow["platform"], prow["chat_id"], prow["thread_id"] or ""),
+        ) is not None:
+            inherited_mode = "notify"
         conn.execute(
             f"""
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -7931,12 +7943,13 @@ def _inherit_notify_subs(
                  delivery_metadata, created_at, last_event_id)
             SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                    scope_id, COALESCE(chat_type, 'dm'), notifier_profile,
-                   COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+                   ?, delivery_metadata, ?, ?
               FROM kanban_notify_subs
              WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
             """,
             (
                 child_id,
+                inherited_mode,
                 int(created_at if created_at is not None else time.time()),
                 cursor,
                 prow["task_id"], prow["platform"], prow["chat_id"],
@@ -27098,6 +27111,12 @@ def task_age(task: Task) -> dict:
 #   "notify+wake"  -> passive send AND wake the destination gateway agent
 #   "wake"         -> wake the agent only; no passive message is sent
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
+# Modes that start an agent turn in the subscriber's session.
+NOTIFY_WAKE_MODES = ("notify+wake", "wake")
+# One waker per card (Ace 2026-10-03 13:28, t_74bf5296): a partial UNIQUE
+# index over the wake rows, so a second wake row on a card cannot be written
+# by ANY writer, not only by add_notify_sub's own bookkeeping.
+ONE_WAKER_INDEX = "idx_notify_one_waker"
 
 
 def _encode_notify_delivery_metadata(
@@ -27318,6 +27337,135 @@ def _notify_sub_admission(
     return "replace", others
 
 
+def card_waker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    exclude: Optional[tuple[str, str, str]] = None,
+) -> Optional[dict]:
+    """The card's single wake subscription (``notify+wake``/``wake``), or None.
+
+    ``exclude`` = ``(platform, chat_id, thread_id)`` of a row to ignore (the
+    row being written). The ``idx_notify_one_waker`` index guarantees at most
+    one such row; ``ORDER BY`` only makes a pre-index legacy DB deterministic.
+    """
+    sql = (
+        "SELECT * FROM kanban_notify_subs WHERE task_id = ?"
+        " AND delivery_mode IN ('notify+wake', 'wake')"
+    )
+    params: list[Any] = [task_id]
+    if exclude is not None:
+        sql += " AND NOT (platform = ? AND chat_id = ? AND thread_id = ?)"
+        params.extend([exclude[0], exclude[1], exclude[2] or ""])
+    row = conn.execute(sql + " ORDER BY created_at, rowid LIMIT 1", params).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _claim_wake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    notifier_profile: Optional[str],
+    mode: str,
+    takeover: bool,
+) -> str:
+    """Resolve the mode a NEW wake request may hold on ``task_id``.
+
+    One waker per card. With no other waker the request keeps ``mode``. When
+    another chat holds the wake, the wake MOVES to the requester (the holder
+    drops to ``notify``) only on a takeover: explicit ``takeover=True``, the
+    requester is the card's home chat (a ``--takeover`` re-home subscribes the
+    new home through here), or the holder's session has been idle 24 h
+    (:func:`notify_chat_is_live`). Otherwise the requester gets ``notify``.
+    """
+    holder = card_waker(conn, task_id, exclude=(platform, chat_id, thread_id))
+    if holder is None:
+        return mode
+    new_sub = {"platform": platform, "chat_id": chat_id, "thread_id": thread_id}
+    home = card_home_chat(conn, task_id, notifier_profile)
+    moves = (
+        takeover
+        or _sub_matches_chat(new_sub, home)
+        or not notify_chat_is_live(
+            holder["platform"], holder["chat_id"], holder.get("notifier_profile"),
+        )
+    )
+    if moves:
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_mode = 'notify'"
+            " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, holder["platform"], holder["chat_id"], holder.get("thread_id") or ""),
+        )
+        _log.info(
+            "wake moved: %s %s:%s -> %s:%s (old waker now notify)",
+            task_id, holder["platform"], holder["chat_id"], platform, chat_id,
+        )
+        return mode
+    _log.info(
+        "wake held: %s:%s holds the wake on %s; %s:%s subscribed notify "
+        "(pass --takeover to move it)",
+        holder["platform"], holder["chat_id"], task_id, platform, chat_id,
+    )
+    return "notify"
+
+
+def _ensure_single_waker_index(conn: sqlite3.Connection) -> None:
+    """Collapse legacy duplicate wakers, then create ``idx_notify_one_waker``.
+
+    Runs once per DB (skipped when the index exists). Per card with more than
+    one wake row it keeps the home chat's row, else the oldest; the rest drop
+    to ``notify``. Their subscription (the human's line) is kept.
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (ONE_WAKER_INDEX,),
+    ).fetchone():
+        return
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_notify_subs'"
+    ).fetchone():
+        return
+    dupes = [
+        r[0] for r in conn.execute(
+            "SELECT task_id FROM kanban_notify_subs"
+            " WHERE delivery_mode IN ('notify+wake', 'wake')"
+            " GROUP BY task_id HAVING COUNT(*) > 1"
+        )
+    ]
+    for task_id in dupes:
+        rows = [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM kanban_notify_subs WHERE task_id = ?"
+                " AND delivery_mode IN ('notify+wake', 'wake')"
+                " ORDER BY created_at, rowid",
+                (task_id,),
+            )
+        ]
+        try:
+            home = card_home_chat(conn, task_id, rows[0].get("notifier_profile"))
+        except Exception:
+            home = None
+        keep = next((x for x in rows if _sub_matches_chat(x, home)), rows[0])
+        for x in rows:
+            if x is keep:
+                continue
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_mode = 'notify'"
+                " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (task_id, x["platform"], x["chat_id"], x.get("thread_id") or ""),
+            )
+        _log.info("single waker: %s kept %s:%s, %d demoted to notify",
+                  task_id, keep["platform"], keep["chat_id"], len(rows) - 1)
+    conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {ONE_WAKER_INDEX}"
+        " ON kanban_notify_subs(task_id)"
+        " WHERE delivery_mode IN ('notify+wake', 'wake')"
+    )
+
+
 def _log_sub_kept(task_id: str, others: list[dict], chat_id: str) -> None:
     owner = others[0]
     _log.info(
@@ -27350,9 +27498,16 @@ def add_notify_sub(
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
     also: bool = False,
+    takeover: bool = False,
 ) -> str:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    One WAKER per card (t_74bf5296): a wake mode is granted only when no other
+    row on the card holds one, or on a takeover (``takeover=True``, the
+    caller is the card's home chat, or the holder is 24 h idle), which MOVES
+    the wake and drops the old waker to ``notify``. Any other wake request is
+    stored as ``notify`` (see :func:`_claim_wake`, :func:`card_waker`).
 
     One subscriber chat per card and platform (t_484a3c72): when another chat
     already subscribes and its session is live, nothing is written and
@@ -27450,6 +27605,28 @@ def add_notify_sub(
                     platform, chat_id,
                 )
                 outcome = "rehomed"
+        requested_mode = (
+            delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
+        )
+        existing = conn.execute(
+            "SELECT delivery_mode FROM kanban_notify_subs WHERE task_id = ?"
+            " AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        target_mode = requested_mode or (
+            existing["delivery_mode"] if existing is not None else insert_mode
+        )
+        if target_mode in NOTIFY_WAKE_MODES:
+            target_mode = _claim_wake(
+                conn, task_id=task_id, platform=platform, chat_id=chat_id,
+                thread_id=thread_id or "", notifier_profile=notifier_profile,
+                mode=target_mode, takeover=takeover,
+            )
+        insert_mode = target_mode
+        if requested_mode is not None or (
+            existing is not None and existing["delivery_mode"] != target_mode
+        ):
+            requested_mode = target_mode
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -27559,15 +27736,16 @@ def add_notify_sub(
                 """,
                 (scope_id, task_id, platform, chat_id, thread_id or ""),
             )
-        if delivery_mode in _NOTIFY_DELIVERY_MODES:
-            # Explicit delivery_mode is last-write-wins on re-subscribe.
+        if requested_mode is not None:
+            # Explicit delivery_mode is last-write-wins on re-subscribe, after
+            # the single-waker resolution above.
             conn.execute(
                 """
                 UPDATE kanban_notify_subs
                    SET delivery_mode = ?
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
                 """,
-                (delivery_mode, task_id, platform, chat_id, thread_id or ""),
+                (requested_mode, task_id, platform, chat_id, thread_id or ""),
             )
         if metadata_json:
             # Refresh the routing anchor for duplicate subscriptions.

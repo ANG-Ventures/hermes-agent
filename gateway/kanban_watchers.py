@@ -220,6 +220,25 @@ def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     return Context().run(func, *args)
 
 
+def _wake_downgrade_reason(owner: Any, profile: Optional[str]) -> Optional[str]:
+    """Per-event wake -> notify reason from the owner's lazily-built WakeGate.
+
+    Fails open toward WAKE: a gate that cannot be built or read must not
+    silence the wake (the notify line is delivered either way).
+    """
+    try:
+        gate = getattr(owner, "_kanban_wake_gate", None)
+        if gate is None:
+            from hermes_cli.kanban_wake_gate import gate_from_config
+
+            gate = gate_from_config()
+            setattr(owner, "_kanban_wake_gate", gate)
+        return gate.downgrade_reason(profile)
+    except Exception:
+        logger.debug("kanban notifier: wake gate unavailable", exc_info=True)
+        return None
+
+
 async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) -> Any:
     """Offload blocking process-service work (dispatcher + notifier writers)
     without inheriting request-local ContextVars."""
@@ -2237,6 +2256,23 @@ class GatewayKanbanWatchersMixin:
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
                     mode = sub.get("delivery_mode") or "notify"
+                    # Contention gate (t_74bf5296): under measured host load
+                    # or a capped waker lane, THIS event's wake is sent as a
+                    # notify. The subscription row is not changed.
+                    wake_downgrade = None
+                    # api_server has no push channel: its wake self-post IS
+                    # the delivery, so it is never downgraded.
+                    if mode in ("notify+wake", "wake") and sub["platform"] != "api_server":
+                        wake_downgrade = await _to_thread_process_service(
+                            _wake_downgrade_reason, self, sub.get("notifier_profile"),
+                        )
+                        if wake_downgrade:
+                            logger.info(
+                                "kanban notifier: wake for %s on %s/%s sent as notify (%s)",
+                                sub["task_id"], sub["platform"], sub["chat_id"],
+                                wake_downgrade,
+                            )
+                            mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
                     # Worker handoff carried into the synthetic wake turn below
@@ -2440,6 +2476,8 @@ class GatewayKanbanWatchersMixin:
                             continue
                         if d.get("home"):
                             msg += "\n" + d["home"]
+                        if wake_downgrade:
+                            msg += f"\n(notify: {wake_downgrade})"
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
