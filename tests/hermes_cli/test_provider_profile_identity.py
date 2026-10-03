@@ -29,7 +29,10 @@ def install_profile(monkeypatch):
     monkeypatch.setattr(profiles, "_PROVIDER_LIST_CACHE", None)
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda *a, **kw: {})
     monkeypatch.setattr("hermes_cli.models_validate.validate_requested_model", lambda *a, **kw: ACCEPT)
-    auth_before = dict(auth_mod.PROVIDER_REGISTRY)
+    # fork: ``auth_mod.PROVIDER_REGISTRY`` is an additive provider_seam facade (no clear()); undo the
+    # plugin's registration by restoring the pre-test generation.
+    from hermes_cli import provider_seam
+    generation = provider_seam.current()
 
     def _install(name: str, *, aliases=(), base_url: str, env_var: str, api_mode: str = "chat_completions"):
         monkeypatch.setenv(env_var, KEY)
@@ -47,8 +50,7 @@ def install_profile(monkeypatch):
         return profiles.get_provider_profile(name)
 
     yield _install
-    auth_mod.PROVIDER_REGISTRY.clear()
-    auth_mod.PROVIDER_REGISTRY.update(auth_before)
+    provider_seam._restore(generation)
 
 
 def test_alias_switch_carries_the_profiles_canonical_identity(install_profile):

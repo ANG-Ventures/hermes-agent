@@ -48,7 +48,6 @@ AGENT_CONSTRUCTION_HOSTS: dict[str, str] = {
     "gateway/run.py": GATEWAY,
     "gateway/run_turn.py": GATEWAY,
     "gateway/run_turn_runner.py": GATEWAY,
-    "gateway/slash_commands.py": GATEWAY,
     "gateway/slash_commands_session.py": GATEWAY,
     "hermes_cli/cli_agent_setup_mixin.py": CLI,
     "hermes_cli/cli_commands_mixin.py": CLI,
