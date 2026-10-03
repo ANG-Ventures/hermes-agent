@@ -91,3 +91,27 @@ def test_wake_delivered_below_the_gate(tmp_path, monkeypatch):
     asyncio.run(_tick(monkeypatch, _runner(adapter, 10.0, tmp_path)))
     assert len(adapter.sent) == 1 and "(notify:" not in adapter.sent[0]
     assert len(adapter.handled) == 1, "a real wake below the gate"
+
+
+def test_unstamped_sub_is_lane_gated_as_the_active_profile(tmp_path, monkeypatch):
+    """Prism #1679 P1 76556142d195: a sub with no ``notifier_profile`` passed
+    None to the gate, and ``lane_contended`` skips a None profile, so a capped
+    lane still launched the turn. Unstamped rows are delivered by this
+    gateway's own adapters, so the gate must probe this gateway's profile."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "lane.db"))
+    kb.init_db()
+    _blocked_task()  # no notifier_profile stamp
+    adapter = RecordingAdapter()
+    runner = _runner(adapter, 10.0, tmp_path)
+    probed = []
+
+    def probe(profile):
+        probed.append(profile)
+        return "lane prov-x capped" if profile == "coder" else None
+
+    runner._kanban_wake_gate._lane_probe = probe
+    runner._active_profile_name = lambda: "coder"
+    asyncio.run(_tick(monkeypatch, runner))
+    assert probed == ["coder"], probed
+    assert len(adapter.sent) == 1 and "(notify: lane prov-x capped)" in adapter.sent[0]
+    assert adapter.handled == [], "no wake turn on a capped lane"

@@ -27717,6 +27717,11 @@ def add_notify_sub(
         target_mode = requested_mode or (
             existing["delivery_mode"] if existing is not None else insert_mode
         )
+        if takeover and requested_mode is None and target_mode not in NOTIFY_WAKE_MODES:
+            # ``--takeover`` alone means "move the wake here" (its help and the
+            # ``wake held`` hint both say so); an explicit mode still wins.
+            # Prism #1679 P1 6d9abd90336a.
+            target_mode = "notify+wake"
         if target_mode in NOTIFY_WAKE_MODES:
             target_mode = _claim_wake(
                 conn, task_id=task_id, platform=platform, chat_id=chat_id,

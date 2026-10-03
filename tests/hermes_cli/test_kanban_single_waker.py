@@ -289,3 +289,49 @@ def test_auto_subscribe_notify_only_opt_out(board, monkeypatch):
         tid = _card(conn)
         assert subscribe_calling_session(conn, tid, wake=False)
         assert _modes(conn, tid) == {("discord", OWNER): "notify"}
+
+
+# -- --takeover alone moves the wake (Prism #1679 P1 6d9abd90336a) --------------
+
+def test_takeover_without_a_mode_moves_the_wake(board):
+    """``takeover=True`` with no delivery_mode must still claim the wake.
+
+    The CLI help ("Move the card's wake to this chat") and the ``wake held``
+    hint ("Pass --takeover to move the wake") both promise the flag works
+    alone; with no mode the store fell back to the row's ``notify`` and never
+    called ``_claim_wake``, so the old waker kept it.
+    """
+    _session(board, "sess-owner", OWNER, age_s=60)
+    _session(board, "sess-other", OTHER, age_s=60)
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _sub(conn, tid, OWNER, delivery_mode="notify+wake")
+        _sub(conn, tid, OTHER, also=True)
+        assert _wakers(conn, tid) == [("discord", OWNER)]
+        _sub(conn, tid, OTHER, also=True, takeover=True)
+        assert _wakers(conn, tid) == [("discord", OTHER)]
+        assert _modes(conn, tid)[("discord", OWNER)] == "notify"
+
+
+def test_takeover_with_explicit_notify_stays_notify(board):
+    """An explicit mode still wins: ``--takeover --delivery-mode notify`` takes no wake."""
+    _session(board, "sess-owner", OWNER, age_s=60)
+    _session(board, "sess-other", OTHER, age_s=60)
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _sub(conn, tid, OWNER, delivery_mode="notify+wake")
+        _sub(conn, tid, OTHER, also=True, takeover=True, delivery_mode="notify")
+        assert _wakers(conn, tid) == [("discord", OWNER)]
+
+
+def test_cli_takeover_alone_moves_the_wake(board, capsys):
+    _session(board, "sess-owner", OWNER, age_s=60)
+    _session(board, "sess-other", OTHER, age_s=60)
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _sub(conn, tid, OWNER, delivery_mode="notify+wake")
+    assert _cli_sub(tid, OTHER, wake=False) == 0
+    assert _cli_sub(tid, OTHER, wake=False, takeover=True) == 0
+    assert "wake held by" not in capsys.readouterr().out
+    with kb.connect_closing() as conn:
+        assert _wakers(conn, tid) == [("discord", OTHER)]
