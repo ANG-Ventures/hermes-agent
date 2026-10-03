@@ -32,7 +32,7 @@ def test_wall_clock_limit_still_reports_seconds():
 
 def test_unknown_payload_never_prints_a_zero_timer():
     msg = format_timed_out_notice({}, task_id="t_abc", board_tag="", tag="")
-    assert "t_abc" in msg and "timed_out" in msg
+    assert "t_abc" in msg and "timed out" in msg
     assert "max_runtime=0s" not in msg
 
 

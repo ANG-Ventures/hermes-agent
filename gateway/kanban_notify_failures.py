@@ -168,7 +168,7 @@ def format_timed_out_notice(
     if limit > 0:
         return f"⏱ {board_tag}{tag}Kanban {task_id} exceeded max_runtime ({limit}s){nxt}"
     tail = f": {error[:120]}" if error else ""
-    return f"⏱ {board_tag}{tag}Kanban {task_id} run ended (timed_out){tail}{nxt}"
+    return f"⏱ {board_tag}{tag}Kanban {task_id} timed out{tail}{nxt}"
 
 
 def format_failure_notice(
