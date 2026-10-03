@@ -25,7 +25,7 @@ _SCUTIL_OUT = "HTTPEnable : 1\nHTTPProxy : proxy.example\nHTTPPort : 8080\n"
 
 @pytest.fixture(autouse=True)
 def _darwin_and_clean_cache(monkeypatch):
-    monkeypatch.setattr(base.sys, "platform", "darwin")
+    monkeypatch.setattr(base.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     base._reset_system_proxy_cache()
     yield
     base._reset_system_proxy_cache()

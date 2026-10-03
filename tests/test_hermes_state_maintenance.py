@@ -1175,7 +1175,7 @@ class TestApplyWalProbe:
         with sqlite3.connect(str(db_path)) as seed:
             seed.execute("PRAGMA journal_mode=WAL")
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         conn = _TracingConn(str(db_path))
         try:
@@ -1203,7 +1203,7 @@ class TestApplyWalProbe:
                 self.executed.append(sql)
                 return super().execute(sql, params)
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         db_path = tmp_path / "macos_fresh.db"
         conn = _TracingConn(str(db_path))
@@ -1237,7 +1237,7 @@ class TestApplyWalProbe:
         with sqlite3.connect(str(db_path)) as seed:
             seed.execute("PRAGMA journal_mode=WAL")
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         conn = _TracingConn(str(db_path))
         try:
@@ -1269,7 +1269,7 @@ class TestApplyWalProbe:
                 self.executed.append(sql)
                 return super().execute(sql, params)
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
         db_path = tmp_path / "macos_fresh_sync.db"
         conn = _TracingConn(str(db_path))
