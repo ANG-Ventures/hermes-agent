@@ -17,7 +17,6 @@ publish.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -33,7 +32,33 @@ def db(tmp_path: Path) -> SessionDB:
     return d
 
 
-def test_append_is_never_blocked_by_a_foreign_compression_lock(db: SessionDB) -> None:
+@pytest.fixture
+def lease_waits(db: SessionDB, monkeypatch: pytest.MonkeyPatch) -> list:
+    """Witness for "the writer waited on a lease": every lease/lock retry in
+    ``_execute_write`` sleeps through ``_sleep_before_write_retry``. Record the
+    calls and refuse the retry, so a writer that takes the wait path surfaces
+    as its busy error on the first collision instead of as elapsed seconds
+    (a stopwatch bound here measured 0.70 s on a loaded CI shard with no
+    behavioural change: cold first-write setup, not a lease wait)."""
+    waits: list = []
+
+    def _no_wait(deadline: float, patience_s: float) -> bool:
+        waits.append(patience_s)
+        return False
+
+    monkeypatch.setattr(db, "_sleep_before_write_retry", _no_wait)
+    return waits
+
+
+def _append_without_waiting(db: SessionDB, lease_waits: list, content: str) -> None:
+    try:
+        db.append_message("sess1", role="user", content=content)
+    except CompressionSessionBusyError as exc:
+        pytest.fail(f"append waited on a compression lease: {exc!r} (waits={lease_waits})")
+    assert lease_waits == [], "append must not wait on a compression lease"
+
+
+def test_append_is_never_blocked_by_a_foreign_compression_lock(db: SessionDB, lease_waits: list) -> None:
     """The classic race: a steer lands while compression owns the session.
 
     Old behavior: busy-wait then land (or die on timeout). New behavior: the
@@ -41,23 +66,17 @@ def test_append_is_never_blocked_by_a_foreign_compression_lock(db: SessionDB) ->
     """
     assert db.try_acquire_compression_lock("sess1", "compressor") is True
 
-    started = time.monotonic()
-    db.append_message("sess1", role="user", content="steered mid-compression")
-    elapsed = time.monotonic() - started
-
-    assert elapsed < 0.5, "append must not wait on a compression lease"
+    _append_without_waiting(db, lease_waits, "steered mid-compression")
     rows = db.get_messages("sess1")
     assert any(r["content"] == "steered mid-compression" for r in rows)
 
 
-def test_append_is_never_blocked_by_a_stale_dead_pid_lock(db: SessionDB) -> None:
+def test_append_is_never_blocked_by_a_stale_dead_pid_lock(db: SessionDB, lease_waits: list) -> None:
     """A crashed compressor's unexpired lock must not fence writes (#74568)."""
     assert db.try_acquire_compression_lock(
         "sess1", "pid-9999999-long-gone", ttl_seconds=3600
     ) is True
-    started = time.monotonic()
-    db.append_message("sess1", role="user", content="lands despite stale lock")
-    assert time.monotonic() - started < 0.5
+    _append_without_waiting(db, lease_waits, "lands despite stale lock")
     rows = db.get_messages("sess1")
     assert any(r["content"] == "lands despite stale lock" for r in rows)
 
@@ -78,9 +97,8 @@ def test_the_lock_owner_append_still_works(db: SessionDB) -> None:
 
 
 
-def test_a_lost_compression_lease_still_fails_fast(db: SessionDB) -> None:
+def test_a_lost_compression_lease_still_fails_fast(db: SessionDB, lease_waits: list) -> None:
     """``publish_compression_child`` with a lost lease is permanent — no retry."""
-    started = time.monotonic()
     with pytest.raises(CompressionSessionBusyError):
         db.publish_compression_child(
             parent_session_id="sess1",
@@ -90,6 +108,6 @@ def test_a_lost_compression_lease_still_fails_fast(db: SessionDB) -> None:
             compression_lock_holder="not-the-holder",
             require_compression_lease=True,
         )
-    assert time.monotonic() - started < 0.5, (
+    assert lease_waits == [], (
         "a lost lease is permanent and must not spend the retry budget"
     )
