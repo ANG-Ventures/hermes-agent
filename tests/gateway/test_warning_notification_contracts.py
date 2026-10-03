@@ -27,7 +27,7 @@ class Agent(StatusOutputMixin):
     _fallback_chain = []
     _empty_content_retries = 3
 
-    def _try_activate_fallback(self):
+    def _try_activate_fallback(self, reason=None):  # fork threads the failover reason
         return False
 
     def _persist_session(self, *args):
