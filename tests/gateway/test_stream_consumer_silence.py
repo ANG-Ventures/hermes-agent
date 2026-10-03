@@ -311,28 +311,24 @@ class TestHumanTurnTrailingMarkerStrip:
 
     2026-10-03: a kanban lifecycle line pasted into a Telegram DM drew a
     "note + NO_REPLY" reply.  Not internal, so delivery is right — but the
-    literal token was edited onto the screen.  ``_clean_for_display`` drops a
-    marker alone on the final line; the silence predicates keep reading the
-    raw buffer so an exact / autonomous marker is still suppressed.
+    literal token was edited onto the screen.  The turn-final text drops a
+    marker alone on its final line (``strip_trailing_silence_marker`` config,
+    set for non-raw surfaces); the silence predicates keep reading the raw
+    buffer so an exact / autonomous marker is still suppressed.
     """
 
     NOTE = "Routine closer digest, nothing for you.\n\nNO_REPLY"
 
-    def test_clean_for_display_drops_trailing_marker_only(self):
-        assert GatewayStreamConsumer._clean_for_display(self.NOTE) == (
-            "Routine closer digest, nothing for you."
-        )
-        # Whole-response marker is NOT stripped by display cleaning — the
-        # silence suppression path owns it.
-        assert GatewayStreamConsumer._clean_for_display("NO_REPLY") == "NO_REPLY"
-        assert GatewayStreamConsumer._clean_for_silence_check(self.NOTE) == self.NOTE
+    def test_clean_for_display_is_media_only(self):
+        # Per-chunk display cleaning never removes text: the trailing-marker
+        # strip is a turn-final decision (Prism f2a2a5636e1e).
+        assert GatewayStreamConsumer._clean_for_display(self.NOTE) == self.NOTE
 
     @pytest.mark.asyncio
     async def test_human_note_plus_marker_streams_without_token(self):
         adapter = _make_adapter()
         consumer = GatewayStreamConsumer(
-            adapter, "chat_1",
-            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+            adapter, "chat_1", _strip_cfg(),
         )
         consumer.on_delta(self.NOTE)
         consumer.finish()
@@ -349,8 +345,7 @@ class TestHumanTurnTrailingMarkerStrip:
         """The gateway's delivered_final_matches sees the same stripped text."""
         adapter = _make_adapter()
         consumer = GatewayStreamConsumer(
-            adapter, "chat_1",
-            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+            adapter, "chat_1", _strip_cfg(),
         )
         consumer.on_delta(self.NOTE)
         consumer.finish(self.NOTE)
@@ -376,3 +371,97 @@ class TestHumanTurnTrailingMarkerStrip:
 
         assert _sent_and_edited(adapter) == []
         assert consumer.final_content_delivered is False
+
+
+def _strip_cfg(**kw):
+    return StreamConsumerConfig(
+        edit_interval=0.01, buffer_threshold=1,
+        strip_trailing_silence_marker=True, **kw,
+    )
+
+
+class TestTrailingMarkerStripIsTurnFinalOnly:
+    """Prism P1s f2a2a5636e1e / 0ed312b03e71 / c7fca8d2bc4c on #1668.
+
+    The trailing-marker strip applies to the completed turn-final text only:
+    a standalone token line that a platform split leaves at the END of a
+    non-final chunk is real content and must be delivered.  Raw-text surfaces
+    (``strip_trailing_silence_marker`` off) never have it removed, and prose
+    like "No reply." is not a control token.
+    """
+
+    @pytest.mark.asyncio
+    async def test_marker_line_at_non_final_chunk_boundary_is_delivered(self):
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 600  # safe limit 500
+        consumer = GatewayStreamConsumer(adapter, "chat_1", _strip_cfg())
+        # 480 chars + "NO_REPLY": the platform split ends chunk 1 on the
+        # token line, chunk 2 carries the rest of the reply.
+        head = ("a" * 79 + "\n") * 6
+        body = head + "NO_REPLY\n" + ("b" * 79 + "\n") * 3 + "end"
+        consumer.on_delta(body)
+        consumer.finish()
+        await consumer.run()
+
+        sends = [c.kwargs.get("content", "") for c in adapter.send.call_args_list]
+        assert len(sends) >= 2, sends  # the reply really was split
+        assert sends[0].rstrip().endswith("NO_REPLY"), sends[0][-30:]
+        delivered = "".join(_sent_and_edited(adapter))
+        assert "NO_REPLY" in delivered, "mid-reply marker line was deleted"
+        assert consumer.delivered_final_matches(body) is True
+
+    @pytest.mark.asyncio
+    async def test_trailing_marker_stripped_before_split_and_reconciles(self):
+        """Completed turn longer than one message: the trailing token is
+        removed from the WHOLE text before splitting, and the gateway's
+        stripped response reconciles (no duplicate full re-send)."""
+        from gateway.response_filters import strip_trailing_silence_marker
+
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 600  # safe limit 500
+        consumer = GatewayStreamConsumer(adapter, "chat_1", _strip_cfg())
+        body = ("a" * 79 + "\n") * 6 + "x" * 30 + "\nNO_REPLY"
+        consumer.on_delta(body)
+        consumer.finish()
+        await consumer.run()
+
+        sends = [c.kwargs.get("content", "") for c in adapter.send.call_args_list]
+        assert len(sends) >= 2, sends
+        delivered = "".join(_sent_and_edited(adapter))
+        assert "NO_REPLY" not in delivered
+        assert "x" * 30 in delivered
+        assert consumer.delivered_final_matches(body) is True
+        assert consumer.delivered_final_matches(
+            strip_trailing_silence_marker(body)
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_send_new_chunk_does_not_strip(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(adapter, "chat_1", _strip_cfg())
+        await consumer._send_new_chunk("prose\nNO_REPLY", None)
+        assert adapter.send.call_args.kwargs["content"] == "prose\nNO_REPLY"
+
+    @pytest.mark.asyncio
+    async def test_raw_text_surface_streams_marker_verbatim(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("note\nNO_REPLY")
+        consumer.finish("note\nNO_REPLY")
+        await consumer.run()
+        texts = _sent_and_edited(adapter)
+        assert texts and texts[-1].rstrip().endswith("NO_REPLY")
+        assert consumer.delivered_final_matches("note\nNO_REPLY") is True
+
+    @pytest.mark.asyncio
+    async def test_prose_last_line_no_reply_is_delivered(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(adapter, "chat_1", _strip_cfg())
+        text = "Checked Alice's thread for a response:\n\nNo reply."
+        consumer.on_delta(text)
+        consumer.finish(text)
+        await consumer.run()
+        assert _sent_and_edited(adapter)[-1].rstrip().endswith("No reply.")
