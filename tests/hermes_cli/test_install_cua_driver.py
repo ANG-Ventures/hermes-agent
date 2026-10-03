@@ -30,6 +30,23 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_unattended_preflights():
+    """Default the unattended-refresh preflights to "lock free, host up".
+
+    ``_run_cua_driver_installer(installer_timeout=...)`` otherwise takes the
+    real upstream install lock and sends a live 5s HEAD to github.com. A
+    network blip on a CI runner then made a stdin/timeout test fail
+    (main-red on 38fd79d50). Tests that are about the preflights patch
+    them again inside the test, and that inner patch wins.
+    """
+    from hermes_cli import tools_config
+
+    with patch.object(tools_config, "_cua_install_lock_held", return_value=False), \
+         patch.object(tools_config, "_cua_release_endpoint_reachable", return_value=True):
+        yield
+
+
 def _runtime_manifest(version="0.20.0", *, omit=None):
     omit = set(omit or ())
     required = {
