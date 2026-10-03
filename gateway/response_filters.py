@@ -160,6 +160,36 @@ def is_intentional_silence_agent_result(
     return is_intentional_silence_response(response)
 
 
+def strip_trailing_silence_marker(response: Any) -> Any:
+    """Drop a silence marker sitting alone on the LAST line of a delivered reply.
+
+    Defensive counterpart to the silence rules above.  When a reply is going
+    to be delivered anyway (a human turn under the exact-marker rule, where
+    ``"short note\\nNO_REPLY"`` is prose, not silence), the trailing control
+    token must not reach the chat as literal text (2026-10-03: a kanban
+    lifecycle line pasted into a Telegram DM drew a "note + NO_REPLY" reply
+    that was delivered verbatim, token included).
+
+    Only a marker on its own final line is removed, and only when other
+    content precedes it — a reply that IS the marker is left for the silence
+    rules to suppress, and a token buried mid-sentence is untouched.  Shares
+    the marker set / canonicalization with the silence predicates so the
+    two never drift.
+    """
+    if not isinstance(response, str):
+        return response
+    lines = response.rstrip().split("\n")
+    if len(lines) < 2:
+        return response
+    last = lines[-1]
+    if not any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(last)):
+        return response
+    head = "\n".join(lines[:-1]).rstrip()
+    if not head.strip():
+        return response
+    return head
+
+
 def is_partial_silence_marker(text: Any) -> bool:
     """Return True while ``text`` could still resolve to a silence marker.
 
