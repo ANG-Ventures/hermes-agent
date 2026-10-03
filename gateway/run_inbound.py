@@ -1143,6 +1143,17 @@ class GatewayInboundMixin:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining:
+            # An internal event (kanban / control-socket wake) reaching an IDLE
+            # session mid-restart-drain: its producer has already advanced its
+            # cursor, so refusing it here loses it (t_cff27691). Spool it for
+            # the next boot like a busy session's follow-up.
+            if getattr(event, "internal", False) and self._queue_during_drain_enabled(
+                self._effective_busy_input_mode(source)
+            ):
+                await self._preserve_followup_across_restart(
+                    self._session_key_for_source(source), event, None
+                )
+                return True, None, command
             return True, t("gateway.busy.drain_rejected_new_work", action=self._status_action_gerund()), command
 
         # User-defined quick commands (bypass agent loop, no LLM call)

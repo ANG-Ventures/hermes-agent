@@ -2391,6 +2391,14 @@ DEFAULT_CONFIG = {
         # Seconds to fold home-chat lines into one post per home chat (one
         # operator batch = one line). 0 = one post per line.
         "lifecycle_home_digest_seconds": 120,
+        # True (t_1ae0c35b): a needs_input / precondition block, a stuck
+        # worker, the last blocker of open children going done, or a review
+        # handback whose PR is red/dirty enqueues a handoff TURN into the
+        # card's owning session (when it is live in this gateway). A card
+        # body line `wake: off` opts one card out.
+        "wake_owner_session": True,
+        # Gateway profiles whose sessions are operator sessions (woken).
+        "wake_owner_profiles": ["default", "aegis"],
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.
