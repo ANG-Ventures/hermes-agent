@@ -95,7 +95,38 @@ paths = [
   # this gate so their new fixtures arrive unmapped — same class as every sync):
   '''tests/cli/test_show_config_credential\.py''',   # literal MASKED display fixtures "sk-pro...1234"/"sk-pro...5678" (the masking-under-test itself)
   '''tests/tools/test_stage2_hook_api_server_keygen\.py''',  # obviously-fake operator/env key fixtures (operator-env-key-0123456789, env-key-9876543210fedcba)
-  '''website/docusaurus\.config\.ts''',             # Algolia DocSearch SEARCH-ONLY apiKey — public by design in every Docusaurus site
+  '''website/docusaurus\.config\.ts''',
+  # Mapped 2026-10-01 parity sync (t_e45c8c8d): upstream test fixtures / relocated paths, every
+  # hit read by hand under gitleaks 8.18.4 (CI pin); fixtures are obviously-fake literals.
+  '''apps/desktop/electron/channel-build-version\.test\.ts''',  # upstream test fixture (fake credential literal)
+  '''apps/desktop/electron/updater/channel\.test\.ts''',  # upstream test fixture (fake credential literal)
+  '''apps/desktop/scripts/side-by-side\.windows\.test\.mjs''',  # upstream test fixture (fake credential literal)
+  '''docs/sync/review/RETHREAD-BRIEF-2026-10-01\.md''',  # git range `26350357d7..612d8e44a2` in a sync brief (two commit SHAs)
+  '''evals/toolperf_abeval/ab_eval\.py''',  # relocated from scripts/toolperf_abeval (already mapped): synthetic `UNIQUE_TOKEN=tok_9f31c_middle`
+  '''tests/agent/test_context_compressor\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/agent/test_iron_proxy\.py''',  # relocated from tests/test_iron_proxy.py (already mapped): literal fake RSA block
+  '''tests/agent/test_primary_runtime_restore\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/agent/test_reset_aware_primary_restore\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/agent/test_switch_model_bedrock_sigv4\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/fakes/providers/bedrock_converse\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/fakes/providers/gemini_native\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/gateway/test_buzz_authz\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/gateway/test_buzz_mention_resolution\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/gateway/test_buzz_thread_topology\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/gateway/test_env_override_explicit_disable\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/gateway/test_multiplex_endpoint_identity_scope\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/gateway/test_startup_launch_profile_hooks_scope\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/hermes_cli/test_approvals_suggest\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/hermes_cli/test_doctor_github_token_probe\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/hermes_cli/test_quick_commands\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/hermes_cli/test_shared_metrics_model_attribution\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/hermes_cli/test_show_config_credential\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/plugins/test_honcho_client_config\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/scripts/test_channel_build_versions\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/scripts/test_release_channels\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/tui_gateway/test_cross_process_orphan_ownership\.py''',  # upstream test fixture (fake credential literal)
+  '''tests/tui_gateway/test_multi_profile_hosting_fail_closed\.py''',  # upstream test fixture (fake credential literal)
+  '''ui-tui/src/__tests__/useSessionLifecycleStoredSid\.test\.ts''',  # upstream test fixture (fake credential literal)             # Algolia DocSearch SEARCH-ONLY apiKey — public by design in every Docusaurus site
 ]
 # Regex allowlist — SOURCE files keep full scanning EXCEPT public OAuth *client
 # IDs* (client IDs are sent in browser auth flows — public by design, not

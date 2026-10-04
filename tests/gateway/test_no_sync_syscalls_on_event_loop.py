@@ -168,27 +168,26 @@ def _ratchet_key(offender: str) -> str:
 # The test fails if a baseline entry disappears without the baseline being
 # updated, so the list cannot silently rot.
 PER_MESSAGE_BASELINE = frozenset({
+    # Re-keyed 2026-10-02 (parity sync 2026-10-01, CI6-M1-gatewayb): upstream split run.py into
+    # run_*.py and slash_commands.py into slash_commands_*.py, so (file, coroutine) keys moved
+    # (_handle_message's /moa branch -> run_inbound._hm_cmd_moa, start -> run_startup.
+    # _start_log_startup_environment, _stop_impl_body -> run_shutdown._stop_persist_exit_state,
+    # wecom adapter -> wecom/media.py). 20 -> 14: qqbot _load_media, line send_*, run.py
+    # _launch_detached_restart_command and start_gateway read_raw_config no longer resolve on
+    # the loop in upstream's structure. Nothing new reaches the loop.
     "gateway/platforms/api_server.py _handle_cron_fire -> config-lock:load_config",
     "gateway/platforms/api_server.py _handle_toolsets -> config-lock:load_config",
-    "gateway/platforms/qqbot/adapter.py _load_media -> realpath:.resolve",
     "gateway/platforms/qqbot/adapter.py _upload_local_file -> realpath:.resolve",
     # /moa slash-command branch, not the general message path.
-    "gateway/run.py _handle_message -> config-lock:load_config",
-    "gateway/run.py _launch_detached_restart_command -> realpath:.resolve",
-    "gateway/run.py _send_telegram_topic_setup_image -> realpath:.resolve",
-    "gateway/run.py _stop_impl_body -> atomic-write:atomic_json_write",
-    "gateway/run.py start -> config-lock:load_config",
-    "gateway/run.py start_gateway -> config-lock:read_raw_config",
-    "gateway/slash_commands.py _finish_switch -> config-lock:save_config",
-    "gateway/slash_commands.py _handle_codex_runtime_command -> config-lock:load_config",
+    "gateway/run_inbound.py _hm_cmd_moa -> config-lock:load_config",
+    "gateway/run_shutdown.py _stop_persist_exit_state -> atomic-write:atomic_json_write",
+    "gateway/run_startup.py _start_log_startup_environment -> config-lock:load_config",
+    "gateway/run_topics.py _send_telegram_topic_setup_image -> realpath:.resolve",
     "gateway/slash_commands.py _handle_update_command -> realpath:.resolve",
-    "gateway/slash_commands.py _on_model_selected -> config-lock:save_config",
+    "gateway/slash_commands_model.py _handle_codex_runtime_command -> config-lock:load_config",
     "plugins/platforms/feishu/feishu_comment.py handle_drive_comment_event -> config-lock:load_config",
     "plugins/platforms/line/adapter.py _handle_media -> realpath:.resolve",
-    "plugins/platforms/line/adapter.py send_image_file -> realpath:.resolve",
-    "plugins/platforms/line/adapter.py send_video -> realpath:.resolve",
-    "plugins/platforms/line/adapter.py send_voice -> realpath:.resolve",
-    "plugins/platforms/wecom/adapter.py _load_outbound_media -> realpath:.resolve",
+    "plugins/platforms/wecom/media.py _load_outbound_media -> realpath:.resolve",
 })
 
 

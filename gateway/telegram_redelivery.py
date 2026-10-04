@@ -144,7 +144,7 @@ def read_hwm(hermes_home: Path, profile: str) -> Optional[int]:
     a surprising type."""
     path = _hwm_path(Path(hermes_home), profile)
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
         return None
     try:

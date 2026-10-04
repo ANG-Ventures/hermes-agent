@@ -218,7 +218,7 @@ def _set_live(task_id, **kw):
 
 
 def _run(agent, tool_side_effect):
-    with patch("run_agent.handle_function_call", side_effect=tool_side_effect), \
+    with patch("model_tools.handle_function_call", side_effect=tool_side_effect), \
             patch.object(agent, "_persist_session"), \
             patch.object(agent, "_save_trajectory"), \
             patch.object(agent, "_cleanup_task_resources"):

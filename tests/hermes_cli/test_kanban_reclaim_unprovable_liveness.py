@@ -38,6 +38,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -161,7 +162,7 @@ def _release(conn, tid, run_id, path):
         old = int(time.time()) - 7200
         conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (old, tid))
         conn.commit()
-        return kb.detect_stale_running(conn, stale_timeout_seconds=30) == [tid]
+        return kbd.detect_stale_running(conn, stale_timeout_seconds=30) == [tid]
     if path == "dashboard":
         return _load_dashboard_api()._set_status_direct(conn, tid, "ready")
     raise AssertionError(path)
@@ -224,7 +225,7 @@ def test_dead_claimer_with_unstamped_orphan_before_first_heartbeat_keeps_claim(
     try:
         assert _release(conn, tid, run_id, reclaim_path) is False
         spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
+        kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
         assert tid not in spawned
         assert orphan.poll() is None
         assert _row(conn, tid)["status"] == "running"
@@ -251,7 +252,7 @@ def test_dead_claimer_orphan_that_heartbeated_then_died_is_released_once_stale(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         stdin=subprocess.DEVNULL, start_new_session=True,
     )
-    assert kb.heartbeat_worker(conn, tid, note="orphan alive once")
+    assert kbd.heartbeat_worker(conn, tid, note="orphan alive once")
     orphan.kill()
     orphan.wait(timeout=10)
     aged = int(time.time()) - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS - 5
@@ -271,7 +272,7 @@ def test_dead_claimer_fresh_heartbeat_holds_even_if_orphan_is_gone(conn):
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
     tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
     _age_claim(conn, tid, run_id, _PAST_LAUNCH_BOUND)
-    assert kb.heartbeat_worker(conn, tid, note="recent")
+    assert kbd.heartbeat_worker(conn, tid, note="recent")
     assert kb.reclaim_task(conn, tid) is False
     refused = _events(conn, tid, "reclaim_refused")[-1]
     assert refused["dead_claimer_release_basis"] == "evidence_stale_bound"
@@ -284,6 +285,30 @@ def test_dead_claimer_inside_launch_bound_is_held(conn):
     _age_claim(conn, tid, run_id, kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS - 60)
     assert kb.reclaim_task(conn, tid) is False
     assert _row(conn, tid)["claim_lock"] == lock
+
+
+def test_dead_claimer_launch_bound_follows_the_claims_own_ttl(conn):
+    """``claim --ttl N`` states how long the claim may hold without evidence; a pid-less
+    claim whose claimer exited is released once THAT window has passed, not after the
+    900 s default (upstream e2e test_kanban_worker_sigkill: claim --ttl 1, then a tick)."""
+    tid = kb.create_task(conn, title="operator short claim", assignee="daedalus-opus")
+    task = kb.claim_task(conn, tid, ttl_seconds=5)
+    assert task is not None
+    run_id = task.current_run_id
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    conn.execute("UPDATE tasks SET claim_lock=? WHERE id=?", (lock, tid))
+    conn.execute("UPDATE task_runs SET claim_lock=? WHERE id=?", (lock, run_id))
+    conn.commit()
+    started = conn.execute("SELECT started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
+    release_at, basis, _ = kb._dead_claimer_release_at(conn, tid)
+    assert basis == "launch_bound"
+    assert release_at == int(started) + 5
+    # A default-TTL claim keeps the full launch bound (dispatcher claims pass no TTL).
+    tid2 = kb.create_task(conn, title="default claim", assignee="daedalus-opus")
+    task2 = kb.claim_task(conn, tid2)
+    started2 = conn.execute(
+        "SELECT started_at FROM task_runs WHERE id=?", (task2.current_run_id,)).fetchone()[0]
+    assert kb._dead_claimer_release_at(conn, tid2)[0] == int(started2) + kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS
 
 
 def test_missing_run_context_fails_closed_for_dead_claimer(conn):
@@ -340,7 +365,7 @@ def test_dead_claimer_with_unstamped_heartbeating_worker_keeps_claim(conn, recla
     )
     try:
         assert kb.heartbeat_claim(conn, tid, claimer=lock)
-        assert kb.heartbeat_worker(conn, tid, note="unstamped worker alive")
+        assert kbd.heartbeat_worker(conn, tid, note="unstamped worker alive")
         assert _row(conn, tid)["worker_pid"] is None
         if reclaim_path == "ttl":
             conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
@@ -351,11 +376,11 @@ def test_dead_claimer_with_unstamped_heartbeating_worker_keeps_claim(conn, recla
             conn.execute("UPDATE task_runs SET started_at=? WHERE id=?", (old, run_id))
             conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (old, tid))
             conn.commit()
-            assert kb.detect_stale_running(conn, stale_timeout_seconds=60) == []
+            assert kbd.detect_stale_running(conn, stale_timeout_seconds=60) == []
         else:
             assert kb.reclaim_task(conn, tid, reason="worker sweep: missing pid") is False
         spawned = []
-        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
+        kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
         assert tid not in spawned
         assert orphan.poll() is None
         assert _row(conn, tid)["status"] == "running"
@@ -494,7 +519,7 @@ def test_no_second_worker_spawns_after_a_refused_reclaim(conn, monkeypatch):
         spawned.append(task.id)
         return 999999
 
-    result = kb.dispatch_once(conn, spawn_fn=_spawn)
+    result = kbd.dispatch_once(conn, spawn_fn=_spawn)
 
     assert tid not in spawned, "a SECOND worker was spawned onto a live card"
     assert tid not in [t for t, *_ in getattr(result, "spawned", [])]
@@ -556,15 +581,20 @@ def test_timeout_survivor_keeps_claim_and_rejects_a_second_claim(conn, monkeypat
                          max_runtime_seconds=1)
     first = kb.claim_task(conn, tid)
     assert first is not None
-    kb._set_worker_pid(conn, tid, 424242)
+    kbd._set_worker_pid(conn, tid, 424242)
     old_run = first.current_run_id
+    # 424242 is synthetic: upstream's spawn fingerprint capture fails for it
+    # and stamps UNVERIFIED, which is never signalled by contract (#99558).
+    # Pin the legacy (pre-fingerprint) row shape so the timeout path signals
+    # and the survivor guard under test is what decides.
+    conn.execute("UPDATE tasks SET worker_started_at=NULL WHERE id=?", (tid,))
     conn.execute("UPDATE task_runs SET started_at=? WHERE id=?",
                  (int(time.time()) - 500, old_run))
     conn.commit()
     signals = []
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
-    assert kb.enforce_max_runtime(conn, signal_fn=lambda pid, sig: signals.append(sig)) == []
+    assert kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: signals.append(sig)) == []
     assert len(signals) == 2
     assert _row(conn, tid)["status"] == "running"
     assert _row(conn, tid)["current_run_id"] == old_run
@@ -577,7 +607,7 @@ def test_timeout_second_claim_guard_after_unsafe_requeue(conn, monkeypatch):
                          max_runtime_seconds=1)
     first = kb.claim_task(conn, tid)
     assert first is not None
-    kb._set_worker_pid(conn, tid, 424242)
+    kbd._set_worker_pid(conn, tid, 424242)
     run_id = first.current_run_id
     # Model an older binary that timed out a process without proving death.
     conn.execute("UPDATE task_runs SET status='timed_out', outcome='timed_out', "
@@ -588,7 +618,7 @@ def test_timeout_second_claim_guard_after_unsafe_requeue(conn, monkeypatch):
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
     assert kb.claim_task(conn, tid) is None
     spawned = []
-    kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 999999)
+    kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 999999)
     assert tid not in spawned
     assert _row(conn, tid)["status"] == "ready"
     assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
@@ -620,7 +650,7 @@ def test_claim_refuses_a_card_whose_previous_worker_is_alive(conn, monkeypatch):
     the latter describes both a still-launching worker and a never-spawned card.
     """
     tid, lock, run_id = _running_card(conn, worker_pid=4242)
-    kb._set_worker_pid(conn, tid, 4242)  # durable spawned event before reclaim
+    kbd._set_worker_pid(conn, tid, 4242)  # durable spawned event before reclaim
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 4242)
     conn.execute(
         "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
@@ -660,7 +690,7 @@ def test_claim_refuses_late_spawn_after_reclaim(conn, monkeypatch):
         }, run_id=run_id)
     # _set_worker_pid is the real post-spawn call. The prior run was already
     # cleared, so it cannot stamp the original run_id or task_runs.worker_pid.
-    kb._set_worker_pid(conn, tid, 4242)
+    kbd._set_worker_pid(conn, tid, 4242)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 4242)
     assert kb.claim_task(conn, tid) is None
     assert _row(conn, tid)["status"] == "ready"

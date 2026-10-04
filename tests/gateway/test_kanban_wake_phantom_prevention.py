@@ -28,6 +28,7 @@ from gateway.kanban_watchers import resolve_wake_participant
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_state import SessionDB
 
 CHAT = "1535189663533506600"
@@ -108,7 +109,7 @@ def _subscribed_completed_task(
         # about WHERE the wake lands, not whether the mode gate opens.
         kw: dict = {"chat_type": "group", "delivery_mode": "notify+wake"}
         kw.update(sub_kw)
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform=platform, chat_id=chat_id, **kw,
         )
         kb.complete_task(conn, tid, summary="done")

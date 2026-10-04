@@ -39,7 +39,7 @@ def _via_direct(**kwargs):
 def _via_registry(**kwargs):
     from tools.registry import registry
 
-    return json.loads(registry.dispatch("cronjob", kwargs))
+    return json.loads(registry.dispatch("cronjob_manage", kwargs))
 
 
 ENTRY_POINTS = pytest.mark.parametrize("call", [_via_direct, _via_registry], ids=["direct", "registry"])

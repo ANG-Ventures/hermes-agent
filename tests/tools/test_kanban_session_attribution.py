@@ -115,7 +115,8 @@ class TestWorkerSpawnDropsGatewayFlag:
         Verify by inspecting the env dict the spawn builds — we patch subprocess
         spawn to capture the env without actually launching a worker.
         """
-        from hermes_cli import kanban_db as kb
+        # Upstream split the worker spawn out of kanban_db into kanban_db_dispatch.
+        from hermes_cli import kanban_db_dispatch as kb
 
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
         captured = {}

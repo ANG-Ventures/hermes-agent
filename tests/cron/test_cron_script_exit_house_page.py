@@ -69,7 +69,9 @@ def test_agent_job_keeps_the_old_summary():
 
 def test_timeout_contract_is_not_reshaped():
     out = _summarize_cron_failure_for_delivery(JOB, "Script timed out after 60s: /x.sh")
-    assert out.startswith("⚠️ Cron 'fleet-model-drift-watch' failed: script timed out.")
+    # Merged copy table wording ("its script timed out"); the point is that the runner's timeout
+    # contract is never reshaped into the house page.
+    assert out.startswith("⚠️ Cron 'fleet-model-drift-watch' failed: its script timed out.")
 
 
 def _send(job, content):

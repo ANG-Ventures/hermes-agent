@@ -98,8 +98,10 @@ def test_conversation_loop_wires_the_filter():
     """Contract: the send-path loop consults both helpers before cloning rows."""
     import inspect
 
-    from agent import conversation_loop
+    # The per-request send loop moved from conversation_loop to
+    # turn_context.build_api_messages (upstream phase-helper split).
+    from agent.turn_context import build_api_messages
 
-    src = inspect.getsource(conversation_loop)
+    src = inspect.getsource(build_api_messages)
     assert "provider_owns_transcript(agent.provider)" in src
     assert "is_interrupt_close_row(msg)" in src

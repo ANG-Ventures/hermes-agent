@@ -40,8 +40,8 @@ def load_certified_gate() -> tuple[str, str]:
     gate_path = os.path.join(_ASSET_DIR, "capture_gate_v3.txt")
     ver_path = os.path.join(_ASSET_DIR, "gate_version.txt")
     try:
-        gate = open(gate_path, encoding="utf-8").read()
-        raw = open(ver_path, encoding="utf-8").read().strip()
+        gate = open(gate_path, encoding="utf-8-sig").read()
+        raw = open(ver_path, encoding="utf-8-sig").read().strip()
         # gate_version.txt is "GATE_VERSION=v3:<hash>"
         version = raw.split("=", 1)[1] if "=" in raw else raw
         if gate.strip() and version:

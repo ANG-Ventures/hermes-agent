@@ -311,7 +311,7 @@ async def test_semaphore_wait_does_not_claim_transcript_lease(
     monkeypatch, tmp_path, caplog,
 ):
     from gateway.turn_lease import SessionTurnLeaseRegistry
-    from tests.gateway.test_42039_duplicate_user_message import (
+    from tests.gateway.test_duplicate_user_message import (
         _bootstrap, _event, _source,
     )
 
@@ -668,7 +668,7 @@ async def test_boot_resume_pool_does_not_extend_restore_gate_timeout(monkeypatch
 ])
 @pytest.mark.parametrize("nested", [False, True])
 def test_config_loader_roundtrip(tmp_path, monkeypatch, key, value, expected, nested):
-    import yaml
+    import hermes_yaml as yaml
     data = {"gateway": {key: value}} if nested else {key: value}
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(data))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -776,7 +776,7 @@ def test_turn_admission_logs_resolved_cap_and_reserve_once(caplog):
 def test_user_turn_reserve_config_roundtrip(
     tmp_path, monkeypatch, value, expected, nested,
 ):
-    import yaml
+    import hermes_yaml as yaml
     key = "user_turn_reserve"
     data = {} if value is None else (
         {"gateway": {key: value}} if nested else {key: value}

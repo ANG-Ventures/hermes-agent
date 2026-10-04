@@ -77,6 +77,7 @@ def test_setup_logging_during_test_does_not_attach_real_handler(tmp_path, monkey
         assert real_logs not in p, f"setup_logging attached a real-home handler: {p}"
 
 
+@pytest.mark.allow_real_home_io  # inspects the REAL agent.log on purpose (never writes it)
 def test_warning_during_test_does_not_write_real_agent_log(tmp_path):
     """A WARNING logged by 'agent.conversation_compression' during a test must not
     append to the real ~/.hermes/logs/agent.log (the exact watcher-tripping leak)."""
@@ -147,6 +148,7 @@ def test_in_sandbox_handler_is_kept(tmp_path):
         h.close()
 
 
+@pytest.mark.allow_real_home_io  # attaches a delay=True handler at the REAL path on purpose
 def test_guard_strips_a_real_home_handler_attached_mid_session():
     """RED-proof of the guard: even if something attaches a RotatingFileHandler at
     the REAL ~/.hermes/logs (the intermittent import-order leak), the autouse

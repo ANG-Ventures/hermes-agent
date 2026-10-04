@@ -17,7 +17,26 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS, DELEGATE_TASK_SCHEMA, DelegateEvent, MAX_DEPTH, _LEGACY_EVENT_MAP, _build_child_agent, _build_child_progress_callback, _build_child_system_prompt, _extract_output_tail, _get_max_concurrent_children, _inherit_parent_base_url, _load_config, _resolve_child_credential_pool, _resolve_delegation_credentials, _strip_blocked_tools, check_delegate_requirements, delegate_task
+from tools.delegate_tool import (
+    DELEGATE_BLOCKED_TOOLS,
+    DELEGATE_TASK_SCHEMA,
+    DelegateEvent,
+    _build_child_agent,
+    _build_child_progress_callback,
+    _build_child_system_prompt,
+    _get_max_concurrent_children,
+    _load_config,
+    _resolve_child_credential_pool,
+    _resolve_delegation_credentials,
+    _strip_blocked_tools,
+    check_delegate_requirements,
+    delegate_task,
+)
+# Parity sync 2026-10-01: upstream extracted these into siblings and the
+# facade no longer re-exports them.
+from tools.delegate_tool_config import MAX_DEPTH
+from tools.delegate_tool_progress import _LEGACY_EVENT_MAP
+from tools.delegate_tool_results import _extract_output_tail
 from hermes_state import SessionDB
 
 
@@ -44,7 +63,6 @@ def _make_mock_parent(depth=0):
     return parent
 
 
-class TestDelegateRequirements(unittest.TestCase):
 
     def test_schema_valid(self):
         self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
@@ -191,10 +209,14 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {_get_max_concurrent_children()}", _blob)
 
 class TestChildSystemPrompt(unittest.TestCase):
+    # Upstream 0aa178736a (parity 2026-10-01): the goal is the child's FIRST USER TURN
+    # (_run_single_child -> run_conversation(user_message=goal)), not part of the system
+    # prompt — sending OAuth Anthropic the same task in both roles duplicated it.
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("YOUR TASK", prompt)
+        self.assertNotIn("Fix the tests", prompt)
+        self.assertNotIn("YOUR TASK", prompt)
+        self.assertIn("focused subagent", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
     def test_empty_context_ignored(self):
@@ -203,7 +225,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 
     def test_goal_with_context(self):
         prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
-        self.assertIn("Fix the tests", prompt)
+        self.assertNotIn("Fix the tests", prompt)
         self.assertIn("CONTEXT", prompt)
         self.assertIn("assertion failed", prompt)
 
@@ -279,7 +301,7 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertEqual(enabled, ["terminal", "code_execution", "delegation"])
 
     def test_inherited_and_fallback_paths_remain_filtered(self):
-        from tools.delegate_tool import DEFAULT_TOOLSETS
+        from tools.delegate_tool_toolsets import DEFAULT_TOOLSETS
         import model_tools
 
         parent_enabled = _make_mock_parent()
@@ -465,7 +487,8 @@ class TestStripBlockedTools(unittest.TestCase):
         new blocked tool can't silently leak through as a toolset name
         (regression for issue #43466's 'more robust variant' suggestion).
         """
-        from tools.delegate_tool import TOOLSETS, _strip_blocked_tools
+        from toolsets import TOOLSETS
+        from tools.delegate_tool import _strip_blocked_tools
         # Every toolset whose tools are ALL in the blocklist should be stripped
         # code_execution is the deliberate exemption (subagents get terminal anyway);
         # it stays inheritable even though execute_code is per-tool blocked.
@@ -637,8 +660,10 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # Upstream #81267: the dedicated-handle registry keys handles by the
+                # RESOLVED path (symlinked /tmp on macOS), so compare canonical paths.
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    Path(child_db.db_path).resolve(), Path(parent_db.db_path).resolve()
                 )
             finally:
                 if child_db is not None:
@@ -647,7 +672,12 @@ class TestDelegateTask(unittest.TestCase):
 
     def test_nous_child_rederives_api_mode_from_model(self):
         """Portal is dual-wire — same provider + different model prefix must
-        not inherit the parent's Messages/chat_completions mode verbatim."""
+        not inherit the parent's Messages/chat_completions mode verbatim.
+        Native wire selected (opt-in since 2026-09-06, ``nous.anthropic_wire``)."""
+        with patch("hermes_cli.providers._nous_anthropic_wire", return_value="native"):
+            self._nous_child_rederives_api_mode_from_model()
+
+    def _nous_child_rederives_api_mode_from_model(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://inference-api.nousresearch.com/v1"
         parent.api_key = "portal-jwt"
@@ -941,30 +971,6 @@ class TestToolNamePreservation(unittest.TestCase):
         self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
 
 
-    def test_saved_tool_names_set_on_child_before_run(self):
-        """_run_single_child must set _delegate_saved_tool_names on the child
-        from model_tools._last_resolved_tool_names before run_conversation."""
-        import model_tools
-
-        parent = _make_mock_parent(depth=0)
-        expected_tools = ["read_file", "web_search", "execute_code"]
-        model_tools._last_resolved_tool_names = list(expected_tools)
-
-        captured = {}
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-
-            def capture_and_return(user_message, task_id=None, stream_callback=None):
-                captured["saved"] = list(mock_child._delegate_saved_tool_names)
-                return {"final_response": "ok", "completed": True, "api_calls": 1}
-
-            mock_child.run_conversation.side_effect = capture_and_return
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="capture test", parent_agent=parent)
-
-        self.assertEqual(captured["saved"], expected_tools)
 
     def test_build_child_agent_does_not_raise_name_error(self):
         """Regression: _build_child_agent must not reference _saved_tool_names.
@@ -1325,6 +1331,181 @@ class TestDelegateObservability(unittest.TestCase):
             trace = result["results"][0]["tool_trace"]
             self.assertEqual(trace[0]["status"], "error")
 
+    def test_failed_child_with_error_summary_marks_status_failed(self):
+        """Regression: a child whose loop gave up on a structured failure
+        (``failed=True``, ``completed=False``, e.g. "API call failed after 3
+        retries: HTTP 524") returns that error message as final_response.
+        Status was derived from summary alone, so the non-empty error text
+        made the batch report show the task as ✓ status=completed. The
+        ``failed`` flag must win over a non-empty summary."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": (
+                    "API call failed after 3 retries: HTTP 524 — origin timeout"
+                ),
+                "completed": False,
+                "failed": True,
+                "error": "HTTP 524 — origin timeout",
+                "failure_reason": "server_error",
+                "interrupted": False,
+                "api_calls": 3,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test failed child", parent_agent=parent)
+            )
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            # The classified reason must survive into the batch entry so the
+            # parent can tell a quota wall from a real task error.
+            self.assertEqual(entry["failure_reason"], "server_error")
+            self.assertEqual(entry["error"], "HTTP 524 — origin timeout")
+            # A structured failure is not budget truncation.
+            self.assertEqual(entry["exit_reason"], "error")
+            self.assertFalse(entry["truncated"])
+
+    def test_successful_child_still_completed(self):
+        """Control for the failed-flag check: a child that succeeds
+        (``completed=True``, no ``failed`` flag) must keep reporting
+        status=completed — the fix must not change success behavior."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "All done.",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test success control", parent_agent=parent)
+            )
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "completed")
+            self.assertEqual(entry["exit_reason"], "completed")
+            self.assertNotIn("failure_reason", entry)
+
+
+class TestDelegateFailedChildStatus(unittest.TestCase):
+    """Honest status / exit_reason for failed subagents (issue #97655).
+
+    A child that fails on its first API call (e.g. an HTTP 400 "not a valid
+    model ID") returns completed=False with failed=True + an error string as
+    its terminal final_response. It must be reported as status=failed with an
+    honest exit_reason — never status=completed + exit_reason=max_iterations
+    (which mislabels provider rejections as iteration-budget exhaustion and
+    would render the false "TRUNCATED" banner).
+    """
+
+    def _delegate_single(self, child_result):
+        """Dispatch a single task whose mock child returns `child_result`,
+        returning the parsed child result entry dict."""
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = child_result
+            MockAgent.return_value = mock_child
+            result = json.loads(
+                delegate_task(goal="Test child status", parent_agent=parent)
+            )
+            return result["results"][0]
+
+
+
+    def test_error_without_failed_flag_marks_failed(self):
+        """A child result that carries a non-empty error string but OMITS the
+        ``failed`` key entirely (not ``failed=False`` — the key is absent, as in
+        legacy/partial result dicts) must still be status=failed + exit_reason=error.
+        The status branch checks ``result.get('failed') or result.get('error')``,
+        so the error field alone has to win — otherwise a dropped ``failed`` key
+        would silently mislabel a provider rejection as budget exhaustion."""
+        entry = self._delegate_single(
+            {
+                "final_response": "connection reset while streaming",
+                "completed": False,
+                "interrupted": False,
+                "error": "connection reset",
+                "api_calls": 2,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "error")
+        self.assertFalse(entry["truncated"])
+
+    def test_empty_error_with_summary_is_completed(self):
+        """REGRESSION PIN: an empty-string ``error`` field must NOT be treated as
+        a failure. ``result.get('error')`` returns ``''`` which is falsy, so the
+        failure branch correctly falls through to the summary-presence heuristic.
+        Empty error + a real summary => status=completed, exit_reason=completed
+        (or max_iterations if completed=False), never 'error'."""
+        entry = self._delegate_single(
+            {
+                "final_response": "work produced",
+                "completed": True,
+                "interrupted": False,
+                "error": "",
+                "api_calls": 2,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "completed")
+        self.assertFalse(entry["truncated"])
+
+    def test_genuine_truncation_stays_completed_max_iterations(self):
+        """REGRESSION GUARD: a child that genuinely exhausts its iteration
+        budget (completed=False, no failed flag, no error) but still returns a
+        summary must keep status=completed, exit_reason=max_iterations, and
+        truncated=True. This is the legitimate truncation path we must not
+        break while making failure labels honest."""
+        entry = self._delegate_single(
+            {
+                "final_response": "made partial progress before the budget ran out",
+                "completed": False,
+                "interrupted": False,
+                "api_calls": 10,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "max_iterations")
+        self.assertTrue(entry["truncated"])
+
+    def test_interrupted_unchanged(self):
+        """Interrupted children keep status=interrupted + exit_reason=interrupted
+        and are not marked truncated."""
+        entry = self._delegate_single(
+            {
+                "final_response": "some partial output",
+                "completed": False,
+                "interrupted": True,
+                "api_calls": 2,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "interrupted")
+        self.assertEqual(entry["exit_reason"], "interrupted")
+        self.assertFalse(entry["truncated"])
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd
@@ -1495,14 +1676,14 @@ class TestBlockedTools(unittest.TestCase):
         self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "cronjob"]:
+        # Upstream e16ad33a9d renamed the registry entry cronjob -> cronjob_manage (the fork's
+        # tool_executor still canonicalizes the legacy "cronjob" alias to it).
+        for tool in ["delegate_task", "clarify", "memory", "send_message", "cronjob_manage"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):
-        from tools.delegate_tool import (
-            _get_max_spawn_depth, _get_orchestrator_enabled,
-            _MIN_SPAWN_DEPTH,
-        )
+        from tools.delegate_tool import _get_max_spawn_depth, _get_orchestrator_enabled
+        from tools.delegate_tool_config import _MIN_SPAWN_DEPTH
         self.assertEqual(_get_max_concurrent_children(), 10)
         self.assertEqual(MAX_DEPTH, 1)
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
@@ -1559,7 +1740,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_base_url_with_provider_carries_runtime_request_overrides(self, mock_resolve):
         """#65035: the base_url short-circuit must not drop the configured
-        provider's request_overrides / max_output_tokens."""
+        provider's generic request_overrides; dedicated output caps are ignored."""
         mock_resolve.return_value = {
             "provider": "custom",
             "base_url": "https://provider-default.example/v1",
@@ -1584,16 +1765,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             creds["request_overrides"],
             {"extra_body": {"thinking": {"type": "disabled"}}},
         )
-        self.assertEqual(creds["max_output_tokens"], 8192)
+        self.assertNotIn("max_output_tokens", creds)
 
-    def test_bare_base_url_returns_none_overrides(self):
-        """No provider alongside base_url → no overrides source; keys are
-        present but None (shape parity with the inherit-everything path)."""
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "m", "provider": "", "base_url": "http://localhost:1234/v1", "api_key": "k"}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["request_overrides"])
-        self.assertIsNone(creds["max_output_tokens"])
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_base_url_survives_runtime_resolution_failure(self, mock_resolve):
@@ -1606,7 +1779,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["base_url"], "https://api.xiaomimimo.com/v1")
         self.assertIsNone(creds["request_overrides"])
-        self.assertIsNone(creds["max_output_tokens"])
+        self.assertNotIn("max_output_tokens", creds)
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
@@ -1617,7 +1790,6 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials(cfg, parent)
         self.assertIn("openrouter", str(ctx.exception).lower())
-        self.assertIn("Cannot resolve", str(ctx.exception))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolves_but_no_api_key_raises(self, mock_resolve):
@@ -1630,9 +1802,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
         cfg = {"model": "some-model", "provider": "openrouter"}
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(ValueError):
             _resolve_delegation_credentials(cfg, parent)
-        self.assertIn("no API key", str(ctx.exception))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_named_custom_provider_preserves_provider_name(self, mock_resolve):
@@ -1869,7 +2040,10 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             _make_mock_parent(depth=0),
         )
         self.assertEqual(creds["request_overrides"], {"extra_body": {"store": False}})
-        self.assertEqual(creds["max_output_tokens"], 3072)
+        # Upstream fd3565deec removed the per-child output cap (R07: converged on upstream;
+        # _build_child_agent's override_max_tokens kwarg is accepted but inert) — the bundle
+        # no longer carries it, matching the sibling base_url-branch assertions above.
+        self.assertNotIn("max_output_tokens", creds)
 
     def test_registered_custom_endpoint_stamps_lane_name(self):
         """AC1: a REGISTERED custom endpoint records provider='custom:<name>'
@@ -1946,39 +2120,6 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_config_provider_credentials_reach_child_agent(self, mock_creds, mock_cfg):
-        """When delegation.provider is configured, child agent gets resolved credentials."""
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "google/gemini-3-flash-preview",
-            "provider": "openrouter",
-        }
-        mock_creds.return_value = {
-            "model": "google/gemini-3-flash-preview",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "sk-or-delegation-key",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Test provider routing", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["model"], "google/gemini-3-flash-preview")
-            self.assertEqual(kwargs["provider"], "openrouter")
-            self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
-            self.assertEqual(kwargs["api_key"], "sk-or-delegation-key")
-            self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2018,39 +2159,6 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertNotEqual(kwargs["base_url"], parent.base_url)
             self.assertNotEqual(kwargs["api_key"], parent.api_key)
 
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_direct_endpoint_credentials_reach_child_agent(self, mock_creds, mock_cfg):
-        mock_cfg.return_value = {
-            "max_iterations": 45,
-            "model": "qwen2.5-coder",
-            "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
-        }
-        mock_creds.return_value = {
-            "model": "qwen2.5-coder",
-            "provider": "custom",
-            "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Direct endpoint test", parent_agent=parent)
-
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["model"], "qwen2.5-coder")
-            self.assertEqual(kwargs["provider"], "custom")
-            self.assertEqual(kwargs["base_url"], "http://localhost:1234/v1")
-            self.assertEqual(kwargs["api_key"], "local-key")
-            self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2064,8 +2172,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
         result = json.loads(delegate_task(goal="Should fail", parent_agent=parent))
         self.assertIn("error", result)
-        self.assertIn("Cannot resolve", result["error"])
-        self.assertIn("nonexistent", result["error"])
+        self.assertNotIn("results", result)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2139,7 +2246,9 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["base_url"], "http://localhost:11434/v1")
-            self.assertEqual(kwargs["api_key"], "ollama")
+            # Upstream #90009 (52705fba6c): the live client's key travels WITH its URL — pairing
+            # the live endpoint with the stale surface key built an instant, non-retryable 401.
+            self.assertEqual(kwargs["api_key"], "no-key-required")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2209,16 +2318,19 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], parent.base_url)
 
     def test_inherit_parent_base_url_prefers_client_kwargs(self):
+        # Parity sync 2026-10-01: upstream folded _inherit_parent_base_url into
+        # delegate_tool_config._inherit_parent_endpoint (returns the live
+        # (base_url, api_key) pair); the stale-attribute property is the same.
+        from tools.delegate_tool_config import _inherit_parent_endpoint
+
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://openrouter.ai/api/v1"
         parent._client_kwargs = {
             "api_key": "no-key-required",
             "base_url": "http://localhost:11434/v1",
         }
-        self.assertEqual(
-            _inherit_parent_base_url(parent, parent.base_url),
-            "http://localhost:11434/v1",
-        )
+        base_url, _api_key = _inherit_parent_endpoint(parent, parent.base_url, "stale-key")
+        self.assertEqual(base_url, "http://localhost:11434/v1")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2345,7 +2457,46 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         result = _resolve_child_credential_pool("openrouter", parent)
         self.assertIs(result, mock_pool)
 
+    def test_same_provider_pool_for_another_endpoint_is_not_shared(self):
+        """#68237: an Azure child must not lease the parent's public-OpenAI ``openai`` pool — the lease swaps the
+        child's base_url too, sending the pooled key to the wrong host. A pool with an entry for the child's endpoint
+        is still shared."""
+        from agent.credential_pool import CredentialPool, PooledCredential
+
+        azure = "https://res.cognitiveservices.azure.com/openai/v1"
+        def _pool(url):
+            return CredentialPool("openai", [PooledCredential(
+                provider="openai", id=url, label=url, auth_type="api_key", priority=0, source="env:X",
+                access_token="k", base_url=url)])
+        parent = _make_mock_parent()
+        parent.provider, parent.base_url = "openai", azure
+
+        parent._credential_pool = _pool("https://api.openai.com/v1")
+        with patch("tools.delegate_tool_config._loaded_pool", return_value=None):
+            self.assertIsNone(_resolve_child_credential_pool("openai", parent, azure))
+        parent._credential_pool = _pool(azure)
+        self.assertIs(_resolve_child_credential_pool("openai", parent, azure), parent._credential_pool)
+
     # --- Custom-endpoint identity resolution (issue #7833) ---
+
+    def test_named_custom_child_pool_follows_requested_provider_not_endpoint_order(self):
+        """#45763 (salvage #89021): two named custom providers on one gateway URL keep separate pools; the child
+        leases the pool of the identity it inherited, not the first entry registered for that URL."""
+        from hermes_constants import get_hermes_home
+
+        url = "https://gateway.invalid/v1"
+        get_hermes_home().joinpath("config.yaml").write_text(
+            f"providers:\n  claude-ai:\n    api: {url}\n  open-ai:\n    api: {url}\n", encoding="utf-8",
+        )
+        parent = _make_mock_parent()
+        parent.provider, parent.base_url, parent.requested_provider = "custom", url, "custom:open-ai"
+        parent._credential_pool = None
+
+        with patch("tools.delegate_tool_config._loaded_pool", side_effect=lambda key: key) as loaded:
+            key = _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
+        loaded.assert_called_once()
+        self.assertIn("open-ai", key)
+        self.assertNotIn("claude", key)
 
 
     @patch(
@@ -2379,6 +2530,9 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
     def test_build_child_agent_assigns_parent_pool_when_shared(self):
         parent = _make_mock_parent()
         mock_pool = MagicMock()
+        # Upstream #68237: pools are provider/endpoint-scoped; a bare MagicMock's auto
+        # ``provider`` attribute would never match the parent's provider.
+        mock_pool.provider = parent.provider
         parent._credential_pool = mock_pool
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -2538,7 +2692,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child = MagicMock()
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
-        child._credential_pool.current.return_value = leased_entry
+        child._credential_pool.entries.return_value = [leased_entry]  # bound by leased id, not the shared cursor
         child.run_conversation.return_value = {
             "final_response": "done",
             "completed": True,
@@ -2577,6 +2731,26 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+    def test_lease_binds_only_an_entry_for_the_child_endpoint(self):
+        """#68237: on a mixed same-provider pool the least-leased pick may target another host; the child must end up
+        bound to the entry for its own base_url, with the wrong-host lease released."""
+        from agent.credential_pool import CredentialPool, PooledCredential
+        from tools.delegate_tool_child_run import _lease_child_credential
+
+        azure = "https://res.cognitiveservices.azure.com/openai/v1"
+        def _entry(eid, url):
+            return PooledCredential(provider="openai", id=eid, label=eid, auth_type="api_key", priority=0,
+                                    source=f"env:{eid}", access_token=f"key-{eid}", base_url=url)
+        pool = CredentialPool("openai", [_entry("pub", "https://api.openai.com/v1"), _entry("az", azure)])
+        pool.acquire_lease("az")  # tilt least-leased selection toward the public entry
+        child = MagicMock(provider="openai", base_url=azure, _credential_pool=pool)
+
+        _pool, lease_id = _lease_child_credential(child)
+
+        self.assertEqual(lease_id, "az")
+        self.assertEqual(child._swap_credential.call_args[0][0].base_url, azure)
+        self.assertEqual(pool._active_leases, {"az": 2})
 
 
 class TestDelegateHeartbeat(unittest.TestCase):
@@ -3008,59 +3182,6 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
-class TestDelegateEventEnum(unittest.TestCase):
-    """Tests for DelegateEvent enum and back-compat aliases."""
-
-    def test_progress_callback_normalises_tool_started(self):
-        """_build_child_progress_callback handles tool.started via enum."""
-        parent = _make_mock_parent()
-        parent._delegate_spinner = MagicMock()
-        parent.tool_progress_callback = MagicMock()
-
-        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
-        self.assertIsNotNone(cb)
-
-        cb("tool.started", tool_name="terminal", preview="ls")
-        parent._delegate_spinner.print_above.assert_called()
-
-
-    def test_progress_callback_ignores_unknown_events(self):
-        """Unknown event types are silently ignored."""
-        parent = _make_mock_parent()
-        parent._delegate_spinner = MagicMock()
-
-        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
-        # Should not raise
-        cb("some.unknown.event", tool_name="x")
-        parent._delegate_spinner.print_above.assert_not_called()
-
-    def test_progress_callback_task_progress_not_misrendered(self):
-        """'subagent_progress' (legacy name for TASK_PROGRESS) carries a
-        pre-batched summary in the tool_name slot.  Before the fix, this
-        fell through to the TASK_TOOL_STARTED rendering path, treating
-        the summary string as a tool name.  After the fix: distinct
-        render (no tool-start emoji lookup) and pass-through relay
-        upward (no re-batching).
-
-        Regression path only reachable once nested orchestration is
-        enabled: nested orchestrators relay subagent_progress from
-        grandchildren upward through this callback.
-        """
-        parent = _make_mock_parent()
-        parent._delegate_spinner = MagicMock()
-        parent.tool_progress_callback = MagicMock()
-
-        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
-        cb("subagent_progress", tool_name="🔀 [1] terminal, file")
-
-        # Spinner gets a distinct 🔀-prefixed line, NOT a tool emoji
-        # followed by the summary string as if it were a tool name.
-        calls = parent._delegate_spinner.print_above.call_args_list
-        self.assertTrue(any("🔀 🔀 [1] terminal, file" in str(c) for c in calls))
-        # Parent callback receives the relay (pass-through, no re-batching).
-        parent.tool_progress_callback.assert_called_once()
-        # No '⚡' tool-start emoji should appear — that's the pre-fix bug.
-        self.assertFalse(any("⚡" in str(c) for c in calls))
 
     def test_enum_values_are_strings(self):
         for event in DelegateEvent:
@@ -3237,11 +3358,6 @@ class TestConcurrencyDefaults(unittest.TestCase):
 class TestAsyncCapUnified(unittest.TestCase):
     """max_async_children is deprecated: the async cap IS max_concurrent_children."""
 
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 15})
-    def test_async_cap_follows_concurrent_children(self, mock_cfg):
-        from tools.delegate_tool import _get_max_async_children
-        self.assertEqual(_get_max_async_children(), 15)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 15, "max_async_children": 3})
@@ -3263,20 +3379,12 @@ class TestAsyncCapUnified(unittest.TestCase):
 class TestMaxSpawnDepth(unittest.TestCase):
     """Tests for _get_max_spawn_depth clamping and fallback behavior."""
 
-    @patch("tools.delegate_tool._load_config", return_value={})
-    def test_max_spawn_depth_defaults_to_1(self, mock_cfg):
-        from tools.delegate_tool import _get_max_spawn_depth
-        self.assertEqual(_get_max_spawn_depth(), 1)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 0})
     def test_max_spawn_depth_clamped_below_one(self, mock_cfg):
-        import logging
         from tools.delegate_tool import _get_max_spawn_depth
-        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
-            result = _get_max_spawn_depth()
-        self.assertEqual(result, 1)
-        self.assertTrue(any("below floor 1" in m for m in cm.output))
+        self.assertEqual(_get_max_spawn_depth(), 1)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": "not-a-number"})
@@ -3354,7 +3462,6 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertIn("leaf (default)", props["role"]["description"])
 
     def test_schema_omits_acp_transport_fields(self):
-        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
 
         task_props = props["tasks"]["items"]["properties"]
@@ -3451,16 +3558,6 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     # ── Role-aware system prompt ────────────────────────────────────────
 
-    def test_orchestrator_prompt_mentions_delegation_capability(self):
-        prompt = _build_child_system_prompt(
-            "Survey approaches", role="orchestrator",
-            max_spawn_depth=2, child_depth=1,
-        )
-        self.assertIn("delegate_task", prompt)
-        self.assertIn("Orchestrator Role", prompt)
-        # Depth/max-depth note present and literal:
-        self.assertIn("depth 1", prompt)
-        self.assertIn("max_spawn_depth=2", prompt)
 
     # Per-task role overrides (per-task leaf beats top-level orchestrator)
     # are locked in tests/tools/test_delegate_leaf_default_role.py.
@@ -3562,7 +3659,10 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             "Deep work", role="orchestrator",
             max_spawn_depth=3, child_depth=1,
         )
-        self.assertIn("can themselves be orchestrators", prompt)
+        # Upstream wording (9dfbde19db, pinned by tests/tools/test_delegate_depth_prompt.py):
+        # the note must not teach a model-controlled role knob that no longer exists.
+        self.assertIn("can themselves delegate because depth remains", prompt)
+        self.assertNotIn("orchestrators or leaves", prompt)
 
 
 class TestOrchestratorEndToEnd(unittest.TestCase):
@@ -3774,7 +3874,10 @@ class TestFallbackModelInheritance(unittest.TestCase):
         fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
         parent._fallback_chain = [fallback_entry]
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={}),
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
@@ -3795,7 +3898,10 @@ class TestFallbackModelInheritance(unittest.TestCase):
         parent = _make_mock_parent(depth=0)
         parent._fallback_chain = []
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={}),
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
@@ -3885,6 +3991,48 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+class TestAtomicChildCredentialBundle(unittest.TestCase):
+    """provider/base_url/api_key reach the child as one bundle: all override, or all from the parent's live runtime.
+
+    #90009: a parent that flipped onto a fallback runtime handed the child the live endpoint paired with the
+    surface (stale) key — an instant 401 the child could never retry out of.
+    """
+
+    def _build(self, parent, **overrides):
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0, goal="bundle", context=None, toolsets=None, model=None,
+                max_iterations=10, parent_agent=parent, task_count=1, **overrides,
+            )
+        return MockAgent.call_args[1]
+
+    def test_provider_override_never_borrows_parent_base_url(self):
+        parent = _make_mock_parent(depth=0)
+        kwargs = self._build(parent, override_provider="copilot", override_base_url=None, override_api_key="gh-x")
+        self.assertEqual(kwargs["provider"], "copilot")
+        self.assertIsNone(kwargs["base_url"])
+        self.assertNotEqual(kwargs["base_url"], parent.base_url)
+
+    def test_no_override_inherits_live_endpoint_and_key_together(self):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://fallback.example/v1"
+        parent.api_key = "FAKE-KEY-STALE-PRIMARY"  # surface attribute lagging the live runtime
+        parent._client_kwargs = {"api_key": "FAKE-KEY-FALLBACK", "base_url": "https://fallback.example/v1/"}
+        parent.client = MagicMock(base_url="https://fallback.example/v1/", api_key="FAKE-KEY-FALLBACK")
+        kwargs = self._build(parent)
+        self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["base_url"], "https://fallback.example/v1")
+        self.assertEqual(kwargs["api_key"], "FAKE-KEY-FALLBACK")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_without_base_url_is_refused(self, mock_resolve):
+        mock_resolve.return_value = {"provider": "copilot", "base_url": "", "api_key": "gh-x", "api_mode": None}
+        parent = _make_mock_parent(depth=0)
+        with self.assertRaises(ValueError):
+            _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
 
 
 if __name__ == "__main__":

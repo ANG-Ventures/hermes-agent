@@ -21,7 +21,9 @@ from __future__ import annotations
 import pytest
 
 from agent.chat_completion_helpers import (
-    _FALLBACK_REASON_LABELS,
+    # The fork's string-keyed announce table (upstream's enum-keyed
+    # _FALLBACK_REASON_LABELS is a parallel invention; renamed in the 2026-10-01 sync).
+    _FALLBACK_ANNOUNCE_LABELS,
     _fallback_reason_label,
     _pool_scope_label,
 )
@@ -100,7 +102,7 @@ def test_model_scoped_label_names_the_model_and_absolves_the_rest():
     assert label == "claude-fable-5 capped pool-wide, other models unaffected"
     # The whole point: it can no longer be read as a fleet outage.
     assert "other models unaffected" in label
-    assert label != _FALLBACK_REASON_LABELS["pool_exhausted"]
+    assert label != _FALLBACK_ANNOUNCE_LABELS["pool_exhausted"]
 
 
 def test_label_degrades_honestly_when_the_model_is_unknown():

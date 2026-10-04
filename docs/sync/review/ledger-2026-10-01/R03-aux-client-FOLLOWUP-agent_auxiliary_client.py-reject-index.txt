@@ -1,0 +1,280 @@
+@@ -230,10 +230,20 @@  (+10/-0)
+   anchor: """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
+   defs: 
+   first+: from agent.fork_ext.relay_headers import (
+   rem: 
+@@ -562,6 +586,15 @@  (+9/-0)
+   anchor: return False
+   defs: def _on_aux_anthropic_stream_event(event: Any) -> None:
+   first+: def _on_aux_anthropic_stream_event(event: Any) -> None:
+   rem: 
+@@ -614,10 +647,180 @@  (+170/-0)
+   anchor: def _run_protected_sync_provider_call(
+   defs: class _CombinedAuxCancelSignal:, def __init__(self, host_check: Optional[Callable[[], Any]], , def is_set(self) -> bool:, def capture_aux_thread_state(extra_cancel_event: Any = None)
+   first+: class _CombinedAuxCancelSignal:
+   rem: 
+@@ -837,17 +1040,19 @@  (+8/-6)
+   anchor: ``gpt-daybreak-blue-latest`` Codex slug is also a verified Sol-family
+   defs: 
+   first+: Slugs that resolve to the large verified window are explicitly EXCLUDED
+   rem: ``-900k`` large-context picker variants are explicitly EXCLUDED: the
+@@ -1373,20 +1684,11 @@  (+5/-14)
+   anchor: "User-Agent": f"HermesAgent/{__version__}",
+   defs: 
+   first+: from hermes_cli.auth import get_codex_account_id
+   rem: if not isinstance(access_token, str) or not access_token.strip():
+@@ -2278,6 +2580,37 @@  (+31/-0)
+   anchor: from agent.anthropic_adapter import _forbids_sampling_params
+   defs: 
+   first+: _aux_task = kwargs.get("_aux_task")
+   rem: 
+@@ -1804,13 +2151,7 @@  (+1/-7)
+   anchor: # stalled summary open. No-op when no hook is installed (None
+   defs: 
+   first+: _on_aux_anthropic_stream_event
+   rem: (
+@@ -2339,6 +2691,7 @@  (+1/-0)
+   anchor: choices=[choice],
+   defs: 
+   first+: provider_data=_nr.provider_data,
+   rem: 
+@@ -4155,7 +4645,9 @@  (+3/-1)
+   anchor: # Preserve per-request attribution headers across the rebuilt-client
+   defs: 
+   first+: from agent.fork_ext.gemini_bridge_claims import merge_extra_headers
+   rem: retry_kwargs["extra_headers"] = dict(extra_headers)
+@@ -4992,6 +5484,10 @@  (+4/-0)
+   anchor: destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+   defs: 
+   first+: if _is_auto_chain_entry(fallback_entry):
+   rem: 
+@@ -5724,6 +6225,8 @@  (+2/-0)
+   anchor: failed_provider: str,
+   defs: 
+   first+: skip_indices: Optional[set[int]] = None,
+   rem: 
+@@ -5750,6 +6253,12 @@  (+6/-0)
+   anchor: on that provider are broken, so a sibling can't help and the
+   defs: 
+   first+: An entry spelled ``{provider: auto}`` is the session's own main model
+   rem: 
+@@ -5783,8 +6292,15 @@  (+7/-0)
+   anchor: min_ctx = _task_minimum_context_length(task)
+   defs: 
+   first+: if i in (skip_indices or ()):
+   rem: 
+@@ -5814,7 +6330,7 @@  (+1/-1)
+   anchor: fb_provider,
+   defs: 
+   first+: api_key=_context_probe_api_key(_fallback_entry_api_key(entry)),
+   rem: api_key=_fallback_entry_api_key(entry) or "",
+@@ -5841,6 +6357,7 @@  (+1/-0)
+   anchor: def _try_configured_fallback_for_unavailable_client(
+   defs: 
+   first+: main_runtime: Optional[Dict[str, Any]] = None,
+   rem: 
+@@ -5857,6 +6374,7 @@  (+1/-0)
+   anchor: task,
+   defs: 
+   first+: main_runtime=main_runtime,
+   rem: 
+@@ -5869,6 +6387,11 @@  (+5/-0)
+   anchor: """
+   defs: 
+   first+: inline = entry.get("api_key") if isinstance(entry, dict) else None
+   rem: 
+@@ -5896,13 +6419,141 @@  (+128/-0)
+   anchor: def _try_main_fallback_chain(
+   defs: def _is_auto_chain_entry(entry: Any) -> bool:, def resolve_auto_chain_entry(, def resolve_task_fallback_chain(, def _select_main_fallback_entry(
+   first+: AUTO_CHAIN_PROVIDER = "auto"
+   rem: 
+@@ -5918,10 +6569,10 @@  (+2/-2)
+   anchor: chain = get_fallback_chain(load_config_readonly())
+   defs: 
+   first+: return None, None, "", None
+   rem: return None, None, ""
+@@ -5938,6 +6589,8 @@  (+2/-0)
+   anchor: continue
+   defs: 
+   first+: if (fb_norm, fb_model.lower()) in (skip_routes or ()):
+   rem: 
+@@ -5951,12 +6604,14 @@  (+3/-1)
+   anchor: logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
+   defs: 
+   first+: if (fb_norm, (resolved_model or fb_model).lower()) in (skip_routes or ()):
+   rem: api_key=_fallback_entry_api_key(entry) or "",
+@@ -5970,7 +6625,7 @@  (+1/-1)
+   anchor: task or "call", reason, failed_provider or "auto", label,
+   defs: 
+   first+: return fb_client, resolved_model or fb_model, fb_provider, entry
+   rem: return fb_client, resolved_model or fb_model, fb_provider
+@@ -5978,7 +6633,7 @@  (+1/-1)
+   anchor: def _resolve_single_provider(
+   defs: 
+   first+: return None, None, "", None
+   rem: return None, None, ""
+@@ -6000,6 +6655,66 @@  (+60/-0)
+   anchor: def _resolve_auto_route(
+   defs: def _main_runtime_route(
+   first+: def _main_runtime_route(
+   rem: 
+@@ -6052,8 +6767,24 @@  (+18/-2)
+   anchor: # on aggregators (OpenRouter, Nous) who previously got routed to a
+   defs: 
+   first+: if runtime_provider:
+   rem: main_provider = str(runtime_provider or _read_main_provider() or "")
+@@ -6093,49 +6824,9 @@  (+3/-43)
+   anchor: 
+   defs: 
+   first+: resolved_provider, explicit_base_url, explicit_api_key = _main_runtime_route(
+   rem: resolved_provider = main_provider
+@@ -6164,7 +6855,8 @@  (+2/-1)
+   anchor: # for users who have not declared a fallback policy.
+   defs: 
+   first+: task, main_provider or "auto", reason="main provider unavailable",
+   rem: task, main_provider or "auto", reason="main provider unavailable")
+@@ -8286,7 +9021,8 @@  (+2/-1)
+   anchor: # This concurrently built loser was never exposed to a caller,
+   defs: 
+   first+: normalized_caller_model = _normalize_resolved_model(model, provider) if model else None
+   rem: return client, model or default_model
+@@ -8445,6 +9181,28 @@  (+22/-0)
+   anchor: provider, base_url = _expand_direct_api_alias(provider, base_url)
+   defs: 
+   first+: if provider and not resolved_api_mode:
+   rem: 
+@@ -8282,7 +9051,49 @@  (+42/-0)
+   anchor: def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
+   defs: def _scope_client_for_task(client: Any, task: Optional[str],
+   first+: def _scope_client_for_task(client: Any, task: Optional[str], effective_timeout: float) -> "Tuple[Any, Dict[str
+   rem: 
+@@ -8600,6 +9411,7 @@  (+1/-0)
+   anchor: def feed(self, chunk: Any) -> None:
+   defs: 
+   first+: _raise_if_aux_cancel_requested()
+   rem: 
+@@ -8767,8 +9579,21 @@  (+14/-1)
+   anchor: stream_options: dict = None,
+   defs: 
+   first+: response_validator: Optional[Callable[[Any], Optional[str]]] = None,
+   rem: """Run an auxiliary LLM request, applying the configured task limit."""
+@@ -8779,6 +9604,7 @@  (+1/-0)
+   anchor: def _timed_response() -> None:
+   defs: 
+   first+: outcome = "failed"
+   rem: 
+@@ -8801,6 +9627,7 @@  (+1/-0)
+   anchor: ),
+   defs: 
+   first+: _aux_route_scope() as aux_route,
+   rem: 
+@@ -8825,17 +9652,88 @@  (+71/-0)
+   anchor: def _release_sync_semaphore_after_stream(
+   defs: def _log_compression_call_duration(
+   first+: outcome = "streaming"
+   rem: 
+@@ -8919,6 +9817,41 @@  (+35/-0)
+   anchor: task, provider, model, base_url, api_key)
+   defs: 
+   first+: if task == "compression" and resolved_model:
+   rem: 
+@@ -8971,7 +9904,7 @@  (+1/-1)
+   anchor: _explicit = (resolved_provider or "").strip().lower()
+   defs: 
+   first+: task, _explicit, main_runtime=main_runtime,
+   rem: task, _explicit,
+@@ -9054,8 +9987,22 @@  (+15/-1)
+   anchor: # provider-quirk handling (same guard as the fallback path).
+   defs: 
+   first+: from agent.fork_ext.gemini_bridge_claims import merge_extra_headers
+   rem: kwargs["extra_headers"] = dict(extra_headers)
+@@ -9184,9 +10131,11 @@  (+4/-2)
+   anchor: ),
+   defs: 
+   first+: provider=request_provider, base_url=_base_info), task)
+   rem: provider=request_provider, base_url=_base_info)
+@@ -9314,7 +10263,7 @@  (+1/-1)
+   anchor: "1210" in err_str
+   defs: 
+   first+: if max_tokens is not None and not _is_context_length_error(first_err) and (
+   rem: if max_tokens is not None and (
+@@ -9563,6 +10512,7 @@  (+1/-0)
+   anchor: or _is_connection_error(first_err)
+   defs: 
+   first+: or _is_context_length_error(first_err)
+   rem: 
+@@ -9586,6 +10536,7 @@  (+1/-0)
+   anchor: or _is_connection_error(first_err)
+   defs: 
+   first+: or _is_context_length_error(first_err)
+   rem: 
+@@ -9602,6 +10553,8 @@  (+2/-0)
+   anchor: )
+   defs: 
+   first+: elif _is_context_length_error(first_err):
+   rem: 
+@@ -9629,7 +10582,7 @@  (+1/-1)
+   anchor: if is_auto:
+   defs: 
+   first+: failed_model=_chain_failed_model, main_runtime=main_runtime)
+   rem: failed_model=_chain_failed_model)
+@@ -9639,7 +10592,7 @@  (+1/-1)
+   anchor: else:
+   defs: 
+   first+: failed_model=_chain_failed_model, main_runtime=main_runtime)
+   rem: failed_model=_chain_failed_model)
+@@ -9649,13 +10602,88 @@  (+82/-7)
+   anchor: _record_route_info(
+   defs: 
+   first+: try:
+   rem: fb_resp = _call_fallback_candidate_sync(
+@@ -9773,27 +10801,45 @@  (+33/-15)
+   anchor: route_info: Optional[Dict[str, str]] = None,
+   defs: 
+   first+: route_info = {} if route_info is None else route_info  # see the sync path's note
+   rem: return await _async_call_llm_impl(
+@@ -9872,7 +10918,7 @@  (+1/-1)
+   anchor: _explicit = (resolved_provider or "").strip().lower()
+   defs: 
+   first+: task, _explicit, main_runtime=main_runtime,
+   rem: task, _explicit,
+@@ -9126,8 +10172,11 @@  (+4/-1)
+   anchor: ),
+   defs: 
+   first+: try:
+   rem: if not _is_transient_transport_error(transient_err):
+@@ -9226,7 +10275,7 @@  (+1/-1)
+   anchor: "1210" in err_str
+   defs: 
+   first+: if max_tokens is not None and not _is_context_length_error(first_err) and (
+   rem: if max_tokens is not None and (
+@@ -9439,6 +10488,7 @@  (+1/-0)
+   anchor: or _is_connection_error(first_err)
+   defs: 
+   first+: or _is_context_length_error(first_err)
+   rem: 
+@@ -9454,6 +10504,7 @@  (+1/-0)
+   anchor: or _is_connection_error(first_err)
+   defs: 
+   first+: or _is_context_length_error(first_err)
+   rem: 
+@@ -9466,6 +10517,8 @@  (+2/-0)
+   anchor: )
+   defs: 
+   first+: elif _is_context_length_error(first_err):
+   rem: 
+@@ -9493,7 +10546,7 @@  (+1/-1)
+   anchor: if is_auto:
+   defs: 
+   first+: failed_model=_chain_failed_model, main_runtime=main_runtime)
+   rem: failed_model=_chain_failed_model)
+@@ -9503,7 +10556,7 @@  (+1/-1)
+   anchor: else:
+   defs: 
+   first+: failed_model=_chain_failed_model, main_runtime=main_runtime)
+   rem: failed_model=_chain_failed_model)
+@@ -9519,13 +10572,86 @@  (+80/-7)
+   anchor: _fallback_provider_from_label(fb_label),
+   defs: 
+   first+: try:
+   rem: fb_resp = await _call_fallback_candidate_async(

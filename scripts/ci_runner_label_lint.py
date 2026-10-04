@@ -230,7 +230,7 @@ def lint(workflows: dict[str, dict]) -> list[str]:
 def load_tree(root: Path) -> dict[str, dict]:
     out = {}
     for p in sorted((root / WORKFLOW_DIR).glob("*.y*ml")):
-        out[f"{WORKFLOW_DIR}/{p.name}"] = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        out[f"{WORKFLOW_DIR}/{p.name}"] = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
     return out
 
 

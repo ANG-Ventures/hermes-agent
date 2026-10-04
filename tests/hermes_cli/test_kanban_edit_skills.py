@@ -177,6 +177,9 @@ def test_hint_command_parses():
     assert args.skills == ["sdlc-review"]
 
 
+# Read-only contract against the home checkout's lint script: upstream's home I/O guard
+# refuses even the existence probe without this explicit marker.
+@pytest.mark.allow_real_home_io
 def test_lint_hint_flags_exist_in_edit_parser():
     """Contract with ~/.hermes/scripts/kanban-review-lane-lint.py: every
     `kanban edit --flag` it suggests is a real `edit` option. Skips when the

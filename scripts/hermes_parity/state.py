@@ -49,7 +49,7 @@ def load_state(worktree: Path, *, invalidate_on_tree_change: bool = True) -> Par
     path = state_path(worktree)
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as fh:
+    with path.open("r", encoding="utf-8-sig") as fh:
         state = ParityState.from_json(json.load(fh))
     if invalidate_on_tree_change:
         current = gitops.tree_sha(worktree)

@@ -118,10 +118,10 @@ def _make_runner(adapter):
 
 
 async def _drive_turn(monkeypatch, tmp_path, *, stop_during_preflight: bool):
-    import yaml
+    import hermes_yaml as yaml
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_progress": "off"}, "streaming": {"enabled": False}}),
+        yaml.safe_dump({"display": {"tool_progress": "off"}, "streaming": {"enabled": False}}),
         encoding="utf-8",
     )
     fake_dotenv = types.ModuleType("dotenv")

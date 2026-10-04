@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as ks
 
 
@@ -41,7 +42,7 @@ def board(tmp_path, monkeypatch):
 def landed_task(conn, tmp_path):
     """A card whose completion recorded a VALID landed receipt; workspace kept."""
     tid = kb.create_task(conn, title="landed receipt")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     repo = ws / "w"
     repo.mkdir(parents=True)
     git(repo, "init", "-b", "main")
@@ -53,7 +54,7 @@ def landed_task(conn, tmp_path):
     sha = git(repo, "rev-parse", "HEAD")
     live = tmp_path / "live-w"
     git(tmp_path, "clone", "--no-local", repo, live)
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     ks.record_baseline(conn, tid, ws)
     receipt = ks.preserve(conn, tid, {
         "changed_files": ["w/w.py"], "landed": [{"repo_path": str(live), "sha": sha}],

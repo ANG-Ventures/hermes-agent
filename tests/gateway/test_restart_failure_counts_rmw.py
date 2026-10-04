@@ -173,6 +173,16 @@ def _run_py() -> Path:
     return Path(run_mod.__file__).resolve()
 
 
+def _runner_tree() -> ast.AST:
+    """One AST over gateway/run.py AND the GatewayRunner mixin modules upstream split out of it
+    (parity 2026-10-01: ``run_*.py`` — the restart-mark mutators now live in run_shutdown.py)."""
+    run_py = _run_py()
+    module = ast.Module(body=[], type_ignores=[])
+    for path in sorted([run_py, *run_py.parent.glob("run_*.py")]):
+        module.body.extend(ast.parse(path.read_text(encoding="utf-8")).body)
+    return module
+
+
 def _calls(node: ast.AST) -> set[str]:
     names: set[str] = set()
     for sub in ast.walk(node):
@@ -200,7 +210,7 @@ def test_no_function_hand_rolls_the_counts_read_modify_write():
     whenever it is added.  The only legal co-occurrence is inside
     ``_restart_failure_counts_rmw`` itself.
     """
-    tree = ast.parse(_run_py().read_text(encoding="utf-8"))
+    tree = _runner_tree()
 
     offenders = []
     for fn in _functions(tree):
@@ -227,7 +237,7 @@ def test_the_choke_point_is_actually_used():
     the choke point.  Measured on the commit that added this gate: 6 mutator
     call sites.
     """
-    tree = ast.parse(_run_py().read_text(encoding="utf-8"))
+    tree = _runner_tree()
 
     users = [fn.name for fn in _functions(tree) if _RMW in _calls(fn) and fn.name != _RMW]
     assert len(users) >= 6, (

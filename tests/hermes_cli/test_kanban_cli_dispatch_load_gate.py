@@ -20,6 +20,7 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_load_gate as klg
 
 GATE = {"enabled": True, "pause_above": 64, "resume_below": 48,
@@ -33,7 +34,7 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     monkeypatch.setattr("hermes_cli.config.load_config",
                         lambda: {"kanban": {"dispatch_load_gate": dict(GATE)}})
@@ -41,8 +42,8 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                         lambda **k: [], raising=False)
     (home / "profiles" / "alpha").mkdir(parents=True, exist_ok=True)
     # Never start real workers: route the CLI's dispatch_once to a stub spawn.
-    real = kb.dispatch_once
-    monkeypatch.setattr(kb, "dispatch_once",
+    real = kbd.dispatch_once
+    monkeypatch.setattr(kbd, "dispatch_once",
                         lambda conn, **kw: real(conn, spawn_fn=lambda *a, **k: 1, **kw))
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
@@ -68,7 +69,7 @@ def _run(**kw) -> int:
 
 def _running() -> int:
     with kb.connect_closing() as conn:
-        return kb.count_running_tasks(conn)
+        return kbd.count_running_tasks(conn)
 
 
 def test_paused_gate_spawns_zero_and_says_why(board, monkeypatch, capsys):

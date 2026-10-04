@@ -169,5 +169,7 @@ def test_both_seams_are_called_from_the_live_turn_path():
             for n in ast.walk(tree)
         )
 
-    assert called("agent/conversation_loop.py", "capture_turn_handoff")
+    # Upstream moved the terminal provider-failure return into turn_recovery
+    # (max_retries_exhausted_result); the capture is wired there.
+    assert called("agent/turn_recovery.py", "capture_turn_handoff")
     assert called("agent/turn_context.py", "consume_handoff_context")

@@ -18,7 +18,6 @@ Or via $HERMES_HOME/mem0.json.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-import concurrent.futures.thread as _threadpool
 import json
 import logging
 import math
@@ -30,10 +29,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
-import weakref
 
 from agent.memory_provider import MemoryProvider
-from agent.secret_scope import get_secret
+from agent.secret_scope import UnscopedSecretError, get_secret
+from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.registry import tool_error
 
 from .temporal_parse import created_at_in_window, parse_temporal_window
@@ -52,35 +51,11 @@ logger = logging.getLogger(__name__)
 _RERANK_DEFAULT_DEADLINE_MS = 8647.166891023517
 
 
-class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """ThreadPoolExecutor whose workers preserve the old daemon-thread behavior."""
-
-    def _adjust_thread_count(self):
-        # Copy of concurrent.futures.thread.ThreadPoolExecutor with daemon=True.
-        # Do not register in _threads_queues: those atexit joins would undo the
-        # previous daemon-thread semantics for a stuck network call.
-        if self._idle_semaphore.acquire(timeout=0):
-            return
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)  # type: ignore[arg-type]
-
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_threadpool._worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)  # type: ignore[attr-defined]
+# Daemon workers (tools.daemon_pool): the shared fleet executor whose workers neither block
+# interpreter exit nor register in ``_threads_queues``; it also tracks CPython 3.14's worker
+# signature (``_create_worker_context`` replaced ``_initializer``/``_initargs``), which the former
+# private copy here did not — every prefetch submit raised AttributeError on 3.14.
+_DaemonThreadPoolExecutor = DaemonThreadPoolExecutor
 
 # Circuit breaker: after this many consecutive failures, pause API calls
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
@@ -183,6 +158,15 @@ def _warn_retired_qmd_keys(config: Optional[dict]) -> None:
             "delete them from mem0.json", ", ".join(present))
 
 
+def _scoped_env(name: str) -> str:
+    """Profile-scoped read of a non-secret mem0 setting; no scope under multiplex = unset (never
+    ``os.environ``). Only the API key may fail closed (upstream a9838c2100 / #99121)."""
+    try:
+        return get_secret(name, "") or ""
+    except UnscopedSecretError:
+        return ""
+
+
 def _load_config() -> dict:
     """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
 
@@ -193,15 +177,15 @@ def _load_config() -> dict:
     from hermes_constants import get_hermes_home
 
     config = {
-        # parity 2026-08-07: fork dropped upstream's "mode" key (dead — 0 consumers in
-        # this module); ADOPTED upstream's get_secret() secret-scope routing for the
-        # credential (falls through to os.environ when no scope is installed).
+        # ADOPTED upstream's get_secret() secret-scope routing for the credential (falls through
+        # to os.environ when no scope is installed). ``mode`` is informational here (the fork has
+        # no OSS backend; 0 consumers in this module) but keeps the upstream config shape.
         "api_key": get_secret("MEM0_API_KEY", ""),
-        "host": os.environ.get("MEM0_HOST", ""),
-        "admin_api_key": os.environ.get("MEM0_ADMIN_API_KEY", ""),
-        "ca_bundle": os.environ.get("MEM0_CA_BUNDLE", ""),
-        "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
-        "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
+        "mode": _scoped_env("MEM0_MODE") or "platform",
+        "host": _scoped_env("MEM0_HOST"),
+        "admin_api_key": get_secret("MEM0_ADMIN_API_KEY", ""),
+        "ca_bundle": _scoped_env("MEM0_CA_BUNDLE"),
+        "agent_id": _scoped_env("MEM0_AGENT_ID") or "hermes",
         # Default-off safety gate for single-user fleets that want one shared
         # user memory scope across Discord/Telegram/CLI sender ids. When false,
         # gateway-provided user_id continues to win exactly as today.
@@ -214,11 +198,16 @@ def _load_config() -> dict:
         "rerank_deadline_ms": _RERANK_DEFAULT_DEADLINE_MS,
         "keyword_search": False,
     }
+    # Only when explicitly configured (upstream a9838c2100 / multiplex invariant): initialize()
+    # falls back to the gateway-native sender id, then "hermes-user" — never the default
+    # profile's MEM0_USER_ID leaking through os.environ into a secondary profile.
+    if user_id := _scoped_env("MEM0_USER_ID"):
+        config["user_id"] = user_id
 
     config_path = get_hermes_home() / "mem0.json"
     if config_path.exists():
         try:
-            file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            file_cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
             config.update({k: v for k, v in file_cfg.items()
                            if v is not None and v != ""})
         except Exception:
@@ -623,7 +612,7 @@ class Mem0MemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text(encoding="utf-8"))
+                existing = json.loads(config_path.read_text(encoding="utf-8-sig"))
             except Exception:
                 pass
         existing.update(values)
@@ -747,7 +736,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from hermes_constants import get_hermes_home
             cfg_path = get_hermes_home() / "mem0.json"
-            kill = (json.loads(cfg_path.read_text(encoding="utf-8")).get("retrieval_kill") or {})
+            kill = (json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("retrieval_kill") or {})
             return self._truthy(kill.get("rerank", False))
         except Exception:
             return False
@@ -835,7 +824,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from hermes_constants import get_hermes_home
             cfg_path = get_hermes_home() / "mem0.json"
-            blk = json.loads(cfg_path.read_text(encoding="utf-8")).get("prefetch_relevance_floor")
+            blk = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("prefetch_relevance_floor")
             return blk if isinstance(blk, dict) else {}
         except Exception:
             return {}
@@ -991,7 +980,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from hermes_constants import get_hermes_home
             cfg_path = get_hermes_home() / "mem0.json"
-            blk = json.loads(cfg_path.read_text(encoding="utf-8")).get(key)
+            blk = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get(key)
             return blk if isinstance(blk, dict) else {}
         except Exception:
             return {}
@@ -1714,7 +1703,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 return self._live_capture_val
             cfg_capture = None
             if mtime and cfg_path.exists():
-                cfg_capture = json.loads(cfg_path.read_text(encoding="utf-8")).get("capture")
+                cfg_capture = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("capture")
             value, source = resolve_capture(env_val, cfg_capture)
             self._live_capture_val = value
             self._live_capture_sig = sig
@@ -2068,7 +2057,7 @@ class Mem0MemoryProvider(MemoryProvider):
         cutoff = time.time() - 3600.0
         n = 0
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8-sig") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -2098,7 +2087,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except (ValueError, OSError):
             return {}
 

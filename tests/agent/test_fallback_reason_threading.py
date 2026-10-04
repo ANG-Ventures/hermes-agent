@@ -27,25 +27,29 @@ import pathlib
 
 import pytest
 
-_LOOP = pathlib.Path(__file__).resolve().parents[2] / "agent" / "conversation_loop.py"
+_AGENT = pathlib.Path(__file__).resolve().parents[2] / "agent"
+# 2026-10-01 parity sync: upstream extracted the conversation loop into ``agent/turn_*.py``;
+# the failover call sites moved with it. The gate follows the sites, keyed by (file, line).
+_LOOP_FAMILY = sorted(_AGENT.glob("turn_*.py")) + [_AGENT / "conversation_loop.py"]
 
 
 def _fallback_calls():
-    """Return {lineno: ast.Call} for every `agent._try_activate_fallback(...)`
-    call in conversation_loop.py, keyed by the call's line number."""
-    tree = ast.parse(_LOOP.read_text())
+    """Return {(path, lineno): ast.Call} for every `agent._try_activate_fallback(...)`
+    call in the extracted loop family, keyed by file and line number."""
     calls = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        if (
-            isinstance(fn, ast.Attribute)
-            and fn.attr == "_try_activate_fallback"
-            and isinstance(fn.value, ast.Name)
-            and fn.value.id == "agent"
-        ):
-            calls[node.lineno] = node
+    for path in _LOOP_FAMILY:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if (
+                isinstance(fn, ast.Attribute)
+                and fn.attr == "_try_activate_fallback"
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "agent"
+            ):
+                calls[(path, node.lineno)] = node
     return calls
 
 
@@ -66,27 +70,28 @@ def _is_bare_none(kw) -> bool:
 # anchor (a distinctive nearby literal) rather than a bare line number so the
 # test survives small line drift in the file.
 _THREAD_ANCHORS = {
-    "nous_rate_limit_guard": "Nous Portal rate limit active",
+    # upstream reworded the Nous guard's log line; the user-facing message is the stable anchor
+    "nous_rate_limit_guard": "hit its rate limit; it resets in",
     "content_filter_stream_kill": "Content filter terminated stream",
     "client_error_should_fallback": "Non-retryable error (HTTP",
     "retry_exhaustion_floor": "Max retries ({max_retries}) exhausted",
+    "safety_refusal": "(safety refusal) — trying fallback",
 }
 
 
-def _lineno_after_anchor(anchor: str) -> int:
-    """Find the first `_try_activate_fallback` call AFTER the anchor string."""
-    src = _LOOP.read_text().splitlines()
-    anchor_line = None
-    for i, line in enumerate(src, start=1):
-        if anchor in line:
-            anchor_line = i
-            break
-    assert anchor_line is not None, f"anchor not found: {anchor!r}"
-    calls = sorted(_fallback_calls())
-    for ln in calls:
-        if ln >= anchor_line:
-            return ln
-    raise AssertionError(f"no fallback call after anchor {anchor!r}")
+def _lineno_after_anchor(anchor: str):
+    """Find the first `_try_activate_fallback` call AFTER the anchor string (same file)."""
+    for path in _LOOP_FAMILY:
+        src = path.read_text().splitlines()
+        anchor_line = next((i for i, line in enumerate(src, start=1) if anchor in line), None)
+        if anchor_line is None:
+            continue
+        calls = sorted(ln for (p, ln) in _fallback_calls() if p == path)
+        for ln in calls:
+            if ln >= anchor_line:
+                return (path, ln)
+        raise AssertionError(f"no fallback call after anchor {anchor!r} in {path.name}")
+    raise AssertionError(f"anchor not found: {anchor!r}")
 
 
 class TestKnowableReasonSitesThread:
@@ -98,11 +103,11 @@ class TestKnowableReasonSitesThread:
         call = _fallback_calls()[ln]
         kw = _reason_kw(call)
         assert kw is not None, (
-            f"{name} (line {ln}): _try_activate_fallback called BARE — "
+            f"{name} ({ln[0].name}:{ln[1]}): _try_activate_fallback called BARE — "
             f"must pass reason= (the classified/known FailoverReason)"
         )
         assert not _is_bare_none(kw), (
-            f"{name} (line {ln}): reason=None is an effectively-bare 'fix' — "
+            f"{name} ({ln[0].name}:{ln[1]}): reason=None is an effectively-bare 'fix' — "
             f"pass the real classified reason, not the None literal"
         )
 
@@ -128,18 +133,23 @@ class TestFloorSitesStayReasonless:
         call = _fallback_calls()[ln]
         kw = _reason_kw(call)
         assert kw is None, (
-            f"{name} (line {ln}): floor site should NOT pass a reason= — "
+            f"{name} ({ln[0].name}:{ln[1]}): floor site should NOT pass a reason= — "
             f"no classification exists here; let it fall to the 'connection issue' floor"
         )
 
 
 class TestSiteCountReconciles:
-    """There are exactly 10 fallback call sites (RC3 reconciliation)."""
+    """There are exactly 12 fallback call sites across the extracted loop family (RC3
+    reconciliation; re-reconciled 2026-10-01: the fork's 10 + upstream's incomplete_response
+    continuation site and the refusal site that the extraction split out of the shared branch)."""
+
+    _EXPECTED = 12
 
     def test_ten_sites(self):
-        assert len(_fallback_calls()) == 10, (
-            f"expected 10 _try_activate_fallback sites, found {len(_fallback_calls())} — "
-            f"the audit table in the PR must be re-reconciled"
+        found = sorted(f"{p.name}:{ln}" for (p, ln) in _fallback_calls())
+        assert len(found) == self._EXPECTED, (
+            f"expected {self._EXPECTED} _try_activate_fallback sites, found {len(found)} — "
+            f"the audit table in the PR must be re-reconciled: {found}"
         )
 
 
@@ -159,7 +169,7 @@ class TestOverloadedFailoverAnnouncesReasonE2E:
 
         captured = []
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("model_tools.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
         ):

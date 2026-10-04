@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -39,7 +41,7 @@ def _profile(kanban_home, cap_block: str) -> None:
 
 def _spawn(monkeypatch, model: str, provider: str | None = "claude-bpr"):
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -59,7 +61,7 @@ def _spawn(monkeypatch, model: str, provider: str | None = "claude-bpr"):
         )
         conn.commit()
         task = kb.get_task(conn, tid)
-    assert kb._default_spawn(task, str(kb.resolve_workspace(task))) == 4242
+    assert kbd._default_spawn(task, str(kbw.resolve_workspace(task))) == 4242
     argv = captured["cmd"]
     return argv[argv.index("-m") + 1], argv, captured["env"]
 

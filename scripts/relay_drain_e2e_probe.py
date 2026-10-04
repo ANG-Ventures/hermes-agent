@@ -122,7 +122,7 @@ def write_private(path: Path, text: str) -> None:
 
 
 def one_seat_registry(seat_label_prefix: str, dest: Path) -> None:
-    d = json.loads(PROD_REGISTRY.read_text(encoding="utf-8"))
+    d = json.loads(PROD_REGISTRY.read_text(encoding="utf-8-sig"))
     subs = d["subs"]
     keep = [
         s for s in subs if str(s.get("label", "")).split(" ")[0] == seat_label_prefix
@@ -154,7 +154,7 @@ class ScratchRelay:
             # error_class_v2 off = the drain 503 as it was before claude-pool #180
             # (bare body, no class/hop/cause): the 2026-09-30 13:03 wire.
             rp = self.home / "config/claude-router.json"
-            cfg = json.loads(rp.read_text(encoding="utf-8")) if rp.exists() else {}
+            cfg = json.loads(rp.read_text(encoding="utf-8-sig")) if rp.exists() else {}
             cfg["error_class_v2"] = v2 == "on"
             rp.parent.mkdir(parents=True, exist_ok=True)
             rp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
@@ -303,7 +303,7 @@ def scratch_home(
     # Only the relay bearer is copied (0600, scratch, never printed or committed).
     key = [
         ln
-        for ln in PROD_ENV.read_text(encoding="utf-8").splitlines()
+        for ln in PROD_ENV.read_text(encoding="utf-8-sig").splitlines()
         if ln.startswith("CLAUDE_BPP_KEY=")
     ]
     write_private(
@@ -395,7 +395,7 @@ def confirm_tree(tree: Path, env: dict, cwd: Path) -> str:
 def relay_events(path: Path) -> list[dict]:
     rows = []
     if path.exists():
-        for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for ln in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
             i = ln.find("{")
             if i < 0:
                 continue
@@ -592,7 +592,7 @@ def main() -> int:
                 al = home / "logs" / "agent.log"
                 if al.exists() and re.search(
                     DRAIN_TOKEN,
-                    al.read_text(encoding="utf-8", errors="replace"),
+                    al.read_text(encoding="utf-8-sig", errors="replace"),
                 ):
                     first_503 = el
                     log(
@@ -621,8 +621,8 @@ def main() -> int:
     finally:
         relay.stop()
 
-    out_txt = stdout_p.read_text(encoding="utf-8", errors="replace")
-    err_txt = stderr_p.read_text(encoding="utf-8", errors="replace")
+    out_txt = stdout_p.read_text(encoding="utf-8-sig", errors="replace")
+    err_txt = stderr_p.read_text(encoding="utf-8-sig", errors="replace")
     events = relay_events(relay.log_path)
     picks = [e for e in events if e.get("event") == "pick"]
     seats_served = sorted({
@@ -635,19 +635,19 @@ def main() -> int:
         if e.get("event") == "serve_start"
     ]
     try:
-        usage = json.loads(usage_p.read_text(encoding="utf-8"))
+        usage = json.loads(usage_p.read_text(encoding="utf-8-sig"))
     except Exception:
         usage = None
     route_log = home / "state" / "model-route-changes.log"
     route_rows = (
-        route_log.read_text(encoding="utf-8").splitlines() if route_log.exists() else []
+        route_log.read_text(encoding="utf-8-sig").splitlines() if route_log.exists() else []
     )
     failover_rows = [r for r in route_rows if "failover" in r.lower()]
     ledger_calls, ledger = ledger_rows(home)
     announces = sorted({m.group(0) for m in ANNOUNCE_RX.finditer(out_txt + err_txt)})
     agent_log = home / "logs" / "agent.log"
     agent_lines = (
-        agent_log.read_text(encoding="utf-8", errors="replace").splitlines()
+        agent_log.read_text(encoding="utf-8-sig", errors="replace").splitlines()
         if agent_log.exists()
         else []
     )

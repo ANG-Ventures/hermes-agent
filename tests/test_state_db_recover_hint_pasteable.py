@@ -1,15 +1,18 @@
-"""The `sqlite3 <db> ".recover"` remedy must survive the shell when pasted.
+"""The `hermes sessions recover --source <db>` remedy must survive the shell when pasted.
 
-`hermes_state` prints a salvage command at three sites on the DB-corruption
-recovery path — the exhausted-repair-budget diagnostic and both
-``_backup_db_file`` disk-space refusals. Each interpolated the DB path bare
-into a backticked span the operator is told to paste, so a ``HERMES_HOME``
-holding a space (``My Drive``, or the Windows ``C:/Users/<First Last>``
-default) printed a remedy that split into two words:
+`hermes_state` (now ``hermes_state_repair``, re-exported through the facade) prints a
+salvage command at three sites on the DB-corruption recovery path — the
+exhausted-repair-budget diagnostic and both ``_backup_db_file`` disk-space
+refusals. Each interpolated the DB path bare into a backticked span the operator
+is told to paste, so a ``HERMES_HOME`` holding a space (``My Drive``, or the
+Windows ``C:/Users/<First Last>`` default) printed a remedy that split into two
+words (originally ``sqlite3 <db> ".recover"``; upstream 5d9a2110ba routes the
+operator to ``hermes sessions recover --source <db> --inspect-only`` instead so a
+WAL-reset-vulnerable sqlite3 CLI never touches the live file — the paste hazard
+is identical):
 
-    printed  : sqlite3 /Users/x/My Drive/hermes/state.db ".recover"
-    bash argv: ['sqlite3', '/Users/x/My', 'Drive/hermes/state.db', '.recover']
-    sqlite3  : exit=1  Error: near "Drive": syntax error
+    printed  : hermes sessions recover --source /Users/x/My Drive/hermes/state.db --inspect-only
+    bash argv: ['hermes', 'sessions', 'recover', '--source', '/Users/x/My', 'Drive/hermes/state.db', ...]
 
 Unreachable remedy on the one path where the operator has least slack. Found
 by Argus as FINDING F3 in the round-2 review of PR #889 (card t_b649d6d1);
@@ -95,9 +98,13 @@ def _run_repair(db: Path, monkeypatch) -> str:
 
 def _printed_sqlite3_remedy(out: str) -> str:
     """The backticked salvage command as the operator sees it on screen."""
-    spans = [s for s in re.findall(r"`([^`]+)`", out) if "sqlite3" in s]
-    assert spans, f"no sqlite3 remedy reached the screen:\n{out}"
+    spans = [s for s in re.findall(r"`([^`]+)`", out) if "sessions recover --source" in s]
+    assert spans, f"no recover remedy reached the screen:\n{out}"
     return spans[0]
+
+
+def _expected_remedy_words(db: Path) -> list:
+    return ["hermes", "sessions", "recover", "--source", str(db), "--inspect-only"]
 
 
 def _exhaust_the_repair_budget(db: Path) -> None:
@@ -124,7 +131,7 @@ def test_exhausted_repair_remedy_pastes_as_one_path(tmp_path, monkeypatch):
     words = _bash_words(remedy, str(tmp_path))
 
     assert words is not None, f"bash refused the printed remedy {remedy!r}"
-    assert words == ["sqlite3", str(db), ".recover"], (
+    assert words == _expected_remedy_words(db), (
         f"printed {remedy!r} produced {words!r}"
     )
 
@@ -155,7 +162,7 @@ def test_low_disk_backup_refusal_remedy_pastes_as_one_path(tmp_path, monkeypatch
     words = _bash_words(remedy, str(tmp_path))
 
     assert words is not None, f"bash refused the printed remedy {remedy!r}"
-    assert words == ["sqlite3", str(db), ".recover"], (
+    assert words == _expected_remedy_words(db), (
         f"printed {remedy!r} produced {words!r}"
     )
 
@@ -172,7 +179,7 @@ def test_unknown_disk_space_refusal_remedy_pastes_as_one_path(tmp_path, monkeypa
     words = _bash_words(remedy, str(tmp_path))
 
     assert words is not None, f"bash refused the printed remedy {remedy!r}"
-    assert words == ["sqlite3", str(db), ".recover"], (
+    assert words == _expected_remedy_words(db), (
         f"printed {remedy!r} produced {words!r}"
     )
 
@@ -188,7 +195,7 @@ def test_the_readable_form_is_kept_for_an_ordinary_path(tmp_path):
     db.write_bytes(b"not a database")
 
     message = hermes_state._persistent_repair_exhausted_error(db)
-    assert f'`sqlite3 {db} ".recover"`' in message, message
+    assert f"`hermes sessions recover --source {db} --inspect-only`" in message, message
 
 
 @requires_bash
@@ -212,7 +219,7 @@ def test_a_home_that_would_EXECUTE_is_neutralised(tmp_path, monkeypatch):
     remedy = _printed_sqlite3_remedy(_run_repair(db, monkeypatch))
     words = _bash_words(remedy, str(tmp_path))
 
-    assert words == ["sqlite3", str(db), ".recover"], (
+    assert words == _expected_remedy_words(db), (
         f"printed {remedy!r} produced {words!r}"
     )
 
@@ -221,14 +228,20 @@ def test_every_sqlite3_recover_remedy_in_hermes_state_is_escaped():
     """Class guard: no site may re-introduce a bare interpolation.
 
     The three call sites are one class, and a fourth is cheap to add. Pins the
-    source shape so a new `sqlite3 {db_path} ".recover"` cannot land silently
-    without its own paste test.
+    source shape so a new `--source {db_path}` (or a resurrected
+    `sqlite3 {db_path} ".recover"`) cannot land silently without its own paste test.
     """
-    source = Path(hermes_state.__file__).read_text(encoding="utf-8")
+    import hermes_state_repair
+
+    source = Path(hermes_state_repair.__file__).read_text(encoding="utf-8")
     bare = re.findall(r"sqlite3 \{(?!hint_value\()[^}]*\}", source)
     assert not bare, f"unescaped sqlite3 remedy interpolation(s): {bare}"
-    assert source.count('sqlite3 {hint_value(str(db_path))}') == 3, (
-        "expected exactly the three known sqlite3 salvage sites"
+    # ``_MANUAL_RECOVER_HINT`` is a template whose ``{db_path}`` slot is filled with
+    # ``hint_value(...)`` at its single ``.format`` site; every f-string site quotes inline.
+    bare = re.findall(r"--source \{(?!hint_value\(|db_path\})[^}]*\}", source)
+    assert not bare, f"unescaped recover remedy interpolation(s): {bare}"
+    assert source.count("hint_value(str(db_path))") == 3, (
+        "expected exactly the three known salvage sites"
     )
 
 

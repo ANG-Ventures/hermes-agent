@@ -32,6 +32,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -89,7 +90,7 @@ def _spawn_and_capture_kwargs(fresh_home, monkeypatch, task_id="t_prio") -> dict
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_task(task_id), str(fresh_home / "ws"), board=None)
+    kbd._default_spawn(_task(task_id), str(fresh_home / "ws"), board=None)
     return captured
 
 
@@ -289,7 +290,7 @@ def test_idle_mode_resolves_and_stays_niced():
     ],
 )
 def test_darwin_prefix_per_mode(monkeypatch, mode, expected):
-    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     monkeypatch.setattr(kb.os, "access", lambda path, flag: True)
     assert kb.worker_darwin_qos_prefix(mode) == expected
 
@@ -301,7 +302,7 @@ def test_darwin_prefix_is_empty_off_macos(monkeypatch):
 
 def test_darwin_prefix_degrades_when_taskpolicy_missing(monkeypatch):
     """A missing wrapper must fall back to nice-only, never break the spawn."""
-    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     monkeypatch.setattr(kb.os, "access", lambda path, flag: False)
     assert kb.worker_darwin_qos_prefix("background") == []
 
@@ -312,7 +313,7 @@ def test_darwin_prefix_degrades_when_taskpolicy_missing(monkeypatch):
 )
 def test_spawn_argv_carries_the_darwin_prefix(fresh_home, monkeypatch, mode, expect_prefix):
     """The prefix must reach Popen, ahead of the unchanged worker argv."""
-    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     monkeypatch.setattr(kb.os, "access", lambda path, flag: True)
     nice = 0 if mode == "normal" else 19
     monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: (mode, nice))

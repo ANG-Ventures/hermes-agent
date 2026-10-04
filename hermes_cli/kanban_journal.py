@@ -183,7 +183,7 @@ def read_entries(board: Optional[str], *, since: float = 0.0) -> Iterator[dict]:
     path = journal_path(board)
     if not path.exists():
         return
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
         for line in handle:
             line = line.strip()
             if not line:

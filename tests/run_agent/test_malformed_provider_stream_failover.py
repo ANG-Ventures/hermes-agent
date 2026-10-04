@@ -60,7 +60,7 @@ def _make_agent(statuses: list[tuple[str, str]]) -> AIAgent:
         }
     ]
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=MagicMock()),
     ):
@@ -125,7 +125,7 @@ def test_http_200_malformed_stream_retries_then_fails_over_with_reason(monkeypat
             "hermes_cli.config.read_raw_config",
             return_value={"model": {"announce_route_change": True}},
         ),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 
@@ -157,7 +157,7 @@ def test_request_serialization_valueerror_remains_nonretryable(monkeypatch):
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 
@@ -243,7 +243,7 @@ def test_partial_tool_json_parse_error_retries_instead_of_aborting(monkeypatch):
             side_effect=lambda model, _provider: model,
         ),
         patch("agent.model_metadata.get_model_context_length", return_value=200000),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 

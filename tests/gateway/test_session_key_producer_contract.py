@@ -23,9 +23,10 @@ ROOT = Path(__file__).resolve().parents[2]
 # Discord bug class and must route through the adapter resolver contract
 # (``canonicalize_session_source``) instead of being added here.
 ALLOWED_CHANNEL_LITERALS = {
-    ("plugins/platforms/teams/adapter.py", "TeamsAdapter._on_message"),
+    # parity 2026-10-01: upstream rewrote TeamsAdapter._on_message (``_CHAT_TYPES`` table) and
+    # TelegramAdapter._build_message_event (conditional expression) — still single producers,
+    # no bare ``chat_type="channel"`` literal left for the lint to allowlist.
     ("plugins/platforms/telegram/adapter.py", "TelegramAdapter.get_chat_info"),
-    ("plugins/platforms/telegram/adapter.py", "TelegramAdapter._build_message_event"),
     ("plugins/platforms/homeassistant/adapter.py", "HomeAssistantAdapter._handle_ha_event"),
 }
 

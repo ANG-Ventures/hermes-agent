@@ -11,14 +11,22 @@ takeovers are not launchd-timed and keep the configured drain).
 
 from __future__ import annotations
 
+import asyncio
+import signal
 import subprocess
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from gateway.restart import (
+    LAUNCHD_LABEL_ENV,
+    LAUNCHD_HARD_EXIT_RESERVE_S,
     LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    effective_stop_drain_timeout,
+    effective_stop_watchdog_delay,
+    is_gateway_supervisor_process,
     launchd_service_label,
     parse_launchd_exit_timeout,
     read_launchd_exit_timeout_s,
@@ -30,6 +38,12 @@ from gateway.shutdown_watchdog import (
     arm_shutdown_watchdog,
     resolve_shutdown_watchdog_delay,
 )
+
+# Fork contract (kept at the 2026-10-01 parity merge): the two reserves are ADDITIVE —
+# the drain may use at most ``exit_timeout - hard_exit_reserve - cleanup_reserve`` so the
+# teardown completes before the watchdog's os._exit, not merely before launchd's SIGKILL
+# (see resolve_launchd_capped_drain). Upstream caps at ``exit_timeout - cleanup`` only.
+_CAPPED = 60.0 - LAUNCHD_HARD_EXIT_RESERVE_S - LAUNCHD_STOP_CLEANUP_RESERVE_S
 
 _PRINT_OUTPUT = """\
 ai.hermes.gateway-aegis = {
@@ -81,10 +95,12 @@ def test_parse_exit_timeout_ignores_lookalike_keys():
 
 
 def test_service_label_from_xpc_env():
-    assert launchd_service_label({"XPC_SERVICE_NAME": "ai.hermes.gateway"}) == "ai.hermes.gateway"
-    assert launchd_service_label({"XPC_SERVICE_NAME": "0"}) is None
-    assert launchd_service_label({"XPC_SERVICE_NAME": ""}) is None
-    assert launchd_service_label({}) is None
+    # Upstream made the host platform data (``None`` off darwin); pin darwin so the
+    # fork's label mapping is exercised on Linux CI too.
+    assert launchd_service_label({"XPC_SERVICE_NAME": "ai.hermes.gateway"}, platform="darwin") == "ai.hermes.gateway"
+    assert launchd_service_label({"XPC_SERVICE_NAME": "0"}, platform="darwin") is None
+    assert launchd_service_label({"XPC_SERVICE_NAME": ""}, platform="darwin") is None
+    assert launchd_service_label({}, platform="darwin") is None
 
 
 def test_read_exit_timeout_queries_gui_domain_for_label():
@@ -96,7 +112,7 @@ def test_read_exit_timeout_queries_gui_domain_for_label():
         return subprocess.CompletedProcess(argv, 0, stdout=_PRINT_OUTPUT, stderr="")
 
     value = read_launchd_exit_timeout_s(
-        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway-aegis"}, uid=501, run=fake_run
+        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway-aegis"}, uid=501, run=fake_run, platform="darwin"
     )
     assert value == 60.0
     assert calls == [["launchctl", "print", "gui/501/ai.hermes.gateway-aegis"]]
@@ -110,7 +126,7 @@ def test_read_exit_timeout_uses_system_domain_for_root():
         return subprocess.CompletedProcess(argv, 0, stdout=_PRINT_OUTPUT, stderr="")
 
     read_launchd_exit_timeout_s(
-        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway"}, uid=0, run=fake_run
+        environ={"XPC_SERVICE_NAME": "ai.hermes.gateway"}, uid=0, run=fake_run, platform="darwin"
     )
     assert calls == [["launchctl", "print", "system/ai.hermes.gateway"]]
 
@@ -995,11 +1011,15 @@ def _runner(*, drain: float, launchd: float | None, by_signal: bool):
 
 
 def test_effective_drain_capped_only_for_signal_stops_under_launchd():
-    assert _runner(drain=180.0, launchd=60.0, by_signal=True)._effective_stop_drain_timeout() == 35.0
+    signal_stop = _runner(drain=180.0, launchd=60.0, by_signal=True)
+    assert effective_stop_drain_timeout(signal_stop) == _CAPPED
     # In-band restart (SIGUSR1 → after-turn → stop()) is not launchd-timed.
-    assert _runner(drain=180.0, launchd=60.0, by_signal=False)._effective_stop_drain_timeout() == 180.0
+    assert effective_stop_drain_timeout(_runner(drain=180.0, launchd=60.0, by_signal=False)) == 180.0
     # Not launchd-owned (systemd, s6, foreground): configured drain stands.
-    assert _runner(drain=180.0, launchd=None, by_signal=True)._effective_stop_drain_timeout() == 180.0
+    assert effective_stop_drain_timeout(_runner(drain=180.0, launchd=None, by_signal=True)) == 180.0
+    # The thread watchdog (drain + grace) must also fire before launchd's SIGKILL.
+    leash = resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(signal_stop))
+    assert effective_stop_watchdog_delay(signal_stop, leash) < 60.0 < leash
 
 
 def test_effective_drain_getattr_guarded_for_bare_doubles():
@@ -2427,3 +2447,81 @@ def test_rearm_shortens_a_deadline_already_past_the_launchd_wall(
         f"re-arm handed arm_shutdown_watchdog {calls[1]}; the relative delay "
         f"must land on the wall at stop()+50, not past it"
     )
+
+def test_capped_drain_fits_inside_launchd_budget_minus_reserve():
+    # The incident shape: configured 180s, launchd clamps to 60s.
+    assert resolve_launchd_capped_drain(180.0, 60.0) == _CAPPED
+    # Never extends a short drain; no launchd budget leaves the configured drain alone.
+    assert resolve_launchd_capped_drain(20.0, 60.0) == 20.0
+    assert resolve_launchd_capped_drain(180.0, None) == 180.0
+
+
+
+def _direct(label):
+    """launchd's own job process: the label sits in XPC_SERVICE_NAME."""
+    return {"XPC_SERVICE_NAME": label}
+
+
+
+def _grandchild(label):
+    """Under the generated plist the gateway is a grandchild of the stderr-timestamp wrapper: launchd
+    stamps XPC_SERVICE_NAME only on the wrapper, the grandchild reads "0" and finds the job label only
+    in the wrapper's HERMES_LAUNCHD_LABEL re-export."""
+    return {"XPC_SERVICE_NAME": "0", LAUNCHD_LABEL_ENV: label}
+
+
+
+@pytest.mark.parametrize(
+    "platform, environ, expected",
+    [
+        ("darwin", _direct("ai.hermes.gateway"), _CAPPED),
+        ("darwin", _grandchild("ai.hermes.gateway"), _CAPPED),
+        # App-coalition label (IDE integrated terminal) is not our job: no budget, drain unchanged —
+        # whichever variable carries it.
+        ("darwin", _direct("application.com.example.ide.123"), 180.0),
+        ("darwin", _grandchild("application.com.example.ide.123"), 180.0),
+        # No label at all (foreground start, or a wrapper older than the forward) is not launchd-owned.
+        ("darwin", {"XPC_SERVICE_NAME": "0"}, 180.0),
+        # launchd is darwin-only (same predicate as control_socket): a leaked label elsewhere is ignored.
+        ("linux", _direct("ai.hermes.gateway"), 180.0),
+        ("linux", _grandchild("ai.hermes.gateway"), 180.0),
+    ],
+    ids=["darwin-direct", "darwin-grandchild", "darwin-direct-app", "darwin-grandchild-app",
+         "darwin-unlabelled", "linux-direct", "linux-grandchild"],
+)
+def test_launchd_reader_yields_a_budget_only_for_hermes_jobs(platform, environ, expected):
+    """End to end from the process environment to the stop drain: the reader sizes the drain to the
+    live ExitTimeOut only for an ``ai.hermes`` job on darwin, seen directly or through the wrapper's
+    re-export. Platform is data, not the host (the launchctl call is faked)."""
+    fake_run = lambda *a, **k: SimpleNamespace(returncode=0, stdout="exit timeout = 60\n")  # noqa: E731
+    budget = read_launchd_exit_timeout_s(environ=environ, uid=501, run=fake_run, platform=platform)
+    assert resolve_launchd_capped_drain(180.0, budget) == expected
+
+
+
+def test_forwarded_label_marks_grandchild_supervised_for_every_reader():
+    """One seam: the restart route and the control-socket declaration see the same launchd identity
+    the drain cap does, so a grandchild is not 'manual' to one reader and 'launchd' to another."""
+    grandchild_env = _grandchild("ai.hermes.gateway")
+    assert launchd_service_label(grandchild_env, platform="darwin") == "ai.hermes.gateway"
+    assert is_gateway_supervisor_process(grandchild_env) is True
+    assert is_gateway_supervisor_process({"XPC_SERVICE_NAME": "0"}) is False
+    assert is_gateway_supervisor_process(_grandchild("application.com.x.1")) is False
+
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_sigterm_handler_marks_stop_as_signal_driven_unless_planned_takeover(monkeypatch, takeover):
+    import gateway.run as run_mod
+    import gateway.shutdown_forensics as forensics
+    import gateway.status as status
+
+    monkeypatch.setattr(status, "consume_takeover_marker_for_self", lambda: takeover)
+    monkeypatch.setattr(status, "consume_planned_stop_marker_for_self", lambda: False)
+    monkeypatch.setattr(forensics, "snapshot_shutdown_context", lambda *a, **k: None)
+    monkeypatch.setattr(run_mod.asyncio, "create_task", lambda coro: coro.close())
+    runner = _runner(drain=180.0, launchd=60.0, by_signal=False)
+    runner.stop = lambda: asyncio.sleep(0)
+    run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
+    assert runner._stop_requested_by_signal is (not takeover)
+    assert effective_stop_drain_timeout(runner) == (180.0 if takeover else _CAPPED)

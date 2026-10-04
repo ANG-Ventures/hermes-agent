@@ -35,7 +35,7 @@ def test_gpt61_sol_codex_offline_fallback_is_advertised_272k():
     fake_response.json.return_value = {}
     import agent.model_metadata as mm
     mm._codex_oauth_context_cache = {}
-    with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+    with patch("agent.model_metadata.model_metadata_http.get", return_value=fake_response), \
          patch("agent.model_metadata.get_cached_context_length", return_value=None), \
          patch("agent.model_metadata.save_context_length"):
         ctx = get_model_context_length(

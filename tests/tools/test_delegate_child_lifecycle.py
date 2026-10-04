@@ -565,10 +565,19 @@ def _real_agent_methods(agent):
     agent._execution_thread_id = None
     agent._active_children = []
     agent._active_children_lock = threading.Lock()
-    for name in ("steer", "_drain_pending_steer", "clear_interrupt"):
+    # _close_active_children is the teardown door AIAgent.close() walks (parity
+    # 2026-10-01: upstream 477a9b46e3c split close() into phase methods that are
+    # looked up eagerly, so the stub binds the real door and no-ops the rest).
+    for name in ("steer", "_drain_pending_steer", "clear_interrupt", "_close_active_children"):
         setattr(agent, name, types.MethodType(getattr(AIAgent, name), agent))
     agent._persist_session = lambda *a, **k: None
     agent._cleanup_task_resources = lambda *a, **k: None
+    for name in (
+        "shutdown_memory_provider", "_close_task_resources", "_drop_shared_client",
+        "_close_request_clients", "_close_codex_session", "_trim_process_memory",
+        "_finalize_owned_session_row",
+    ):
+        setattr(agent, name, lambda *a, **k: None)
     return agent
 
 

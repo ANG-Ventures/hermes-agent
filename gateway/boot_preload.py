@@ -48,6 +48,8 @@ PRELOAD_PACKAGES: tuple[str, ...] = (
     "acp_adapter",
     "plugins",
     "providers",
+    "hermes_platform",
+    "pm",
 )
 
 # Modules whose import has side effects that are unsafe inside a running
@@ -69,6 +71,17 @@ EXCLUDED_MODULES: dict[str, str] = {
         "ad-hoc live E2E script: inserts a worktree path into sys.path at import, "
         "which makes its flat modules importable under a second name"
     ),
+    "pm.launch": (
+        "PM CLI entry after interpreter selection: mutates sys.path and imports truststore at "
+        "import; only ever run as a subprocess, never inside a gateway"
+    ),
+    "repro_rollback_store": (
+        "repro script: runs `git show` in a subprocess and executes the result at import"
+    ),
+    "repro_executor_slot_leak": "repro script: mutates sys.path at import and is run standalone",
+    "mini_swe_runner": (
+        "standalone benchmark runner: calls load_dotenv() at import, mutating os.environ"
+    ),
 }
 
 
@@ -86,23 +99,23 @@ def is_excluded(name: str) -> bool:
 
 
 def top_level_modules(project_root: Path = _PROJECT_ROOT) -> list[str]:
-    """First-party single-file modules, read from ``[tool.setuptools] py-modules``.
+    """First-party single-file modules: every ``<root>/*.py`` except ``setup.py``.
 
-    Sealed/wheel installs have no pyproject next to the code; they return ``[]``
-    (their tree is not a git checkout that can fast-forward underneath us).
+    Mirrors ``setup.py::_root_py_modules`` (upstream 283c4f058c5 derives the wheel's
+    root modules from the tree; the static ``py-modules`` list is gone). Sealed/wheel
+    installs have no pyproject next to the code; they return ``[]`` (their tree is not
+    a git checkout that can fast-forward underneath us).
     """
     pyproject = project_root / "pyproject.toml"
     if not pyproject.is_file():
         return []
     try:
-        import tomllib
-
-        with pyproject.open("rb") as fh:
-            data = tomllib.load(fh)
-        mods = data.get("tool", {}).get("setuptools", {}).get("py-modules", [])
-        return [m for m in mods if isinstance(m, str)]
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("boot preload: could not read py-modules from %s: %s", pyproject, exc)
+        return sorted(
+            p.stem for p in project_root.iterdir()
+            if p.suffix == ".py" and p.is_file() and p.name != "setup.py" and p.stem.isidentifier()
+        )
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.warning("boot preload: could not list root modules under %s: %s", project_root, exc)
         return []
 
 

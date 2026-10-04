@@ -146,10 +146,12 @@ def test_gc_defers_linked_parent_until_child_finishes(kanban_home, parent_kind):
     _set(parent, workspace_kind=parent_kind)
     (ws / "handoff.txt").write_text("still needed", encoding="utf-8")
     child = _mktask("active child")
-    _set(child, status="running", workspace_kind="dir", workspace_path=str(kanban_home),
-         claim_expires=int(time.time()) + 3600)
+    # Link before the child runs: link_tasks refuses a running child (upstream b95513df7c);
+    # the parent is already done so the blocks edge does not demote it.
     with kb.connect_closing() as conn:
         kb.link_tasks(conn, parent, child)
+    _set(child, status="running", workspace_kind="dir", workspace_path=str(kanban_home),
+         claim_expires=int(time.time()) + 3600)
     assert _gc(done_retention_days=3) == 0
     assert (ws / "handoff.txt").read_text(encoding="utf-8") == "still needed"
     assert "active-children-need-handoff" in kb.workspace_deletion_log_path().read_text(encoding="utf-8")

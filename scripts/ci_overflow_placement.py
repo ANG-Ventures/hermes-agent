@@ -192,7 +192,7 @@ def cmd_place(args) -> int:
     out = os.environ["GITHUB_OUTPUT"]
     placement, reason = None, "generate outputs unusable"
     try:
-        matrix = json.loads(Path(os.environ["CI_MATRIX_FILE"]).read_text(encoding="utf-8"))
+        matrix = json.loads(Path(os.environ["CI_MATRIX_FILE"]).read_text(encoding="utf-8-sig"))
         digest = os.environ.get("CI_REQUEST_DIGEST", "").strip()
         if digest and not digest.startswith("sha256:"):
             digest = "sha256:" + digest
@@ -217,15 +217,23 @@ def cmd_place(args) -> int:
     return 0
 
 
-def gate(needs: dict) -> list[str]:
-    """Problems that must fail the tests workflow; skipped required work is failure."""
-    problems = [f"{job} result={needs.get(job, {}).get('result')}" for job in ("generate", "test", "e2e")
+def gate(needs: dict, *, e2e_requested: bool = True) -> list[str]:
+    """Problems that must fail the tests workflow; skipped required work is failure.
+
+    ``e2e`` is a slow lane gated by ``inputs.e2e``: required when requested, and an
+    expected skip (not a problem) when the caller did not ask for it.
+    """
+    required = ("generate", "test", "e2e") if e2e_requested else ("generate", "test")
+    problems = [f"{job} result={needs.get(job, {}).get('result')}" for job in required
                 if needs.get(job, {}).get("result") != "success"]
     return problems
 
 
 def cmd_gate(_args) -> int:
-    problems = gate({job: {"result": os.environ.get(f"{job.upper()}_RESULT")} for job in ("generate", "test", "e2e")})
+    # Unset (an older caller) means requested: the gate never gets looser by omission.
+    e2e_requested = os.environ.get("E2E_REQUESTED", "true").strip().lower() != "false"
+    problems = gate({job: {"result": os.environ.get(f"{job.upper()}_RESULT")} for job in ("generate", "test", "e2e")},
+                    e2e_requested=e2e_requested)
     for p in problems:
         print(f"::error::required tests job not successful: {p}")
     return 1 if problems else 0

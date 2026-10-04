@@ -13,6 +13,7 @@ import json
 import os
 import socket
 import threading
+from types import SimpleNamespace
 import time
 
 import pytest
@@ -540,6 +541,9 @@ def test_api_request_refused_under_hold_and_counted_otherwise(store):
     class Stub:
         _pending_agent_requests = 0
         _check_auth = staticmethod(lambda request: None)
+        # Upstream room-grant auth: /v1/runs with a grant token takes _check_run_auth; a plain
+        # chat request (no token) keeps the bearer check this test exercises.
+        _room_grant_token = staticmethod(lambda request: None)
         _gateway_is_draining = staticmethod(lambda: False)
         _checkout_hold_refusal = staticmethod(api.APIServerAdapter._checkout_hold_refusal)
         _draining_response = api.APIServerAdapter._draining_response
@@ -552,9 +556,10 @@ def test_api_request_refused_under_hold_and_counted_otherwise(store):
         return "ok"
 
     stub = Stub()
-    assert asyncio.run(handler(stub, None)) == "ok" and seen == [1]
+    request = SimpleNamespace(path="/v1/chat/completions")
+    assert asyncio.run(handler(stub, request)) == "ok" and seen == [1]
     store.hold("op", [GW])
-    resp = asyncio.run(handler(stub, None))
+    resp = asyncio.run(handler(stub, request))
     assert resp.status == 503
     assert json.loads(resp.body)["error"]["code"] == "checkout_held"
     assert seen == [1] and stub._pending_agent_requests == 0
@@ -630,7 +635,10 @@ def test_serve_background_ticket_spans_worker_thread(store, serve_gate, monkeypa
         return server._ok(rid, {"task_id": "bg"})
 
     monkeypatch.setitem(server._methods, "prompt.background", fake)
-    server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "prompt.background", "params": {}})
+    # Upstream wire contracts: the dispatcher validates params/results of every registered method
+    # (strict under HERMES_TEST_ISOLATION), so the double is driven with contract-valid params.
+    server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "prompt.background",
+                           "params": {"session_id": "s-bg", "text": "work"}})
     deadline = time.time() + 5
     while not counts and time.time() < deadline:
         time.sleep(0.01)

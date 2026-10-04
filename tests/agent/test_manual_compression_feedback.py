@@ -9,7 +9,6 @@ full-request line — a self-contradicting message.
 """
 
 from agent.manual_compression_feedback import (
-    describe_compression_lock_skip,
     summarize_manual_compression,
 )
 
@@ -224,8 +223,6 @@ def _messages(count: int) -> list[dict[str, str]]:
     ]
 
 
-
-
 def test_failure_reason_redaction_is_forced_at_ui_boundary(monkeypatch):
     messages = _messages(12)
     fake_secret = "sk-proj-" + "X" * 40
@@ -271,7 +268,5 @@ def test_fallback_compression_reports_dropped_message_count():
     assert feedback["headline"] == "Compressed with fallback: 12 → 4 messages (manual — you ran /compress)"
     assert "removed 8 message(s)" in feedback["note"]
     assert "invalid response" in feedback["note"]
-
-
 
 

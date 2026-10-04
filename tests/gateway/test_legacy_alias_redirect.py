@@ -37,6 +37,11 @@ def _seed(tmp_path, entries, backend):
             "INSERT INTO gateway_routing(scope, session_key, entry_json, updated_at) VALUES (?, ?, ?, ?)",
             [(str(tmp_path.resolve()), key, json.dumps(value), now) for key, value in entries.items()],
         ))
+        # Both routes point at sessions that still EXIST: a route whose state.db row is missing is
+        # a hard delete at routing time and is recovered as a fresh session (upstream #42422, kept
+        # at the 2026-10-01 parity merge), which is not the window this test pins.
+        for value in entries.values():
+            db.create_session(value["session_id"], source="discord")
     store = SessionStore(tmp_path, GatewayConfig())
     store._db = db
     return store, db

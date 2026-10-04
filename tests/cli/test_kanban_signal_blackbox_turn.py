@@ -155,7 +155,14 @@ def test_flush_runs_before_session_end_and_failures_are_contained(monkeypatch):
 
 
 def test_kanban_signal_path_calls_the_finalizer():  # noqa: source-proxy wiring of a closure nested in main() that only a real signal reaches and that ends in os._exit; the finalizer itself is exercised behaviourally above
-    src = inspect.getsource(cli_mod)
+    # parity 2026-10-01: upstream moved the -q signal handlers to hermes_cli.cli_single_query
+    # (``_install_single_query_signal_handlers``, re-exported by cli); read the source where it lives.
+    from hermes_cli import cli_single_query
+
+    src = inspect.getsource(cli_single_query)
     handler = src[src.index("def _signal_handler_q("):]
-    handler = handler[:handler.index("os._exit(0)\n", handler.index("_lg.shutdown()"))]
+    # The kanban-worker arm ends by flushing logging/stdio (upstream's ``_flush_logging_and_stdio``,
+    # formerly an inline ``_lg.shutdown()``) and hard-exiting via ``_kill_foreground_and_exit``.
+    handler = handler[:handler.index("_kill_foreground_and_exit()\n", handler.index("_flush_logging_and_stdio()"))]
     assert "_finalize_signaled_kanban_worker(cli, signum)" in handler
+    assert handler.index("_finalize_signaled_kanban_worker(cli, signum)") < handler.index("_flush_logging_and_stdio()")

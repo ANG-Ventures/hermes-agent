@@ -17,6 +17,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -59,7 +60,7 @@ def test_other_cards_open_pr_mentioned_on_card_does_not_guard(kanban_home, fake_
             "D9 coordination from t_46c8caeb: my bake change "
             "https://github.com/o/home/pull/1333 touches only bake.py",
         )
-        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
 
 
 def test_cards_own_open_pr_still_guards_and_names_the_pr(kanban_home, fake_gh):
@@ -68,7 +69,7 @@ def test_cards_own_open_pr_still_guards_and_names_the_pr(kanban_home, fake_gh):
         fake_gh[1271] = _open(f"daedalus-opus/{tid}-kimi-code-lane")
         kb.add_comment(conn, tid, "worker", "PR https://github.com/o/home/pull/1271 open")
         detail: dict = {}
-        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
         assert detail == {
             "pr": "https://github.com/o/home/pull/1271", "pr_state": "OPEN",
             "hold": "PR merge state unknown", "pr_owned": True,
@@ -85,7 +86,7 @@ def test_unattributable_open_pr_stays_guarded(kanban_home, fake_gh, head):
         fake_gh[7] = {"state": "OPEN", "mergedAt": None, **({"headRefName": head} if head else {})}
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/7")
         detail: dict = {}
-        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
         # Guarded, but NOT this card's PR: never landed automatically (Prism #1545).
         assert detail["pr_owned"] is False
 
@@ -100,7 +101,7 @@ def test_other_cards_pr_skipped_but_own_pr_in_same_card_still_guards(kanban_home
             "see https://github.com/o/r/pull/1 and mine https://github.com/o/r/pull/2",
         )
         detail: dict = {}
-        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
         assert detail["pr"] == "https://github.com/o/r/pull/2"
 
 
@@ -111,7 +112,7 @@ def test_dispatch_event_and_show_name_the_holding_pr(
         tid = kb.create_task(conn, title="lane work", assignee="alice")
         fake_gh[1271] = _open(f"daedalus-opus/{tid}-lane")
         kb.add_comment(conn, tid, "worker", "https://github.com/o/home/pull/1271")
-        res = kb.dispatch_once(conn)
+        res = kbd.dispatch_once(conn)
         assert res.respawn_guarded == [(tid, "active_pr")]
         payloads = [e.payload for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
         assert payloads[-1] == {
@@ -166,7 +167,7 @@ def test_card_id_outside_owner_position_stays_guarded(kanban_home, fake_gh, head
         tid = kb.create_task(conn, title="lane work", assignee="alice")
         fake_gh[5] = _open(head)
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/5")
-        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
 
 @pytest.mark.parametrize("head", ["wt/t_11111111", "proj/t_11111111", "bob/t_11111111-x"])
@@ -175,7 +176,7 @@ def test_other_card_id_in_owner_position_skips(kanban_home, fake_gh, head):
         tid = kb.create_task(conn, title="lane work", assignee="alice")
         fake_gh[6] = _open(head)
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/6")
-        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
 
 
 def test_show_drops_ready_hold_after_review_requested(kanban_home):
@@ -223,7 +224,7 @@ def test_workerless_card_spawns_to_fix_its_own_unmergeable_pr(
         fake_gh[1871] = _with_health(f"daedalus-opus/{tid}-perf", merge_state, rollup)
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/1871")
         assert kb._prior_worker_still_alive(conn, tid) is None
-        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
         assert kb._pr_needs_its_worker("o/r", 1871) == needs
 
 
@@ -236,7 +237,7 @@ def test_unmergeable_pr_holds_while_its_worker_is_alive(kanban_home, fake_gh, mo
         fake_gh[1871] = _with_health(f"daedalus-opus/{tid}-perf", "DIRTY")
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/1871")
         detail: dict = {}
-        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
     assert detail == {
         "pr": "https://github.com/o/r/pull/1871", "pr_state": "OPEN",
         "merge_state": "DIRTY", "pr_needs": "DIRTY", "hold": "worker alive",
@@ -253,7 +254,7 @@ def test_mergeable_pr_still_holds_and_says_the_closer_lands_it(
         fake_gh[9] = _with_health(f"alice/{tid}-x", merge_state)
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/9")
         detail: dict = {}
-        assert kb.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid, detail=detail) == "active_pr"
     assert detail["hold"] == "PR mergeable, closer will land it"
     assert detail["merge_state"] == merge_state
     assert detail["pr_owned"] is True
@@ -267,7 +268,7 @@ def test_dispatch_spawns_workerless_card_behind_planted_dirty_pr(
         tid = kb.create_task(conn, title="D-perf1", assignee="alice")
         fake_gh[1871] = _with_health(f"daedalus-opus/{tid}-perf", "DIRTY")
         kb.add_comment(conn, tid, "worker", "https://github.com/o/r/pull/1871")
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kbd.dispatch_once(conn, dry_run=True)
         assert (tid, "active_pr") not in res.respawn_guarded
         assert tid in [t for (t, _a, _w) in res.spawned]
 

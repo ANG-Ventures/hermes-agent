@@ -105,7 +105,7 @@ def main():
                 shutil.copyfile(ROOT / filename, dst)
             shutil.copytree(ROOT / "tests/fixtures/ci_overflow", root / "tests/fixtures/ci_overflow", dirs_exist_ok=True)
             target = root / src
-            content = target.read_text(encoding="utf-8")
+            content = target.read_text(encoding="utf-8-sig")
             assert content.count(before) == 1, (name, content.count(before))
             target.write_text(content.replace(before, after), encoding="utf-8")
             # -B: the scratch dir is reused, and two same-size mutants written within one mtime

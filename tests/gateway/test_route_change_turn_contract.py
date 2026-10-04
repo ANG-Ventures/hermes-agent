@@ -47,7 +47,7 @@ class RecordingAdapter:
 
 
 def make_agent(monkeypatch):
-    monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda *a, **kw: {})
     monkeypatch.setattr("run_agent.OpenAI", MagicMock())
     monkeypatch.setattr(
@@ -56,16 +56,19 @@ def make_agent(monkeypatch):
             "model": {"announce_route_change": True, "announce_recovery": True},
         },
     )
+    # The retry loop now lives in agent/turn_recovery.py and resolves its
+    # backoff helpers lazily from agent.retry_utils, so patch the source
+    # module (patching the conversation_loop facade no longer intercepts).
     monkeypatch.setattr(
-        "agent.conversation_loop.jittered_backoff", lambda *a, **kw: 0.0
+        "agent.retry_utils.jittered_backoff", lambda *a, **kw: 0.0
     )
     # Pool-capacity 503s wait via capacity_retry_wait, not jittered_backoff
     # (~6s real sleep per 503). Keep its give-up decision (None), zero the wait.
-    import agent.conversation_loop as _loop
+    import agent.retry_utils as _ru
 
-    _capacity_wait = _loop.capacity_retry_wait
+    _capacity_wait = _ru.capacity_retry_wait
     monkeypatch.setattr(
-        _loop,
+        _ru,
         "capacity_retry_wait",
         lambda **kw: None if _capacity_wait(**kw) is None else 0.0,
     )
@@ -121,6 +124,17 @@ def response():
     )
 
 
+async def _drain_scheduled_sends():
+    """Let sends the worker thread already scheduled on this loop run to completion.
+
+    fork (parity 2026-10-01 CI): one ``sleep(0)`` was not always enough on a loaded Blacksmith slice
+    (run 37113322684: 0 == 1 messages for 3 parametrizations that pass everywhere else).
+    """
+    for _ in range(20):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+
+
 async def bind_delivery(agent, adapter):
     source = SimpleNamespace(platform=Platform.DISCORD, chat_id="test-chat")
     ctx = TurnContext(
@@ -150,7 +164,7 @@ def test_every_cause_announces_route_change_in_same_turn(monkeypatch, reason):
         agent._current_turn_id = "test-turn"
         assert await asyncio.to_thread(agent._try_activate_fallback, reason=reason)
         # Drain all sends scheduled before activation returned, on this same loop.
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert len(adapter.messages) == 1
         assert agent._last_fallback_event["turn_id"] == "test-turn"
 
@@ -199,7 +213,7 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
     async def scenario():
         await bind_delivery(agent, adapter)
         result = await asyncio.to_thread(agent.run_conversation, "hello")
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert result["final_response"] == "Recovered"
         assert result["completed"] is True
         assert len(adapter.messages) == 2
@@ -217,7 +231,7 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
         # Phase 2 (fallback spec §4.2): the primary's pool-wide quota_model
         # armed a sticky episode, so the next turn boundary stays put ...
         await asyncio.to_thread(agent._restore_primary_runtime)
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert len(adapter.messages) == 2
         # ... until the §4.3 gate opens (until passed, fallback idle > 60 min).
         from agent import fallback_sticky_store as fss
@@ -231,7 +245,7 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
         state.last_fallback_call_epoch = now - 61 * 60
         fss.default_store().put(key, state, now)
         await asyncio.to_thread(agent._restore_primary_runtime)
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert len(adapter.messages) == 2 + int(announce_recovery)
         if announce_recovery:
             assert "Model recovery" in adapter.messages[-1][1]
@@ -267,13 +281,13 @@ def test_effort_only_fallback_and_restore_are_each_delivered(monkeypatch, capsys
         assert await asyncio.to_thread(
             agent._try_activate_fallback, reason=FailoverReason.overloaded
         )
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert agent.reasoning_config["effort"] == "medium"
         assert len(adapter.messages) == 1
         assert "(high)" in adapter.messages[0][1]
         assert "(medium)" in adapter.messages[0][1]
         assert await asyncio.to_thread(agent._restore_primary_runtime)
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert agent.reasoning_config["effort"] == "high"
         assert len(adapter.messages) == 2
         assert "Model recovery" in adapter.messages[-1][1]
@@ -336,6 +350,9 @@ def make_turn_owner(agent, prior, *, cached=True, effort="medium"):
     owner._pending_model_notes = {}
     owner._pending_skills_reload_notes = {}
     owner._override_target_just_changed = {}
+    # Upstream (parity 2026-10-01): run_sync counts consecutive transcript-lag turns here;
+    # on a MagicMock owner the getattr default never fires, so give it the real dict.
+    owner._transcript_lag_streaks = {}
     owner.session_store._lock = None
     entry = SimpleNamespace(
         last_served_identity=prior, model_override_identity=None, resume_pending=False
@@ -388,7 +405,7 @@ async def run_turn(owner, agent, adapter, user_config=None):
     runner = TurnRunner(owner, ctx)
     ctx._status_callback_sync = runner._status_callback_sync
     result = await asyncio.to_thread(runner.run_sync)
-    await asyncio.sleep(0)
+    await _drain_scheduled_sends()
     assert result["final_response"] == "Recovered"
     return result
 
@@ -460,7 +477,7 @@ def test_warm_cache_recovery_preserves_from_effort_and_announces_once(
         assert await asyncio.to_thread(
             agent._try_activate_fallback, reason=FailoverReason.overloaded
         )
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert len(adapter.messages) == 1
         # Strip the §4.8 cause rider (" — <cause> <hop> <sub>, <time>").
         fallback = adapter.messages[0][1].split(" — ", 1)[0].split(": ", 1)[1]
@@ -503,7 +520,7 @@ def test_warm_cache_blocked_recovery_keeps_fallback_effort(
         assert await asyncio.to_thread(
             agent._try_activate_fallback, reason=FailoverReason.overloaded
         )
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         old_model = agent.model
         adapter.messages.clear()
         agent._rate_limited_until = time.monotonic() + 3600
@@ -546,12 +563,12 @@ def test_cached_config_effort_change_survives_later_fallback(
         assert await asyncio.to_thread(
             agent._try_activate_fallback, reason=FailoverReason.overloaded
         )
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         adapter.messages.clear()
         # Exercise core restoration too: gateway config refresh must update the
         # snapshot, not leave the next non-gateway restore pointing at old effort.
         assert await asyncio.to_thread(agent._restore_primary_runtime)
-        await asyncio.sleep(0)
+        await _drain_scheduled_sends()
         assert agent.reasoning_config == {"effort": "low"}
         assert adapter.messages == []
 
@@ -573,8 +590,10 @@ async def test_manual_model_switch_delivers_once_without_old_turn_callback(
         "hermes_cli.model_switch.resolve_display_context_length",
         lambda *a, **kw: 200000,
     )
+    # Upstream (parity 2026-10-01) extracted the picker listing into model_switch_providers;
+    # the gateway reads it from there.
     monkeypatch.setattr(
-        "hermes_cli.model_switch.list_picker_providers",
+        "hermes_cli.model_switch_providers.list_picker_providers",
         lambda **kw: [
             {"slug": "openrouter", "name": "OpenRouter", "models": ["gpt-5.5"]},
         ],

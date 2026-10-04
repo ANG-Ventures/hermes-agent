@@ -26,12 +26,13 @@ import psutil
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
     kb.init_db()
     with kb.connect_closing() as conn:
         yield conn
@@ -106,17 +107,17 @@ def _running(board, now, pid, *, progress_at, started_ago=1800):
     task = kb.claim_task(board, tid)
     # Record the pid the way the dispatcher does (with its ``spawned`` event):
     # termination signals only a worker bounded by that record (#1021).
-    assert kb._set_worker_pid(board, tid, pid, run_id=task.current_run_id)
+    assert kbd._set_worker_pid(board, tid, pid, run_id=task.current_run_id)
     board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now - started_ago, task.current_run_id))
     board.commit()
     if progress_at is not None:
-        assert kb.heartbeat_worker(board, tid, expected_run_id=task.current_run_id, progress_at=progress_at)
+        assert kbd.heartbeat_worker(board, tid, expected_run_id=task.current_run_id, progress_at=progress_at)
     return tid
 
 
 def _heartbeat(board, tid, progress_at):
     rid = kb.get_task(board, tid).current_run_id
-    assert kb.heartbeat_worker(board, tid, expected_run_id=rid, progress_at=progress_at)
+    assert kbd.heartbeat_worker(board, tid, expected_run_id=rid, progress_at=progress_at)
 
 
 def _count(board, tid, kind):
@@ -154,7 +155,7 @@ def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, m
         again = _in_flight_worker(silent_server, fake_cpu)
         claimed = kb.claim_task(board, tid)
         board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now - 1500, claimed.current_run_id))
-        assert kb._set_worker_pid(board, tid, again.pid, run_id=claimed.current_run_id)
+        assert kbd._set_worker_pid(board, tid, again.pid, run_id=claimed.current_run_id)
         # The faked clock has advanced 600 s past the REAL one, so claim_task
         # stamped its ``claimed`` event in the future of this worker's real
         # creation. The owner-identity window (t_0ae83825) would then read the
@@ -354,7 +355,7 @@ def test_run_without_progress_signal_is_unknown_and_never_reclaimed(board, monke
     try:
         tid = _running(board, now, proc.pid, progress_at=None)
         rid = kb.get_task(board, tid).current_run_id
-        assert kb.heartbeat_worker(board, tid, expected_run_id=rid)  # legacy: no progress_at
+        assert kbd.heartbeat_worker(board, tid, expected_run_id=rid)  # legacy: no progress_at
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
         assert _count(board, tid, "stalled") == 0
     finally:
@@ -367,7 +368,7 @@ def test_dispatch_tick_observes_progress_despite_fresh_heartbeats(board, monkeyp
     proc = _in_flight_worker(silent_server, fake_cpu)
     try:
         tid = _running(board, now, proc.pid, progress_at=now - 901)
-        kb.dispatch_once(board, max_spawn=1, spawn_fn=lambda *args: 123)
+        kbd.dispatch_once(board, max_spawn=1, spawn_fn=lambda *args: 123)
         assert _count(board, tid, "stalled") == 1
     finally:
         proc.kill()
@@ -421,10 +422,11 @@ def test_first_auto_heartbeat_is_not_dropped_on_a_freshly_booted_host(tmp_path):
         "os.environ['HERMES_KANBAN_TASK'] = 't_fresh'\n"
         "from tools import kanban_tools as kt\n"
         "calls = []\n"
-        "def _connect():\n"
+        # The board open is now the ``_board`` context manager (upstream); same seam.
+        "def _board(*a, **k):\n"
         "    calls.append('connect')\n"
         "    raise RuntimeError('stop after the limiter')\n"
-        "kt._connect = _connect\n"
+        "kt._board = _board\n"
         "kt.heartbeat_current_worker_from_env(progress_at=1000.0)\n"
         "print('CALLS', len(calls))\n"
     )

@@ -23,10 +23,16 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Every module that calls _compress_context. Add new ones here deliberately.
+# (Upstream's turn_*.py extraction moved the in-turn call sites out of
+# conversation_loop / turn_context into the modules below.)
 CALLER_FILES = [
-    "agent/turn_context.py",
-    "agent/conversation_loop.py",
+    "agent/turn_context_compaction.py",
+    "agent/turn_preflight.py",
+    "agent/turn_overflow.py",
+    "agent/turn_recovery.py",
+    "agent/conversation_compression_manual.py",
     "gateway/run.py",
+    "gateway/run_turn.py",
     "gateway/slash_commands.py",
 ]
 
@@ -69,9 +75,9 @@ def test_lint_every_compress_call_site_names_its_trigger():
 
 def test_lint_finds_call_sites_at_all():
     """Positive control: a lint that silently matches nothing always passes."""
-    path = os.path.join(REPO, "agent/turn_context.py")
+    path = os.path.join(REPO, "agent/turn_context_compaction.py")
     calls = _compress_context_calls(path)
-    assert calls, "AST lint found zero call sites in turn_context.py — lint is broken"
+    assert calls, "AST lint found zero call sites in turn_context_compaction.py — lint is broken"
 
 
 def test_started_log_line_carries_the_trigger():
@@ -97,11 +103,12 @@ def test_missing_trigger_is_logged_as_a_warning():
 
 def test_trigger_reason_is_still_a_supported_parameter():
     """Guards against the forwarder silently dropping the kwarg."""
-    src = open(os.path.join(REPO, "run_agent.py"), encoding="utf-8",
+    # The forwarder lives on CompressionFacadeMixin (mixed into run_agent.AIAgent).
+    src = open(os.path.join(REPO, "agent/compression_facade.py"), encoding="utf-8",
                errors="ignore").read()
     assert re.search(r"def _compress_context\(", src)
     assert "trigger_reason=trigger_reason" in src, (
-        "run_agent._compress_context no longer forwards trigger_reason"
+        "CompressionFacadeMixin._compress_context no longer forwards trigger_reason"
     )
 
 

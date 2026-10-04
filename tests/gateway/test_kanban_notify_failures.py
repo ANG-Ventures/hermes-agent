@@ -9,6 +9,7 @@ import asyncio
 
 from gateway import kanban_notify_failures as knf
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from tests.gateway.test_kanban_notifier import (
     RecordingAdapter,
     _make_runner,
@@ -46,7 +47,7 @@ def _lane_cards(n, assignee="daedalus-sol"):
         tids = []
         for i in range(n):
             tid = kb.create_task(conn, title=f"card {i}", assignee=assignee)
-            kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+            kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
             tids.append(tid)
         return tids
 

@@ -601,7 +601,7 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     if not path.exists() or not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return None
     summary = _externalized_summary(path, payload)
@@ -883,7 +883,7 @@ def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, he
         return False
     path = storage_dir / ref
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return False
     if payload.get("kind", "tool_result") != "tool_result":
@@ -910,7 +910,7 @@ def reassign_externalized_payloads(
         if not path.is_file():
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             continue
         if (payload.get("session_id") or "") != old_session_id:
@@ -953,7 +953,7 @@ def find_externalized_payload_for_message(
     fallback_match = None
     for path in candidates:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             continue
         if kind is not None and payload.get("kind", "tool_result") != kind:
@@ -1009,7 +1009,7 @@ def find_externalized_tool_result_content_for_call(
         return None
     for path in sorted(storage_dir.glob("*.json")):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             continue
         if payload.get("kind", "tool_result") != "tool_result":
@@ -1189,7 +1189,7 @@ def maybe_externalize_payload(
         existing_payload = None
         if metadata:
             try:
-                existing_payload = json.loads(existing_path.read_text(encoding="utf-8"))
+                existing_payload = json.loads(existing_path.read_text(encoding="utf-8-sig"))
             except (OSError, json.JSONDecodeError):
                 existing_payload = None
             if existing_payload is not None and _merge_persisted_output_marker_metadata(existing_payload, metadata):

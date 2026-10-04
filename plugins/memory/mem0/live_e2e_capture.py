@@ -41,7 +41,7 @@ def _mem0_config_path() -> str:
 def _cfg() -> dict:
     global _CFG_CACHE
     if _CFG_CACHE is None:
-        with open(_mem0_config_path(), encoding="utf-8") as fh:
+        with open(_mem0_config_path(), encoding="utf-8-sig") as fh:
             _CFG_CACHE = json.load(fh)
     assert _CFG_CACHE is not None
     return _CFG_CACHE

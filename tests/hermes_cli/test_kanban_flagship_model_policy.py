@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import model_switch as ms
 from hermes_cli.model_policy import FLAGSHIP_MODEL_SUBSTRINGS
 
@@ -265,8 +266,8 @@ def test_dispatch_refuses_direct_db_bypass_and_logs_once(
         )
         conn.commit()
 
-        first = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task.id))
-        second = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task.id))
+        first = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task.id))
+        second = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task.id))
         task = kb.get_task(conn, task_id)
         comments = kb.list_comments(conn, task_id)
 
@@ -304,7 +305,7 @@ def test_dispatch_allows_direct_db_model_with_override_comment(
             "flagship override: incident commander approved",
         )
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             spawn_fn=lambda task, workspace: spawned.append(task.id),
         )

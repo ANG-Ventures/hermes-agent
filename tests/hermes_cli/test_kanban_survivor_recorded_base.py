@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -43,7 +44,7 @@ def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False,
                          remote_name="origin"):
     """old -> fork (recorded base) -> work; remote main has moved past `fork`."""
     tid = kb.create_task(conn, title="implement fixture")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
@@ -57,7 +58,7 @@ def stale_base_workspace(conn, tmp_path, *, track_main=True, rewrite_main=False,
     if track_main:
         git(ws, "push", remote_name, "HEAD:refs/heads/main")
         git(ws, "fetch", remote_name)
-    kb.set_workspace_path(conn, tid, ws)       # records bases[.] = fork
+    kbw.set_workspace_path(conn, tid, ws)       # records bases[.] = fork
     # Main moves on elsewhere; its new tip never reaches this object store.
     other = tmp_path / "other"
     git(tmp_path, "clone", "-b", "old", str(remote), str(other))
