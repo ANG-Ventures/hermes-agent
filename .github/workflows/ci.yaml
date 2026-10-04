@@ -191,7 +191,7 @@ jobs:
         env:
           RELEASE: ${{ inputs.release }}
           EVENT_NAME: ${{ github.event_name }}
-          DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
+          DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS || 'on' }}  # PROOF ONLY: simulates CI_DESKTOP_JOBS=on (t_bf20260d), never merged
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
           python3 - <<'PY'
