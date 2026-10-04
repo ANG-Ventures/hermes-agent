@@ -149,6 +149,7 @@ jobs:
           fi
           MATRIX=$(python3 scripts/run_tests_parallel.py \
             --generate-slices "$SLICES" \
+            --full-slices '${{ inputs.slice_count }}' \
             "${IMPACT_ARGS[@]}" \
             --test-scope '${{ inputs.test_scope }}' \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
@@ -501,7 +502,9 @@ jobs:
           printf '%s\n' "${files[@]}"
           [ "${#files[@]}" -gt 0 ] || { echo "::error::no *_ptb.py test files found"; exit 1; }
           "$HERMES_PYTHON" -c "import telegram; print('python-telegram-bot', telegram.__version__)"
-          scripts/run_tests.sh "${files[@]}" -- -v
+          # --junit-dir: the registered call_site_tests nodeids are checked
+          # one by one against the junit (a skipped nodeid is RED).
+          scripts/run_tests.sh --junit-dir ci-junit "${files[@]}" -- -v
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
