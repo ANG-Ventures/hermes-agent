@@ -133,6 +133,10 @@ class SessionCreateParams(ProfileParams):
     hidden: bool = False
     room_plumbing: bool = False
     follow_profile_config: bool = False
+    # fork (methods_session._declared_cache_scope_param): one prompt-cache bucket shared by every
+    # session a pooled client opens (voice warm pool, L3 t_c16a5ab2). Echoed as
+    # ``info.declared_cache_scope``. Dropping it 4000s every tier-2 voice turn (t_f146c725).
+    cache_scope: str | None = None
 
 
 class SessionCreateResult(Result):
