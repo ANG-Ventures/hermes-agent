@@ -340,6 +340,10 @@ _SPECS = [
                   "any operator-profile session may act on. For cron/script minters with no "
                   "session of their own: create REFUSES a card that would be born unhomed. "
                   "Accepts 'operator' or 'operator:<name>'; exclusive with --session."),
+        _arg("--unhomed", action="store_true", default=False,
+             help="Mint the card with NO home session on purpose (same as --session none). "
+                  "Without it a worker, cron or gateway create that resolves no home is "
+                  "refused; the orphan watch infers a home for unhomed cards (t_6281f908)."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -520,6 +524,15 @@ _SPECS = [
                   "Closes it done with outcome 'superseded'; no --result/--summary required, "
                   "but the pointer must be non-empty (an unnamed supersede is a silent delete "
                   "of the work)."),
+        _arg("--external", metavar="URL",
+             help="Terminal close for a card whose remaining step is an outside party's (an "
+                  "upstream maintainer merge): closes it done with outcome 'external', no "
+                  "--result/--summary/receipt/survivor PR required. URL = the upstream PR/issue "
+                  "(http/https). Requires --watcher."),
+        _arg("--watcher", metavar="ID",
+             help="With --external: the watcher that reopens the card when the upstream closes "
+                  "unmerged (e.g. the external-card-watch cron id). Recorded on the run and the "
+                  "completed event."),
         _arg("--draft-ok", metavar="REASON",
              help="Audited per-card override for the DRAFT-PR refusal: the handoff names a "
                   "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)

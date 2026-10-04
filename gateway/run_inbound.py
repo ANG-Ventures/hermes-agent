@@ -1410,6 +1410,14 @@ class GatewayInboundMixin:
         if _paused_notice is not None:
             return _paused_notice
 
+        # Orphan-card menu (t_6281f908): a bare-number reply to the 🏷 #alerts
+        # line re-homes that option's card. Anything else passes through.
+        if not is_internal:
+            from gateway.run import _maybe_orphan_menu_reply
+            _orphan_reply = await _maybe_orphan_menu_reply(event, source)
+            if _orphan_reply is not None:
+                return _orphan_reply
+
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:

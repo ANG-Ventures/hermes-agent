@@ -7938,15 +7938,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
         reply_to_id = None
         reply_to_text = None
+        reply_to_author_id = None
+        reply_to_is_own = False
         if message.reference:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
+                # Platform-verified authorship of the replied-to message: text is
+                # user-forgeable, the author id is not (t_3ad14889 untrusted menus).
+                _ref_author_id = getattr(getattr(message.reference.resolved, "author", None), "id", None)
+                _own_id = getattr(getattr(self._client, "user", None), "id", None)
+                if _ref_author_id is not None:
+                    reply_to_author_id = str(_ref_author_id)
+                    reply_to_is_own = _own_id is not None and _ref_author_id == _own_id
         event = MessageEvent(
             text=event_text, message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
             media_text_inlined=media_text_inlined,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id, reply_to_is_own_message=reply_to_is_own,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )

@@ -874,7 +874,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # model reads a tool_error as terminal and blocks.
             return tool_error(
                 f"kanban_complete blocked: {supersede_err}. Your task is still in-flight "
-                f"(no state change). Retry with a non-empty superseded_by naming what "
+                f"(no state change). Retry with a short (<=500 chars), non-empty superseded_by naming what "
                 f"satisfied the premise.")
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
@@ -1313,6 +1313,9 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
+    # D-O1 (t_6281f908): a worker/cron/gateway create that resolves no home
+    # is refused unless ``unhomed`` is passed.
+    unhomed = _parse_bool_arg(args, "unhomed")
     # Fork arg name ``model_override`` is the surviving contract (tests + schema);
     # upstream's ``model`` alias is also accepted.
     model_override = args.get("model_override")
@@ -1368,7 +1371,8 @@ def _handle_create(args: dict, **kw) -> str:
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
                 initial_status=str(args.get("initial_status") or "running"), triage=bool(triage)),
-            created_by=_persisted_identity(), session_id=session_id,
+            created_by=_persisted_identity(), session_id=None if unhomed else session_id,
+            session_explicit=unhomed, require_home=True,
             duplicate_guard=True, force_reason=force_reason)
         dup_warning = kb.near_duplicate_warning(conn, new_tid)
         # Placeholder-assignee lint (``default``/``apollo``/``human:x``) runs inside

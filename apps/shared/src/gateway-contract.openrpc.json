@@ -26245,6 +26245,18 @@
             "default": null,
             "title": "System Context"
           },
+          "room": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Room"
+          },
           "title_preview": {
             "anyOf": [
               {
@@ -29754,6 +29766,18 @@
             "default": false,
             "title": "Follow Profile Config",
             "type": "boolean"
+          },
+          "cache_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cache Scope"
           }
         },
         "title": "SessionCreateParams",
