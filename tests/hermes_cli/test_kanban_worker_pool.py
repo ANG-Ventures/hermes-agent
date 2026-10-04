@@ -96,8 +96,8 @@ def _write_pool(fleet: Path, *, roles=None, sidecar=None):
                   "ace-ai": {"enabled": True, "absence": "required"},
                   "ace-media": {"enabled": True, "absence": "optional"}},
     }
-    (fleet / kwp.ROLES_FILE).write_text(json.dumps(roles))
-    (fleet / kwp.SIDECAR_FILE).write_text(json.dumps(sidecar))
+    (fleet / kwp.ROLES_FILE).write_text(json.dumps(roles), encoding="utf-8")
+    (fleet / kwp.SIDECAR_FILE).write_text(json.dumps(sidecar), encoding="utf-8")
     return sidecar
 
 
@@ -369,7 +369,7 @@ def test_cards_no_host_serves_are_never_claimed(kanban_home):
 def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
     ws = tmp_path / "legacy-ws"
     ws.mkdir()
-    (ws / "handoff.md").write_text("x")
+    (ws / "handoff.md").write_text("x", encoding="utf-8")
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1, body="host:any")
         conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), tid))

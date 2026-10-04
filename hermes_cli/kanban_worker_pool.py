@@ -187,7 +187,7 @@ def validate_sidecar(doc) -> List[str]:
 def _read_json(path: Path):
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolConfig:
