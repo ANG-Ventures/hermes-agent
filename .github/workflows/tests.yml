@@ -486,10 +486,15 @@ jobs:
     # tests/ci/test_plumbing_runner_routing pin it so the fallback can never
     # resolve to an unset variable). e2e ran 26 min on 2-core ubuntu-latest
     # across #1624 rounds 4-7 (2026-10-03).
+    # push (post-merge backstop on main, nobody waits on it) runs on free
+    # ubuntu-latest; PR / merge_group / dispatch keep Blacksmith (critical path).
+    # Public repo: Blacksmith on every push:main was ~$1.25/run x ~44 runs/day
+    # (t_e95fdb01, Apollo ruling 2026-10-03).
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
-    timeout-minutes: 30
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || github.event_name == 'push' && '["ubuntu-latest"]' || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
+    # 45, not 30: push runs on 2-core ubuntu-latest, where e2e measured 26 min.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -614,7 +619,9 @@ jobs:
     # the (git) shard took 48 min on 2-core ubuntu-latest and set every round's
     # wall clock (52 min); upstream runs this job on a 32-core pool. Repo var
     # CI_E2E_RUNNER overrides (outage fallback: set it to ubuntu-latest).
-    runs-on: ${{ vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # push (post-merge backstop on main) runs on free ubuntu-latest; the
+    # 60-min timeout bounds the slowest shard (t_e95fdb01, 2026-10-03).
+    runs-on: ${{ vars.CI_E2E_RUNNER || (github.event_name == 'push' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404') }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
