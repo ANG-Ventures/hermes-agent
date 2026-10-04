@@ -237,6 +237,34 @@ def format_worker_sizing_log(
 #                        setup. The dedicated job sidesteps both costs.
 _SKIP_PARTS = {"integration", "e2e", "docker"}
 
+# Files that need an optional dep the slice env deliberately lacks. The slice
+# matrix leaves them out and the `ptb-tests` job in tests.yml runs them with
+# the dep installed. `*_ptb.py` needs real python-telegram-bot; ~29 gateway
+# test files install a MagicMock `telegram` module and are proven only without
+# the real one, so PTB stays out of the slice extras.
+_DEDICATED_LANE_SUFFIXES = ("_ptb.py",)
+
+# Registry whose `call_site_tests` must EXECUTE somewhere: a skip-only run of
+# one of those files is RED, not a ⚠ (D2b, t_34bb9bef).
+_CALL_SITE_MANIFEST = Path("docs/sync/fork-features.json")
+
+
+def _is_dedicated_lane_file(path: Path) -> bool:
+    return path.name.endswith(_DEDICATED_LANE_SUFFIXES)
+
+
+def _call_site_test_files(repo_root: Path) -> set[Path]:
+    """Resolved files named by any registry ``call_site_tests`` nodeid."""
+    try:
+        raw = json.loads((repo_root / _CALL_SITE_MANIFEST).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return set()
+    out: set[Path] = set()
+    for entry in raw:
+        for node in entry.get("call_site_tests") or []:
+            out.add((repo_root / str(node).split("::", 1)[0]).resolve())
+    return out
+
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 #
@@ -2308,6 +2336,20 @@ def main() -> int:
 
     # --generate-slices: compute LPT distribution and emit JSON, then exit.
     if args.generate_slices is not None:
+        lane_owned = [f for f in files if _is_dedicated_lane_file(f)]
+        if lane_owned:
+            files = [f for f in files if not _is_dedicated_lane_file(f)]
+            print(
+                f"{len(lane_owned)} dedicated-lane file(s) left out of the slices "
+                f"(run by the ptb-tests job): "
+                + ", ".join(_format_file(f, repo_root) for f in lane_owned),
+                file=sys.stderr,
+            )
+            if not files:
+                # An impact set made only of lane files: slice the full suite
+                # rather than emit an empty matrix.
+                files = [f for f in _discover_files([repo_root / "tests"])
+                         if not _is_dedicated_lane_file(f)]
         durations = _load_durations(repo_root)
         slices = _compute_lpt_slices(
             files, args.generate_slices, durations, repo_root
@@ -2785,6 +2827,8 @@ def _noop_guard(
     Skip-storms (skipped>0, passed==0, failed==0) are a loud ⚠ *surfacing*,
     not a gate — a dep-missing skip-storm stays visible even where the dep is
     genuinely optional, without false-reding an optional-dep environment.
+    The exception is a file named in the registry's ``call_site_tests``: a
+    skip-storm there is RED, because the D2b lint counts it as coverage.
     """
     def _executed(s: Dict[str, int]) -> int:
         return s.get("passed", 0) + s.get("failed", 0)
@@ -2804,6 +2848,21 @@ def _noop_guard(
         for f, s in skip_storms:
             _n = s.get("skipped", 0)
             print(f"  ⚠  {_format_file(f, repo_root)}  ({_n} skipped, 0 run)")
+
+    # ── RED: a registry call_site_tests file that executed nothing ────────
+    # The ⚠ above is right for an optional dep, wrong for a registered
+    # call-site test: the D2b lint is satisfied by its nodeid, so a skip-only
+    # run leaves the call site with no executing test in any lane.
+    if skip_storms:
+        registered = _call_site_test_files(repo_root)
+        unexecuted = [(f, s) for f, s in skip_storms if f.resolve() in registered]
+        if unexecuted:
+            print()
+            print(f"=== {len(unexecuted)} file(s) named in {_CALL_SITE_MANIFEST} call_site_tests "
+                  f"skipped every test — RED: a registered call-site test must execute ===")
+            for f, s in unexecuted:
+                print(f"    {_format_file(f, repo_root)}  ({s.get('skipped', 0)} skipped, 0 run)")
+            red = True
 
     # ── ⚠ intentionally-testless files (tombstones / __main__ scripts) ────
     testless = [(f, s) for f, s in all_summaries if s.get("noop_testless")]

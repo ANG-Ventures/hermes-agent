@@ -475,6 +475,38 @@ jobs:
           path: test_durations.json
           key: test-durations-${{ github.run_id }}
 
+  # Real python-telegram-bot tests (`*_ptb.py`). The slice env has no PTB on
+  # purpose (~29 gateway test files install a MagicMock `telegram` module), so
+  # --generate-slices leaves these files out and this job runs them with the
+  # `telegram` extra. A registry call_site_tests file that skips here is RED
+  # (run_tests_parallel._noop_guard), so a missing PTB cannot read green.
+  ptb-tests:
+    name: Run tests (real PTB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "telegram"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Run *_ptb.py tests
+        run: |
+          mapfile -t files < <(find tests -name 'test_*_ptb.py' | sort)
+          printf '%s\n' "${files[@]}"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no *_ptb.py test files found"; exit 1; }
+          "$HERMES_PYTHON" -c "import telegram; print('python-telegram-bot', telegram.__version__)"
+          scripts/run_tests.sh "${files[@]}" -- -v
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
   e2e:
     needs: [generate, placement]
     if: always() && !cancelled() && needs.generate.result == 'success' && inputs.e2e
@@ -796,7 +828,7 @@ jobs:
   # into a visible failure (spec §3.7).
   tests-complete:
     name: Tests complete
-    needs: [generate, placement, test, e2e, e2e-upgrade-plan, e2e-upgrade]
+    needs: [generate, placement, test, ptb-tests, e2e, e2e-upgrade-plan, e2e-upgrade]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -846,6 +878,15 @@ jobs:
           E2E_RESULT: ${{ needs.e2e.result }}
           E2E_REQUESTED: ${{ inputs.e2e }}
         run: python3 scripts/ci_overflow_placement.py gate
+      - name: Fail on skipped or failed real-PTB tests
+        env:
+          PTB_RESULT: ${{ needs.ptb-tests.result }}
+        run: |
+          if [ "$PTB_RESULT" != success ]; then
+            echo "::error::ptb-tests result=$PTB_RESULT"
+            exit 1
+          fi
+          echo "ptb-tests passed"
       - name: Fail on skipped or failed e2e-upgrade shards
         # The upgrade shards are gated by inputs.e2e_upgrade (ci.yaml passes
         # the classifier's answer); when they were requested, a skip is a
