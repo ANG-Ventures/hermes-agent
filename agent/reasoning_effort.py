@@ -12,8 +12,12 @@ rejects a level fix its declared set, never a predicate.
 
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import dataclass
 from typing import Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 #: Matches ``k3`` as a delimited token (``k3``, ``k3-256k``, ``kimi-k3-cot``), never K2-era names (``kimi-k2.6``).
 # From #76427 by @ruizanthony.
@@ -180,6 +184,129 @@ def requested_effort(reasoning_config: Optional[dict]) -> Optional[str]:
     if not isinstance(reasoning_config, dict) or reasoning_config.get("enabled") is False:
         return None
     return str(reasoning_config.get("effort") or "").strip().lower() or None
+
+
+# (route label, requested, sent) triples already announced this process: the clamp notice is
+# one line per route and level, not one per request.
+_CLAMP_NOTICED: set[tuple[str, str, str]] = set()
+
+
+@dataclass(frozen=True)
+class EffortRoute:
+    """How one chat-completions route takes OpenAI's top-level ``reasoning_effort``.
+
+    ``supported`` is the wire vocabulary (``()`` = the route takes no effort field), ``overrides``
+    a declared vendor mapping consulted before the nearest-weaker clamp, ``default`` what an unset
+    effort sends (None = omit, the route's own default applies), ``label`` names the route in the
+    clamp notice, and ``thinking_toggle`` adds Moonshot's ``extra_body.thinking`` on/off beside it.
+    """
+
+    supported: tuple[str, ...]
+    overrides: Optional[dict[str, str]] = None
+    default: Optional[str] = None
+    label: str = ""
+    thinking_toggle: bool = False
+
+
+def resolve_wire_effort(
+    reasoning_config: Optional[dict],
+    supported: Sequence[str],
+    overrides: Optional[dict[str, str]] = None,
+    *,
+    default: Optional[str] = None,
+    route: str = "",
+) -> Optional[str]:
+    """The ``reasoning_effort`` value a top-level-knob wire gets for ``reasoning_config``, or None = omit.
+
+    One resolver for every emitter of OpenAI's top-level ``reasoning_effort`` (config
+    ``agent.reasoning_effort``, ``--reasoning``, per-task ``auxiliary.<task>.reasoning_effort`` all
+    arrive here as a reasoning config): disabled → ``none`` when the route lists it, else omitted;
+    unset → ``default`` (None keeps the field off); a ladder level → :func:`clamp_effort` onto
+    ``supported`` (``overrides`` first), and when an explicit request is sent as a different level
+    one log line names the route, the requested level and what was sent (never a silent
+    downgrade). A bespoke non-ladder level passes through verbatim (custom relays publish their
+    own tiers). An empty ``supported`` means the route takes no effort field: always None.
+    """
+    if not supported:
+        return None
+    if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
+        return "none" if "none" in supported else None
+    requested = requested_effort(reasoning_config)
+    explicit = requested is not None
+    if requested is None:
+        requested = default
+    if requested is None:
+        return None
+    if requested == "none":
+        return "none" if "none" in supported else None
+    sent = clamp_effort(requested, supported, overrides)
+    if explicit and sent != requested:
+        key = (route, requested, str(sent))
+        if key not in _CLAMP_NOTICED:
+            _CLAMP_NOTICED.add(key)
+            logger.warning(
+                "reasoning_effort: %s accepts %s; '%s' sent as '%s'",
+                route or "this route", "/".join(str(s) for s in supported), requested, sent,
+            )
+    return sent
+
+
+def resolve_route_effort(reasoning_config: Optional[dict], route: EffortRoute) -> Optional[str]:
+    """:func:`resolve_wire_effort` for an :class:`EffortRoute`."""
+    return resolve_wire_effort(
+        reasoning_config, route.supported, route.overrides, default=route.default, route=route.label,
+    )
+
+
+def kimi_effort_route(model: Optional[str]) -> EffortRoute:
+    """Moonshot/Kimi direct hosts: K3 = low/high/max (server default high), K2-era = low/medium/high."""
+    supported = kimi_supported_efforts(model)
+    is_k3 = supported is KIMI_K3_EFFORTS
+    return EffortRoute(
+        supported, KIMI_K3_OVERRIDES if is_k3 else None, default="high" if is_k3 else "medium",
+        label=f"kimi/{(model or '').rsplit('/', 1)[-1] or 'model'}", thinking_toggle=True,
+    )
+
+
+def tokenhub_effort_route() -> EffortRoute:
+    """Tencent TokenHub: low/medium/high, server default high."""
+    return EffortRoute(TOKENHUB_EFFORTS, default="high", label="tencent-tokenhub")
+
+
+def profile_effort_route(
+    declared: Optional[Sequence[str]], label: str, overrides: Optional[dict[str, str]] = None,
+) -> EffortRoute:
+    """A profile's ``supported_reasoning_efforts`` as a route: None = the widest OpenAI-compatible
+    vocabulary (narrower upstreams clamp again), ``()`` = no effort field."""
+    supported = OPENAI_COMPAT_WIRE_EFFORTS if declared is None else tuple(declared)
+    return EffortRoute(supported, overrides, label=label)
+
+
+def profile_route_for(profile, model: Optional[str]) -> EffortRoute:
+    """The :class:`EffortRoute` a ``supports_reasoning_effort`` profile declares for *model*."""
+    overrides_fn = getattr(profile, "reasoning_effort_overrides", None)
+    overrides = overrides_fn(model) if callable(overrides_fn) else None
+    return profile_effort_route(
+        profile.supported_reasoning_efforts(model), f"{profile.name}/{model}",
+        overrides if isinstance(overrides, dict) else None,
+    )
+
+
+#: Request-body keys that carry a reasoning/thinking control on some chat-completions wire.
+REASONING_CONTROL_KEYS: frozenset[str] = frozenset({
+    "reasoning", "reasoning_effort", "thinking", "thinking_config", "thinkingconfig",
+    "thinking_budget", "thinkingbudget", "enable_thinking", "think", "verbosity",
+})
+
+
+def has_reasoning_control(value: object) -> bool:
+    """Whether a request payload (recursively) already carries a reasoning wire control."""
+    if not isinstance(value, dict):
+        return False
+    return any(
+        str(key).strip().lower() in REASONING_CONTROL_KEYS or has_reasoning_control(nested)
+        for key, nested in value.items()
+    )
 
 
 def clamp_reasoning_config(reasoning_config: Optional[dict], supported: Sequence[str] = OPENAI_COMPAT_WIRE_EFFORTS) -> Optional[dict]:
