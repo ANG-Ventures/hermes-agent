@@ -4211,6 +4211,15 @@ def _dispatch_once_locked(
             _pin = _kwp.card_pin(r["body"])
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
+        _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
+        if _unplanned:
+            # The pool is planned by the GATEWAY tick only (KWLB v0.1); the
+            # standalone daemon and one-shot CLI dispatch never place.
+            _kb._log.info(
+                "kanban dispatch: %d remote-pinned card(s) wait pool_unavailable: no pool "
+                "plan this tick (pool disabled/refused/no hosts, proc_paused, or a "
+                "daemon/CLI dispatch, which never places remotely)", _unplanned,
+            )
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.

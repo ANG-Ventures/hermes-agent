@@ -54,8 +54,9 @@ _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
 
 # Card-body pin: a line that is exactly ``host:<id>`` (case and surrounding
-# whitespace ignored). Line-anchored so prose that mentions a pin is not one.
-HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$",
+# whitespace ignored, CRLF line endings accepted). Line-anchored so prose that
+# mentions a pin is not one.
+HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\r?$",
                          re.IGNORECASE | re.MULTILINE)
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
@@ -205,11 +206,17 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",))
     with_role = {h for h, (r, _s) in roles.items() if ROLE in r}
     legacy = (kanban_cfg or {}).get("worker_hosts") if isinstance(kanban_cfg, Mapping) else None
-    if legacy not in (None, [], {}, "") and with_role:
+    if legacy not in (None, [], {}, ""):
+        if with_role:
+            return PoolConfig(warnings=(
+                "kanban pool: kanban.worker_hosts is set while fleet-roles.json has a "
+                f"{ROLE} role ({', '.join(sorted(with_role))}): two sources, placing nothing "
+                "(kanban.worker_hosts is retired)",))
+        # Never silent: the old key alone no longer places anything.
         return PoolConfig(warnings=(
-            "kanban pool: kanban.worker_hosts is set while fleet-roles.json has a "
-            f"{ROLE} role ({', '.join(sorted(with_role))}): two sources, placing nothing "
-            "(kanban.worker_hosts is retired)",))
+            "kanban pool: kanban.worker_hosts is retired and ignored; no host has a "
+            f"{ROLE} role in {ROLES_FILE}, so nothing spills (register hosts with "
+            "`fleet-host kanban-enable`)",))
     if sidecar is None:
         return PoolConfig(warnings=tuple(
             f"kanban pool: {h} has a {ROLE} role but {SIDECAR_FILE} is absent (host dropped)"
@@ -393,7 +400,10 @@ class SpilloverPlan:
             if host is None:
                 self.refusal = "pin_host_disabled" if pin in self.disabled else "pin_unknown_host"
                 return None
-            if self.slots.get(pin, 0) <= 0 or assignee not in host.profiles:
+            if assignee not in host.profiles:
+                self.refusal = "pin_profile"  # the pinned host does not serve this assignee
+                return None
+            if self.slots.get(pin, 0) <= 0:
                 reachable = (self.detail.get(pin) or {}).get("reachable")
                 self.refusal = "pin_host_unreachable" if reachable is False else "pin_host_full"
                 return None

@@ -212,7 +212,7 @@ def test_take_walks_priority_and_pins_select_one_host():
     p.disabled = ("ci-box",)
     assert p.take("alpha", pin="ci-box") is None and p.refusal == "pin_host_disabled"
     assert p.take("alpha", pin="nope") is None and p.refusal == "pin_unknown_host"
-    assert p.take("beta", pin="ace-ai") is None and p.refusal == "pin_host_full"
+    assert p.take("beta", pin="ace-ai") is None and p.refusal == "pin_profile"
     host = p.take("alpha", pin="ace-ai")
     assert host.name == "ace-ai" and p.budget == 0
     p.release(host)
@@ -418,3 +418,38 @@ def test_unassigned_pinned_card_routes_as_its_default_assignee(kanban_home):
         res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0,
                              spawn_paused="test", default_assignee="alpha")
     assert spawned == [(tid, "ace-ai")] and res.placed == [(tid, "ace-ai")]
+
+
+# -- Prism round 2 (PR #1730) -----------------------------------------------
+
+@pytest.mark.parametrize("body,pin", [
+    ("Fix it.\r\nhost:studio\r\nmore\r\n", "studio"),
+    ("Fix it.\r\nhost: ace-ai \r\n", "ace-ai"),
+    ("host:any\r\n", "any"),
+])
+def test_crlf_card_bodies_keep_their_pin(body, pin):
+    assert kwp.card_pin(body) == pin
+
+
+def test_crlf_studio_pin_stays_local():
+    assert _portable(body="x\r\nhost:studio\r\n") == (False, "host_studio", None)
+
+
+def test_retired_worker_hosts_alone_warns(tmp_path):
+    hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={"worker_hosts": [{"name": "x"}]})
+    assert hosts == [] and len(warnings) == 1 and "retired and ignored" in warnings[0]
+
+
+def test_pin_to_a_host_that_does_not_serve_the_assignee_says_so():
+    p = _plan(hosts=[_host("ace-ai", slots=2, profiles=("alpha",))])
+    assert p.take("beta", pin="ace-ai") is None and p.refusal == "pin_profile"
+    assert p.budget == 2
+
+
+def test_pool_unavailable_pins_are_logged(kanban_home, caplog):
+    import logging
+    caplog.set_level(logging.INFO)
+    with kb.connect_closing() as conn:
+        _make(conn, 1, body="host:ace-ai")
+        _tick(conn, spillover=None, spawn_limit=4)
+    assert any("wait pool_unavailable" in r.getMessage() for r in caplog.records)
