@@ -622,12 +622,12 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     # without going through `gateway install`.
     from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
     if service_writes_disabled("install the gateway plist"):
-        return
+        sys.exit(1)
     load = start_now or _gw()._launchctl_label_supervising_process(label)
 
     if plist_path.exists() and not force_unit_path:
         if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "overwrite"):
-            return
+            sys.exit(1)
     # --force-unit-path repoints the plist at this home, so it writes rather than refreshing in place.
     if plist_path.exists() and not (force or force_unit_path):
         if _gw().launchd_plist_is_current():
@@ -652,7 +652,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return
+        sys.exit(1)
     print(f"Installing launchd service to: {plist_path}")
     _gw()._prepare_service_launcher()
     plist_path.write_text(new_plist, encoding="utf-8")

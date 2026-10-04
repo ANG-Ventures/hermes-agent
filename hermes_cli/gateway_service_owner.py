@@ -67,10 +67,28 @@ def definition_belongs_to_home(definition_path: Path, home: Path, action: str) -
     return False
 
 
+def _installed_definition_pins(home: Path) -> bool:
+    """True when a gateway definition already installed at this home's service path pins *home* itself.
+
+    Mere existence is not ownership: a same-named definition can belong to another home (the collision
+    these guards exist for), so only a definition whose pinned ``HERMES_HOME`` is *home* counts.
+    """
+    from hermes_cli import gateway as gw
+
+    paths = [gw.get_systemd_unit_path(system=False), gw.get_systemd_unit_path(system=True)]
+    if gw.is_macos():
+        paths.append(gw.get_launchd_plist_path())
+    for path in paths:
+        raw = pinned_home(path) if path.exists() else None
+        if raw is not None and _resolve(raw) == home:
+            return True
+    return False
+
+
 def home_may_install_service(home: Path) -> bool:
     """True for a home that may own a host gateway service: the account's Hermes tree (default root and
     ``profiles/<name>``), any bare-name owner (native default, sudo invoker's, the home the installed bare
-    unit pins), or a home whose service is already installed (a re-install of its own unit)."""
+    unit pins), or a home whose installed definition already pins it (a re-install of its own unit)."""
     from hermes_cli import gateway as gw
 
     resolved = _resolve(home)
@@ -79,7 +97,7 @@ def home_may_install_service(home: Path) -> bool:
     # Platform-native default root(s): ~/.hermes, plus the sudo invoker's under sudo.
     if any(resolved == root or root in resolved.parents for root in gw._native_service_homes()):
         return True
-    return gw._home_owns_bare_service_name(resolved) or gw._is_service_installed()
+    return gw._home_owns_bare_service_name(resolved) or _installed_definition_pins(resolved)
 
 
 def refuse_foreign_home_install(home: Path, force_unit_path: bool) -> bool:

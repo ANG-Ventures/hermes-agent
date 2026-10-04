@@ -350,15 +350,20 @@ def _service_op(kind: str, system: bool, verb: str, home: Path, *, run_as_user: 
     from hermes_cli import gateway as gw
     with _home_env(home):
         if verb == "install":
-            if kind == "launchd":
-                gw.launchd_install()
-            elif kind == "windows":
-                # Non-interactive: the migration already asked; prompting here would hang a
-                # supervised/`--yes` run on a console that has no operator.
-                from hermes_cli import gateway_windows as gww
-                gww.install(start_now=True, start_on_login=True)
-            else:
-                gw.systemd_install(system=system, run_as_user=run_as_user, non_interactive=True)
+            try:
+                if kind == "launchd":
+                    gw.launchd_install()
+                elif kind == "windows":
+                    # Non-interactive: the migration already asked; prompting here would hang a
+                    # supervised/`--yes` run on a console that has no operator.
+                    from hermes_cli import gateway_windows as gww
+                    gww.install(start_now=True, start_on_login=True)
+                else:
+                    gw.systemd_install(system=system, run_as_user=run_as_user, non_interactive=True)
+            except SystemExit as exc:
+                # A refused write (another home's definition, worker kill switch) is a failed step,
+                # never a silent success followed by starting someone else's service.
+                raise RuntimeError(f"gateway service install for {home} was refused") from exc
             return
         if verb == "enable":
             # Boot enablement only: the migration's uninstall of every secondary destroys their

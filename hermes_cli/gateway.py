@@ -1234,16 +1234,26 @@ def _unit_environment_value(unit_path: Path, name: str) -> str | None:
         text = unit_path.read_text(encoding="utf-8-sig")
     except OSError:
         return None
+    # systemd semantics: one Environment= line may carry several quoted assignments, a later assignment
+    # wins, and an empty ``Environment=`` resets every assignment before it.
+    value: str | None = None
     for line in text.splitlines():
         body = line.strip()
         if not body.startswith("Environment="):
             continue
         body = body[len("Environment=") :].strip()
-        if body.startswith('"') and body.endswith('"'):
-            body = body[1:-1].replace('\\"', '"').replace("\\\\", "\\").replace("%%", "%")
-        if body.startswith(f"{name}="):
-            return body.split("=", 1)[1].strip() or None
-    return None
+        if not body:
+            value = None
+            continue
+        try:
+            words = shlex.split(body)
+        except ValueError:  # unbalanced quotes: systemd ignores the line
+            continue
+        for word in words:
+            key, sep, raw = word.partition("=")
+            if sep and key == name:
+                value = raw.replace("%%", "%").strip() or None
+    return value
 
 
 def _hermes_home_pinned_by_unit(unit_path: Path) -> str | None:
@@ -3656,9 +3666,11 @@ def systemd_install(
         _require_root_for_system_service("install")
     # The writer itself honours the worker kill switch: setup, migrate and ensure_gateway_service call it
     # without going through `gateway install`.
+    # A refusal exits non-zero: callers (`gateway install`, setup, ensure_gateway_service) go on to START the
+    # service, and the unit they would start is the other home's.
     from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
     if service_writes_disabled("install the gateway unit"):
-        return
+        sys.exit(1)
 
     # Offer to remove legacy units first: alongside the new unit they flap-fight for the bot token.
     if has_legacy_hermes_units():
@@ -3678,7 +3690,7 @@ def systemd_install(
     if unit_path.exists() and not force_unit_path:
         _sync_hermes_home_from_systemd_unit(system=system)
         if not definition_belongs_to_home(unit_path, get_hermes_home(), "overwrite"):
-            return
+            sys.exit(1)
 
     # --force-unit-path repoints the unit at this home, so it writes rather than refreshing in place.
     if unit_path.exists() and not (force or force_unit_path):
@@ -3712,7 +3724,7 @@ def systemd_install(
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     new_unit = generate_systemd_unit(system=system, run_as_user=run_as_user)
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
-        return
+        sys.exit(1)
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)
     unit_path.write_text(new_unit, encoding="utf-8")

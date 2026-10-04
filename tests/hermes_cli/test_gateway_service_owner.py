@@ -81,7 +81,9 @@ class TestSystemdWriters:
         assert ("daemon-reload",) in systemd_unit.calls
 
     def test_force_install_does_not_overwrite_another_homes_unit(self, systemd_unit):
-        gw.systemd_install(force=True, non_interactive=True)
+        with pytest.raises(SystemExit) as exc:
+            gw.systemd_install(force=True, non_interactive=True)
+        assert exc.value.code == 1
         assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
         assert ("daemon-reload",) not in systemd_unit.calls
 
@@ -135,9 +137,56 @@ class TestSystemdWriters:
         # ensure_gateway_service / setup wizard / migrate call systemd_install without _cmd_install.
         systemd_unit.path.unlink()
         monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
-        gw.systemd_install(non_interactive=True)
+        with pytest.raises(SystemExit):
+            gw.systemd_install(non_interactive=True)
         assert not systemd_unit.path.exists()
         assert systemd_unit.calls == []
+
+
+    def test_refused_install_never_starts_the_other_homes_service(self, systemd_unit, monkeypatch):
+        # `gateway install` starts the service after systemd_install returns; a refusal that returned
+        # normally started the foreign-home gateway it had just refused to touch.
+        started = []
+        monkeypatch.setattr(gw, "systemd_start", lambda system=False: started.append(system))
+        args = SimpleNamespace(start_now=True, start_on_login=True, force_unit_path=False)
+        with pytest.raises(SystemExit):
+            gw._install_systemd_from_cli(args, force=False, system=False, run_as_user=None)
+        assert started == []
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+
+
+class TestPinnedHomeParsing:
+    """The owner check reads HERMES_HOME the way systemd does; a missed pin reads as "unowned"."""
+
+    @pytest.mark.parametrize("line", [
+        'Environment="PATH=/usr/bin" "HERMES_HOME={home}"',
+        "Environment=PATH=/usr/bin HERMES_HOME={home}",
+        'Environment="HERMES_HOME=/elsewhere" "HERMES_HOME={home}"',
+    ])
+    def test_multi_assignment_lines_pin_the_home(self, tmp_path, line):
+        unit = tmp_path / "u.service"
+        unit.write_text("[Service]\n" + line.format(home="/srv/other") + "\n", encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/other"
+
+    def test_later_assignment_wins_and_empty_environment_resets(self, tmp_path):
+        unit = tmp_path / "u.service"
+        unit.write_text('[Service]\nEnvironment="HERMES_HOME=/a"\nEnvironment="HERMES_HOME=/b"\n', encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/b"
+        unit.write_text('[Service]\nEnvironment="HERMES_HOME=/a"\nEnvironment=\n', encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) is None
+
+    def test_quoted_value_with_escapes_round_trips(self, tmp_path):
+        unit = tmp_path / "u.service"
+        unit.write_text("[Service]\n" + gw._systemd_env_line("HERMES_HOME", '/srv/o"d%dir'), encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == '/srv/o"d%dir'
+
+    def test_multi_assignment_unit_of_another_home_is_not_overwritten(self, systemd_unit, homes):
+        systemd_unit.path.write_text(
+            f'[Service]\nEnvironment="PATH=/usr/bin" "HERMES_HOME={homes.real}"\n', encoding="utf-8")
+        original = systemd_unit.path.read_text(encoding="utf-8")
+        with pytest.raises(SystemExit):
+            gw.systemd_install(force=True, non_interactive=True)
+        assert systemd_unit.path.read_text(encoding="utf-8") == original
 
 
 class TestLaunchdWriters:
@@ -162,7 +211,8 @@ class TestLaunchdWriters:
         monkeypatch.setattr(gw, "_prepare_service_launcher", lambda *a, **k: pytest.fail("launcher prepared"))
         monkeypatch.setattr(gateway_launchd.subprocess, "run", lambda *a, **k: pytest.fail("launchctl ran"))
         monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
-        gateway_launchd.launchd_install(start_now=False)
+        with pytest.raises(SystemExit):
+            gateway_launchd.launchd_install(start_now=False)
         assert not plist.exists()
 
 
@@ -179,6 +229,8 @@ class TestInstallCommand:
         monkeypatch.setattr(gw, "refuses_container_user_scope_install", lambda system: False)
         monkeypatch.setattr(gw, "_home_owns_bare_service_name", lambda home: False)
         monkeypatch.setattr(gw, "_is_service_installed", lambda: False)
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: tmp_path / "no-unit.service")
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: tmp_path / "no-plist.plist")
         monkeypatch.setattr(gw, "_install_systemd_from_cli", lambda args, **kw: installs.append(args))
         return SimpleNamespace(account=account, installs=installs)
 
@@ -204,6 +256,30 @@ class TestInstallCommand:
     def test_account_tree_homes_install(self, cli, monkeypatch, rel):
         home = cli.account / rel
         home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        gw._cmd_install(self._args())
+        assert len(cli.installs) == 1
+
+    def test_same_named_unit_of_another_home_does_not_admit_a_scratch_home(self, cli, tmp_path, monkeypatch):
+        # A host unit at this name pinning ANOTHER home made "a service is installed" true for every caller.
+        other = cli.account / ".hermes"
+        unit = tmp_path / "systemd" / "hermes-gateway.service"
+        unit.parent.mkdir()
+        unit.write_text(REAL_UNIT.format(home=other), encoding="utf-8")
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit)
+        monkeypatch.setattr(gw, "_is_service_installed", lambda: True)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "srv-ci-scratch" / "profile"))
+        with pytest.raises(SystemExit):
+            gw._cmd_install(self._args())
+        assert cli.installs == []
+
+    def test_reinstall_of_a_unit_pinning_this_home_is_allowed(self, cli, tmp_path, monkeypatch):
+        home = tmp_path / "srv-custom" / "home"
+        home.mkdir(parents=True)
+        unit = tmp_path / "systemd" / "hermes-gateway-abc.service"
+        unit.parent.mkdir()
+        unit.write_text(REAL_UNIT.format(home=home), encoding="utf-8")
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit)
         monkeypatch.setenv("HERMES_HOME", str(home))
         gw._cmd_install(self._args())
         assert len(cli.installs) == 1
