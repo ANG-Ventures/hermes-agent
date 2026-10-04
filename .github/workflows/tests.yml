@@ -477,7 +477,7 @@ jobs:
           path: test_durations.json
           key: test-durations-${{ github.run_id }}
 
-  # Real python-telegram-bot tests (`*_ptb.py`). The slice env has no PTB on
+  # Real python-telegram-bot tests (`test_*.py` named `*_ptb.py`). The slice env has no PTB on
   # purpose (~29 gateway test files install a MagicMock `telegram` module), so
   # --generate-slices leaves these files out and this job runs them with the
   # `telegram` extra. A registry call_site_tests file that skips here is RED
@@ -499,7 +499,9 @@ jobs:
 
       - name: Run *_ptb.py tests
         run: |
-          mapfile -t files < <(find tests -name 'test_*_ptb.py' | sort)
+          # Same rule as run_tests_parallel: a test_*.py file whose name ends
+          # in _ptb.py (so tests/test_ptb.py is included).
+          mapfile -t files < <(find tests -name 'test_*.py' -name '*_ptb.py' | sort)
           printf '%s\n' "${files[@]}"
           [ "${#files[@]}" -gt 0 ] || { echo "::error::no *_ptb.py test files found"; exit 1; }
           "$HERMES_PYTHON" -c "import telegram; print('python-telegram-bot', telegram.__version__)"

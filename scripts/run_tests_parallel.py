@@ -867,11 +867,15 @@ def _scoped_plugin_matrix(
         return None
 
     plugin_root = repo_root / "tests" / "plugins" / plugin_name
-    plugin_files = _discover_files([plugin_root])
+    # Dedicated-lane files (*_ptb.py) run in their own job on every scope; a
+    # PTB-less plugin slice would only skip them (t_34bb9bef).
+    plugin_files = [f for f in _discover_files([plugin_root]) if not _is_dedicated_lane_file(f)]
     smoke_files = [repo_root / path for path in _CORE_SMOKE_TESTS]
     if not plugin_files or any(not path.is_file() for path in smoke_files):
         return None
-    dependent_files = _plugin_dependent_tests(plugin_name, repo_root)
+    dependent_files = [
+        f for f in _plugin_dependent_tests(plugin_name, repo_root) if not _is_dedicated_lane_file(f)
+    ]
     if len(dependent_files) > _MAX_PLUGIN_DEPENDENT_TESTS:
         return None
 

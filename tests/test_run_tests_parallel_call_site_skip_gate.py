@@ -173,3 +173,47 @@ def test_ptb_only_impact_set_slices_the_full_suite_at_the_full_slice_count() -> 
     sliced = [f for s in matrix["slice"] for f in s["files"].split(":") if f]
     assert len(sliced) > 100
     assert not any(f.endswith("_ptb.py") for f in sliced)
+
+
+def test_scoped_plugin_matrix_leaves_ptb_files_to_their_lane(tmp_path):
+    """Prism r2 P0: the plugin-scoped builder must apply the same lane exclusion
+    as the full matrix, for the plugin's own tree and for its dependents."""
+    mod = _runner()
+    for rel in mod._CORE_SMOKE_TESTS:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("def test_ok():\n    pass\n")
+    own = tmp_path / "tests" / "plugins" / "foo"
+    own.mkdir(parents=True)
+    (own / "test_a.py").write_text("def test_a():\n    pass\n")
+    (own / "test_b_ptb.py").write_text("def test_b():\n    pass\n")
+    ref = "import plugins.foo\n\ndef test_x():\n    pass\n"
+    (tmp_path / "tests" / "plugins" / "test_dep_ptb.py").write_text(ref)
+    (tmp_path / "tests" / "test_dep.py").write_text(ref)
+    matrix = mod._scoped_plugin_matrix("plugin:foo", tmp_path)
+    assert matrix is not None
+    sliced = {f for s in matrix["slice"] for f in s["files"].split(":") if f}
+    assert {"tests/plugins/foo/test_a.py", "tests/test_dep.py"} <= sliced
+    assert not [f for f in sliced if f.endswith("_ptb.py")], sliced
+
+
+def test_ptb_job_selector_matches_the_runner_lane_rule(tmp_path):
+    """Prism r2 P1: every file the slices drop as dedicated-lane must be picked
+    up by the ptb-tests job's selector, or no lane runs it."""
+    import yaml
+
+    mod = _runner()
+    for rel in ("tests/test_ptb.py", "tests/plugins/test_a_ptb.py", "tests/x/test__ptb.py",
+                "tests/test_plain.py", "tests/helper_ptb.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("")
+    wf = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    step = next(s for s in wf["jobs"]["ptb-tests"]["steps"] if s.get("name") == "Run *_ptb.py tests")
+    select = next(l for l in step["run"].splitlines() if l.strip().startswith("mapfile"))
+    proc = subprocess.run(["bash", "-c", select + '\nprintf "%s\\n" "${files[@]}"'],
+                          cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    job = {l for l in proc.stdout.splitlines() if l}
+    lane = {mod._format_file(f, tmp_path) for f in mod._discover_files([tmp_path / "tests"])
+            if mod._is_dedicated_lane_file(f)}
+    assert lane == {"tests/test_ptb.py", "tests/plugins/test_a_ptb.py", "tests/x/test__ptb.py"}
+    assert job == lane
