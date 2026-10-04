@@ -41,7 +41,10 @@ def github(tmp_path, monkeypatch):
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in self.path:
-                value = [[]]
+                value = [[{**st, "sha": sha} for st in state.get("statuses", [])]]
+            elif self.path.startswith("/apps/"):
+                # GET /apps/{slug}: the bot login's app id (public endpoint).
+                value = {"id": state.get("apps", {}).get(self.path[len("/apps/"):]), "slug": self.path[6:]}
             elif "/pulls/" in self.path:
                 value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
             else:
@@ -287,3 +290,55 @@ def test_assignee_profile_home_lane_contract(tmp_path, monkeypatch):
         acc._assignee_profile_home("ghost-profile")
     with pytest.raises(acc._GateAuthError):
         acc._assignee_profile_home("humane")  # prefix lookalike is a profile name, not the sentinel
+
+
+# --- t_2315d06a: a pinned context delivered as a commit STATUS by the pinned app's bot ---
+# The fleet lander posts `fleet/attribution` via the statuses API (never a check-run) while
+# the ruleset pins it to the lander's integration id; GitHub accepts that status.
+
+def _lander_status(login, type_="Bot", state="success", id_=7):
+    return {"id": id_, "context": "required", "state": state,
+            "target_url": None, "creator": {"login": login, "type": type_, "id": 333956532}}
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("statuses, apps, expected", [
+    # pinned (app 1) + status from app 1's own bot -> satisfied (red on main: 'missing')
+    ([_lander_status("lander[bot]")], {"lander": 1}, "success"),
+    # pinned + a failing status from the pinned bot is still a failure, not missing
+    ([_lander_status("lander[bot]", state="failure")], {"lander": 1}, "failure"),
+    # pinned + HUMAN-posted status (the spoof the pin exists for) -> missing
+    ([_lander_status("mallory", type_="User")], {}, "missing"),
+    # pinned + a different app's bot -> missing
+    ([_lander_status("other[bot]")], {"other": 99}, "missing"),
+    # a Bot-typed login whose slug does not resolve -> missing
+    ([_lander_status("ghost[bot]")], {}, "missing"),
+])
+def test_pinned_context_status_only_from_the_pinned_apps_bot(github, statuses, apps, expected):
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head="a" * 40, missing=True, statuses=statuses, apps=apps)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == expected, receipt
+    assert receipt["ok"] is (expected == "success")
+    if expected != "missing":
+        assert receipt["checks"][0]["satisfied_by"] == f"status({statuses[0]['creator']['login']})"
+
+
+@pytest.mark.platforms("posix")
+def test_unpinned_context_still_accepts_any_status(github, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acc
+    real = acc._api
+
+    def unpinned(endpoint, **kw):
+        value = real(endpoint, **kw)
+        if endpoint == "graphql":
+            value["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"][
+                "requiredStatusChecks"][0]["app"] = None
+        return value
+    monkeypatch.setattr(acc, "_api", unpinned)
+    github.update(conclusion="success", head="a" * 40, missing=True,
+                  statuses=[_lander_status("someone", type_="User")])
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    # no app lookup is needed for an unpinned context
+    assert not any(r.startswith("/apps/") for r in github["requests"])
