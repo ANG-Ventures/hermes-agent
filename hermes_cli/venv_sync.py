@@ -537,3 +537,5 @@ def main(argv: list | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# ci-proof t_bf20260d (throwaway, never merged)
