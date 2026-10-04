@@ -3618,6 +3618,37 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
 _SESSION_DB_UNPINNED = object()
 
 
+async def _maybe_orphan_menu_reply(event, source) -> Optional[str]:
+    """t_6281f908: a bare-number reply to the 🏷 orphan menu re-homes that card.
+
+    None = not a menu reply (normal dispatch continues).
+
+    The menu is executable only when the platform says the replied-to message
+    was posted by THIS gateway's own bot (``reply_to_is_own_message``, set from
+    the author id, never from text). A user-authored message that copies the
+    option shape is just text and passes through (t_3ad14889 untrusted menus).
+    Platforms that do not stamp authorship fail closed."""
+    if not getattr(event, "reply_to_text", None):
+        return None
+    if getattr(event, "reply_to_is_own_message", False) is not True:
+        return None
+    try:
+        from gateway.kanban_orphan_menu import apply_choice, parse_choice
+
+        choice = parse_choice(getattr(event, "text", None), event.reply_to_text)
+    except Exception:
+        logger.debug("orphan menu parse failed", exc_info=True)
+        return None
+    if choice is None:
+        return None
+    actor = str(getattr(source, "user_name", None) or getattr(source, "user_id", None) or "")
+    try:
+        return await asyncio.to_thread(apply_choice, choice, actor=actor)
+    except Exception as exc:
+        logger.warning("orphan menu rehome failed: %s", exc)
+        return f"\u26a0 {choice.card or 'card'} not re-homed: {exc}"
+
+
 # Only explicit suspension can replace a routed conversation.
 _AUTO_RESET_CONTEXT_NOTES = {
     "suspended": "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]",

@@ -7337,6 +7337,14 @@ class TelegramAdapter(BasePlatformAdapter):
             user_name=user_name, thread_id=thread_id_str, chat_topic=chat_topic, message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False)
         reply_to_id, reply_to_text = self._reply_context(message)
+        # Platform-verified authorship of the replied-to message: text is
+        # user-forgeable, the author id is not (t_3ad14889 untrusted menus).
+        reply_to_author_id = None
+        reply_to_is_own = False
+        _ref_from = getattr(message.reply_to_message, "from_user", None) if message.reply_to_message else None
+        if _ref_from is not None and getattr(_ref_from, "id", None) is not None:
+            reply_to_author_id = str(_ref_from.id)
+            reply_to_is_own = self._is_own_message(message.reply_to_message)
         from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
         from plugins.platforms.telegram.telegram_context import group_identity_prompt
         _chat_id_str = str(chat.id)
@@ -7344,7 +7352,9 @@ class TelegramAdapter(BasePlatformAdapter):
         return MessageEvent(
             text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
-            reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
+            reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id, reply_to_is_own_message=reply_to_is_own,
+            auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
             timestamp=message.date)
 

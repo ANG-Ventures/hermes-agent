@@ -340,6 +340,10 @@ _SPECS = [
                   "any operator-profile session may act on. For cron/script minters with no "
                   "session of their own: create REFUSES a card that would be born unhomed. "
                   "Accepts 'operator' or 'operator:<name>'; exclusive with --session."),
+        _arg("--unhomed", action="store_true", default=False,
+             help="Mint the card with NO home session on purpose (same as --session none). "
+                  "Without it a worker, cron or gateway create that resolves no home is "
+                  "refused; the orphan watch infers a home for unhomed cards (t_6281f908)."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [

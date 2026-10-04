@@ -488,6 +488,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
         )),
+        "unhomed": _prop("boolean", (
+            "Mint the card with no home session on purpose. Without "
+            "it, a create that resolves no home (no session, no homed "
+            "parent) is refused."
+        )),
         "completion_contract": _prop("string", (
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
