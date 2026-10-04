@@ -7344,15 +7344,21 @@ def _project_provider_profile(
             )
             reasoning_extra = reasoning_extra or {}
             top_level = top_level or {}
-            handles_reasoning = (
-                type(profile).build_api_kwargs_extras is not ProviderProfile.build_api_kwargs_extras
-                or _contains_profile_reasoning_fields(body)
+            # Did the profile's own projections put a reasoning control on the wire? Judged on
+            # the emitted dicts alone — a hook override that only adds unrelated options, or
+            # returns nothing for this model, has NOT handled reasoning.
+            emitted_control = (
+                _contains_profile_reasoning_fields(body)
                 or _contains_profile_reasoning_fields(reasoning_extra)
                 or _contains_profile_reasoning_fields(top_level)
             )
+            handles_reasoning = (
+                type(profile).build_api_kwargs_extras is not ProviderProfile.build_api_kwargs_extras
+                or emitted_control
+            )
             # Same capability flag as the main transport: the declared top-level knob, clamped
             # (with notice) onto the profile's per-model vocabulary, for aux calls too.
-            if getattr(profile, "supports_reasoning_effort", False) and not handles_reasoning:
+            if getattr(profile, "supports_reasoning_effort", False) and not emitted_control:
                 from agent.reasoning_effort import profile_route_for, resolve_route_effort
                 effort = resolve_route_effort(reasoning_config, profile_route_for(profile, model))
                 if effort is not None:

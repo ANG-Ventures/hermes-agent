@@ -100,6 +100,26 @@ class TestCapabilityFlag:
         assert "reasoning_effort" not in kw
         assert kw["extra_body"]["reasoning"] == {"effort": "custom-tier"}
 
+    def test_caller_schema_named_reasoning_is_data_not_a_control(self):
+        """Prism r1 P1: a ``reasoning`` *property name* inside a caller-supplied schema (guided
+        decoding, structured output) must not suppress the user's explicit effort."""
+        kw = _kw(
+            _proxy(), "gpt-6-astra", {"enabled": True, "effort": "high"},
+            extra_body_additions={"guided_json": {"properties": {"reasoning": {"type": "string"}}}},
+        )
+        assert kw["reasoning_effort"] == "high"
+        assert kw["extra_body"]["guided_json"]["properties"]["reasoning"] == {"type": "string"}
+
+    def test_hook_override_that_emits_no_control_still_gets_the_field(self):
+        """A profile overriding build_api_kwargs_extras only for unrelated options has not
+        handled reasoning; the flag still fills the field (main and aux paths alike)."""
+        class Headers(_Proxy):
+            def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+                return {}, {"extra_headers": {"X-Thing": "1"}}
+
+        kw = _kw(Headers(name="hdr", supports_reasoning_effort=True), "three-level-model", {"enabled": True, "effort": "xhigh"})
+        assert kw["reasoning_effort"] == "high" and kw["extra_headers"] == {"X-Thing": "1"}
+
     def test_request_override_beats_the_generic_field(self):
         kw = _kw(_proxy(), "gpt-6-astra", {"enabled": True, "effort": "high"}, request_overrides={"reasoning_effort": "low"})
         assert kw["reasoning_effort"] == "low"
@@ -189,6 +209,25 @@ class TestAuxiliaryPath:
         kw = _build_call_kwargs("aux-proxy", "three-level-model", MSGS, reasoning_config={"enabled": True, "effort": "max"}, base_url="http://127.0.0.1:9/v1")
         assert kw["reasoning_effort"] == "high"
         assert "reasoning" not in (kw.get("extra_body") or {})
+
+    def test_aux_hook_override_without_a_control_still_emits(self, monkeypatch):
+        """Prism r1 P1: a flagged profile whose build_api_kwargs_extras override emits no reasoning
+        control (headers only / empty for this model) must still get the effort on aux calls."""
+        import providers
+        from agent.auxiliary_client import _build_call_kwargs
+
+        class Headers(_Proxy):
+            def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+                return {}, {"extra_headers": {"X-Thing": "1"}}
+
+        hdr = Headers(name="aux-hdr", base_url="http://127.0.0.1:9/v1", supports_reasoning_effort=True)
+        monkeypatch.setattr(providers, "get_provider_profile", lambda name: hdr if name == "aux-hdr" else None)
+        kw = _build_call_kwargs("aux-hdr", "three-level-model", MSGS, reasoning_config={"enabled": True, "effort": "xhigh"}, base_url="http://127.0.0.1:9/v1")
+        assert kw["reasoning_effort"] == "high"
+        assert "reasoning" not in (kw.get("extra_body") or {})
+        # explicit disable is honoured the same way (no 'none' level on this route → omitted, no fallback)
+        kw = _build_call_kwargs("aux-hdr", "three-level-model", MSGS, reasoning_config={"enabled": False}, base_url="http://127.0.0.1:9/v1")
+        assert "reasoning_effort" not in kw and "reasoning" not in (kw.get("extra_body") or {})
 
 
 class TestNoProviderNameGate:

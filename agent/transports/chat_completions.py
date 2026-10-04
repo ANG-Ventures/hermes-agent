@@ -578,9 +578,11 @@ class ChatCompletionsTransport(ProviderTransport):
         # Capability flag, not a provider name: a profile that declares the top-level
         # ``reasoning_effort`` knob gets the user's effort on every request its own hooks
         # left without a reasoning control, clamped (with notice) onto the vocabulary it
-        # declares for the model.
-        if getattr(profile, "supports_reasoning_effort", False) and not (
-            has_reasoning_control(api_kwargs) or has_reasoning_control(extra_body)
+        # declares for the model. Only the PROFILE's projections are inspected — never the
+        # caller's extra_body_additions, tool schemas or messages, where a property merely
+        # named ``reasoning`` is data, not a wire control.
+        if getattr(profile, "supports_reasoning_effort", False) and not any(
+            has_reasoning_control(part) for part in (profile_body, extra_body_from_profile, top_level_from_profile)
         ):
             _effort = resolve_route_effort(reasoning_config, profile_route_for(profile, model))
             if _effort is not None:
