@@ -779,3 +779,12 @@ def test_pin_on_a_known_but_dropped_host_waits_and_never_spawns(kanban_home):
     assert spawned == []
     assert res.placement_waits.get(tid) == "pin_host_dropped"
     assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+
+
+def test_r8_prose_host_line_above_a_real_pin_does_not_hide_the_pin():
+    """Prism r8: the first host: line is prose (an HTTP header), the second is
+    the real pin. The pin wins; the prose word is reported as ignored."""
+    body = "Repro:\nhost: example.com\n\nhost:ace-ai\n"
+    assert kwp.resolve_pin(body, ("ace-ai",)) == ("ace-ai", "example.com")
+    assert kwp.resolve_pin("host: example.com\nhost:any\n", ()) == ("any", "example.com")
+    assert kwp.resolve_pin("host: example.com\n", ("ace-ai",)) == (None, "example.com")

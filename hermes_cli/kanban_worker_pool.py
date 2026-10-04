@@ -296,10 +296,18 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str]) -> Tuple[Option
     pool registry knows; any other ``host: <word>`` line (an HTTP header, a
     config snippet) is prose: ``pin`` None, the word returned as ``ignored``.
     So a card never waits on a host that does not exist."""
-    raw = card_pin(body)
-    if raw is None or raw in (PIN_ANY, PIN_STUDIO) or raw in set(known_hosts or ()):
-        return raw, None
-    return None, raw
+    known = set(known_hosts or ())
+    ignored: Optional[str] = None
+    # Every line-anchored host: line, in order: prose lines (an HTTP header
+    # pasted above the real pin) are skipped, the first REAL pin wins
+    # (Prism r8 "skip prose host lines before choosing the effective pin").
+    for m in HOST_PIN_RE.finditer(body or ""):
+        raw = m.group(1).lower()
+        if raw in (PIN_ANY, PIN_STUDIO) or raw in known:
+            return raw, ignored
+        if ignored is None:
+            ignored = raw
+    return None, ignored
 
 
 def note_ignored_pin(card_id: str, word: str) -> None:

@@ -140,6 +140,10 @@ def reapply_placement_env(environ: Optional[MutableMapping[str, str]] = None) ->
             # would read as success to reapply_or_record (Prism 361860f7dee5).
             return None
         pending[key] = value
+    if not pending:
+        # A placement that names a host but carries no TERMINAL_* mapping
+        # applied nothing: not a success (Prism r8 "false success" :134).
+        return None
     env.update(pending)
     return str(data.get("host") or "") or None
 

@@ -164,6 +164,13 @@ def test_r6_close_never_lowers_the_reapply_counter(tmp_path, monkeypatch):
     assert high[kwh.REAPPLY_FAILED_KEY] == 9
 
 
+def test_r8_placement_without_terminal_env_is_not_a_success(reapply_state):
+    environ = {kwh.PLACEMENT_ENV: json.dumps({"host": "ace-ai", "env": {"UNRELATED": "x"}})}
+    assert kwh.reapply_placement_env(environ) is None
+    assert kwh.reapply_or_record("terminal", environ, boot_host="ace-ai") is None
+    assert reapply_state == [1]
+
+
 def test_unreadable_local_workspace_fails_closed(tmp_path, monkeypatch):
     assert kwh.local_workspace_has_content(None) is False
     assert kwh.local_workspace_has_content(str(tmp_path / "missing")) is False
