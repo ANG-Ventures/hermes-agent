@@ -287,11 +287,14 @@ class DispatchResult:
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
     spillover: Optional[str] = None
-    """Worker-host spillover state for a gate-paused tick (kanban.worker_hosts):
-    per-host load1 / running / slots. None when the tick was not paused or no
-    worker host is configured."""
-    placements: dict = field(default_factory=dict)
-    """task id -> worker host name for workers spawned onto a worker host."""
+    """The shared pool plan this tick saw (KWLB v0.1): per-host load1 / ncpu /
+    running / free. None when no plan was passed."""
+    placed: list = field(default_factory=list)
+    """``(task_id, host)`` for workers placed on a pool host; the gateway
+    books local spawns as ``len(spawned) - len(placed)``."""
+    placement_waits: dict = field(default_factory=dict)
+    """task id -> why a ready card was not spawned anywhere this tick
+    (``local_full``, ``pool_full``, ``pin_*``, ``not_portable:<rule>``)."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -3664,6 +3667,54 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
+def _route_row(conn, row, plan) -> "tuple[str, Optional[str]]":
+    """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
+    ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
+
+    ``portable()`` is THE classifier; a remote pin on a card that fails
+    ``hard_ok`` waits ``not_portable:<rule>`` and is never spawned locally.
+    """
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    try:
+        skills = json.loads(row["skills"] or "[]") or []
+    except (TypeError, ValueError, IndexError, KeyError):
+        skills = []
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
+        (row["id"], row["id"]),
+    ).fetchone() is not None
+    ok, rule, route_class = _kwp.portable(
+        workspace_kind=row["workspace_kind"], has_links=linked,
+        workspace_has_content=_kb._kwh.local_workspace_has_content(row["workspace_path"]),
+        assignee=row["assignee"], body=row["body"],
+        skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
+    )
+    pin = _kwp.card_pin(row["body"])
+    if ok:
+        return ("pin", pin) if route_class == "pin" else ("portable", None)
+    if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
+        return "wait", f"not_portable:{rule}"
+    return "local", f"not_portable:{rule}"
+
+
+def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
+    """Why this row cannot spawn anywhere this tick, or None to proceed.
+
+    Decided before any guard runs so a row with no slot writes no events.
+    """
+    if route == "wait":
+        return arg
+    if route == "local":
+        return None if local_free else "local_full"
+    if route == "portable" and not local_free:
+        if plan.pins_only:
+            return "local_full"  # admitting band: the pool takes pins only
+        if plan.budget <= 0:
+            return "pool_full"
+    return None
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -3803,6 +3854,7 @@ def _dispatch_once_locked(
     pr_gate_prefetch=None,
     budget_cache: Optional[dict] = None,
     spillover_fn=None,
+    spillover=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -4035,19 +4087,23 @@ def _dispatch_once_locked(
     # above already ran, so a paused tick keeps the board honest but adds
     # NO new workers to an overloaded host. Measured 2026-09-24: load1 80-110
     # on 32 cores while the dispatcher kept spawning 9-14 workers a tick.
-    # Worker-host spillover (kanban.worker_hosts, t_5981ff03): while the gate
-    # holds THIS host, eligible cards may still spawn with their tools placed
-    # on a worker host. No configured host (the default) keeps the old return.
-    spillover = None
+    # KWLB v0.1 TWO budgets (PRD 5.2.6, RC-2). ``local_budget`` = the gate's
+    # spawn_limit (None only when the gate is disabled; a paused tick is 0),
+    # decremented by LOCAL spawns only. ``spawn_budget`` below is the TOTAL
+    # budget (max_spawn ∩ max_in_progress ∩ memory), decremented by local AND
+    # remote spawns: every worker loop runs here. The local budget is never
+    # intersected into the total. ``spillover`` = the gateway tick's shared
+    # pool plan (its ``spillover_fn`` test seam only when none is passed).
+    if spillover is None and spillover_fn is not None:
+        spillover = spillover_fn(conn)
+    local_budget: Optional[int] = None if spawn_limit is None else max(0, int(spawn_limit))
+    if spillover is not None:
+        result.spillover = spillover.summary()
     if spawn_paused:
         result.spawn_paused = str(spawn_paused)
-        spillover = (spillover_fn or _kb._default_spillover_plan)(conn)
+        local_budget = 0
         if spillover is None or spillover.budget <= 0:
-            if spillover is not None:
-                result.spillover = f"no worker-host capacity: {spillover.summary()}"
             return result
-        result.spillover = spillover.summary()
-        spawn_limit = spillover.budget
 
     running_count = 0
     spawn_budget: Optional[int] = None
@@ -4088,17 +4144,12 @@ def _dispatch_once_locked(
             spawn_budget = remaining
 
     # Load-gate allowance (kanban.dispatch_load_gate, see kanban_load_gate):
-    # the per-tick number of NEW workers the host can absorb given current
-    # load plus the not-yet-visible ramp of recent spawns. Intersects with
-    # every concurrency cap above; it never raises a budget.
-    if spawn_limit is not None:
-        _limit = max(0, int(spawn_limit))
-        if spawn_budget is None or spawn_budget > _limit:
-            spawn_budget = _limit
-        if _limit == 0:
-            result.spawn_capped = (
-                "load gate: this tick's spawn allowance for this board is 0"
-            )
+    # the per-tick number of NEW LOCAL workers this host can absorb. It caps
+    # ``local_budget`` only, never the total (a paused tick may still place).
+    if local_budget == 0 and not spawn_paused:
+        result.spawn_capped = (
+            "load gate: this tick's spawn allowance for this board is 0"
+        )
 
     # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
     # can't see the host's actual memory state (other tenants, bloated
@@ -4125,31 +4176,26 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, body, workspace_kind, workspace_path, no_worker "
+        "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Operator-only cards are never spawnable, whatever their assignee.
     ready_rows = _kb._drop_no_worker_rows(conn, ready_rows, result, dry_run=dry_run)
+    # One route per row (KWLB D-11): with a pool plan, ONE stable sort puts
+    # remote pins first, then non-portable cards (first claim on the local
+    # budget), then portable ones; the ORDER BY holds inside each class.
+    # Without a plan every row is local and the order is unchanged.
+    row_route: dict = {}
     if spillover is not None:
-        # Only cards a worker host can take: scratch workspace + allowlisted
-        # assignee. Everything else waits for this host's gate to reopen.
-        # Also: no task link in either direction (children read the
-        # parent's scratch dir locally; a spilled card's files live on the
-        # worker host) and no local workspace content (it is not on the host).
-        ready_rows = [
-            r for r in ready_rows
-            if spillover.eligible(r["assignee"], r["workspace_kind"], r["body"])
-            and not _kb._kwh.local_workspace_has_content(r["workspace_path"])
-            and conn.execute(
-                "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? "
-                "LIMIT 1", (r["id"], r["id"]),
-            ).fetchone() is None
-        ]
+        row_route = {r["id"]: _route_row(conn, r, spillover) for r in ready_rows}
+        _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
+        ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
     # Review rows are enumerated up front (not after the ready loop) so the
-    # budget split below can see whether review work exists at all.
+    # budget split below can see whether review work exists at all. The
+    # review lane is never offered to the pool: its rows are always local.
     review_rows = []
-    if spillover is None and review_dispatch_enabled():
+    if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee, no_worker FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
@@ -4217,8 +4263,20 @@ def _dispatch_once_locked(
         )
 
     ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review_this_tick():
-        ready_budget = max(spawn_budget - 1, 0)
+    # Review rows spawn locally, so the reservation holds back one LOCAL slot
+    # too (``ready_local``); the review loop checks the full ``local_budget``.
+    ready_local = local_budget
+    local_spawned = 0
+    if (
+        (spawn_budget is None or spawn_budget > 0)
+        and (local_budget is None or local_budget > 0)
+        and (spawn_budget is not None or local_budget is not None)
+        and _any_spawnable_review_this_tick()
+    ):
+        if spawn_budget is not None:
+            ready_budget = max(spawn_budget - 1, 0)
+        if local_budget is not None:
+            ready_local = local_budget - 1
     # Lazily populated only when a ready card reaches the point where it would
     # actually spawn. A queue containing only unassigned, capped, guarded, or
     # control-plane cards pays zero collision-scan queries on every idle tick.
@@ -4650,6 +4708,17 @@ def _dispatch_once_locked(
         if ready_budget is not None and spawned >= ready_budget:
             ready_scan_complete = False
             break
+        local_free = ready_local is None or local_spawned < ready_local
+        pool_free = spillover is not None and spillover.budget > 0
+        if not local_free and not pool_free:
+            # No slot anywhere: same early stop the intersected budget gave.
+            ready_scan_complete = False
+            break
+        route, route_arg = row_route.get(row["id"], ("local", None))
+        wait = _route_wait(route, route_arg, local_free, spillover)
+        if wait is not None:
+            result.placement_waits[row["id"]] = wait
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -4802,6 +4871,8 @@ def _dispatch_once_locked(
             result.spawned.append((row["id"], row_assignee, ""))
             charge_pool(row["id"])
             spawned += 1
+            if route != "pin" and local_free:
+                local_spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -4812,9 +4883,11 @@ def _dispatch_once_locked(
                 )
             continue
         placed_host = None
-        if spillover is not None:
-            placed_host = spillover.take(row_assignee)
+        if route == "pin" or (route == "portable" and not local_free):
+            # A refused take() NEVER falls through to a local spawn (I-11).
+            placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
             if placed_host is None:
+                result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
                 continue
         claimed = _kb.claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -4918,20 +4991,29 @@ def _dispatch_once_locked(
                     raise
             pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             if placed_host is not None:
+                band = getattr(spillover, "band", None)
+                spill_reason = getattr(spillover, "spill_reason", None)
+                reason = "pin" if route == "pin" else (
+                    "band_paused" if band == "paused" else "band_spilling")
+                probe = spillover.probe(placed_host.name)
                 _kb._append_event(
                     conn, claimed.id, _kb._kwh.PLACED_EVENT,
                     {"host": placed_host.name, "target": placed_host.target,
-                     "workspace": str(workspace),
-                     "reason": str(spawn_paused), "pid": pid},
+                     "workspace": str(workspace), "reason": reason,
+                     "band": band, "spill_reason": spill_reason, "probe": probe,
+                     "local_gate": str(spawn_paused) if spawn_paused else None,
+                     "pid": pid},
                     run_id=claimed.current_run_id,
                 )
-                result.placements[claimed.id] = placed_host.name
+                result.placed.append((claimed.id, placed_host.name))
                 _kb._log.info(
-                    "kanban dispatch: placed %s (%s) on worker host %s pid=%s; "
-                    "local gate: %s",
+                    "kanban dispatch: placed %s (%s) on worker host %s pid=%s "
+                    "band=%s spill_reason=%s reason=%s probe=%s; local gate: %s",
                     claimed.id, claimed.assignee, placed_host.name, pid,
-                    spawn_paused,
+                    band, spill_reason, reason, probe, spawn_paused,
                 )
+            else:
+                local_spawned += 1
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
@@ -5013,6 +5095,8 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if local_budget is not None and local_spawned >= local_budget:
+            break  # review rows are always local
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -5057,6 +5141,7 @@ def _dispatch_once_locked(
             result.spawned.append((row["id"], row["assignee"], ""))
             charge_pool(row["id"])
             spawned += 1
+            local_spawned += 1
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
@@ -5166,6 +5251,7 @@ def _dispatch_once_locked(
             result.spawn_route_sources[claimed.id] = review_route_source
             charge_pool(claimed.id, claimed.current_run_id)
             spawned += 1
+            local_spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
