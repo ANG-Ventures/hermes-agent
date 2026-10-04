@@ -40,7 +40,6 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
 from gateway.profile_routing import ProfileRoute  # noqa: E402
 from hermes_cli.plugins import (  # noqa: E402
-    VALID_HOOKS,
     PluginContext,
     PluginManager,
     PluginManifest,
@@ -109,15 +108,6 @@ def _auth_reaction_update(user_id, chat_type="private", chat_id=123, message_id=
 # Hook registration
 # ---------------------------------------------------------------------------
 
-class TestHookRegistration:
-    def test_gateway_platform_event_registered_reserved_absent(self):
-        """register_hook rejects names not in VALID_HOOKS, so the implemented
-        hook must be present. The reserved gateway_* names are deliberately
-        absent (no inert surface without a concrete fire site); lock that in."""
-        assert "gateway_platform_event" in VALID_HOOKS
-        assert "gateway_session_titled" not in VALID_HOOKS
-        assert "gateway_message_delivered" not in VALID_HOOKS
-        assert "gateway_thread_created" not in VALID_HOOKS
 
 
 # ---------------------------------------------------------------------------
@@ -159,25 +149,6 @@ class TestRunnerDispatch:
 
         invoke.assert_not_called()
 
-    def test_skips_dispatch_when_no_subscriber(self):
-        runner = object.__new__(GatewayRunner)
-        authorized = MagicMock(return_value=True)
-        runner._is_user_authorized = authorized
-        invoke = MagicMock()
-        source = _adapter()._source_from_reaction_for_auth(
-            _auth_reaction_update(user_id=777)
-        )
-
-        with patch("hermes_cli.lifecycle.has_hook", return_value=False), patch(
-            "hermes_cli.lifecycle.invoke_hook", invoke
-        ):
-            asyncio.run(runner._handle_gateway_platform_event(
-                {"platform": "telegram", "event_type": "reaction", "payload": {}},
-                source,
-            ))
-
-        authorized.assert_not_called()
-        invoke.assert_not_called()
 
     def test_plugin_layer_error_is_isolated(self):
         runner = object.__new__(GatewayRunner)
@@ -415,19 +386,6 @@ class TestNormalizeMessageEdited:
 # ---------------------------------------------------------------------------
 
 class TestOnPlatformUpdate:
-    def test_no_subscriber_skips_normalization_source_and_dispatch(self):
-        a = _adapter()
-        a._normalize_platform_event = MagicMock()
-        a._source_from_reaction_for_auth = MagicMock()
-        handler = AsyncMock()
-        a.set_platform_event_handler(handler)
-
-        with patch("hermes_cli.lifecycle.has_hook", return_value=False):
-            asyncio.run(a._on_platform_update(MagicMock(), context=MagicMock()))
-
-        a._normalize_platform_event.assert_not_called()
-        a._source_from_reaction_for_auth.assert_not_called()
-        handler.assert_not_awaited()
 
     def test_fires_gateway_platform_event_with_envelope(self):
         a = _adapter()

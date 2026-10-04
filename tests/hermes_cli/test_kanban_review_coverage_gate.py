@@ -211,8 +211,17 @@ def test_human_only_board_can_claim_review_and_return_full_verdict(review, monke
     # The human-lane claim binds to the claiming session (t_088fe9e3); pin one
     # so the result never depends on the runner's ambient session env.
     monkeypatch.setenv('HERMES_SESSION_ID', 'human-review-session')
+    # A human reviewer is not a dispatcher worker: drop the ``review`` fixture's
+    # worker scoping. Upstream's ``_worker_run_id_for`` now REFUSES a worker
+    # that touches a card other than its own instead of silently returning
+    # None, so the leaked scope would read as a cross-card mutation.
+    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.delenv('HERMES_KANBAN_RUN_ID', raising=False)
     with kb.connect() as conn:
-        parked = kb.create_task(conn, title='human review', assignee='builder')
+        # Homed on the reviewing session: an UNHOMED card is refused to any
+        # session (fork home-session guard) once the worker lane is gone.
+        parked = kb.create_task(conn, title='human review', assignee='builder',
+                                session_id='human-review-session')
         assert kb.request_review(conn, parked, summary='ready', reviewer='human')
     assert 'Claimed' in cli.run_slash(f'claim {parked} --review')
     with kb.connect() as conn:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -97,7 +98,7 @@ def test_dry_run_warns_on_incident_shape_and_names_both_cards(conn, caplog):
     )
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert result.collision_warnings == [
         (new, source, ["scripts/wirelog-coverage-check.py"])
@@ -113,7 +114,7 @@ def test_real_dispatch_persists_warning_on_both_cards_without_blocking(conn):
     _comment_changed_files(conn, source, "scripts/worker.py")
     new = _ready_task(conn, "Change `scripts/worker.py`.")
 
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123)
 
     assert result.spawned[0][0] == new
     assert kb.get_task(conn, new).status == "running"
@@ -154,7 +155,7 @@ def test_collision_comment_transaction_finishes_before_claim(
         spawn_calls.append(task.id)
         return 123
 
-    result = kb.dispatch_once(conn, spawn_fn=spawn)
+    result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert transaction_states == [("before", False), ("after", False)]
     assert spawn_calls == [new]
@@ -177,7 +178,7 @@ def test_running_scope_can_come_from_structured_run_metadata(conn):
     conn.commit()
     new = _ready_task(conn, "Modify `src/router.py`.")
 
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert result.collision_warnings == [(new, source, ["src/router.py"])]
 
@@ -197,7 +198,7 @@ def test_recently_blocked_scope_is_checked_but_stale_block_is_ignored(conn):
     conn.commit()
 
     new = _ready_task(conn, "Touch `src/shared.py` and `src/stale.py`.")
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert result.collision_warnings == [(new, recent, ["src/shared.py"])]
 
@@ -208,7 +209,7 @@ def test_unknown_new_scope_and_unreported_running_scope_are_explicit(conn, caplo
     unknown_new = _ready_task(conn, "Research the dispatch behavior; no files selected yet.")
 
     with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db"):
-        first = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+        first = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert first.collision_scope_unknown == [unknown_new]
     assert "SCOPE UNKNOWN" in caplog.text
@@ -219,7 +220,7 @@ def test_unknown_new_scope_and_unreported_running_scope_are_explicit(conn, caplo
     known_new = _ready_task(conn, "Modify `src/reported.py`.")
 
     with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db"):
-        second = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+        second = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert second.collision_warnings == [
         (known_new, reported, ["src/reported.py"])
@@ -235,7 +236,7 @@ def test_disjoint_reported_scope_does_not_warn(conn):
     _comment_changed_files(conn, source, "src/a.py")
     new = _ready_task(conn, "Modify `src/b.py`.")
 
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert result.collision_warnings == []
     assert result.collision_scope_unknown == []
@@ -247,7 +248,7 @@ def test_bare_filename_does_not_suffix_match_unrelated_directory(conn):
     _comment_changed_files(conn, source, "package/config.py")
     new = _ready_task(conn, "Modify `config.py`.")
 
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert result.collision_warnings == []
     assert result.collision_scope_unknown == []
@@ -256,7 +257,7 @@ def test_bare_filename_does_not_suffix_match_unrelated_directory(conn):
 def test_lane_vocabulary_is_not_misreported_as_file_scope(conn):
     new = _ready_task(conn, "Compare `apx/bpx` with `cpx/cpr`; no file selected.")
 
-    result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123, dry_run=True)
 
     assert result.collision_scope_unknown == [new]
 
@@ -273,7 +274,7 @@ def test_collision_check_failure_is_loud_but_never_blocks_spawn(
 
     monkeypatch.setattr(kb, "_load_dispatch_collision_scopes", broken_scope_load)
     with caplog.at_level(logging.ERROR, logger="hermes_cli.kanban_db"):
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 123)
 
     assert result.spawned[0][0] == new
     assert result.collision_check_failed == [new]
@@ -295,7 +296,7 @@ def test_cli_surfaces_collision_and_incomplete_coverage(
         collision_scope_unreported=[("t_new", ["t_unreported"])],
         collision_check_failed=["t_failed"],
     )
-    monkeypatch.setattr(kb, "dispatch_once", lambda *_a, **_k: result)
+    monkeypatch.setattr(kbd, "dispatch_once", lambda *_a, **_k: result)
     monkeypatch.setattr(config, "load_config", lambda: {"kanban": {}})
 
     json_args = argparse.Namespace(

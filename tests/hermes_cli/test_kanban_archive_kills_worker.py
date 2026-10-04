@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -44,7 +45,7 @@ def _running_card_with_worker(conn, pid_factory):
     assert task is not None
     time.sleep(1.1)  # process create time strictly after the claim second
     pid = pid_factory()
-    assert kb._set_worker_pid(conn, tid, pid, run_id=task.current_run_id)
+    assert kbd._set_worker_pid(conn, tid, pid, run_id=task.current_run_id)
     return tid
 
 
@@ -129,7 +130,7 @@ def test_archive_keeps_workspace_when_liveness_is_not_provable(board, monkeypatc
         lock = "some-other-host:4242" if claimer == "remote" else None
         task = kb.claim_task(conn, tid, claimer="some-other-host:4242")
         assert task is not None
-        assert kb._set_worker_pid(conn, tid, pid, run_id=task.current_run_id)
+        assert kbd._set_worker_pid(conn, tid, pid, run_id=task.current_run_id)
         if lock is None:
             conn.execute("UPDATE tasks SET claim_lock = NULL WHERE id = ?", (tid,))
         assert kb.archive_task(conn, tid) is True
@@ -165,7 +166,7 @@ def test_archive_snapshot_sees_pid_stamped_just_before_archive_txn(board, monkey
             if not stamped:
                 stamped.append(True)
                 with kb.connect_closing() as other:
-                    assert kb._set_worker_pid(other, tid, pid, run_id=task.current_run_id)
+                    assert kbd._set_worker_pid(other, tid, pid, run_id=task.current_run_id)
             return real_txn(c, **kw)
 
         monkeypatch.setattr(kb, "write_txn", racing_txn)

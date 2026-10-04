@@ -1,0 +1,15 @@
+batch-aa: tests/acp_adapter/test_server.py tests/acp_adapter/test_session.py tests/ci/test_evaluate_needs.py  :: 83 passed in 18.07s
+batch-ab: tests/ci/test_no_new_source_proxy_asserts.py tests/context_engine/test_lcm_adoption_smoke.py tests/cron/test_cron_no_agent.py  :: 2 failed, 27 passed in 17.17s
+batch-ac: tests/cron/test_cron_pinned_job_fallback.py tests/cron/test_cron_script_exit_house_page.py tests/cron/test_cron_script_job_timeout.py  :: 51 passed in 8.37s
+batch-ad: tests/cron/test_cron_shared_scripts_and_stuck_page.py tests/cron/test_cron_transient_failure_suppression.py tests/cron/test_init_fallback_job_chain.py  :: 35 passed in 7.90s
+batch-ae: tests/cron/test_lifecycle_guard_heredoc_walk.py tests/cron/test_oneshot_restart_catchup.py tests/cron/test_parallel_pool.py  :: 25 passed in 3.37s
+batch-af: tests/cron/test_run_one_job.py tests/discord/test_restart_backfill.py tests/discord/test_restart_backfill_e2e.py  :: 34 passed in 141.72s (0:02:21)
+batch-ag: tests/providers/test_fork_canary_plugin_discovery_not_at_import.py tests/run_agent/test_local_relay_restart_wait.py tests/run_agent/test_malformed_provider_stream_failover.py  :: 19 passed in 12.24s
+batch-ah: tests/run_agent/test_relay_deploy_drain.py tests/run_agent/test_run_agent_conversation.py tests/run_agent/test_run_agent_providers.py  :: 124 passed in 52.62s
+batch-ai: tests/run_agent/test_run_agent_streaming.py tests/run_agent/test_run_agent_tool_exec.py tests/run_agent/test_session_persistence_cause.py  :: 105 passed in 30.94s
+batch-aj: tests/scripts/desktop_update/test_desktop_update_windows_cwd.py tests/scripts/desktop_update/test_desktop_update_windows_timestamp.py tests/scripts/test_mint_launchers.py  :: 
+batch-ak: tests/scripts/test_run_tests_parallel_stdio.py tests/state/test_writer_conn_thread_safety.py tests/tui_gateway/contracts/test_generated.py  :: 12 passed in 13.34s
+batch-al: tests/tui_gateway/test_compute_host.py tests/tui_gateway/test_compute_host_late_compress_ack.py tests/tui_gateway/test_foreground_notification_snapshot.py  :: 20 passed, 1 skipped in 12.72s
+batch-am: tests/tui_gateway/test_kanban_notify_poller.py tests/tui_gateway/test_protocol.py tests/tui_gateway/test_seeded_session_create.py  :: 89 passed in 31.62s
+batch-an: tests/tui_gateway/test_tui_gateway_server.py tests/tui_gateway/test_turn_system_context.py tests/tui_gateway/test_warning_callback_conservation.py  :: 752 passed in 132.48s (0:02:12)
+DONE

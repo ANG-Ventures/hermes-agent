@@ -7,6 +7,7 @@ import cycle.
 
 from __future__ import annotations
 
+import re
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
@@ -74,11 +75,15 @@ FAST_MODE_CAPABILITY_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType
         ),
         # Opus 4.7 is intentionally absent. Anthropic deprecated its Fast
         # contract on 2026-06-25 and will reject speed=fast after 2026-07-24.
+        # Opus 5 / Opus 5.5 joined the documented list (upstream 78a50c28fc:
+        # ``agent.model_metadata._ANTHROPIC_FAST_MODE_MODELS`` and the fast-mode
+        # pricing rows carry the same three ids); the wire gate and the ``/fast``
+        # toggle read this one tuple.
         "anthropic_fast": _contract(
             source_url=(
                 "https://platform.claude.com/docs/en/build-with-claude/fast-mode"
             ),
-            models=("claude-opus-4-8",),
+            models=("claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"),
         ),
     }
 )
@@ -184,8 +189,10 @@ def normalize_fast_model_id(model_id: Optional[str]) -> str:
     # separately, so the contract lookup keys on the bare model id.
     if normalized.startswith(_FAST_MODEL_ID_PREFIXES):
         normalized = normalized.split("/", 1)[1]
-    if normalized == "claude-opus-4.8":
-        return "claude-opus-4-8"
+    if normalized.startswith("claude-opus-"):
+        # Dotted spelling alias (``claude-opus-4.8`` / ``claude-opus-5.5`` -> hyphens); every
+        # other suffix (``:fast``, ``-suffix``, ``-80``) is retained and therefore rejected.
+        return re.sub(r"(\d)\.(\d)", r"\1-\2", normalized)
     return normalized
 
 

@@ -26,6 +26,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 CHAT = "1535189663533506600"
 USER = "117431298246705156"
@@ -76,7 +77,7 @@ def _sub(
     chat_type: str = "group", user_id=None, user_id_alt=None, scope_id=None,
     creator_session_id: str | None = CREATOR_SESSION,
 ) -> None:
-    kb.add_notify_sub(
+    kbn.add_notify_sub(
         conn, task_id=task_id, platform=platform, chat_id=chat_id,
         chat_type=chat_type, user_id=user_id, user_id_alt=user_id_alt,
         scope_id=scope_id,
@@ -98,7 +99,7 @@ def _run(**kwargs) -> int:
 def _identity_of(task_id: str):
     conn = kb.connect()
     try:
-        subs = kb.list_notify_subs(conn, task_id)
+        subs = kbn.list_notify_subs(conn, task_id)
         assert len(subs) == 1, subs
         return {
             field: subs[0].get(field)

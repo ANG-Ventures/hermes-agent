@@ -35,7 +35,7 @@ def _route_step() -> dict:
 
 # Hermetic stand-in for curl: answers the tag lookup from FAKE_TAG_CODE/FAKE_TAG_SHA
 # and logs every URL, so no test touches the network.
-_FAKE_CURL = r"""#!/bin/bash
+_FAKE_CURL = r"""#!/usr/bin/env bash
 out=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac; shift
@@ -151,7 +151,7 @@ def test_post_step_is_gated_on_route():
 
 # --- C6 (FleetReview backfill, #1196) ------------------------------------
 
-_FAKE_CURL_RUNS = r"""#!/bin/bash
+_FAKE_CURL_RUNS = r"""#!/usr/bin/env bash
 url=""; out=""
 while [ $# -gt 0 ]; do
   case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac; shift
@@ -192,7 +192,7 @@ def test_known_red_predecessor_is_the_latest_COMPLETED_run_not_latest_created(tm
     assert got["route"] == "alerts", proc.stdout
 
 
-_FAKE_CURL_POST = r"""#!/bin/bash
+_FAKE_CURL_POST = r"""#!/usr/bin/env bash
 url=""; out=""; event=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -247,7 +247,7 @@ def test_known_red_and_fallback_both_failing_turns_the_step_red(tmp_path):
     assert proc.returncode != 0
 
 
-_FAKE_CURL_BODY = r"""#!/bin/bash
+_FAKE_CURL_BODY = r"""#!/usr/bin/env bash
 body=""; prev=""
 for a in "$@"; do [ "$prev" = "--data" ] && body="$a"; prev="$a"; done
 printf '%s\n' "$body" >> "$FAKE_CURL_LOG"
@@ -285,7 +285,7 @@ def test_page_names_scheduled_vs_merge(tmp_path, event, trigger, actor):
 # --- merge-queue dedupe (t_70f92e0b) -------------------------------------------
 # Fake GitHub API: every URL is looked up by suffix in FAKE_API (a JSON file of
 # {url-substring: response-json}); a miss exits 22 like `curl -f` on a 404.
-_FAKE_API_CURL = r"""#!/bin/bash
+_FAKE_API_CURL = r"""#!/usr/bin/env bash
 url=""
 for a in "$@"; do case "$a" in https://*) url="$a" ;; esac; done
 echo "$url" >> "$FAKE_CURL_LOG"

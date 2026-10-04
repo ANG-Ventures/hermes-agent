@@ -33,6 +33,7 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -93,7 +94,7 @@ def test_triaged_parent_strands_child_and_dispatch_names_it(kanban_home: Path) -
     with kb.connect_closing() as conn:
         parent, child = _triaged_parent_with_todo_child(conn)
 
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, dry_run=True, spawn_fn=lambda *a, **k: 1,
         )
         assert res.spawned == []
@@ -324,7 +325,7 @@ def test_triage_resolve_to_done_unstrands_the_subtree(kanban_home: Path) -> None
         # Child is free now, and the dispatcher says so.
         assert kb.get_task(conn, child).status == "ready"
         assert kb.find_stranded_by_triage(conn) == []
-        res = kb.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1)
+        res = kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1)
         assert res.stranded_by_triage == []
 
 

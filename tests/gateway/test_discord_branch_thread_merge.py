@@ -53,6 +53,11 @@ def _entry(session_key, session_id, source):
 def _make_runner(session_db, adapter=None):
     from gateway.run import GatewayRunner
 
+    if adapter is not None and isinstance(getattr(adapter, "_threads", None), MagicMock):
+        # Upstream's /branch marks the new thread on the adapter's tracker (``await
+        # _threads.mark_async``); a bare MagicMock attribute is not awaitable.
+        adapter._threads = None
+
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.DISCORD: adapter} if adapter is not None else {}
     runner.config = {}
@@ -330,8 +335,9 @@ class TestBranchDiscordThread:
         # Classic in-place: switch_session called with the CURRENT (parent) key.
         switch_keys = [c.args[0] for c in runner.session_store.switch_session.call_args_list]
         assert parent_key in switch_keys
-        # Classic branch confirmation, not the thread one.
-        assert "thread" not in result.lower()
+        # Classic branch confirmation (plus upstream's one-line "no thread could be created"
+        # fallback note), not the thread-branched one.
+        assert "branched to" in result.lower() and "<#" not in result
 
     @pytest.mark.asyncio
     async def test_branch_non_discord_uses_classic_path(self, session_db):
@@ -354,7 +360,7 @@ class TestBranchDiscordThread:
         result = await runner._handle_branch_command(_event("/branch", source))
         switch_keys = [c.args[0] for c in runner.session_store.switch_session.call_args_list]
         assert key in switch_keys
-        assert "thread" not in result.lower()
+        assert "branched to" in result.lower() and "<#" not in result
 
 
 # --------------------------------------------------------------------------- #

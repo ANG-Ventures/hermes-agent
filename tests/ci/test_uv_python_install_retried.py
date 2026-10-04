@@ -45,7 +45,11 @@ def _violations(root: Path = _WORKFLOWS) -> list[str]:
 
 def test_every_uv_python_install_is_retried_over_an_outage_window():
     found = list(_steps_running("uv python install"))
-    assert len(found) >= 7, f"census: only {len(found)} uv python install steps found"
+    # Census floor: the unit/lint/docker/desktop lanes now take their
+    # interpreter from ./.github/actions/setup-pm (PM-pinned, no `uv python
+    # install` step); the e2e-upgrade job and live-providers still install
+    # one directly, and those are the steps this guard must keep wrapped.
+    assert len(found) >= 2, f"census: only {len(found)} uv python install steps found"
     assert _violations() == []
 
 

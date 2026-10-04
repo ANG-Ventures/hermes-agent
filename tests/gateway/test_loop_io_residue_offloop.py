@@ -8,7 +8,9 @@ amplified ~1000x.  PHASE=event_loop_blocked dumps 2026-10-01 23:00 ->
 2026-10-02 02:07 named these sites, all reached from a coroutine:
 
 1. ``BasePlatformAdapter._set_fatal_error`` -> ``_write_runtime_status_safe``
-   -> ``gateway.status.write_runtime_status`` -> ``utils.atomic_json_write``
+   -> ``gateway.status.publish_runtime_status`` (parity 2026-10-01: was
+   ``write_runtime_status``; the merged adapter publishes through upstream's
+   single background writer thread, so the file I/O is off the loop)
    (utils.py:387) -- Discord liveness sampler, Telegram polling-error handler.
 2. ``gateway/status.py`` ``release_scoped_lock`` (unlink) -- adapter
    ``disconnect()`` -> ``_release_platform_lock``.
@@ -86,15 +88,27 @@ def _calls_named(fn, name: str) -> list[ast.Call]:
 # ---------------------------------------------------------------------------
 
 
+# Parity 2026-10-01: the merged adapter publishes through
+# ``gateway.status.publish_runtime_status`` (upstream d5479495b8, "persist runtime
+# status off event loop"): the snapshot merge is in memory and the file write runs
+# on the single background writer thread. That is the same fix as fork/main's
+# lane job for this site, so these tests pin the invariant (no status FILE I/O on
+# the loop thread, failures logged, last write wins) against the merged mechanism.
+
+
+def _spy_status_writes(monkeypatch, sink):
+    def _write(path, payload):
+        sink.append((threading.get_ident(), payload))
+    monkeypatch.setattr(status, "_write_json_file", _write)
+
+
 @pytest.mark.asyncio
-async def test_set_fatal_error_on_loop_writes_status_off_the_loop_thread(monkeypatch):
+async def test_set_fatal_error_on_loop_writes_status_off_the_loop_thread(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    status._reset_identity_caches()
     loop_thread = threading.get_ident()
     seen: list[tuple[int, dict]] = []
-    monkeypatch.setattr(
-        status,
-        "write_runtime_status",
-        lambda **kw: seen.append((threading.get_ident(), kw)),
-    )
+    _spy_status_writes(monkeypatch, seen)
     adapter = _adapter()
 
     adapter._set_fatal_error("telegram_network", "boom", retryable=True)
@@ -102,21 +116,21 @@ async def test_set_fatal_error_on_loop_writes_status_off_the_loop_thread(monkeyp
     # State the runner reads is set synchronously, before any await.
     assert adapter._fatal_error_code == "telegram_network"
     assert adapter._running is False
-    status.drain_runtime_status_lane()
-    assert len(seen) == 1
-    tid, kw = seen[0]
-    assert tid != loop_thread, "runtime-status write ran on the event-loop thread"
-    assert kw["platform"] == "telegram"
-    assert kw["platform_state"] == "fatal"
-    assert kw["error_code"] == "telegram_network"
+    assert status.flush_runtime_status(timeout=5.0)
+    assert seen, "no runtime-status write happened"
+    tid, payload = seen[-1]
+    assert tid != loop_thread, "runtime-status file write ran on the event-loop thread"
+    entry = payload["platforms"]["telegram"]
+    assert entry["state"] == "fatal"
+    assert entry["error_code"] == "telegram_network"
 
 
 @pytest.mark.asyncio
-async def test_slow_adapter_status_write_does_not_stall_the_loop(monkeypatch):
+async def test_slow_adapter_status_write_does_not_stall_the_loop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    status._reset_identity_caches()
     gate = threading.Event()
-    monkeypatch.setattr(
-        status, "write_runtime_status", lambda **kw: gate.wait(5)
-    )
+    monkeypatch.setattr(status, "_write_json_file", lambda path, payload: gate.wait(5))
     adapter = _adapter()
 
     loop = asyncio.get_running_loop()
@@ -125,16 +139,7 @@ async def test_slow_adapter_status_write_does_not_stall_the_loop(monkeypatch):
     await asyncio.sleep(0)
     assert loop.time() - t0 < 1.0, "the loop waited on the status write"
     gate.set()
-    status.drain_runtime_status_lane()
-
-
-def test_adapter_status_write_without_a_loop_stays_inline(monkeypatch):
-    seen: list[int] = []
-    monkeypatch.setattr(
-        status, "write_runtime_status", lambda **kw: seen.append(threading.get_ident())
-    )
-    _adapter()._mark_disconnected()
-    assert seen == [threading.get_ident()]
+    assert status.flush_runtime_status(timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -142,11 +147,10 @@ async def test_adapter_status_write_failure_is_still_logged(monkeypatch, caplog)
     def _boom(**_kw):
         raise OSError("ENOSPC")
 
-    monkeypatch.setattr(status, "write_runtime_status", _boom)
+    monkeypatch.setattr(status, "publish_runtime_status", _boom)
     adapter = _adapter()
     with caplog.at_level("WARNING"):
         adapter._set_fatal_error("x", "y", retryable=False)
-        status.drain_runtime_status_lane()
     assert "Failed to write runtime status (fatal)" in caplog.text
 
 
@@ -158,14 +162,16 @@ async def test_adapter_status_write_lands_on_disk_in_order(tmp_path, monkeypatch
     adapter = _adapter()
     adapter._set_fatal_error("c", "m", retryable=True)
     adapter._mark_connected()
-    status.drain_runtime_status_lane()
+    assert status.flush_runtime_status(timeout=5.0)
     state = status.read_runtime_status()
     assert state["platforms"]["telegram"]["state"] == "connected"
 
 
-def test_write_runtime_status_safe_routes_through_the_ordered_lane():
-    calls = _calls_named(BasePlatformAdapter._write_runtime_status_safe, "submit_runtime_status_job")
-    assert calls, "_write_runtime_status_safe must queue on the ordered status lane"
+def test_write_runtime_status_safe_uses_the_non_blocking_publisher():
+    assert _calls_named(BasePlatformAdapter._write_runtime_status_safe, "publish_runtime_status"), (
+        "_write_runtime_status_safe must publish through the background writer")
+    assert not _calls_named(BasePlatformAdapter._write_runtime_status_safe, "write_runtime_status"), (
+        "_write_runtime_status_safe must not call the blocking write_runtime_status")
 
 
 # ---------------------------------------------------------------------------

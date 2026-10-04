@@ -73,10 +73,14 @@ def test_codex_notional_route_prefers_curated_snapshot_over_external_catalog(mon
 
     # Simulate the external catalogs not knowing the model yet.
     monkeypatch.setattr(up, "_external_pricing_entry", lambda route: None)
-    usage = up.CanonicalUsage(input_tokens=1_000_000, output_tokens=0)
+    # Stay under the 272K whole-request context tier (upstream bdde674296 priced it into the
+    # snapshot) so the base input rate is the oracle, not the ``*_above`` rate.
+    usage = up.CanonicalUsage(input_tokens=100_000, output_tokens=0)
     result = up.estimate_usage_cost("gpt-6-astra", usage, provider="openai-codex")
     assert result.source == "official_docs_snapshot"
-    assert result.amount_usd == up._OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")].input_cost_per_million
+    assert result.amount_usd == (
+        up._OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")].input_cost_per_million / 10
+    )
 
     # Models absent from the snapshot still fall through to the external catalog.
     sentinel = up._OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")]

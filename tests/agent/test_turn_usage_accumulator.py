@@ -11,10 +11,19 @@ import agent.turn_finalizer as tf
 
 
 def test_turn_calls_initialized_local_not_agent_attr():
-    """_turn_calls must be a LOCAL var in run_conversation, never agent._turn."""
-    src = inspect.getsource(cl.run_conversation)
-    assert "_turn_calls: List[Dict[str, Any]] = []" in src, "local accumulator not initialized"
-    assert "agent._turn_calls" not in src, "accumulator must not be an agent attribute (re-entrancy)"
+    """_turn_calls must be per-turn state, never agent._turn_calls (re-entrancy).
+
+    Upstream moved the loop's locals into the per-turn ``_LoopState`` dataclass; a fresh
+    ``field(default_factory=list)`` per turn carries the same no-shared-agent-state property
+    the fork's local var did.
+    """
+    src = inspect.getsource(cl._LoopState)
+    assert "_turn_calls: List[Dict[str, Any]] = field(default_factory=list)" in src, (
+        "per-turn accumulator not initialized on _LoopState"
+    )
+    assert "agent._turn_calls" not in inspect.getsource(cl), (
+        "accumulator must not be an agent attribute (re-entrancy)"
+    )
 
 
 def test_append_inside_success_block_only(tmp_path):
@@ -52,7 +61,7 @@ def test_append_inside_success_block_only(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("model_tools.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch.object(lifecycle, "invoke_hook", _fake_invoke_hook),

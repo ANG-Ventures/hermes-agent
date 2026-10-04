@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -119,7 +120,7 @@ def test_dispatch_once_runs_the_sweep(conn):
     rid = _open_run(conn, tid, task_status="archived", pid=_dead_pid(),
                     heartbeat=int(time.time()), current=False)
 
-    res = kb.dispatch_once(conn, dry_run=True)
+    res = kbd.dispatch_once(conn, dry_run=True)
 
     assert res.ended_terminal_runs == [rid]
     assert _run(conn, rid)["outcome"] == "orphaned_terminal_task"

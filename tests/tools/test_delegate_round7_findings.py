@@ -170,13 +170,13 @@ def _loop_responses():
 def test_f3_the_loop_settles_only_after_a_model_response(tmp_path):
     """Real loop: the steer lands in the turn's tool result and the next model
     response reads it, so the ledger settles it (control for t_race1)."""
-    from tests.agent.test_pre_api_steer_drain_turn_bound import _run, _tool_contents
+    from tests.agent.test_pre_api_steer_drain_turn_bound import _run, _steer_after_tool
 
     agent, led = _loop_child("sa-loop-ok", tmp_path)
     assert agent.steer("check the replica")
     result, sent = _run(agent, _loop_responses())
     assert result["final_response"] == "done"
-    assert "check the replica" in _tool_contents(sent[1])["c1"]  # the model read it
+    assert "check the replica" in _steer_after_tool(sent[1], "c1")  # the model read it
     assert led.missed() is None
 
 
@@ -233,12 +233,14 @@ def test_r1_f983_build_attaches_the_door_before_publishing_the_child():
             f = node.func
             if isinstance(f, ast.Name) and f.id == "_attach_owner_teardown":
                 door = min(door or node.lineno, node.lineno)
+            # Publish = the child becomes visible to the parent: a direct
+            # ``_active_children.append`` or the ``_attach_child`` helper that does it.
             if (
                 isinstance(f, ast.Attribute)
                 and f.attr == "append"
                 and isinstance(f.value, ast.Attribute)
                 and f.value.attr == "_active_children"
-            ):
+            ) or (isinstance(f, ast.Name) and f.id == "_attach_child"):
                 publish = min(publish or node.lineno, node.lineno)
     assert door is not None and publish is not None and door < publish
 

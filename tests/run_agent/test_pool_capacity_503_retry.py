@@ -144,7 +144,7 @@ def _make_agent(statuses: list[tuple[str, str]]) -> AIAgent:
         }
     ]
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=MagicMock()),
     ):
@@ -227,6 +227,11 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         return outcome
 
     clock = _FakeClock(sleeps)
+    # Upstream c5b99a3ee5 keeps should_use_direct_api_call() contexts on the STREAMING wire
+    # (inline, monitor thread), so that flag no longer lands the primary on
+    # ``_interruptible_api_call``. Disable streaming on the rig instead: the non-streaming
+    # path is ``relay_llm.execute(..., agent._interruptible_api_call)``, the fallback's seam.
+    agent._disable_streaming = True
     with (
         # Route the PRIMARY through the same seam as the fallback (the cron /
         # delegated-child inline path) so one script drives the whole turn.
@@ -252,12 +257,18 @@ def _run(agent, outcomes, sleeps: list[float], call_seconds: float = 0.0):
         ),
         # Generic path jitter (pre-policy) vs the capacity schedule. Pin both
         # so the test asserts on POLICY, not RNG: a 2.0 sleep is the generic
-        # path, a 5.0 sleep is the capacity path.
-        patch("agent.conversation_loop.jittered_backoff", return_value=2.0),
-        patch("agent.retry_utils.jittered_backoff", return_value=5.0),
+        # path, a 5.0 sleep is the capacity path. Both now read the ONE
+        # ``agent.retry_utils.jittered_backoff`` (the generic backoff moved into
+        # agent.turn_recovery and imports it lazily), so key on ``base_delay``:
+        # 2.0 is the generic schedule, 5.0 is CAPACITY_RETRY_BASE_DELAY_S.
+        patch("agent.retry_utils.jittered_backoff",
+              side_effect=lambda *_a, base_delay=2.0, **_k: 5.0 if base_delay == 5.0 else 2.0),
         # The loop sleeps in 0.2s ticks until ``time.time() >= sleep_end``;
         # the fake clock advances on sleep so the wait is recorded, not served.
-        patch("agent.conversation_loop.time", clock),
+        # Upstream split the retry wait out of conversation_loop into
+        # agent.turn_recovery (interruptible_backoff_sleep + the capacity budget's
+        # monotonic reads); patch the clock where it is read.
+        patch("agent.turn_recovery.time", clock),
     ):
         result = agent.run_conversation("hello")
     return result, activate, call
@@ -427,7 +438,7 @@ def test_config_knobs_are_read_from_the_agent_section():
     land on the agent; garbage falls back to the defaults; negatives clamp."""
     def _build(agent_section):
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("model_tools.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch("hermes_cli.config.load_config_readonly", return_value={"agent": agent_section}),

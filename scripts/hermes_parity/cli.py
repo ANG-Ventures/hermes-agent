@@ -315,7 +315,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
     for path in args.paths:
         entries.append((path, args.reason or ""))
     for source in args.from_file or []:
-        for raw in Path(source).read_text(encoding="utf-8").splitlines():
+        for raw in Path(source).read_text(encoding="utf-8-sig").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue

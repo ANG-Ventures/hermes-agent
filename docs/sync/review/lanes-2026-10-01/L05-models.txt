@@ -1,0 +1,4 @@
+agent/auxiliary_client.py
+agent/credential_pool.py
+agent/model_metadata.py
+hermes_cli/models.py

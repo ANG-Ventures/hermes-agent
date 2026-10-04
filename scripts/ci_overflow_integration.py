@@ -70,7 +70,7 @@ def fallback_predicate(workflow_text: str) -> CheckResult:
         if gate not in matrix:
             problems.append(f"placement matrix not gated by {gate!r}")
     e2e_runs_on = str((jobs.get("e2e") or {}).get("runs-on", ""))
-    if not e2e_runs_on.rstrip("} ").endswith("|| '[\"ubuntu-latest\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
+    if not e2e_runs_on.rstrip("} ").endswith("|| '[\"blacksmith-4vcpu-ubuntu-2404\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
         problems.append("e2e runs-on does not end in the static CI_RUNNER_LABELS fallback")
     if json.dumps(LOCAL_LABELS).replace(" ", "") in e2e_runs_on.replace(" ", "").replace("'", ""):
         problems.append("e2e runs-on can select the fixed local pool")
@@ -352,7 +352,7 @@ def app_gates(repo: str, controller_root: Path | None) -> list[CheckResult]:
         return [check(n, "UNVERIFIABLE", {}, "supply --controller-root (fleet-ops-scripts/ci-overflow-controller)") for n in names]
     sys.path.insert(0, str(controller_root))
     gh_mod = importlib.import_module("cioc.github")
-    cfg = json.loads((controller_root / "config.json").read_text(encoding="utf-8"))
+    cfg = json.loads((controller_root / "config.json").read_text(encoding="utf-8-sig"))
     gh = gh_mod.GitHub(cfg["api_base"], gh_mod.InstallationTokens(cfg["api_base"], cfg["app_id"], cfg["installation_id"],
                                                                   os.path.expanduser(cfg["key_path"])))
 

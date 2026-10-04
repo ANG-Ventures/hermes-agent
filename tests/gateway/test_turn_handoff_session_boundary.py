@@ -18,7 +18,7 @@ from agent.turn_handoff import (
     consume_handoff_context,
     handoff_path_for,
 )
-from gateway.config import GatewayConfig, Platform, SessionResetPolicy
+from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 
 
@@ -48,10 +48,8 @@ def handoff_root(tmp_path, monkeypatch):
     return root
 
 
-def _store(tmp_path, policy=None):
+def _store(tmp_path):
     config = GatewayConfig()
-    if policy is not None:
-        config.default_reset_policy = policy
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
     store._db = None
     return store
@@ -96,10 +94,13 @@ def test_resume_switch_discards_the_old_conversations_handoff(tmp_path, handoff_
 
 
 def test_auto_reset_discards_the_old_conversations_handoff(tmp_path, handoff_root):
-    store = _store(tmp_path, SessionResetPolicy(mode="idle", idle_minutes=30))
+    # Upstream (parity 2026-10-01) retired timed resets (SessionResetPolicy -> plugin); at the
+    # store, only an explicit suspension replaces a routed conversation (session_lifecycle
+    # _route_reset_reason). That rotation is the one that must discard the old handoff.
+    store = _store(tmp_path)
     old = store.get_or_create_session(_source())
     _capture(old)
-    store._entries[old.session_key].updated_at = datetime.now() - timedelta(hours=2)
+    store._entries[old.session_key].suspended = True
 
     new = store.get_or_create_session(_source())
 

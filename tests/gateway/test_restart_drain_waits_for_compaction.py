@@ -125,6 +125,8 @@ def test_active_work_count_includes_compactions():
         _running_agent_count = lambda self: 0
         _active_cron_job_count = lambda self: 0
         _active_api_run_count = lambda self: 0
+        # upstream-new aggregate member (deferred agent workers)
+        _active_deferred_agent_worker_count = lambda self: 0
         _active_compaction_count = GatewayRunner._active_compaction_count
         _active_work_count = GatewayRunner._active_work_count
 

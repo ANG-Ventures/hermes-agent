@@ -49,7 +49,7 @@ def _stdlib_branch_gate(path: Path, exercise: Callable[[], object]) -> None:
         sys.settrace(old)
 
     missing: list[int] = []
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
     for node in ast.walk(tree):
         # Every stdlib-visible branch construct, not just `if` (Greptile P2):
         # if/elif arms + else, while/for bodies + their else clauses, except

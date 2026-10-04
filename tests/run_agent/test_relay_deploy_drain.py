@@ -99,7 +99,7 @@ FB_CHAIN = [
 
 def _make_agent():
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=MagicMock()),
     ):
@@ -139,7 +139,7 @@ def _run(agent, fake_api_call, *, drain_wait_s):
         # create=True so the contract runs (RED) on a tree without the fix.
         patch("agent.fallback_wiring.relay_drain_wait_s", return_value=drain_wait_s,
               create=True),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.05),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.05),
         patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve),
         patch("hermes_cli.model_normalize.normalize_model_for_provider",
               side_effect=lambda m, p: m),

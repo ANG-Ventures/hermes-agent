@@ -8,6 +8,7 @@ import yaml
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_constants import get_hermes_home
 
 LOG = "log-chan"
@@ -57,7 +58,7 @@ def _set_channel(value):
 
 def _card(conn, priority=0, mode="notify+wake"):
     tid = kb.create_task(conn, title="card", assignee="worker", priority=priority)
-    kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="origin",
+    kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="origin",
                       chat_type="group", user_id="u1", delivery_mode=mode)
     return tid
 

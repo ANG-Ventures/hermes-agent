@@ -375,6 +375,7 @@ def test_unblock_reset_failures_already_happens_q16_branch_a(home):
 
 def test_default_spawn_strips_operator_token_from_worker_env(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
     captured = {}
@@ -396,9 +397,9 @@ def test_default_spawn_strips_operator_token_from_worker_env(monkeypatch, tmp_pa
     )
     with monkeypatch.context() as m:
         m.setattr("subprocess.Popen", _fake_popen)
-        m.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+        m.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
         m.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
-        kb._default_spawn(task, str(workspace))
+        kbd._default_spawn(task, str(workspace))
 
     assert TOKEN_ENV not in captured["env"]
     assert os.environ[TOKEN_ENV] == TOKEN_VALUE  # stripped from the child only
@@ -454,6 +455,7 @@ def test_refusal_event_records_no_argument_values(home):
 @pytest.fixture
 def inproc(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     h = tmp_path / "hermes"
     h.mkdir()

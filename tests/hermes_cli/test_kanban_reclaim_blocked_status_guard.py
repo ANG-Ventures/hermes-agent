@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -102,7 +103,7 @@ def test_dispatcher_does_not_spawn_a_reclaimed_blocked_card(conn):
         spawned.append(task.id)
         return 4242
 
-    kb.dispatch_once(conn, spawn_fn=spawn_fn)
+    kbd.dispatch_once(conn, spawn_fn=spawn_fn)
 
     # Pre-fix: the reclaim left it 'ready', the dispatcher claimed it and
     # spawned a worker on a card the operator had explicitly held.
@@ -162,7 +163,7 @@ def test_reclaim_returns_proven_dead_running_task_to_ready(conn):
     """Running -> ready still works when the worker is proven gone."""
     tid = kb.create_task(conn, title="dead worker", assignee="w")
     kb.claim_task(conn, tid)
-    kb._set_worker_pid(conn, tid, 999999)
+    kbd._set_worker_pid(conn, tid, 999999)
     assert _status(conn, tid) == "running"
 
     def absent_process(_pid, _sig):
@@ -177,6 +178,6 @@ def test_reclaim_returns_proven_dead_running_task_to_ready(conn):
         spawned.append(task.id)
         return 4242
 
-    kb.dispatch_once(conn, spawn_fn=spawn_fn)
+    kbd.dispatch_once(conn, spawn_fn=spawn_fn)
     # A genuinely reclaimed running task MUST become dispatchable again.
     assert spawned == [tid]

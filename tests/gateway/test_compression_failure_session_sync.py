@@ -153,7 +153,10 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
                 session_key=SESSION_KEY,
                 run_generation=run_generation,
             ),
-            timeout=2,
+            # Hang guard, not a latency bound: the turn takes ~0.1 s locally, but its first call
+            # pays cold lazy imports inside the window and blew 2 s on Blacksmith 4-vCPU
+            # (#1624 7a391f8c4b slice 8, 1900204f6e slice 5).
+            timeout=30,
         )
     )
 

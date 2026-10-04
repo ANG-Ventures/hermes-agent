@@ -1,0 +1,1 @@
+plugins/platforms/discord/adapter.py

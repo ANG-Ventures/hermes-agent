@@ -8,35 +8,57 @@ import threading
 from pathlib import Path
 
 import gateway.run as gateway_run
+import gateway.run_shutdown as gateway_run_shutdown
 from gateway.shutdown_watchdog import _format_asyncio_tasks, _write_watchdog_dump
 
 
 def _stop_impl_calls_to(name: str):
-    """Every Call node naming ``name`` inside GatewayRunner.stop()."""
-    tree = ast.parse(Path(gateway_run.__file__).read_text(encoding="utf-8"))
-    runner = next(
+    """Every Call node naming ``name`` across the stop path (``GatewayShutdownMixin`` — parity
+    2026-10-01: upstream split ``GatewayRunner.stop()`` into ``gateway/run_shutdown.py`` phase
+    helpers; the kill sweep is ``_stop_kill_tool_subprocesses`` and its off-loop wrapper).
+
+    Returns ``(direct, offloaded)``: ``direct`` are loop-thread call sites of the blocking
+    sweep (any method except its own ``to_thread`` wrapper); ``offloaded`` are the
+    ``await <wrapper>(...)`` sites, where the wrapper is the one method that hands
+    ``name`` to ``asyncio.to_thread``.
+    """
+    tree = ast.parse(Path(gateway_run_shutdown.__file__).read_text(encoding="utf-8"))
+    mixin = next(
         n for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "GatewayRunner"
+        if isinstance(n, ast.ClassDef) and n.name == "GatewayShutdownMixin"
     )
-    stop = next(
-        n for n in runner.body
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "stop"
-    )
-    direct, offloaded = [], []
-    for node in ast.walk(stop):
-        if not isinstance(node, ast.Call):
+
+    def _names(func):
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return None
+
+    wrappers = set()
+    for method in mixin.body:
+        if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        func = node.func
-        if isinstance(func, ast.Name) and func.id == name:
-            direct.append(node.lineno)
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "to_thread"
-            and node.args
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id == name
-        ):
-            offloaded.append(node.lineno)
+        for node in ast.walk(method):
+            if (
+                isinstance(node, ast.Call)
+                and _names(node.func) == "to_thread"
+                and node.args
+                and _names(node.args[0]) == name
+            ):
+                wrappers.add(method.name)
+    direct, offloaded = [], []
+    for method in mixin.body:
+        if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(method):
+            if not isinstance(node, ast.Call):
+                continue
+            called = _names(node.func)
+            if called == name and method.name not in wrappers:
+                direct.append(node.lineno)
+            if called in wrappers and method.name not in wrappers:
+                offloaded.append(node.lineno)
     return direct, offloaded
 
 
@@ -44,13 +66,13 @@ def test_kill_tool_subprocesses_never_runs_on_the_loop():
     # The loop thread was dumped parked in _fire_job_lock (4 force-exits) and
     # in a terminal-env glob sweep (1) under this helper. Both call sites must
     # hand it to a worker thread.
-    direct, offloaded = _stop_impl_calls_to("_kill_tool_subprocesses")
-    assert direct == [], f"_kill_tool_subprocesses called on the loop at {direct}"
+    direct, offloaded = _stop_impl_calls_to("_stop_kill_tool_subprocesses")
+    assert direct == [], f"_stop_kill_tool_subprocesses called on the loop at {direct}"
     assert len(offloaded) == 2, offloaded
 
 
 def test_shutdown_cron_mark_is_bounded():
-    src = Path(gateway_run.__file__).read_text(encoding="utf-8")
+    src = Path(gateway_run_shutdown.__file__).read_text(encoding="utf-8")
     assert "lock_timeout=_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S" in src
     assert 0 < gateway_run._SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S < 15.0
 

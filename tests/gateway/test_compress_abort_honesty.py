@@ -210,10 +210,14 @@ class TestCompressFeedbackDistinguishesAllCases:
         """
         import pathlib
 
-        import yaml
+        import hermes_yaml as yaml
 
         root = pathlib.Path(__file__).resolve().parents[2]
-        locales = sorted((root / "locales").glob("*.yaml"))
+        # ``*.tui.yaml`` (upstream, parity 2026-10-01) is the TUI catalog with its
+        # own top-level schema; only the gateway catalogs carry ``gateway.compress``.
+        locales = sorted(
+            p for p in (root / "locales").glob("*.yaml") if not p.name.endswith(".tui.yaml")
+        )
         assert locales, "no locale files discovered"
         for path in locales:
             data = yaml.safe_load(path.read_text())

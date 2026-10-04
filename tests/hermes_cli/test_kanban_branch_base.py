@@ -16,6 +16,7 @@ import pytest
 
 from hermes_cli import kanban_branch_base as bb
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 OLD = "2020-01-01T00:00:00+0000"
 
@@ -156,7 +157,7 @@ def test_worktree_workspace_branches_from_fetched_trunk_not_local_head(origin, t
     _advance_trunk(origin, 5)
     trunk_tip = _git(origin, "rev-parse", "HEAD")
     target = tmp_path / "anchor" / ".worktrees" / "t_1"
-    kb._ensure_git_worktree(anchor, target, "wt/t_1")
+    kbw._ensure_git_worktree(anchor, target, "wt/t_1")
     assert _git(target, "rev-parse", "HEAD") == trunk_tip
     # no upstream: a bare `git push` cannot target the trunk
     proc = subprocess.run(["git", "-C", str(target), "rev-parse", "--abbrev-ref", "@{u}"],

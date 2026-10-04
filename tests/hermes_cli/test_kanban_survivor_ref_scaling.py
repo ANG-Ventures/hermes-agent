@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as survivor
 
 
@@ -61,7 +62,7 @@ def _workspace_with_published_heads(conn, nheads):
     can only be attributed to ref count.
     """
     tid = kb.create_task(conn, title=f"refs={nheads}")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
@@ -88,7 +89,7 @@ def _workspace_with_published_heads(conn, nheads):
     git(ws, "add", "impl.py")
     git(ws, "commit", "-m", "unpublished implementation")
 
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws
 
 
@@ -108,7 +109,7 @@ def _workspace_contained_behind_a_tip(conn, nheads):
     decoy before it finds the answer.
     """
     tid = kb.create_task(conn, title=f"contained refs={nheads}")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
@@ -141,7 +142,7 @@ def _workspace_contained_behind_a_tip(conn, nheads):
 
     git(ws, "checkout", "-q", "--detach", head)
     git(ws, "clean", "-qfd")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws, head
 
 

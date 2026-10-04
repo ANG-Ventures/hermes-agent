@@ -216,7 +216,7 @@ def read_entries_with_health(
     cutoff = _hermes_now() - timedelta(hours=window_hours)
     entries: List[Dict[str, Any]] = []
     malformed = 0
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         for seq, line in enumerate(f):
             line = line.strip()
             if not line:
@@ -283,7 +283,7 @@ def _prune_locked(path: Path) -> int:
     kept: List[str] = []
     dropped = 0
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             for line in f:
                 stripped = line.strip()
                 if not stripped:

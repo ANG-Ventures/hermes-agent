@@ -15,6 +15,7 @@ from gateway import kanban_home_route as hr
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_constants import get_hermes_home
 
 LOGS = "1480525090331561984"     # #logs (kanban.lifecycle_channel)
@@ -102,7 +103,7 @@ def _runner(adapters):
 
 def _card(conn, session=None, title="card", sub_chat=APOLLO, assignee="worker"):
     tid = kb.create_task(conn, title=title, assignee=assignee, session_id=session)
-    kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=sub_chat,
+    kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=sub_chat,
                       chat_type="group", user_id="u1", delivery_mode="notify")
     return tid
 
@@ -375,7 +376,7 @@ def test_rehome_stamps_session_and_subscribes_its_chat(tmp_path, monkeypatch, ca
     assert kc._cmd_rehome(argparse.Namespace(task_id=tid, session=S_CC)) == 0
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).session_id == S_CC
-        subs = kb.list_notify_subs(conn, tid)
+        subs = kbn.list_notify_subs(conn, tid)
     assert [(s["platform"], s["chat_id"]) for s in subs] == [("discord", KANBAN_CC)]
     assert "Re-homed" in capsys.readouterr().out
 

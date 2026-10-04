@@ -518,12 +518,17 @@ class TestProductionPathWiring:
 
 
 def _turn_context():
-    import agent.turn_context as m
+    # The turn-prologue preflight was extracted from agent/turn_context.py into
+    # agent/turn_context_compaction.py (upstream turn_*.py split); the AST guard
+    # follows the production site.
+    import agent.turn_context_compaction as m
 
     return m
 
 
 def _conversation_loop():
-    import agent.conversation_loop as m
+    # The pre-API compaction gate was extracted from agent/conversation_loop.py
+    # into agent/turn_preflight.py (upstream turn_*.py split).
+    import agent.turn_preflight as m
 
     return m

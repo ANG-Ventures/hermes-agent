@@ -108,7 +108,7 @@ class TestHandlerFlatStringPins:
 
     def test_flat_string_model_pins_requested_not_agent(self):
         # The exact failing 2026-07-21 call shape: flat model + flat provider.
-        out = json.loads(ct._cronjob_tool_handler({
+        out = json.loads(ct._cronjob_handler({
             "action": "create",
             "prompt": "Check",
             "schedule": "every 1h",
@@ -122,7 +122,7 @@ class TestHandlerFlatStringPins:
         assert out["job"]["provider"] == "openai-codex"
 
     def test_object_shape_still_works(self):
-        out = json.loads(ct._cronjob_tool_handler({
+        out = json.loads(ct._cronjob_handler({
             "action": "create",
             "prompt": "Check",
             "schedule": "every 1h",
@@ -135,7 +135,7 @@ class TestHandlerFlatStringPins:
 
     def test_auto_still_pins_agent(self):
         # Back-compat: model="auto" still resolves to the creating agent.
-        out = json.loads(ct._cronjob_tool_handler({
+        out = json.loads(ct._cronjob_handler({
             "action": "create",
             "prompt": "Check",
             "schedule": "every 1h",
@@ -147,7 +147,7 @@ class TestHandlerFlatStringPins:
         assert out["job"]["provider"] == "claude-apr"
 
     def test_uninterpretable_model_warns_in_result(self):
-        out = json.loads(ct._cronjob_tool_handler({
+        out = json.loads(ct._cronjob_handler({
             "action": "create",
             "prompt": "Check",
             "schedule": "every 1h",
@@ -163,7 +163,7 @@ class TestHandlerFlatStringPins:
         # half-pin. The intent is auto-pin — here the creating agent is fable,
         # so the job should pin the AGENT (model+provider together), never end up
         # with the stray codex provider glued to a fable/auto model.
-        out = json.loads(ct._cronjob_tool_handler({
+        out = json.loads(ct._cronjob_handler({
             "action": "create",
             "prompt": "Check",
             "schedule": "every 1h",

@@ -16,6 +16,8 @@ import yaml
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -45,12 +47,12 @@ def _card_under_retired_root(home, monkeypatch, conn, *, kind='scratch', status=
     _configure(home, root)
     monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == ramscratch)
     task_id = kb.create_task(conn, title='retired root', assignee='default')
-    path = kb.resolve_workspace(
+    path = kbw.resolve_workspace(
         SimpleNamespace(id=task_id, workspace_kind='scratch', workspace_path=None),
         board='default',
     )
     assert path == root / 'default' / task_id
-    kb.set_workspace_path(conn, task_id, path)
+    kbw.set_workspace_path(conn, task_id, path)
     conn.execute('UPDATE tasks SET workspace_kind=?, status=? WHERE id=?', (kind, status, task_id))
     # Retire: config no longer names ramscratch; the volume goes away.
     _configure(home, None)
@@ -70,7 +72,7 @@ def test_retired_root_scratch_card_is_reallocated_and_spawns_same_tick(home, mon
     with kb.connect_closing() as conn:
         task_id, old_path, root = _card_under_retired_root(home, monkeypatch, conn)
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
         assert task_id in calls
         assert task_id not in [t for t, _ in result.workspace_refused]
         assert task_id not in result.stranded_by_mount_loss
@@ -89,7 +91,7 @@ def test_retired_root_heals_when_old_volume_is_mounted_but_tree_gone(home, monke
         root.mkdir(parents=True)  # old volume back, card tree gone
         monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
         calls = []
-        kb.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
         assert task_id in calls
         assert Path(kb.get_task(conn, task_id).workspace_path).parent == kb.workspaces_root('default')
         assert 'stranded_by_mount_loss' in _events(conn, task_id, 'workspace_reallocated')[0]
@@ -100,7 +102,7 @@ def test_retired_root_never_moves_operator_owned_paths(home, monkeypatch, kind):
     with kb.connect_closing() as conn:
         task_id, old_path, _root = _card_under_retired_root(home, monkeypatch, conn, kind=kind)
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
         assert not calls
         assert task_id in [t for t, _ in result.workspace_refused]
         assert kb.get_task(conn, task_id).workspace_path == str(old_path)
@@ -114,7 +116,7 @@ def test_current_root_unmounted_is_not_treated_as_retired(home, monkeypatch):
         task_id, old_path, root = _card_under_retired_root(home, monkeypatch, conn)
         _configure(home, root)
         calls = []
-        result = kb.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
         assert not calls
         assert task_id in [t for t, _ in result.workspace_refused]
         assert kb.get_task(conn, task_id).workspace_path == str(old_path)
@@ -128,7 +130,7 @@ def test_retired_root_reallocates_under_a_new_configured_root(home, monkeypatch)
         _configure(home, new_root)
         monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == new_root.parent)
         calls = []
-        kb.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
         assert task_id in calls
         assert kb.get_task(conn, task_id).workspace_path == str(new_root / 'default' / task_id)
 
@@ -136,14 +138,14 @@ def test_retired_root_reallocates_under_a_new_configured_root(home, monkeypatch)
 def test_dry_run_does_not_reallocate(home, monkeypatch):
     with kb.connect_closing() as conn:
         task_id, old_path, _root = _card_under_retired_root(home, monkeypatch, conn)
-        kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, dry_run=True)
+        kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, dry_run=True)
         assert kb.get_task(conn, task_id).workspace_path == str(old_path)
 
 
 def test_refused_card_is_flagged_in_list_and_show(home, monkeypatch, capsys):
     with kb.connect_closing() as conn:
         task_id, _old, _root = _card_under_retired_root(home, monkeypatch, conn, kind='dir')
-        kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
         state = kb.workspace_refusal_state(conn, [task_id])[task_id]
         assert state['reason'].startswith('workspaces_root_unmounted:')
     monkeypatch.delenv('HERMES_SESSION_ID', raising=False)
@@ -161,5 +163,5 @@ def test_refusal_flag_clears_after_reallocation_and_claim(home, monkeypatch):
         kb._append_event(conn, task_id, 'workspace_refused',
                          {'reason': 'workspaces_root_unmounted: /x'})
         assert task_id in kb.workspace_refusal_state(conn, [task_id])
-        kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
         assert task_id not in kb.workspace_refusal_state(conn, [task_id])

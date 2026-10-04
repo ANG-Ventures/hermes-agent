@@ -60,6 +60,14 @@ def test_provider_request_overrides_merged_under_fast_mode(monkeypatch):
         "hermes_cli.models.resolve_fast_mode_capability",
         lambda **_kw: _NS(request_overrides={"service_tier": "priority"}),
     )
+    # 2026-10 parity merge: upstream extracted the turn route to
+    # gateway/run_turn.py, which gates through resolve_fast_mode_overrides
+    # (route-aware since c7e2e0b779). Stub that seam too so this test pins the
+    # provider-override merge whichever gate the turn path calls.
+    monkeypatch.setattr(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        lambda model_id, **_route: {"service_tier": "priority"},
+    )
     runner = _runner(service_tier="priority")
     rk = _runtime_kwargs(request_overrides=PROVIDER_OVERRIDES)
     route = runner._resolve_turn_agent_config("hi", "main", rk)

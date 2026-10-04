@@ -135,7 +135,7 @@ def box_health_url(sub: str) -> str | None:
     judged on the one bridge that reports that sub's ``usage_limits``.
     """
     try:
-        data = json.loads(_usage_registry_path().read_text(encoding="utf-8"))
+        data = json.loads(_usage_registry_path().read_text(encoding="utf-8-sig"))
     except Exception:
         return None
     subs = data.get("subs") if isinstance(data, dict) else None

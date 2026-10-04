@@ -161,7 +161,7 @@ def test_k95_heartbeat_from_an_older_life_is_not_the_death_time(tmp_path, monkey
     # The dying life never wrote a heartbeat: the file belongs to pid 11111.
     hb.write_text(json.dumps({"pid": 11111, "start_time": 10.0,
                               "updated_at": "2026-09-20T01:00:00+00:00"}), encoding="utf-8")
-    monkeypatch.setattr(ll, "_pid_alive_with_start_time", lambda *a, **k: False)
+    monkeypatch.setattr(ll, "_pid_is_sentinel_owner", lambda *a, **k: False)  # upstream 40087fba7de renamed the probe
     evidence = ll.detect_unclean_exit(tmp_path)
     assert evidence is not None
     assert "last_heartbeat_at" not in evidence, evidence
@@ -179,7 +179,7 @@ def test_k95_heartbeat_of_the_dead_life_is_still_carried(tmp_path, monkeypatch):
     hb = get_loop_heartbeat_path(tmp_path)
     hb.parent.mkdir(parents=True, exist_ok=True)
     hb.write_text(json.dumps({"pid": 99678, "start_time": 5000.0, "updated_at": _DEATH}), encoding="utf-8")
-    monkeypatch.setattr(ll, "_pid_alive_with_start_time", lambda *a, **k: False)
+    monkeypatch.setattr(ll, "_pid_is_sentinel_owner", lambda *a, **k: False)  # upstream 40087fba7de renamed the probe
     assert ll.detect_unclean_exit(tmp_path)["last_heartbeat_at"] == _DEATH
 
 
@@ -282,7 +282,10 @@ def test_k99_skill_added_or_removed_inside_a_category_invalidates_the_index(tmp_
 
 
 def test_k102_honcho_memo_never_stores_values_under_another_contents_digest(tmp_path, monkeypatch):
-    from gateway.run import GatewayRunner
+    # Upstream moved the honcho cache-busting memo from GatewayRunner._extract_honcho_cache_busting_config
+    # into the provider's identity_signature() (consumed via _memory_provider_identity_signature);
+    # the k102 contract (no memoization under a digest the parse did not read) rides that seam now.
+    import plugins.memory.honcho as honcho
     import plugins.memory.honcho.client as hc
 
     cfg = tmp_path / "honcho.json"
@@ -290,7 +293,8 @@ def test_k102_honcho_memo_never_stores_values_under_another_contents_digest(tmp_
     b = json.dumps({"peerName": "bob"})
     cfg.write_text(a, encoding="utf-8")
     monkeypatch.setattr(hc, "resolve_config_path", lambda: cfg)
-    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+    monkeypatch.setattr(honcho, "resolve_config_path", lambda: cfg)
+    provider = honcho.HonchoMemoryProvider()
     real = hc.HonchoClientConfig.from_global_config.__func__
     race = {"armed": True}
 
@@ -301,7 +305,7 @@ def test_k102_honcho_memo_never_stores_values_under_another_contents_digest(tmp_
         return real(cls, *args, **kw)
 
     monkeypatch.setattr(hc.HonchoClientConfig, "from_global_config", classmethod(racing))
-    GatewayRunner._extract_honcho_cache_busting_config()
+    provider.identity_signature()
     cfg.write_text(a, encoding="utf-8")  # flipped back to exactly A
-    values = GatewayRunner._extract_honcho_cache_busting_config()
-    assert values["honcho.peer_name"] == "alice", values
+    values = provider.identity_signature()
+    assert values["user_identity"] == "alice", values

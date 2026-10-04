@@ -141,7 +141,8 @@ def test_run_sync_stamps_anchor_from_raw_transcript() -> None:
     """Wiring: run_sync stamps the anchor from ctx.history (raw rows keep
     timestamps) before converting history for the agent."""
     import inspect
-    from gateway import run as gw_run
+    # Upstream (parity 2026-10-01) moved run_sync into the TurnRunner module.
+    from gateway import run_turn_runner as gw_run
 
     src = inspect.getsource(gw_run)
     stamp = src.index("_stamp_idle_gap_anchor(agent, ctx.history, ctx._interrupt_depth)")

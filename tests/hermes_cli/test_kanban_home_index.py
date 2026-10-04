@@ -186,8 +186,17 @@ def test_sync_hook_lives_inside_write_txn_commit_path():
 
     src = inspect.getsource(kb.write_txn)
     tree = ast.parse(src)
-    calls = [c.func.id for c in ast.walk(tree)
-             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)]
+    # write_txn now lives in kanban_db_connect (upstream split) and reaches the
+    # mirror through the late-bound ``_kb`` namespace, so accept both the bare
+    # name and the attribute call form.
+    calls = []
+    for c in ast.walk(tree):
+        if not isinstance(c, ast.Call):
+            continue
+        if isinstance(c.func, ast.Name):
+            calls.append(c.func.id)
+        elif isinstance(c.func, ast.Attribute):
+            calls.append(c.func.attr)
     assert "_sync_home_index" in calls
     assert src.index("_sync_home_index") > src.index('"COMMIT"')
 

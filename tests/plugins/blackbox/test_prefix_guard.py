@@ -426,10 +426,13 @@ def test_chokepoint_passes_session_and_consumes_compaction_marker(monkeypatch):
                             api_mode="anthropic_messages", session_id="20260925_050000_abcdef",
                             _blackbox_prefix_reset="compaction:threshold")
     req = _request(2)
-    response = SimpleNamespace(usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+
+    def response():
+        # fork: recording is idempotent per response object (f117750b52), so each call gets its own.
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=1, output_tokens=1),
                                pool_headers={"x-pool-served-by": "sub-vps-3"})
-    cch._record_successful_api_call(agent, response, req)
-    cch._record_successful_api_call(agent, response, req)
+    cch._record_successful_api_call(agent, response(), req)
+    cch._record_successful_api_call(agent, response(), req)
     assert [(r["session_key"], r["prefix_reset"]) for r in rows] == [
         ("20260925_050000_abcdef", "compaction:threshold"),
         ("20260925_050000_abcdef", None),  # one-shot: tags exactly the first request after compaction
@@ -446,15 +449,17 @@ def test_chokepoint_keys_review_fork_on_its_own_chain(monkeypatch):
     become the main lane's comparison baseline."""
     rows = []
     monkeypatch.setattr("plugins.blackbox.record_api_call", lambda **row: rows.append(row))
-    response = SimpleNamespace(usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    def response():
+        # fork: recording is idempotent per response object (f117750b52), so each call gets its own.
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=1, output_tokens=1),
                                pool_headers={})
     main = SimpleNamespace(_current_turn_id="S:S:aaaa", provider="p", model="m",
                            api_mode="anthropic_messages", session_id="S")
     fork = SimpleNamespace(_current_turn_id="S:uuid:bbbb", provider="p", model="m",
                            api_mode="anthropic_messages", session_id="S",
                            _memory_write_origin="background_review")
-    cch._record_successful_api_call(main, response, _request(2))
-    cch._record_successful_api_call(fork, response, _request(2))
+    cch._record_successful_api_call(main, response(), _request(2))
+    cch._record_successful_api_call(fork, response(), _request(2))
     assert [(r["session_key"], r["prefix_compare_across_turns"]) for r in rows] == [
         ("S", True), ("S:review", False)]
 

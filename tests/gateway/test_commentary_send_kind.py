@@ -58,25 +58,35 @@ class TestConsumerLane:
 
 class TestRunCallbackLane:
     def test_interim_assistant_cb_marks_commentary(self):
-        """The direct-send branch of ``_interim_assistant_cb`` must wrap its
-        metadata with ``mark_commentary_send``."""
-        src = inspect.getsource(gateway_run)
-        tree = ast.parse(src)
-        cbs = [
-            n for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "_interim_assistant_cb"
-        ]
+        """The direct-send branch of the interim-assistant callback must wrap its
+        metadata with ``mark_commentary_send``. Upstream moved the callback from
+        ``gateway/run.py::_interim_assistant_cb`` into
+        ``gateway/run_turn_runner.py::interim_assistant_cb``, which sends through the
+        ``_send_status_text(text, metadata, ...)`` helper; both homes and both send
+        shapes are accepted, the marker is what is pinned."""
+        import gateway.run_turn_runner as turn_runner
+
+        cbs = []
+        for mod in (gateway_run, turn_runner):
+            tree = ast.parse(inspect.getsource(mod))
+            cbs += [
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef)
+                and n.name in ("_interim_assistant_cb", "interim_assistant_cb")
+            ]
         assert cbs, "_interim_assistant_cb not found"
         for cb in cbs:
             send_calls = [
                 n for n in ast.walk(cb)
                 if isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "send"
+                and n.func.attr in ("send", "_send_status_text")
             ]
             assert send_calls, "expected a direct adapter.send in the callback"
             for call in send_calls:
                 md = next((k.value for k in call.keywords if k.arg == "metadata"), None)
+                if md is None and call.func.attr == "_send_status_text" and len(call.args) >= 2:
+                    md = call.args[1]
                 assert (
                     isinstance(md, ast.Call)
                     and isinstance(md.func, ast.Name)

@@ -359,12 +359,15 @@ def test_seq_counters_are_partitioned_by_turn_on_one_agent(recorded):
             "_api_call_seq_by_turn", {}
         )
         barrier.wait()
-        cch._record_successful_api_call(scoped, response)
-        cch._record_successful_api_call(scoped, response)
+        # Two distinct calls (recording is idempotent per response object).
+        for one in response():
+            cch._record_successful_api_call(scoped, one)
 
     threads = [
-        threading.Thread(target=record, args=("turn-a", _response("sub-vps-7", 1000, 50))),
-        threading.Thread(target=record, args=("turn-b", _response("sub-vps-2", 10, 7))),
+        threading.Thread(target=record, args=(
+            "turn-a", lambda: (_response("sub-vps-7", 1000, 50), _response("sub-vps-7", 1000, 50)))),
+        threading.Thread(target=record, args=(
+            "turn-b", lambda: (_response("sub-vps-2", 10, 7), _response("sub-vps-2", 10, 7)))),
     ]
     for thread in threads:
         thread.start()

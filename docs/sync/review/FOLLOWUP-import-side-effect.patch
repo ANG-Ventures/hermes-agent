@@ -1,0 +1,318 @@
+diff --git a/hermes_cli/psutil_android.py b/hermes_cli/psutil_android.py
+index 4a85c73a72..3c4541212d 100644
+--- a/hermes_cli/psutil_android.py
++++ b/hermes_cli/psutil_android.py
+@@ -3,7 +3,7 @@
+ from pathlib import Path
+ from typing import NoReturn
+ 
+-from hermes_cli._old_updater import stop_for_relaunch
++from hermes_cli._old_updater import in_historical_update, stop_for_relaunch
+ 
+ # Frozen data for old imports, not a download performed by this module.
+ PSUTIL_URL = (
+@@ -21,4 +21,8 @@ def prepare_patched_psutil_sdist(archive: Path, destination: Path) -> NoReturn:
+ # Shim to stop the old updater doing work until relaunch. Historical callers
+ # download PSUTIL_URL BEFORE calling prepare_patched_psutil_sdist, so waiting
+ # for that call is too late. Stop the import without offering a fake URL.
+-stop_for_relaunch()
++# Only under a historical updater frame: anything else that imports this module
++# (an import smoke, a doc tool) would otherwise run a whole update takeover --
++# dependency sync, launcher publication and a gateway fleet restart.
++if in_historical_update():
++    stop_for_relaunch()
+diff --git a/hermes_cli/update_cmd_fleet.py b/hermes_cli/update_cmd_fleet.py
+index aec6e66012..e1a69d5030 100644
+--- a/hermes_cli/update_cmd_fleet.py
++++ b/hermes_cli/update_cmd_fleet.py
+@@ -905,6 +905,14 @@ def _restart_launchd_gateway_after_update(
+     try:
+         if not get_launchd_plist_path().exists():
+             return [], []  # not a launchd install — nothing to do or warn
++        # The label is account-global and the plist path follows the REAL account home, so a
++        # scratch HERMES_HOME shaped like the native default derives the live install's label.
++        # Same ownership rule as the sibling loop (#93349): never refresh or restart another
++        # home's job.
++        from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
++        if (foreign_home := launchd_label_foreign_home(current_label)) is not None:
++            print(describe_skipped_runtime("launchd job", current_label, foreign_home))
++            return [], []
+         # Snapshot BEFORE the restart: "supervising some pid" was true before too, so only a pid that
+         # actually changed distinguishes a restart from a no-op (the sibling loop's contract). Read-only
+         # and verification-only — the restart itself is never gated on `launchctl list` (#74973).
+diff --git a/tests/e2e/core/upgrade/test_fresh_process_entrypoints.py b/tests/e2e/core/upgrade/test_fresh_process_entrypoints.py
+index bb3ecdf35a..4a3dbe8692 100644
+--- a/tests/e2e/core/upgrade/test_fresh_process_entrypoints.py
++++ b/tests/e2e/core/upgrade/test_fresh_process_entrypoints.py
+@@ -204,10 +204,6 @@ def _shipped_modules() -> tuple[list[dict], set[str]]:
+             rel = f.relative_to(WORKTREE).as_posix()
+             if f.name.startswith("test_") or f.name == "conftest.py" or f.stem == "__main__":
+                 continue
+-            # This frozen old-updater shim exits at import time to force a relaunch.
+-            # Importing it is neither safe nor an import-graph smoke test.
+-            if rel == "hermes_cli/psutil_android.py":
+-                continue
+             if tracked is not None and rel not in tracked:
+                 continue
+             if all(p.isidentifier() for p in parts):
+@@ -460,14 +456,16 @@ def _sandbox_or_skip() -> None:
+ # --------------------------------------------------------------------------- (a) import smoke
+ 
+ 
+-def test_relaunch_shim_is_excluded_only_while_it_exits_on_import():
++def test_relaunch_shim_hands_off_at_import_only_under_a_historical_update():
++    # An unconditional module-level stop_for_relaunch() ran a whole update takeover
++    # (and a gateway fleet restart) for ANY importer, an import smoke included.
+     shim = WORKTREE / "hermes_cli" / "psutil_android.py"
+     top_level = ast.parse(shim.read_text(encoding="utf-8")).body
+-    assert any(isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+-               and isinstance(node.value.func, ast.Name) and node.value.func.id == "stop_for_relaunch"
+-               for node in top_level)
++    assert not any(isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
++                   and isinstance(node.value.func, ast.Name) and node.value.func.id == "stop_for_relaunch"
++                   for node in top_level)
+     entries, _ = _shipped_modules()
+-    assert "hermes_cli.psutil_android" not in {entry["id"] for entry in entries}
++    assert "hermes_cli.psutil_android" in {entry["id"] for entry in entries}
+ 
+ def test_optional_import_table_only_names_optional_or_platform_deps():
+     """The tolerance table cannot launder a missing CORE dependency into a skip."""
+diff --git a/tests/hermes_cli/test_import_side_effect_canary.py b/tests/hermes_cli/test_import_side_effect_canary.py
+new file mode 100644
+index 0000000000..f0aafa9c4a
+--- /dev/null
++++ b/tests/hermes_cli/test_import_side_effect_canary.py
+@@ -0,0 +1,170 @@
++"""Canary: importing a shipped module must never install, update or restart anything.
++
++2026-10-01: an import smoke over the whole tree, run under a sandboxed HOME/HERMES_HOME,
++imported ``hermes_cli.psutil_android``. That shim called ``stop_for_relaunch()`` at module
++level, so the import ran a full update takeover (dependency sync, launcher publication,
++``finish_update`` -> ``_restart_gateway_fleet_after_update``). The launchd branch rewrote the
++REAL account's ``~/Library/LaunchAgents/ai.hermes.gateway.plist`` (the plist path is resolved
++from ``pwd``, not ``HOME``) to point at the scratch home and restarted the live gateway on it.
++
++This test imports every module of every shipped package (the ``packages.find`` list in
++pyproject.toml) in ONE fresh interpreter, with HOME and HERMES_HOME in a temp dir and the
++service managers shadowed on PATH. An audit hook in the child records and REFUSES every
++service-manager exec, every child Python interpreter (it would escape the hook) and every
++write outside the temp root, so the probe itself cannot repeat the incident. Any refusal, any service-manager call, and any import that exits the process fails.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++import tomllib
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++
++pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX service managers and paths")
++
++_SERVICE_MANAGERS = ("launchctl", "systemctl", "loginctl", "schtasks")
++
++_CHILD = textwrap.dedent(r'''
++    import importlib, json, os, sys
++
++    root, report = sys.argv[1], sys.argv[2]
++    safe = tuple(os.path.realpath(p) for p in sys.argv[3].split(os.pathsep) if p)
++    managers = set(sys.argv[4].split(","))
++    modules = json.loads(sys.argv[5])
++    python_names = {os.path.basename(sys.executable), os.path.basename(os.path.realpath(sys.executable))}
++    violations = []
++    current = ["<startup>"]
++
++    def _outside(path):
++        try:
++            real = os.path.realpath(os.fsdecode(path))
++        except Exception:
++            return None
++        if real == "/dev/null" or real.startswith(safe):
++            return None
++        return real
++
++    def _hook(event, args):
++        if event in ("subprocess.Popen", "os.exec", "os.posix_spawn", "os.spawn"):
++            argv = args[1] if len(args) > 1 and args[1] else [args[0]]
++            try:
++                exe = os.path.basename(os.fsdecode(list(argv)[0] if not isinstance(argv, (str, bytes)) else argv))
++            except Exception:
++                exe = ""
++            if exe in managers:
++                violations.append({"module": current[0], "kind": "service-manager", "detail": repr(argv)[:300]})
++                raise PermissionError(f"import canary: refused {exe}")
++            if exe.startswith(("python", "pythonw")) or exe in python_names:
++                # A child interpreter escapes this hook (``-I`` drops PYTHONPATH), and the
++                # 2026-10-01 incident ran the whole updater in exactly such a child.
++                violations.append({"module": current[0], "kind": "python-child", "detail": repr(argv)[:300]})
++                raise PermissionError("import canary: refused child interpreter")
++        elif event == "os.system":
++            cmd = os.fsdecode(args[0]) if args and isinstance(args[0], (str, bytes)) else ""
++            if any(m in cmd.split() for m in managers):
++                violations.append({"module": current[0], "kind": "service-manager", "detail": cmd[:300]})
++                raise PermissionError("import canary: refused os.system service-manager call")
++        elif event == "open":
++            path, mode = args[0], args[1]
++            if isinstance(path, (str, bytes, os.PathLike)) and mode and any(c in str(mode) for c in "wax+"):
++                if (real := _outside(path)) is not None:
++                    violations.append({"module": current[0], "kind": "write", "detail": real})
++                    raise PermissionError(f"import canary: refused write to {real}")
++        elif event in ("os.rename", "os.replace", "os.symlink", "os.link", "shutil.copyfile"):
++            target = args[1] if len(args) > 1 else None
++            if isinstance(target, (str, bytes, os.PathLike)) and (real := _outside(target)) is not None:
++                violations.append({"module": current[0], "kind": event, "detail": real})
++                raise PermissionError(f"import canary: refused {event} to {real}")
++        elif event in ("os.mkdir", "os.remove", "os.rmdir", "os.chmod", "os.truncate"):
++            target = args[0] if args else None
++            if isinstance(target, (str, bytes, os.PathLike)) and (real := _outside(target)) is not None:
++                violations.append({"module": current[0], "kind": event, "detail": real})
++                raise PermissionError(f"import canary: refused {event} on {real}")
++
++    sys.path.insert(0, root)
++    sys.argv = ["import-canary"]
++    sys.addaudithook(_hook)
++    exited = []
++    for name in modules:
++        current[0] = name
++        try:
++            importlib.import_module(name)
++        except SystemExit as exc:
++            exited.append({"module": name, "code": repr(exc.code)})
++        except BaseException:
++            pass  # optional third-party deps; this canary is about side effects, not importability
++    with open(report, "w", encoding="utf-8") as fh:
++        json.dump({"violations": violations, "exited": exited, "imported": len(modules)}, fh)
++''')
++
++
++def _shipped_modules() -> list[str]:
++    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
++    includes = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
++    packages = sorted({p for p in includes if not p.endswith(".*")})
++    names: set[str] = set()
++    for pkg in packages:
++        base = ROOT / pkg.replace(".", "/")
++        if not (base / "__init__.py").is_file():
++            continue
++        for path in base.rglob("*.py"):
++            rel = path.relative_to(ROOT).with_suffix("")
++            parts = rel.parts
++            if any(p in {"tests", "__pycache__", "node_modules"} or p.startswith(".") for p in parts):
++                continue
++            if parts[-1] == "__main__" or not all(p.isidentifier() for p in parts):
++                continue
++            names.add(".".join(parts[:-1] if parts[-1] == "__init__" else parts))
++    return sorted(names)
++
++
++def test_importing_every_shipped_module_has_no_service_or_out_of_home_side_effects(tmp_path):
++    modules = _shipped_modules()
++    assert "hermes_cli.psutil_android" in modules  # the module that caused the 2026-10-01 incident
++    assert len(modules) > 100
++
++    home = tmp_path / "home"
++    hermes_home = home / ".hermes"  # the native-default shape: owns the BARE service label
++    hermes_home.mkdir(parents=True)
++    tmpdir = tmp_path / "tmp"
++    tmpdir.mkdir()
++    stubs = tmp_path / "stubbin"
++    stubs.mkdir()
++    calls = tmp_path / "service-manager-calls.log"
++    for name in _SERVICE_MANAGERS:
++        stub = stubs / name
++        stub.write_text(f'#!/bin/sh\necho "{name} $*" >> "{calls}"\nexit 1\n', encoding="utf-8")
++        stub.chmod(0o755)
++
++    report = tmp_path / "report.json"
++    env = {
++        "PATH": f"{stubs}{os.pathsep}/usr/bin{os.pathsep}/bin{os.pathsep}/usr/sbin{os.pathsep}/sbin",
++        "HOME": str(home),
++        "HERMES_HOME": str(hermes_home),
++        "TMPDIR": str(tmpdir),
++        "PYTHONDONTWRITEBYTECODE": "1",
++        "LANG": "C.UTF-8",
++    }
++    safe = os.pathsep.join([str(tmp_path), str(Path("/dev"))])
++    proc = subprocess.run(
++        [sys.executable, "-c", _CHILD, str(ROOT), str(report), safe, ",".join(_SERVICE_MANAGERS),
++         json.dumps(modules)],
++        cwd=str(tmp_path), env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
++        encoding="utf-8", errors="replace", timeout=900,
++    )
++    assert report.is_file(), f"canary child died (rc={proc.returncode}):\n{proc.stderr[-4000:]}"
++    result = json.loads(report.read_text(encoding="utf-8"))
++    stub_calls = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
++
++    problems = [f"  {e['module']}: exited the process at import (code {e['code']})" for e in result["exited"]]
++    problems += [f"  {v['module']}: {v['kind']} {v['detail']}" for v in result["violations"]]
++    problems += [f"  service-manager stub called: {c}" for c in stub_calls]
++    assert not problems, "import-time side effects:\n" + "\n".join(problems)
+diff --git a/tests/hermes_cli/test_old_updater_shims.py b/tests/hermes_cli/test_old_updater_shims.py
+index 56fd097663..66e7e14e65 100644
+--- a/tests/hermes_cli/test_old_updater_shims.py
++++ b/tests/hermes_cli/test_old_updater_shims.py
+@@ -224,9 +224,26 @@ def old_updater():
+     return old
+ 
+ 
++def _under_historical_update(fn, module="hermes_cli.update_cmd"):
++    """Run *fn* below a frame shaped like a historical ``_cmd_update_impl`` (no sentinel local):
++    every shipped caller of the psutil Android installer ran inside that entrypoint."""
++    namespace = {"__name__": module, "_fn": fn}
++    exec("def _cmd_update_impl():\n    pre_update_version = '1.0'\n    _fn()\n", namespace)
++    return namespace["_cmd_update_impl"]
++
++
+ def test_old_android_updater_handoffs_before_download(old_updater, fresh_child):
++    sys.modules.pop("hermes_cli.psutil_android", None)
+     with fresh_child.exits():
+-        old_updater._install_psutil_android_compat(["uv", "pip"])
++        _under_historical_update(lambda: old_updater._install_psutil_android_compat(["uv", "pip"]))()
++
++
++def test_psutil_android_import_outside_an_update_starts_nothing(no_external_work, monkeypatch):
++    # 2026-10-01: an import smoke imported this shim and the unconditional import-time
++    # handoff ran a whole update takeover, which restarted the account's live gateway.
++    monkeypatch.delitem(sys.modules, "hermes_cli.psutil_android", raising=False)
++    module = importlib.import_module("hermes_cli.psutil_android")
++    assert module.PSUTIL_URL.endswith(".tar.gz")
+ 
+ 
+ def test_old_updater_retains_its_code_but_loads_new_managed_uv(old_updater, fresh_child, no_external_work, tmp_path):
+diff --git a/tests/hermes_cli/test_update_launchd_unloaded_gateway.py b/tests/hermes_cli/test_update_launchd_unloaded_gateway.py
+index e62e05eeae..513b5797c6 100644
+--- a/tests/hermes_cli/test_update_launchd_unloaded_gateway.py
++++ b/tests/hermes_cli/test_update_launchd_unloaded_gateway.py
+@@ -108,6 +108,26 @@ class TestLaunchdRestartAfterUpdate:
+         out = capsys.readouterr().out
+         assert "hermes gateway restart" in out
+ 
++    def test_invoking_label_of_another_home_is_left_alone(self, launchd, capsys, tmp_path, monkeypatch):
++        """2026-10-01: a scratch HERMES_HOME shaped like the native default derives the bare label,
++        and the plist path follows the real account home, so the update refreshed and restarted the
++        account's LIVE gateway onto the scratch home. A plist pinning another home is not ours (#93349)."""
++        import plistlib
++
++        calls, state, subprocess_calls = launchd
++        plist = tmp_path / "ai.hermes.gateway.plist"
++        plist.write_bytes(plistlib.dumps({"Label": "ai.hermes.gateway",
++                                          "EnvironmentVariables": {"HERMES_HOME": str(tmp_path / "live-home")}}))
++        before = plist.read_bytes()
++        state["plist"] = plist
++        monkeypatch.setattr("hermes_cli.update_fleet_scope.update_scope_homes", lambda: {(tmp_path / "scratch").resolve()})
++
++        assert update_cmd._restart_launchd_gateway_after_update(supervision_verify=False) == ([], [])
++        assert calls == []
++        assert subprocess_calls == []
++        assert plist.read_bytes() == before
++        assert "left alone" in capsys.readouterr().out
++
+     def test_no_plist_is_not_a_launchd_install(self, launchd, capsys):
+         """No service definition → nothing to restart, and nothing to warn about."""
+         calls, state, _ = launchd

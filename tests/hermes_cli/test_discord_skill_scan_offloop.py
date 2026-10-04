@@ -39,7 +39,7 @@ def _cmds(paths: dict[str, str]) -> dict:
 
 
 def _run(skills_dir: Path, cmds: dict, ext_dirs=()):
-    from hermes_cli.commands import discord_skill_commands_by_category
+    from hermes_cli.commands_platforms import discord_skill_commands_by_category
 
     with patch("agent.skill_commands.get_skill_commands", return_value=cmds), patch(
         "tools.skills_tool.SKILLS_DIR", skills_dir

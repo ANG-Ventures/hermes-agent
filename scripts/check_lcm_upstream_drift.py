@@ -131,7 +131,7 @@ class CheckResult:
 
 def parse_metadata(path: str | Path) -> LcmMetadata:
     metadata_path = Path(path).expanduser().resolve()
-    text = metadata_path.read_text(encoding="utf-8")
+    text = metadata_path.read_text(encoding="utf-8-sig")
     fields = _parse_metadata_section(text, metadata_path)
     missing = [field for field in REQUIRED_FIELDS if not fields.get(field)]
     if missing:

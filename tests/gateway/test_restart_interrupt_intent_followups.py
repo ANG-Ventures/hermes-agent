@@ -242,15 +242,23 @@ def test_stale_spool_is_not_replayed(home):
     assert records == [] and stale == 1
 
 
+# Upstream extracted the post-turn pending drain out of ``_run_agent_admitted`` (gateway/run.py)
+# into ``run_turn.py::_run_agent_drain_pending``; the draining branch lives there now and ends at
+# the method's ``return``.
+RUN_TURN_PY = RUN_PY.with_name("run_turn.py")
+_DRAIN_BRANCH_END = "return pending_event, pending"
+
+
 def test_draining_site_preserves_instead_of_discarding():
-    """Source contract on the one site inside _run_agent_admitted that used to
+    """Source contract on the one site (now ``_run_agent_drain_pending``) that used to
     drop the follow-up: the draining branch must hand it to the spool."""
-    src = RUN_PY.read_text(encoding="utf-8")
+    src = RUN_TURN_PY.read_text(encoding="utf-8")
     assert "Discarding pending follow-up" not in src
+    assert "Discarding pending follow-up" not in RUN_PY.read_text(encoding="utf-8")
     head = "if self._draining and (pending_event or pending):"
     start = src.find(head)
     assert start != -1, "draining follow-up branch not found"
-    end = src.find("if pending_event or pending:", start + len(head))
+    end = src.find(_DRAIN_BRANCH_END, start + len(head))
     assert end != -1
     assert "await self._preserve_followup_across_restart(" in src[start:end]
 
@@ -262,11 +270,11 @@ def test_draining_site_spools_the_parked_event_itself():
     ``pending`` string. Mutating the argument to ``None`` survived 40/40."""
     import ast
 
-    src = RUN_PY.read_text(encoding="utf-8")
+    src = RUN_TURN_PY.read_text(encoding="utf-8")
     head = "if self._draining and (pending_event or pending):"
     start = src.find(head)
     assert start != -1, "draining follow-up branch not found"
-    end = src.find("if pending_event or pending:", start + len(head))
+    end = src.find(_DRAIN_BRANCH_END, start + len(head))
     line_start = src.rfind("\n", 0, start) + 1
     branch = ast.parse(__import__("textwrap").dedent(src[line_start:end]).rstrip() + "\n")
     calls = [

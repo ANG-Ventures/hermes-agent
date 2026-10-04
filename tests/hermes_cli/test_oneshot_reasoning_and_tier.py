@@ -21,7 +21,8 @@ def _run_oneshot(monkeypatch, cfg, *, model, provider, api_mode="codex_responses
             self.tool_gen_callback = object()
             self._session_messages = []
 
-        def run_conversation(self, _prompt):
+        def run_conversation(self, _prompt, conversation_history=None):
+            # upstream's oneshot forwards ``conversation_history=`` (resume support)
             return {"final_response": "done"}
 
         def shutdown_memory_provider(self, messages=None):

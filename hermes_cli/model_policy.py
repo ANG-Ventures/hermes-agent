@@ -193,7 +193,7 @@ def _usage_registry_subs() -> Optional[list]:
 
     try:
         data = json.loads(
-            kanban_provider_health._usage_registry_path().read_text(encoding="utf-8")
+            kanban_provider_health._usage_registry_path().read_text(encoding="utf-8-sig")
         )
     except Exception:
         return None

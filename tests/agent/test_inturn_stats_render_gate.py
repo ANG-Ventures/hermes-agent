@@ -99,17 +99,28 @@ def test_stats_gate_token_identity_and_lcm_scope():
     to _emit_compaction_announce as pre_tokens/post_tokens (_pre_request_est /
     _compressed_est), sits inside the `if _engine_name == "lcm":` branch, and the
     NON-LCM path is left eligible (unchanged always-attempt behavior — Greptile #177)."""
-    src = inspect.getsource(cc_mod)
+    # The announce block now lives in the extracted helper
+    # ``_announce_committed_compaction`` (upstream's compress_context decomposition), where
+    # the two token figures arrive as the parameters ``pre_request_est`` / ``compressed_est``
+    # instead of the inline locals ``_pre_request_est`` / ``_compressed_est``.
+    src = inspect.getsource(cc_mod._announce_committed_compaction)
     # LCM branch: render-eligibility gate consuming the announce-call token variables
     m = re.search(
         r"if _engine_name == \"lcm\":\s*"
         r"_inturn_stats_eligible = _inturn_stats_render_eligible\(\s*_status,\s*"
-        r"locals\(\)\.get\(\"_pre_request_est\"\),\s*_compressed_est,?\s*\)\s*"
+        r"(?P<pre>locals\(\)\.get\(\"_pre_request_est\"\)|_?pre_request_est),\s*"
+        r"(?P<post>_?compressed_est),?\s*\)\s*"
         r"else:\s*"
         r"_inturn_stats_eligible = True",
         src,
     )
     assert m, "gate must be LCM-scoped, consume _pre_request_est/_compressed_est, and leave non-LCM eligible"
+    # Token identity: the announce call passes the SAME two names the gate consumed.
+    post = m.group("post")
+    pre = "_pre_request_est" if m.group("pre").startswith("locals") else m.group("pre")
+    assert re.search(rf"pre_tokens={re.escape(pre)},\s*post_tokens={re.escape(post)},", src), (
+        "announce call must pass the gate's exact token variables as pre_tokens/post_tokens"
+    )
 
 
 # ────────────────────────── behavior through the announce block ──────────────────────────

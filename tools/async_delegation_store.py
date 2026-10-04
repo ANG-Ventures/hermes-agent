@@ -168,7 +168,7 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
     if not path.exists():
         return empty_registry()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         logger.error("async_delegation_registry_invalid path=%s reason=%s", path, exc)
         raise RegistryError(f"invalid async-delegation registry: {exc}") from exc

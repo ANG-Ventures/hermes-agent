@@ -31,6 +31,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as ks
 
 HEAD = "a1" * 20
@@ -89,10 +90,10 @@ def _commit(repo, name, text):
 
 def _dispatched(board, tid):
     """Workspace with recorded repo `a` at a commit holding unpublished bytes."""
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     a = _init(ws / "a")
     _commit(a, "lost_impl.py", f"UNPUBLISHED_{tid}\n")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     ks.record_baseline(board, tid, ws)
     assert set(ks._state(board, tid)[0]) == {"a"}
     return ws, a

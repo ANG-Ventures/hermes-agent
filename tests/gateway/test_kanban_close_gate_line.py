@@ -9,6 +9,7 @@ import time
 from gateway import kanban_close_gate as cg
 from gateway.kanban_lifecycle_digest import LifecycleDigest, fold_batches, render
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from tests.gateway.test_kanban_changes_requested_notifier import (
     RecordingAdapter,
     _run_one_tick,
@@ -24,7 +25,7 @@ def _card(*, reason, items=None, head=HEAD, batch="apollo-1700", own_pr=PR, cove
     try:
         tid = kb.create_task(conn, title="fs-daemon-guard", assignee="daedalus",
                              session_id="agent:main:telegram:thread:chat-1:topic-7")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", thread_id="topic-7",
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", thread_id="topic-7",
                           chat_type="thread", delivery_mode="notify",
                           delivery_metadata={"session_id": "topic-7", "chat_type": "thread"})
         if own_pr:
@@ -196,7 +197,7 @@ def test_watcher_folds_an_operator_batch_into_one_home_line(tmp_path, monkeypatc
         for i, gate in enumerate(("2 quiet ticks + mdutil -s", "p99 < 200ms one hour", "one 6h digest cycle")):
             pr = f"ANG-Ventures/hermes-home#{2470 + i}"
             tid = kb.create_task(conn, title=f"c{i}", assignee="daedalus", session_id=sid)
-            kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="home", chat_type="group",
+            kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="home", chat_type="group",
                               delivery_mode="notify")
             conn.execute("INSERT INTO task_runs (task_id, profile, status, outcome, metadata, started_at) "
                          "VALUES (?, 'daedalus', 'done', 'review_requested', ?, 1)",
@@ -207,7 +208,7 @@ def test_watcher_folds_an_operator_batch_into_one_home_line(tmp_path, monkeypatc
                              payload={"reason": gate, "implementer": "daedalus", "reviewer": "human:apollo"})
             ids.append(tid)
         real = kb.create_task(conn, title="real", assignee="daedalus", session_id=sid)
-        kb.add_notify_sub(conn, task_id=real, platform="telegram", chat_id="home", chat_type="group",
+        kbn.add_notify_sub(conn, task_id=real, platform="telegram", chat_id="home", chat_type="group",
                           delivery_mode="notify")
         kb._append_event(conn, real, kind="changes_requested",
                          payload={"reason": "F1: fix the race", "implementer": "daedalus"})

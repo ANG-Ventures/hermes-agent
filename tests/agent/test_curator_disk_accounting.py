@@ -59,6 +59,10 @@ def test_run_counts_archives_without_usage_rows(tmp_path, monkeypatch, consolida
 
     monkeypatch.setattr(curator, "apply_automatic_transitions", automatic)
     monkeypatch.setattr(curator, "_run_llm_review", review)
+    # Subject is the on-disk accounting (#699), not candidate selection: with no usage rows the
+    # real candidate list is empty and the pass is skipped ("llm: skipped (no candidates)"), so
+    # hand the fork a non-empty list to keep the review step on the path under test.
+    monkeypatch.setattr(curator, "_render_candidate_list", lambda: "Agent-created skills (2):\n- archive-one\n- archive-two")
     curator.run_curator_review(synchronous=True, consolidate=consolidate)
     report_dir = Path(curator.load_state()["last_report_path"])
     report = json.loads((report_dir / "run.json").read_text())

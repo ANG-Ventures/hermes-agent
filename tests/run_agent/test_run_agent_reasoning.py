@@ -312,6 +312,21 @@ class TestExtractReasoning:
         # structured field was found first → content-list branch skipped
         assert result == "from structured field"
 
+    def test_thinking_block_list_payload_flattened_not_crashed(self, agent):
+        # Non-strict OpenAI-compatible backends (Mistral via custom provider) can
+        # deliver the thinking value as a JSON array; .strip() on a list crashed
+        # the whole API call with AttributeError (#106006). Flatten instead.
+        msg = _mock_assistant_msg(
+            content=[{"type": "thinking", "thinking": ["list-shaped reasoning", "part two"]}]
+        )
+        assert agent._extract_reasoning(msg) == "list-shaped reasoningpart two"
+
+    def test_thinking_block_string_payload_still_extracted(self, agent):
+        msg = _mock_assistant_msg(
+            content=[{"type": "thinking", "thinking": "  block reasoning  "}]
+        )
+        assert agent._extract_reasoning(msg) == "block reasoning"
+
 
 class TestReasoningReplayForStrictProviders:
     """Assistant replay must preserve provider-native reasoning fields."""

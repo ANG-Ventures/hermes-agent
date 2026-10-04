@@ -20,6 +20,7 @@ import pytest
 from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as survivor
 
 
@@ -44,7 +45,7 @@ NHEADS = 60
 
 def _card_with_many_published_heads(conn):
     tid = kb.create_task(conn, title="terminal transition under many refs")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
@@ -65,7 +66,7 @@ def _card_with_many_published_heads(conn):
     (ws / "impl.py").write_text("implementation = True\n")
     git(ws, "add", "impl.py")
     git(ws, "commit", "-m", "unpublished implementation")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws
 
 
@@ -163,7 +164,7 @@ def _card_contained_behind_a_tip(conn):
     653.6 s against the new form's 13 / 2.4 s (same ref, exact parity).
     """
     tid = kb.create_task(conn, title="contained HEAD under many refs")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
@@ -194,7 +195,7 @@ def _card_contained_behind_a_tip(conn):
         git(ws, "push", "-q", "origin", f"HEAD:refs/heads/aaa-decoy-{i:04d}")
     git(ws, "checkout", "-q", "--detach", head)
     git(ws, "clean", "-qfd")
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws
 
 

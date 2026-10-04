@@ -35,7 +35,7 @@ def _plugin_metadata() -> dict[str, str]:
     metadata = {"name": "hermes-lcm", "version": "unknown"}
     manifest = _PLUGIN_ROOT / "plugin.yaml"
     try:
-        for line in manifest.read_text(encoding="utf-8").splitlines():
+        for line in manifest.read_text(encoding="utf-8-sig").splitlines():
             key, sep, raw_value = line.partition(":")
             if not sep:
                 continue

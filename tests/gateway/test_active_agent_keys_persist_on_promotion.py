@@ -25,14 +25,18 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+# Upstream (parity 2026-10-01) extracted the ``track_agent`` closure out of
+# ``gateway/run.py`` into the ``_run_agent_track_agent`` mixin method in
+# ``gateway/run_turn.py``; the contract is unchanged, only the owner moved.
+RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run_turn.py"
+_TRACK_AGENT_NAMES = ("track_agent", "_run_agent_track_agent")
 
 
 def _find_track_agent(tree: ast.AST) -> ast.AsyncFunctionDef | ast.FunctionDef:
     for node in ast.walk(tree):
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "track_agent":
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in _TRACK_AGENT_NAMES:
             return node
-    raise AssertionError("track_agent closure not found in gateway/run.py")
+    raise AssertionError("track_agent closure not found in gateway/run_turn.py")
 
 
 def _is_promotion_assign(stmt: ast.stmt) -> bool:
@@ -40,10 +44,22 @@ def _is_promotion_assign(stmt: ast.stmt) -> bool:
     if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
         return False
     tgt = stmt.targets[0]
-    if not (isinstance(tgt, ast.Attribute) and tgt.attr == "agent"
-            and isinstance(tgt.value, ast.Attribute) and tgt.value.attr == "turn"):
-        return False
     val = stmt.value
+    # Upstream form: ``turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx``
+    if isinstance(tgt, ast.Tuple) and isinstance(val, ast.Tuple) and len(tgt.elts) == len(val.elts):
+        return any(_is_promotion_pair(t, v) for t, v in zip(tgt.elts, val.elts))
+    return _is_promotion_pair(tgt, val)
+
+
+def _is_promotion_pair(tgt: ast.expr, val: ast.expr) -> bool:
+    if not (isinstance(tgt, ast.Attribute) and tgt.attr == "agent"):
+        return False
+    owner = tgt.value
+    owner_is_turn = (isinstance(owner, ast.Attribute) and owner.attr == "turn") or (
+        isinstance(owner, ast.Name) and owner.id == "turn_state"
+    )
+    if not owner_is_turn:
+        return False
     return (isinstance(val, ast.Subscript) and isinstance(val.value, ast.Name)
             and val.value.id == "agent_holder")
 

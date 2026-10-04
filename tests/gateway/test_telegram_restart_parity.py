@@ -158,6 +158,13 @@ def _build_connect_harness(monkeypatch, captured, adapter=None):
 # on that single path. Every other call site is still bound by the invariant —
 # both tests below share this exemption set so they can never drift apart.
 _CONFLICT_RECOVERY_EXEMPT = frozenset({"_handle_polling_conflict"})
+# The initial-connect bootstrap. Upstream (2026-10-01 parity) extracted the polling half of
+# ``connect`` into ``_start_polling_mode(is_reconnect=...)``, called only from ``connect``.
+_BOOTSTRAP_FNS = frozenset({"connect", "_start_polling_mode"})
+# The cold-boot gate as upstream now spells it: ``_cold_boot_drop_pending`` returns False on a
+# reconnect and ``extra.drop_pending_on_cold_boot`` (default true) on a cold boot — the same
+# ``not is_reconnect`` contract behind a config knob (proven behaviourally by AC-1/AC-2 above).
+_COLD_BOOT_GATES = frozenset({"not is_reconnect", "self._cold_boot_drop_pending(is_reconnect=is_reconnect)"})
 
 
 # ── INV-1: reconnect preserves the queue; cold boot drops it ──────────────
@@ -203,6 +210,22 @@ async def test_cold_boot_drops_pending_updates(monkeypatch):
 
 
 # ── INV-2: every non-bootstrap recovery poll preserves the queue ──────────
+
+
+def _resolve_local_alias(fn, expr: str) -> str:
+    """A bare local name passed as ``drop_pending_updates`` (``drop_pending = <gate>; ...
+    drop_pending_updates=drop_pending``) is judged by the single value assigned to it in the
+    enclosing function; anything else (several assignments, no assignment) stays as spelled so
+    the verdict is explicit. Non-identifier expressions pass through untouched."""
+    if fn is None or not expr.isidentifier() or expr == "drop_pending_updates":
+        return expr
+    values = [
+        ast.unparse(node.value)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == expr
+    ]
+    return values[0] if len(values) == 1 else expr
 
 
 def _start_polling_calls_in_adapter():
@@ -253,7 +276,7 @@ def _start_polling_calls_in_adapter():
                 dpu = ast.unparse(kw.value)
         fn = enclosing.get(id(node))
         fn_name = fn.name if fn is not None else "<module>"
-        results.append((node.lineno, fn_name, dpu))
+        results.append((node.lineno, fn_name, _resolve_local_alias(fn, dpu)))
 
     # Dataflow resolution for thin polling wrappers (upstream extracted a
     # ``_start_polling_resilient`` helper that adds a bootstrap watchdog around
@@ -296,7 +319,7 @@ def _start_polling_calls_in_adapter():
             for kw in node.keywords:
                 if kw.arg == "drop_pending_updates":
                     dpu = ast.unparse(kw.value)
-            calls_of[name].append((node.lineno, caller_name, dpu))
+            calls_of[name].append((node.lineno, caller_name, _resolve_local_alias(caller, dpu)))
 
     # Fixpoint: replace (fn, 'drop_pending_updates') rows — a wrapper
     # forwarding its own param — with the rows of the wrapper's callers.
@@ -327,7 +350,7 @@ def test_all_start_polling_sites_preserve_queue_or_gate_on_reconnect():
     calls = _start_polling_calls_in_adapter()
     assert calls, "expected at least one start_polling call site in adapter.py"
 
-    allowed = {"False", "not is_reconnect"}
+    allowed = {"False"} | _COLD_BOOT_GATES
     offenders = [
         (lineno, fn, expr)
         for lineno, fn, expr in calls
@@ -355,10 +378,10 @@ def test_recovery_ladders_preserve_queue_unconditionally():
     calls = _start_polling_calls_in_adapter()
 
     recovery = [
-        (ln, fn, e) for ln, fn, e in calls if fn != "connect"
+        (ln, fn, e) for ln, fn, e in calls if fn not in _BOOTSTRAP_FNS
     ]
     bootstrap = [
-        (ln, fn, e) for ln, fn, e in calls if fn == "connect"
+        (ln, fn, e) for ln, fn, e in calls if fn in _BOOTSTRAP_FNS
     ]
 
     assert recovery, (
@@ -379,7 +402,7 @@ def test_recovery_ladders_preserve_queue_unconditionally():
     # The bootstrap inside connect() is the only place a cold-boot gate is legal.
     bad_bootstrap = [
         (ln, fn, e) for ln, fn, e in bootstrap
-        if e not in {"not is_reconnect", "False"}
+        if e not in _COLD_BOOT_GATES | {"False"}
     ]
     assert not bad_bootstrap, (
         "the connect() bootstrap must gate on cold-boot (not is_reconnect) or "

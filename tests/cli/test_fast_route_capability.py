@@ -179,12 +179,21 @@ def test_anthropic_resolver_and_adapter_share_one_immutable_exact_catalog():
     from hermes_cli.fast_mode_contracts import FAST_MODE_CAPABILITY_CATALOG
     from hermes_cli.models import resolve_fast_mode_capability
 
+    # Live docs (https://platform.claude.com/docs/en/build-with-claude/fast-mode): Opus 5.5,
+    # Opus 5 and Opus 4.8 — the same three ids as the fast-mode pricing rows and
+    # ``agent.model_metadata._ANTHROPIC_FAST_MODE_MODELS``; one exact catalog, no family prefix.
     assert FAST_MODE_CAPABILITY_CATALOG["anthropic_fast"]["models"] == (
+        "claude-opus-5-5",
+        "claude-opus-5",
         "claude-opus-4-8",
     )
     for model, expected in (
         ("claude-opus-4-8", True),
         ("anthropic/claude-opus-4.8", True),
+        ("claude-opus-5", True),
+        ("claude-opus-5-5", True),
+        ("anthropic/claude-opus-5.5", True),
+        ("claude-opus-5-6", False),
         ("claude-opus-4-7", False),
         ("claude-opus-4-80", False),
         ("claude-opus-4-8:fast", False),

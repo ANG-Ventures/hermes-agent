@@ -13,6 +13,8 @@ import pytest
 
 from gateway.kanban_watchers import _acquire_singleton_lock, _release_singleton_lock
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -26,7 +28,7 @@ def board(tmp_path, monkeypatch):
 
 
 def assert_tick_available(board):
-    with kb._dispatch_tick_lock(board) as held:
+    with kbc._dispatch_tick_lock(board) as held:
         assert held is True
 
 
@@ -36,7 +38,7 @@ def test_global_leadership_does_not_block_cli_dispatch(board):
     try:
         assert not os.get_inheritable(handle.fileno())
         with kb.connect_closing(board) as conn:
-            result = kb.dispatch_once(conn, dry_run=True)
+            result = kbd.dispatch_once(conn, dry_run=True)
         assert result.skipped_locked is False
         contender, state = _acquire_singleton_lock(board.parent / "kanban/.dispatcher.lock")
         assert contender is None
@@ -48,14 +50,14 @@ def test_global_leadership_does_not_block_cli_dispatch(board):
 @pytest.mark.parametrize("error", [KeyboardInterrupt, GeneratorExit, asyncio.CancelledError])
 def test_tick_released_after_base_exception(board, error):
     with pytest.raises(error):
-        with kb._dispatch_tick_lock(board) as held:
+        with kbc._dispatch_tick_lock(board) as held:
             assert held is True
             raise error()
     assert_tick_available(board)
 
 
 def test_abandoned_context_manager_releases_after_collection(board):
-    manager = kb._dispatch_tick_lock(board)
+    manager = kbc._dispatch_tick_lock(board)
     assert manager.__enter__() is True
     del manager
     gc.collect()
@@ -67,7 +69,7 @@ async def test_cancelled_task_releases_tick_lock(board):
     entered = asyncio.Event()
 
     async def owner():
-        with kb._dispatch_tick_lock(board) as held:
+        with kbc._dispatch_tick_lock(board) as held:
             assert held is True
             entered.set()
             await asyncio.Future()
@@ -86,7 +88,7 @@ def test_exec_child_does_not_inherit_tick_descriptor(board):
 
     # Deliberately disable subprocess's close_fds protection: prove the opened
     # lock descriptor itself has close-on-exec, independently of spawn defaults.
-    manager = kb._dispatch_tick_lock(board)
+    manager = kbc._dispatch_tick_lock(board)
     with manager as held:
         assert held is True
         descriptor = manager.gen.gi_frame.f_locals["handle"].fileno()

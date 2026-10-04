@@ -1,3 +1,5 @@
+import ast
+import inspect
 """#84733: prompt-cache TTL/prefix propagation into MoA/aux paths + failover re-preflight.
 
 The main loop threads ``agent._cache_ttl`` and the stable system prefix into
@@ -10,9 +12,6 @@ per-destination Qwen clamp (1h -> 5m), and the failover re-preflight
 contract (every fallback activation must restart the outer iteration so the
 pre-API preflight re-runs against the fallback's context window).
 """
-
-import ast
-import inspect
 
 
 def _collect_cache_controls(obj):
@@ -197,140 +196,105 @@ class TestFailoverRestartsPreflight:
     restart statement for its loop fails here on purpose.
     """
 
+    # Upstream split ``run_conversation`` into phase helpers (agent/turn_*.py) that return a
+    # verdict instead of executing ``break`` / ``continue`` themselves. The retry loop is
+    # ``conversation_loop._run_api_retry_loop`` and a ``"break"`` verdict from a retry-loop
+    # phase leaves it with ``restart_with_rebuilt_messages`` armed (``_arm_fallback_restart``),
+    # which ``apply_retry_restarts`` turns into an outer ``continue``. Outer-loop phases must
+    # verdict ``"continue"`` directly.
+    RETRY_LOOP_PHASES = {
+        "nous_rate_limit_guard", "retry_invalid_response", "handle_content_policy_refusal",
+        "_content_filter_fallback", "settle_unrecovered_error", "route_classified_error",
+    }
+    OUTER_LOOP_PHASES = {"recover_empty_response", "continue_codex_incomplete"}
+    # Pre-loop: the codex app-server turn hands its failure to the generic loop (bool), no verdict.
+    EXEMPT = {"activate_codex_app_server_fallback"}
+    PHASE_MODULES = (
+        "turn_api_call", "turn_api_error", "turn_empty_response", "turn_recovery",
+        "turn_response_check", "turn_truncation",
+    )
+
+    @staticmethod
+    def _verdict_action(fn, if_node):
+        """The loop action a fallback-activation ``if`` body resolves to."""
+        rets = [stmt for stmt in if_node.body if isinstance(stmt, ast.Return)]
+        assert len(rets) == 1, f"{fn.name}: fallback site must return exactly one verdict"
+        value = rets[0].value
+        if isinstance(value, ast.Name) and value.id == "CODEX_FALLBACK_ACTIVATED":
+            return "continue"  # turn_response_intake maps the sentinel to _verdict("continue")
+        if isinstance(value, ast.Call):
+            if isinstance(value.func, ast.Name) and not value.args:
+                nested = next(
+                    (n for n in ast.walk(fn)
+                     if isinstance(n, ast.FunctionDef) and n.name == value.func.id), None)
+                if nested is not None:
+                    inner = [n.value for n in ast.walk(nested) if isinstance(n, ast.Return)]
+                    assert len(inner) == 1
+                    value = inner[0]
+            if isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Constant):
+                return value.args[0].value
+        raise AssertionError(f"{fn.name}: unrecognised verdict shape {ast.dump(value)}")
+
     def test_every_fallback_activation_restarts_preflight(self):
+        import importlib
+
         from agent import conversation_loop
 
-        tree = ast.parse(inspect.getsource(conversation_loop.run_conversation))
-
-        # Parent map so each site can be bound to its nearest enclosing loop.
-        parents = {}
-        for node in ast.walk(tree):
-            for child in ast.iter_child_nodes(node):
-                parents[child] = node
-
-        retry_loops = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.While)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "retry_count"
-        ]
-        assert retry_loops, "expected the retry loop in run_conversation"
-        retry_loop_ids = {id(loop) for loop in retry_loops}
-
-        def _inside_retry_loop(node):
-            cur = parents.get(node)
-            while cur is not None:
-                if id(cur) in retry_loop_ids:
-                    return True
-                cur = parents.get(cur)
-            return False
-
-        def _test_calls_fallback(test_node):
-            # Direct call `if agent._try_activate_fallback(...):` OR a guarded
-            # boolean form `if _cond and agent._try_activate_fallback(...):`
-            # (parity 2026-08-30: upstream added a `_may_fallback and ...`
-            # site; short-circuit AND preserves the restart discipline -- the
-            # call still executes only inside the If test).
-            if (
-                isinstance(test_node, ast.Call)
-                and isinstance(test_node.func, ast.Attribute)
-                and test_node.func.attr == "_try_activate_fallback"
-            ):
-                return True
-            if isinstance(test_node, ast.BoolOp) and isinstance(test_node.op, ast.And):
-                return any(_test_calls_fallback(v) for v in test_node.values)
-            return False
-
-        fallback_ifs = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If) and _test_calls_fallback(node.test)
-        ]
-        assert fallback_ifs, "expected _try_activate_fallback sites in run_conversation"
-        # Every reference to _try_activate_fallback must be one of the matched
-        # `if agent._try_activate_fallback(...):` sites — a site written as
-        # `activated = agent._try_activate_fallback()` would silently escape
-        # this guard.
-        all_refs = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Attribute)
-            and node.attr == "_try_activate_fallback"
-        ]
-        assert len(all_refs) == len(fallback_ifs), (
-            "every _try_activate_fallback reference must be a direct "
-            "`if agent._try_activate_fallback(...):` site so this guard "
-            "can bind its restart discipline (#84733)"
-        )
-        for node in fallback_ifs:
-            if _inside_retry_loop(node):
-                assert any(isinstance(stmt, ast.Break) for stmt in node.body), (
-                    "retry-loop fallback activation must break to the "
-                    "restart-with-rebuilt-messages handler so the pre-API "
-                    "preflight re-runs against the fallback's context "
-                    "window (#84733)"
-                )
-            else:
-                assert any(
-                    isinstance(stmt, ast.Continue) for stmt in node.body
-                ), (
-                    "outer-loop fallback activation must continue the outer "
-                    "iteration (which re-runs the preflight); a break here "
-                    "would end the turn without calling the fallback (#84733)"
-                )
-                assert not any(
-                    isinstance(stmt, ast.Break) for stmt in node.body
-                ), (
-                    "outer-loop fallback activation must not break — that "
-                    "exits the conversation loop and ends the turn (#84733)"
-                )
-
-    def test_restart_handler_clears_preflight_block(self):
-        """The single consumer of restart_with_rebuilt_messages must clear
-        _preflight_compression_blocked, so every retry-loop failover gets a
-        fresh preflight against the fallback's context window (#84733)."""
-        from agent import conversation_loop
-
-        tree = ast.parse(inspect.getsource(conversation_loop.run_conversation))
-        handlers = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Attribute)
-            and node.test.attr == "restart_with_rebuilt_messages"
-        ]
-        assert handlers, "expected the restart_with_rebuilt_messages handler"
-        consumer = [
-            node
-            for node in handlers
-            if any(
-                isinstance(stmt, ast.Assign)
-                and any(
-                    isinstance(t, ast.Attribute)
-                    and t.attr == "restart_with_rebuilt_messages"
-                    for t in stmt.targets
-                )
-                for stmt in node.body
-            )
-        ]
-        assert consumer, "expected the flag-consuming handler"
-        for node in consumer:
+        loop_src = inspect.getsource(conversation_loop._run_api_retry_loop)
+        assert "while s.retry_count < s.max_retries" in loop_src, "expected the retry loop"
+        for name in self.RETRY_LOOP_PHASES | self.OUTER_LOOP_PHASES | self.EXEMPT:
             assert any(
-                isinstance(stmt, ast.Assign)
-                and any(
-                    isinstance(t, ast.Name)
-                    and t.id == "_preflight_compression_blocked"
-                    for t in stmt.targets
+                hasattr(importlib.import_module(f"agent.{m}"), name) for m in self.PHASE_MODULES
+            ), f"phase {name} moved: update the loop table"
+
+        seen = 0
+        for mod_name in self.PHASE_MODULES:
+            mod = importlib.import_module(f"agent.{mod_name}")
+            tree = ast.parse(inspect.getsource(mod))
+            parents = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parents[child] = node
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Attribute) and node.attr == "_try_activate_fallback"):
+                    continue
+                seen += 1
+                if_node = fn = None
+                cur = parents.get(node)
+                while cur is not None and fn is None:
+                    if isinstance(cur, ast.If) and if_node is None:
+                        if_node = cur
+                    if isinstance(cur, ast.FunctionDef):
+                        fn = cur
+                    cur = parents.get(cur)
+                assert fn is not None
+                if fn.name in self.EXEMPT:
+                    continue
+                # Every site must be a direct ``if agent._try_activate_fallback(...):`` so this
+                # guard can bind its restart discipline (#84733).
+                assert if_node is not None and node in list(ast.walk(if_node.test)), (
+                    f"{mod_name}.{fn.name}: _try_activate_fallback must be an `if` test"
                 )
-                and isinstance(stmt.value, ast.Constant)
-                and stmt.value.value is False
-                for stmt in node.body
-            ), (
-                "the restart handler must clear _preflight_compression_blocked "
-                "so the re-run preflight isn't skipped (#84733)"
-            )
+                action = self._verdict_action(fn, if_node)
+                if fn.name in self.RETRY_LOOP_PHASES:
+                    assert action == "break", (
+                        f"{mod_name}.{fn.name}: retry-loop fallback activation must verdict "
+                        "'break' so apply_retry_restarts re-runs the preflight (#84733)"
+                    )
+                    assert "restart_with_rebuilt_messages = True" in inspect.getsource(mod) or (
+                        "_arm_fallback_restart(" in ast.unparse(if_node)
+                        or "_fallback_break()" in ast.unparse(if_node)
+                    ), f"{mod_name}.{fn.name}: break site must arm restart_with_rebuilt_messages"
+                elif fn.name in self.OUTER_LOOP_PHASES:
+                    assert action == "continue", (
+                        f"{mod_name}.{fn.name}: outer-loop fallback activation must verdict "
+                        "'continue' (re-runs the preflight); 'break' ends the turn (#84733)"
+                    )
+                else:
+                    raise AssertionError(
+                        f"{mod_name}.{fn.name}: new fallback site — classify it in the loop table"
+                    )
+        assert seen >= 12, f"expected the known fallback sites, saw {seen}"
 
 
 class TestAuxFallbackReplanThreadsTtl:

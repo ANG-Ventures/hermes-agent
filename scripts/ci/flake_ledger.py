@@ -224,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--list", default=fq.LIST_PATH)
     args = ap.parse_args(argv)
     path = Path(args.list)
-    data = fq.parse_list(path.read_text(encoding="utf-8") if path.is_file() else None)
+    data = fq.parse_list(path.read_text(encoding="utf-8-sig") if path.is_file() else None)
     now = dt.datetime.now(dt.timezone.utc)
     if args.cmd == "digest":
         lines = digest(data, now.date())
@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.assign:
             print("--apply needs --assign: every quarantine names a fix card + owner", file=sys.stderr)
             return 2
-        ready, missing = assign(found, json.loads(Path(args.assign).read_text(encoding="utf-8")))
+        ready, missing = assign(found, json.loads(Path(args.assign).read_text(encoding="utf-8-sig")))
         for node in missing:
             print(f"NOT quarantined (no card/owner assigned): {node}", file=sys.stderr)
         if ready:

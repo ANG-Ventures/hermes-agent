@@ -2,11 +2,11 @@
 import asyncio
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
 from tests.gateway.test_completion_delivery import (
+    AdmittingHandler,
     _async_event,
     _json_outbox_states,
     _runner,
@@ -31,7 +31,8 @@ def test_cancel_during_batch_receipt_finishes_all_accepted_receipts(
     if with_legacy:
         for event in events:
             _persist_pending_completion(event)
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    # The fake transport must issue the production acceptance receipt (admit_internal_event).
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     entered = threading.Event()
     release = threading.Event()

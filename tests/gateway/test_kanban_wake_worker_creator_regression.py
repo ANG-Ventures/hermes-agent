@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 from tests.gateway.test_kanban_wake_phantom_prevention import (  # noqa: F401
     CHAT,
@@ -49,7 +50,7 @@ def _worker_card(session_id) -> str:
             conn, title="worker card", assignee="worker",
             session_id=session_id,
         )
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT,
             chat_type="group", delivery_mode="notify+wake",
         )

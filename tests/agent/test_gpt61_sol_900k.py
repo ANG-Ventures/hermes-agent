@@ -35,7 +35,7 @@ def _codex_ctx(model: str) -> int:
     import agent.model_metadata as mm
 
     mm._codex_oauth_context_cache = {}
-    with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+    with patch("agent.model_metadata.model_metadata_http.get", return_value=fake_response), \
          patch("agent.model_metadata.get_cached_context_length", return_value=None), \
          patch("agent.model_metadata.save_context_length"):
         return get_model_context_length(

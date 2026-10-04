@@ -100,7 +100,7 @@ def _run_terminal(**kwargs):
          patch("tools.terminal_tool._start_cleanup_thread"), \
          patch("tools.terminal_tool._active_environments", {}), \
          patch("tools.terminal_tool._last_activity", {}), \
-         patch("tools.terminal_tool._create_environment", return_value=mock_env), \
+         patch("tools.terminal_tool_backends._create_environment", return_value=mock_env), \
          patch("tools.terminal_tool._check_all_guards",
                return_value={"approved": True}, create=True):
         result = json.loads(terminal_tool(**kwargs))
@@ -225,7 +225,7 @@ class TestPollingLoopGuard:
         with patch("tools.terminal_tool._gateway_polling_loop_guidance") as guard, \
              patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
              patch("tools.terminal_tool._start_cleanup_thread"), \
-             patch("tools.terminal_tool._create_environment", return_value=MagicMock()):
+             patch("tools.terminal_tool_backends._create_environment", return_value=MagicMock()):
             try:
                 terminal_tool(command=INCIDENT_LOOP, background=True, notify_on_complete=True)
             except Exception:
@@ -317,7 +317,7 @@ class TestToolWaitLongWatchdog:
         Discord turn without ever spawning the shell."""
         from model_tools import handle_function_call
 
-        with patch("tools.terminal_tool._create_environment") as create:
+        with patch("tools.terminal_tool_backends._create_environment") as create:
             out = handle_function_call(
                 "terminal", {"command": INCIDENT_LOOP, "timeout": 3600}, task_id="t-e2e"
             )

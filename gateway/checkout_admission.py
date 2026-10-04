@@ -231,7 +231,7 @@ class HoldStore:
     def read_hold(self) -> Optional[HoldState]:
         """``None`` = open. Raises :class:`HoldUnreadable` on any doubt."""
         try:
-            raw = self.hold_path.read_text(encoding="utf-8")
+            raw = self.hold_path.read_text(encoding="utf-8-sig")
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -312,7 +312,7 @@ class HoldStore:
 
     def read_consumer(self, name: str) -> Optional[dict]:
         try:
-            raw = self.consumer_path(name).read_text(encoding="utf-8")
+            raw = self.consumer_path(name).read_text(encoding="utf-8-sig")
         except FileNotFoundError:
             return None
         data = json.loads(raw)

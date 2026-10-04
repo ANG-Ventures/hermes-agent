@@ -1,0 +1,10 @@
+tools/skill_manager_tool.py
+tools/terminal_tool.py
+tools/shell_heredoc.py
+tools/cronjob_tools.py
+tools/web_tools.py
+tools/vision_tools.py
+tools/file_operations.py
+plugins/kanban/dashboard/plugin_api.py
+tools/environments/base.py
+tools/environments/local.py

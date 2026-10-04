@@ -211,6 +211,9 @@ def test_goal_wait_barriers_mark_the_process(monkeypatch):
             return 1
 
     monkeypatch.setattr(pr_module, "process_registry", _Reg())
+    # Upstream (parity 2026-10-01) refuses a dead pid before parking; this test pins
+    # the barrier registration, not host liveness, so the fake pid is "alive".
+    monkeypatch.setattr(goals, "_pid_alive", lambda pid: True)
     goals._DB_CACHE.clear()
     try:
         mgr = goals.GoalManager(session_id="t-ec17-goal")
@@ -319,7 +322,7 @@ def test_normalize_agent_notify_mode(raw, want):
 
 def test_spawn_stamps_producer_profile_mode(tmp_path, monkeypatch):
     import tools.process_registry as pr_module
-    import yaml
+    import hermes_yaml as yaml
     home = __import__("os").environ["HERMES_HOME"]
     from pathlib import Path
     Path(home, "config.yaml").write_text(

@@ -107,7 +107,8 @@ async def test_replace_waits_past_ten_seconds_before_sigkill(monkeypatch, tmp_pa
     monkeypatch.setattr("gateway.status._snapshot_gateway_children", lambda pid: [])
     monkeypatch.setattr("gateway.status.reap_gateway_children", lambda children, *, parent_pid, timeout=5.0: 0)
 
-    def _terminate(pid, force=False):
+    def _terminate(pid, force=False, expected_start_time=None):
+        # upstream terminate_pid grew an identity guard kwarg (start-time check)
         events.append(("terminate", pid, force, clock["t"]))
         if force:
             old_alive["v"] = False

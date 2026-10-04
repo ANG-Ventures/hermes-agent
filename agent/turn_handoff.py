@@ -327,7 +327,7 @@ def _unlink_if_unchanged(path: Path, raw: str) -> None:
         return
     try:
         try:
-            current = claimed.read_text(encoding="utf-8")
+            current = claimed.read_text(encoding="utf-8-sig")
         except Exception:
             current = raw
         if current != raw:
@@ -363,7 +363,7 @@ def _load_turn_handoff(
             logger.debug("turn handoff claim failed for %s", session_key, exc_info=True)
             return None
     try:
-        raw = source.read_text(encoding="utf-8")
+        raw = source.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None
     except Exception:
@@ -469,7 +469,7 @@ def prune_expired_handoffs(*, root: Optional[Path] = None) -> int:
     now = time.time()
     for path in entries:
         try:
-            raw = path.read_text(encoding="utf-8")
+            raw = path.read_text(encoding="utf-8-sig")
         except Exception:
             continue
         try:

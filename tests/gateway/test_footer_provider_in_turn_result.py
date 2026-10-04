@@ -29,20 +29,24 @@ def _run_sync_source() -> str:
 
 
 def test_turn_result_carries_served_provider():
+    # Parity 2026-10-01: upstream's run_sync builds ONE ``usage`` dict that both result paths
+    # (success + empty-response) share through ``common``; the fork's served provider and live
+    # reasoning config ride that dict (names follow upstream's ``resolved_*`` locals).
     src = _run_sync_source()
-    assert re.search(r'_resolved_provider\s*=\s*getattr\(_agent,\s*"provider"', src), (
+    assert re.search(r'resolved_provider\s*=\s*getattr\(agent,\s*"provider"', src), (
         "run_sync no longer resolves the served provider — the footer's "
         "provider/model field will silently degrade to the bare model"
     )
-    assert src.count('"provider": _resolved_provider') >= 2, (
-        "both run_sync result dicts (success + failure) must carry the served "
-        "provider for the runtime footer"
+    assert '"provider": resolved_provider' in src, (
+        "the run_sync usage dict (shared by the success + failure results) must carry the "
+        "served provider for the runtime footer"
     )
+    assert "**common" in src or "common" in src, "both result paths must share the usage dict"
 
 
 def test_turn_result_carries_live_reasoning_config():
     src = _run_sync_source()
-    assert src.count('"reasoning_config": _resolved_reasoning_config') >= 2, (
+    assert '"reasoning_config": getattr(agent, "reasoning_config"' in src, (
         "run_sync result dicts must carry the live reasoning config — "
         "_footer_reasoning_label prefers it over the session-resolver fallback"
     )
@@ -59,5 +63,5 @@ def test_announce_and_persist_served_route_is_not_orphaned():
     )
     # And the call must feed the resolved identity, not constants.
     call = src.split("_announce_and_persist_served_route(", 1)[1][:400]
-    assert "served_provider=_resolved_provider" in call
-    assert "served_model=_resolved_model" in call
+    assert "served_provider=resolved_provider" in call
+    assert "served_model=resolved_model" in call

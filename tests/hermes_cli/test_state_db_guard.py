@@ -1,6 +1,6 @@
 """Tests for the state.db integrity guard used by the update flow (#68474).
 
-Exercises ``verify_sqlite_integrity`` and ``copy_db_and_verify`` against REAL
+Exercises ``verify_sqlite_integrity`` against REAL
 SQLite files (valid, zeroed, truncated) — the exact corruption signature from
 issue #68474 (file kept at original size, 100% null bytes, header gone).
 """
@@ -9,7 +9,7 @@ import sqlite3
 
 import pytest
 
-from hermes_cli.backup import copy_db_and_verify, verify_sqlite_integrity
+from hermes_cli.backup import verify_sqlite_integrity
 
 
 @pytest.fixture()
@@ -92,7 +92,6 @@ class TestPreUpdateBackupIntegrityGuard:
     @pytest.fixture()
     def hermes_home(self, tmp_path, monkeypatch):
         from pathlib import Path
-        import sys
 
         root = tmp_path / ".hermes"
         root.mkdir()
@@ -104,15 +103,17 @@ class TestPreUpdateBackupIntegrityGuard:
         conn.close()
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        for mod in list(sys.modules.keys()):
-            if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
-                del sys.modules[mod]
-        return root
+        # Fresh import of the config layer under the temp HERMES_HOME, restored on teardown
+        # (the fork's sys_modules leak gate fails a purge that is not put back).
+        from tests.sys_modules_leak_gate import purged_modules
+
+        with purged_modules(lambda mod: mod.startswith("hermes_cli.config") or mod == "hermes_constants"):
+            yield root
 
     def test_healthy_db_stays_quiet(self, hermes_home, capsys):
         from argparse import Namespace
 
-        from hermes_cli.main import _run_pre_update_backup
+        from hermes_cli.update_cmd import _run_pre_update_backup
 
         snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
         out = capsys.readouterr().out
@@ -126,7 +127,7 @@ class TestPreUpdateBackupIntegrityGuard:
         from argparse import Namespace
 
         import hermes_cli.backup as backup_mod
-        from hermes_cli.main import _run_pre_update_backup
+        from hermes_cli.update_cmd import _run_pre_update_backup
 
         real_create = backup_mod.create_quick_snapshot
 
@@ -142,3 +143,22 @@ class TestPreUpdateBackupIntegrityGuard:
         assert snap_id is not None
         assert "integrity check FAILED" in out
         assert "Snapshot copy is valid" in out
+
+    def test_failed_snapshot_is_loud_and_update_continues(self, hermes_home, capsys, monkeypatch):
+        """Best-effort by design, but never silent: a snapshot helper that raises (or captures
+        nothing) prints a stdout warning and returns None so the receipt records a failed step."""
+        from argparse import Namespace
+
+        import hermes_cli.backup as backup_mod
+        from hermes_cli.update_cmd import _run_pre_update_backup
+
+        def boom(**kwargs):
+            raise PermissionError("state-snapshots is read-only")
+
+        monkeypatch.setattr(backup_mod, "create_quick_snapshot", boom)
+        snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
+        out = capsys.readouterr().out
+        assert snap_id is None
+        assert "Pre-update snapshot FAILED" in out
+        assert "state-snapshots is read-only" in out
+        assert "Continuing with update" in out

@@ -27,15 +27,33 @@ from pathlib import Path
 
 import pytest
 
-import agent.conversation_loop as conversation_loop
-import run_agent
+# 2026-10-01 parity sync: upstream extracted the outgoing-message builder
+# (``build_api_messages``) out of ``conversation_loop`` into ``turn_context`` and
+# the session-DB flush into ``session_persistence``; the strip itself now pops
+# the ``PERSISTENCE_ONLY_MESSAGE_FIELDS`` contract set ("membership is the real
+# contract") instead of two literal pops. The pins follow the symbols.
+import agent.session_persistence as session_persistence
+import agent.turn_context as outgoing_builder
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 
 STRIPPED_PRESENTATION_FIELDS = ("display_kind", "display_metadata")
+_CONTRACT_SET_NAME = "PERSISTENCE_ONLY_MESSAGE_FIELDS"
 
 
 def _popped_literals(tree: ast.AST, target_name: str) -> set[str]:
-    """Every string literal X in a ``<target_name>.pop("X", ...)`` call."""
+    """Every field X removed by ``<target_name>.pop(...)`` under *tree*.
+
+    A literal ``pop("X", ...)`` counts directly. A ``pop(key, ...)`` whose ``key``
+    iterates ``PERSISTENCE_ONLY_MESSAGE_FIELDS`` counts every member of the real
+    (imported) set — the set, not the leading underscore, is the contract.
+    """
     found: set[str] = set()
+    loop_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and (
+            isinstance(node.iter, ast.Name) and node.iter.id == _CONTRACT_SET_NAME
+        ):
+            loop_vars.add(node.target.id)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -45,22 +63,26 @@ def _popped_literals(tree: ast.AST, target_name: str) -> set[str]:
         value = func.value
         if not isinstance(value, ast.Name) or value.id != target_name:
             continue
-        if node.args and isinstance(node.args[0], ast.Constant):
-            if isinstance(node.args[0].value, str):
-                found.add(node.args[0].value)
+        if not node.args:
+            continue
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found.add(arg.value)
+        elif isinstance(arg, ast.Name) and arg.id in loop_vars:
+            found.update(PERSISTENCE_ONLY_MESSAGE_FIELDS)
     return found
 
 
 class TestReplayStripPinnedBySymbol:
     def test_both_presentation_fields_are_popped_from_api_msg(self):
         """Pinned by AST symbol, not by line number."""
-        source = Path(inspect.getsourcefile(conversation_loop)).read_text()
+        source = Path(inspect.getsourcefile(outgoing_builder)).read_text()
         popped = _popped_literals(ast.parse(source), "api_msg")
 
         for field in STRIPPED_PRESENTATION_FIELDS:
             assert field in popped, (
                 f"api_msg.pop({field!r}) is missing from "
-                f"{conversation_loop.__name__} — presentation-only fields "
+                f"{outgoing_builder.__name__} — presentation-only fields "
                 "would be replayed to the provider. See "
                 "agent/confab_notice.py and the out-of-band notice contract."
             )
@@ -73,7 +95,7 @@ class TestReplayStripPinnedBySymbol:
         wire copy still carried the field, so also require that the enclosing
         function references the clone helper.
         """
-        source = Path(inspect.getsourcefile(conversation_loop)).read_text()
+        source = Path(inspect.getsourcefile(outgoing_builder)).read_text()
         tree = ast.parse(source)
 
         hosts = []
@@ -99,7 +121,7 @@ class TestPersistenceCarriesDisplayMetadata:
     """Spec §consumer step 4 — do not 'add' this, assert it stays."""
 
     def test_flush_passes_display_metadata_into_the_row_dict(self):
-        source = Path(inspect.getsourcefile(run_agent)).read_text()
+        source = Path(inspect.getsourcefile(session_persistence)).read_text()
         tree = ast.parse(source)
 
         found = False
@@ -142,11 +164,16 @@ class TestCloneForSendBehaviour:
             },
         }
 
-        api_msg = conversation_loop._clone_message_for_send(msg)
-        # The clone is structural; the strip is the caller's two pops. Apply
-        # them the same way the builder does and assert nothing leaks.
-        api_msg.pop("display_kind", None)
-        api_msg.pop("display_metadata", None)
+        from agent.conversation_loop import _clone_message_for_send  # the builder's helper
+
+        api_msg = _clone_message_for_send(msg)
+        # The clone is structural; the strip is the caller's pop of the
+        # persistence-only contract set. Apply it the same way the builder does
+        # and assert nothing leaks — and that both fields ARE in that set.
+        for field in STRIPPED_PRESENTATION_FIELDS:
+            assert field in PERSISTENCE_ONLY_MESSAGE_FIELDS
+        for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+            api_msg.pop(key, None)
 
         assert "scaffold_confab_removed" not in repr(api_msg)
         # And the clone must not have aliased the persisted dict.

@@ -2061,7 +2061,7 @@ def externalized_payload_stats(config, hermes_home: str = "") -> dict[str, Any]:
                 if stat.st_mtime > latest_mtime:
                     latest_mtime = stat.st_mtime
                     latest_path = str(path)
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
                 total_chars += int(payload.get("content_chars") or len(payload.get("content", "") or ""))
             except Exception:
                 continue

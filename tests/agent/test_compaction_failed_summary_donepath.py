@@ -42,19 +42,27 @@ def _build_real_agent(db: SessionDB, session_id: str):
 
 def _thrash_transcript() -> list:
     """A transcript whose PROTECTED TAIL is essentially the whole request: a
-    tiny summarizable middle + an 8-message huge recent tail. Summarizing the
-    middle sheds ~0% of the request, so a failed/placeholder summary that stays
-    over threshold is the real thrash condition (the protected tail alone
-    exceeds the trigger)."""
+    tiny summarizable middle + a huge in-progress final exchange. Summarizing
+    the middle sheds ~0% of the request, so a failed/placeholder summary that
+    stays over threshold is the real thrash condition (the protected tail alone
+    exceeds the trigger).
+
+    Parity 2026-10-01: upstream fdbcdef9146 bounds the ``protect_last_n`` count
+    floor by the tail token budget (pinned by
+    test_message_floor_does_not_unboundedly_override_soft_ceiling), so a
+    4-pair huge tail no longer rides the floor past the ceiling — the walk
+    folds older pairs and the request genuinely shrinks. What still stays in
+    the tail unconditionally is the REQUIRED anchor pair: the most recent user
+    turn (#10896) and the latest visible assistant reply (#29824). Put the
+    weight there."""
     msgs = []
     # Tiny middle (cheap to summarize, ~zero payoff).
     for i in range(4):
         msgs.append({"role": "user", "content": f"mid {i}"})
         msgs.append({"role": "assistant", "content": "ok"})
-    # 8-message huge recent tail (protected; dominates the request).
-    for i in range(4):
-        msgs.append({"role": "user", "content": "recent " * 5000})
-        msgs.append({"role": "assistant", "content": "reply " * 5000})
+    # Huge final exchange (required anchors; dominates the request).
+    msgs.append({"role": "user", "content": "recent " * 20000})
+    msgs.append({"role": "assistant", "content": "reply " * 20000})
     return msgs
 
 
@@ -65,7 +73,7 @@ def test_failed_summary_over_threshold_counts_ineffective_on_real_donepath(tmp_p
     agent = _build_real_agent(db, parent)
 
     cc = agent.context_compressor
-    cc.protect_last_n = 8
+    cc.protect_last_n = 2
     cc.abort_on_summary_failure = False
     # Force the summary to FAIL -> placeholder path.
     cc._generate_summary = lambda *a, **k: None
