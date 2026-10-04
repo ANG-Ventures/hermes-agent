@@ -453,3 +453,155 @@ def test_pool_unavailable_pins_are_logged(kanban_home, caplog):
         _make(conn, 1, body="host:ace-ai")
         _tick(conn, spillover=None, spawn_limit=4)
     assert any("wait pool_unavailable" in r.getMessage() for r in caplog.records)
+
+
+
+# -- Apollo review r1 (PR #1730) -------------------------------------------
+
+def test_reservation_is_refunded_when_launch_fails_before_spawn(kanban_home):
+    """A reserved remote slot whose launch dies before the worker starts goes
+    back to the shared plan, so a later card (any board) can still use it."""
+    plan = _plan(free=1)
+    calls = []
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        calls.append(task.id)
+        if len(calls) == 1:
+            raise RuntimeError("worker host ace-ai: mkdir failed")
+        return 4242
+
+    with kb.connect_closing() as conn:
+        first, second = _make(conn, 2)
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_paused="test",
+                                spawn_limit=0, spillover=plan, reconcile_orphans=False)
+    assert res.spawn_failed == [first]
+    assert res.placed == [(second, "ace-ai")]
+
+
+def test_native_command_profile_is_never_placed(kanban_home):
+    (kanban_home / "profiles" / "alpha" / "config.yaml").write_text(
+        "foreign_lane:\n  worker_command: [\"echo\", \"{task_id}\"]\n", encoding="utf-8")
+    assert _portable(native_command=True) == (False, "native_command", None)
+    with kb.connect_closing() as conn:
+        (pinned,) = _make(conn, 1, body="host:ace-ai")
+        (plain,) = _make(conn, 1)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert spawned == [] and res.placed == []
+    assert res.placement_waits == {pinned: "not_portable:native_command", plain: "local_full"}
+
+
+def test_placement_turns_ssh_file_sync_off(monkeypatch):
+    """One kanbanw login serves every profile: a placed worker's ssh backend
+    syncs nothing up (credentials) and nothing back down (other profiles)."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools import terminal_tool, terminal_tool_backends as tb
+
+    env: dict = {}
+    kwh.apply_placement(env, _host(), "/tmp/ws")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    cfg = terminal_tool._get_env_config()
+    assert cfg["env_type"] == "ssh" and cfg["ssh_sync_files"] is False
+    seen = {}
+    monkeypatch.setattr(tb, "_SSHEnvironment", lambda **kw: seen.update(kw) or object())
+    tb._build_ssh_env(cwd="/tmp/ws", timeout=5, ssh_config=tb._ssh_config_from_config(cfg))
+    assert seen["sync_files"] is False and seen["user"] == "kanbanw"
+
+
+def test_retired_worker_hosts_refusal_is_visible_in_load_gate(tmp_path):
+    from gateway.kanban_gate_tick import GateTickBuilder
+    from hermes_cli.kanban_load_gate import LoadGate
+
+    _write_pool(tmp_path)
+    gate = LoadGate({}, ncpu=32)
+    gate.band = "paused"
+    builder = GateTickBuilder(gate, fleet_dir=lambda: tmp_path,
+                              kanban_cfg=lambda: {"worker_hosts": [{"name": "x"}]},
+                              ledger=lambda b: {}, connect=None, probe=lambda h: (1.0, 16))
+    assert builder.plan_pool([], {}) is None
+    assert gate.pool["planned"] is False
+    assert gate.pool["reason"] == "refused:legacy_worker_hosts"
+    assert "retired" in gate.pool["warnings"][0]
+
+
+def test_daemon_places_through_the_gateway_plan(kanban_home, monkeypatch):
+    import threading
+
+    from hermes_cli import config as _config
+    from hermes_cli import kanban_load_gate as klg
+
+    _write_pool(kanban_home / "fleet")
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (146.0, 90.0))
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kw):
+        captured.update(kw)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=lambda _r: stop.set(),
+                   load_gate=klg.LoadGate({}, ncpu=32))
+    plan = captured["spillover"]
+    assert captured["spawn_limit"] == 0 and isinstance(plan, kwp.SpilloverPlan)
+    assert list(plan.hosts) == ["ace-ai", "ace-media"] and plan.budget == 8
+
+
+def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeypatch):
+    import argparse
+
+    from hermes_cli import config as _config
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_load_gate as klg
+
+    _write_pool(kanban_home / "fleet")
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (1.0, 1.0))
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.1, None))
+    with kb.connect_closing() as conn:
+        _make(conn, 1, body="host:ace-media")
+    captured: dict = {}
+
+    def fake_dispatch_once(conn, **kw):
+        captured.update(kw)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    kb_cli._cmd_dispatch(argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False))
+    plan = captured["spillover"]
+    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is True
+    assert plan.take("alpha", pin="ace-media").name == "ace-media"
+
+
+def test_count_running_by_placement_reads_one_snapshot(kanban_home, monkeypatch):
+    """A placed run that ends between the two queries must not be read as a
+    LOCAL worker (total counted it, the remote map did not)."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    real = kwp.running_by_host
+
+    def finish_then_read(conn):
+        with kb.connect_closing() as other:
+            other.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+            other.commit()
+        return real(conn)
+
+    monkeypatch.setattr(kwp, "running_by_host", finish_then_read)
+    assert kb.count_running_by_placement([{"slug": "default"}]) == {"default": (1, {"ace-ai": 1})}
+
+
+def test_aborted_placement_is_not_reported_placed(kanban_home, monkeypatch):
+    """``placed`` is a subset of ``spawned``: the gateway books local spawns
+    by id, so a placement the loop aborted must not appear in either."""
+    monkeypatch.setattr(kbd, "_set_worker_pid", lambda *a, **k: False)
+    monkeypatch.setattr(kb, "_abort_lost_claim_spawn", lambda *a, **k: None)
+    with kb.connect_closing() as conn:
+        _make(conn, 1)
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    assert len(spawned) == 1 and res.spawned == [] and res.placed == []
+    res = kb.DispatchResult(spawned=[("a", "x", ""), ("b", "x", "")], placed=[("c", "ace-ai")])
+    assert kbd._local_spawn_count(res) == 2
