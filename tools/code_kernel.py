@@ -611,12 +611,13 @@ def _parent_process_handle(child_env: Dict[str, str]):
 def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
            sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "") -> None:
     from tools.code_execution_env import _build_child_env
-    from tools.code_execution_tool import generate_hermes_tools_module
+    from tools.code_execution_tool import generate_hermes_tools_module, _AGENT_TOOLS_ALIAS_MODULE
     kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
     kernel.rpc_token = secrets.token_urlsafe(32)
     kernel.sentinel = "@@HERMES-KERNEL-" + secrets.token_urlsafe(16) + "@@"
     rpc_endpoint = _bind_rpc_socket(kernel)
     for name, src in (("hermes_tools.py", generate_hermes_tools_module(list(sandbox_tools))),
+                      ("agent_tools.py", _AGENT_TOOLS_ALIAS_MODULE),
                       ("hermes_kernel_runner.py", KERNEL_RUNNER_SOURCE)):
         Path(kernel.tmpdir, name).write_text(src, encoding="utf-8")
     child_env = _build_child_env(rpc_endpoint=rpc_endpoint, rpc_token=kernel.rpc_token,

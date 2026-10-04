@@ -36,7 +36,7 @@ NOTE = (
 MANAGE_CATALOG_SCHEMA = {
     "name": "manage_catalog",
     "description": (
-        "Find and install Hermes catalog plugins and hub skills for the user. 'search' lists matches "
+        "Find and install catalog plugins and hub skills for the user. 'search' lists matches "
         "(id, kind, display, tier, platforms, installed) and changes nothing. 'install' shows the user "
         "one approval card with a row per item and blocks until every row is installed, skipped, or "
         "the card is closed; the host installs each approved row into the user's default profile at "

@@ -23,8 +23,6 @@ from typing import Callable, Dict, Any, List, Optional
 
 import copy
 
-from hermes_constants import display_hermes_home
-
 logger = logging.getLogger(__name__)
 
 
@@ -591,31 +589,32 @@ def check_tts_requirements() -> bool:
 from tools.registry import registry, tool_error
 
 def _output_path_description(home: str) -> str:
-    return f"Optional custom file path to save the audio. Defaults to {home}/audio_cache/<timestamp>.mp3"
+    return f"Optional custom file path to save the audio. Defaults to the audio_cache/ subdirectory of {home} (a <timestamp>.mp3 name is appended when omitted)"
 
 
 def _tts_schema_overrides() -> dict:
-    """Rebuild the ``output_path`` default hint from the ACTIVE profile at every get_definitions():
-    the multiplexed gateway serves every profile from one process, so a path baked in at import
-    would name the launch profile's home for everyone else (#95685)."""
+    """Keep the ``output_path`` default hint profile-neutral at every get_definitions():
+    the multiplexed gateway serves every profile from one process, and the concrete
+    profile path would name the launch profile's data home for everyone else (#95685)
+    and leak the profile name into the wire schema (t_79ef440f)."""
     params = copy.deepcopy(TTS_SCHEMA["parameters"])
-    params["properties"]["output_path"]["description"] = _output_path_description(display_hermes_home())
+    params["properties"]["output_path"]["description"] = _output_path_description("this profile's data home")
     return {"parameters": params}
 
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected.",
+    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge or custom command providers under tts.providers.<name>), not model-selected.",
     "parameters": {
         "type": "object",
         "properties": {
             "text": {
                 "type": "string",
-                "description": "The text to convert to speech. Provider-specific per-request character caps apply automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); longer input is split into ordered chunks without silent truncation."
+                "description": "The text to convert to speech. Provider-specific per-request character caps apply automatically (typically 4k-40k depending on the provider and model); longer input is split into ordered chunks without silent truncation."
             },
             "output_path": {
                 "type": "string",
-                "description": _output_path_description("the profile HERMES_HOME")
+                "description": _output_path_description("this profile's data home")
             },
             "speed": {
                 "type": "number",
@@ -626,16 +625,16 @@ TTS_SCHEMA = {
                 "description": (
                     "Optional voice-design guidance: tone, emotion, pacing, accent, "
                     "whispering, impressions (e.g. 'Speak in a cheerful, excited whisper'). "
-                    "Forwarded to the OpenAI backend (gpt-4o-mini-tts and OpenAI-compatible "
-                    "voice-design servers). Silently ignored by backends that don't support it."
+                    "Forwarded to voice-design-capable backends. Silently ignored "
+                    "by backends that don't support it."
                 )
             },
             "provider": {
                 "type": "string",
                 "description": (
-                    "Optional TTS provider override. Accepts built-in names "
-                    "(edge, openai, elevenlabs, minimax, xai, mistral, gemini, "
-                    "neutts, kittentts, piper), user-declared command provider "
+                    "Optional TTS provider override. Accepts built-in provider "
+                    "names (edge, neutts, kittentts, piper, and the "
+                    "vendor-backed ones), user-declared command provider "
                     "names from tts.providers.<name>, or plugin-registered names. "
                     "When omitted, the configured tts.provider from config.yaml is used."
                 )

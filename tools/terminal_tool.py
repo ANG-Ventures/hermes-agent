@@ -1775,7 +1775,7 @@ TERMINAL_SCHEMA = {
             },
             "pty": {
                 "type": "boolean",
-                "description": "With background=true: run in a pseudo-terminal for interactive CLI tools (Codex, Claude Code, Python REPL). Local backend only. Default: false.",
+                "description": "With background=true: run in a pseudo-terminal for interactive CLI tools (agent CLIs, Python REPL, shells). Local backend only. Default: false.",
                 "default": False
             },
             "notify": {

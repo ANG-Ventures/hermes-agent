@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import hermes_yaml as yaml
 
-from hermes_constants import display_hermes_home, get_hermes_home
+from hermes_constants import get_hermes_home
 from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -1017,7 +1017,7 @@ def _skill_manage_description() -> str:
         "edit is a list of one); it applies atomically — any failure rolls "
         "every touched skill back. Ops: create (full SKILL.md; when a "
         "shared skills tree exists it lands in "
-        f"{display_hermes_home()}/skills-shared/<category>/ by default — "
+        "the profile home's skills-shared/<category>/ directory by default — "
         "git-backed + shared across agents, so `category` must be a real "
         "shared group; pass local=true for a single-agent skill in the "
         "profile's skills directory or configured skills.create_dir; create must precede that skill's other "

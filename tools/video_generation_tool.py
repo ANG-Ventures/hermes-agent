@@ -250,7 +250,7 @@ _GENERIC_DESCRIPTION = (
     "reference-to-video. Video edit/extend workflows are not part of this "
     "unified surface; use a dedicated provider-specific tool when one is "
     "available. The backend and model family are user-configured via "
-    "`hermes tools` → Video Generation; the agent does not pick them. "
+    "the CLI's tool manager → Video Generation; the agent does not pick them. "
     "Long-running generations may take 30 seconds to several minutes — "
     "the call blocks until the video is ready. Returns the result in the "
     "`video` field — either an HTTP URL or an absolute file path. To show "
@@ -284,7 +284,7 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
     if provider is None:
         parts.append(
             "\nNo video backend is available. Calls will return an error "
-            "until the user picks one via `hermes tools` → Video Generation.")
+            "until the user picks one via the CLI's tool manager → Video Generation.")
         return _schema("\n".join(parts), {"prompt": static_props["prompt"]})
     caps = _provider_call(provider, "capabilities", {})
     models = _provider_call(provider, "list_models", [])

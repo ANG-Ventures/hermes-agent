@@ -25,7 +25,7 @@ def apply_layout_tool(preset: str) -> str:
 APPLY_LAYOUT_SCHEMA = {
     "name": "apply_layout",
     "description": (
-        "Apply a saved layout preset to the Hermes desktop app when the user "
+        "Apply a saved layout preset to the desktop app when the user "
         "asks to rearrange the workspace. Built-ins: default (chat + "
         "sidebars), focus (chat only), terminal-deck, quad; plugin/user "
         "presets by id. To reveal ONE pane, use focus_pane instead."

@@ -1,0 +1,75 @@
+{
+  "_comment": "bl-tokens.json — THE single forbidden-token / forbidden-phrase / allowed-phrase corpus for the BL-1..BL-5 upstream-brand-leak gate. ONE list, four consumers: claude-apx (test/parity/upstream-brand-leak.test.js), claude-bpx (bridge/test/unit-upstream-brand-leak.test.js), claude-pool (tests/test_upstream_brand_leak.py) and the fleet-wide lint (~/.hermes/scripts/fleet-upstream-leak-lint.py). Built 2026-08-08 on card t_0f8201a6 as the measured UNION of the four lists that had drifted apart. Every entry carries the rationale for why it is banned and which sources already had it. DO NOT edit a private copy in a repo: the copies are byte-checked against this file (see bl-tokens.sha256 / the `stale-vendored-tokens` check). Change this file, then re-vendor.",
+
+  "_schema": {
+    "version": "bump on any content change; consumers assert on it so a silently-swapped corpus is a test failure",
+    "forbidden_tokens": "substring-matched, case-insensitive. Names the TRANSPORT, the PRODUCT, the VENDOR or the HARNESS. Any hit inside an upstream-bound or client-facing literal is a leak.",
+    "forbidden_phrases": "substring-matched, case-insensitive. Ordinary English words ('bridge', 'pool', 'gateway') that only self-identify a transport in these specific PHRASINGS. Banning the bare noun would be noise; banning the phrasing is the signal.",
+    "allowed_condition_phrases": "strings that CONTAIN a bare banned-adjacent noun but describe the CONDITION, not the transport. The false-positive guard: a gate that flags these forces correct code to be rewritten for nothing. Only claude-pool carried this before the union.",
+    "allowed_substrings": "strings that contain a forbidden TOKEN but are demonstrably not a leak (vendor header NAMES, the upstream host itself, the vendor's npm scope). Every entry is a hole in the gate, so each one is justified individually and the list is kept short.",
+    "sources": "which of the four pre-union lists already carried the entry. Recorded so a reviewer can see what is genuinely NEW versus what was already agreed."
+  },
+
+  "version": 1,
+  "generated": "2026-08-08",
+  "card": "t_0f8201a6",
+
+  "forbidden_tokens": [
+    { "value": "claude-apx",       "why": "our proxy component's own name — the transport announcing itself",                       "sources": ["apx", "pool", "lint"] },
+    { "value": "claude-api-proxy", "why": "the same component's legacy/repo name; the directory is still claude-api-proxy",       "sources": ["apx", "pool", "lint"] },
+    { "value": "claude-bpx",       "why": "our bridge component's own name — origin of the 2026-08-07 incident (PR #79)",         "sources": ["apx", "bpx", "pool", "lint"] },
+    { "value": "claude-bridge",    "why": "the bridge's pre-rename name; old names alias forever so the old name still identifies us", "sources": ["apx", "bpx", "pool", "lint"] },
+    { "value": "claude bridge",    "why": "space-separated spelling of the same product name — bpx-only before the union; a hyphen is not a security boundary", "sources": ["bpx"] },
+    { "value": "claude-cpx",       "why": "the pinned-sub CLI shim lane",                                                         "sources": ["apx", "pool", "lint"] },
+    { "value": "claude-cpr",       "why": "the pool-picked CLI shim lane. NEW to every gate except the fleet lint — it is a live lane (momus review path migrated onto it 2026-08-08, card t_b06fed47) and was simply never added", "sources": ["lint"] },
+    { "value": "claude-pool",      "why": "the relay component's own name — third leg of the incident (8 error bodies)",          "sources": ["apx", "pool", "lint"] },
+    { "value": "claude-bpp",       "why": "the pool face's pre-rename name",                                                      "sources": ["apx", "pool", "lint"] },
+    { "value": "claude-apr",       "why": "the apx pool face. Missing from apx's own gate before the union",                      "sources": ["pool", "lint"] },
+    { "value": "claude-bpr",       "why": "the bpx pool face. Missing from apx's own gate before the union",                      "sources": ["pool", "lint"] },
+    { "value": "openclaw",         "why": "harness identity — a third-party harness name in-band identifies the whole stack",     "sources": ["apx", "bpx", "pool", "lint"] },
+    { "value": "open-claw",        "why": "hyphenated spelling of the same harness",                                              "sources": ["apx", "pool", "lint"] },
+    { "value": "hermes",           "why": "harness identity — the fleet's own agent product name",                                "sources": ["apx", "bpx", "pool", "lint"] },
+    { "value": "apollo",           "why": "harness/agent identity — the orchestrator profile name",                               "sources": ["apx", "bpx", "pool", "lint"] },
+    { "value": "nousresearch",     "why": "vendor identity behind the harness",                                                   "sources": ["apx", "pool", "lint"] },
+    { "value": "anthropic",        "why": "naming the upstream vendor in OUR OWN error/injected text is a transport tell. Guarded by allowed_substrings for the legitimate header names, the upstream host and the vendor's own SDK preamble. Missing from apx AND bpx before the union", "sources": ["pool", "lint"] },
+    { "value": "proxy",            "why": "bare transport word — a third party in the path announcing its role",                  "sources": ["apx", "bpx", "pool", "lint"] },
+    { "value": "relay",            "why": "bare transport word — same class as proxy",                                            "sources": ["apx", "bpx", "pool", "lint"] }
+  ],
+
+  "forbidden_phrases": [
+    { "value": "bridge notice",         "why": "the literal shape of the CONFAB_MARKER_TEXT leak that started this",                    "sources": ["apx", "bpx", "lint"] },
+    { "value": "bridge diagnostic",     "why": "the failedToolCallRetryPrompt leak's opening words",                                    "sources": ["apx", "bpx", "lint"] },
+    { "value": "the bridge detected",   "why": "self-identifying narration inside injected content",                                    "sources": ["apx", "bpx", "lint"] },
+    { "value": "the bridge removed",    "why": "same class as 'the bridge detected'",                                                   "sources": ["apx", "bpx", "lint"] },
+    { "value": "this bridge",           "why": "self-reference by a transport describing itself to the model",                          "sources": ["apx", "bpx", "lint"] },
+    { "value": "pool: ",                "why": "the self-identifying PREFIX on the pool's 8 leaking error bodies. The bare noun 'pool' stays legal — see allowed_condition_phrases", "sources": ["pool", "lint"] },
+    { "value": "pool notice",           "why": "pool-side analogue of 'bridge notice'",                                                  "sources": ["pool", "lint"] },
+    { "value": "pool diagnostic",       "why": "pool-side analogue of 'bridge diagnostic'",                                             "sources": ["pool", "lint"] },
+    { "value": "the pool detected",     "why": "self-identifying narration",                                                            "sources": ["pool", "lint"] },
+    { "value": "the pool removed",      "why": "self-identifying narration",                                                            "sources": ["pool", "lint"] },
+    { "value": "this pool instance is", "why": "self-reference; the streaming-unsupported body's original shape. Present ONLY in the pool gate before the union — the fleet lint was missing it", "sources": ["pool"] },
+    { "value": "billing proxy",         "why": "names the component's ROLE, which identifies it as precisely as its name",              "sources": ["apx", "pool", "lint"] },
+    { "value": "routing relay",         "why": "same class as 'billing proxy'",                                                         "sources": ["apx", "pool", "lint"] },
+    { "value": "upstream gateway",      "why": "third transport-role phrasing; 'gateway' is ordinary English alone. NEW to all three repo gates — the fleet lint added it and it never propagated back", "sources": ["lint"] }
+  ],
+
+  "allowed_condition_phrases": [
+    { "value": "pool at capacity",                             "why": "describes the CONDITION using the bare English noun for the resource" },
+    { "value": "pool deadline exceeded",                       "why": "condition, not identity" },
+    { "value": "pool health unavailable",                      "why": "condition, not identity" },
+    { "value": "pool models unavailable",                      "why": "condition, not identity" },
+    { "value": "pool dispatch error",                          "why": "condition, not identity" },
+    { "value": "streaming not supported on this pool instance","why": "condition, not identity — deliberately NOT the banned 'this pool instance is' phrasing" }
+  ],
+
+  "allowed_substrings": [
+    { "value": "anthropic-version",   "why": "a REQUIRED upstream request header NAME" },
+    { "value": "anthropic-beta",      "why": "a required upstream header NAME" },
+    { "value": "anthropic-dangerous", "why": "a required upstream header NAME" },
+    { "value": "x-anthropic",         "why": "upstream header namespace" },
+    { "value": "api.anthropic.com",   "why": "the upstream host itself — unavoidable in a client" },
+    { "value": "@anthropic-ai/",      "why": "the vendor's own npm scope in dependency strings" },
+    { "value": "anthropic_version",   "why": "the bedrock/vertex request BODY field name" },
+    { "value": "built on anthropic's claude agent sdk", "why": "🔴 the VENDOR'S OWN preamble, which a genuine client is SUPPOSED to send. apx injects it verbatim to reproduce a real Claude-Agent-SDK request; the source comment marks it exact-match ('Anthropic's classifier may key on this string ... Do not paraphrase'). Removing it would make us MORE distinguishable, not less. The rule is 'do not name the TRANSPORT', not 'never say the vendor'." }
+  ]
+}

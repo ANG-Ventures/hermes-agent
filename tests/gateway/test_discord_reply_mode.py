@@ -305,3 +305,27 @@ class TestVoiceReplyReference:
         await adapter.send_voice("12345", str(audio), reply_to="999")
 
         channel.fetch_message.assert_not_called()
+
+
+class TestReplyToAuthorship:
+    """t_3ad14889: replied-to authorship comes from the platform author id, never text."""
+
+    @pytest.mark.asyncio
+    async def test_reply_to_own_bot_message_is_stamped_own(self, reply_text_adapter):
+        resolved = SimpleNamespace(content="  1. t_0000aaaa \u2192 <#1> \u00b7 session s (x)",
+                                   author=SimpleNamespace(id=999))
+        message = _make_message(content="1", reference=SimpleNamespace(message_id=555, resolved=resolved))
+        await reply_text_adapter._handle_message(message)
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_is_own_message is True
+        assert event.reply_to_author_id == "999"
+
+    @pytest.mark.asyncio
+    async def test_reply_to_user_message_is_not_own(self, reply_text_adapter):
+        resolved = SimpleNamespace(content="  1. t_0000aaaa \u2192 <#1> \u00b7 session s (x)",
+                                   author=SimpleNamespace(id=4242))
+        message = _make_message(content="1", reference=SimpleNamespace(message_id=555, resolved=resolved))
+        await reply_text_adapter._handle_message(message)
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_is_own_message is False
+        assert event.reply_to_author_id == "4242"
