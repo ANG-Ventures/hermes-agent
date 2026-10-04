@@ -377,6 +377,32 @@ def _is_summary_message(content) -> bool:
     return bool(_LCM_SUMMARY_RE.search(text))
 
 
+# LCM opens its summary assembly with this anchor when it preserves the latest
+# user objective (plugins/context_engine/lcm/reconcile.py).
+_LCM_PRESERVED_OBJECTIVE_PREFIX = "[Current user objective preserved from compacted history]"
+
+
+def is_standalone_summary_content(content) -> bool:
+    """True when the WHOLE message is a compaction summary a compactor synthesized.
+
+    Stricter than ``_is_summary_message``: the summary marker must OPEN the
+    message (built-in handoff prefix, an LCM summary header, or LCM's preserved-
+    objective anchor followed by a summary header), so a user row that quotes a
+    summary further down never matches. Replay uses it to keep the
+    ``[timestamp]`` render off these rows: they are sent bare at compaction, so
+    stamping them on reload rewrote msg[0] by the prefix (+30 B, t_f98bc0c5).
+    """
+    from agent.context_compressor import ContextCompressor
+
+    if ContextCompressor.classify_summary_content(content) == "standalone":
+        return True
+    text = _content_to_text(content)
+    if "[Expand for details:" not in text or not _is_summary_message(text):
+        return False
+    head = text.lstrip()
+    return bool(_LCM_SUMMARY_RE.match(head)) or head.startswith(_LCM_PRESERVED_OBJECTIVE_PREFIX)
+
+
 # Internal scaffolding marker the LCM engine sets on the summary message it
 # assembles (see plugins/context_engine/lcm/engine.py). ``_``-prefixed so the
 # transport sanitizer strips it before any provider request (and the Anthropic/
