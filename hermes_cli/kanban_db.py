@@ -17910,8 +17910,14 @@ def count_running_by_placement(boards) -> "dict[str, tuple[int, dict[str, int]]]
     return out
 
 
-def merge_run_metadata(conn: sqlite3.Connection, run_id: int, values: dict) -> None:
-    """Merge ``values`` into one run's metadata JSON (other keys kept)."""
+def merge_run_metadata(conn: sqlite3.Connection, run_id: int, values: dict,
+                       *, keep_max: Iterable[str] = ()) -> None:
+    """Merge ``values`` into one run's metadata JSON (other keys kept).
+
+    A key in ``keep_max`` is a monotonic counter: inside the write txn the
+    stored value becomes ``max(stored, incoming)``, so concurrent writers
+    landing out of order can never lower it.
+    """
     with write_txn(conn):
         row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
@@ -17922,6 +17928,11 @@ def merge_run_metadata(conn: sqlite3.Connection, run_id: int, values: dict) -> N
             meta = {}
         if not isinstance(meta, dict):
             meta = {}
+        values = dict(values)
+        for key in keep_max:
+            old = meta.get(key)
+            if key in values and isinstance(old, int) and not isinstance(old, bool):
+                values[key] = max(old, values[key])
         meta.update(values)
         conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
                      (json.dumps(meta, ensure_ascii=False), run_id))

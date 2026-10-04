@@ -106,6 +106,27 @@ def test_rc9_counter_lands_on_the_run_metadata(tmp_path, monkeypatch):
         meta = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?",
                                        (run_id,)).fetchone()[0])
     assert meta == {"other": 1, kwh.REAPPLY_FAILED_KEY: 3}
+    # Prism r4 b64f07c0: a concurrent call's older count landing last never
+    # lowers the stored counter.
+    kwh._record_reapply_failure(2)
+    with kb.connect_closing() as conn:
+        meta = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?",
+                                       (run_id,)).fetchone()[0])
+    assert meta[kwh.REAPPLY_FAILED_KEY] == 3
+
+
+def test_rc9_reapply_table_after_boot_capture(reapply_state, monkeypatch):
+    """Apollo r4 (C): with the host recorded by ``capture_boot_placement``
+    (no explicit ``boot_host``), the None path still counts every call."""
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
+    environ: dict = {}
+    kwh.apply_placement(environ, HOST, "/tmp/ws")
+    assert kwh.capture_boot_placement(environ) == HOST.name
+    assert kwh.reapply_or_record("terminal", environ) == HOST.name
+    environ.pop(kwh.PLACEMENT_ENV)
+    for _ in range(2):
+        assert kwh.reapply_or_record("terminal", environ) is None
+    assert kwh.reapply_failures() == 2 and reapply_state == [1, 2]
 
 
 def test_unreadable_local_workspace_fails_closed(tmp_path, monkeypatch):

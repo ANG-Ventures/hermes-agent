@@ -183,7 +183,8 @@ def _record_reapply_failure(count: int) -> None:
 
         conn = kb.connect()
         try:
-            kb.merge_run_metadata(conn, run_id, {REAPPLY_FAILED_KEY: int(count)})
+            kb.merge_run_metadata(conn, run_id, {REAPPLY_FAILED_KEY: int(count)},
+                                  keep_max=(REAPPLY_FAILED_KEY,))
         finally:
             conn.close()
     except Exception:
