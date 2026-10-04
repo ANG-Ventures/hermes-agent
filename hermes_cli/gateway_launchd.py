@@ -553,6 +553,10 @@ def refresh_launchd_plist_if_needed() -> bool:
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
         return False
+    # A plist this CLI did not write (fleet-hardened `venv/bin/python -m hermes_cli.main ...`) is not
+    # "outdated": regenerating it replaced a bootable job with one that crash-looped (2026-10-04).
+    if _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist"):
+        return False
 
     _gw()._prepare_service_launcher()
     plist_path.write_text(new_plist, encoding="utf-8")
@@ -638,6 +642,8 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
+        return
+    if plist_path.exists() and _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist", force=force):
         return
     print(f"Installing launchd service to: {plist_path}")
     _gw()._prepare_service_launcher()
