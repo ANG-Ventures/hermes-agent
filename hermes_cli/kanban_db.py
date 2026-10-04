@@ -7515,6 +7515,11 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+        # One running card per PR (t_cb70d390): a rebase helper for a PR
+        # whose owner card is running is refused at birth, owner named.
+        from hermes_cli import kanban_pr_owner as _kpo
+
+        _kpo.refuse_rebase_card_at_birth(conn, idempotency_key)
 
     now = int(time.time())
 
@@ -22702,6 +22707,24 @@ def check_respawn_guard(
                 detail["eligible_at"] = hold_until
             return "overlap_hold"
 
+    # 0b. One running card per PR (t_cb70d390). A fresh owner holds the card;
+    #     a stale one (run and PR head both >2 h old) is left in
+    #     ``detail["pr_owner_stale"]`` for the dispatcher to reclaim.
+    if lane == "ready":
+        from . import kanban_pr_owner as _kpo
+
+        owners = _kpo.spawn_owners(conn, task_id, now=now)
+        fresh = [o for o in owners if not o["stale"]]
+        if fresh:
+            if detail is not None:
+                detail.update(
+                    pr=fresh[0]["pr"], owner=fresh[0]["task_id"],
+                    pr_owner=fresh[0]["pr_owner"], hold=_kpo.describe(fresh[0]),
+                )
+            return _kpo.GUARD_REASON
+        if owners and detail is not None:
+            detail["pr_owner_stale"] = owners
+
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
     #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
@@ -22886,6 +22909,50 @@ def check_respawn_guard(
                     detail["pr_needs"] = fixable
             return "active_pr"
 
+    return None
+
+
+def _reassign_stale_pr_owners(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owners: list,
+    detail: dict,
+    *,
+    dry_run: bool = False,
+) -> Optional[str]:
+    """Reclaim each STALE running owner of ``task_id``'s PRs (t_cb70d390).
+
+    The PR passes to ``task_id``; the old owner goes back to its queue and is
+    held by ``pr_owner_busy`` while the new card runs. Returns None when every
+    owner was reclaimed (spawn may proceed), else ``pr_owner_busy``: a reclaim
+    that cannot prove the old worker dead (``reclaim_task`` fails closed) never
+    becomes a second writer.
+    """
+    from . import kanban_pr_owner as _kpo
+
+    for owner in owners:
+        reason = (
+            f"{_kpo.REASSIGN_EVENT}: {owner['pr']} had no push and no new run for "
+            f"{_kpo.STALE_OWNER_SECONDS // 3600} h; reassigned to {task_id}"
+        )
+        if dry_run:
+            continue
+        ok = False
+        try:
+            ok = reclaim_task(conn, owner["task_id"], reason=reason)
+        except Exception:
+            _log.exception("kanban dispatch: stale PR owner reclaim failed for %s",
+                           owner["task_id"])
+        if not ok:
+            detail.update(pr=owner["pr"], owner=owner["task_id"],
+                          hold=f"stale owner {owner['task_id']} could not be reclaimed")
+            return _kpo.GUARD_REASON
+        payload = {"pr": owner["pr"], "from": owner["task_id"], "to": task_id,
+                   "owner_since": owner.get("since"),
+                   "head_committed_at": owner.get("head_committed_at")}
+        with write_txn(conn):
+            _append_event(conn, owner["task_id"], _kpo.REASSIGN_EVENT, payload)
+            _append_event(conn, task_id, _kpo.REASSIGN_EVENT, payload)
     return None
 
 
@@ -24946,6 +25013,11 @@ def _dispatch_once_locked(
             conn, row["id"], pr_state_resolver=pr_state_resolver,
             detail=guard_detail,
         )
+        stale_owners = guard_detail.pop("pr_owner_stale", None)
+        if guard_reason is None and stale_owners:
+            guard_reason = _reassign_stale_pr_owners(
+                conn, row["id"], stale_owners, guard_detail, dry_run=dry_run,
+            )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             if guard_detail:

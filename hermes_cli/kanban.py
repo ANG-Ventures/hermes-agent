@@ -3278,6 +3278,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
+        try:
+            from hermes_cli import kanban_pr_owner as kpo
+
+            pr_card_map = kpo.pr_card_map(conn, task.id)
+        except kb.sqlite3.Error:  # older/minimal board schema: no PR list
+            pr_card_map = {}
 
     if getattr(args, "json", False):
         payload = {
@@ -3287,6 +3293,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "workspace_refusal": refusal,
             "parents": parents,
             "children": children,
+            "pr_cards": pr_card_map,
             "parent_links": [
                 {"id": pid, "kind": kind} for pid, kind in parent_links
             ],
@@ -3416,6 +3423,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  parents:   {_fmt_links(parent_links)}")
     if children:
         print(f"  children:  {_fmt_links(child_links)}")
+    for pr, others in (pr_card_map or {}).items():
+        print(f"  pr-cards:  {pr}: " + (", ".join(
+            f"{o['id']} ({o['status']}, {o['assignee'] or '-'})" for o in others) or "none other"))
     if task.body:
         print()
         print("Body:")
