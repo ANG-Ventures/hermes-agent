@@ -43,6 +43,7 @@ from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
 from hermes_constants import get_default_hermes_root
 
 
@@ -1208,12 +1209,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         except kb.sqlite3.Error:  # older/minimal board schema: no PR list
             pr_card_map = {}
 
+    held = held_repo([c.body for c in comments]) if task.status in ("review", "blocked", "ready") else None
     if want_json:
         _print_json({
             "task": _task_to_dict(task),
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "latest_summary": latest_summary,
             "workspace_refusal": refusal,
+            "held_repo": held,
             "parents": parents, "children": children,
             "pr_cards": pr_card_map,
             "parent_links": [{"id": pid, "kind": kind} for pid, kind in parent_links],
@@ -1240,6 +1243,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     guard_line = _fmt_current_respawn_guard(task.status, events)
     if guard_line:
         field("guard", guard_line)
+    if held:
+        field("held", fmt_held_repo(held))
     field("assignee", task.assignee or "-")
     if task.priority:
         field("priority", task.priority)
