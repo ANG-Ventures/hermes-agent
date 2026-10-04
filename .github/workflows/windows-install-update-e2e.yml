@@ -56,9 +56,12 @@ jobs:
             files: tests/e2e/core/windows_update/test_paths_and_acls.py
           - leg: spares
             files: tests/e2e/core/windows_update/test_update_spares_other_installs.py
-    # HERMES_TEST_FILE_TIMEOUT (2400 s) plus setup and upload, so a stuck file is killed
-    # and named by the per-file timeout before the job wall cancels the leg blind.
-    timeout-minutes: 50
+    # 2x the measured p90 leg wall: 17 green legs over runs 37168966958, 37169022868,
+    # 37170959667 had wall 650-1403 s (p90 1297 s), test step 494-1006 s (p90 812 s) and
+    # setup (checkout + setup-pm) 89-565 s (565 s on a cold cache). The per-file timeout
+    # (2x the test-step p90, rounded up) plus the cold setup max stays under this wall, so a
+    # stuck file is killed and named before the job wall cancels the leg blind.
+    timeout-minutes: 44
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -96,7 +99,7 @@ jobs:
           # install takes 870-1015 s and the cells pass (run 37102491348: 15/15 across the 4
           # files that finished inside the old job wall).
           HERMES_TEST_WORKERS: '2'
-          HERMES_TEST_FILE_TIMEOUT: '2400'
+          HERMES_TEST_FILE_TIMEOUT: '1800'
           # Six journeys each run install.ps1 (a cold PM toolchain + venv + Node deps) on a
           # 4-vCPU hosted runner. A journey is one module-scoped fixture (install -> update
           # -> turns) that runs BEFORE its first cell can print, so pytest is silent for the
