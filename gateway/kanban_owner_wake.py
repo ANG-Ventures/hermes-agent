@@ -222,7 +222,8 @@ def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
     return None
 
 
-def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
+def red_check_names(runs: list, workflows: Optional[dict] = None,
+                    pending: frozenset = frozenset()) -> list[str]:
     """Names of the checks that grade the head red (t_65e5d76f).
 
     A head carries every run ever started on it: override_lint runs twice per
@@ -233,6 +234,9 @@ def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
     ``workflows`` maps check_suite id -> (workflow id, event); without an entry
     the key is the suite, so a duplicate in another suite is never merged
     (fails closed). Mirrors hermes-home kanban-review-merge-pass effective_checks().
+    ``pending`` holds the (workflow id, event) pairs with a queued/in-progress run on
+    the head: an all-cancelled key of such a workflow is superseded by a run whose
+    job has no check-run yet, so it is pending, not red (t_5081f571).
     """
     workflows = workflows or {}
     live: dict = {}
@@ -257,7 +261,8 @@ def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
         if key not in live or rank > live[key][0]:
             live[key] = (rank, name, concl)
     red = [name for _rank, name, concl in live.values() if concl in _RED_CONCLUSIONS]
-    return red + [name for key, name in cancelled.items() if key not in live]
+    return red + [name for key, name in cancelled.items()
+                  if key not in live and not (key[0] == "wf" and key[1] in pending)]
 
 
 def _needs_workflow_map(runs: list) -> bool:
@@ -265,22 +270,34 @@ def _needs_workflow_map(runs: list) -> bool:
     merging suites into workflows changes the verdict; skip the REST read otherwise."""
     suites: dict = {}
     unsettled = set()
+    not_cancelled = set()
     for run in runs or []:
         if not isinstance(run, dict):
             continue
         name = run.get("name")
         suites.setdefault(name, set()).add((run.get("check_suite") or {}).get("id"))
-        if str(run.get("conclusion") or "").lower() not in ("success", "skipped", "neutral"):
+        concl = str(run.get("conclusion") or "").lower()
+        if concl not in ("success", "skipped", "neutral"):
             unsettled.add(name)
-    return any(len(v) > 1 and k in unsettled for k, v in suites.items())
+        if concl != "cancelled":
+            not_cancelled.add(name)
+    # An all-cancelled name needs the map too: its successor run may exist with no
+    # check-run yet (t_5081f571).
+    return any((len(v) > 1 and k in unsettled) or k not in not_cancelled
+               for k, v in suites.items())
 
 
-def _workflow_map(repo: str, sha: str) -> dict:
-    """check_suite id -> (workflow id, event); {} when unreadable. A push run and a
-    pull_request run of one workflow on one sha are separate checks, not re-runs."""
-    rows = _gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or []
-    return {r["check_suite_id"]: (r.get("workflow_id"), r.get("event"))
-            for r in rows if isinstance(r, dict) and r.get("check_suite_id") is not None}
+def _workflow_map(repo: str, sha: str) -> tuple[dict, frozenset]:
+    """(check_suite id -> (workflow id, event), {(workflow id, event) with a run not yet
+    completed}); ({}, empty) when unreadable. A push run and a pull_request run of one
+    workflow on one sha are separate checks, not re-runs."""
+    rows = [r for r in _gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or []
+            if isinstance(r, dict)]
+    wf = {r["check_suite_id"]: (r.get("workflow_id"), r.get("event"))
+          for r in rows if r.get("check_suite_id") is not None}
+    pending = frozenset((r.get("workflow_id"), r.get("event")) for r in rows
+                        if str(r.get("status") or "").lower() not in ("", "completed"))
+    return wf, pending
 
 
 def query_pr_health(repo: str, number: int) -> Optional[dict]:
@@ -295,8 +312,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
         if runs is None:
             return None  # unknown: retried, never read as green (Prism P1)
-        wf = _workflow_map(repo, sha) if _needs_workflow_map(runs) else {}
-        out["failing"] = red_check_names(runs, wf)
+        wf, pending = _workflow_map(repo, sha) if _needs_workflow_map(runs) else ({}, frozenset())
+        out["failing"] = red_check_names(runs, wf, pending)
     return out
 
 

@@ -374,6 +374,53 @@ def test_pr_2694_unreadable_workflow_map_fails_closed(monkeypatch):
     assert health["failing"] == ["override_lint / override_lint"] * 2
 
 
+# t_5081f571: hermes-home#2783 head a3c03ad6. The `opened` run (suite A) was cancelled
+# at 07:43:12Z by the `edited` run created 07:43:08Z, whose job check-run only started
+# at 07:43:13Z. In that gap the head holds ONE override_lint check-run, cancelled.
+_GAP_RUNS = [_RUNS_2694[0]]
+
+
+def _gap_workflows(successor_status, event="pull_request", workflow_id=368437559):
+    return {"workflow_runs": [
+        {"check_suite_id": 100688518781, "workflow_id": 368437559, "event": "pull_request",
+         "status": "completed"},
+        {"check_suite_id": 100688599999, "workflow_id": workflow_id, "event": event,
+         "status": successor_status},
+    ]}
+
+
+def test_cancelled_with_queued_successor_is_pending_not_red(monkeypatch):
+    for status in ("queued", "in_progress", "waiting", "requested", "pending"):
+        _fake_gh(monkeypatch, _GAP_RUNS, _gap_workflows(status))
+        health = ow.query_pr_health("ANG-Ventures/hermes-home", 2694)
+        assert health["failing"] == [], status
+        assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_cancelled_without_live_successor_stays_red(monkeypatch):
+    red = ["override_lint / override_lint"]
+    # the successor already finished and left no check-run: nothing supersedes the cancel
+    _fake_gh(monkeypatch, _GAP_RUNS, _gap_workflows("completed"))
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == red
+    # a pending push run is a different check, not a re-run of the PR check
+    _fake_gh(monkeypatch, _GAP_RUNS, _gap_workflows("queued", event="push"))
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == red
+    # a pending run of another workflow hides nothing
+    _fake_gh(monkeypatch, _GAP_RUNS, _gap_workflows("queued", workflow_id=1))
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == red
+    # unreadable workflow map fails closed
+    _fake_gh(monkeypatch, _GAP_RUNS, None)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == red
+
+
+def test_pending_never_hides_a_failure():
+    wf = {1: (10, "pull_request")}
+    pending = frozenset({(10, "pull_request")})
+    assert ow.red_check_names([_run(1, "failure", 1)], wf, pending) == ["lint"]
+    # an in-progress successor run (conclusion null) supersedes a cancel without a map read
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(2, None, 1)]) == []
+
+
 def test_all_pass_head_skips_the_workflow_read(monkeypatch):
     calls: list = []
     runs = [dict(r, conclusion="success") for r in _RUNS_2694]
