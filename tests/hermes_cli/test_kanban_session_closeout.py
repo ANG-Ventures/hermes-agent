@@ -138,7 +138,8 @@ def test_unread_pr_state_is_never_a_pass(root):
     _fixture(root)
     r = sc.build(root, [SID], network=False)
     assert all(s is None for c in r["cards"] for _, s in c["prs"])
-    assert next(g for g in r["gates"] if g["row"] == "-1")["status"] == "FAIL"
+    gates = {g["row"]: g["status"] for g in r["gates"]}
+    assert gates["-1"] == gates["6b"] == gates["6b'"] == "FAIL"
     assert "UNREAD" in sc.render(r)
 
 
@@ -177,13 +178,36 @@ def test_worker_cost_sums_turns_keyed_on_card_ids_across_profiles(root):
         path = root / name / "turns.db"
         path.parent.mkdir(parents=True)
         with sqlite3.connect(path) as b:
-            b.execute("CREATE TABLE turns (turn_id TEXT, chat_id TEXT, ts_end REAL, cost_usd REAL, "
-                      "input_tokens INT, output_tokens INT, cache_read INT, cache_write INT)")
-            b.execute("INSERT INTO turns VALUES ('a', ?, 5, 1.5, 10, 20, 30, 40)", (ids["w"],))
-            b.execute("INSERT INTO turns VALUES ('b', 't_00000000', 5, 99, 1, 1, 1, 1)")
+            b.execute("CREATE TABLE turns (turn_id TEXT PRIMARY KEY, chat_id TEXT, ts_end REAL, cost_usd REAL, "
+                      "cost_status TEXT, input_tokens INT, output_tokens INT, cache_read INT, cache_write INT)")
+            b.execute("INSERT INTO turns VALUES ('a', ?, 5, 1.5, 'estimated', 10, 20, 30, 40)", (ids["w"],))
+            b.execute("INSERT INTO turns VALUES ('u', ?, 5, NULL, 'unknown', 1, 1, 1, 1)", (ids["r"],))
+            b.execute("INSERT INTO turns VALUES ('b', 't_00000000', 5, 99, 'estimated', 1, 1, 1, 1)")
     cost = _build(root)["cost"]["workers"]
-    assert cost["total"] == [2, 3.0, 20, 40, 60, 80]
+    assert cost["total"] == [4, 3.0, 22, 42, 62, 82, 2, 0]   # unpriced turns counted, not summed as $0
     assert set(cost["per_profile"]) == {"default", "daedalus"}
+    assert "known-only (2 turns unpriced" in sc._tok(cost["total"])
+
+
+def test_session_turns_come_from_the_owning_profile_by_turn_id_prefix(root):
+    _fixture(root)
+    prof = root / "profiles" / "athena"
+    (prof / "blackbox").mkdir(parents=True)
+    with sqlite3.connect(prof / "state.db") as st:
+        st.execute("CREATE TABLE sessions (id TEXT, started_at REAL, ended_at REAL, chat_id TEXT, "
+                   "estimated_cost_usd REAL)")
+        st.execute("INSERT INTO sessions VALUES (?, 1, 9, 'chan', 7.5)", (SID,))
+    for path, rows in ((prof / "blackbox" / "turns.db", [(f"{SID}:{SID}:a", 2.0), ("other:other:x", 50.0)]),
+                       (root / "blackbox" / "turns.db", [(f"{SID}:{SID}:z", 1000.0)])):  # wrong profile: ignored
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(path) as b:
+            b.execute("CREATE TABLE turns (turn_id TEXT PRIMARY KEY, chat_id TEXT, cost_usd REAL, cost_status TEXT, "
+                      "input_tokens INT, output_tokens INT, cache_read INT, cache_write INT)")
+            for tid, usd in rows:
+                b.execute("INSERT INTO turns VALUES (?, 'chan', ?, 'estimated', 1, 1, 1, 1)", (tid, usd))
+    (sess,) = _build(root)["cost"]["sessions"]
+    assert sess["profile"] == "athena" and sess["state_db_usd"] == 7.5
+    assert sess["session_turns"][:2] == [1, 2.0]
 
 
 def test_cli_verb_writes_both_outputs_and_check_exit(root, tmp_path, capsys):
@@ -212,3 +236,44 @@ def test_unknown_session_exits_2(root, capsys):
     ns = argparse.Namespace(session_ids=["nope"], root=str(root), vault=None, no_network=True,
                             out=None, vault_out=None, json=False, check=False)
     assert sc.run(ns) == 2
+
+
+def test_prism_r1_proof_close_record_own_prs_and_parent_gated_todo(root):
+    d = _conn(root)
+    compact = _card(d, "r2 A: compact md", status="done",
+                    run_md={"live_evidence": "yes: saw it", "pr_url": "https://github.com/ANG-Ventures/a/pull/1"})
+    negated = _card(d, "r2 B: negated", status="done", result="ANG-Ventures/a#2 merged")
+    kb.add_comment(d, negated, "w", "No live proof available yet; native proof failed.")
+    url_closed = _card(d, "r2 C: url close", status="done", result="see below")
+    kb.add_comment(d, url_closed, "w", "CLOSED: https://github.com/ANG-Ventures/a/pull/3 — superseded")
+    own = _card(d, "r2 D: own_prs only", status="review", result="awaiting merge",
+                run_md={"own_prs": ["ANG-Ventures/a#4"], "survivor": {"refs": [{"pr": "ANG-Ventures/a#5"}]}})
+    parent = _card(d, "r2 E: parent", block=("NEEDS RULING", "needs_input"))
+    child = kb.create_task(d, title="r2 F: child", session_id=SID, parents=[parent])
+    d.commit(); d.close()
+    # url_closed's PR is only named in a comment: give it a metadata pointer so it is the card's own PR
+    with sqlite3.connect(root / "kanban.db") as c:
+        c.execute("INSERT INTO task_runs(task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                  (url_closed, "w", "done", 1, json.dumps({"pr": "https://github.com/ANG-Ventures/a/pull/3"})))
+    states = {("ANG-Ventures/a", n): s for n, s in ((1, "MERGED"), (2, "MERGED"), (3, "CLOSED"),
+                                                    (4, "OPEN"), (5, "MERGED"))}
+    r = sc.build(root, [SID], pr_query=lambda repo, n: states.get((repo, n)))
+    by = {c["id"]: c for c in r["cards"]}
+    assert by[compact]["proof"] and not by[negated]["proof"]
+    assert {ref for ref, _ in by[own]["prs"]} == {("ANG-Ventures/a", 4), ("ANG-Ventures/a", 5)}
+    gates = {g["row"]: g for g in r["gates"]}
+    assert "ANG-Ventures/a#3" not in gates["6b'"]["evidence"]
+    assert "ANG-Ventures/a#4" in gates["6b"]["evidence"]
+    flips = {c["id"]: g for g, rows in r["flips"].items() for c, _ in rows}
+    assert by[child]["status"] == "todo" and flips[child] == "gated on in-session card"
+
+
+def test_card_queries_chunk_past_the_sqlite_variable_limit(root, monkeypatch):
+    d = _conn(root)
+    ids = [_card(d, f"r3 A: bulk {i}", status="done") for i in range(12)]
+    for i in ids:
+        kb.add_comment(d, i, "w", "ok")
+    d.close()
+    monkeypatch.setattr(sc, "_CHUNK", 5)
+    cards, bad = sc.load_cards(root, [SID])
+    assert not bad and len(cards) == 12 and all(len(c["comments"]) == 1 for c in cards)

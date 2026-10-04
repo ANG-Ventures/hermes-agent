@@ -12,8 +12,9 @@ Sections:
   * standing rulings: 'Ace ruled' / 'Ace MM-DD HH:MM' / 'Ace YYYY-MM-DD HH:MM' in bodies and
     comments, deduped by stamp.
   * open remainder grouped by what flips it.
-  * cost: the session's own state.db row + every blackbox turns.db (root + profiles) for the
-    worker turns, which key ``chat_id`` on the card id.
+  * cost: the session's row in its owning profile's state.db, its own blackbox turns (turn_id
+    prefix ``<sid>:``), and every profile's turns.db rows whose chat_id is a card id (worker turns).
+    Unpriced / partially priced turns are counted and the $ is labelled known-only, never a silent $0.
   * incident ledger: every comment saying 'root cause'.
   * skills/docs named by the cards (skills/, plans/, vault paths), with on-disk existence.
   * ang-closeout gate list, PASS/FAIL per row. No machine evidence = FAIL (ang-closeout rule).
@@ -55,7 +56,9 @@ _RULING = re.compile(
 _STAMP = re.compile(r"Ace (?:ruled\b.*?)?((?:20\d\d-)?\d\d-\d\d \d\d:\d\d)")
 _ROOT_CAUSE = re.compile(r"root[ -]cause", re.I)
 _RETRACT = re.compile(r"\bCORRECTION\b|\bretract(?:ed|ion|s)?\b|\bFALSE-DONE\b", re.I)
-_PROOF = re.compile(r"live-evidence:\s*yes|\b(?:live|native) proof\b", re.I)
+_PROOF = re.compile(r"live-evidence:\s*yes|\b(?:live|native)[ -]pro(?:of|ven)\b|\bGATE-PROVEN\b", re.I)
+# A proof mention on a line that also negates it ("no live proof", "native proof failed") is not proof.
+_NEGATED = re.compile(r"\b(?:no|not|without|missing|failed|fails|pending|unproven|cannot|can't|blocked)\b", re.I)
 _CLOSE_ON = re.compile(r"close-on:\s*([^\n]{1,200})", re.I)
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 _CLOSE_RECORD = re.compile(r"SUPERSED|\bCLOSED:|\bclosed\b", re.I)
@@ -89,6 +92,19 @@ def _ph(n: int) -> str:
     return ",".join("?" * n)
 
 
+_CHUNK = 900   # under SQLite's legacy 999-variable limit
+
+
+def _chunked(conn: sqlite3.Connection, sql: str, ids: list, order: str = "id") -> list:
+    """Run ``sql`` (one ``IN ({})`` slot) over ``ids`` in chunks; rows re-sorted by ``order`` so the
+    result matches one unchunked ``ORDER BY``."""
+    out = []
+    for i in range(0, len(ids), _CHUNK):
+        chunk = ids[i:i + _CHUNK]
+        out.extend(conn.execute(sql.format(_ph(len(chunk))), chunk).fetchall())
+    return sorted(out, key=lambda r: r[order] or "")
+
+
 def load_cards(root: Path, sids: list[str]) -> tuple[list[dict], list[str]]:
     """Every card whose session_id is in ``sids`` on every board, with comments, runs and
     the latest block reason. Returns (cards, unreadable board slugs)."""
@@ -105,26 +121,38 @@ def load_cards(root: Path, sids: list[str]) -> tuple[list[dict], list[str]]:
                 continue
             ids = [r["id"] for r in rows]
             comments = collections.defaultdict(list)
-            for r in conn.execute(f"SELECT task_id, author, body, created_at FROM task_comments "
-                                  f"WHERE task_id IN ({_ph(len(ids))}) ORDER BY id", ids):
+            for r in _chunked(conn, "SELECT task_id, author, body, created_at, id FROM task_comments "
+                                    "WHERE task_id IN ({}) ORDER BY id", ids):
                 comments[r["task_id"]].append(dict(r))
             runs = collections.defaultdict(list)
-            for r in conn.execute(f"SELECT task_id, summary, metadata, outcome FROM task_runs "
-                                  f"WHERE task_id IN ({_ph(len(ids))}) ORDER BY id", ids):
+            for r in _chunked(conn, "SELECT task_id, summary, metadata, outcome, id FROM task_runs "
+                                    "WHERE task_id IN ({}) ORDER BY id", ids):
                 runs[r["task_id"]].append(dict(r))
-            blocked = {}
-            for r in conn.execute(f"SELECT task_id, payload FROM task_events WHERE kind='blocked' "
-                                  f"AND task_id IN ({_ph(len(ids))}) ORDER BY id", ids):
+            blocked, waits = {}, collections.defaultdict(set)
+            for r in _chunked(conn, "SELECT task_id, kind, payload, id FROM task_events WHERE kind IN "
+                                    "('blocked','dependency_wait') AND task_id IN ({}) ORDER BY id", ids):
                 try:
-                    blocked[r["task_id"]] = str((json.loads(r["payload"] or "{}") or {}).get("reason") or "")
+                    payload = json.loads(r["payload"] or "{}") or {}
                 except (TypeError, ValueError):
-                    blocked[r["task_id"]] = ""
+                    payload = {}
+                if r["kind"] == "blocked":
+                    blocked[r["task_id"]] = str(payload.get("reason") or "")
+                elif payload.get("parent"):
+                    waits[r["task_id"]].add(str(payload["parent"]))
+            parents = collections.defaultdict(list)
+            for r in _chunked(conn, "SELECT l.child_id AS task_id, l.parent_id, p.status FROM task_links l "
+                                    "LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.kind='blocks' "
+                                    "AND l.child_id IN ({}) ORDER BY l.parent_id", ids, order="parent_id"):
+                if (r["status"] or "") not in TERMINAL:
+                    parents[r["task_id"]].append(r["parent_id"])
             for r in rows:
                 d = dict(r)
                 d["board"] = slug
                 d["comments"] = comments.get(d["id"], [])
                 d["runs"] = runs.get(d["id"], [])
                 d["block_reason"] = blocked.get(d["id"], "")
+                d["open_parents"] = parents.get(d["id"], [])
+                d["dependency_waits"] = sorted(waits.get(d["id"], ()))
                 cards.append(d)
             conn.close()
         except sqlite3.Error:
@@ -151,18 +179,32 @@ def header_counts(root: Path, sids: list[str]) -> tuple[dict, int, dict]:
     return dict(by), total, per
 
 
+def state_dbs(root: Path) -> list[tuple[str, Path]]:
+    """Session storage is per profile: <root>/state.db plus <root>/profiles/<name>/state.db."""
+    out = [("default", root / "state.db")]
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        out += [(p.name, p / "state.db") for p in sorted(profiles.iterdir())]
+    return [(n, p) for n, p in out if p.is_file() and p.stat().st_size > 0]
+
+
 def session_rows(root: Path, sids: list[str]) -> list[dict]:
-    path = root / "state.db"
-    if not path.is_file():
-        return []
-    try:
-        with _ro(path) as conn:
-            conn.row_factory = sqlite3.Row
-            return [dict(r) for r in conn.execute(
-                "SELECT id, started_at, ended_at, chat_id, estimated_cost_usd, input_tokens, output_tokens, "
-                f"cache_read_tokens, cache_write_tokens FROM sessions WHERE id IN ({_ph(len(sids))})", sids)]
-    except sqlite3.Error:
-        return []
+    """The session rows for ``sids`` from whichever profile owns them, tagged with that profile."""
+    rows, seen = [], set()
+    for name, path in state_dbs(root):
+        try:
+            with _ro(path) as conn:
+                conn.row_factory = sqlite3.Row
+                found = conn.execute(
+                    "SELECT id, started_at, ended_at, chat_id, estimated_cost_usd FROM sessions "
+                    f"WHERE id IN ({_ph(len(sids))})", sids).fetchall()
+        except sqlite3.Error:
+            continue
+        for r in found:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                rows.append({**dict(r), "profile": name})
+    return rows
 
 
 def turns_dbs(root: Path) -> list[tuple[str, Path]]:
@@ -174,45 +216,52 @@ def turns_dbs(root: Path) -> list[tuple[str, Path]]:
     return [(n, p) for n, p in out if p.is_file() and p.stat().st_size > 0]
 
 
+# turns, known $, in, out, cache read, cache write, unpriced turns (cost_usd NULL / status unknown),
+# partially priced turns. Unknown spend is counted, never summed as $0.
 _COST_COLS = ("count(*), coalesce(sum(cost_usd),0), coalesce(sum(input_tokens),0), "
-              "coalesce(sum(output_tokens),0), coalesce(sum(cache_read),0), coalesce(sum(cache_write),0)")
+              "coalesce(sum(output_tokens),0), coalesce(sum(cache_read),0), coalesce(sum(cache_write),0), "
+              "sum(cost_usd IS NULL OR cost_status='unknown'), sum(cost_status='partial')")
+_ZERO = [0, 0.0, 0, 0, 0, 0, 0, 0]
+
+
+def _add(a, b):
+    return [x + (y or 0) for x, y in zip(a, b)]
 
 
 def worker_cost(root: Path, card_ids: list[str]) -> dict:
     """Blackbox turns whose chat_id is a card id (kanban worker turns), per profile."""
-    per, tot = {}, [0, 0.0, 0, 0, 0, 0]
+    per, tot = {}, list(_ZERO)
     for name, path in turns_dbs(root):
         try:
             with _ro(path) as conn:
-                row = [0, 0.0, 0, 0, 0, 0]
+                row = list(_ZERO)
                 for i in range(0, len(card_ids), 900):
                     chunk = card_ids[i:i + 900]
                     r = conn.execute(f"SELECT {_COST_COLS} FROM turns WHERE chat_id IN ({_ph(len(chunk))})",
                                      chunk).fetchone()
-                    row = [a + b for a, b in zip(row, r)]
+                    row = _add(row, r)
         except sqlite3.Error:
             continue
         if row[0]:
             per[name] = row
-            tot = [a + b for a, b in zip(tot, row)]
+            tot = _add(tot, row)
     return {"per_profile": per, "total": tot}
 
 
-def chat_cost(root: Path, sess: dict) -> list:
-    """Blackbox turns in the session's chat between its start and end (the orchestrator's turns)."""
-    if not sess.get("chat_id"):
-        return [0, 0.0, 0, 0, 0, 0]
-    end = sess.get("ended_at") or 9e12
-    tot = [0, 0.0, 0, 0, 0, 0]
-    for _name, path in turns_dbs(root):
-        try:
-            with _ro(path) as conn:
-                r = conn.execute(f"SELECT {_COST_COLS} FROM turns WHERE chat_id=? AND ts_end>=? AND ts_end<?",
-                                 (str(sess["chat_id"]), sess["started_at"], end)).fetchone()
-        except sqlite3.Error:
-            continue
-        tot = [a + b for a, b in zip(tot, r)]
-    return tot
+def session_turn_cost(root: Path, sess: dict) -> list:
+    """The session's own turns: blackbox turn_id is ``<session_id>:<task>:…`` (agent/turn_context.py).
+    Read from the owning profile's turns.db only, so another conversation in the same chat never counts."""
+    owner = dict(turns_dbs(root)).get(sess.get("profile") or "default")
+    if owner is None:
+        return list(_ZERO)
+    lo = f"{sess['id']}:"
+    hi = f"{sess['id']};"   # ';' sorts right after ':' -> a PK range scan, no LIKE
+    try:
+        with _ro(owner) as conn:
+            return _add(list(_ZERO), conn.execute(
+                f"SELECT {_COST_COLS} FROM turns WHERE turn_id >= ? AND turn_id < ?", (lo, hi)).fetchone())
+    except sqlite3.Error:
+        return list(_ZERO)
 
 
 # --------------------------------------------------------------------------- PR state
@@ -280,7 +329,8 @@ def resolve_pr_states(refs: Iterable[tuple[str, int]], query: Optional[PrQuery] 
 # --------------------------------------------------------------------------- per-card facts
 
 def card_prs(card: dict) -> list[tuple[str, int]]:
-    """The card's own PRs: run metadata pr_url/pr_urls/pr, else qualified refs in the result."""
+    """The card's own PRs: every key kanban_open_pr.recorded_pr_refs reads from run metadata, else
+    qualified refs in the result."""
     found = []
 
     def add(text):
@@ -294,15 +344,21 @@ def card_prs(card: dict) -> list[tuple[str, int]]:
             md = json.loads(run.get("metadata") or "null")
         except (TypeError, ValueError):
             md = None
-        if isinstance(md, dict):
-            for k in ("pr_url", "pr_urls", "pr"):
-                v = md.get(k)
-                for s in ([v] if isinstance(v, str) else v if isinstance(v, list) else []):
-                    if isinstance(s, str):
-                        add(s)
+        for text in _opr.recorded_pr_refs(md):   # pr_url[s], pr, own_prs, survivor refs/claims
+            add(text)
     if not found:
         add(card.get("result") or "")
     return found
+
+
+def _md_live_evidence(raw) -> bool:
+    """Run metadata ``live_evidence`` declared ``yes[: <obs>]`` (parsed, not string-matched)."""
+    try:
+        md = json.loads(raw or "null")
+    except (TypeError, ValueError):
+        return False
+    v = md.get("live_evidence") if isinstance(md, dict) else None
+    return isinstance(v, str) and v.strip().lower().startswith("yes")
 
 
 def is_fleet(repo: str) -> bool:
@@ -315,7 +371,7 @@ def close_recorded(card: dict, repo: str, number: int) -> bool:
     full ref) together with SUPERSEDED / CLOSED: / closed."""
     texts = [card.get("result") or ""] + [r.get("summary") or "" for r in card["runs"]] + \
             [x.get("body") or "" for x in card["comments"]]
-    pat = re.compile(rf"(?:{re.escape(repo)})?#{number}\b")
+    pat = re.compile(rf"(?:{re.escape(repo)})?#{number}\b|github\.com/{re.escape(repo)}/pull/{number}\b", re.I)
     return any(pat.search(ln) and _CLOSE_RECORD.search(ln) for t in texts for ln in t.splitlines())
 
 
@@ -366,6 +422,11 @@ def flip_of(card: dict, open_ids: set) -> tuple[str, str]:
     if st == "triage":
         return "triage", "needs triage-resolve"
     if st in ("ready", "todo"):
+        gate = card.get("open_parents") or [p for p in card.get("dependency_waits") or () if p in open_ids]
+        if gate:
+            ours = [p for p in gate if p in open_ids]
+            return (("gated on in-session card" if ours else "gated on other card"),
+                    "parent not done: " + ", ".join(gate))
         return "dispatcher", "waiting for a worker slot"
     up = reason.lstrip().upper()
     if up.startswith("EXTERNAL:"):
@@ -416,8 +477,8 @@ def build(root: Path, sids: list[str], *, pr_query: Optional[PrQuery] = None, ne
     # per-card outcome flags
     for c in cards:
         texts = [x.get("body") or "" for x in c["comments"]] + [r.get("summary") or "" for r in c["runs"]]
-        md_proof = any('"live_evidence": "yes' in (r.get("metadata") or "") for r in c["runs"])
-        c["proof"] = md_proof or any(_PROOF.search(t) for t in texts)
+        c["proof"] = any(_md_live_evidence(r.get("metadata")) for r in c["runs"]) or any(
+            _PROOF.search(ln) and not _NEGATED.search(ln) for t in texts for ln in t.splitlines())
         c["retracted"] = any(_RETRACT.search(x.get("body") or "") for x in c["comments"])
         c["prs"] = [(r, states.get(r)) for r in pr_map[c["id"]]]
 
@@ -474,7 +535,7 @@ def build(root: Path, sids: list[str], *, pr_query: Optional[PrQuery] = None, ne
     # cost
     sess = session_rows(root, sids)
     cost = {"sessions": [{"id": s["id"], "state_db_usd": s.get("estimated_cost_usd"),
-                          "chat_turns": chat_cost(root, s)} for s in sess],
+                          "profile": s["profile"], "session_turns": session_turn_cost(root, s)} for s in sess],
             "workers": worker_cost(root, ids)}
 
     # open remainder
@@ -538,10 +599,12 @@ def gates(r: dict) -> list[dict]:
     closed = sorted({f"{repo}#{n}" for c, (repo, n), s in fleet if s == "CLOSED" and not close_recorded(c, repo, n)})
     foreign_open = sorted({f"{repo}#{n}" for c in cards for (repo, n), s in c["prs"]
                            if not is_fleet(repo) and s == "OPEN"})
-    g("6b", "No fleet PR of the session left OPEN", not open_prs,
-      f"open={len(open_prs)} {' '.join(open_prs[:12])}; upstream still-open, mention only: {len(foreign_open)}")
-    g("6b'", "No fleet PR closed-unmerged without a close record on its card", not closed,
-      f"unrecorded closed-unmerged={len(closed)} {' '.join(closed[:12])} (audit each with ang-git §5)")
+    g("6b", "No fleet PR of the session left OPEN", not open_prs and not unread,
+      f"open={len(open_prs)} {' '.join(open_prs[:12])}; unreadable={unread}; "
+      f"upstream still-open, mention only: {len(foreign_open)}")
+    g("6b'", "No fleet PR closed-unmerged without a close record on its card", not closed and not unread,
+      f"unrecorded closed-unmerged={len(closed)} {' '.join(closed[:12])}; unreadable={unread} "
+      "(audit each with ang-git §5)")
     g("7", "mem0 fact hygiene", False, "not derivable from the board")
     g("8", "Cron/alerts committed", False, "not derivable from the board; check cron/jobs.json on origin")
     noflip = r["flips"].get("no flip named", [])
@@ -564,7 +627,11 @@ def _money(x) -> str:
 
 
 def _tok(row) -> str:
-    return (f"{row[0]:,} turns · {_money(row[1])} · in {row[2]:,} · out {row[3]:,} · "
+    money = _money(row[1])
+    if row[6] or row[7]:
+        money = (f"{money} known-only ({row[6]:,} turns unpriced, {row[7]:,} partially priced)"
+                 if row[1] else f"unknown ({row[6]:,} turns unpriced)")
+    return (f"{row[0]:,} turns · {money} · in {row[2]:,} · out {row[3]:,} · "
             f"cache read {row[4]:,} · cache write {row[5]:,}")
 
 
@@ -603,8 +670,8 @@ def render(r: dict) -> str:
     # cost
     L.append("## Cost (blackbox turns.db + state.db)\n")
     for s in r["cost"]["sessions"]:
-        L.append(f"- Session `{s['id']}` state.db estimate {_money(s['state_db_usd'])}; "
-                 f"chat turns in window: {_tok(s['chat_turns'])}")
+        L.append(f"- Session `{s['id']}` ({s['profile']} profile) state.db estimate {_money(s['state_db_usd'])}; "
+                 f"its own turns (turn_id prefix): {_tok(s['session_turns'])}")
     w = r["cost"]["workers"]
     L.append(f"- Worker turns on this session's cards (chat_id = card id, every profile): {_tok(w['total'])}")
     for name, row in sorted(w["per_profile"].items(), key=lambda x: -x[1][1]):
