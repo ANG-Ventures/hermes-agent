@@ -405,7 +405,9 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
     "refine", "review", "pause", "whoami", "platform", "insights", "login",
     # Fork-only commands demoted so the cap never drops help/restart/usage (fork parity set).
-    "boomerang", "merge", "resume-handoff"})
+    "boomerang", "merge", "resume-handoff",
+    # overview: the fleet operator's session card overview, used from Discord (t_66ffcd4f).
+    "overview"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

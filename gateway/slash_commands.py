@@ -562,6 +562,30 @@ class GatewaySlashCommandsMixin(
         runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else t("gateway.shared.none_marker")
         return head + t("gateway.whoami.tier_user", commands=runnable_str)
 
+    async def _handle_overview_command(self, event: MessageEvent) -> str:
+        """Handle /overview — this chat's session card overview (t_66ffcd4f).
+
+        Resolves the invoking chat's session id (read-only, never
+        get_or_create) and renders ``scripts/session-overview.py <sid>
+        --lineage`` off the event loop. ``/overview fast`` skips the GitHub
+        and deploy readbacks.
+        """
+        from gateway.overview_command import render_overview
+
+        try:
+            entry = await self.async_session_store.entry_for(
+                self._session_key_for_source(event.source)
+            )
+            session_id = getattr(entry, "session_id", None) or None
+        except Exception as exc:
+            # A failed lookup is not "no session": say so and let the user retry.
+            logger.warning("/overview: could not resolve invoking session (%s)", exc)
+            return (f"/overview: could not resolve this chat's session "
+                    f"({type(exc).__name__}: {str(exc)[:120]}); retry in a moment.")
+        return await asyncio.to_thread(
+            render_overview, session_id, event.get_command_args() or ""
+        )
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI (DB work in a thread pool). Allowed
         while an agent runs: the board is profile-agnostic and never touches agent state."""
