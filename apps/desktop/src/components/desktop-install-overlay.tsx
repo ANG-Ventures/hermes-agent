@@ -297,6 +297,9 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
   const copy = t.install
 
   const [state, setState] = useState<DesktopBootstrapState>(EMPTY_STATE)
+  // Set by the subscription effect; called by any user-initiated dismissal so
+  // the in-flight initial snapshot cannot overwrite it.
+  const supersedeSnapshotRef = useRef<(() => void) | null>(null)
   const [logOpen, setLogOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -329,11 +332,17 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
     }
 
     let cancelled = false
+    // A user dismissal (Escape / Close -> EMPTY_STATE) or a live event that
+    // arrives before the initial snapshot resolves must win over that
+    // snapshot: otherwise a slow getBootstrapState() lands AFTER the user
+    // dismissed a failed install and resurrects it (UI tests shard 2/3,
+    // "dismisses a failed install on Escape", red under load 2026-10-03).
+    let superseded = false
 
     desktop
       .getBootstrapState()
       .then(snapshot => {
-        if (!cancelled && snapshot) {
+        if (!cancelled && !superseded && snapshot) {
           setState(snapshot)
         }
       })
@@ -342,10 +351,17 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
         // stays empty, app falls through to existing onboarding flow.
       })
 
-    const off = desktop.onBootstrapEvent(ev => setState(prev => applyEvent(prev, ev)))
+    const off = desktop.onBootstrapEvent(ev => {
+      superseded = true
+      setState(prev => applyEvent(prev, ev))
+    })
+    supersedeSnapshotRef.current = () => {
+      superseded = true
+    }
 
     return () => {
       cancelled = true
+      supersedeSnapshotRef.current = null
       off?.()
     }
   }, [enabled])
@@ -377,6 +393,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        supersedeSnapshotRef.current?.()
         setState(EMPTY_STATE)
       }
     }
@@ -732,7 +749,14 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
                 <code className="font-mono text-(--ui-text-secondary)">%LOCALAPPDATA%\hermes\logs\</code>
               </span>
               <div className="flex gap-2">
-                <Button onClick={() => setState(EMPTY_STATE)} size="sm" variant="ghost">
+                <Button
+                  onClick={() => {
+                    supersedeSnapshotRef.current?.()
+                    setState(EMPTY_STATE)
+                  }}
+                  size="sm"
+                  variant="ghost"
+                >
                   {t.common.close}
                 </Button>
                 <Button
