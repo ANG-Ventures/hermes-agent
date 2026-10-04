@@ -918,3 +918,21 @@ def test_fold_blocked_by_an_extra_red_job_past_the_first_jobs_page(tmp_path):
     got = _queue_route(tmp_path, api)
     assert got["route"] == "alerts", got["_stdout"]
     assert "Windows-only tests" in got["summary"]
+
+
+# --- cancelled runs are evidence too (Prism P1 daaf469b6e2e / eb4c30f2ca3e, 2026-10-04) ----------
+def test_main_red_step_passed_in_a_cancelled_run_pages(tmp_path):
+    # older run red, next run passed e2e but was cancelled on another job, now red again
+    passed = _main_jobs((E2E, "success", {E2E_STEP: "success"}), ("Lint (ruff + ty) / ruff", "cancelled", {}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", passed),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_cancelled_run_that_never_finished_the_job_is_walked_past(tmp_path):
+    cut = _main_jobs((E2E, "cancelled", {E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]

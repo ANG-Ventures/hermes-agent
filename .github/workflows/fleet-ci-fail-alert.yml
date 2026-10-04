@@ -345,7 +345,6 @@ jobs:
             PREVS="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}" \
               | jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
                 [.workflow_runs[] | select(.id != $id)
-                  | select(.conclusion == "success" or .conclusion == "failure")
                   | select($created == "" or .created_at < $created)]
                 | sort_by(.created_at) | reverse | .[:10][] | .id')" || PREVS=error
             if [ "$ITEMS" = error ] || [ "$PREVS" = error ] || [ "$ITEMS" = "[]" ]; then
@@ -353,6 +352,9 @@ jobs:
             else
               LEFT="$ITEMS"; COVER=""
               for prev in $PREVS; do
+                # Every completed run counts, whatever its overall conclusion: a CANCELLED run
+                # whose step passed is still proof main recovered (Prism P1 daaf469b6e2e /
+                # eb4c30f2ca3e, 2026-10-04). The per-item check below decides what each run shows.
                 # Per item in a prior run: red (that step failed), green (it ran and passed:
                 # main went green, so this is a new red), unknown (job or step did not run,
                 # e.g. path-classified CI skipped it; look further back).
