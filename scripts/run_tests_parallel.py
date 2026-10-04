@@ -72,6 +72,7 @@ from typing import Dict, List, Optional, Tuple
 # "skipped on this host" note and the lanes can never disagree.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts  # noqa: E402
+from scripts.ci.flake_quarantine import JunitError, junit_outcomes  # noqa: E402
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -253,16 +254,57 @@ def _is_dedicated_lane_file(path: Path) -> bool:
     return path.name.endswith(_DEDICATED_LANE_SUFFIXES)
 
 
-def _call_site_test_files(repo_root: Path) -> set[Path]:
-    """Resolved files named by any registry ``call_site_tests`` nodeid."""
+def _call_site_nodeids(repo_root: Path) -> dict[Path, set[str]]:
+    """Registry ``call_site_tests`` nodeids, keyed by their resolved file."""
     try:
         raw = json.loads((repo_root / _CALL_SITE_MANIFEST).read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
-        return set()
-    out: set[Path] = set()
+        return {}
+    out: dict[Path, set[str]] = {}
     for entry in raw:
         for node in entry.get("call_site_tests") or []:
-            out.add((repo_root / str(node).split("::", 1)[0]).resolve())
+            node = str(node)
+            out.setdefault((repo_root / node.split("::", 1)[0]).resolve(), set()).add(node)
+    return out
+
+
+def _unexecuted_call_site_nodeids(
+    all_summaries: List[Tuple[Path, Dict[str, int]]], repo_root: Path,
+) -> List[Tuple[Path, List[str]]]:
+    """Registered call-site nodeids in this run that did not execute.
+
+    With a junit dir, every registered nodeid of a file in the run must appear
+    passed or failed in that file's junit: a skipped or uncollected nodeid
+    counts, even when a sibling test in the same file passed. A missing or
+    unreadable junit proves nothing and counts too. Without a junit dir (a
+    local run) the proxy is the file: a file that skipped every test.
+    """
+    registered = _call_site_nodeids(repo_root)
+    if not registered:
+        return []
+    out: List[Tuple[Path, List[str]]] = []
+    seen: set[Path] = set()
+    for f, s in all_summaries:
+        rp = f.resolve()
+        if rp not in registered or rp in seen:
+            continue
+        seen.add(rp)
+        nodes = registered[rp]
+        junit = _junit_path(f, repo_root)
+        if junit is None:
+            storm = (s.get("skipped", 0) > 0 and s.get("passed", 0) == 0
+                     and s.get("failed", 0) == 0) or s.get("noop_skip")
+            if storm:
+                out.append((f, sorted(nodes)))
+            continue
+        try:
+            failed, passed = junit_outcomes(junit.read_bytes(), _format_file(f, repo_root))
+        except (OSError, JunitError):
+            out.append((f, sorted(nodes)))
+            continue
+        missing = sorted(n for n in nodes if n not in failed and n not in passed)
+        if missing:
+            out.append((f, missing))
     return out
 
 # Per-file wall-clock cap. Override
@@ -1895,6 +1937,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--full-slices",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "Slice count for the full suite. Used by --generate-slices when an "
+            "impact set holds only dedicated-lane files (*_ptb.py) and the "
+            "full suite is sliced instead; defaults to --generate-slices."
+        ),
+    )
+    parser.add_argument(
         "--generate-slices",
         metavar="N",
         type=int,
@@ -2084,7 +2137,7 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--files", "--files-from",
+        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--full-slices", "--files", "--files-from",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
@@ -2347,9 +2400,11 @@ def main() -> int:
             )
             if not files:
                 # An impact set made only of lane files: slice the full suite
-                # rather than emit an empty matrix.
+                # rather than emit an empty matrix, at the FULL slice count —
+                # args.generate_slices was sized for the tiny impact set.
                 files = [f for f in _discover_files([repo_root / "tests"])
                          if not _is_dedicated_lane_file(f)]
+                args.generate_slices = max(args.generate_slices, args.full_slices or 0)
         durations = _load_durations(repo_root)
         slices = _compute_lpt_slices(
             files, args.generate_slices, durations, repo_root
@@ -2827,8 +2882,9 @@ def _noop_guard(
     Skip-storms (skipped>0, passed==0, failed==0) are a loud ⚠ *surfacing*,
     not a gate — a dep-missing skip-storm stays visible even where the dep is
     genuinely optional, without false-reding an optional-dep environment.
-    The exception is a file named in the registry's ``call_site_tests``: a
-    skip-storm there is RED, because the D2b lint counts it as coverage.
+    The exception is a nodeid named in the registry's ``call_site_tests``:
+    if it skipped or was not collected, the run is RED, because the D2b lint
+    counts it as coverage.
     """
     def _executed(s: Dict[str, int]) -> int:
         return s.get("passed", 0) + s.get("failed", 0)
@@ -2849,20 +2905,20 @@ def _noop_guard(
             _n = s.get("skipped", 0)
             print(f"  ⚠  {_format_file(f, repo_root)}  ({_n} skipped, 0 run)")
 
-    # ── RED: a registry call_site_tests file that executed nothing ────────
+    # ── RED: a registry call_site_tests nodeid that did not execute ───────
     # The ⚠ above is right for an optional dep, wrong for a registered
-    # call-site test: the D2b lint is satisfied by its nodeid, so a skip-only
-    # run leaves the call site with no executing test in any lane.
-    if skip_storms:
-        registered = _call_site_test_files(repo_root)
-        unexecuted = [(f, s) for f, s in skip_storms if f.resolve() in registered]
-        if unexecuted:
-            print()
-            print(f"=== {len(unexecuted)} file(s) named in {_CALL_SITE_MANIFEST} call_site_tests "
-                  f"skipped every test — RED: a registered call-site test must execute ===")
-            for f, s in unexecuted:
-                print(f"    {_format_file(f, repo_root)}  ({s.get('skipped', 0)} skipped, 0 run)")
-            red = True
+    # call-site test: the D2b lint is satisfied by its nodeid, so a skipped
+    # nodeid leaves the call site with no executing test in any lane.
+    unexecuted = _unexecuted_call_site_nodeids(all_summaries, repo_root)
+    if unexecuted:
+        print()
+        n = sum(len(nodes) for _f, nodes in unexecuted)
+        print(f"=== {n} nodeid(s) named in {_CALL_SITE_MANIFEST} call_site_tests did not "
+              f"execute (skipped or not collected) — RED: a registered call-site test must run ===")
+        for _f, nodes in unexecuted:
+            for node in nodes:
+                print(f"    {node}")
+        red = True
 
     # ── ⚠ intentionally-testless files (tombstones / __main__ scripts) ────
     testless = [(f, s) for f, s in all_summaries if s.get("noop_testless")]
