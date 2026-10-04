@@ -618,10 +618,14 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     label = _gw().get_launchd_label()
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
     # loading it. A gateway that launchd already runs is still reloaded; this install did not start it.
+    # The writer itself honours the worker kill switch: setup, migrate and ensure_gateway_service call it
+    # without going through `gateway install`.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
+    if service_writes_disabled("install the gateway plist"):
+        return
     load = start_now or _gw()._launchctl_label_supervising_process(label)
 
     if plist_path.exists() and not force_unit_path:
-        from hermes_cli.gateway_service_owner import definition_belongs_to_home
         if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "overwrite"):
             return
     # --force-unit-path repoints the plist at this home, so it writes rather than refreshing in place.

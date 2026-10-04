@@ -3422,15 +3422,23 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
     return True
 
 
-def _retire_hermes_replace_dropin(system: bool = False) -> bool:
-    """Remove only the legacy ``--replace`` drop-in written by Hermes."""
+def _hermes_replace_dropin(system: bool = False) -> Path | None:
+    """The legacy ``--replace`` drop-in written by Hermes, or None when there is none."""
     unit_path = get_systemd_unit_path(system=system)
     dropin = unit_path.parent / f"{unit_path.name}.d" / "20-replace.conf"
     try:
         text = dropin.read_text(encoding="utf-8-sig")
     except OSError:
-        return False
+        return None
     if not all(token in text for token in ("Added to end the gateway respawn storm", "--replace", "ExecStart=")):
+        return None
+    return dropin
+
+
+def _retire_hermes_replace_dropin(system: bool = False) -> bool:
+    """Remove only the legacy ``--replace`` drop-in written by Hermes."""
+    dropin = _hermes_replace_dropin(system=system)
+    if dropin is None:
         return False
     dropin.unlink()
     return True
@@ -3449,10 +3457,12 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     # systemd_unit_is_current is the HERMES_HOME-sync chokepoint; its env mutation persists for the regenerate below.
     current = systemd_unit_is_current(system=system)
     # Runs on every gateway boot: a scratch-home gateway whose name collided with the host's unit
-    # rewrote it (t_8749a807). Only the home the unit pins may rewrite it.
+    # rewrote it (t_8749a807). Only the home the unit pins may rewrite it. Guard every mutation below,
+    # the drop-in retirement + daemon-reload of a current unit included.
     from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
-    if not current and (service_writes_disabled("rewrite the gateway unit") or not definition_belongs_to_home(
-            unit_path, get_hermes_home(), "rewrite")):
+    if (not current or _hermes_replace_dropin(system=system) is not None) and (
+            service_writes_disabled("rewrite the gateway unit")
+            or not definition_belongs_to_home(unit_path, get_hermes_home(), "rewrite")):
         return False
     if _retire_hermes_replace_dropin(system=system):
         _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
@@ -3644,6 +3654,11 @@ def systemd_install(
 ):
     if system:
         _require_root_for_system_service("install")
+    # The writer itself honours the worker kill switch: setup, migrate and ensure_gateway_service call it
+    # without going through `gateway install`.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
+    if service_writes_disabled("install the gateway unit"):
+        return
 
     # Offer to remove legacy units first: alongside the new unit they flap-fight for the bot token.
     if has_legacy_hermes_units():
@@ -3658,11 +3673,11 @@ def systemd_install(
     scope_label = _service_scope_label(system)
     sudo, scope_flag, user_flag = _systemd_cli_bits(system)
 
-    # Existing system units already pin HERMES_HOME; adopt it before any regenerate.
-    if unit_path.exists():
+    # Existing system units already pin HERMES_HOME; adopt it before any regenerate. --force-unit-path
+    # repoints the unit at the caller's home, so adopting the old one would regenerate it unchanged.
+    if unit_path.exists() and not force_unit_path:
         _sync_hermes_home_from_systemd_unit(system=system)
-        from hermes_cli.gateway_service_owner import definition_belongs_to_home
-        if not force_unit_path and not definition_belongs_to_home(unit_path, get_hermes_home(), "overwrite"):
+        if not definition_belongs_to_home(unit_path, get_hermes_home(), "overwrite"):
             return
 
     # --force-unit-path repoints the unit at this home, so it writes rather than refreshing in place.

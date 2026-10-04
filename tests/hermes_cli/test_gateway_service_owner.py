@@ -17,6 +17,10 @@ import hermes_cli.gateway as gw
 from hermes_cli import gateway_launchd
 from hermes_cli.gateway_service_owner import INSTALL_DISABLED_ENV
 
+_REAL_RETIRE_DROPIN = gw._retire_hermes_replace_dropin
+LEGACY_DROPIN = ("# Added to end the gateway respawn storm\n[Service]\nExecStart=\n"
+                 "ExecStart=/usr/bin/hermes gateway run --replace\n")
+
 REAL_UNIT = (
     "[Service]\n"
     "ExecStart=/home/ace/.hermes/hermes-agent/.hermes/bin/hermes gateway run\n"
@@ -95,6 +99,47 @@ class TestSystemdWriters:
         assert ("daemon-reload",) not in systemd_unit.calls
 
 
+    @pytest.fixture
+    def current_unit_with_dropin(self, systemd_unit, homes, monkeypatch):
+        # The unit is current, so the only pending mutation is the legacy --replace drop-in.
+        monkeypatch.setenv("HERMES_HOME", str(homes.real))
+        monkeypatch.setattr(gw, "systemd_unit_is_current", lambda system=False: True)
+        monkeypatch.setattr(gw, "_retire_hermes_replace_dropin", _REAL_RETIRE_DROPIN)
+        dropin = systemd_unit.path.parent / f"{systemd_unit.path.name}.d" / "20-replace.conf"
+        dropin.parent.mkdir()
+        dropin.write_text(LEGACY_DROPIN, encoding="utf-8")
+        return dropin
+
+    def test_worker_kill_switch_blocks_dropin_retirement_on_current_unit(
+            self, systemd_unit, current_unit_with_dropin, monkeypatch):
+        monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
+        assert gw.refresh_systemd_unit_if_needed(system=False) is False
+        assert current_unit_with_dropin.exists()
+        assert ("daemon-reload",) not in systemd_unit.calls
+
+    def test_current_unit_still_retires_its_dropin(self, systemd_unit, current_unit_with_dropin):
+        assert gw.refresh_systemd_unit_if_needed(system=False) is True
+        assert not current_unit_with_dropin.exists()
+        assert ("daemon-reload",) in systemd_unit.calls
+
+    def test_force_unit_path_repoints_an_existing_system_unit(self, systemd_unit, homes, monkeypatch):
+        # Under --system the installed unit's home is adopted into os.environ (sudo strips HERMES_HOME);
+        # an explicit repoint must keep the caller's home instead.
+        monkeypatch.setattr(gw, "_require_root_for_system_service", lambda action: None)
+        monkeypatch.setattr(gw, "_read_systemd_user_from_unit", lambda path: None)
+        gw.systemd_install(system=True, force_unit_path=True, non_interactive=True)
+        assert f"HERMES_HOME={homes.scratch}" in systemd_unit.path.read_text(encoding="utf-8")
+        assert Path(gw.get_hermes_home()) == homes.scratch
+
+    def test_worker_kill_switch_blocks_direct_install(self, systemd_unit, homes, monkeypatch):
+        # ensure_gateway_service / setup wizard / migrate call systemd_install without _cmd_install.
+        systemd_unit.path.unlink()
+        monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
+        gw.systemd_install(non_interactive=True)
+        assert not systemd_unit.path.exists()
+        assert systemd_unit.calls == []
+
+
 class TestLaunchdWriters:
     def test_boot_refresh_leaves_plist_pinned_to_another_home_untouched(self, tmp_path, homes, monkeypatch):
         plist = tmp_path / "ai.hermes.gateway.plist"
@@ -108,6 +153,17 @@ class TestLaunchdWriters:
 
         assert gateway_launchd.refresh_launchd_plist_if_needed() is False
         assert plist.read_bytes() == original
+
+    def test_worker_kill_switch_blocks_direct_install(self, tmp_path, homes, monkeypatch):
+        plist = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist)
+        monkeypatch.setattr(gw, "_launchctl_label_supervising_process", lambda label: False)
+        monkeypatch.setattr(gw, "generate_launchd_plist", lambda: "<plist>scratch</plist>")
+        monkeypatch.setattr(gw, "_prepare_service_launcher", lambda *a, **k: pytest.fail("launcher prepared"))
+        monkeypatch.setattr(gateway_launchd.subprocess, "run", lambda *a, **k: pytest.fail("launchctl ran"))
+        monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
+        gateway_launchd.launchd_install(start_now=False)
+        assert not plist.exists()
 
 
 class TestInstallCommand:
