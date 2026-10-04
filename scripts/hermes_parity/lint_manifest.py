@@ -112,6 +112,44 @@ def lint_census(manifest_path: Path) -> list[str]:
     return errors
 
 
+def lint_call_sites(manifest_path: Path) -> list[str]:
+    """D2b: an entry that declares ``call_site`` must name the e2e test that drives it.
+
+    ``call_site`` is the upstream function the fork threads a kwarg / header / hook into.
+    ``call_site_tests`` lists the nodeids that exercise THAT function and assert the visible
+    effect; each must also be in ``tests`` so ``lint_nodeids`` proves it collects. A helper-only
+    test leaves the call site free to drop the fork's input silently (t_829a3079: the footer
+    consumer lost six kwargs while every registered test stayed green).
+    Coverage table: docs/sync/fork-call-site-coverage.md.
+    """
+    with manifest_path.open("r", encoding="utf-8-sig") as fh:
+        raw = json.load(fh)
+    errors: list[str] = []
+    for entry in raw:
+        call_site = entry.get("call_site")
+        if call_site is None:
+            continue
+        name = entry.get("feature")
+        if not isinstance(call_site, str) or not call_site.strip():
+            errors.append(f"call_site for {name!r} must be a non-empty 'path::symbol' string")
+            continue
+        e2e = entry.get("call_site_tests") or []
+        if not e2e:
+            errors.append(
+                f"call_site {call_site!r} for {name!r} has no call_site_tests naming an e2e test "
+                "that drives it (D2b)"
+            )
+            continue
+        listed = set(entry.get("tests") or [])
+        for node in e2e:
+            if node not in listed:
+                errors.append(
+                    f"call_site_tests entry {node!r} for {name!r} is not in its tests list, so "
+                    "nothing checks that it collects"
+                )
+    return errors
+
+
 def lint_nodeids(repo: Path, nodeids: Sequence[str]) -> list[str]:
     if not nodeids:
         return []
@@ -195,6 +233,7 @@ def lint_manifest(
         return ManifestLintResult(False, (f"manifest missing: {manifest.relative_to(repo)}",))
     errors = lint_schema(manifest)
     errors.extend(lint_census(manifest))
+    errors.extend(lint_call_sites(manifest))
     errors.extend(lint_paths(repo, manifest))
     nodeids = forkdelta.manifest_nodeids(manifest)
     errors.extend(lint_nodeids(repo, nodeids))
