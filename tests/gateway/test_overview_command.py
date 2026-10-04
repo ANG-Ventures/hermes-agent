@@ -136,3 +136,56 @@ class TestHandler:
         out = await mixin._handle_overview_command(event)
         assert "could not resolve this chat's session (RuntimeError: database is locked)" in out
         assert "no session yet" not in out and not called
+
+
+class TestProfileIsolation:
+    """Prism P1 566b41b037f9: under multiplex the invoking profile is bound in ContextVars, not os.environ. The child
+    must run with THAT profile's home and secrets; A -> B -> A on one process, observed from inside the child."""
+
+    def test_child_env_follows_the_invoking_profile(self, tmp_path, monkeypatch):
+        import json
+        from agent.secret_scope import set_multiplex_active
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        a = tmp_path / ".hermes"
+        b = a / "profiles" / "b"
+        b.mkdir(parents=True)
+        (a / ".env").write_text("A_MARKER=a\nGH_TOKEN=a-gh\n", encoding="utf-8")
+        (b / ".env").write_text("B_MARKER=b\nGH_TOKEN=b-gh\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(a))
+        monkeypatch.setenv("A_MARKER", "a")
+        monkeypatch.setenv("GH_TOKEN", "a-gh")
+        monkeypatch.delenv("B_MARKER", raising=False)
+        _script(tmp_path, """
+            import json, os
+            print(json.dumps({k: os.environ.get(k) for k in ("HERMES_HOME", "A_MARKER", "B_MARKER", "GH_TOKEN")}))
+        """)
+
+        def seen():
+            return json.loads(oc.render_overview("sid", root=tmp_path, python=sys.executable))
+
+        set_multiplex_active(True)
+        try:
+            first = seen()                                   # A: the launch profile
+            token = set_hermes_home_override(str(b))
+            try:
+                served = seen()                              # B: served profile
+            finally:
+                reset_hermes_home_override(token)
+            again = seen()                                   # back to A
+        finally:
+            set_multiplex_active(False)
+        assert served == {"HERMES_HOME": str(b), "A_MARKER": None, "B_MARKER": "b", "GH_TOKEN": "b-gh"}, served
+        assert first["GH_TOKEN"] == again["GH_TOKEN"] == "a-gh" and first["B_MARKER"] is None
+        assert first == again
+
+    def test_unbuildable_env_is_reported_not_spawned(self, tmp_path):
+        _script(tmp_path, "")
+        ran = []
+
+        def boom():
+            raise RuntimeError("no profile scope bound")
+
+        out = oc.render_overview("sid", root=tmp_path, python="py", child_env=boom,
+                                 run=lambda *a, **k: ran.append(a))
+        assert out.startswith("/overview: could not build this profile's child environment") and not ran

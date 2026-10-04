@@ -34,6 +34,15 @@ def overview_script(root: Optional[Path] = None) -> Path:
     return Path(root) / SCRIPT_REL
 
 
+def overview_child_env() -> dict:
+    """Env for session-overview.py: the active (served) profile's home and its own credentials. The target home is
+    named explicitly (the bound override, else this process's home) so the secret scope is that profile's."""
+    from tools.environments.local import served_profile_child_env
+    from hermes_constants import get_hermes_home
+
+    return served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
+
+
 def build_argv(session_id: str, args: str, script: Path, python: str) -> list[str]:
     """argv for the script. ``/overview fast`` skips the GitHub/deploy reads (board numbers only)."""
     argv = [python, str(script), session_id, "--lineage"]
@@ -51,8 +60,10 @@ def render_overview(
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     python: Optional[str] = None,
     timeout: int = TIMEOUT_S,
+    child_env: Optional[Callable[[], dict]] = None,
 ) -> str:
     """Reply text for ``/overview``. Never raises: every failure is a one-line reason."""
+    child_env = child_env or overview_child_env
     if not session_id:
         return ("/overview: this chat has no session yet, so there are no session cards. "
                 "Send any message to open the session, then retry.")
@@ -61,8 +72,15 @@ def render_overview(
         return f"/overview: {script} is not installed on this host."
     argv = build_argv(session_id, args, script, python or sys.executable)
     try:
+        # Prism P1 566b41b037f9: the child acts for the INVOKING profile. Under multiplex that profile is bound in
+        # ContextVars (asyncio.to_thread carries them here), not in os.environ: build the env from its home and
+        # its own credentials (gh / GitHub reads), never the launch profile's.
+        env = child_env()
+    except Exception as exc:  # noqa: BLE001 - an unbuildable env is reported, never a spawn on the launch env
+        return f"/overview: could not build this profile's child environment ({type(exc).__name__}: {exc})"
+    try:
         p = run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
-                stdin=subprocess.DEVNULL)
+                stdin=subprocess.DEVNULL, env=env)
     except subprocess.TimeoutExpired:
         return f"/overview: session-overview.py did not finish in {timeout} s; try `/overview fast`."
     except OSError as exc:
