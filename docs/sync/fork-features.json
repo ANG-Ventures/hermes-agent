@@ -198,7 +198,20 @@
       "tests/gateway/test_fork_ext_restart_policy.py",
       "tests/gateway/test_restart_cascade.py",
       "tests/gateway/test_auto_continue_interrupted_turns.py",
-      "tests/gateway/test_reboot_resume_reason.py"
+      "tests/gateway/test_reboot_resume_reason.py",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_wiring",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
+    ],
+    "call_site": "gateway/run.py::_bridge_config_to_env",
+    "call_site_tests": [
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_wiring",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
     ],
     "paths": [
       "gateway/fork_ext/restart_policy.py",

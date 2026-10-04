@@ -22,7 +22,7 @@ Verdicts:
 
 Lint (D2b, `scripts/hermes_parity/lint_manifest.py::lint_call_sites`): an entry that sets
 `call_site` must list `call_site_tests` (nodeids that drive it), each also in `tests` so the
-collection lint covers it. Only the footer entry declares `call_site` today. Each presence-only
+collection lint covers it. The footer and restart-policy entries declare `call_site` today. Each presence-only
 row below has a child card of t_96049446. That card adds the e2e tests AND the `call_site` /
 `call_site_tests` fields, after which the lint holds the line.
 
@@ -35,7 +35,7 @@ row below has a child card of t_96049446. That card adds the e2e tests AND the `
 | 6 | cron per-job reasoning + script timeout | `cron/scheduler.py::_job_script_kwargs` → `_run_job_script(timeout_seconds=…)` on the `script` path | monitor path only: `tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling` (not registered). `script` path: `test_cron_workdir.py` swallows `**_fork_kwargs` without asserting them; `TestRunJobScript` asserts output only | **presence-only** |
 | 7 | relay-pool session affinity + lane headers | `agent/chat_completion_helpers.py::_build_anthropic_kwargs` (merges `_pool_affinity_headers` into the request, ~L2190) | none. Both registered files call `_pool_affinity_headers` directly; no test asserts the headers on the built request | **presence-only** |
 | 8 | restart failure count codec | `gateway/fork_ext/restart_codec.py` (pure codec + goldens) | golden + codec tests | n/a |
-| 9 | restart policy, config bridge, initiator breadcrumb | `gateway/run.py::_bridge_config_to_env` (startup, calls `_bridge_agent_config_to_env`, ~L2178/2220) | none. Tests call `_bridge_agent_config_to_env` directly; `test_fork_ext_restart_policy.py::test_breadcrumb_contract_block_documented_in_source` reads source | **presence-only** |
+| 9 | restart policy, config bridge, initiator breadcrumb | `gateway/run.py::_bridge_config_to_env` (startup, calls `_bridge_agent_config_to_env`, ~L2178/2220) | `tests/gateway/test_restart_config_bridge_call_site.py`: `test_wiring[<key>]` + `test_effect[<key>]` for each of the 7 fork-only keys (drives the real startup function, reads the live reader, regresses to the stale preset with the call dropped); `test_restart_breadcrumb_frozen_contract_is_consumed` replaces the source-text check | covered |
 | 10 | configured + persisted route identity helpers | `GatewayRunner` session route lookup → `PersistedSessionRouteLookup` | `tests/gateway/test_session_model_reset.py` (drives `GatewayRunner`) | covered |
 | 12 | state helpers: denorm gate + platform session search | `SessionDB` list / search paths | `tests/hermes_state/test_session_list_denorm_reland.py::test_flag_on_denorm_path_matches_cte_oracle_byte_for_byte`, `tests/test_hermes_state_core.py::TestSearchSessionsByTitle` | covered |
 | 14 | /undo, /redo | gateway slash dispatch → half-turn rewind | `tests/gateway/test_undo_redo_half_turn.py` (drives `GatewayRunner` with a real `SessionDB`) | covered |

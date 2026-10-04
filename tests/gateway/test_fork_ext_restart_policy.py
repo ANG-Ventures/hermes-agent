@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -36,13 +35,6 @@ def test_restart_policy_import_is_one_way():
         capture_output=True,
     )
     assert probe.returncode == 0, probe.stderr
-
-
-def test_breadcrumb_contract_block_documented_in_source():
-    """The F2 contract block is the single documented source of truth."""
-    restart_policy = importlib.import_module("gateway.fork_ext.restart_policy")
-
-    assert "F2 BREADCRUMB CONTRACT" in inspect.getsource(restart_policy)
 
 
 def test_gateway_run_reexports_restart_policy_helpers():
