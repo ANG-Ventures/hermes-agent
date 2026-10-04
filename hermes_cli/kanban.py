@@ -7772,9 +7772,13 @@ def run_slash(rest: str, *, session_id: Optional[str] = None) -> str:
     ``None`` falls back to :func:`_caller_session_id`'s normal resolution.
     """
     token = _SLASH_SESSION_ID.set((session_id or "").strip() or None)
+    # A typed CLI/TUI ``/kanban`` is hand-typed (D-O2, t_6281f908); the
+    # gateway's in-process call is classified as ``gateway`` before this.
+    hand = kb.HAND_TYPED_SLASH.set(True)
     try:
         return _run_slash(rest)
     finally:
+        kb.HAND_TYPED_SLASH.reset(hand)
         _SLASH_SESSION_ID.reset(token)
 
 

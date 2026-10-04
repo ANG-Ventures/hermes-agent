@@ -5399,6 +5399,12 @@ CREATE_ORIGIN_SCRIPT = "script"
 # Set by cron/scheduler.py on every script-job child (HERMES_CRON_SCRIPT is
 # also set there when the gh shim is installed).
 CRON_JOB_ID_ENV = "HERMES_CRON_JOB_ID"
+# Set by ``kanban.run_slash`` for a ``/kanban`` typed in the CLI or TUI (never
+# the gateway, which is classified first). Not ``HERMES_INTERACTIVE``: agent
+# subprocesses (-q runs, workers) inherit that env flag.
+HAND_TYPED_SLASH: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "kanban_hand_typed_slash", default=False
+)
 
 
 def classify_create_origin() -> str:
@@ -5409,8 +5415,8 @@ def classify_create_origin() -> str:
         return CREATE_ORIGIN_CRON
     if _process_is_gateway():
         return CREATE_ORIGIN_GATEWAY
-    if (os.environ.get("HERMES_INTERACTIVE") or "").strip() == "1":
-        return CREATE_ORIGIN_HAND  # the TUI slash worker (stdin is a pipe)
+    if HAND_TYPED_SLASH.get():
+        return CREATE_ORIGIN_HAND  # a typed CLI/TUI ``/kanban`` (the TUI slash worker's stdin is a pipe)
     try:
         if sys.stdin is not None and sys.stdin.isatty():
             return CREATE_ORIGIN_HAND
