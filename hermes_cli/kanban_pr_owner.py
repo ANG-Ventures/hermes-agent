@@ -21,7 +21,10 @@ The rule: a PR has at most ONE running card.
   a second worker. An unknown head-commit time counts as fresh: no reclaim and
   no spawn.
 * ``create_task`` refuses a ``rebase:``-keyed helper card at birth while a
-  fresh owner runs (:class:`PrOwnerBusyError`). This covers both minters
+  fresh owner runs (:class:`PrOwnerBusyError`). Override: ``force_reason``
+  (CLI ``--force "<reason>"``), ledgered as a ``pr_owner_forced`` event. The
+  spawn guard's override is to reclaim the owner (``kanban reclaim``, audited
+  by its ``reclaimed`` event). This covers both minters
   (kanban-review-merge-pass and fleet-merge-horizon-watch) without changing
   their scripts. A refused create exits non-zero with the owner named.
 * :func:`pr_cards` lists every card on a PR for ``kanban show``.
@@ -171,8 +174,8 @@ def pr_owner_card(conn: sqlite3.Connection, target: tuple) -> Optional[str]:
 
 def _gh_json(path: str) -> Optional[dict]:
     try:
-        proc = subprocess.run(["gh", "api", path], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace",
+        proc = subprocess.run(["gh", "api", path], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
                               timeout=_GH_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -244,7 +247,7 @@ def refuse_rebase_card_at_birth(conn: sqlite3.Connection, idempotency_key: Optio
         raise PrOwnerBusyError(
             f"refused: {describe(owner)}. One running card per PR (t_cb70d390): the owner folds "
             f"the base branch itself; a stale owner (no PR push in 2 h) is reassigned by the "
-            f"dispatcher.", owner)
+            f"dispatcher. Override: --force \"<reason>\" (ledgered as pr_owner_forced).", owner)
 
 
 def spawn_owners(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,

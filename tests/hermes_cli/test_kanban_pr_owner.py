@@ -209,3 +209,14 @@ def test_bare_title_ref_inherits_the_parents_pr(kanban_home, head_at):
         detail: dict = {}
         assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
         assert detail["owner"] == owner
+
+
+def test_birth_refusal_override_is_ledgered(kanban_home, head_at):
+    with kb.connect() as conn:
+        owner = _run_owner(conn)
+        tid = kb.create_task(conn, title=f"rebase {PR} @9339c44b", assignee="daedalus-opus",
+                             idempotency_key=f"rebase:{PR}@9339c44b",
+                             force_reason="Apollo: owner is wedged, take the fold")
+        ev = [e.payload for e in kb.list_events(conn, tid) if e.kind == "pr_owner_forced"]
+        assert ev == [{"owner": owner, "pr": "ang-ventures/hermes-agent#1624",
+                       "reason": "Apollo: owner is wedged, take the fold"}]

@@ -7501,6 +7501,7 @@ def create_task(
         skills_auto_added.append(MILESTONE_QA_SKILL)
 
 
+    pr_owner_forced: Optional[dict] = None
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -7517,9 +7518,17 @@ def create_task(
             return row["id"]
         # One running card per PR (t_cb70d390): a rebase helper for a PR
         # whose owner card is running is refused at birth, owner named.
+        # ``force_reason`` (CLI ``--force "<reason>"``) overrides it; the
+        # override is ledgered as a ``pr_owner_forced`` event below.
         from hermes_cli import kanban_pr_owner as _kpo
 
-        _kpo.refuse_rebase_card_at_birth(conn, idempotency_key)
+        try:
+            _kpo.refuse_rebase_card_at_birth(conn, idempotency_key)
+        except _kpo.PrOwnerBusyError as exc:
+            if not force_reason:
+                raise
+            pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
+                               "reason": force_reason}
 
     now = int(time.time())
 
@@ -7794,6 +7803,8 @@ def create_task(
                             **({"reason": force_reason} if forced else {}),
                         },
                     )
+                if pr_owner_forced:
+                    _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 overlap_hits: list[dict] = []
                 if duplicate_guard:
                     # Same-incident gate (t_ba30f0de): another session minted
