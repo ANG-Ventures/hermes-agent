@@ -77,6 +77,9 @@ ExecStart="/home/ace/src/hermes-agent/venv/bin/python" "-I" "-c" "import os, sys
         (CHECKOUT_UNIT, "systemd unit", False),
         (GENERATED_UNIT, "systemd unit", True),
         (DEV_GENERATED_UNIT, "systemd unit", True),
+        # A quoted interpreter path with a space is still the generator's runtime_command shape.
+        (DEV_GENERATED_UNIT.replace("/home/ace/src/", "/home/ace/Hermes Project/"), "systemd unit", True),
+        (GENERATED_UNIT.replace("/home/ace/", "/home/a ce/"), "systemd unit", True),
         (CHECKOUT_UNIT.replace('"-m"', '"-I" "-c" "import os"'), "systemd unit", False),
         ("[Service]\nExecStart=/home/ace/.hermes/.hermes/bin/hermes gateway run\n", "systemd unit", True),
         ("not a service definition at all", "systemd unit", False),
@@ -97,6 +100,26 @@ def test_refuse_reads_the_installed_file_not_the_generated_one(tmp_path, capsys,
     p.write_text(GENERATED_PLIST, encoding="utf-8")
     assert gateway_cli._refuse_foreign_service_overwrite(p, "launchd plist") is False
     assert gateway_cli._refuse_foreign_service_overwrite(tmp_path / "missing.plist", "launchd plist") is False
+
+
+@pytest.mark.platforms("posix")
+def test_unreadable_definition_is_refused_not_overwritten(tmp_path, capsys, monkeypatch):
+    """Ownership cannot be established for a definition we cannot read, so it is left alone."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads any file")
+    monkeypatch.delenv(gateway_cli._FOREIGN_SERVICE_OVERWRITE_ENV, raising=False)
+    p = tmp_path / "hermes-gateway.service"
+    p.write_text(CHECKOUT_UNIT, encoding="utf-8")
+    p.chmod(0o200)
+    try:
+        assert gateway_cli._refuse_foreign_service_overwrite(p, "systemd unit") is True
+        assert "cannot read it" in capsys.readouterr().out
+        assert gateway_cli._refuse_foreign_service_overwrite(p, "systemd unit", force=True) is False
+    finally:
+        p.chmod(0o600)
+    assert p.read_text(encoding="utf-8") == CHECKOUT_UNIT
 
 
 @pytest.mark.parametrize("how", ["force", "env"])
