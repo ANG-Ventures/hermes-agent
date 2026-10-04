@@ -639,6 +639,17 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Persist the runner's git alternate
+        # ace-e2e-vm runners (t_78d851d1) export GIT_ALTERNATE_OBJECT_DIRECTORIES so
+        # checkout borrows objects from a host mirror. The suite spawns git with an
+        # allowlisted env that drops that var, so its local "remote" could not read
+        # them (run 37170424601: "Could not read 64eb1c8c"). Writing the alternate
+        # into the repo makes it env-independent. No-op where the var is unset.
+        run: |
+          [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ] || exit 0
+          printf '%s\n' "$GIT_ALTERNATE_OBJECT_DIRECTORIES" | tr ':' '\n' >> "$(git rev-parse --git-path objects/info/alternates)"
+          git fsck --connectivity-only --no-progress >/dev/null 2>&1 || git count-objects -v
+
       - name: Fetch upstream release tags
         # Fork: the release tags (v2026.*) are cut on NousResearch/hermes-agent and this
         # repo's own tag list stops at v2026.5.7, so `git describe` on a parity ref named a
