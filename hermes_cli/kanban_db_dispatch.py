@@ -5943,7 +5943,7 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    # Worker-host placement (kanban.worker_hosts): same process, same grant,
+    # Worker-pool placement (kanban_worker_pool): same process, same grant,
     # tools on the worker host. Never inherit a placement from our own env.
     env.pop(_kb._kwh.PLACEMENT_ENV, None)
     if placement is not None:
@@ -6194,6 +6194,10 @@ def run_daemon(
                     running=_klg_mod.count_running_workers()
                     if load_gate.enabled else None
                 )
+                if load_gate.enabled and allowance is None:
+                    # Same contract as the gateway's GateTick (RC-5c): an
+                    # enabled gate is an int LOCAL budget; unreadable = 0.
+                    allowance, reason = 0, (reason or "gate_unreadable")
                 gate_kwargs = {"spawn_paused": reason, "spawn_limit": allowance}
                 if load_gate.host_recovered():
                     with contextlib.closing(_kbc.connect()) as _rconn:
