@@ -255,7 +255,10 @@ def check_fallback(doc: dict) -> list[str]:
                     except (ValueError, SyntaxError, KeyError, TypeError) as exc:
                         errors.append(f"{where}: {exc}")
                         continue
-                    legacy_e2e = ["self-hosted", "hermes-ci", "X64"] if labels else ["blacksmith-4vcpu-ubuntu-2404"]
+                    # push (post-merge backstop) runs on free ubuntu-latest; every other
+                    # event keeps the Blacksmith literal (t_e95fdb01).
+                    hosted_e2e = ["ubuntu-latest"] if event == "push" else ["blacksmith-4vcpu-ubuntu-2404"]
+                    legacy_e2e = ["self-hosted", "hermes-ci", "X64"] if labels else hosted_e2e
                     if event != "merge_group" or not enabled:
                         want, want_e2e = GEN_MATRIX, legacy_e2e
                     elif outcome == "valid":
@@ -533,7 +536,9 @@ def test_fromjson_never_fed_a_possibly_missing_output():
         assert arg[0] == "op" and arg[1] == "||", expr
         last = _refs(arg[3])
         assert last and not any(r.startswith("needs.placement") for r in last), last
-        assert last <= {"needs.generate.outputs.matrix", "vars.CI_RUNNER_LABELS"}, last
+        # github.event_name is always defined (never a missing output); e2e uses it to
+        # put push (post-merge backstop) on free ubuntu-latest (t_e95fdb01).
+        assert last <= {"needs.generate.outputs.matrix", "vars.CI_RUNNER_LABELS", "github.event_name"}, last
 
 
 def test_gate_cli_reads_results_from_env(tmp_path):
