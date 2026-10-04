@@ -111,3 +111,42 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
             assert kb.get_task(conn, c).status == "ready"
 
 
+
+
+# ---------------------------------------------------------------------------
+# t_102864fa: a stale land script replaying promote/triage-resolve on a card
+# that is already terminal must be a refused no-op that says so, like complete.
+
+def _event_count(conn, tid):
+    return conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("terminal", ["done", "archived"])
+def test_promote_on_terminal_card_is_a_refused_noop(conn, terminal):
+    tid = kb.create_task(conn, title="t", assignee="setup")
+    conn.execute(
+        "UPDATE tasks SET status = ?, completed_at = 1 WHERE id = ?", (terminal, tid)
+    )
+    before = _event_count(conn, tid)
+    ok, err = kb.promote_task(conn, tid, actor="tester")
+    assert not ok
+    assert err and ("already done" in err or "archived" in err)
+    assert kb.get_task(conn, tid).status == terminal
+    assert _event_count(conn, tid) == before
+
+
+@pytest.mark.parametrize("terminal", ["done", "archived"])
+def test_triage_resolve_on_terminal_card_is_a_refused_noop(conn, terminal):
+    tid = kb.create_task(conn, title="t", assignee="setup")
+    conn.execute(
+        "UPDATE tasks SET status = ?, completed_at = 1 WHERE id = ?", (terminal, tid)
+    )
+    before = _event_count(conn, tid)
+    ok, err = kb.triage_resolve_task(conn, tid, to="done", reason="replay", actor="tester")
+    assert not ok
+    assert err and ("already done" in err or "archived" in err)
+    assert "complete instead" not in err
+    assert kb.get_task(conn, tid).status == terminal
+    assert _event_count(conn, tid) == before
