@@ -5,7 +5,7 @@
 # ANG-Ventures/fleet-floor-workflows (never a moving tag).
 #
 # Placeholders:
-#   debd27598fa6c6a4a250e211f7501f3698984120   40-char commit SHA of the central repo
+#   b701cc0171ab91c92237672b8fcee9efe2e6af5d   40-char commit SHA of the central repo
 #   ubuntu-latest      public repo: GitHub-hosted. Private ANG-Ventures repos use the org's metered runner label.
 name: override-lint
 
@@ -61,7 +61,7 @@ permissions:
 
 jobs:
   override_lint:
-    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@debd27598fa6c6a4a250e211f7501f3698984120
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@b701cc0171ab91c92237672b8fcee9efe2e6af5d
     with:
       runner: ubuntu-latest
       # Repos whose skills live elsewhere: pass the dirs grepped for the named override (warning only).
