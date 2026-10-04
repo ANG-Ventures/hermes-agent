@@ -19,6 +19,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from tests.hermes_cli.test_kanban_notify_repair import (  # noqa: F401  (fixture)
     CHAT, USER, _run, _user_id_of, kanban_home,
 )
@@ -43,7 +44,7 @@ def _card(monkeypatch, origin: str) -> tuple[str, object]:
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cron origin", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT,
             chat_type="group", user_id=None, user_id_alt=None, scope_id=None,
         )

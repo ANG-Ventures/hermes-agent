@@ -28,6 +28,8 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 from plugins.kanban.dashboard import plugin_api as api
 
 
@@ -80,7 +82,7 @@ def _dispatch(conn):
         spawned.append(task.id)
         return 777001
 
-    result = kb.dispatch_once(conn, spawn_fn=spawn, max_spawn=20)
+    result = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=20)
     return spawned, result
 
 
@@ -88,7 +90,7 @@ def _live_claim(conn, title, pid=424242):
     tid = kb.create_task(conn, title=title, assignee="worker")
     first = kb.claim_task(conn, tid)
     assert first is not None
-    kb._set_worker_pid(conn, tid, pid)
+    kbd._set_worker_pid(conn, tid, pid)
     return tid, first
 
 
@@ -178,7 +180,9 @@ def test_operator_terminal_outcome_does_not_certify_worker_exit(conn, monkeypatc
     elif release == "review":
         assert kb.request_review(conn, tid, summary="operator", reviewer="worker", force=True)
     elif release == "complete":
-        assert kb.complete_task(conn, tid, summary="operator")
+        # Upstream #111764: an operator close of a card under a LIVE worker
+        # claim is an explicit override (force=True), never implicit.
+        assert kb.complete_task(conn, tid, summary="operator", force=True)
         assert api._set_status_direct(conn, tid, "ready")
         assert kb.claim_task(conn, tid) is None
         assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
@@ -189,7 +193,7 @@ def test_operator_terminal_outcome_does_not_certify_worker_exit(conn, monkeypatc
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
         review = kb.claim_review_task(conn, tid)
         assert review is not None
-        kb._set_worker_pid(conn, tid, 525252)
+        kbd._set_worker_pid(conn, tid, 525252)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 525252)
         from tests.kanban_review_helpers import covered_request_changes
         assert covered_request_changes(conn, tid, reason="operator")
@@ -283,7 +287,7 @@ def test_real_process_survives_operator_block_without_second_spawn(conn, monkeyp
     proc = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        kb._set_worker_pid(conn, tid, proc.pid)
+        kbd._set_worker_pid(conn, tid, proc.pid)
         assert kb.block_task(conn, tid, reason="operator pause")
         assert kb.unblock_task(conn, tid)
         spawned, _ = _dispatch(conn)
@@ -353,7 +357,7 @@ def _review_run_released_unsafely(conn):
                              expected_run_id=builder.current_run_id)
     review = kb.claim_review_task(conn, tid)
     assert review is not None
-    kb._set_worker_pid(conn, tid, 525252)
+    kbd._set_worker_pid(conn, tid, 525252)
     # A releaser that did not prove death (older binary / other host).
     with kb.write_txn(conn):
         conn.execute(
@@ -407,16 +411,16 @@ def _external_release(conn, tid):
 def test_launch_aborts_when_claim_released_before_spawn(conn, monkeypatch):
     tid = kb.create_task(conn, title="released during setup", assignee="worker")
     kb.recompute_ready(conn)
-    real_tip = kb._maybe_emit_scratch_tip
+    real_tip = kbw._maybe_emit_scratch_tip
 
     def tip_then_release(c, task_id, kind):
         real_tip(c, task_id, kind)
         if task_id == tid:
             _external_release(c, tid)
 
-    monkeypatch.setattr(kb, "_maybe_emit_scratch_tip", tip_then_release)
+    monkeypatch.setattr(kbw, "_maybe_emit_scratch_tip", tip_then_release)
     spawned: list[str] = []
-    kb.dispatch_once(
+    kbd.dispatch_once(
         conn, max_spawn=1,
         spawn_fn=lambda task, ws, board=None: spawned.append(task.id) or 1,
     )
@@ -440,7 +444,7 @@ def test_late_spawn_is_terminated_and_never_stamped(conn, monkeypatch):
         _external_release(conn, task.id)
         return 434343
 
-    result = kb.dispatch_once(conn, spawn_fn=spawn, max_spawn=1)
+    result = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=1)
     assert killed == [434343]
     assert tid not in [t for t, *_ in result.spawned]
     assert _row(conn, tid)["worker_pid"] is None
@@ -458,9 +462,9 @@ def test_fenced_late_pid_never_overwrites_successor(conn):
     _external_release(conn, tid)
     second = kb.claim_task(conn, tid)
     assert second is not None
-    assert kb._set_worker_pid(conn, tid, 434343,
+    assert kbd._set_worker_pid(conn, tid, 434343,
                               run_id=second.current_run_id) is True
-    assert kb._set_worker_pid(conn, tid, 424242,
+    assert kbd._set_worker_pid(conn, tid, 424242,
                               run_id=first.current_run_id) is False
     assert _row(conn, tid)["worker_pid"] == 434343
 
@@ -495,7 +499,7 @@ def test_open_leaked_run_with_real_live_owner_blocks_dispatch(conn):
     proc = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        kb._set_worker_pid(conn, tid, proc.pid, run_id=first.current_run_id)
+        kbd._set_worker_pid(conn, tid, proc.pid, run_id=first.current_run_id)
         _leak_open_run(conn, tid)
         assert _run_ended_at(conn, first.current_run_id) is None
 
@@ -542,7 +546,7 @@ def test_every_spawn_of_one_run_is_probed(conn, monkeypatch, alive_pid):
     """A run stamped twice: whichever PID still lives blocks the claim; a dead
     sibling stamp must not vouch for it (older- or newer-alive)."""
     tid, first = _live_claim(conn, "double stamp")
-    kb._set_worker_pid(conn, tid, 434343, run_id=first.current_run_id)
+    kbd._set_worker_pid(conn, tid, 434343, run_id=first.current_run_id)
     assert len(_events(conn, tid, "spawned")) == 2
     _external_release(conn, tid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == alive_pid)
@@ -554,7 +558,7 @@ def test_every_spawn_of_one_run_is_probed(conn, monkeypatch, alive_pid):
 
 def test_double_stamped_run_with_all_owners_dead_is_dispatched(conn, monkeypatch):
     tid, first = _live_claim(conn, "double stamp, both dead")
-    kb._set_worker_pid(conn, tid, 434343, run_id=first.current_run_id)
+    kbd._set_worker_pid(conn, tid, 434343, run_id=first.current_run_id)
     _external_release(conn, tid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
@@ -689,7 +693,7 @@ def _released_with_real_holder(conn, title):
     first = kb.claim_task(conn, tid)
     assert first is not None
     proc = _sleeper()
-    kb._set_worker_pid(conn, tid, proc.pid)
+    kbd._set_worker_pid(conn, tid, proc.pid)
     assert kb.block_task(conn, tid, reason="operator pause")
     assert kb.unblock_task(conn, tid)
     return tid, first, proc
@@ -712,7 +716,7 @@ def _review_handoff_with_real_holder(conn, title):
     builder = kb.claim_task(conn, tid)
     assert builder is not None
     proc = _sleeper()
-    kb._set_worker_pid(conn, tid, proc.pid)
+    kbd._set_worker_pid(conn, tid, proc.pid)
     assert kb.request_review(conn, tid, summary="for review", reviewer="argus",
                              expected_run_id=builder.current_run_id)
     return tid, builder, proc
@@ -784,7 +788,7 @@ def test_lock_lagged_spawn_event_still_identifies_genuine_owner(conn, real_ident
         t = threading.Thread(target=hold_lock)
         t.start()
         assert holding.wait(10)
-        kb._set_worker_pid(conn, tid, proc.pid)
+        kbd._set_worker_pid(conn, tid, proc.pid)
         t.join()
 
         spawned_at = [

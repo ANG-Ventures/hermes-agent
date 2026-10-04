@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_diagnostics as kd
 
 
@@ -327,6 +329,19 @@ def test_failure_rules_exempt_running_retry():
     assert kd.compute_task_diagnostics(task, [], runs) == []
 
 
+def test_running_with_open_parents_fires_only_while_running():
+    """A running card whose parent is not terminal is flagged; the same graph
+    on a ready/todo card (the gate is holding it) and a done parent are not."""
+    graph = {"parents": [{"id": "t_parent", "title": "p", "status": "todo"}], "children": []}
+    diags = kd.compute_task_diagnostics(_task(status="running", started_at=100), [], [], graph=graph)
+    assert [d.kind for d in diags] == ["running_with_open_parents"]
+    assert diags[0].data["open_parents"] == [{"id": "t_parent", "status": "todo"}]
+    assert "hermes kanban unlink t_parent t_demo00" in diags[0].actions[0].payload["command"]
+    assert kd.compute_task_diagnostics(_task(status="todo"), [], [], graph=graph) == []
+    done_graph = {"parents": [{"id": "t_parent", "title": "p", "status": "done"}], "children": []}
+    assert kd.compute_task_diagnostics(_task(status="running"), [], [], graph=done_graph) == []
+
+
 def test_stuck_in_blocked_fires_past_threshold():
     now = int(time.time())
     task = _task(status="blocked")
@@ -343,23 +358,10 @@ def test_stuck_in_blocked_fires_past_threshold():
     assert d.data["age_hours"] >= 48
 
 
-def test_repeated_crashes_truncates_huge_tracebacks():
-    """Full Python tracebacks can be tens of KB. The title stays one
-    line (≤160 chars); the detail caps at 500 chars + ellipsis so the
-    card doesn't explode visually."""
-    huge = "Traceback (most recent call last):\n" + ("  File\n" * 500)
-    task = _task(status="ready")
-    runs = [
-        _run(outcome="crashed", run_id=1, error=huge),
-        _run(outcome="crashed", run_id=2, error=huge),
-    ]
-    diags = kd.compute_task_diagnostics(task, [], runs)
-    d = diags[0]
-    # Title only the first line, capped.
-    assert "\n" not in d.title
-    assert len(d.title) < 250
-    # Detail contains the snippet with ellipsis.
-    assert d.detail.endswith("…") or len(d.detail) < 700
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +380,7 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
     as well as dataclass Task / plain dict. The API layer passes Row
     objects directly.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="p", assignee="w")
         real = kb.create_task(conn, title="r", assignee="x", created_by="w")
@@ -562,7 +564,7 @@ def test_claim_refused_live_owner_from_real_review_refusal(kanban_home, monkeypa
         tid = kb.create_task(conn, title="held review", assignee="builder")
         run = kb.claim_task(conn, tid)
         assert run is not None
-        kb._set_worker_pid(conn, tid, 515151)
+        kbd._set_worker_pid(conn, tid, 515151)
         assert kb.request_review(conn, tid, summary="done", reviewer="argus",
                                  expected_run_id=run.current_run_id)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 515151)

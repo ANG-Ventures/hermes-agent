@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli.kanban_load_gate import LoadGate
 
@@ -32,7 +33,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _board_with_ready(kanban_home, monkeypatch, n):
-    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     (kanban_home / "profiles" / "alpha").mkdir(parents=True, exist_ok=True)
     with kb.connect_closing() as conn:
@@ -49,7 +50,7 @@ def _tick(gate, load1, now, *, load5=None, old=False):
     else:
         allowance, reason = gate.admit(load1, load5=load5, now=now)
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=lambda *a, **k: 1, max_spawn=64,
             spawn_paused=reason, spawn_limit=allowance,
         )
@@ -155,10 +156,10 @@ def test_bad_config_values_fall_back_to_defaults():
 def test_dispatch_once_spawn_limit_intersects_budget(kanban_home, monkeypatch):
     _board_with_ready(kanban_home, monkeypatch, 5)
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=2)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=2)
     assert len(res.spawned) == 2
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=0)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=0)
     assert res.spawned == []
 
 
@@ -207,10 +208,10 @@ def test_run_daemon_applies_gate(kanban_home, monkeypatch):
         captured.append(kwargs)
         return kb.DispatchResult()
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (146.0, 90.0))
     gate = LoadGate({}, ncpu=32)
-    kb.run_daemon(interval=0.01, stop_event=stop,
+    kbd.run_daemon(interval=0.01, stop_event=stop,
                   on_tick=lambda _res: stop.set(), load_gate=gate)
     assert captured[0]["spawn_limit"] == 0
     assert "load1=146.0" in captured[0]["spawn_paused"]
@@ -285,13 +286,13 @@ def test_dispatch_once_names_the_cap_that_refused(kanban_home, monkeypatch):
     """A manual dispatch that spawns 0 must say which cap refused."""
     _board_with_ready(kanban_home, monkeypatch, 4)
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=0)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, spawn_limit=0)
     assert res.spawned == [] and "load gate" in (res.spawn_capped or "")
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, max_spawn=2)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, max_spawn=2)
     assert len(res.spawned) == 2 and res.spawn_capped is None
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, max_spawn=2)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, max_spawn=2)
     assert res.spawned == [] and "max_spawn=2" in (res.spawn_capped or "")
 
 

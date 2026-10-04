@@ -26,7 +26,9 @@ def _capture_agent_kwargs(monkeypatch, *, task=None, board=None):
             self.tool_gen_callback = object()
             self._session_messages = []
 
-        def run_conversation(self, _prompt):
+        def run_conversation(self, _prompt, conversation_history=None):
+            # upstream _run_agent forwards conversation_history (None for a fresh one-shot)
+            assert conversation_history is None
             return {"final_response": "done"}
 
         def shutdown_memory_provider(self, messages=None):

@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -63,7 +64,7 @@ def borrowed_workspace(conn, tmp_path, *, publish=True, commit_local=False,
                              `bases`) or created by a later round
     """
     tid = kb.create_task(conn, title="clone that borrows objects")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(parents=True, exist_ok=True)
     remote = tmp_path / f"{tid}.git"
     git(tmp_path, "init", "--bare", str(remote))
@@ -79,7 +80,7 @@ def borrowed_workspace(conn, tmp_path, *, publish=True, commit_local=False,
     if publish:
         git(cold, "push", "origin", "HEAD:refs/heads/published")
     if record_before_clone:
-        kb.set_workspace_path(conn, tid, ws)
+        kbw.set_workspace_path(conn, tid, ws)
 
     # `git clone --shared <local path>` records an alternates lender instead of
     # copying objects. This is the shape the incident had.
@@ -92,7 +93,7 @@ def borrowed_workspace(conn, tmp_path, *, publish=True, commit_local=False,
     if commit_local:
         git(redprove, "commit", "-m", "local work the worker committed")
     if not record_before_clone:
-        kb.set_workspace_path(conn, tid, ws)
+        kbw.set_workspace_path(conn, tid, ws)
     return tid, ws, cold, redprove
 
 

@@ -27,7 +27,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.run import _build_gateway_agent_history
 from plugins.blackbox.prefix_guard import compare, fingerprint_request
-from tests.run_agent.test_tool_call_incremental_persistence import (
+from tests.agent.test_tool_call_incremental_persistence import (
     SessionDB,
     _attach_real_session_db,
     _make_agent,
@@ -145,7 +145,14 @@ def test_composed_followup_reload_keeps_prefix(tmp_path):
 
 def test_recursive_followup_run_agent_call_passes_persist_overrides():
     """Every recursive ``_run_agent`` follow-up carries the composed persist pair."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(gateway_run.GatewayRunner)))
+    import gateway.run_turn as gateway_run_turn
+
+    # The follow-up recursion moved from GatewayRunner into gateway/run_turn.py
+    # (upstream decomposition); scan both so neither home can drop the pair.
+    tree = ast.Module(body=[
+        ast.parse(textwrap.dedent(inspect.getsource(gateway_run.GatewayRunner))),
+        ast.parse(inspect.getsource(gateway_run_turn)),
+    ], type_ignores=[])
     calls = [
         node
         for node in ast.walk(tree)

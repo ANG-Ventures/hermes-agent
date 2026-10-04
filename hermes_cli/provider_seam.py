@@ -355,7 +355,11 @@ def _restore(gen: Generation) -> None:
     """
     global _current
     with _lock:
-        _current = gen
+        # A container registered AFTER the snapshot (a module whose facade materialised
+        # lazily mid-test, e.g. ``hermes_cli.providers.HERMES_OVERLAYS``) has no entry in
+        # ``gen``; carry its current entry forward or every later read raises KeyError.
+        missing = {n: _current[n] for n in FACADES if n not in gen._containers and n in _current._containers}
+        _current = _with(gen, missing) if missing else gen
         for name, facade in FACADES.items():
             try:
                 data = gen[name]

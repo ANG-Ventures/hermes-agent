@@ -22,6 +22,7 @@ import pytest
 import cron.jobs as jobs_mod
 from cron.jobs import (
     LATE_FIRE_KEY,
+    claim_job_for_fire,
     drain_missed_oneshot_notices,
     get_due_jobs,
     load_jobs,
@@ -175,6 +176,10 @@ class TestRecurringRestartCatchup:
 
         due = get_due_jobs()
         assert [d["id"] for d in due] == ["hourly"]
+        # The tick claims the offered slot before running it; upstream #107485 restores an
+        # offered-but-never-claimed slot on the next scan (crash between advance and claim),
+        # so the claim is what makes "runs once" hold.
+        assert claim_job_for_fire("hourly") is True
         # Next scan (same instant) must not fire it again.
         nxt = datetime.fromisoformat(load_jobs()[0]["next_run_at"])
         assert nxt > FIXED_NOW
@@ -187,6 +192,7 @@ class TestRecurringRestartCatchup:
 
         first = get_due_jobs()
         assert [d["id"] for d in first] == ["hourly"]
+        assert claim_job_for_fire("hourly") is True  # the tick's claim (see above)
         nxt = datetime.fromisoformat(load_jobs()[0]["next_run_at"])
         assert nxt > FIXED_NOW
         # No backlog replay: repeated scans at the same instant fire nothing.

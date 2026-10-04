@@ -167,19 +167,21 @@ class TestTerminalToolStampsTheMarker:
         import re
         from pathlib import Path
 
-        import tools.terminal_tool as terminal_tool
+        # Upstream extracted the guard into tools/terminal_tool_guards.py
+        # (gateway_lifecycle_block); the refusals are `_blocked_json(...)` calls.
+        import tools.terminal_tool_guards as terminal_tool_guards
 
-        source = Path(terminal_tool.__file__).read_text(encoding="utf-8")
-        # Every `"status": "error"` return in the supervised-gateway guard
-        # block must be stamped. Locate the guard region lexically.
-        start = source.index("if _is_supervised_gateway_process():")
-        end = source.index("# Validate before the source guard resolves", start)
+        source = Path(terminal_tool_guards.__file__).read_text(encoding="utf-8")
+        # Every refusal in the supervised-gateway guard must be stamped. Locate
+        # the guard region lexically.
+        start = source.index("def gateway_lifecycle_block(")
+        end = source.index("def self_repo_block(", start)
         region = source[start:end]
-        blocks = re.findall(r'"status": "error",', region)
+        blocks = re.findall(r"_blocked_json\(", region)
         markers = re.findall(
-            r'"blocked_by": _GATEWAY_LIFECYCLE_BLOCK_MARKER,', region
+            r"blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER", region
         )
-        assert len(blocks) == 2, f"expected 2 guard refusals, found {len(blocks)}"
+        assert len(blocks) >= 2, f"expected >=2 guard refusals, found {len(blocks)}"
         assert len(markers) == len(blocks), (
             f"{len(blocks)} guard refusals but only {len(markers)} stamped "
             "with the block marker — an unstamped refusal is a silent block "

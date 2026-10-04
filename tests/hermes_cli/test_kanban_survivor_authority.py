@@ -14,6 +14,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 HEAD = "a1" * 20
 MERGE = "b2" * 20
@@ -135,8 +136,8 @@ def test_mined_pr_does_not_authorize_deleting_an_uncaptured_workspace(board, rem
     must not convert that fail-closed HOLD into an rmtree.
     """
     tid = kb.create_task(board, title="implementation card")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     (ws / "deliverable.py").write_text("real_work = True\n")
     kb.add_comment(board, tid, "reviewer", f"context: unrelated {PR} landed earlier")
 

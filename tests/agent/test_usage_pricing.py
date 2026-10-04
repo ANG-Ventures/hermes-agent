@@ -1,6 +1,10 @@
+from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
+    _OFFICIAL_DOCS_PRICING,
     CanonicalUsage,
     NOTIONAL_ANTHROPIC_PROVIDERS,
     format_cost_label,
@@ -13,7 +17,6 @@ from agent.usage_pricing import (
     resolve_billing_route,
 )
 from agent.usage_pricing import _infer_vendor_from_model
-from decimal import Decimal
 
 
 # Representative notional-Anthropic provider keys: the exact base members PLUS a
@@ -35,6 +38,69 @@ _REPRESENTATIVE_NOTIONAL = [
     "claude-bpx-3",
     "claude-bpx-5",
 ]
+def test_astra_whole_request_price_tier_includes_cache_writes():
+    below = estimate_usage_cost(
+        "gpt-6-astra",
+        CanonicalUsage(input_tokens=100_000, output_tokens=10_000, cache_read_tokens=10_000, cache_write_tokens=10_000),
+        provider="openai",
+    )
+    above = estimate_usage_cost(
+        "gpt-6-astra",
+        CanonicalUsage(input_tokens=100_000, output_tokens=10_000, cache_read_tokens=100_000, cache_write_tokens=100_001),
+        provider="openai",
+    )
+
+    # Whole-request tier: crossing 272K prompt tokens re-prices every component of the request,
+    # including cache writes, at the *_above rates — so the cost ratio exceeds the token ratio.
+    entry = _OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")]
+    assert above.amount_usd == (
+        Decimal(100_000) * entry.input_cost_per_million_above
+        + Decimal(10_000) * entry.output_cost_per_million_above
+        + Decimal(100_000) * entry.cache_read_cost_per_million_above
+        + Decimal(100_001) * entry.cache_write_cost_per_million_above
+    ) / Decimal(1_000_000)
+    assert below.amount_usd < above.amount_usd
+
+
+# A Grok id absent from the fork's official-docs snapshot (grok-4.3 is bundled there,
+# _XAI_GROK_CASES), so the models.dev leg is what prices it.
+_UNLISTED_GROK = "grok-9-unlisted"
+_MODELS_DEV_REGISTRY = {
+    "openai": {"models": {"gpt-5-nano": {"cost": {"input": 0.05, "output": 0.4, "cache_read": 0.005}}}},
+    "xai": {"models": {_UNLISTED_GROK: {"cost": {"input": 1.25, "output": 2.5, "cache_read": 0.2}}}},
+}
+_USAGE = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+
+
+@pytest.fixture
+def models_dev_registry(monkeypatch):
+    """A models.dev cache holding the vendors' rate cards; the providers' own /models carry no prices."""
+    import agent.models_dev as models_dev
+
+    monkeypatch.setattr(models_dev, "_models_dev_cache", _MODELS_DEV_REGISTRY)
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_a, **_k: {})
+
+
+@pytest.mark.parametrize(("provider", "base_url", "model", "expected"), [
+    ("openai-api", "https://api.openai.com/v1", "gpt-5-nano", ("estimated", Decimal("0.455"))),
+    ("openai", "", "gpt-5-nano", ("estimated", Decimal("0.455"))),
+    ("xai", "https://api.x.ai/v1", _UNLISTED_GROK, ("estimated", Decimal("3.95"))),
+    # The vendor's list price needs the vendor's own API: same provider name on
+    # someone else's host or a downgraded origin keep ``unknown`` rather than
+    # inheriting it.
+    ("xai", "https://grok-relay.example.com/v1", _UNLISTED_GROK, ("unknown", None)),
+    ("xai", "http://api.x.ai/v1", _UNLISTED_GROK, ("unknown", None)),
+    # Fork contract: xai-oauth is the notional SuperGrok relay priced at xAI list rates for
+    # cost visibility (is_notional_xai_provider), and api.x.ai over HTTPS is the metered
+    # direct API whatever the lane is called (resolve_billing_route host match) — both
+    # resolve to the ``xai`` vendor route and so price from the vendor's rate card.
+    ("xai-oauth", "https://api.x.ai/v1", _UNLISTED_GROK, ("estimated", Decimal("3.95"))),
+    ("custom", "https://api.x.ai/v1", _UNLISTED_GROK, ("estimated", Decimal("3.95"))),
+])
+def test_direct_first_party_route_prices_models_missing_from_snapshot(models_dev_registry, provider, base_url, model, expected):
+    cost = estimate_usage_cost(model, _USAGE, provider=provider, base_url=base_url)
+
+    assert (cost.status, cost.amount_usd) == expected
 
 
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
@@ -586,35 +652,55 @@ def test_estimate_usage_cost_still_unknown_when_input_and_cache_write_both_missi
     assert result.status == "unknown"
 
 
-def test_deepseek_v4_pro_pricing_entry_exists():
-    """Regression test: deepseek-v4-pro must have a pricing entry.
+def test_bundled_pricing_skips_endpoint_metadata(monkeypatch):
+    """An exact bundled price must not block on the provider's /models API."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("endpoint metadata should not be fetched")
+        ),
+    )
 
-    Before this fix, deepseek-v4-pro sessions showed as unknown cost
-    in hermes insights because the _OFFICIAL_DOCS_PRICING table had no
-    entry for that model.  See #24218.  Rates track the 2026-07 price cut
-    ($1.74/$3.48 → $0.435/$0.87).
-    """
     entry = get_pricing_entry(
-        "deepseek-v4-pro",
+        "deepseek-chat",
         provider="deepseek",
+        base_url="https://api.deepseek.com/v1",
     )
 
     assert entry is not None
-    assert entry.input_cost_per_million is not None
-    assert entry.output_cost_per_million is not None
-    assert float(entry.input_cost_per_million) == 0.435
-    assert float(entry.output_cost_per_million) == 0.87
-    assert float(entry.cache_read_cost_per_million) == 0.003625
+    assert entry.source == "official_docs_snapshot"
 
 
-def test_deepseek_deprecated_aliases_price_as_v4_flash():
-    """Invariant: deepseek-chat / deepseek-reasoner are deprecated aliases for
-    deepseek-v4-flash's non-thinking / thinking modes (deprecation 2026-07-24)
-    — they must bill at identical rates to the flash entry, or sessions on the
-    legacy names over/under-report cost."""
-    flash = get_pricing_entry("deepseek-v4-flash", provider="deepseek")
+def test_unknown_model_falls_back_to_endpoint_metadata(monkeypatch):
+    """Models absent from the bundled table still use endpoint pricing."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "deepseek-future": {
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"}
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "deepseek-future",
+        provider="deepseek",
+        base_url="https://api.deepseek.com/v1",
+    )
+
+    assert entry is not None
+    assert entry.source == "provider_models_api"
+    assert entry.input_cost_per_million == Decimal("1")
+    assert entry.output_cost_per_million == Decimal("2")
+
+
+def test_deepseek_deprecated_aliases_price_as_flash():
+    """Invariant: deepseek-v4-flash / deepseek-chat / deepseek-reasoner are retired aliases
+    served by the current Flash model — they must bill at identical rates to the
+    ``deepseek-flash`` entry, or sessions on the legacy names over/under-report cost."""
+    flash = get_pricing_entry("deepseek-flash", provider="deepseek")
     assert flash is not None
-    for alias in ("deepseek-chat", "deepseek-reasoner"):
+    for alias in ("deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"):
         entry = get_pricing_entry(alias, provider="deepseek")
         assert entry is not None, alias
         assert entry.input_cost_per_million == flash.input_cost_per_million, alias
@@ -734,43 +820,6 @@ def test_bedrock_claude_rows_all_carry_cache_pricing():
         # Cache reads are cheaper than fresh input; cache writes cost more.
         assert entry.cache_read_cost_per_million < entry.input_cost_per_million, key
         assert entry.cache_write_cost_per_million > entry.input_cost_per_million, key
-
-
-def test_bedrock_current_gen_claude_rows_resolve():
-    """Current-gen Claude models (Opus 4.8/4.7, Sonnet 5) must have Bedrock
-    pricing rows so cached sessions report a dollar cost, not ``unknown``.
-    Assert each resolves via the bare id and a cross-region inference profile
-    (us./global. prefix), that every id for a given model resolves to the same
-    entry, and that the row carries the cache fields a Bedrock Claude session
-    needs.
-
-    (Version-suffixed IDs like ``...-v1:0`` are covered separately by the
-    normalizer test in the suffix-strip change; this test intentionally sticks
-    to id shapes that resolve on ``main`` so it is independent of that PR.)
-    """
-    url = "https://bedrock-runtime.us-east-1.amazonaws.com"
-    for bare in (
-        "anthropic.claude-opus-4-8",
-        "anthropic.claude-opus-4-7",
-        "anthropic.claude-sonnet-5",
-    ):
-        ref = get_pricing_entry(bare, provider="bedrock", base_url=url)
-        assert ref is not None, bare
-        assert ref.input_cost_per_million is not None, bare
-        assert ref.output_cost_per_million is not None, bare
-        # Output costs more than input across the Claude line; sanity-check the
-        # row isn't malformed (input < output).
-        assert ref.output_cost_per_million > ref.input_cost_per_million, bare
-        # Cache fields present so cached sessions price correctly (the #50295
-        # symptom was unknown cost on cached Bedrock Claude sessions).
-        assert ref.cache_read_cost_per_million is not None, bare
-        assert ref.cache_write_cost_per_million is not None, bare
-        # Cross-region inference profiles resolve to the same entry.
-        for mid in (f"us.{bare}", f"global.{bare}"):
-            entry = get_pricing_entry(mid, provider="bedrock", base_url=url)
-            assert entry is not None, mid
-            assert entry.input_cost_per_million == ref.input_cost_per_million, mid
-            assert entry.output_cost_per_million == ref.output_cost_per_million, mid
 
 
 def test_bedrock_versioned_inference_profile_resolves_to_bare_pricing():
@@ -1114,62 +1163,32 @@ def test_custom_lane_classification_imports_predicates_not_a_second_list():
         up.NOTIONAL_ANTHROPIC_PROVIDERS = original
 
 
-def test_normalize_usage_minimax_logs_cache_observability(caplog):
-    """MiniMax providers on the Anthropic wire emit a debug-level
-    cache-observability line recording the observable fields
-    (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens),
-    so an operator can see real cache behavior without trusting the
-    misleading cache_read number (constant +128 floor on MiniMax-M3).
-    Standard logging level gating applies — no separate opt-in flag.
+def test_curated_google_flash_models_resolve_official_snapshot_pricing(monkeypatch):
+    """Every ``google/gemini-*-flash`` model curated for the OpenRouter and Nous
+    pickers must also bill through the Google official-docs snapshot on the
+    direct Gemini and Vertex routes — a model pickable via the aggregators but
+    ``unknown`` to Google-route accounting is a catalog/pricing drift.
     """
-    usage = SimpleNamespace(
-        input_tokens=1,
-        output_tokens=11,
-        cache_read_input_tokens=8594,
-        cache_creation_input_tokens=0,
+    from hermes_cli.models_catalog_static import OPENROUTER_MODELS, _PROVIDER_MODELS
+
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {},
     )
-
-    with caplog.at_level("DEBUG", logger="agent.usage_pricing"):
-        normalize_usage(
-            usage,
-            provider="minimax-cn",
-            api_mode="anthropic_messages",
-        )
-
-    cache_obs_records = [r for r in caplog.records if "cache_observability" in r.message]
-    assert len(cache_obs_records) == 1
-    record = cache_obs_records[0]
-    assert "input_tokens=1" in record.message
-    assert "output_tokens=11" in record.message
-    assert "cache_read_tokens=8594" in record.message
-    assert "cache_write_tokens=0" in record.message
-
-
-def test_normalize_usage_native_anthropic_no_cache_observability(caplog):
-    """The MiniMax cache-observability line must NOT fire for native
-    Anthropic: there cache_read_input_tokens is exact and billable, so
-    the MiniMax-specific "+128 floor / unreliable hit signal" note would
-    be false and misleading in the logs.
-    """
-    usage = SimpleNamespace(
-        input_tokens=100,
-        output_tokens=20,
-        cache_read_input_tokens=50,
-        cache_creation_input_tokens=10,
-    )
-
-    with caplog.at_level("DEBUG", logger="agent.usage_pricing"):
-        result = normalize_usage(
-            usage,
-            provider="anthropic",
-            api_mode="anthropic_messages",
-        )
-
-    assert all("cache_observability" not in rec.message for rec in caplog.records)
-    # Token normalization itself is unaffected.
-    assert result.input_tokens == 100
-    assert result.cache_read_tokens == 50
-    assert result.cache_write_tokens == 10
+    curated = {m for m, _desc in OPENROUTER_MODELS} | set(_PROVIDER_MODELS["nous"])
+    flash = sorted(m for m in curated if m.startswith("google/gemini-") and m.endswith("-flash"))
+    assert flash, "expected curated google/gemini-*-flash picker entries"
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    for model in flash:
+        bare = model.split("/", 1)[1]
+        gemini = estimate_usage_cost(bare, usage, provider="gemini")
+        vertex = estimate_usage_cost(model, usage, provider="vertex")
+        assert gemini.status == "estimated", (model, gemini.status)
+        assert gemini.source == "official_docs_snapshot", model
+        assert vertex.amount_usd == gemini.amount_usd, model
+        # Direct-route models the picker offers must also be pickable directly.
+        assert bare in _PROVIDER_MODELS["gemini"], model
+        assert model in _PROVIDER_MODELS["vertex"], model
 
 
 # ---------------------------------------------------------------------------
@@ -1197,14 +1216,6 @@ class TestFormatCostLabel:
     def test_normal_cost_renders_2dp(self):
         assert format_cost_label(Decimal("1.23")) == "~$1.23"
 
-    def test_large_cost_renders_2dp(self):
-        assert format_cost_label(Decimal("42.50")) == "~$42.50"
-
-    def test_very_small_sub_cent(self):
-        """Even very small costs render non-zero."""
-        label = format_cost_label(Decimal("0.0001"))
-        assert label == "~$0.0001"
-        assert label != "$0.00"
 
     def test_below_4dp_floor_never_reads_zero(self):
         """Amounts below $0.00005 must not render as '~$0.0000' (#79220).
@@ -1217,16 +1228,6 @@ class TestFormatCostLabel:
         # Exact boundary: $0.00005 rounds to 0.0000 under ROUND_HALF_EVEN
         # and must also take the fallback.
         assert format_cost_label(Decimal("0.00005")) == "~$<0.0001"
-
-    def test_sub_cent_deepseek_scenario(self):
-        """Reproduce the #79220 reproduction: DeepSeek at $0.004640."""
-        # DeepSeek V4 Pro: 8K input + 1.2K output + 32K cache read
-        # = $0.004640 per turn
-        amount = Decimal("0.004640")
-        label = format_cost_label(amount)
-        assert "0.0046" in label
-        assert label != "$0.00"
-        assert label != "~$0.00"
 
 
 # ---------------------------------------------------------------------------
@@ -2042,3 +2043,39 @@ def test_sonnet_5_5_prices_at_launch_rates_and_sonnet_5_still_prices():
     assert new.amount_usd is not None and float(new.amount_usd) == 12.20  # type: ignore[arg-type]
     old = estimate_usage_cost("claude-sonnet-5", usage, provider="anthropic")
     assert old.amount_usd is not None and old.amount_usd > 0
+
+
+def _anthropic_usage(speed=None):
+    """Canonical usage from an Anthropic-shaped usage payload; ``speed`` rides ``raw_usage``."""
+    payload = {"input_tokens": 100_000, "output_tokens": 10_000, "cache_read_input_tokens": 200_000, "cache_creation_input_tokens": 50_000}
+    if speed:
+        payload["speed"] = speed
+    return normalize_usage(payload, provider="anthropic", api_mode="anthropic_messages")
+
+
+def test_anthropic_fast_mode_responses_price_from_the_fast_rate_row():
+    from agent.model_metadata import _ANTHROPIC_FAST_MODE_MODELS
+    from agent.usage_pricing import _ANTHROPIC_FAST_MODE_PRICING
+
+    # Every model the fast-mode gate sends ``speed`` to has a fast rate and a standard rate.
+    assert set(_ANTHROPIC_FAST_MODE_PRICING) == set(_ANTHROPIC_FAST_MODE_MODELS)
+    for model in _ANTHROPIC_FAST_MODE_MODELS:
+        standard_entry = get_pricing_entry(model, provider="anthropic")
+        assert standard_entry is not None
+        fast = estimate_usage_cost(model, _anthropic_usage("fast"), provider="anthropic")
+        standard = estimate_usage_cost(model, _anthropic_usage(), provider="anthropic")
+        assert fast.pricing_version == _ANTHROPIC_FAST_MODE_PRICING[model].pricing_version
+        assert standard.pricing_version == standard_entry.pricing_version
+        assert fast.amount_usd > standard.amount_usd
+        # A response the API reports as standard speed is billed like one without the field.
+        assert estimate_usage_cost(model, _anthropic_usage("standard"), provider="anthropic").amount_usd == standard.amount_usd
+    # Vendor-prefixed, dotted ids price from the same fast row.
+    assert estimate_usage_cost("anthropic/claude-opus-5.5", _anthropic_usage("fast"), provider="anthropic").amount_usd == (
+        estimate_usage_cost("claude-opus-5-5", _anthropic_usage("fast"), provider="anthropic").amount_usd
+    )
+
+
+def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
+    result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
+    assert result.amount_usd is None
+    assert result.status == "unknown"

@@ -21,7 +21,7 @@ MARKER = "apollo-certify-DISPOSABLE"
 _MAX_DRIVERS = 4  # INV-3: bounded concurrency, never the 6+ that wedged the box
 
 def _creds():
-    env = open(os.path.join(CERTIFY_HERMES_HOME, ".env"), encoding="utf-8").read()
+    env = open(os.path.join(CERTIFY_HERMES_HOME, ".env"), encoding="utf-8-sig").read()
     U = re.search(r"HERMES_DASHBOARD_BASIC_AUTH_USERNAME=(.*)", env).group(1).strip().strip('"\'')
     P = re.search(r"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=(.*)", env).group(1).strip().strip('"\'')
     return U, P

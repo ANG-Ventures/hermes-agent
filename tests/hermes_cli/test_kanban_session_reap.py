@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 pytestmark = [
     pytest.mark.skipif(
@@ -93,7 +94,7 @@ def _worker_card(conn, mode: str, max_runtime=None):
     sleep_pid = int(worker.stdout.readline())
     _LEFTOVERS.append(sleep_pid)
     threading.Thread(target=worker.wait, daemon=True).start()  # no zombie
-    assert kb._set_worker_pid(conn, tid, worker.pid)
+    assert kbd._set_worker_pid(conn, tid, worker.pid)
     # The worker heartbeats (while alive) after starting its child; event
     # times are whole seconds, so step past the second the sleep was born in.
     time.sleep(1.1)
@@ -121,7 +122,7 @@ def test_max_runtime_reaps_session_leftovers(conn):
             "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
             (int(time.time()) - 30, tid),
         )
-    assert tid in kb.enforce_max_runtime(conn)
+    assert tid in kbd.enforce_max_runtime(conn)
     assert _gone(worker.pid)
     assert _gone(sleep_pid), "setpgrp'd sleep outlived its worker's session"
 
@@ -133,7 +134,7 @@ def test_crashed_worker_session_leftovers_reaped(conn, monkeypatch):
     _crash(worker)
     assert _gone(worker.pid)
     assert kb._pid_alive(sleep_pid)
-    kb.detect_crashed_workers(conn)
+    kbd.detect_crashed_workers(conn)
     assert _gone(sleep_pid), "setpgrp'd sleep outlived its crashed worker"
 
 
@@ -154,7 +155,7 @@ def test_recycled_session_is_not_reaped(conn, monkeypatch):
         )
     _crash(worker)
     assert _gone(worker.pid)
-    kb.detect_crashed_workers(conn)
+    kbd.detect_crashed_workers(conn)
     time.sleep(0.5)
     assert kb._pid_alive(sleep_pid), "reaped a session that is not the recorded worker's"
 

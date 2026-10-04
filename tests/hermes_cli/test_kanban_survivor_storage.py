@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as survivor
 
 
@@ -30,7 +31,7 @@ def board(tmp_path, monkeypatch):
 
 def source(board):
     tid = kb.create_task(board, title="storage independence")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
@@ -38,7 +39,7 @@ def source(board):
     (ws / "implementation.py").write_text("value = 42\n")
     git(ws, "add", "implementation.py")
     git(ws, "commit", "-m", "implementation")
-    kb.set_workspace_path(board, tid, ws)
+    kbw.set_workspace_path(board, tid, ws)
     return tid, ws, git(ws, "rev-parse", "HEAD")
 
 

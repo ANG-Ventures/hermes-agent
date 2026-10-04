@@ -1,5 +1,5 @@
 import { parseMarkdownIntoBlocks } from '@assistant-ui/react-streamdown'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { parseMarkdownIntoBlocksCached } from './markdown-blocks'
 
@@ -134,9 +134,6 @@ describe('parseMarkdownIntoBlocksCached', () => {
   // the pre-fix boundary at seed 11 / step 257, so the workload can't shrink
   // without gutting the guard. The work is bounded but exceeds one test's 5s
   // default budget, so raise the timeout rather than weaken the coverage.
-  // The timeout is a hang-guard, not a speed assertion: the workload is fixed,
-  // and CI measured 13.6-25.8 s for it (2026-09-25), then 30.0 s on a loaded
-  // runner -> red main at 05bfb486. 120 s keeps the guard with real headroom.
   it('matches a full lex at every char-level streaming cut over noisy markdown (property fuzz)', () => {
     // Character-level append fuzz over the markdown control alphabet — the
     // harness that surfaced the setext-underline merge above. Growing a single
@@ -163,5 +160,24 @@ describe('parseMarkdownIntoBlocksCached', () => {
         expect(parseMarkdownIntoBlocksCached(text)).toEqual(parseMarkdownIntoBlocks(text))
       }
     }
-  }, 120_000)
+  }, 30_000)
+
+  it('falls back to the raw text block when the lexer throws instead of crashing the thread (#80621)', () => {
+    // The cached splitter feeds the whole transcript renderer; an unhandled
+    // lexer throw would unwind through MessageRenderBoundary to the root
+    // boundary and blank every message. Spy on String.prototype.split (which
+    // the lexer uses) to force a throw, and assert the fallback keeps the text
+    // visible as one raw block.
+    const splitSpy = vi.spyOn(String.prototype, 'split').mockImplementation(() => {
+      throw new Error('boom')
+    })
+
+    try {
+      const text = 'The proof is at `/tmp/render-proof.png` and it looks good.'
+
+      expect(parseMarkdownIntoBlocksCached(text)).toEqual([text])
+    } finally {
+      splitSpy.mockRestore()
+    }
+  })
 })

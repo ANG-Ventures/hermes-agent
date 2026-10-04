@@ -49,6 +49,11 @@ from gateway.session import SessionStore
 REAL_ROOT = (Path(os.path.expanduser("~")) / ".hermes").resolve()
 PROD_DB = REAL_ROOT / "state.db"
 
+# These probe the live-DB guard against the real root on purpose (read-only counts); the
+# upstream home-I/O guard (tests/home_io_guard.py) is opted out the same way its own
+# tests/hermes_state/test_live_db_isolation_guard.py does.
+pytestmark = pytest.mark.allow_real_home_io
+
 
 def _prod_routing_rows() -> int | None:
     """Count rows in the production ``gateway_routing``, read-only.

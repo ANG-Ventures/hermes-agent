@@ -1,10 +1,12 @@
-"""Regression tests for streamed surrogate-pair splits.
+r"""Regression tests for streamed surrogate-pair splits.
 
 Providers can deliver JSON-escaped UTF-16 surrogate halves in adjacent stream
 text deltas (e.g. ``"\ud83d"`` then ``"\ude00"`` for 😀).  Python keeps those
 as lone surrogate code points until we actively recombine them.  Passing a lone
 surrogate to the gateway/CLI callback crashes on UTF-8 encode and used to make
 Hermes return a 0-char partial-stream stub and fall back to codex.
+
+(Raw docstring: Python 3.14 refuses to compile a module whose docstring holds a lone surrogate.)
 """
 from __future__ import annotations
 
@@ -275,6 +277,9 @@ class TestAnthropicMessagesStreamPath:
                         type="content_block_delta",
                         delta=SimpleNamespace(type="thinking_delta", thinking="\uddd0"),
                     ),
+                    # Upstream c1281fff2a: a stream that ends without message_stop is an
+                    # EmptyStreamError (upstream drop), so the completed fake must terminate.
+                    SimpleNamespace(type="message_stop"),
                 ])
 
             def get_final_message(self):

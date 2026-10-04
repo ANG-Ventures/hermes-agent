@@ -250,7 +250,9 @@ def event_kwargs(fields: Dict[str, Any]) -> Dict[str, Any]:
 
     from gateway.platforms.base import MessageEvent, MessageType
 
-    known = {f.name for f in dataclasses.fields(MessageEvent)} - set(NOT_CARRIED_FIELDS)
+    # init=False fields (e.g. upstream's ``_gateway_accepted`` intake flag) are process-local
+    # state, not constructor kwargs: passing one raises TypeError and drops the replay.
+    known = {f.name for f in dataclasses.fields(MessageEvent) if f.init} - set(NOT_CARRIED_FIELDS)
     kwargs: Dict[str, Any] = {}
     for name, value in fields.items():
         if name not in known:
@@ -344,7 +346,7 @@ def take_followups(
     key = _spool_key(home, create=False)
     for path in files:
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
             if (
                 not isinstance(record, dict)
                 or not record.get("session_key")
@@ -379,3 +381,24 @@ def acknowledge_followup(path: str) -> bool:
     except OSError:
         logger.warning("restart follow-up acknowledgement failed for %s", path, exc_info=True)
         return False
+
+
+def report_refused_followup(source: Any, reason: str) -> None:
+    """A replayed restart follow-up refused at intake is LOST, never silent.
+
+    Its spool file was acknowledged when the adapter accepted the replay, so this
+    log line is the only remaining trace (t_43e058b7). No-op for a source that is
+    not a replay (``_restart_followup_session`` is set only by the boot loader).
+    """
+    session = getattr(source, "_restart_followup_session", None)
+    if not session:
+        return
+    logger.error(
+        "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
+        "user=%s: replayed follow-up refused at intake; it is DROPPED",
+        session,
+        reason,
+        getattr(getattr(source, "platform", None), "value", "unknown"),
+        getattr(source, "chat_id", None),
+        getattr(source, "user_id", None),
+    )

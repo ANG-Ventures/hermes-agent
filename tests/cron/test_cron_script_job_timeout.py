@@ -191,16 +191,16 @@ def test_script_within_interval_still_succeeds(hermes_env, monkeypatch):
 def test_monitor_script_passes_job_ceiling(hermes_env, monkeypatch):
     # monitor_script shares _run_job_script with the `script` field; it must get the same
     # per-job ceiling, not only the global cron.script_timeout_seconds.
-    import cron.scheduler as sched
+    import cron.scheduler_script as sched_script  # monitor.py reads the runner from the split module
     from cron.monitor import _run_monitor_source
 
     calls = []
 
-    def fake(script_path, workdir=None, cancel_event=None, **kwargs):
+    def fake(script_path, workdir=None, cancel_event=None, interpreter=None, **kwargs):
         calls.append(kwargs)
         return True, ""
 
-    monkeypatch.setattr(sched, "_run_job_script", fake)
+    monkeypatch.setattr(sched_script, "_run_job_script", fake)
     job = {"id": "m1", "name": "monitor-job", "monitor_script": "m.sh", "timeout_s": 45,
            "schedule": {"kind": "interval", "minutes": 30}}
     _run_monitor_source(job)

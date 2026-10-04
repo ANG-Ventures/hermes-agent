@@ -114,8 +114,9 @@ def test_cleanup_arm_marks_itself_not_user_visible():
 
 
 def test_host_consults_the_visibility_hook_before_announcing():
-    """turn_context must CALL the hook, not merely tolerate it existing."""
-    from agent import turn_context
+    """The turn-start compaction host must CALL the hook, not merely tolerate it
+    existing (upstream moved the block from turn_context to turn_context_compaction)."""
+    from agent import turn_context_compaction as turn_context
 
     src = inspect.getsource(turn_context)
     assert "preflight_is_user_visible" in src, (
@@ -129,7 +130,7 @@ def test_host_consults_the_visibility_hook_before_announcing():
 
 def test_a_broken_hook_fails_open_to_announcing():
     """A raising hook must never silence a genuine compaction."""
-    from agent import turn_context
+    from agent import turn_context_compaction as turn_context
 
     src = inspect.getsource(turn_context)
     hook_idx = src.index("preflight_is_user_visible")

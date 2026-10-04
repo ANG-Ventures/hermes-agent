@@ -8,6 +8,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import pr_target, rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as survivor
 
 HEAD = "a1" * 20
@@ -105,8 +106,8 @@ def test_explicit_ref_records_resolved_full_sha(board, remote):
 def test_review_approval_discovers_handoff_summary_and_preserves_on_cleanup(board, remote):
     """The implementer's review handoff (a run summary) is the mined source, not the approval comment."""
     tid = kb.create_task(board, title="external implementation")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     assert kb.request_review(board, tid, summary=f"Shipped {PR} at {HEAD}",
                              metadata={"changed_files": ["code.py"]})
     kb.add_comment(board, tid, "argus", "Approved")
@@ -148,8 +149,8 @@ def test_claimed_card_still_reaches_the_remote(board, remote):
 def test_explicit_pr_keeps_dirty_workspace_capture(board, remote, tmp_path):
     tid = kb.create_task(board, title="dirty implementation")
     _bind(remote, tid)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     def git(*args):
         return subprocess.run(["git", "-C", str(ws), *args], check=True,
                               stdin=subprocess.DEVNULL, capture_output=True)
@@ -231,8 +232,8 @@ def test_comments_are_discussion_not_handoff(board, remote):
 def test_uncaptured_workspace_files_are_never_traded_for_a_mined_pr(board, remote):
     """P1: a workspace holding un-versioned work must HOLD, not be deleted on a text hint."""
     tid = kb.create_task(board, title="external implementation")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "notes.md").write_text("work that lives nowhere else\n")
     with pytest.raises(ValueError, match="survivor_unavailable"):

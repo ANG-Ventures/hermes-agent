@@ -78,7 +78,7 @@ class DeferredRestartRequest:
 
     @classmethod
     def load(cls, path: Path) -> "DeferredRestartRequest":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         if payload.get("kind") != DEFERRED_RESTART_KIND:
             raise ValueError("not a deferred restart request")
         state = _state_from_name(Path(path))
@@ -360,7 +360,7 @@ class DeferredRestartCoordinator:
 
     def _read_leader_meta(self) -> dict[str, Any] | None:
         try:
-            payload = json.loads((self.leader_dir / "meta.json").read_text(encoding="utf-8"))
+            payload = json.loads((self.leader_dir / "meta.json").read_text(encoding="utf-8-sig"))
             return payload if isinstance(payload, dict) else None
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None

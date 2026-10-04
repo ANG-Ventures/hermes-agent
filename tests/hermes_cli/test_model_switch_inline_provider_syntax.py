@@ -27,7 +27,7 @@ def _switch(raw_input: str, *, current_provider: str = "openrouter", catalog=Non
          patch("hermes_cli.model_switch.list_provider_models", return_value=catalog), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                return_value={"api_key": "test", "base_url": "https://example.invalid/v1", "api_mode": "chat_completions"}), \
-         patch("hermes_cli.models.validate_requested_model", return_value=_MOCK_VALIDATION), \
+         patch("hermes_cli.models_validate.validate_requested_model", return_value=_MOCK_VALIDATION), \
          patch("hermes_cli.model_switch.get_model_info", return_value=None), \
          patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
          patch("hermes_cli.models.detect_provider_for_model", return_value=None):

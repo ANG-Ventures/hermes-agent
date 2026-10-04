@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -34,7 +35,7 @@ def _die_with_exit_1(conn, tid, output, monkeypatch, fake_pid=86099):
     assert kb.claim_task(conn, tid, claimer=f"{host}:w") is not None
     task = kb.get_task(conn, tid)
     assert task is not None and task.current_run_id is not None
-    kb._set_worker_pid(conn, tid, fake_pid)
+    kbd._set_worker_pid(conn, tid, fake_pid)
     log_dir = kb.worker_logs_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{tid}.log"
@@ -46,7 +47,7 @@ def _die_with_exit_1(conn, tid, output, monkeypatch, fake_pid=86099):
     receipt.parent.mkdir(parents=True, exist_ok=True)
     receipt.write_text(json.dumps({"exit_code": 1, "exit_class": None}), encoding="utf-8")
     monkeypatch.setattr(kb, "_pid_alive", lambda _p: False)
-    return kb.detect_crashed_workers(conn)
+    return kbd.detect_crashed_workers(conn)
 
 
 def _kinds(conn, tid):
@@ -67,7 +68,7 @@ def test_credential_cooldown_exit_is_guarded_not_crashed(kanban_home, monkeypatc
         assert "rate_limited" in kinds
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "ready"
-        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
         run = conn.execute(
             "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()

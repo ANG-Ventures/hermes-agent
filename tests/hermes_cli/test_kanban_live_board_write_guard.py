@@ -40,6 +40,7 @@ if str(_WORKTREE) not in sys.path:
 import hermes_state
 import hermes_test_context
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -314,7 +315,7 @@ def test_repair_db_refuses_the_live_board_from_a_test_context(
     monkeypatch.setattr(hermes_test_context, "_in_test_context", lambda: True)
 
     with pytest.raises(kb.LiveBoardWriteRefused):
-        kb.repair_db(db_path=live)
+        kbc.repair_db(db_path=live)
 
 
 def test_repair_db_refuses_the_pin_resolved_live_board(live_root, monkeypatch):
@@ -324,7 +325,7 @@ def test_repair_db_refuses_the_pin_resolved_live_board(live_root, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
 
     with pytest.raises(kb.LiveBoardWriteRefused):
-        kb.repair_db()
+        kbc.repair_db()
 
 
 def test_repair_db_refusal_creates_no_files(live_root, monkeypatch):
@@ -341,7 +342,7 @@ def test_repair_db_refusal_creates_no_files(live_root, monkeypatch):
 
     before = sorted(p.name for p in live_root.iterdir())
     with pytest.raises(kb.LiveBoardWriteRefused):
-        kb.repair_db()
+        kbc.repair_db()
     assert sorted(p.name for p in live_root.iterdir()) == before
     assert not (live_root / "kanban.db.init.lock").exists()
     assert not list(live_root.glob("*.bak"))
@@ -389,7 +390,7 @@ def test_repair_db_still_repairs_for_a_real_operator(
     raw.close()
     kb._INITIALIZED_PATHS.clear()
 
-    report = kb.repair_db(db_path=live)
+    report = kbc.repair_db(db_path=live)
     assert report.status == "repaired"
     assert index_name in report.reindexed
     with kb.connect_readonly(db_path=live) as conn:

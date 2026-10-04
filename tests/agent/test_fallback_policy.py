@@ -1325,6 +1325,10 @@ def test_wiring_sticky_policy_false_purges_and_disables(wired):
 
 _READ_ALLOW = {
     ("agent/chat_completion_helpers.py", "try_activate_fallback"),  # the writer (its own max())
+    # upstream split the writer's body (2026-10-01 sync): the exhausted-chain cooldown arm and the
+    # announce's same-error backoff + cooldown rider are try_activate_fallback's own max()/read.
+    ("agent/chat_completion_helpers.py", "_fallback_chain_exhausted"),
+    ("agent/chat_completion_helpers.py", "_announce_fallback_switch"),
     ("agent/fallback_wiring.py", "restore_allowed"),                # the one restore predicate
     ("agent/fallback_policy.py", "restore_allowed"),
     ("agent/fallback_sticky_store.py", "get"),                     # the store accessor

@@ -278,7 +278,7 @@ def claim_restart_notice(
     path = get_restart_notice_ledger_path(home)
     payload: Dict[str, Any] = {"boot_id": boot_id, "notified": []}
     try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
+        existing = json.loads(path.read_text(encoding="utf-8-sig"))
         if isinstance(existing, dict) and existing.get("boot_id") == boot_id:
             notified = existing.get("notified")
             if isinstance(notified, list):

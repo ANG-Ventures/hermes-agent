@@ -27,8 +27,8 @@ class TestInit:
     def test_anthropic_base_url_accepted(self):
         """Anthropic base URLs should route to native Anthropic client."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
             patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
         ):
             agent = AIAgent(
@@ -44,9 +44,9 @@ class TestInit:
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -61,9 +61,9 @@ class TestInit:
     def test_prompt_caching_non_claude(self):
         """Non-Claude model should disable prompt caching."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -78,9 +78,9 @@ class TestInit:
     def test_prompt_caching_non_openrouter(self):
         """Custom base_url (not OpenRouter) should disable prompt caching."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -95,8 +95,8 @@ class TestInit:
     def test_prompt_caching_native_anthropic(self):
         """Native Anthropic provider should enable prompt caching."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
             patch("agent.anthropic_adapter._anthropic_sdk"),
         ):
             a = AIAgent(
@@ -112,9 +112,9 @@ class TestInit:
     def test_prompt_caching_cache_ttl_defaults_without_config(self):
         """cache_ttl stays 5m when prompt_caching is absent from config."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
             patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             a = AIAgent(
@@ -130,9 +130,9 @@ class TestInit:
     def test_prompt_caching_cache_ttl_custom_1h(self):
         """prompt_caching.cache_ttl 1h is applied when present in config."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
             patch(
                 "hermes_cli.config.load_config_readonly",
                 return_value={"prompt_caching": {"cache_ttl": "1h"}},
@@ -151,9 +151,9 @@ class TestInit:
     def test_model_max_tokens_from_config(self):
         """model.max_tokens config populates the chat-completions request cap."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("terminal")),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("terminal")),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
             patch(
                 "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
@@ -177,9 +177,9 @@ class TestInit:
     def test_constructor_max_tokens_wins_over_config(self):
         """Explicit constructor max_tokens keeps programmatic callers stable."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
             patch(
                 "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
@@ -201,9 +201,9 @@ class TestInit:
     def test_prompt_caching_cache_ttl_invalid_falls_back(self):
         """Non-Anthropic TTL values keep default 5m without raising."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
             patch(
                 "hermes_cli.config.load_config_readonly",
                 return_value={"prompt_caching": {"cache_ttl": "30m"}},
@@ -223,9 +223,9 @@ class TestInit:
         """valid_tool_names should contain names from loaded tools."""
         tools = _make_tool_defs("web_search", "terminal")
         with (
-            patch("run_agent.get_tool_definitions", return_value=tools),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=tools),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -239,9 +239,9 @@ class TestInit:
     def test_session_id_auto_generated(self):
         """Session ID should be auto-generated in YYYYMMDD_HHMMSS_<hex6> format."""
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -261,7 +261,7 @@ class TestMemoryNudgeCounterPersistence:
 
     def test_counters_initialized_in_init(self):
         """Counters must exist on the agent after __init__."""
-        with patch("run_agent.get_tool_definitions", return_value=[]):
+        with patch("model_tools.get_tool_definitions", return_value=[]):
             a = AIAgent(
                 model="test", api_key="test-key", base_url="http://localhost:1234/v1",
                 provider="openrouter", skip_context_files=True, skip_memory=True,
@@ -274,18 +274,15 @@ class TestMemoryNudgeCounterPersistence:
     def test_counters_not_reset_in_preamble(self):
         """The turn preamble must not zero the nudge counters."""
         import inspect
-        from agent.turn_context import build_turn_context as _btc
-        src = inspect.getsource(_btc)
-        # The preamble (now in build_turn_context) resets many fields (retry
-        # counts, budget, etc.) before returning. Find that reset block and
-        # verify our counters aren't in it. The reset block ends at
-        # iteration_budget. Anchor exactly on
-        # ``agent.iteration_budget = IterationBudget`` so an unrelated
-        # identifier ending in ``iteration_budget`` can't match the boundary.
-        preamble_end = src.index("agent.iteration_budget = IterationBudget")
-        preamble = src[:preamble_end]
-        assert "agent._turns_since_memory = 0" not in preamble
-        assert "agent._iters_since_skill = 0" not in preamble
+        from agent import turn_context as _tc
+        # The per-turn reset now lives in ``_reset_per_turn_agent_state`` (driven by
+        # the ``_PER_TURN_RESET_STATE`` table); neither may touch the nudge counters.
+        src = inspect.getsource(_tc._reset_per_turn_agent_state)
+        reset_names = {name for name, _ in _tc._PER_TURN_RESET_STATE}
+        assert "_turns_since_memory" not in reset_names
+        assert "_iters_since_skill" not in reset_names
+        assert "agent._turns_since_memory = 0" not in src
+        assert "agent._iters_since_skill = 0" not in src
 
 
 class TestMemoryContextSanitization:
@@ -333,8 +330,8 @@ class TestMemoryProviderTurnStart:
     def test_on_turn_start_called_before_prefetch(self):
         """Source-level check: on_turn_start appears before prefetch_all in the prologue."""
         import inspect
-        from agent.turn_context import build_turn_context as _btc
-        src = inspect.getsource(_btc)
+        from agent.turn_context import _memory_turn_start_and_prefetch as _mts
+        src = inspect.getsource(_mts)
         # Find the actual method calls, not comments
         idx_turn_start = src.index(".on_turn_start(")
         idx_prefetch = src.index(".prefetch_all(")
@@ -346,8 +343,9 @@ class TestMemoryProviderTurnStart:
     def test_on_turn_start_uses_user_turn_count(self):
         """Source-level check: on_turn_start receives the user_turn_count."""
         import inspect
-        from agent.turn_context import build_turn_context as _btc
-        src = inspect.getsource(_btc)
+        import re
+        from agent.turn_context import _memory_turn_start_and_prefetch as _mts
+        src = inspect.getsource(_mts)
         # The extracted body uses ``agent.X`` rather than ``self.X``;
-        # assert the extracted-form spelling directly.
-        assert "on_turn_start(agent._user_turn_count" in src
+        # assert the extracted-form spelling directly (first positional arg).
+        assert re.search(r"on_turn_start\(\s*agent\._user_turn_count", src)

@@ -123,3 +123,26 @@ def test_cron_kind_unaffected(clock):
     save_jobs(jobs)
     advance_next_runs([job["id"]])
     assert INTERVAL_FIRE_AT_KEY not in get_job(job["id"])
+
+
+def test_next_slot_steps_real_time_across_dst_fall_back(monkeypatch):
+    """``fire_at + k*N`` is real elapsed time, not wall-clock arithmetic.
+
+    America/New_York falls back at 2026-11-01 02:00 EDT -> 01:00 EST. A 2 h
+    interval fired at 00:11 EDT (04:11Z) is next due at 06:11Z = 01:11 EST.
+    Aware local + timedelta would give 02:11 EST (07:11Z), an hour late
+    (CI e2e test_cron_virtual_clock_soak[newyork_on_shanghai_fall]).
+    """
+    from zoneinfo import ZoneInfo
+
+    from cron.jobs import _next_interval_slot
+
+    ny = ZoneInfo("America/New_York")
+    fire_at = datetime(2026, 11, 1, 0, 11, tzinfo=ny)
+    now = fire_at + timedelta(seconds=5)
+    # _ensure_aware converts the anchor into the Hermes zone (a DST zone here).
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+    slot = _next_interval_slot({"kind": "interval", "minutes": 120}, fire_at.isoformat(), now)
+    assert datetime.fromisoformat(slot).astimezone(timezone.utc) == datetime(
+        2026, 11, 1, 6, 11, tzinfo=timezone.utc
+    )

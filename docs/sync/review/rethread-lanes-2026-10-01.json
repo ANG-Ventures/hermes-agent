@@ -1,0 +1,42 @@
+{
+ "F01-hermes_state": {
+  "manifests": ["L13-root-py-followup-hermes_state.md"],
+  "targets": ["hermes_state.py", "hermes_state_*.py (all mixins)"],
+  "tests_hint": "tests/test_undo_redo_stack.py tests/test_half_turn_target.py tests/test_state_rewind_generalized.py tests/gateway/test_undo_error_honesty.py tests/hermes_state/ (file-scoped only)"
+ },
+ "F02-gateway_run": {
+  "manifests": ["L02-gw-run-FOLLOWUP-gateway_run.py.md"],
+  "targets": ["gateway/run.py", "gateway/run_*.py", "gateway/turn_executor.py"],
+  "tests_hint": "tests/gateway/test_route_change_turn_contract.py tests/gateway/test_session_model_reset.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_cascade.py tests/gateway/test_reboot_resume_reason.py tests/gateway/test_deferred_restart_taxonomy.py tests/gateway/test_auto_continue_interrupted_turns.py tests/gateway/test_fast_command.py tests/gateway/test_model_route_status_delivery.py tests/gateway/test_session_route_invariant.py; also settle the double _run_housekeeping_in_executor def in gateway/run.py (R09 HOTSPOT)"
+ },
+ "F03-gateway_session": {
+  "manifests": ["L02-gw-run-FOLLOWUP-gateway_session.py.md"],
+  "targets": ["gateway/session.py", "gateway/session_*.py"],
+  "tests_hint": "tests/gateway/test_manual_reset_sticky_route.py tests/gateway/test_session_hygiene.py tests/gateway/test_discord_chat_identity.py tests/gateway/test_session_*.py"
+ },
+ "F04-agent_runtime": {
+  "manifests": ["L13-root-py-followup-run_agent.md", "R05-agent-core-FOLLOWUP-agent_conversation_loop.py.md"],
+  "targets": ["run_agent.py", "agent/conversation_loop.py", "agent/turn_*.py", "agent/status_output.py", "agent/session_persistence.py", "agent/turn_explainers.py", "agent/activity_tracking.py", "agent/client_lifecycle.py", "agent/stream_delivery.py", "agent/compression_facade.py", "agent/agent_runtime_helpers.py", "agent/chat_completion_nonstream.py"],
+  "tests_hint": "tests/agent/ and tests/run_agent/ files named in the manifests; tests/gateway/test_undo_redo_half_turn.py"
+ },
+ "F05-cli": {
+  "manifests": ["L13-root-py-followup-cli.md"],
+  "targets": ["cli.py", "hermes_cli/cli_*.py", "hermes_cli/callbacks.py", "hermes_cli/goals.py", "hermes_cli/kanban_native_worker.py"],
+  "tests_hint": "tests/cli/ tests/hermes_cli/test_cli_* files named in the manifest; agent/turn_facade.py items -> XFOLLOWUP to F04"
+ },
+ "F06-kanban_cli_siblings": {
+  "manifests": ["R01-cli-kanban.md (FOLLOWUP rows) + followup-src/e45-R01-cli-kanban/*"],
+  "targets": ["hermes_cli/kanban_parser.py", "hermes_cli/kanban_ops.py", "hermes_cli/kanban_boards.py", "hermes_cli/kanban_output.py"],
+  "tests_hint": "tests/hermes_cli/test_kanban_cli*.py tests/hermes_cli/test_kanban_*.py that drive `hermes kanban <verb>` (file-scoped)"
+ },
+ "F07-cron_tools_auth_misc": {
+  "manifests": ["R10-cron-FOLLOWUP-cron_scheduler_siblings.md", "R08-tools-FOLLOWUP-environments.md", "R11-cli-a-FOLLOWUP-auth-siblings.md", "R11-cli-a-FOLLOWUP-web_server-siblings.md", "S04-cli-plugins-misc-FOLLOWUP-cronjob_siblings.md", "S04-cli-plugins-misc-FOLLOWUP-plugins_siblings.md", "S04-cli-plugins-misc-FOLLOWUP-model_switch_providers.md", "L09-clib-FOLLOWUP-backup_sqlite-safe_copy_db.py.txt"],
+  "targets": ["cron/scheduler_*.py", "cron/monitor.py", "tools/environments/base_*.py", "hermes_cli/auth_*.py", "hermes_cli/web_server_lifecycle.py", "hermes_cli/web_routers/models.py", "hermes_cli/web_routers/cron.py", "tools/cronjob_prompt_scan.py", "tools/cronjob_job_args.py", "hermes_cli/plugins_dispatch.py", "hermes_cli/plugins_loader.py", "hermes_cli/model_switch_providers.py", "hermes_cli/backup*.py"],
+  "tests_hint": "tests/cron/test_cron_script.py tests/fork_canaries/test_fork_canary_provider_seam.py tests/providers/test_fork_canary_plugin_discovery_not_at_import.py + files named in each manifest"
+ },
+ "F08-aux_client_reject": {
+  "manifests": ["R03-aux-client-FOLLOWUP-agent_auxiliary_client.py.md", "R03-aux-client-FOLLOWUP-agent_auxiliary_client.py-reject-index.txt", "S01-aux-client.md"],
+  "targets": ["agent/auxiliary_client.py", "agent/auxiliary_*.py", "agent/context_compressor*.py", "agent/conversation_compression*.py", "agent/moa_loop.py", "plugins/context_engine/lcm/parallel_summary.py"],
+  "tests_hint": "tests/agent/test_auxiliary_client*.py tests/agent/test_context_compressor*.py (file-scoped)"
+ }
+}

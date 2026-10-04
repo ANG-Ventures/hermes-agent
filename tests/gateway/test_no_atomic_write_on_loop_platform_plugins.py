@@ -66,17 +66,19 @@ def _plugin_sites(repo: Path) -> list[str]:
 # setup-command / dedup paths outside this incident; tracked for follow-up on
 # card t_eb49443b.  Fix one: move it off-loop, then DELETE its line.
 PLUGIN_REACHABLE_BASELINE = frozenset({
-    "plugins/platforms/buzz/adapter.py connect -> os.replace",
-    "plugins/platforms/feishu/adapter.py _handle_message_event_data -> atomic_json_write",
+    # Shrunk 11 -> 5 on 2026-10-02 (parity sync 2026-10-01, CI6-M1-gatewayb). The merge had
+    # taken upstream's sync forms at five fork sites (buzz/irc/line connect ->
+    # _acquire_platform_lock, buzz connect -> _save_cursors, photon _start_sidecar ->
+    # _write_runtime_record, google_chat setup_files -> load_user_credentials); each is back off
+    # the loop (await _acquire_platform_lock_async / asyncio.to_thread). feishu
+    # _handle_message_event_data and google_chat _handle_setup_files_command no longer reach a
+    # sink on upstream's structure. feishu connect -> acquire_scoped_lock is pre-existing (same
+    # on fork/main c14e059f8f2).
     "plugins/platforms/feishu/adapter.py connect -> os.replace",
     "plugins/platforms/feishu/adapter.py disconnect -> atomic_json_write",
     "plugins/platforms/google_chat/adapter.py _build_message_event -> os.replace",
     "plugins/platforms/google_chat/adapter.py _create_message -> os.replace",
-    "plugins/platforms/google_chat/adapter.py _handle_setup_files_command -> atomic_replace",
     "plugins/platforms/google_chat/adapter.py _send_file -> os.replace",
-    "plugins/platforms/irc/adapter.py connect -> os.replace",
-    "plugins/platforms/line/adapter.py connect -> os.replace",
-    "plugins/platforms/photon/adapter.py _start_sidecar -> os.replace",
 })
 
 

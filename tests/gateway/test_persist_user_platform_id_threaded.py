@@ -120,7 +120,7 @@ async def test_gateway_turn_row_carries_platform_message_id(
         session_id=SID,
         session_key=SESSION_KEY,
         event_message_id=MSG_ID,
-        persist_user_platform_id=MSG_ID,
+        inbound_message_id=MSG_ID,
     )
     assert result["final_response"] == "ack"
 
@@ -129,8 +129,10 @@ async def test_gateway_turn_row_carries_platform_message_id(
 
 
 def test_every_run_agent_call_site_passes_the_event_platform_id():
-    gateway_run = importlib.import_module("gateway.run")
-    tree = ast.parse(Path(gateway_run.__file__).read_text(encoding="utf-8"))
+    # Parity 2026-10-01: the two ``_run_agent`` call sites moved to gateway/run_turn.py and carry the raw
+    # inbound id as ``inbound_message_id`` (TurnRunner stamps it as ``persist_user_platform_id``).
+    gateway_run_turn = importlib.import_module("gateway.run_turn")
+    tree = ast.parse(Path(gateway_run_turn.__file__).read_text(encoding="utf-8"))
 
     calls = [
         node
@@ -144,8 +146,8 @@ def test_every_run_agent_call_site_passes_the_event_platform_id():
     assert len(calls) >= 2, "expected the fresh-turn and queued-follow-up call sites"
     for node in calls:
         kw = {k.arg: k.value for k in node.keywords}
-        assert "persist_user_platform_id" in kw, (
-            f"_run_agent call at gateway/run.py:{node.lineno} drops "
-            "persist_user_platform_id; restart backfill dedupe goes blind"
+        assert "inbound_message_id" in kw, (
+            f"_run_agent call at gateway/run_turn.py:{node.lineno} drops "
+            "inbound_message_id; restart backfill dedupe goes blind"
         )
-        assert "message_id" in ast.unparse(kw["persist_user_platform_id"])
+        assert "inbound_id" in ast.unparse(kw["inbound_message_id"]) or "message_id" in ast.unparse(kw["inbound_message_id"])

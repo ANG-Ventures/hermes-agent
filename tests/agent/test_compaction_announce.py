@@ -724,12 +724,18 @@ class TestSingleDoneSite:
         import inspect
         import agent.conversation_loop as loop
         import agent.turn_context as tc
+        # Upstream's turn_*.py extraction moved the reactive (overflow / tier-reduction)
+        # and proactive (turn-start) call sites out of the two facades into these modules.
+        import agent.turn_overflow as overflow
+        import agent.turn_recovery as recovery
+        import agent.turn_context_compaction as tcc
 
         loop_src = inspect.getsource(loop)
         tc_src = inspect.getsource(tc)
         # every compaction caller uses the single _compress_context entry
-        assert "_compress_context(" in loop_src
-        assert "_compress_context(" in tc_src
+        for mod in (overflow, recovery, tcc):
+            assert "_compress_context(" in inspect.getsource(mod), mod.__name__
+            assert "_emit_compaction_announce" not in inspect.getsource(mod), mod.__name__
         # and there is no second compaction-announce emit site outside the done-site
         assert "_emit_compaction_announce" not in loop_src
         assert "_emit_compaction_announce" not in tc_src

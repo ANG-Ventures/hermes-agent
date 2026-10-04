@@ -359,7 +359,7 @@ def _page_once_sync(home: Path, path: str, outcome: str) -> None:
                     _flock_bounded(lock, shell_hooks.fcntl)
                 state_file = state_dir / "missing-hook-pages.json"
                 try:
-                    stamps = json.loads(state_file.read_text(encoding="utf-8"))
+                    stamps = json.loads(state_file.read_text(encoding="utf-8-sig"))
                     if not isinstance(stamps, dict):
                         stamps = {}
                 except (OSError, ValueError):

@@ -1,0 +1,4 @@
+plugins/kanban/dashboard/plugin_api.py
+hermes_cli/plugins.py
+hermes_cli/model_switch.py
+tools/cronjob_tools.py

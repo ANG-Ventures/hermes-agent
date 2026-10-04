@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 # Hard ceiling for "connect() returned at all". Two orders of magnitude above
 # the bounded acquire under test (0.6s), so it is not a timing assertion — it
@@ -43,7 +44,7 @@ _HANG_CEILING_SECONDS = 60.0
 
 
 def _connect_in_thread():
-    """Run ``kb.connect()`` off-thread; return (returned_event, elapsed_box, thread).
+    """Run ``kbc.connect()`` off-thread; return (returned_event, elapsed_box, thread).
 
     ``returned`` is set on EVERY exit path, so "did the call come back?" is an
     ordering fact rather than a stopwatch reading.
@@ -54,7 +55,7 @@ def _connect_in_thread():
     def _run():
         start = time.monotonic()
         try:
-            conn = kb.connect()
+            conn = kbc.connect()
             conn.close()
         except BaseException as exc:  # pragma: no cover - surfaced via box
             box["error"] = exc
@@ -90,7 +91,7 @@ def _hold_init_lock(db_path: Path):
     release = threading.Event()
 
     def _holder():
-        with kb._cross_process_init_lock(db_path):
+        with kbc._cross_process_init_lock(db_path):
             holding.set()
             release.wait(timeout=_HANG_CEILING_SECONDS * 3)
 
@@ -109,14 +110,14 @@ def test_initialized_path_connect_skips_init_lock(kanban_home, monkeypatch):
     """
     db_path = kb.kanban_db_path(board="default")
     # Initialize once.
-    kb.connect().close()
+    kbc.connect().close()
     assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
 
     # Hold the init lock; a fast-path connect must not even ask for it.
     release, holder = _hold_init_lock(db_path)
 
     lock_entries: list[str] = []
-    real_lock = kb._cross_process_init_lock
+    real_lock = kbc._cross_process_init_lock
     t: threading.Thread | None = None
 
     @contextlib.contextmanager
@@ -125,7 +126,7 @@ def test_initialized_path_connect_skips_init_lock(kanban_home, monkeypatch):
         with real_lock(path):
             yield
 
-    monkeypatch.setattr(kb, "_cross_process_init_lock", _spy)
+    monkeypatch.setattr(kbc, "_cross_process_init_lock", _spy)
 
     try:
         returned, box, t = _connect_in_thread()
@@ -154,7 +155,7 @@ def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch, 
     timeout WARNING plus the fact that the connect returned while the holder
     still owns the lock — no upper wall-clock bound involved.
     """
-    monkeypatch.setattr(kb, "_INIT_LOCK_TIMEOUT_SECONDS", 0.6)
+    monkeypatch.setattr(kbc, "_INIT_LOCK_TIMEOUT_SECONDS", 0.6)
     db_path = kb.kanban_db_path(board="default")
 
     release, holder = _hold_init_lock(db_path)
@@ -177,7 +178,7 @@ def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch, 
         # A LOWER bound is load-safe: contention only makes it larger.
         elapsed = box["elapsed"]
         assert isinstance(elapsed, float) and elapsed >= 0.4, (
-            f"connect did not wait out the {kb._INIT_LOCK_TIMEOUT_SECONDS}s "
+            f"connect did not wait out the {kbc._INIT_LOCK_TIMEOUT_SECONDS}s "
             f"acquire deadline (elapsed {elapsed}s)"
         )
 

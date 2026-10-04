@@ -246,7 +246,7 @@ def test_full_loop_moa_turn_ledgers_parent_and_physical_children(db, tmp_path):
     session_db = SessionDB(db_path=tmp_path / "state.db")
     try:
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("model_tools.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
         ):

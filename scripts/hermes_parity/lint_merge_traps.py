@@ -194,7 +194,7 @@ def lint_paths(paths: list[Path], *, repo: Path | None = None) -> list[TrapIssue
     trees: list[tuple[str, str, ast.AST]] = []
     for file_path in paths:
         try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
+            source = file_path.read_text(encoding="utf-8-sig", errors="replace")
             tree = ast.parse(source)
         except (OSError, SyntaxError):
             continue

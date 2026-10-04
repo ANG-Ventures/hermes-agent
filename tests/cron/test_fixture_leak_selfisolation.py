@@ -2,7 +2,7 @@
 
 2026-07-15 incident: harnesses (real-agent blackbox sessions / kanban workers
 in worktrees sharing the live HERMES_HOME) executed the fixture-creating code
-in ``test_ticker_stall_60703.py`` / ``test_per_job_reasoning_effort.py``
+in ``test_ticker_stall.py`` / ``test_per_job_reasoning_effort.py``
 WITHOUT pytest's autouse hermetic conftest — leaking ``brief``/``claim job``
 fixture jobs into the real ``~/.hermes/cron/jobs.json`` (re-arming
 cron-config-lint) and, once, wiping it via ``save_jobs([])``.
@@ -39,7 +39,7 @@ HARNESS = textwrap.dedent(
     t1 = load("t_re", f"{repo}/tests/cron/test_per_job_reasoning_effort.py")
     t1.TestPersistence().test_create_persists_reasoning_effort()
 
-    t2 = load("t_ts", f"{repo}/tests/cron/test_ticker_stall_60703.py")
+    t2 = load("t_ts", f"{repo}/tests/cron/test_ticker_stall.py")
     t2.TestFutureDatedClaims().test_expired_fire_claim_is_reclaimable()
 
     leaked = fake_home / "cron" / "jobs.json"

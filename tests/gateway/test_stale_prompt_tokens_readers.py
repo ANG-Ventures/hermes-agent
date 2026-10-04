@@ -82,7 +82,8 @@ async def test_status_after_compaction_shows_post_compaction_estimate():
                         context_length=1_000_000)
     )
     result = await runner._handle_message(_make_event("/status"))
-    assert "**Context:** ~95,100 / 1,000,000 (10%)" in result
+    # upstream 04767e7aaa marks the percentage too when the figure is an estimate
+    assert "**Context:** ~95,100 / 1,000,000 (~10%)" in result
     assert "900,000" not in result
     assert "-1 /" not in result
 
@@ -152,13 +153,16 @@ def test_footer_renders_post_compaction_estimate_marked():
     ) == ""
 
 
-def test_turn_result_carries_footer_display_figure():
+def test_turn_result_carries_footer_display_figure():  # noqa: source-proxy structural: both run_sync result paths share one usage dict
     """Both run_sync result dicts carry the resolved footer figure (source contract,
     same pattern as test_footer_provider_in_turn_result)."""
     import inspect
 
     import gateway.run as gw_run
 
+    # Parity 2026-10-01: upstream's run_sync builds ONE ``usage`` dict both result paths share
+    # through ``common`` (same shape as test_footer_provider_in_turn_result).
     src = inspect.getsource(gw_run.TurnRunner.run_sync)
-    assert src.count('"context_tokens_display": _ctx_display_toks') >= 2
-    assert src.count('"context_tokens_estimated": _ctx_display_estimated') >= 2
+    assert '"context_tokens_display": ctx_display_toks' in src
+    assert '"context_tokens_estimated": ctx_display_estimated' in src
+    assert "**common" in src, "both result paths must share the usage dict"
