@@ -1010,6 +1010,44 @@ FLOOR_HEAD = "generic_head"
 _HOP_SUB_UNKNOWN_SEG = f"({HOP_UNKNOWN}, {SUB_UNKNOWN})"
 
 
+# Relay 504s that arrive BEFORE the first byte (t_6eddafcd): the relay buffers
+# the whole upstream body, so "upstream attempt timed out" means the seat
+# never answered within the relay's per-attempt budget. Not a client read
+# timeout and not a mid-stream stall.
+SEAT_TIMEOUT_RELAY_ERROR = "upstream attempt timed out"
+SEAT_TIMEOUT_CAUSE = "seat timed out"
+RELAY_DEADLINE_CAUSE = "relay deadline exceeded"
+POOL_NO_OTHER_SEAT = "pool had no other seat"
+_CLIENT_READ_TIMEOUT_EXC = frozenset(("ReadTimeout", "APITimeoutError"))
+
+
+def _elapsed_text(seconds: Any) -> Optional[str]:
+    """``7m00s`` / ``42s`` for a positive duration, else None."""
+    try:
+        s = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    if s <= 0:
+        return None
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _seat_timeout_body(row: Mapping[str, Any], seat: str) -> str:
+    """``sub-vps-18 did not answer in 7m00s (relay deadline)``."""
+    who = "the seat" if seat == SUB_UNKNOWN else seat
+    took = _elapsed_text(row.get("elapsed_s"))
+    if took:
+        return f"{who} did not answer in {took} (relay deadline)"
+    return f"{who} did not answer before the relay deadline"
+
+
+def _pool_context(row: Mapping[str, Any]) -> str:
+    """`` · pool had no other seat`` when the relay stated zero eligible seats
+    besides the failing one (``x-pool-other-eligible: 0`` / v2
+    ``x-relay-eligible: 0``): the failure was lane-wide, not one seat."""
+    return f" · {POOL_NO_OTHER_SEAT}" if row.get("pool_eligible") == 0 else ""
+
+
 # claude-pool box-level refusals (t_0ff05041): no session slot / CLI-child cap
 # on the relay box, and an interactive session that missed its startup deadline.
 BOX_CAPACITY_CAUSE = "relay box at session capacity"
@@ -1034,6 +1072,33 @@ def invalid_response_cause(row: Mapping[str, Any]) -> str:
     return f"{head} ({', '.join(parts)})" if parts else head
 
 
+def _relay_empty_chain(row: Mapping[str, Any], seat_names: bool) -> Optional[str]:
+    """``empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23) —
+    relay retried, gave up`` when the pooled relay already ran its own
+    empty-content ladder (``x-pool-empty-content-retried: gave_up``,
+    claude-pool #193) and gave up. None otherwise (t_6eddafcd)."""
+    fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
+    if fl.get("relay_retry") != "gave_up":
+        return None
+    seats = [str(x) for x in (fl.get("relay_attempts") or ()) if x]
+    if seats:
+        names = ", ".join(seats) if seat_names else ", ".join("a sub" for _ in seats)
+        return f"empty reply from Anthropic ×{len(seats)} ({names}) — relay retried, gave up"
+    seat = row.get("seat") or fl.get("served_by")
+    where = f" (last on {seat if seat_names else 'a sub'})" if seat and seat != "unknown" else ""
+    return f"empty reply from Anthropic{where} — relay retried, gave up"
+
+
+def invalid_response_chat_cause(row: Mapping[str, Any]) -> str:
+    """Chat wording of a rejected billed response: ``empty reply`` for the
+    0-block shape. The raw ``stop_reason=…, 0 content blocks, N out`` stays in
+    the route-changes log and the ledger (t_6eddafcd)."""
+    fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
+    if fl.get("content_blocks") == 0:
+        return "empty reply"
+    return invalid_response_cause(row)
+
+
 def _invalid_response_body(row: Mapping[str, Any], seat_names: bool) -> str:
     """``<cause> · hop=relay-200 · sub=<seat>``: the relay ANSWERED 200 (the
     fault is box/upstream side, not the relay hop) and named the seat in
@@ -1046,7 +1111,10 @@ def _invalid_response_body(row: Mapping[str, Any], seat_names: bool) -> str:
     hop = "relay-200" if relayed else "200"
     seat = row.get("seat") or fl.get("served_by")
     sub = (str(seat) if seat_names else "a sub") if seat and seat != "unknown" else "unknown"
-    return f"{invalid_response_cause(row)} · hop={hop} · sub={sub}"
+    chain = _relay_empty_chain(row, seat_names)
+    if chain:
+        return chain
+    return f"{invalid_response_chat_cause(row)} · hop={hop} · sub={sub}"
 
 
 def _cause_phrase(row: Mapping[str, Any]) -> str:
@@ -1061,8 +1129,16 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return "connect timeout"
         if "incomplete" in t:
             return "incomplete read"
+        if row.get("relay_error") == SEAT_TIMEOUT_RELAY_ERROR:
+            return SEAT_TIMEOUT_CAUSE
+        if row.get("relay_error") == "pool deadline exceeded":
+            return RELAY_DEADLINE_CAUSE
         if "timed out" in t or "timeout" in t:
-            return "read timeout"
+            # t_6eddafcd: "read timeout" only when the CLIENT's read timed out.
+            if (row.get("socket_cause") == "read_timeout"
+                    or row.get("exc_name") in _CLIENT_READ_TIMEOUT_EXC):
+                return "read timeout"
+            return "timed out"
         return "connection error"
     if cls == "pool_pressure":
         if "replayed history no longer matches" in t:
@@ -1218,10 +1294,12 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
         if cause == RELAY_DRAIN_CAUSE:
             return f"{prefix}{cause} (at the relay), {window}", ()
         return f"{prefix}relay busy: all subs at capacity (at the relay), {window}", ()
+    if cause == SEAT_TIMEOUT_CAUSE:
+        return f"{prefix}{_seat_timeout_body(row, seat)}{_pool_context(row)}, {window}", ()
     seg = _hop_segment(hop, seat, row.get("http_status"))
     floors = tuple(f for f, hit in ((FLOOR_CAUSE, cause == UNCLASSIFIED_CAUSE),
                                     (FLOOR_HOP_SUB, seg == _HOP_SUB_UNKNOWN_SEG)) if hit)
-    return f"{prefix}{cause} {seg}, {window}", floors
+    return f"{prefix}{cause} {seg}{_pool_context(row)}, {window}", floors
 
 
 # ── same-error re-failover backoff (t_7f2ced0d) ───────────────────────────
@@ -1413,6 +1491,19 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     cls = row.get("trigger_class")
     relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
                      or bool(row.get("relay_synthetic")))
+    if cls == INVALID_RESPONSE_CLASS:
+        # t_6eddafcd: say what came back, and that the relay already retried.
+        fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
+        if fl.get("content_blocks") == 0:
+            if fl.get("relay_retry") == "gave_up":
+                n = len(fl.get("relay_attempts") or ())
+                return f"empty reply, retried ×{n}" if n else "empty reply, relay retried"
+            return "empty reply"
+        return None
+    if cls == "conn" and _cause_phrase(row) == SEAT_TIMEOUT_CAUSE:
+        return SEAT_TIMEOUT_CAUSE
+    if cls == "conn" and _cause_phrase(row) == RELAY_DEADLINE_CAUSE:
+        return "relay deadline"
     if cls == "pool_pressure" and _cause_phrase(row) == RELAY_DRAIN_CAUSE:
         return "relay deploying"
     if cls == "pool_pressure" and _cause_phrase(row).startswith(SESSION_DEMOTED_CAUSE):

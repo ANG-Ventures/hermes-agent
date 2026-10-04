@@ -97,6 +97,8 @@ _POOL_HEADER_NAMES = (
     # claude-pool #193: "gave_up" = the relay already retried an empty-content
     # 200 on the same seat AND one other seat (t_9d411670).
     "x-pool-empty-content-retried",
+    # t_6eddafcd: the seats the relay's empty-content ladder tried, in order.
+    "x-pool-empty-content-attempts",
 )
 
 

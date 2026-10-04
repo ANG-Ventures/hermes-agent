@@ -107,6 +107,52 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
                        "rate limit", "rate_limit", "too many requests")),
 )
 
+# Relay-synthetic error bodies -> the hop the relay states for them under
+# error-class-v2 (claude-pool ``_SYNTHETIC_CLASS``). A lane that does not
+# negotiate v2 (claude-dtlr*, claude-btpr) gets the same bytes WITHOUT the
+# ``x-relay-error-hop`` header; the body alone names the hop (t_6eddafcd: a
+# dlr 504 "upstream attempt timed out" rendered "(hop unknown)"). Exact
+# ``error`` strings only: they are the relay's own answers, never upstream text.
+RELAY_SYNTHETIC_HOP: Dict[str, str] = {
+    "pool at capacity": "relay",
+    "upstream connect timed out": "relay->bridge",
+    "upstream attempt timed out": "relay->bridge",
+    "pool deadline exceeded": "relay->bridge",
+    "upstream unreachable on every box": "relay->bridge",
+    "upstream unreachable": "relay->bridge",
+    "client cancelled": "relay",
+    "pool dispatch error": "relay",
+    "upstream capacity unavailable for the requested model": "relay",
+    "overflow_exhausted": "relay",
+    "no eligible sub": "relay",
+    "confirm probe failed": "relay->bridge",
+    "no box could serve /v1/models": "relay->bridge",
+}
+_RELAY_JSON_RE = re.compile(r'\{\s*"error"\s*:\s*"([^"]{1,120})"\s*\}')
+
+
+def relay_synthetic_error(body: Any, text: Optional[str] = None) -> Optional[str]:
+    """The relay-synthetic ``error`` string of a failed call, else None.
+
+    Reads ``body["error"]`` (a string: the relay's own shape) first, then the
+    exception text when it carries the relay's JSON (``HTTP 504:
+    {"error":"upstream attempt timed out"}``). Never raises."""
+    try:
+        cand = None
+        if isinstance(body, dict) and isinstance(body.get("error"), str):
+            cand = body["error"]
+        if cand is None and text:
+            m = _RELAY_JSON_RE.search(str(text))
+            if m:
+                cand = m.group(1)
+        if cand is None:
+            return None
+        cand = cand.strip().lower()
+        return cand if cand in RELAY_SYNTHETIC_HOP else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 _CONN_EXC_NAMES = frozenset((
     "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
     "ReadError", "ReadTimeout", "RemoteProtocolError", "IncompleteRead",
@@ -547,6 +593,16 @@ def socket_cause(exc: Any) -> Optional[str]:
     return None
 
 
+def _attempt_seats(raw: Any) -> Optional[list]:
+    """``x-pool-empty-content-attempts: sub-vps-18,sub-vps-18,sub-vps-23`` ->
+    the seat list (at most 8 short tokens), else None."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    seats = [t.strip() for t in raw.split(",") if t.strip()]
+    seats = [t for t in seats if re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", t)][:8]
+    return seats or None
+
+
 def stash_response_failure(agent: Any, site: str, response: Any = None, *,
                            detail: Optional[str] = None,
                            elapsed_s: Optional[float] = None,
@@ -579,6 +635,10 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
             "route_id": ph.get("x-pool-route-id"),
             "served_by": ph.get("x-pool-served-by"),
             "repeat": True if repeat else None,
+            # t_6eddafcd: the relay's own empty-content ladder (claude-pool
+            # #193): "gave_up" / "1" and, when sent, the seats it tried in order.
+            "relay_retry": (ph.get("x-pool-empty-content-retried") or "").strip().lower() or None,
+            "relay_attempts": _attempt_seats(ph.get("x-pool-empty-content-attempts")),
         }
         agent._pending_fallback_error = {
             "at": time.monotonic(),
@@ -731,6 +791,7 @@ def stash_api_error(agent: Any, api_error: BaseException,
                                  "x-relay-seat", "x-pool-served-by",
                                  "x-pool-unreachable",
                                  "x-pool-route-id", "retry-after",
+                                 "x-relay-eligible", "x-pool-other-eligible",
                                  "x-ratelimit-limit", "x-ratelimit-remaining",
                                  "x-ratelimit-reset")},
             "body": body if isinstance(body, dict) else None,
@@ -845,6 +906,21 @@ def relay_hop_seat(headers: Any, body: Any) -> Tuple[Optional[str], Optional[str
     except Exception:  # noqa: BLE001
         return None, None
     return hop, seat
+
+
+def pool_eligible(headers: Any) -> Optional[int]:
+    """Eligible seat count the relay stated with a failed call
+    (``x-pool-other-eligible``: seats other than the one that failed, sent on
+    every relay error; else v2 ``x-relay-eligible``), else None. ``?`` or junk
+    -> None. Never raises."""
+    h = _lower_headers(headers)
+    v = (h.get("x-pool-other-eligible") or "").strip()
+    if v.isdigit():
+        return int(v)
+    # v2 counts every eligible seat, the failing one included: only 0 proves
+    # there was no other.
+    v = (h.get("x-relay-eligible") or "").strip()
+    return 0 if v == "0" else None
 
 
 def served_by_seat(headers: Any) -> Optional[str]:
@@ -1035,8 +1111,22 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         if p_scope and not row.get("provider_scope"):
             row["provider_scope"] = p_scope
         r_hop, r_seat = relay_hop_seat(headers, body)
+        synthetic = relay_synthetic_error(body, text)
+        if not r_hop and synthetic:
+            # No error-class-v2 hop header (the lane did not negotiate v2):
+            # the relay-synthetic body names the hop (t_6eddafcd).
+            from agent.fallback_policy import normalize_hop
+
+            r_hop = normalize_hop(RELAY_SYNTHETIC_HOP[synthetic])
+        if synthetic and not row.get("relay_error"):
+            row["relay_error"] = synthetic
         if r_hop and not row.get("hop"):
             row["hop"] = r_hop
+        elig = pool_eligible(headers)
+        if elig is not None and "pool_eligible" not in row:
+            row["pool_eligible"] = elig
+        if pending and pending.get("elapsed_s") is not None:
+            row.setdefault("elapsed_s", pending.get("elapsed_s"))
         if not r_seat:
             # A pooled relay names the seat that answered an upstream 4xx
             # passthrough only in x-pool-served-by (no error-class-v2 headers).
