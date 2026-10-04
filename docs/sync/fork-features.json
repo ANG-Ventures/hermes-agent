@@ -132,7 +132,24 @@
     "tests": [
       "tests/cron/test_cron_script.py::TestRunJobScript",
       "tests/cron/test_per_job_reasoning_effort.py::TestResolution",
-      "tests/cron/test_reasoning_config_per_model.py::TestCronPerModelReasoningConfig"
+      "tests/cron/test_reasoning_config_per_model.py::TestCronPerModelReasoningConfig",
+      "tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_id",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_id"
+    ],
+    "call_site": "cron/scheduler.py::_job_script_kwargs",
+    "call_site_tests": [
+      "tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_id",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_id"
     ],
     "paths": [
       "cron/fork_ext/scheduler_ext.py",
@@ -146,7 +163,7 @@
     "surfaces": [
       "cron"
     ],
-    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `TestRunJobScript::test_script_timeout` does not exist; `grep -rn 'def test_script_timeout' tests/` is empty tree-wide. The class holds test_successful_script / test_script_relative_path / test_script_subprocess_env_sanitized. Repointed at the class so the entry collects, but the SCRIPT-TIMEOUT RESOLUTION CHAIN named in `why` is now UNCOVERED. The module docstring still advertises timeout coverage, suggesting a silent rename/drop. ACTION: restore a timeout test or amend `why` to stop claiming that behavior."
+    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `TestRunJobScript::test_script_timeout` does not exist; the class is kept for output/env coverage only. RESOLVED 2026-10-04 (t_db03da56): the per-job script-timeout chain is covered end to end by tests/cron/test_cron_script_kwargs_isolated.py (run_one_job/run_job through _job_script_kwargs, per-kwarg wiring + visible effect) and the monitor path by test_monitor_script_passes_job_ceiling; both are in call_site_tests."
   },
   {
     "feature": "relay-pool session affinity and lane headers",
