@@ -12691,6 +12691,26 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     coverage, error = _latest_review_coverage(rows)
     if coverage is None:
         return error
+    return _review_coverage_record_error(coverage)
+
+
+def review_coverage_text_error(text: Any) -> Optional[str]:
+    """Why a caller-supplied ``review_coverage`` JSON is invalid, or None.
+
+    Pure (no DB access): request-changes runs it before any write, so a
+    refused record never lands on the card where the lander would read it as
+    the deciding record (t_c5bfb48b).
+    """
+    coverage, error = _latest_review_coverage(
+        [{"body": "review_coverage: " + str(text or "").strip()}]
+    )
+    if coverage is None:
+        return error
+    return _review_coverage_record_error(coverage)
+
+
+def _review_coverage_record_error(coverage: dict) -> Optional[str]:
+    """Field checks for one parsed review_coverage record; None when valid."""
     lenses = coverage.get("lenses")
     if not isinstance(lenses, dict):
         return "missing lenses object"
@@ -12845,6 +12865,12 @@ def request_changes(
         if refusal is not None:
             return False, refusal
     coverage_text = str(redact_review_value(coverage or "")).strip()
+    if coverage_text:
+        # Validate the whole record before any write (t_c5bfb48b), so no
+        # rejected call can leave it behind.
+        coverage_error = review_coverage_text_error(coverage_text)
+        if coverage_error:
+            return False, coverage_error
     coverage_body = f"review_coverage: {coverage_text}" if coverage_text else None
     comment_author = str(claimer or "reviewer").strip() or "reviewer"
 
