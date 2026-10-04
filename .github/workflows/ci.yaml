@@ -53,6 +53,20 @@ name: CI
 #
 # ``CI_RUNNER_LABELS`` rollback still sends the heavy variable-routed jobs,
 # including the matrix slices, to ubuntu-latest. Literal hosted gates stay hosted.
+#
+# PR LANE GATES (fork, Ace 2026-10-03, t_bf20260d). Two heavy lane sets are off
+# on a pull request unless the diff calls for them; both come from the `detect`
+# classifier (scripts/ci/classify_changes.py), not a second paths filter:
+#
+#   * desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip
+#     CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the
+#     desktop app is in use. Desktop core E2E, Desktop update E2E, the UI test
+#     shards and the apps/desktop check units run only when apps/desktop/**
+#     changed AND vars.CI_DESKTOP_JOBS == 'on'. A release run forces them on.
+#   * install/update: e2e-upgrade, Windows install + update E2E and Bootstrap
+#     installer run on a PR only when the diff touches _INSTALL_PATHS.
+#     merge_group forces them on and push:main runs everything, so a PR run is
+#     never the only gate (t_e8c5045e).
 
 on:
   workflow_dispatch:
