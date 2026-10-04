@@ -164,6 +164,23 @@ def test_load1_unreadable_while_enabled_is_paused_with_remote_allowed(monkeypatc
     assert (g2.band, g2.spill_reason, g2.remote_allowed) == ("paused", "unreadable", True)
 
 
+def test_unreadable_load1_keeps_a_held_proc_pause(monkeypatch):
+    # Prism P1 (PR #1728): an unreadable tick must not lift proc_paused's
+    # remote ban; no process check ran to clear it.
+    g, c = _gate(), _Clock()
+    c.tick(g, 30.0, 0.40, procs=9000, limit=10666)
+    assert g.band == "proc_paused" and not g.remote_allowed
+    assert g.admit(None, now=c.now + 60) == (None, None)
+    assert (g.band, g.remote_allowed) == ("proc_paused", False)
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (None, None))
+    assert g.admit_now(running=0) == (None, None)
+    assert (g.band, g.remote_allowed) == ("proc_paused", False)
+    assert g.snapshot()["pool"] == {"planned": False, "reason": "proc_paused"}
+    c.now += 120
+    c.tick(g, 30.0, 0.40, procs=1000, limit=10666)   # a real check clears it
+    assert g.band != "proc_paused" and g.remote_allowed
+
+
 def test_cpu_none_never_enters_and_always_satisfies_the_exit():
     g, c = _gate(), _Clock()
     for _ in range(3):

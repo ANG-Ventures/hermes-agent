@@ -525,7 +525,15 @@ class LoadGate:
     def _mark_unreadable(self) -> None:
         """Enabled gate, load1 unreadable: ``admit()`` still returns
         ``(None, None)``; the band tells the tick builder to run local 0
-        (``gate_unreadable``) while the pool's own probes decide remote."""
+        (``gate_unreadable``) while the pool's own probes decide remote.
+
+        A held process-slot pause wins: the unreadable paths return before
+        ``update_procs`` runs, so nothing has cleared it and remote stays off.
+        """
+        if self.proc_paused:
+            self.band, self.spill_reason, self.remote_allowed = "proc_paused", None, False
+            self.pool = {"planned": False, "reason": "proc_paused"}
+            return
         self.band, self.spill_reason, self.remote_allowed = "paused", "unreadable", True
 
     def _cpu_over(self, bar: float) -> bool:
