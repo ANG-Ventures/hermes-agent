@@ -3390,6 +3390,7 @@ def dispatch_once(
     budget_cache: Optional[dict] = None,
     spillover_fn=None,
     spillover=None,
+    max_new: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -3432,6 +3433,7 @@ def dispatch_once(
             budget_cache=budget_cache,
             spillover_fn=spillover_fn,
             spillover=spillover,
+            max_new=max_new,
         )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -3461,6 +3463,7 @@ def dispatch_once(
                 budget_cache=budget_cache,
                 spillover_fn=spillover_fn,
                 spillover=spillover,
+                max_new=max_new,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -3686,8 +3689,26 @@ def _native_command_profile(assignee: str, cache: dict) -> bool:
     return cache[assignee]
 
 
+def _linked_ids(conn, ids) -> set:
+    """Ids among ``ids`` with any task link: ONE query per tick (bounded by
+    the ready set), not one per row."""
+    ids = list(ids)
+    out: set = set()
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            f"SELECT parent_id, child_id FROM task_links "
+            f"WHERE parent_id IN ({marks}) OR child_id IN ({marks})", chunk + chunk,
+        ):
+            out.add(r[0])
+            out.add(r[1])
+    return out
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
-               native_cache: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               native_cache: Optional[dict] = None,
+               linked_ids: Optional[set] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3700,17 +3721,26 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         skills = json.loads(row["skills"] or "[]") or []
     except (TypeError, ValueError, IndexError, KeyError):
         skills = []
-    linked = conn.execute(
-        "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
-        (row["id"], row["id"]),
-    ).fetchone() is not None
+    if linked_ids is not None:
+        linked = row["id"] in linked_ids
+    else:
+        linked = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
+            (row["id"], row["id"]),
+        ).fetchone() is not None
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
-    native = bool(assignee) and assignee in tuple(plan.config.profiles or ()) and \
+    allowlisted = bool(assignee) and assignee in tuple(plan.config.profiles or ())
+    native = allowlisted and \
         _native_command_profile(assignee, {} if native_cache is None else native_cache)
+    # The filesystem scan is the expensive check: only a row every cheaper
+    # rule would admit pays for it (non-scratch, linked or non-allowlisted
+    # rows can never place; a non-allowlisted one reports ``profile``).
+    scan = (row["workspace_kind"] or "scratch") == "scratch" and not linked and allowlisted
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
-        workspace_has_content=_kb._kwh.local_workspace_has_content(row["workspace_path"]),
+        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
+                               if scan else False),
         assignee=assignee, body=row["body"],
         skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
         native_command=native,
@@ -3882,6 +3912,7 @@ def _dispatch_once_locked(
     budget_cache: Optional[dict] = None,
     spillover_fn=None,
     spillover=None,
+    max_new: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -4202,6 +4233,17 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
+    # ``max_new`` (CLI ``--max N``, additive) caps NEW workers this call
+    # across local AND remote spawns: it is a TOTAL-budget cap, never only
+    # the load gate's local allowance (else remote pins bypass it).
+    if max_new is not None:
+        _cap = max(0, int(max_new))
+        if spawn_budget is None or spawn_budget > _cap:
+            spawn_budget = _cap
+        if _cap == 0:
+            result.spawn_capped = "--max=0: no new workers this call"
+            return result
+
     ready_rows = conn.execute(
         "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
@@ -4221,7 +4263,8 @@ def _dispatch_once_locked(
             spillover = _dc.replace(spillover, slots=dict(spillover.slots))
         _eff_default = (default_assignee or "").strip() or None
         _native: dict = {}
-        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native)
+        _linked = _linked_ids(conn, [r["id"] for r in ready_rows])
+        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked)
                      for r in ready_rows}
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
@@ -4391,7 +4434,11 @@ def _dispatch_once_locked(
     # with no spawnable review work are untouched, and the map is cleared
     # before the review loop so reviewers see the full pool budget.
     review_pool_reserve: dict[str, int] = {}
-    if pool_spawns_per_eligible and review_rows:
+    # Reviews only ever run locally: with no local slot this tick (load gate
+    # paused / allowance 0) the review loop cannot launch, so holding a pool
+    # admission for it would only starve portable ready cards that could
+    # place remotely on the same pool.
+    if pool_spawns_per_eligible and review_rows and (local_budget is None or local_budget > 0):
         try:
             from hermes_cli.profiles import profile_exists as _rpp
         except Exception:

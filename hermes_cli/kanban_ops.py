@@ -256,6 +256,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             spawn_paused=gate["spawn_paused"],
             spawn_limit=gate["spawn_limit"],
             spillover=_one_shot_pool_plan(gate.get("gate"), _cfg),
+            # --max is additive across local AND remote spawns (total budget).
+            max_new=additive,
         )
         if gate["override"] is not None and not args.dry_run and res.spawned:
             # Attribute any load episode to the override on every card it

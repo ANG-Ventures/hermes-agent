@@ -95,9 +95,23 @@ def _placed_host(raw: Optional[str]) -> Optional[str]:
         return None
 
 
-# Boot record (RC-9): the placement this worker process was spawned with,
-# captured at import, i.e. before any tool bridge could drop the variable.
-BOOT_PLACED_HOST: Optional[str] = _placed_host(os.environ.get(PLACEMENT_ENV))
+# Boot record (RC-9): the placement this worker process was spawned with.
+# ``capture_boot_placement`` runs from ``main()`` before env files or the
+# config bridge can touch the environment; the import-time read below only
+# covers an entry point that skips ``main()``. First captured host wins and
+# lives here, independent of the (mutable) environment.
+BOOT_PLACED_HOST: Optional[str] = None
+
+
+def capture_boot_placement(environ: Optional[MutableMapping[str, str]] = None) -> Optional[str]:
+    global BOOT_PLACED_HOST
+    if BOOT_PLACED_HOST is None:
+        env = os.environ if environ is None else environ
+        BOOT_PLACED_HOST = _placed_host(env.get(PLACEMENT_ENV))
+    return BOOT_PLACED_HOST
+
+
+capture_boot_placement()
 _reapply = {"failed": 0, "warned": False}
 
 
