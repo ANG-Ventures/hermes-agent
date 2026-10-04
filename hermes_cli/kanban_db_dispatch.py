@@ -3698,7 +3698,9 @@ def _route_row(conn, row, plan) -> "tuple[str, Optional[str]]":
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", f"not_portable:{rule}"
-    return "local", f"not_portable:{rule}"
+    # host:any that fails hard_ok may still run locally; with no local slot
+    # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
+    return "local", (f"not_portable:{rule}" if pin == _kwp.PIN_ANY else None)
 
 
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
@@ -3709,7 +3711,7 @@ def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optio
     if route == "wait":
         return arg
     if route == "local":
-        return None if local_free else "local_full"
+        return None if local_free else (arg or "local_full")
     if route == "portable" and not local_free:
         if plan.pins_only:
             return "local_full"  # admitting band: the pool takes pins only

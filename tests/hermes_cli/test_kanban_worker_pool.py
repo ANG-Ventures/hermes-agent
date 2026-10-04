@@ -306,6 +306,7 @@ def test_rc1_linked_card_with_host_any_is_not_placed(kanban_home):
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
     assert res.placed == [] and all(tid != child for tid, _ in spawned)
+    assert res.placement_waits[child] == "not_portable:linked"
 
 
 def test_review_rows_spawn_locally_only(kanban_home, monkeypatch):
@@ -333,3 +334,44 @@ def test_count_running_by_placement_skips_unopenable_board(kanban_home, monkeypa
     monkeypatch.setattr(kb, "connect", connect)
     out = kb.count_running_by_placement([{"slug": "default"}, {"slug": "broken"}])
     assert out == {"default": (1, {"ace-ai": 1})}
+
+
+def test_paused_tick_without_a_plan_spawns_nothing(kanban_home):
+    with kb.connect_closing() as conn:
+        _make(conn, 3)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=0, spawn_paused="test")
+    assert spawned == [] and res.spawned == [] and res.spawn_paused == "test"
+
+
+def test_running_placements_fill_the_host_for_the_next_plan(kanban_home):
+    with kb.connect_closing() as conn:
+        _make(conn, 3)
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        running = kwp.running_by_host(conn)
+        assert running == {"ace-ai": 2}
+        nxt = kwp.plan([_host(slots=2)], running, probe=lambda h: (0.0, 16))
+        res, spawned = _tick(conn, spillover=nxt, spawn_limit=0, spawn_paused="test")
+    assert spawned == [] and "running=2/2" in (res.spillover or "")
+
+
+def test_cards_no_host_serves_are_never_claimed(kanban_home):
+    """Budget is summed across hosts; per-assignee capacity is not."""
+    hosts = [_host("ace-ai", slots=2), _host("host-b", slots=2, priority=1, profiles=("beta",))]
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 4)
+        res, spawned = _tick(conn, spillover=_plan(hosts=hosts), spawn_limit=0, spawn_paused="test")
+        assert [h for _, h in spawned] == ["ace-ai", "ace-ai"]
+        assert res.spawn_failed == [] and res.auto_blocked == []
+        assert _claimed(conn, ids) == 2
+
+
+def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
+    ws = tmp_path / "legacy-ws"
+    ws.mkdir()
+    (ws / "handoff.md").write_text("x")
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host:any")
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), tid))
+        conn.commit()
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files"
