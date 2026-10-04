@@ -292,7 +292,7 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
 async def test_fast_status_and_toggle_replies_use_i18n(monkeypatch, tmp_path):
     runner = _make_runner()
     translator = MagicMock(side_effect=lambda key, **_kwargs: key)
-    monkeypatch.setattr("gateway.slash_commands.t", translator)
+    monkeypatch.setattr("gateway.slash_commands_model.t", translator)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     runner._resolve_configured_session_route_identity = MagicMock(
@@ -1048,3 +1048,61 @@ async def test_malformed_persisted_identity_roundtrip_fails_closed_before_enrich
     assert _CapturingAgent.last_init is None
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["auto", "cold"])
+async def test_gateway_runner_accepts_bounded_fast_modes(monkeypatch, tmp_path, mode):
+    """/fast auto|cold reach the one /fast handler on GatewayRunner (no stale mixin shadow) and
+    become the session's bounded tier, durably persisted for that session."""
+    owners = [
+        cls.__module__ for cls in gateway_run.GatewayRunner.__mro__
+        if "_handle_fast_command" in cls.__dict__
+    ]
+    assert owners == ["gateway.slash_commands_model"]
+
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    runner._resolve_configured_session_route_identity = MagicMock(
+        return_value=("gpt-5.5", "openai-codex", "codex_responses")
+    )
+    event = _make_event(f"/fast {mode}")
+    session_key = runner._session_key_for_source(event.source)
+
+    response = await runner._handle_fast_command(event)
+
+    assert "Unknown argument" not in response
+    assert mode.upper() in response
+    assert runner._resolve_session_service_tier(session_key=session_key) == mode
+    assert runner._resolve_session_service_tier(session_key="other-session") is None
+    assert mode in await runner._handle_fast_command(_make_event("/fast status"))
+
+
+@pytest.mark.asyncio
+async def test_session_fast_tier_survives_gateway_restart(monkeypatch, tmp_path):
+    """The "saved" reply is true: a fresh runner (restart) reads the session tier back, and a
+    --global write clears it so the global default wins after the next restart too."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    route = MagicMock(return_value=("gpt-5.5", "openai-codex", "codex_responses"))
+    event = _make_event("/fast cold")
+
+    first = _make_runner()
+    first._resolve_configured_session_route_identity = route
+    session_key = first._session_key_for_source(event.source)
+    assert "saved" in await first._handle_fast_command(event)
+
+    restarted = _make_runner()
+    assert restarted._resolve_session_service_tier(session_key=session_key) == "cold"
+    assert restarted._resolve_session_service_tier(session_key="other-session") is None
+
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.5")
+    restarted._resolve_configured_session_route_identity = route
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner, "_configured_route_identity",
+        staticmethod(lambda _cfg: ("gpt-5.5", "openai-codex", "codex_responses")),
+    )
+    assert "saved" in await restarted._handle_fast_command(_make_event("/fast normal --global"))
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"agent": {"service_tier": "fast"}})
+    assert _make_runner()._resolve_session_service_tier(session_key=session_key) == "priority"

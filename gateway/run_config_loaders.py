@@ -227,7 +227,44 @@ class GatewayConfigLoadersMixin:
             _t_state = self._peek_session_state(resolved_session_key)
             if _t_state is not None and _t_state.conversation.service_tier_override is not _SERVICE_TIER_UNSET:
                 return _t_state.conversation.service_tier_override
+            persisted = self._persisted_session_service_tiers()
+            if resolved_session_key in persisted:
+                # A session /fast saved before a restart (gateway_session_tiers.yaml) wins over config.
+                # Read through the mtime cache, never pinned in memory: the file stays authoritative
+                # when another gateway process sharing it changes the session's tier.
+                return persisted[resolved_session_key]
         return self._load_service_tier()
+
+    def _persisted_session_service_tiers(self) -> Dict[str, Optional[str]]:
+        """Session /fast overrides persisted by ``_persist_session_service_tier``; {} when absent or
+        unreadable. Values parse through the shared tier table (unknown words are dropped)."""
+        from agent.fast_mode import parse_service_tier
+
+        path = self._session_service_tiers_path()
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+        cached = self.__dict__.get("_persisted_service_tiers_cache")
+        if cached and cached[0] == (str(path), mtime):
+            return cached[1]  # resolved every turn: re-read only when the file changes
+        try:
+            import hermes_yaml as yaml
+            with open(path, encoding="utf-8-sig") as f:
+                loaded = yaml.safe_load(f) or {}
+        except Exception as exc:
+            logger.warning("Unreadable session service tiers %s: %s", path, type(exc).__name__)
+            return {}
+        tiers = loaded.get("session_service_tiers") if isinstance(loaded, dict) else None
+        if not isinstance(tiers, dict):
+            return {}
+        out: Dict[str, Optional[str]] = {}
+        for key, raw in tiers.items():
+            tier = None if raw is None else parse_service_tier(raw)
+            if raw is None or tier is not None:
+                out[str(key)] = tier
+        self.__dict__["_persisted_service_tiers_cache"] = ((str(path), mtime), out)
+        return out
 
     def _set_session_service_tier_override(self, session_key: str, service_tier, clear: bool = False) -> None:
         """Set ("priority" / None = explicit normal) or ``clear`` the session-scoped /fast override."""
