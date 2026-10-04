@@ -96,6 +96,7 @@ class PoolConfig:
     pool_hosts: Tuple[PoolHost, ...] = ()
     disabled: Tuple[str, ...] = ()
     warnings: Tuple[str, ...] = ()
+    refused: Optional[str] = None   # why the whole pool was refused (load_gate.json)
 
 
 # -- registry ---------------------------------------------------------------
@@ -199,11 +200,12 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         roles_doc = _read_json(fleet_dir / ROLES_FILE)
         sidecar = _read_json(fleet_dir / SIDECAR_FILE)
     except (OSError, ValueError) as exc:
-        return PoolConfig(warnings=(f"kanban pool: unreadable pool file: {exc}",))
+        return PoolConfig(warnings=(f"kanban pool: unreadable pool file: {exc}",),
+                          refused="unreadable")
     try:
         roles = parse_roles(roles_doc) if roles_doc is not None else {}
     except PoolError as exc:
-        return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",))
+        return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",), refused="roles")
     with_role = {h for h, (r, _s) in roles.items() if ROLE in r}
     legacy = (kanban_cfg or {}).get("worker_hosts") if isinstance(kanban_cfg, Mapping) else None
     if legacy not in (None, [], {}, ""):
@@ -211,9 +213,9 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             return PoolConfig(warnings=(
                 "kanban pool: kanban.worker_hosts is set while fleet-roles.json has a "
                 f"{ROLE} role ({', '.join(sorted(with_role))}): two sources, placing nothing "
-                "(kanban.worker_hosts is retired)",))
+                "(kanban.worker_hosts is retired)",), refused="legacy_worker_hosts")
         # Never silent: the old key alone no longer places anything.
-        return PoolConfig(warnings=(
+        return PoolConfig(refused="legacy_worker_hosts", warnings=(
             "kanban pool: kanban.worker_hosts is retired and ignored; no host has a "
             f"{ROLE} role in {ROLES_FILE}, so nothing spills (register hosts with "
             "`fleet-host kanban-enable`)",))
@@ -223,7 +225,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             for h in sorted(with_role)))
     errs = validate_sidecar(sidecar)
     if errs:
-        return PoolConfig(warnings=("kanban pool: sidecar refused: " + "; ".join(errs),))
+        return PoolConfig(warnings=("kanban pool: sidecar refused: " + "; ".join(errs),),
+                          refused="sidecar")
     prio: List[str] = sidecar["priority"]
     rows: dict = sidecar["hosts"]
     gprofiles = tuple(sidecar.get("profiles") or ())
@@ -281,12 +284,13 @@ def card_pin(body: Optional[str]) -> Optional[str]:
 
 def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_content: bool,
              assignee: Optional[str], body: Optional[str], skills: Iterable[str] = (),
-             pool) -> Tuple[bool, Optional[str], Optional[str]]:
+             pool, native_command: bool = False) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
     ``hard_ok`` (scratch, unlinked, empty local workspace, allowlisted
-    assignee) is required for every remote placement; a pin only picks the
+    assignee whose profile is not a native-command lane) is required for every
+    remote placement; a pin only picks the
     route and never overrides it (RC-1). ``pool`` needs ``profiles``,
     ``studio_bound_skills`` and ``hosts`` (known host ids).
     """
@@ -298,6 +302,10 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         return False, "local_files", None
     if not assignee or assignee not in tuple(pool.profiles or ()):
         return False, "profile", None
+    if native_command:
+        # foreign_lane.worker_command runs the lane with a LOCAL Popen; the
+        # ssh terminal backend never sees it, so placement would be a lie.
+        return False, "native_command", None
     pin = card_pin(body)
     if pin == PIN_STUDIO:
         return False, "host_studio", None

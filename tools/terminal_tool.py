@@ -901,6 +901,9 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": _tenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": _tenv("TERMINAL_SSH_KEY", ""),
+        # Internal bridge: a kanban pool placement turns ~/.hermes file sync
+        # off (KWLB: one shared kanbanw login serves every profile).
+        "ssh_sync_files": _tenv_bool("TERMINAL_SSH_SYNC_FILES", "true"),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting; local is always opt-in. Per-backend env vars override.
         "ssh_persistent": _tenv_bool(

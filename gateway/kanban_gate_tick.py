@@ -142,6 +142,11 @@ class GateTickBuilder:
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
         for warning in pool.warnings:
             self._log(logger.warning, warning)
+        if pool.refused is not None:
+            # A refused pool places nothing; remote pins wait pool_unavailable.
+            gate.pool = {"planned": False, "reason": f"refused:{pool.refused}",
+                         "warnings": list(pool.warnings)}
+            return None
         if not pool.pool_hosts and not pool.disabled:
             gate.pool = {"planned": False, "reason": "no_hosts"}
             return None
@@ -151,6 +156,29 @@ class GateTickBuilder:
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         gate.pool = plan.snapshot()
         return plan
+
+
+def standalone_builder(load_gate, kanban_cfg: Callable) -> GateTickBuilder:
+    """The gateway's tick path for the standalone daemon and one-shot CLI
+    dispatch: same pool files, ledger and plan as ``kanban_watchers``."""
+    from hermes_cli import kanban_db as _kb
+
+    return GateTickBuilder(
+        load_gate,
+        fleet_dir=lambda: _kb.kanban_home() / "fleet",
+        kanban_cfg=kanban_cfg,
+        ledger=lambda boards: _kb.count_running_by_placement(boards),
+        connect=lambda board=None: _kb.connect(board=board),
+    )
+
+
+def live_boards() -> list:
+    from hermes_cli import kanban_db as _kb
+
+    try:
+        return _kb.list_boards(include_archived=False)
+    except Exception:
+        return [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
 
 
 def format_tick_line(gate, tick: GateTick, local: int, placed: list) -> str:

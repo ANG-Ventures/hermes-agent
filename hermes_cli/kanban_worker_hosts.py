@@ -40,6 +40,10 @@ def placement_env(host: PoolHost, workspace: str) -> Dict[str, str]:
         "TERMINAL_SSH_USER": host.ssh_user,
         "TERMINAL_SSH_PORT": str(host.ssh_port),
         "TERMINAL_CWD": workspace,
+        # Every profile shares the one kanbanw login: no ~/.hermes sync up
+        # (credentials stay on the Studio, PRD 5.8) and none back down into a
+        # profile from a tree another profile wrote.
+        "TERMINAL_SSH_SYNC_FILES": "false",
     }
 
 

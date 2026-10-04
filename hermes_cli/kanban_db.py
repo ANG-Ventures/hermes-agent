@@ -17889,8 +17889,14 @@ def count_running_by_placement(boards) -> "dict[str, tuple[int, dict[str, int]]]
                 if path in seen:
                     continue
                 conn = connect(board=slug)
-            total = _count_running_strict(conn)
-            remote = _kwp.running_by_host(conn)
+            # ONE read snapshot: a run that starts or ends between the two
+            # queries cannot land in one count and not the other.
+            conn.execute("BEGIN")
+            try:
+                total = _count_running_strict(conn)
+                remote = _kwp.running_by_host(conn)
+            finally:
+                conn.execute("ROLLBACK")
         except Exception:
             continue
         finally:

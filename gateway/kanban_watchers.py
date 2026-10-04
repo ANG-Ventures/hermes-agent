@@ -3714,8 +3714,9 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, res))
                 _res_placed = list(getattr(res, "placed", None) or []) if res is not None else []
                 _placed.extend(_res_placed)
-                # Local spawns only: the split was over the LOCAL allowance.
-                _n = (len(getattr(res, "spawned", None) or []) if res is not None else 0) - len(_res_placed)
+                # Local spawns only (by id, never spawned - placed): the
+                # split was over the LOCAL allowance.
+                _n = _kbd._local_spawn_count(res) if res is not None else 0
                 _tick_spawned += _n
                 if _spare is not None:
                     # Quota this board did not use (concurrency cap, demand

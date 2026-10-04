@@ -3670,7 +3670,24 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
-def _route_row(conn, row, plan, default_assignee: Optional[str] = None) -> "tuple[str, Optional[str]]":
+def _native_command_profile(assignee: str, cache: dict) -> bool:
+    """The assignee's profile sets ``foreign_lane.worker_command``: its lane
+    runs as a LOCAL Popen, so it can never be placed (cached per tick)."""
+    if assignee not in cache:
+        from hermes_cli.kanban_native_worker import worker_command
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+        try:
+            cache[assignee] = worker_command(
+                resolve_profile_env(normalize_profile_name(assignee))) is not None
+        except FileNotFoundError:
+            cache[assignee] = False   # no such profile: the spawn itself fails
+        except Exception:
+            cache[assignee] = True    # cannot tell: never place it
+    return cache[assignee]
+
+
+def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
+               native_cache: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3687,12 +3704,16 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None) -> "tupl
         "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
         (row["id"], row["id"]),
     ).fetchone() is not None
+    # An unassigned card is routed as the assignee the loop will give it.
+    assignee = row["assignee"] or default_assignee
+    native = bool(assignee) and assignee in tuple(plan.config.profiles or ()) and \
+        _native_command_profile(assignee, {} if native_cache is None else native_cache)
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=_kb._kwh.local_workspace_has_content(row["workspace_path"]),
-        # An unassigned card is routed as the assignee the loop will give it.
-        assignee=row["assignee"] or default_assignee, body=row["body"],
+        assignee=assignee, body=row["body"],
         skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
+        native_command=native,
     )
     pin = _kwp.card_pin(row["body"])
     if ok:
@@ -4199,7 +4220,9 @@ def _dispatch_once_locked(
             import dataclasses as _dc
             spillover = _dc.replace(spillover, slots=dict(spillover.slots))
         _eff_default = (default_assignee or "").strip() or None
-        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default) for r in ready_rows}
+        _native: dict = {}
+        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native)
+                     for r in ready_rows}
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
     else:
@@ -4973,8 +4996,12 @@ def _dispatch_once_locked(
             _kb._release_claim_for_workspace_refusal(
                 conn, claimed.id, result, str(exc),
             )
+            if placed_host is not None:
+                spillover.release(placed_host)  # nothing launched: refund
             continue
         except Exception as exc:
+            if placed_host is not None:
+                spillover.release(placed_host)  # nothing launched: refund
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
             # re-runs the identical git probe against the identical path. Block
@@ -5002,8 +5029,11 @@ def _dispatch_once_locked(
         _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
+            if placed_host is not None:
+                spillover.release(placed_host)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        launched = False
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -5027,6 +5057,7 @@ def _dispatch_once_locked(
                 if placed_host is not None:
                     raise
             pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+            launched = True
             if placed_host is not None:
                 band = getattr(spillover, "band", None)
                 spill_reason = getattr(spillover, "spill_reason", None)
@@ -5042,15 +5073,12 @@ def _dispatch_once_locked(
                      "pid": pid},
                     run_id=claimed.current_run_id,
                 )
-                result.placed.append((claimed.id, placed_host.name))
                 _kb._log.info(
                     "kanban dispatch: placed %s (%s) on worker host %s pid=%s "
                     "band=%s spill_reason=%s reason=%s probe=%s; local gate: %s",
                     claimed.id, claimed.assignee, placed_host.name, pid,
                     band, spill_reason, reason, probe, spawn_paused,
                 )
-            else:
-                local_spawned += 1
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
@@ -5072,6 +5100,12 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            # placed is a subset of spawned: a placement the loop then aborted
+            # never counts as one (the gateway books local spawns by id).
+            if placed_host is not None:
+                result.placed.append((claimed.id, placed_host.name))
+            else:
+                local_spawned += 1
             result.spawn_routes[claimed.id] = _kb.effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = route_source
             charge_pool(claimed.id, claimed.current_run_id)
@@ -5084,6 +5118,8 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            if placed_host is not None and not launched:
+                spillover.release(placed_host)  # pre-launch failure: refund
             from tools.process_registry import RestartSafeScopeUnavailable
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7) is not the card's failure: the run is closed with
@@ -6167,6 +6203,12 @@ def _default_spawn(
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
+def _local_spawn_count(res) -> int:
+    """Spawns of ``res`` that run on THIS host (placed ids excluded by id)."""
+    placed = {tid for tid, _h in (getattr(res, "placed", None) or [])}
+    return sum(1 for s in (getattr(res, "spawned", None) or []) if s[0] not in placed)
+
+
 def run_daemon(
     *,
     interval: float = 60.0,
@@ -6210,6 +6252,22 @@ def run_daemon(
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(sig, _handle)
 
+    gate_ticks = None
+    if load_gate is not None:
+        # The gateway's tick path (KWLB): LOCAL allowance + ONE pool plan, so
+        # the daemon places remote work exactly as the gateway does.
+        from gateway.kanban_gate_tick import live_boards, standalone_builder
+
+        def _kanban_cfg() -> dict:
+            try:
+                from hermes_cli.config import load_config
+                k = (load_config() or {}).get("kanban") or {}
+            except Exception:
+                return {}
+            return k if isinstance(k, dict) else {}
+
+        gate_ticks = standalone_builder(load_gate, _kanban_cfg)
+
     while not stop_event.is_set():
         try:
             # Resolve the global concurrency cap the same way the gateway
@@ -6224,19 +6282,11 @@ def run_daemon(
                 configured_max_in_progress()
             )
             gate_kwargs: dict = {}
-            if load_gate is not None:
-                from hermes_cli import kanban_load_gate as _klg_mod
-
-                allowance, reason = load_gate.admit_now(
-                    running=_klg_mod.count_running_workers()
-                    if load_gate.enabled else None
-                )
-                if load_gate.enabled and allowance is None and _klg_mod.loadavg_supported():
-                    # Same contract as the gateway's GateTick (RC-5c): an
-                    # enabled gate is an int LOCAL budget; unreadable = 0
-                    # (a host with no sampler at all keeps no limit).
-                    allowance, reason = 0, (reason or "gate_unreadable")
-                gate_kwargs = {"spawn_paused": reason, "spawn_limit": allowance}
+            if gate_ticks is not None:
+                tick = gate_ticks.build(live_boards())
+                gate_kwargs = {"spawn_paused": tick.spawn_paused,
+                               "spawn_limit": tick.local_allowance,
+                               "spillover": tick.remote_plan}
                 if load_gate.host_recovered():
                     with contextlib.closing(_kbc.connect()) as _rconn:
                         _kb.requeue_host_transient_blocks(
@@ -6251,7 +6301,8 @@ def run_daemon(
                     **gate_kwargs,
                 )
             if load_gate is not None:
-                load_gate.finish_tick(len(res.spawned or []), logger=_kb._log)
+                # The Studio gate books LOCAL spawns only (RC-2).
+                load_gate.finish_tick(_local_spawn_count(res), logger=_kb._log)
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
