@@ -82,6 +82,25 @@ def test_behind_without_strict_rule_is_not_updated_and_armed():
     assert armed == [("o/r", 5, HEAD, "t_x")]
 
 
+@pytest.mark.parametrize("ms", [None, "unknown", ""])
+def test_far_behind_with_uncomputed_mergeable_state_is_deferred(ms):
+    # t_6395b273: GitHub returns mergeable_state null/"unknown" until its background
+    # mergeability job finishes. A far-behind head may still be blocked by a strict
+    # up-to-date rule, so it is neither updated nor armed on the stale SHA: deferred.
+    gh, armed = FakeGh(behind=40, ms=ms), []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a) or "log")
+    assert gh.updates() == []
+    assert armed == []
+    assert "deferred" in rep["prs"]["o/r#5"]
+
+
+def test_near_head_with_uncomputed_mergeable_state_is_still_armed():
+    # Within behind_max the strict rule cannot have made it unlandable via staleness alone.
+    gh, armed = FakeGh(behind=3, ms="unknown"), []
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a) or "log")
+    assert armed == [("o/r", 5, HEAD, "t_x")]
+
+
 def test_at_threshold_is_not_updated():
     gh = FakeGh(behind=20, checks=("failure",))
     fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: None)
