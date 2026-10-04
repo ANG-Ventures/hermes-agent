@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
+from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 
 logger = logging.getLogger("gateway.kanban_watchers")
@@ -110,8 +111,10 @@ class GateTickBuilder:
         gate = self.gate
         running_local, remote_by_host = running_split(self._ledger(boards))
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
-        if gate.enabled and allowance is None:
-            # Enabled gate, load1 unreadable: fail CLOSED locally (RC-5c).
+        if gate.enabled and allowance is None and klg.loadavg_supported():
+            # Enabled gate, load1 unreadable on a host that has the sampler:
+            # fail CLOSED locally (RC-5c). No sampler at all (Windows): the
+            # gate has no signal, admission stays unrestricted as before.
             allowance, paused = 0, "gate_unreadable"
         plan = self.plan_pool(boards, remote_by_host)
         return GateTick(band=gate.band, spill_reason=gate.spill_reason,

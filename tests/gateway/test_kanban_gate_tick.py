@@ -201,3 +201,15 @@ async def test_admitting_band_without_a_pin_does_not_probe(tick):
     tick.band, tick.allowance = "admitting", (4, None)
     await _run_ticks(tick)
     assert tick.probes == [] and tick.plans[0] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported,limit", [(True, 0), (False, None)])
+async def test_unreadable_load_fails_closed_only_where_the_sampler_exists(
+        tick, monkeypatch, supported, limit):
+    """A host with no getloadavg (native Windows) keeps unrestricted local
+    admission; a host whose sampler failed gets a local budget of 0."""
+    monkeypatch.setattr(klg, "loadavg_supported", lambda: supported)
+    tick.band, tick.allowance = "admitting", (None, None)
+    await _run_ticks(tick)
+    assert tick.calls[0][1] == limit

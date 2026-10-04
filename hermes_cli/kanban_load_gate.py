@@ -890,6 +890,12 @@ def format_board_starvation_lines(
     return out
 
 
+def loadavg_supported() -> bool:
+    """False on hosts with no ``os.getloadavg`` (native Windows): the gate
+    has no load signal there and must not fail closed on its absence."""
+    return hasattr(os, "getloadavg")
+
+
 def sample_loadavg() -> "tuple[Optional[float], Optional[float]]":
     """(load1, load5) or (None, None) on platforms without getloadavg."""
     try:

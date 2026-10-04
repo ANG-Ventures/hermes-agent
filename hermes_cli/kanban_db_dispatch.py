@@ -3670,7 +3670,7 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
-def _route_row(conn, row, plan) -> "tuple[str, Optional[str]]":
+def _route_row(conn, row, plan, default_assignee: Optional[str] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3690,7 +3690,8 @@ def _route_row(conn, row, plan) -> "tuple[str, Optional[str]]":
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=_kb._kwh.local_workspace_has_content(row["workspace_path"]),
-        assignee=row["assignee"], body=row["body"],
+        # An unassigned card is routed as the assignee the loop will give it.
+        assignee=row["assignee"] or default_assignee, body=row["body"],
         skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
     )
     pin = _kwp.card_pin(row["body"])
@@ -4193,9 +4194,23 @@ def _dispatch_once_locked(
     # Without a plan every row is local and the order is unchanged.
     row_route: dict = {}
     if spillover is not None:
-        row_route = {r["id"]: _route_row(conn, r, spillover) for r in ready_rows}
+        if dry_run:
+            # Dry run reserves on its own ledger: the shared plan is untouched.
+            import dataclasses as _dc
+            spillover = _dc.replace(spillover, slots=dict(spillover.slots))
+        _eff_default = (default_assignee or "").strip() or None
+        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default) for r in ready_rows}
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
+    else:
+        # No plan this tick (pool disabled, refused, no hosts, proc_paused,
+        # or a caller that plans no pool): a REMOTE pin still never runs
+        # locally (I-11). It waits until a plan can place it.
+        from hermes_cli import kanban_worker_pool as _kwp
+        for r in ready_rows:
+            _pin = _kwp.card_pin(r["body"])
+            if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
+                row_route[r["id"]] = ("wait", "pool_unavailable")
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.
@@ -4878,11 +4893,20 @@ def _dispatch_once_locked(
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
+        placed_host = None
+        if route == "pin" or (route == "portable" and not local_free):
+            # A refused take() NEVER falls through to a local spawn (I-11).
+            placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
+            if placed_host is None:
+                result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             charge_pool(row["id"])
             spawned += 1
-            if route != "pin" and local_free:
+            if placed_host is not None:
+                result.placed.append((row["id"], placed_host.name))
+            else:
                 local_spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -4893,13 +4917,6 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        placed_host = None
-        if route == "pin" or (route == "portable" and not local_free):
-            # A refused take() NEVER falls through to a local spawn (I-11).
-            placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
-            if placed_host is None:
-                result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
-                continue
         claimed = _kb.claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             if placed_host is not None:
@@ -6205,9 +6222,10 @@ def run_daemon(
                     running=_klg_mod.count_running_workers()
                     if load_gate.enabled else None
                 )
-                if load_gate.enabled and allowance is None:
+                if load_gate.enabled and allowance is None and _klg_mod.loadavg_supported():
                     # Same contract as the gateway's GateTick (RC-5c): an
-                    # enabled gate is an int LOCAL budget; unreadable = 0.
+                    # enabled gate is an int LOCAL budget; unreadable = 0
+                    # (a host with no sampler at all keeps no limit).
                     allowance, reason = 0, (reason or "gate_unreadable")
                 gate_kwargs = {"spawn_paused": reason, "spawn_limit": allowance}
                 if load_gate.host_recovered():

@@ -247,9 +247,12 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             warnings.append(f"kanban pool: hosts.{hid} is not in priority (host dropped)")
     for hid in sorted(with_role - set(rows)):
         warnings.append(f"kanban pool: {hid} has a {ROLE} role but no sidecar row (host dropped)")
+    # The classifier allowlist is every profile SOME enabled host serves
+    # (global list + per-host overrides); take() still checks the host.
+    served = tuple(dict.fromkeys([*gprofiles, *(p for h in hosts for p in h.profiles)]))
     return PoolConfig(
         hosts=tuple(h for h in prio if h in rows),
-        profiles=gprofiles,
+        profiles=served,
         studio_bound_skills=tuple(sidecar.get("studio_bound_skills") or ()),
         pool_hosts=tuple(hosts), disabled=tuple(disabled), warnings=tuple(warnings),
     )

@@ -62,7 +62,7 @@ def _make(conn, n, *, assignee="alpha", body=None, priority=0, **kw):
                            body=body, priority=priority, **kw) for i in range(n)]
 
 
-def _tick(conn, *, spillover, spawn_limit, spawn_paused=None, spawned=None):
+def _tick(conn, *, spillover, spawn_limit, spawn_paused=None, spawned=None, **kw):
     spawned = [] if spawned is None else spawned
 
     def spawn(task, workspace, *, board=None, placement=None):
@@ -71,7 +71,7 @@ def _tick(conn, *, spillover, spawn_limit, spawn_paused=None, spawned=None):
 
     res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_paused=spawn_paused,
                             spawn_limit=spawn_limit, spillover=spillover,
-                            reconcile_orphans=False)
+                            reconcile_orphans=False, **kw)
     return res, spawned
 
 
@@ -376,3 +376,45 @@ def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
     assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files"
+
+
+# -- Prism round 1 (PR #1730) -----------------------------------------------
+
+def test_per_host_profile_overrides_reach_the_classifier(tmp_path):
+    side = _write_pool(tmp_path)
+    side.pop("profiles")
+    side["hosts"]["ace-media"]["profiles"] = ["beta"]
+    _write_pool(tmp_path, sidecar=side)
+    cfg = kwp.read_pool(tmp_path)
+    assert "beta" in cfg.profiles
+    assert kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                        assignee="beta", body="host:ace-media", pool=cfg) == (True, None, "pin")
+
+
+def test_remote_pin_without_a_plan_never_spawns_locally(kanban_home):
+    with kb.connect_closing() as conn:
+        (pinned,) = _make(conn, 1, body="host:ace-ai")
+        (plain,) = _make(conn, 1)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert spawned == [(plain, None)]
+    assert res.placement_waits[pinned] == "pool_unavailable"
+
+
+def test_dry_run_checks_the_pin_and_leaves_the_shared_plan_alone(kanban_home):
+    plan = _plan(free=1, band="spilling")
+    with kb.connect_closing() as conn:
+        (bad,) = _make(conn, 1, body="host:nope")
+        (good,) = _make(conn, 1, body="host:ace-ai")
+        res, _ = _tick(conn, spillover=plan, spawn_limit=4, dry_run=True)
+    assert [t for t, *_ in res.spawned] == [good]
+    assert res.placed == [(good, "ace-ai")]
+    assert res.placement_waits[bad] == "pin_unknown_host"
+    assert plan.budget == 1
+
+
+def test_unassigned_pinned_card_routes_as_its_default_assignee(kanban_home):
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, assignee=None, body="host:ace-ai")
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0,
+                             spawn_paused="test", default_assignee="alpha")
+    assert spawned == [(tid, "ace-ai")] and res.placed == [(tid, "ace-ai")]
