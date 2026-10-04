@@ -481,15 +481,17 @@ jobs:
     # Managed mode with a validated, attempt-bound plan uses its labels; every
     # other case (static routing, switch OFF, or no plan) uses the legacy X64
     # expression over CI_RUNNER_LABELS — never a fixed local pool (t_42bed567).
-    # The static last-resort label is Blacksmith 4vCPU (a literal, never a
-    # vars.* expression: ci_overflow_integration.fallback_predicate and
+    # The static last-resort label is GitHub-hosted ubuntu-latest (a literal,
+    # never a vars.* expression: ci_overflow_integration.fallback_predicate and
     # tests/ci/test_plumbing_runner_routing pin it so the fallback can never
-    # resolve to an unset variable). e2e ran 26 min on 2-core ubuntu-latest
-    # across #1624 rounds 4-7 (2026-10-03).
+    # resolve to an unset variable). Public repo: GitHub-hosted minutes are
+    # free; Blacksmith is reached only through the overflow placement plan
+    # above, never a hardcoded label (t_e95fdb01, Ace ruling 2026-10-03).
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
-    timeout-minutes: 30
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
+    # 45, not 30: e2e measured 26 min on GitHub-hosted (#1624 rounds 4-7).
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -611,10 +613,11 @@ jobs:
     # unprivileged-userns sysctl; the self-hosted pool runs no-new-privileges
     # containers (see the RUNNERS note in ci.yaml). Blacksmith VMs allow both
     # (hermes-home runs apt on them). Measured 2026-10-03 on #1624 rounds 4-7:
-    # the (git) shard took 48 min on 2-core ubuntu-latest and set every round's
-    # wall clock (52 min); upstream runs this job on a 32-core pool. Repo var
-    # CI_E2E_RUNNER overrides (outage fallback: set it to ubuntu-latest).
-    runs-on: ${{ vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # the (git) shard took 48 min on 2-core ubuntu-latest before the per-file
+    # split (longest shard now 11.6 min on Blacksmith 4vCPU). Public repo:
+    # GitHub-hosted minutes are free, so ubuntu-latest is the default; repo var
+    # CI_E2E_RUNNER overrides (t_e95fdb01, Ace ruling 2026-10-03).
+    runs-on: ${{ vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
