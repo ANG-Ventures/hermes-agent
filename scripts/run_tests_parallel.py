@@ -72,7 +72,6 @@ from typing import Dict, List, Optional, Tuple
 # "skipped on this host" note and the lanes can never disagree.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts  # noqa: E402
-from scripts.ci.flake_quarantine import JunitError, junit_outcomes  # noqa: E402
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -282,6 +281,9 @@ def _unexecuted_call_site_nodeids(
     registered = _call_site_nodeids(repo_root)
     if not registered:
         return []
+    # Lazy: stripped runner copies (tests/scripts runner-root, the placement
+    # artifact) ship only list_os_marked_tests.py, and have no manifest either.
+    from scripts.ci.flake_quarantine import JunitError, junit_outcomes
     out: List[Tuple[Path, List[str]]] = []
     seen: set[Path] = set()
     for f, s in all_summaries:
