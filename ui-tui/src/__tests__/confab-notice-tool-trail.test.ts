@@ -50,11 +50,7 @@ describe('confab notice preserves the tool trail', () => {
   })
 
   it('keeps every tool of a multi-tool flagged turn', () => {
-    const assistant = assistantOf([
-      toolRow('terminal', 'ls -la'),
-      toolRow('read_file', 'notes.md'),
-      noticeRow()
-    ])
+    const assistant = assistantOf([toolRow('terminal', 'ls -la'), toolRow('read_file', 'notes.md'), noticeRow()])
 
     expect(assistant?.tools).toHaveLength(2)
   })
