@@ -693,7 +693,7 @@ class AutoResumeAttemptStore:
         attempts = []
         if self.path.exists():
             try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 attempts = self._validate(raw)
             except Exception as exc:
                 self._credits_lost = True
@@ -705,7 +705,7 @@ class AutoResumeAttemptStore:
         self._legacy_extra = {k: v for k, v in raw.items() if k not in {"version", "attempts"}}
         try:
             if self.session_path.exists():
-                ledger = json.loads(self.session_path.read_text(encoding="utf-8"))
+                ledger = json.loads(self.session_path.read_text(encoding="utf-8-sig"))
                 if not isinstance(ledger, dict) or ledger.get("version") != 2:
                     raise ValueError("unsupported session ledger version")
                 if "session_attempts" not in ledger:

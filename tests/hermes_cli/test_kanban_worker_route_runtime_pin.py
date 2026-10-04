@@ -59,7 +59,7 @@ def _fresh_card_pin_cache():
 
 def _runtime_agent(provider, chain):
     from agent.chat_completion_helpers import try_activate_fallback
-    from tests.run_agent.test_fallback_reasoning_override import _make_reasoning_agent
+    from tests.agent.test_fallback_reasoning_override import _make_reasoning_agent
 
     agent = _make_reasoning_agent()
     agent.provider = provider

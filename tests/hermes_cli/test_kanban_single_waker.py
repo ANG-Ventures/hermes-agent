@@ -21,6 +21,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 OWNER = "1553876718639390760"
 OTHER = "1552754415428177980"
@@ -35,7 +36,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
-    kb._CHAT_LIVENESS_CACHE.clear()
+    kbn._CHAT_LIVENESS_CACHE.clear()
     kb.init_db()
     db = sqlite3.connect(home / "state.db")
     db.execute(
@@ -69,7 +70,7 @@ def _card(conn, home_sid: str = "sess-owner") -> str:
 def _modes(conn, tid) -> dict:
     return {
         (s["platform"], s["chat_id"]): s["delivery_mode"]
-        for s in kb.list_notify_subs(conn, tid)
+        for s in kbn.list_notify_subs(conn, tid)
     }
 
 
@@ -78,7 +79,7 @@ def _wakers(conn, tid) -> list:
 
 
 def _sub(conn, tid, chat, platform="discord", **kw):
-    return kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat,
+    return kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat,
                              chat_type="group", **kw)
 
 
@@ -171,7 +172,7 @@ def test_api_server_rows_are_exempt(board):
         tid = _card(conn)
         _sub(conn, tid, OWNER, delivery_mode="notify+wake")
         for origin in ("origin-a", "origin-b"):
-            kb.add_notify_sub(conn, task_id=tid, platform="api_server",
+            kbn.add_notify_sub(conn, task_id=tid, platform="api_server",
                               chat_id=origin, also=True)
         modes = _modes(conn, tid)
         assert modes[("api_server", "origin-a")] == "notify+wake"

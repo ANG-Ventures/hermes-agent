@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 import time
 
@@ -491,7 +492,20 @@ def test_canonical_hermes_home_does_not_realpath_every_call(sandbox_home):
     real_realpath = ospath.realpath
 
     def counting(path, **kwargs):
-        calls["n"] += 1
+        # The test harness's home-I/O guard (tests/home_io_guard.py) wraps
+        # os.stat/os.lstat and realpaths every component it is asked to check,
+        # from inside the ONE walk ``Path.resolve()`` performs; those are the
+        # harness's calls, not the hot path's.
+        frame, from_guard = sys._getframe(1), False
+        for _ in range(6):
+            if frame is None:
+                break
+            if frame.f_code.co_filename.endswith("home_io_guard.py"):
+                from_guard = True
+                break
+            frame = frame.f_back
+        if not from_guard:
+            calls["n"] += 1
         return real_realpath(path, **kwargs)
 
     ospath.realpath = counting  # type: ignore[assignment]

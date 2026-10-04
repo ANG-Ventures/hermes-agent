@@ -213,9 +213,15 @@ def test_handlers_are_registered_from_a_single_site():
     )
 
     registrar = inspect.getsource(tg_adapter.TelegramAdapter._register_handlers)
-    # Strip the docstring: it *discusses* block=False, and a guard that greps
-    # prose would match its own explanation.
-    code_only = registrar.split('"""')[-1]
+    # Strip docstring AND comments: both *discuss* block=False, and a guard that
+    # greps prose would match its own explanation.
+    import io
+    import tokenize
+    code_only = "".join(
+        tok.string for tok in tokenize.generate_tokens(io.StringIO(registrar).readline)
+        if tok.type not in (tokenize.COMMENT,)
+        and not (tok.type == tokenize.STRING and tok.string.startswith(('"""', "'''")))
+    )
     assert "TypeHandler" in code_only
     assert "group=-1" in code_only, "the sentinel must observe before handling"
     # The sentinel must be BLOCKING. block=False defers the callback to

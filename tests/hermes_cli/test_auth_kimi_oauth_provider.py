@@ -379,7 +379,6 @@ def test_auth_add_label_does_not_restore_a_rotated_refresh_token(home, monkeypat
         return written
 
     monkeypatch.setattr(auth_mod, "_kimi_oauth_login", _fake_login)
-    monkeypatch.setattr(auth_commands, "load_pool", lambda provider: None, raising=False)
 
     class _Args:
         provider = "kimi-oauth"

@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli import kanban_provider_health as ph
 
@@ -149,7 +150,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_USAGE_REGISTRY", raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
     getattr(ph, "_PROBE_STATE", {}).clear()
     kb.init_db()
     yield h
@@ -341,11 +342,11 @@ def test_dispatch_holds_pool_worker_when_pool_empty(home, pool):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pool bound", assignee="a")
         observed = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(observed))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == []
         assert (tid, "provider_capped") in res.respawn_guarded
         pool.eligible = 3
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(observed))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == [tid]
 
 
@@ -356,7 +357,7 @@ def test_dispatch_non_pool_worker_unaffected_by_empty_pool(home, pool):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="codex", assignee="b")
         observed = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(observed))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == [tid]
         assert pool.hits == 0
 
@@ -367,7 +368,7 @@ def test_dispatch_fails_open_when_pool_unreachable(home):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pool bound", assignee="a")
         observed = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(observed))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == [tid]
 
 
@@ -378,7 +379,7 @@ def _dispatch_one(assignee):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="x", assignee=assignee)
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         return tid, seen, res
 
 
@@ -438,7 +439,7 @@ def test_fallback_rung_judged_on_its_own_pool(home, apr, bpr):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="x", assignee="fb")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [tid]
         ev = _events(conn, tid, "dispatch_provider_fallback")
         assert ev and ev[-1]["to_provider"] == "claude-apr"
@@ -457,7 +458,7 @@ def test_single_tick_pool_budget_across_ready_and_review(home, apr, reviews):
                              [(tid,) for tid in ids[-reviews:]])
             conn.commit()
         seen = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                                max_in_progress=100)
         assert len(seen) == 2
         assert len([tid for tid, reason in res.respawn_guarded if reason == "pool_budget"]) == 28
@@ -494,7 +495,7 @@ def test_review_pool_reservation_survives_ready_backlog(home, apr, monkeypatch):
         conn.execute("UPDATE tasks SET status='review' WHERE id=?", (rev,))
         conn.commit()
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                                max_in_progress=100, dry_run=True)
         spawned = [tid for tid, _a, _w in res.spawned]
         assert rev in spawned, spawned
@@ -504,7 +505,7 @@ def test_review_pool_reservation_survives_ready_backlog(home, apr, monkeypatch):
         # No review work: the hold releases and ready gets both admissions.
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (rev,))
         conn.commit()
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                                max_in_progress=100, dry_run=True)
         assert len([t for t, _a, _w in res.spawned if t in ready]) == 2
 
@@ -529,7 +530,7 @@ def test_pool_budget_is_per_tick_across_boards_with_shared_tick_cache(home, apr)
     seen: list = []
     for b in boards:
         with kb.connect_closing(board=b) as conn:
-            kb.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
+            kbd.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
                              max_in_progress=100, budget_cache=tick_cache)
     assert len(seen) == 2, seen
     assert set(seen) <= set(ids["default"])
@@ -547,7 +548,7 @@ def test_pool_budget_is_per_tick_across_boards_with_shared_tick_cache(home, apr)
     # A NEW tick (fresh cache) gets a fresh budget.
     seen.clear()
     with kb.connect_closing(board="b2") as conn:
-        kb.dispatch_once(conn, board="b2", spawn_fn=_spawner(seen), max_spawn=100,
+        kbd.dispatch_once(conn, board="b2", spawn_fn=_spawner(seen), max_spawn=100,
                          max_in_progress=100, budget_cache={})
     assert len(seen) == 2
 
@@ -562,14 +563,14 @@ def test_pool_budget_single_call_without_tick_cache_is_per_call(home, apr):
         for i in range(6):
             kb.create_task(conn, title=f"c-{i}", assignee="argus")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 2
         # Per-tick counter resets per call, but the 2 running workers still
         # hold the pool's concurrency ceiling (t_38be6b10).
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 2
         _end_runs(conn, seen)
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 4
 
 
@@ -611,7 +612,7 @@ def test_spawn_records_charged_pool_on_run_and_spawned_event(home, apr):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="stamp", assignee="argus")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [tid]
         assert _events(conn, tid, "spawned")[-1]["pool"] == "claude-apr"
         meta = conn.execute("SELECT metadata FROM task_runs WHERE task_id=?",
@@ -632,7 +633,7 @@ def test_in_flight_workers_fill_the_pool_ceiling(home, apr):
                          {"pool": "claude-apr"})
         ids = [kb.create_task(conn, title=f"new-{i}", assignee="argus") for i in range(3)]
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                                max_in_progress=100)
         assert seen == []
         for tid in ids:
@@ -657,7 +658,7 @@ def test_in_flight_on_one_pool_does_not_consume_another(home, apr, bpr):
         a_new = kb.create_task(conn, title="a-new", assignee="a")
         b_new = [kb.create_task(conn, title=f"b-{i}", assignee="b") for i in range(3)]
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                                max_in_progress=100)
         assert seen == b_new[:2]
         assert (a_new, "pool_budget") in res.respawn_guarded
@@ -676,10 +677,10 @@ def test_ended_run_frees_its_slot_next_tick(home, apr):
             _running_run(conn, tid, {"pool": "claude-apr"})
         new = kb.create_task(conn, title="new", assignee="argus")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert seen == []
         _end_runs(conn, running[:1])
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert seen == [new]
 
 
@@ -696,7 +697,7 @@ def test_legacy_runs_without_pool_count_as_zero(home, apr, metadata):
                          metadata)
         ids = [kb.create_task(conn, title=f"new-{i}", assignee="argus") for i in range(3)]
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert seen == ids[:2]
         assert kb._pool_in_flight(conn) == {"claude-apr": 2}
 
@@ -718,7 +719,7 @@ def test_in_flight_spans_boards_within_one_tick(home, apr):
     seen: list = []
     for b in ("default", "b2"):
         with kb.connect_closing(board=b) as conn:
-            kb.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
+            kbd.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
                              max_in_progress=100, budget_cache=tick_cache)
     assert seen == []
     with kb.connect_closing(board="b2") as conn:
@@ -776,7 +777,7 @@ def test_fallback_spawns_charge_serving_pool_budget(home, apr, bpr):
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"fallback-{i}", assignee="fb") for i in range(10)]
         seen = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
                                max_in_progress=100)
         assert seen == ids[:4]
         assert all(not _events(conn, tid, "dispatch_provider_fallback") for tid in ids[:2])
@@ -796,12 +797,12 @@ def test_pinned_lanes_share_sub_budget_and_zero_disables_it(home, apr):
         ids = [kb.create_task(conn, title=f"pinned-{i}", assignee="apx" if i % 2 else "bpx")
                for i in range(6)]
         seen = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 2
         assert _events(conn, ids[2], "deferred")[-1]["pool"] == "sub-vps-16"
         _config(home, pool_health_urls=_urls(apr.url, apr.url), pool_box_health=False,
                 pool_spawns_per_eligible=0)
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 6
 
 
@@ -811,7 +812,7 @@ def test_unreachable_probe_fails_open_even_with_pool_budget(home):
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"unreachable-{i}", assignee="a") for i in range(5)]
         seen = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert seen == ids
 
 
@@ -823,7 +824,7 @@ def test_unreachable_pinned_probe_fails_open_without_box_health(home):
         ids = [kb.create_task(conn, title=f"pin-unreachable-{i}", assignee="a")
                for i in range(5)]
         seen = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert seen == ids
 
 
@@ -855,7 +856,7 @@ def test_guard_escalates_on_consecutive_rate_limits(home):
         _runs(conn, tid, [("rate_limited", now - 5000), ("rate_limited", now - 3000),
                           ("rate_limited", now - 1000)])
         detail: dict = {}
-        assert kb.check_respawn_guard(conn, tid, detail=detail) == "rate_limit_cooldown"
+        assert kbd.check_respawn_guard(conn, tid, detail=detail) == "rate_limit_cooldown"
         assert detail["eligible_at"] == now - 1000 + 2700
         assert detail["backoff_streak"] == 3
 
@@ -867,7 +868,7 @@ def test_guard_backoff_resets_after_other_outcome(home):
         _runs(conn, tid, [("rate_limited", now - 9000), ("rate_limited", now - 8000),
                           ("crashed", now - 7000), ("rate_limited", now - 400)])
         assert kb.consecutive_rate_limited_runs(conn, tid) == 1
-        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
 
 
 def test_consecutive_count_ignores_open_runs(home):
@@ -891,13 +892,13 @@ def test_release_stamps_escalated_next_eligible_at(home, monkeypatch):
         tid = kb.create_task(conn, title="x", assignee="a")
         _runs(conn, tid, [("rate_limited", now - 4000), ("rate_limited", now - 3000)])
         task = kb.claim_task(conn, tid)
-        kb._set_worker_pid(conn, tid, 99999999)
+        kbd._set_worker_pid(conn, tid, 99999999)
         path = kb.kanban_db_path().parent / "runs" / f"{tid}.{task.current_run_id}.exit.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"exit_code": 75, "failure_reason": "rate_limit",
                                     "ts": time.time()}))
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-        kb.detect_crashed_workers(conn)
+        kbd.detect_crashed_workers(conn)
         current = kb.get_task(conn, tid)
         # Third consecutive rate-limit -> 45 min.
         assert current.next_eligible_at >= now + 2700 - 5
@@ -1030,10 +1031,10 @@ def test_dispatch_circuit_holds_pool_only_and_notifies_once(home, pool, monkeypa
         pooled = kb.create_task(conn, title="pool", assignee="a")
         codex = kb.create_task(conn, title="codex", assignee="b")
         observed = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(observed))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == [codex]
         assert (pooled, "rate_limit_circuit") in res.respawn_guarded
-        kb.dispatch_once(conn, spawn_fn=_spawner(observed))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == [codex]
         assert len(sent) == 1
         assert "--target" in sent[0] and kbud.RECOVERY_TARGET in sent[0]
@@ -1052,7 +1053,7 @@ def test_D_codex_429s_do_not_trip_claude_circuit(home, apr, monkeypatch):
                   provider="openai-codex")
         claude_t = kb.create_task(conn, title="claude", assignee="argus")
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [claude_t]
         assert not [r for r in res.respawn_guarded if r[1] == "rate_limit_circuit"]
 
@@ -1072,7 +1073,7 @@ def test_dispatch_circuit_holds_only_the_tripped_pool(home, apr, bpr, monkeypatc
         on_apr = kb.create_task(conn, title="apr", assignee="a")
         on_bpr = kb.create_task(conn, title="bpr", assignee="b")
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [on_apr]
         assert (on_bpr, "rate_limit_circuit") in res.respawn_guarded
 
@@ -1098,7 +1099,7 @@ def test_circuited_card_falls_back_to_rung_on_open_pool(home, apr, bpr, monkeypa
                   provider="claude-bpr")
         tid = kb.create_task(conn, title="x", assignee="fb")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [tid]
         assert _events(conn, tid, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-apr"
 
@@ -1122,7 +1123,7 @@ def test_circuited_card_never_falls_back_onto_another_circuited_pool(home, apr, 
         _rl_burst(conn, ends, provider="claude-apx-3")  # sub-vps-3 circuit open too
         tid = kb.create_task(conn, title="x", assignee="fb")
         seen: list = []
-        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == []
         assert (tid, "rate_limit_circuit") in res.respawn_guarded
 
@@ -1142,10 +1143,10 @@ def test_notify_once_per_episode_even_as_closes_extend_the_hold(home, pool, monk
     with kb.connect_closing() as conn:
         tid = _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50])
         kb.create_task(conn, title="pool", assignee="a")
-        kb.dispatch_once(conn)
+        kbd.dispatch_once(conn)
         for ended in (now - 30, now - 20, now - 10):
             _runs(conn, tid, [("rate_limited", ended)])
-            kb.dispatch_once(conn)
+            kbd.dispatch_once(conn)
         assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": now - 10 + 600}
     assert len(sent) == 1
 
@@ -1175,7 +1176,7 @@ def test_dispatch_dry_run_does_not_notify(home, pool, monkeypatch):
     with kb.connect_closing() as conn:
         _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50])
         kb.create_task(conn, title="pool", assignee="a")
-        kb.dispatch_once(conn, dry_run=True)
+        kbd.dispatch_once(conn, dry_run=True)
         assert sent == []
 
 
@@ -1349,7 +1350,7 @@ def test_G2_fallback_skips_rung_whose_box_is_rejected(home, apr, bpr, box):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="x", assignee="fb")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [tid]
         assert _events(conn, tid, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-apr"
 
@@ -1392,7 +1393,7 @@ def test_G1_fallback_rung_429s_open_the_rungs_circuit_not_the_primary(home, apr,
     ])
     with kb.connect_closing() as conn:
         first = [kb.create_task(conn, title=f"s{i}", assignee="fb") for i in range(5)]
-        kb.dispatch_once(conn, spawn_fn=_spawner([]))
+        kbd.dispatch_once(conn, spawn_fn=_spawner([]))
         rungs = [_events(conn, t, "dispatch_provider_fallback")[-1]["to_provider"] for t in first]
         assert rungs == ["claude-bpx-16"] * 5
         now = int(time.time())
@@ -1401,7 +1402,7 @@ def test_G1_fallback_rung_429s_open_the_rungs_circuit_not_the_primary(home, apr,
         assert set(circuits) == {"sub-vps-16"}
         nxt = kb.create_task(conn, title="next", assignee="fb")
         seen: list = []
-        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        kbd.dispatch_once(conn, spawn_fn=_spawner(seen))
         assert seen == [nxt]
         assert _events(conn, nxt, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-apr"
 
@@ -1441,7 +1442,7 @@ def test_G1_lane_routed_429s_charge_the_lane_pool(home, apr, bpr, monkeypatch):
                                    expires_at=int(time.time()) + 3600, reason="window")
         for i in range(5):
             kb.create_task(conn, title=f"l{i}", assignee="ln")
-        kb.dispatch_once(conn, spawn_fn=_spawner([]))
+        kbd.dispatch_once(conn, spawn_fn=_spawner([]))
         now = int(time.time())
         assert _close_running_rate_limited(conn, now) == 5
         assert set(kb.rate_limit_circuits(conn, now=now, trip=5)) == {"claude-apr"}
@@ -1463,7 +1464,7 @@ def test_circuit_lane_then_fallback_charges_the_serving_rung(home, apr, bpr, mon
         kb.set_lane_model_override(conn, provider="claude-apr", model="lm", assignee="fb",
                                    expires_at=int(time.time()) + 3600, reason="window")
         tids = [kb.create_task(conn, title=f"h{i}", assignee="fb") for i in range(5)]
-        kb.dispatch_once(conn, spawn_fn=_spawner([]))
+        kbd.dispatch_once(conn, spawn_fn=_spawner([]))
         lane = [_events(conn, t, "dispatch_lane_route") for t in tids]
         fb = [_events(conn, t, "dispatch_provider_fallback") for t in tids]
         print("\nH1 lane events:", [e[-1]["provider"] if e else None for e in lane])
@@ -1525,13 +1526,13 @@ def test_steady_state_deferral_is_recorded_once(home, apr):
                          {"pool": "claude-apr"})
         tid = kb.create_task(conn, title="backlog", assignee="argus")
         for _ in range(3):
-            kb.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100,
+            kbd.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100,
                              max_in_progress=100)
         assert len(_events(conn, tid, "deferred")) == 1
         apr.eligible = 2  # the budget changed: a new deferral row
         getattr(ph, "_PROBE_STATE", {}).clear()
         _running_run(conn, kb.create_task(conn, title="r-5", assignee="argus"),
                      {"pool": "claude-apr"})
-        kb.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100, max_in_progress=100)
+        kbd.dispatch_once(conn, spawn_fn=_spawner([]), max_spawn=100, max_in_progress=100)
         deferred = _events(conn, tid, "deferred")
         assert len(deferred) == 2 and deferred[-1]["eligible"] == 2

@@ -28,6 +28,9 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -221,7 +224,7 @@ def test_migration_adds_column_and_is_idempotent(tmp_path, monkeypatch):
     # Second run on the SAME existing db must be a clean no-op.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with kb.connect() as conn:
-        kb._migrate_add_optional_columns(conn)  # explicit third pass
+        kbc._migrate_add_optional_columns(conn)  # explicit third pass
         assert _reasoning_cols(conn) == ["reasoning_effort"]
         assert kb.get_task(conn, "t_legacy1").reasoning_effort is None
 
@@ -232,7 +235,7 @@ def test_migration_adds_column_and_is_idempotent(tmp_path, monkeypatch):
 
 def _spawn_argv_for(monkeypatch, task) -> list:
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -243,8 +246,8 @@ def _spawn_argv_for(monkeypatch, task) -> list:
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
-    workspace = kb.resolve_workspace(task)
-    assert kb._default_spawn(task, str(workspace)) == 4242
+    workspace = kbw.resolve_workspace(task)
+    assert kbd._default_spawn(task, str(workspace)) == 4242
     return captured["cmd"]
 
 
@@ -285,7 +288,7 @@ def test_dispatch_once_spawn_argv_carries_reasoning(
 ):
     """Full dispatcher tick (claim -> spawn) drives the real _default_spawn."""
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -301,7 +304,7 @@ def test_dispatch_once_spawn_argv_carries_reasoning(
             conn, title="t", assignee="worker",
             reasoning_effort="high", initial_status="running",
         )
-        result = kb.dispatch_once(conn)
+        result = kbd.dispatch_once(conn)
     assert result.spawned, f"expected a spawn, got {result!r}"
     cmd = captured["cmd"]
     assert cmd[cmd.index("--reasoning") + 1] == "high"

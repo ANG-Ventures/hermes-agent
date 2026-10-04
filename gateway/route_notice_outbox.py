@@ -74,7 +74,7 @@ class RouteNoticeOutbox:
         # call, so the outbox follows the live home (profiles, test homes).
         data: Dict[str, List[Dict[str, Any]]] = {}
         try:
-            raw = json.loads(self._file().read_text(encoding="utf-8"))
+            raw = json.loads(self._file().read_text(encoding="utf-8-sig"))
             if isinstance(raw, dict):
                 data = {str(k): [e for e in v if isinstance(e, dict)]
                         for k, v in raw.items() if isinstance(v, list)}

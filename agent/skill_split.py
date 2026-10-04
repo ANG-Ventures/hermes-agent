@@ -201,7 +201,7 @@ def plan_split(skill_dir: Path, threshold_kb: int) -> Dict[str, Any]:
     result: Dict[str, Any] = {"skill_dir": str(skill_dir), "action": "skip"}
     if threshold_kb <= 0 or not skill_md.exists():
         return result
-    raw = skill_md.read_text(encoding="utf-8")
+    raw = skill_md.read_text(encoding="utf-8-sig")
     size = len(raw.encode("utf-8"))
     threshold = min(threshold_kb * 1024, PATCH_CAP_BYTES)
     result["size"] = size
@@ -350,7 +350,7 @@ def execute_split(skill_dir: Path, plan: Dict[str, Any]) -> List[Path]:
     touching disk (the plan could be stale if the file changed since).
     """
     skill_md = skill_dir / "SKILL.md"
-    current = skill_md.read_text(encoding="utf-8")
+    current = skill_md.read_text(encoding="utf-8-sig")
     if current != plan.get("original_text"):
         raise RuntimeError(
             f"SKILL.md changed since the split was planned: {skill_md}"
@@ -399,10 +399,10 @@ def join_split_skill(skill_dir: Path) -> bool:
     manifest_path = refs_dir / MANIFEST_NAME
     if not manifest_path.exists():
         return False
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     carves = manifest.get("carves") or []
     skill_md = skill_dir / "SKILL.md"
-    text = skill_md.read_text(encoding="utf-8")
+    text = skill_md.read_text(encoding="utf-8-sig")
     fm, body = split_frontmatter(text)
 
     # P0 FIX: Validate every carve path stays inside skill_dir (path traversal protection)
@@ -441,7 +441,7 @@ def join_split_skill(skill_dir: Path) -> bool:
         
         contents.append({
             **c,
-            "content": src.read_text(encoding="utf-8"),
+            "content": src.read_text(encoding="utf-8-sig"),
         })
 
     joined = body

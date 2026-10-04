@@ -54,6 +54,10 @@ def _agent(db: SessionDB, session_id: str, *, in_place: bool):
         {"role": "user", "content": "tail"},
     ]
     compressor.compression_count = 1
+    # The feasibility probe reuses the main window when the aux model rides the main route
+    # (#89500); a MagicMock would coerce to int(...) == 1 and trip the minimum-context guard.
+    compressor.context_length = 200_000
+    compressor.threshold_tokens = 120_000
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
     compressor._last_summary_error = None
@@ -168,7 +172,10 @@ def test_stale_identity_log_names_field_and_values(caplog):
     [
         ("Model: a\nProvider: p", {"model": "b", "provider": "p"}, ("Model", "a", "b")),
         ("Model: a\nProvider: p", {"model": "a", "provider": "q"}, ("Provider", "p", "q")),
-        ("Model: a\nPlatform: cli", {"model": "a", "platform": "discord"}, ("Platform", "cli", "discord")),
+        # Platform is no longer an identity field (upstream #104414, adopted by the 2026-10-01
+        # parity sync): a surface switch keeps the stored bytes and stages a switch note instead
+        # of rebuilding (agent/surface_switch.py), so the prefix cache survives.
+        ("Model: a\nPlatform: cli", {"model": "a", "platform": "discord"}, None),
         ("Model: a\nProvider: p\nPlatform: cli", {"model": "a", "provider": "p", "platform": "cli"}, None),
     ],
 )

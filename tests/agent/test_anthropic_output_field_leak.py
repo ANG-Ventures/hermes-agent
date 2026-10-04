@@ -20,11 +20,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest
-from agent.anthropic_adapter import (
-    _sanitize_replay_block,
-    _convert_content_part_to_anthropic,
-    _convert_assistant_message,
-)
+from agent.anthropic_message_convert import _sanitize_replay_block, _convert_content_part_to_anthropic, _convert_assistant_message
 
 FORBIDDEN = {"parsed_output", "caller"}
 

@@ -49,14 +49,18 @@ def _run(agent, responses):
     agent.save_trajectories = False
     agent.client.chat.completions.create.side_effect = list(responses)
     from agent import conversation_loop as _cl
+    from agent import turn_response_check as _trc
 
+    # The invalid-response branch lives in agent.turn_response_check on this fork
+    # (extracted from conversation_loop); its backoff comes from agent.retry_utils.
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
         patch("run_agent.time", _fast_time()),
         patch.object(_cl, "time", _fast_time()),
-        patch.object(_cl, "jittered_backoff", lambda *a, **k: 0.0),
+        patch.object(_trc, "time", _fast_time()),
+        patch("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0),
     ):
         return agent.run_conversation("hello")
 

@@ -337,7 +337,7 @@ class TestReferencedScriptInheritsSelfAwareness:
     ):
         script = tmp_path / "recover_sibling.sh"
         script.write_text(
-            "#!/bin/bash\nlaunchctl bootout gui/501/ai.hermes.gateway\n"
+            "#!/usr/bin/env bash\nlaunchctl bootout gui/501/ai.hermes.gateway\n"
         )
         assert not contains_gateway_lifecycle_command_or_referenced_script(
             f"bash {script}", cwd=str(tmp_path)
@@ -348,7 +348,7 @@ class TestReferencedScriptInheritsSelfAwareness:
     ):
         script = tmp_path / "kill_self.sh"
         script.write_text(
-            "#!/bin/bash\nlaunchctl bootout gui/501/ai.hermes.gateway-aegis\n"
+            "#!/usr/bin/env bash\nlaunchctl bootout gui/501/ai.hermes.gateway-aegis\n"
         )
         assert contains_gateway_lifecycle_command_or_referenced_script(
             f"bash {script}", cwd=str(tmp_path)
@@ -357,7 +357,7 @@ class TestReferencedScriptInheritsSelfAwareness:
     def test_mixed_in_referenced_script_blocked(self, tmp_path, launchd_identity):
         script = tmp_path / "mixed.sh"
         script.write_text(
-            "#!/bin/bash\n"
+            "#!/usr/bin/env bash\n"
             "launchctl bootout gui/501/ai.hermes.gateway\n"
             "launchctl bootout gui/501/ai.hermes.gateway-aegis\n"
         )
@@ -376,7 +376,7 @@ class TestReferencedScriptInheritsSelfAwareness:
         """
         script = tmp_path / "loop.sh"
         script.write_text(
-            "#!/bin/bash\n"
+            "#!/usr/bin/env bash\n"
             "uid=$(id -u); for item in 'ai.hermes.gateway-apollo:/a.plist' "
             "'ai.hermes.gateway:/p.plist'; do label=${item%%:*}; "
             'launchctl bootout "gui/$uid/$label"; done\n'

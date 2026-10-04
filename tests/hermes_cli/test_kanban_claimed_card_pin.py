@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worker_route as kwr
 
 
@@ -55,7 +56,7 @@ def _spawn_env(task, workspace, monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace.mkdir(parents=True, exist_ok=True)
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
     return captured["env"]
 
 

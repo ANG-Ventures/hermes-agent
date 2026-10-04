@@ -121,7 +121,10 @@ def _entry(node):
 
 def _run_verdict(work: Path, base_sha: str, outcome="failure"):
     script = _step("test", "Slice verdict")["run"]
-    env = {**os.environ, "TESTS_OUTCOME": outcome, "BASE_SHA": base_sha, "RUNNER_TEMP": str(work.parent)}
+    # The step runs the base checker under "$HERMES_PYTHON" (exported by the
+    # setup-pm action in CI); here the test interpreter stands in for it.
+    env = {**os.environ, "TESTS_OUTCOME": outcome, "BASE_SHA": base_sha, "RUNNER_TEMP": str(work.parent),
+           "HERMES_PYTHON": sys.executable}
     return subprocess.run(["bash", "-e", "-c", script], cwd=work, env=env, capture_output=True, text=True)
 
 

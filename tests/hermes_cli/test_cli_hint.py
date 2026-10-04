@@ -159,9 +159,13 @@ def test_the_resume_hint_does_not_expand_a_session_title(title, hostile_cwd,
     """
     import hermes_state
 
-    from hermes_cli import main as cli_main
+    # upstream moved the print site to hermes_cli.main_tui_launch (same lazy SessionDB import).
+    from hermes_cli import main_tui_launch as cli_main
 
     class _FakeDB:
+        def __init__(self, *args, **kwargs):  # upstream opens SessionDB(read_only=True)
+            pass
+
         def get_session(self, sid):
             return {"message_count": 3, "input_tokens": 1, "output_tokens": 1}
 
@@ -328,6 +332,7 @@ def test_the_session_repair_remedy_is_accepted_verbatim(tmp_path, monkeypatch, c
     Drives the real print site and a real bash, not the helper.
     """
     import hermes_state
+    import hermes_state_repair
 
     from hermes_cli import sessions_cmd
 
@@ -337,12 +342,13 @@ def test_the_session_repair_remedy_is_accepted_verbatim(tmp_path, monkeypatch, c
     db = tmp_path / "state.db"
     db.write_bytes(b"")
 
-    # `cmd_sessions` imports these from `hermes_state` at call time.
+    # `_cmd_repair` imports the path from `hermes_state` and the repair helpers from
+    # `hermes_state_repair` at call time (upstream moved them out of hermes_state).
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db, raising=False)
-    monkeypatch.setattr(hermes_state, "_db_opens_cleanly",
+    monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly",
                         lambda p: "database disk image is malformed", raising=False)
     monkeypatch.setattr(
-        hermes_state, "repair_state_db_schema",
+        hermes_state_repair, "repair_state_db_schema",
         lambda *a, **k: {"repaired": False, "error": "disk image is malformed",
                          "backup_path": str(backup)},
         raising=False,

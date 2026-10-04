@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -135,14 +136,14 @@ def test_dispatch_skips_flagged_card(kanban_home):
     with kb.connect_closing() as conn:
         tid = _flagged(conn, assignee="default")
         ok_tid = kb.create_task(conn, title="normal", assignee="default")
-        dry = kb.dispatch_once(conn, spawn_fn=_spawn, dry_run=True)
+        dry = kbd.dispatch_once(conn, spawn_fn=_spawn, dry_run=True)
     spawned = [s[0] for s in dry.spawned]
     assert tid not in spawned and ok_tid in spawned
     assert dry.skipped_no_worker == [tid]
     with kb.connect_closing() as conn:
         assert "dispatch_skipped" not in _kinds(conn, tid)  # dry run writes nothing
         for _ in range(3):
-            res = kb.dispatch_once(conn, spawn_fn=_spawn, dry_run=False)
+            res = kbd.dispatch_once(conn, spawn_fn=_spawn, dry_run=False)
             assert tid not in [s[0] for s in res.spawned]
         task = kb.get_task(conn, tid)
         kinds = _kinds(conn, tid)
@@ -155,7 +156,7 @@ def test_dispatch_skips_flagged_card(kanban_home):
 def test_dispatch_skips_flagged_unassigned_card_without_default_assignee(kanban_home):
     with kb.connect_closing() as conn:
         tid = _flagged(conn, assignee=None)
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_spawn, dry_run=False, default_assignee="default",
         )
         task = kb.get_task(conn, tid)

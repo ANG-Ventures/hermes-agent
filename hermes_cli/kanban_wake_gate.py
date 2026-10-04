@@ -221,7 +221,7 @@ def state_path() -> Path:
 
 def read_state(path: Optional[Path] = None) -> Optional[dict]:
     try:
-        data = json.loads((path or state_path()).read_text(encoding="utf-8"))
+        data = json.loads((path or state_path()).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None

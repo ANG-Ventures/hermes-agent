@@ -191,6 +191,12 @@ class TestCreateAutoModelE2E:
         monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
         monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        # Script jobs must point at an existing file at create/update time
+        # (tools/cronjob_job_args._validate_cron_script_path, upstream 7ecbe50d98).
+        from hermes_constants import get_hermes_home
+        scripts_dir = get_hermes_home() / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "noop.sh").write_text("#!/bin/sh\ntrue\n")
         yield
         ct.set_current_agent_model(None, None)
 
@@ -252,7 +258,7 @@ class TestCreateAutoModelE2E:
             job = next(job for job in json.loads(JOBS_FILE.read_text())["jobs"] if job["id"] == created["job_id"])
             assert (job["provider"], job["model"]) == (pool, "claude-sonnet-5")
 
-            result = registry.dispatch("cronjob", {
+            result = registry.dispatch("cronjob_manage", {
                 "action": "create", "prompt": "Check", "schedule": "every 1h",
                 "model": {"model": "claude-sonnet-5"},
             })
@@ -335,7 +341,7 @@ class TestCreateAutoModelE2E:
             if entrypoint == "registry":
                 if "model" in kwargs:
                     kwargs["model"] = {"model": kwargs["model"]}
-                return json.loads(registry.dispatch("cronjob", kwargs))
+                return json.loads(registry.dispatch("cronjob_manage", kwargs))
             return json.loads(ct.cronjob(**kwargs))
 
         created = call(action="create", prompt="Check", schedule="every 1h",
@@ -360,7 +366,7 @@ class TestCreateAutoModelE2E:
         ct.set_current_agent_model("claude-bpx-7", "claude-opus-5-5")
         args = {"action": "update", "job_id": created["job_id"], "no_agent": True,
                 "model": {"model": "auto"} if entrypoint == "registry" else "auto"}
-        updated = json.loads(registry.dispatch("cronjob", args) if entrypoint == "registry"
+        updated = json.loads(registry.dispatch("cronjob_manage", args) if entrypoint == "registry"
                              else ct.cronjob(**args))
         assert updated["success"] is True, updated
         job = next(j for j in json.loads(JOBS_FILE.read_text())["jobs"] if j["id"] == created["job_id"])
@@ -397,7 +403,7 @@ class TestCreateAutoModelE2E:
                             lambda: {"model": {"provider": "claude-apr", "default": "claude-opus-5-5"}})
         if action == "create":
             ct.set_current_agent_model("claude-bpx-7", "claude-opus-5-5")
-            result = json.loads(registry.dispatch("cronjob", {
+            result = json.loads(registry.dispatch("cronjob_manage", {
                 "action": "create", "prompt": "Check", "schedule": "every 1h",
                 "model": {"model": "claude-sonnet-5"},
             }))
@@ -408,7 +414,7 @@ class TestCreateAutoModelE2E:
             assert created["success"] is True, created
             job_id = created["job_id"]
             ct.set_current_agent_model("claude-bpx-7", "claude-opus-5-5")
-            result = json.loads(registry.dispatch("cronjob", {
+            result = json.loads(registry.dispatch("cronjob_manage", {
                 "action": "update", "job_id": job_id, "model": {"model": "claude-sonnet-5"},
             }))
         assert result["success"] is True, result
@@ -420,7 +426,7 @@ class TestCreateAutoModelE2E:
         from tools.registry import registry
 
         ct.set_current_agent_model("claude-bpx-7", "claude-opus-5-5")
-        result = registry.dispatch("cronjob", {
+        result = registry.dispatch("cronjob_manage", {
             "action": "create", "prompt": "Check", "schedule": "every 1h",
             "model": {"model": "claude-sonnet-5"},
         })
@@ -454,7 +460,7 @@ class TestCreateAutoModelE2E:
             if entrypoint == "registry":
                 if "model" in kwargs:
                     kwargs["model"] = {"model": kwargs["model"]}
-                return json.loads(registry.dispatch("cronjob", kwargs))
+                return json.loads(registry.dispatch("cronjob_manage", kwargs))
             return json.loads(ct.cronjob(**kwargs))
 
         if action == "create":
@@ -484,7 +490,7 @@ class TestCreateAutoModelE2E:
                                         script="noop.sh"))
         assert created["success"] is True, created
         ct.set_current_agent_model("claude-bpx-7", "claude-opus-5-5")
-        updated = json.loads(registry.dispatch("cronjob", {
+        updated = json.loads(registry.dispatch("cronjob_manage", {
             "action": "update", "job_id": created["job_id"], "no_agent": True,
             "model": {"model": "claude-sonnet-5"},
         }))
@@ -515,7 +521,7 @@ class TestCreateAutoModelE2E:
             if entrypoint == "registry":
                 if "model" in kwargs:
                     kwargs["model"] = {"model": kwargs["model"]}
-                return json.loads(registry.dispatch("cronjob", kwargs))
+                return json.loads(registry.dispatch("cronjob_manage", kwargs))
             return json.loads(ct.cronjob(**kwargs))
 
         def row(job_id):
@@ -589,7 +595,7 @@ class TestCreateAutoModelE2E:
         # and model="auto"; the persisted job must carry NO model.
         scripts_dir = tmp_path / "scripts"
         scripts_dir.mkdir()
-        (scripts_dir / "noop.sh").write_text("#!/bin/bash\necho hi\n")
+        (scripts_dir / "noop.sh").write_text("#!/usr/bin/env bash\necho hi\n")
         monkeypatch.setattr("tools.cronjob_tools.HERMES", tmp_path, raising=False)
         ct.set_current_agent_model("openai-codex", "gpt-5.6-terra")
         created = json.loads(ct.cronjob(

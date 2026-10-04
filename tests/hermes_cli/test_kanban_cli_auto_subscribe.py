@@ -35,6 +35,8 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_notify as kbn
 
 
 @pytest.fixture
@@ -77,7 +79,7 @@ def _create_and_get_task_id(title: str = "hello") -> tuple[str, str]:
 def _subs_for(task_id: str) -> list[dict]:
     conn = kb.connect()
     try:
-        return kb.list_notify_subs(conn, task_id)
+        return kbn.list_notify_subs(conn, task_id)
     finally:
         conn.close()
 
@@ -201,7 +203,7 @@ def test_add_notify_sub_failure_does_not_fail_create(kanban_home, monkeypatch):
     def _boom(*a, **kw):
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(kb, "add_notify_sub", _boom)
+    monkeypatch.setattr(kbn, "add_notify_sub", _boom)
 
     task_id, out = _create_and_get_task_id("sub failure tolerated")
     assert task_id
@@ -221,7 +223,7 @@ def _dispatch_args(**overrides) -> argparse.Namespace:
 
 def _fake_dispatch(monkeypatch, spawned):
     res = kb.DispatchResult(spawned=spawned)
-    monkeypatch.setattr(kb, "dispatch_once", lambda conn, **kw: res)
+    monkeypatch.setattr(kbd, "dispatch_once", lambda conn, **kw: res)
 
 
 def test_dispatch_warns_on_spawned_cards_with_zero_subs(
@@ -250,7 +252,7 @@ def test_dispatch_warning_suppressed_when_spawned_cards_are_watched(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="watched", assignee="worker1")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1"
         )
     finally:
@@ -282,7 +284,7 @@ def test_dispatch_warning_counts_only_unwatched(kanban_home, monkeypatch, capsys
         tid_watched = kb.create_task(conn, title="w", assignee="worker1")
         tid_silent_a = kb.create_task(conn, title="a", assignee="worker1")
         tid_silent_b = kb.create_task(conn, title="b", assignee="worker1")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid_watched, platform="telegram", chat_id="chat1"
         )
     finally:

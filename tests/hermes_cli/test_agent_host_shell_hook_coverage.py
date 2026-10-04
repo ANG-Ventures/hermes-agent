@@ -47,7 +47,9 @@ AGENT_CONSTRUCTION_HOSTS: dict[str, str] = {
     "cron/scheduler.py": CRON,
     "gateway/platforms/api_server.py": GATEWAY,
     "gateway/run.py": GATEWAY,
-    "gateway/slash_commands.py": GATEWAY,
+    "gateway/run_turn.py": GATEWAY,
+    "gateway/run_turn_runner.py": GATEWAY,
+    "gateway/slash_commands_session.py": GATEWAY,
     "hermes_cli/cli_agent_setup_mixin.py": CLI,
     "hermes_cli/cli_commands_mixin.py": CLI,
     "hermes_cli/oneshot.py": CLI,
@@ -112,7 +114,7 @@ def startup_spy(monkeypatch):
     """Record hook registration; neutralise plugin + MCP discovery side effects."""
     import hermes_cli.mcp_startup as mcp_startup
     import hermes_cli.plugins as plugins_mod
-    import tools.mcp_tool as mcp_tool
+    import tools.mcp_tool_discovery as mcp_tool_discovery
 
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -122,7 +124,9 @@ def startup_spy(monkeypatch):
     )
     monkeypatch.setattr(plugins_mod, "start_background_plugin_discovery", lambda: None)
     monkeypatch.setattr(mcp_startup, "start_background_mcp_discovery", lambda **kw: None)
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda *a, **kw: None)
+    # discover_mcp_tools lives in tools.mcp_tool_discovery since upstream's MCP decomposition
+    # (the tools.mcp_tool compat re-export was removed in a5bd246865b); main.py imports it there.
+    monkeypatch.setattr(mcp_tool_discovery, "discover_mcp_tools", lambda *a, **kw: None)
     return calls
 
 

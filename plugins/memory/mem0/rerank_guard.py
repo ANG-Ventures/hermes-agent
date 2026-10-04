@@ -120,7 +120,7 @@ class RerankIncidentManager:
 
     def _read(self) -> Dict[str, Any]:
         try:
-            value = json.loads(self._path.read_text(encoding="utf-8"))
+            value = json.loads(self._path.read_text(encoding="utf-8-sig"))
             if not isinstance(value, dict):
                 return _default_state()
             state = _default_state()

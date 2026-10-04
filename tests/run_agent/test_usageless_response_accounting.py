@@ -46,7 +46,7 @@ _MEASURED = {"prompt_tokens": 4000, "completion_tokens": 120, "total_tokens": 41
 
 def _make_agent(session_db, response):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("model_tools.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):

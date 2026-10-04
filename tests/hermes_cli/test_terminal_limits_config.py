@@ -97,7 +97,9 @@ def test_enforcement_site_does_not_reference_the_frozen_constant():
     import inspect
     import tools.terminal_tool as tt
 
-    src = inspect.getsource(tt.terminal_tool)
+    # upstream 7cfc90bae84 split the planning (cap enforcement) out of terminal_tool()
+    # into _plan_execution(); the contract follows the enforcement site.
+    src = inspect.getsource(tt._plan_execution) + inspect.getsource(tt.terminal_tool)
     assert "_foreground_max_timeout()" in src, "enforcement must call the accessor"
     assert "> FOREGROUND_MAX_TIMEOUT" not in src, (
         "enforcement compared against the import-time constant — a config-set "

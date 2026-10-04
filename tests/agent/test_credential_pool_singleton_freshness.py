@@ -134,7 +134,7 @@ def xai_pool(tmp_path, monkeypatch):
 def test_xai_sync_refuses_stale_pair(xai_pool, store_time, entry_time):
     pool, entry, path, calls = xai_pool(store_time=store_time, entry_time=entry_time)
     before = path.read_bytes()
-    assert pool._sync_xai_oauth_entry_from_auth_store(entry) is entry
+    assert pool._sync_entry_from_auth_store(entry) is entry
     assert path.read_bytes() == before
     assert calls == []
 
@@ -159,7 +159,7 @@ def test_xai_sync_adopts_non_stale_pair(xai_pool, store_time, entry_time):
     pool, entry, path, calls = xai_pool(
         store_time=store_time, entry_time=entry_time, entry_ttl=4 * 3600,
     )
-    synced = pool._sync_xai_oauth_entry_from_auth_store(entry)
+    synced = pool._sync_entry_from_auth_store(entry)
     assert synced is not entry
     assert synced.refresh_token == "synthetic-store-refresh"
     persisted = next(e for e in json.loads(path.read_text())["credential_pool"]["xai-oauth"]
@@ -174,7 +174,7 @@ def test_xai_manual_row_stays_independent(xai_pool):
         store_time=NEWER, entry_time=ENTRY_TIME, source="manual:device_code",
     )
     before = path.read_bytes()
-    assert pool._sync_xai_oauth_entry_from_auth_store(entry) is entry
+    assert pool._sync_entry_from_auth_store(entry) is entry
     assert path.read_bytes() == before
 
 
@@ -404,13 +404,25 @@ def test_nous_forced_refresh_does_not_spend_stale_refresh_token(
 
     monkeypatch.setattr("hermes_cli.auth._refresh_access_token", _fake_refresh)
     updated = pool.try_refresh_matching(credential_id=entry.id)
-    assert seen == [expected]
     assert updated is not None
-    assert updated.refresh_token == "synthetic-rotated-refresh"
     raw = json.loads(path.read_text())
-    assert raw["providers"]["nous"]["refresh_token"] == "synthetic-rotated-refresh"
     persisted = next(e for e in raw["credential_pool"]["nous"] if e["id"] == entry.id)
-    assert persisted["refresh_token"] == "synthetic-rotated-refresh"
+    if expected == "synthetic-pool-refresh":
+        # Store pair provably stale (#670): refused, the pool's own grant is the one redeemed.
+        assert seen == [expected]
+        assert updated.refresh_token == "synthetic-rotated-refresh"
+        assert raw["providers"]["nous"]["refresh_token"] == "synthetic-rotated-refresh"
+        assert persisted["refresh_token"] == "synthetic-rotated-refresh"
+    else:
+        # Store pair fresher (or unprovable): adopted. A peer already rotated and persisted a
+        # usable key, so the forced refresh adopts it and redeems NO grant (upstream
+        # a6f75130386 peer-rotated skip, kept by the 2026-10-01 sync) — the stale pool token is
+        # never replayed and the sibling's fresh token is never invalidated either.
+        assert seen == []
+        assert updated.refresh_token == expected
+        assert persisted["refresh_token"] == expected
+        assert "synthetic-pool-refresh" not in (
+            raw["providers"]["nous"]["refresh_token"], persisted["refresh_token"])
 
 
 def test_nous_refresh_rereads_newer_singleton_inside_transaction(nous_pool, monkeypatch):
@@ -441,9 +453,11 @@ def test_nous_refresh_rereads_newer_singleton_inside_transaction(nous_pool, monk
     monkeypatch.setattr(auth, "_provider_state_transaction", concurrent_winner)
     monkeypatch.setattr(auth, "_refresh_access_token", refresh)
     updated = pool.try_refresh_matching(credential_id=entry.id)
-    assert seen == ["synthetic-winner-refresh"]
+    # The winner's pair is re-read inside the transaction and adopted; its usable key means
+    # no grant is redeemed (peer-rotated skip) — the loser's consumed token is never replayed.
+    assert seen == []
     assert updated is not None
-    assert updated.refresh_token == "synthetic-rotated-refresh"
+    assert updated.refresh_token == "synthetic-winner-refresh"
 
 
 def test_nous_exhausted_entry_select_refuses_stale_singleton(nous_pool):

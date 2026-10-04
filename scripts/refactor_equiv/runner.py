@@ -36,7 +36,7 @@ def import_ref(spec: str) -> Any:
 
 
 def load_cases(path: str | Path) -> list[dict[str, Any]]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if isinstance(data, dict):
         return list(data["cases"])
     return list(data)
@@ -80,7 +80,7 @@ def verify_golden(
     runner: Callable[[dict[str, Any]], Any],
 ) -> dict[str, Any]:
     actual = capture(load_cases(corpus_path), runner)
-    expected = json.loads(Path(golden_path).read_text(encoding="utf-8"))
+    expected = json.loads(Path(golden_path).read_text(encoding="utf-8-sig"))
     if actual != expected:
         raise EquivalenceError(_first_diff(expected, actual))
     return actual

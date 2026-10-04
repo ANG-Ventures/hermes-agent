@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban as kc, kanban_db as kb
+from hermes_cli import kanban as kc, kanban_db as kb, kanban_db_dispatch as kbd
 from gateway.kanban_watchers import _log_dispatch_tick
 from tests.hermes_cli.test_kanban_batch_set_model import _create
 
@@ -204,7 +204,7 @@ def test_lane_route_banned_after_it_was_set_is_refused_on_the_ready_path(
     _ban(kanban_home, "sol")  # policy tightened AFTER the lane was installed
     seen, spawn = _spawn_log()
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
         comments = [c.body for c in kb.list_comments(conn, lane_card)]
 
     assert seen == []
@@ -215,7 +215,7 @@ def test_lane_route_banned_after_it_was_set_is_refused_on_the_ready_path(
 def test_lane_route_banned_after_it_was_set_is_refused_on_the_review_path(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
     with kb.connect() as conn:
         kb.set_lane_model_override(
             conn, provider="openai-codex", model="gpt-5.6-sol",
@@ -227,7 +227,7 @@ def test_lane_route_banned_after_it_was_set_is_refused_on_the_review_path(
     _ban(kanban_home, "sol")
     seen, spawn = _spawn_log()
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert seen == []
     assert result.flagship_refused == [card]
@@ -248,7 +248,7 @@ def test_authorized_lane_and_authorized_card_still_spawn(kanban_home, all_assign
         )
     seen, spawn = _spawn_log()
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert result.flagship_refused == []
     assert sorted(seen) == sorted([
@@ -269,7 +269,7 @@ def test_card_pin_still_beats_a_banned_lane(kanban_home, all_assignees_spawnable
     _ban(kanban_home, "sol")
     seen, spawn = _spawn_log()
     with kb.connect() as conn:
-        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert result.flagship_refused == []
     assert seen == [(card, None, "standard-model")]
@@ -344,7 +344,7 @@ def test_scoped_expiry_under_a_live_board_wide_lane_names_the_survivor(
         )
         card = kb.create_task(conn, title="lane", assignee="worker")
         monkeypatch.setattr(kb.time, "time", lambda: 100)
-        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert result.expired_lane_models == [("worker", "openai-codex/model-scoped")]
     assert result.expired_lane_successors == {
@@ -368,7 +368,7 @@ def test_sole_lane_expiry_still_says_profile_default(
             expires_at=100, reason="only", now=50,
         )
         monkeypatch.setattr(kb.time, "time", lambda: 100)
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
     logger = logging.getLogger("test.f08.expiry2")
     with caplog.at_level(logging.INFO, logger="test.f08.expiry2"):
         _log_dispatch_tick(logger, "scratch", result)

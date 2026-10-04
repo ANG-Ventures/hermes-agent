@@ -15,6 +15,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_constants import get_hermes_home
 
 LOGS = "1480525090331561984"
@@ -61,6 +62,12 @@ class Adapter:
 @pytest.fixture(autouse=True)
 def _sessions(monkeypatch):
     monkeypatch.setattr(hr, "read_session_row", lambda sid: SESSIONS.get(sid))
+    # Upstream's media allowlist roots (_HERMES_ROOT/profiles, the cache-dir
+    # SAFE_ROOTS) are frozen at import against the outer home; point them at
+    # the isolated home so the home-IO guard does not refuse the path check.
+    from gateway.platforms import base as _base
+    monkeypatch.setattr(_base, "_HERMES_ROOT", get_hermes_home())
+    monkeypatch.setattr(_base, "MEDIA_DELIVERY_SAFE_ROOTS", ())
 
 
 async def _tick(monkeypatch, runner):
@@ -94,7 +101,7 @@ def _run(tmp_path, monkeypatch, session, *, channel=True, home_digest=0, route=N
     art.write_text("tick\n")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="card", assignee="worker", session_id=session)
-        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=SUB,
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=SUB,
                           chat_type="group", user_id="u1", delivery_mode="notify")
         kb.complete_task(conn, tid, summary="shipped", metadata={"artifacts": [str(art)]})
     ad = adapter or Adapter()

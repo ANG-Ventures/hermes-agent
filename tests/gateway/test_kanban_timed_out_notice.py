@@ -47,7 +47,7 @@ ITER_CAP_PAYLOAD = {
 def test_tui_formatter_renders_the_iteration_cap():
     # Drive the real TUI notice path, not its source text.
     from types import SimpleNamespace
-    from tui_gateway.server import _format_kanban_event_text
+    from tui_gateway.session_notifications import _format_kanban_event_text
 
     ev = SimpleNamespace(kind="timed_out", payload=dict(ITER_CAP_PAYLOAD))
     task = SimpleNamespace(title="t", assignee="w", result=None)
@@ -75,7 +75,8 @@ async def test_gateway_notifier_renders_the_iteration_cap(tmp_path, monkeypatch)
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        import hermes_cli.kanban_db_notify as kbn
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         kb._append_event(conn, tid, kind="timed_out", payload=dict(ITER_CAP_PAYLOAD))
     finally:
         conn.close()

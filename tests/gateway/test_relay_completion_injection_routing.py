@@ -32,7 +32,11 @@ class _RelayAdapter:
 
     def __init__(self):
         self.handled = []
-        self.handle_message = AsyncMock(side_effect=self.handled.append)
+        self.handle_message = AsyncMock(side_effect=self._admit)
+
+    def _admit(self, event):
+        self.handled.append(event)
+        event._gateway_accepted = True
 
     def fronts_platform(self, platform):
         return platform == Platform.SLACK
@@ -72,9 +76,9 @@ async def test_injection_resolves_relay_adapter_for_fronted_platform():
         "[delegation completed]", _slack_async_event()
     )
 
-    # 2026-08 parity merge: the fork's injection contract returns outcome
-    # strings; "delivered" is adapter acceptance (upstream's True).
-    assert result == "delivered", (
+    # 2026-10-01 parity: upstream's True/False/None injection contract is the
+    # merged one (ledger F02c); True is adapter acceptance.
+    assert result is True, (
         f"injection returned {result!r} on a relay-fronted gateway — the "
         "completion was dropped exactly as in the 2026-08-09 staging "
         "incident (literal adapter scan misses Platform.RELAY)"
@@ -83,10 +87,8 @@ async def test_injection_resolves_relay_adapter_for_fronted_platform():
 
 
 @pytest.mark.asyncio
-async def test_injection_still_none_when_platform_not_fronted():
-    """Control: a platform the relay does NOT front stays undeliverable
-    (returns None) — the resolver must not let relay hijack unrelated
-    targets."""
+async def test_injection_retries_when_platform_not_fronted():
+    """Unavailable transport stays retryable without letting relay hijack unrelated targets."""
     adapter = _RelayAdapter()  # fronts slack only
     runner = _runner_with_relay(adapter)
     evt = _slack_async_event()
@@ -94,9 +96,8 @@ async def test_injection_still_none_when_platform_not_fronted():
     evt["platform"] = "discord"
 
     result = await runner._inject_watch_notification("[x]", evt)
-    # Fork vocabulary: a resolvable route with no live adapter is "temporary"
-    # (retryable — an adapter may reconnect), never a delivery. The invariant
-    # under test — relay must not hijack unrelated targets — is the zero
-    # handle_message count.
-    assert result in ("temporary", "dropped")
+    # A resolvable route with no live adapter is False (retryable — an adapter
+    # may reconnect), never a delivery. The invariant under test — relay must
+    # not hijack unrelated targets — is the zero handle_message count.
+    assert result is False
     assert adapter.handle_message.await_count == 0

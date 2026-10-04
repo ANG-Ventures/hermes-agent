@@ -9,6 +9,7 @@ import asyncio
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli.kanban_wake_gate import WakeGate
 
 
@@ -56,7 +57,7 @@ def _blocked_task():
     try:
         tid = kb.create_task(conn, title="gate task", assignee="worker",
                              session_id="agent:main:telegram:dm:chat-1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
                           chat_type="dm", delivery_mode="notify+wake")
         kb.block_task(conn, tid, reason="need a decision")
         return tid
@@ -67,7 +68,7 @@ def _blocked_task():
 def _mode(tid):
     conn = kb.connect()
     try:
-        return [s["delivery_mode"] for s in kb.list_notify_subs(conn, tid)]
+        return [s["delivery_mode"] for s in kbn.list_notify_subs(conn, tid)]
     finally:
         conn.close()
 

@@ -517,7 +517,9 @@ async def test_backfill_reinjected_message_hits_full_auth_path(_tmp_home, monkey
     adapter._dispatch_incoming_message = DiscordAdapter._dispatch_incoming_message.__get__(adapter)
 
     # Lock the allowlist: only user 11111 is allowed.
-    adapter._is_allowed_user = lambda uid, author, guild=None, is_dm=False: str(uid) == "11111"
+    # parity 2026-10-01: re-inject now routes through _discord_message_admission (the live
+    # path), which passes channel_ids= (channel-scoped allowlist); accept it like the real method.
+    adapter._is_allowed_user = lambda uid, author, guild=None, is_dm=False, channel_ids=None: str(uid) == "11111"
 
     bot = _FakeAuthor(99999, "bot", bot=True)
     allowed = _FakeAuthor(11111, "alice")

@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES
 
 REPO = Path(__file__).resolve().parents[2]
@@ -250,7 +251,7 @@ def test_operator_release_verdict_is_fenced_to_the_inspected_run(home, monkeypat
             if path == "reclaim":
                 assert kb.reclaim_task(conn, tid, reason="probe") is False
             else:
-                assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == []
+                assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == []
             assert state["verdict"]["dead_claimer_release_basis"] == "operator_claim_no_worker"
             task = kb.get_task(conn, tid)
             assert task.status == "running"
@@ -273,7 +274,7 @@ def test_heartbeat_does_not_make_operator_claim_unreclaimable(home):
                 conn, tid, claimer=f"{host}:{gateway.pid}",
                 session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
             )
-            assert kb.heartbeat_worker(conn, tid, note="operator still here")
+            assert kbd.heartbeat_worker(conn, tid, note="operator still here")
             assert kb.reclaim_task(conn, tid, reason="probe") is True
             assert kb.get_task(conn, tid).status == "review"
             assert not [e for e in kb.list_events(conn, tid) if e.kind == "reclaim_refused"]
@@ -283,7 +284,7 @@ def test_heartbeat_does_not_make_operator_claim_unreclaimable(home):
                 conn, tid, claimer=f"{host}:{gateway.pid}",
                 session_ref=kb.derive_session_ref(SESSION), operator_claim=True,
             )
-            assert kb.heartbeat_worker(conn, tid)
+            assert kbd.heartbeat_worker(conn, tid)
             conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (tid,))
             conn.commit()
             assert kb.release_stale_claims(conn) == 1

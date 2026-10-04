@@ -29,6 +29,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -231,7 +232,7 @@ def test_cli_set_effort_reaches_spawn_argv(kanban_home, monkeypatch):
     assert task.reasoning_effort == "xhigh"
 
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -244,6 +245,6 @@ def test_cli_set_effort_reaches_spawn_argv(kanban_home, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = kanban_home / "ws"
     workspace.mkdir(exist_ok=True)
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
     cmd = captured["cmd"]
     assert cmd[cmd.index("--reasoning") + 1] == "xhigh"

@@ -114,7 +114,7 @@ def test_parsers_are_fail_open_on_unrelated_text() -> None:
 def test_attribute_unclean_exit_end_to_end_against_real_log_output(monkeypatch) -> None:
     """The full probe, with the real `log show` output injected at the
     subprocess seam - no live system query, but the real parse + chain."""
-    monkeypatch.setattr(lifecycle_ledger.sys, "platform", "darwin")
+    monkeypatch.setattr(lifecycle_ledger.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     calls = []
 
     def fake_run(argv, timeout):
@@ -139,7 +139,7 @@ def test_attribute_unclean_exit_is_unattributed_on_unsupported_platform(monkeypa
 
 
 def test_attribute_unclean_exit_never_raises_and_reports_reason(monkeypatch) -> None:
-    monkeypatch.setattr(lifecycle_ledger.sys, "platform", "darwin")
+    monkeypatch.setattr(lifecycle_ledger.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
 
     def boom(argv, timeout):
         raise RuntimeError("log show exploded")
@@ -152,7 +152,7 @@ def test_attribute_unclean_exit_never_raises_and_reports_reason(monkeypatch) -> 
 
 def test_probe_is_bounded(monkeypatch) -> None:
     """Every subprocess call must carry a timeout inside the overall bound."""
-    monkeypatch.setattr(lifecycle_ledger.sys, "platform", "darwin")
+    monkeypatch.setattr(lifecycle_ledger.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     timeouts = []
 
     def fake_run(argv, timeout):

@@ -57,6 +57,23 @@ class _HangingSession:
         return await self._ping(self)
 
 
+# The fork split tools/mcp_tool.py into sibling modules (parity 2026-10-01): the handler
+# factory, discovery and lifecycle entry points live there, state stays on mcp_tool.
+def _handlers():
+    from tools import mcp_tool_handlers
+    return mcp_tool_handlers
+
+
+def _discovery():
+    from tools import mcp_tool_discovery
+    return mcp_tool_discovery
+
+
+def _lifecycle():
+    from tools import mcp_tool_lifecycle
+    return mcp_tool_lifecycle
+
+
 def _install_http_server(mcp_tool, name, session):
     server = mcp_tool.MCPServerTask(name)
     server._config = {"url": "http://127.0.0.1:9/mcp"}
@@ -82,7 +99,8 @@ def mcp_tool(monkeypatch, tmp_path):
     # must fail on behaviour (hang -> slow error), not on setup.
     monkeypatch.setattr(mod, "_HTTP_INFLIGHT_PROBE_INTERVAL", 0.2, raising=False)
     monkeypatch.setattr(mod, "_HTTP_INFLIGHT_PROBE_TIMEOUT", 0.5, raising=False)
-    mod._ensure_mcp_loop()
+    from tools import mcp_tool_loop as _loop
+    _loop._ensure_mcp_loop()
     return mod
 
 
@@ -102,7 +120,7 @@ def test_ping_session_loss_fails_inflight_call_fast(mcp_tool):
     session = _HangingSession(_terminated)
     server = _install_http_server(mcp_tool, "srv-http-lost", session)
     try:
-        handler = mcp_tool._make_tool_handler("srv-http-lost", "hacr", 12.0)
+        handler = _handlers()._make_tool_handler("srv-http-lost", "hacr", 12.0)
         t0 = time.monotonic()
         parsed = json.loads(handler({}))
         elapsed = time.monotonic() - t0
@@ -125,7 +143,7 @@ def test_session_replaced_by_reconnect_fails_inflight_call_fast(mcp_tool):
     session = _HangingSession(_hang)
     server = _install_http_server(mcp_tool, "srv-http-swap", session)
     try:
-        handler = mcp_tool._make_tool_handler("srv-http-swap", "hacr", 12.0)
+        handler = _handlers()._make_tool_handler("srv-http-swap", "hacr", 12.0)
         out = {}
         th = threading.Thread(target=lambda: out.setdefault("r", handler({})))
         t0 = time.monotonic()
@@ -164,7 +182,7 @@ def test_healthy_slow_call_is_not_failed(mcp_tool):
     session = _SlowSession(_pong)
     _install_http_server(mcp_tool, "srv-http-slow", session)
     try:
-        handler = mcp_tool._make_tool_handler("srv-http-slow", "hacr", 30.0)
+        handler = _handlers()._make_tool_handler("srv-http-slow", "hacr", 30.0)
         parsed = json.loads(handler({}))
         assert parsed.get("result") == "done", parsed
         assert session.pings >= 1, "watcher never probed a >1s call"
@@ -193,7 +211,7 @@ def test_slow_ping_alone_does_not_fail_the_call(mcp_tool):
     session = _SlowSession(_slow_pong)
     _install_http_server(mcp_tool, "srv-http-busy", session)
     try:
-        handler = mcp_tool._make_tool_handler("srv-http-busy", "hacr", 30.0)
+        handler = _handlers()._make_tool_handler("srv-http-busy", "hacr", 30.0)
         parsed = json.loads(handler({}))
         assert parsed.get("result") == "done", parsed
     finally:
@@ -275,12 +293,12 @@ def test_server_restart_midcall_errors_within_seconds(monkeypatch, tmp_path):
     name = "restart_e2e"
     tool_timeout = 60.0
     try:
-        mcp_tool.register_mcp_servers({
+        _discovery().register_mcp_servers({
             name: {"url": f"http://127.0.0.1:{port}/mcp",
                    "timeout": tool_timeout, "skip_preflight": True},
         })
-        slow = mcp_tool._make_tool_handler(name, "slow", tool_timeout)
-        fast = mcp_tool._make_tool_handler(name, "fast", tool_timeout)
+        slow = _handlers()._make_tool_handler(name, "slow", tool_timeout)
+        fast = _handlers()._make_tool_handler(name, "fast", tool_timeout)
         assert "fast-done" in fast({})
 
         results = {}
@@ -318,5 +336,5 @@ def test_server_restart_midcall_errors_within_seconds(monkeypatch, tmp_path):
         else:
             pytest.fail("server never became usable after the restart")
     finally:
-        mcp_tool.shutdown_mcp_servers()
+        _lifecycle().shutdown_mcp_servers()
         _stop(proc)

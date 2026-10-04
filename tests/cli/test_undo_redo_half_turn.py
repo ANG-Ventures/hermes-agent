@@ -90,9 +90,10 @@ def test_str_prefill_edit_resend_merges_two_user_rows_before_provider(db):
 
     assert repairs == 1
     # parity 2026-08-30: rows re-materialized from the DB carry the
-    # _db_persisted provenance marker; the contract is role+content.
+    # _db_persisted provenance marker; parity 2026-10-01: upstream also stamps the
+    # durable ``message_uid``. The contract is role+content.
     assert [
-        {k: v for k, v in m.items() if not k.startswith("_")}
+        {k: v for k, v in m.items() if k in ("role", "content")}
         for m in messages
     ] == [{"role": "user", "content": "original draft\n\nedited draft"}]
 
@@ -113,6 +114,19 @@ def test_clear_redo_on_send_leaves_undo_stack_available(db):
     assert state.undo_stack == []
 
 
+def _redo_cli(captured):
+    """A HermesCLI double for process_command: upstream (parity 2026-10-01) dispatches through the
+    class-level ``_slash_handler`` table and binds ``_handle_redo_command`` by name, so the double
+    carries those two seams; everything else stays the bare namespace the fork test used."""
+    cli_obj = SimpleNamespace(
+        _pending_resume_sessions=None,
+        redo_last=lambda n=1: captured.__setitem__("n", n),
+        _slash_handler=HermesCLI._slash_handler,
+    )
+    cli_obj._handle_redo_command = lambda cmd: HermesCLI._handle_redo_command(cli_obj, cmd)
+    return cli_obj
+
+
 @pytest.mark.parametrize(
     "command, expected_n",
     [
@@ -126,10 +140,7 @@ def test_redo_command_clamps_non_positive_count_to_one(command, expected_n):
     """/redo 0 and /redo -N must clamp to 1 like /undo, not fall through to a
     misleading 'nothing to redo' (Greptile PR #49 finding)."""
     captured = {}
-    cli_obj = SimpleNamespace(
-        _pending_resume_sessions=None,
-        redo_last=lambda n=1: captured.__setitem__("n", n),
-    )
+    cli_obj = _redo_cli(captured)
     cont = HermesCLI.process_command(cli_obj, command)
     assert cont is True
     assert captured.get("n") == expected_n
@@ -138,9 +149,6 @@ def test_redo_command_clamps_non_positive_count_to_one(command, expected_n):
 def test_redo_command_rejects_non_numeric_count():
     """A non-numeric /redo argument is rejected, not silently treated as 1."""
     captured = {}
-    cli_obj = SimpleNamespace(
-        _pending_resume_sessions=None,
-        redo_last=lambda n=1: captured.__setitem__("n", n),
-    )
+    cli_obj = _redo_cli(captured)
     HermesCLI.process_command(cli_obj, "/redo abc")
     assert "n" not in captured  # redo_last never called on a parse error

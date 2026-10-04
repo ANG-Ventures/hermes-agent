@@ -184,9 +184,11 @@ def test_identical_error_pages_once_then_again_on_state_change(profile_env, monk
     for _ in range(6):
         streaks.append(_tick(job["id"])["error_repeat_streak"])
     assert streaks == [1, 2, 3, 4, 5, 6]
-    # Ticks 1-2 alert as before, tick 3 is the one stuck page, 4-6 are silent.
-    assert len(delivered) == 3, delivered
-    page = delivered[2]
+    # Tick 1 alerts; tick 2 is withheld by the incident reminder cooldown
+    # (cron.failure_repeat_alert_hours, upstream); tick 3 is the one stuck page,
+    # which is an escalation the cooldown must not swallow; 4-6 are silent.
+    assert len(delivered) == 2, delivered
+    page = delivered[1]
     assert "stuck" in page
     assert "disk full on /data" in page  # the cause, untruncated
     assert "Fix:" in page
@@ -195,8 +197,8 @@ def test_identical_error_pages_once_then_again_on_state_change(profile_env, monk
     # State change: a DIFFERENT error alerts again immediately.
     script.write_text('import sys; print("permission denied"); sys.exit(1)\n')
     assert _tick(job["id"])["error_repeat_streak"] == 1
-    assert len(delivered) == 4
-    assert "stuck" not in delivered[3]
+    assert len(delivered) == 3
+    assert "stuck" not in delivered[2]
 
     # Recovery resets the streak; the next failure starts a fresh count.
     script.write_text('print("")\n')
@@ -224,8 +226,9 @@ def test_shared_symlink_escape_page_names_the_cause_and_fix(profile_env, monkeyp
     for _ in range(4):
         _tick(job["id"])
 
-    assert len(delivered) == 3
-    page = delivered[2]
+    # Tick 1 alerts, tick 2 sits in the reminder cooldown, tick 3 is the stuck page.
+    assert len(delivered) == 2
+    page = delivered[1]
     assert "resolves outside the scripts directory" in page
     assert "shared" in page and "scripts/" in page
 

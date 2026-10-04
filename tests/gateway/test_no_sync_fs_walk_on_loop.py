@@ -49,7 +49,13 @@ from tests.gateway.test_no_sync_syscalls_on_event_loop import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-SCANNED_FILES = ("gateway/run.py", "gateway/slash_commands.py")
+# Upstream (parity 2026-10-01) split both god-files into mixin modules composing ONE class
+# (gateway/run_*.py -> GatewayRunner, gateway/slash_commands_*.py -> GatewaySlashCommandsMixin).
+# Each family is scanned as one unit so the same-module call graph still sees a coroutine in
+# run_turn.py calling a sync helper defined in run.py (or vice versa). Offender keys carry the
+# file the coroutine actually lives in.
+SCANNED_FAMILIES = (("gateway/run.py", "run_*.py"), ("gateway/slash_commands.py", "slash_commands_*.py"))
+_RUNNER_CLASSES = frozenset({"GatewayRunner", "GatewaySlashCommandsMixin"})
 
 _WALK_ATTRS = frozenset({"rglob", "glob", "iglob"})
 _READ_ATTRS = frozenset({"read_text", "read_bytes"})
@@ -60,16 +66,20 @@ _READ_ATTRS = frozenset({"read_text", "read_bytes"})
 # one small state file. To fix one: offload it, then lower/delete its count
 # here (a stale count fails).
 READ_BASELINE = {
+    # Re-keyed 2026-10-02 (parity sync 2026-10-01, CI6-M1-gatewayb): upstream split run.py into
+    # run_*.py, so the (file, coroutine) keys moved; counts are the same sites. Net 12 -> 10:
+    # two of _stop_impl_body's three reads left the loop in upstream's shutdown split, and the
+    # upstream-new _replay_pending_planned_restart_notification read was offloaded here.
     # via one-hop sync helpers (breadcrumb / resume-pending / stuck-loop state files)
-    "gateway/run.py _handle_message_with_agent_admitted -> read:.read_text": 1,
-    "gateway/run.py _stop_impl_body -> read:.read_text": 3,
-    "gateway/run.py start -> read:.read_text": 1,
+    "gateway/run_turn.py _handle_message_with_agent_admitted -> read:.read_text": 1,
+    "gateway/run_shutdown.py _stop_persist_exit_state -> read:.read_text": 1,
+    "gateway/run_startup.py _start_recover_previous_run -> read:.read_text": 1,
     "gateway/slash_commands.py _handle_reset_command -> read:.read_text": 1,
     # direct
-    "gateway/run.py _watch_update_progress -> read:.read_text": 3,
-    "gateway/run.py _send_update_notification -> read:.read_text": 2,
-    "gateway/run.py _send_update_notification -> read:.read_bytes": 1,
-    "gateway/run.py _send_restart_notification -> read:.read_text": 1,
+    "gateway/run_notifications.py _watch_update_progress -> read:.read_text": 3,
+    "gateway/run_notifications.py _send_update_notification -> read:.read_text": 2,
+    "gateway/run_notifications.py _send_update_notification -> read:.read_bytes": 1,
+    "gateway/run_notifications.py _send_restart_notification -> read:.read_text": 1,
 }
 
 
@@ -111,24 +121,32 @@ def _callee_key(call: ast.Call, cls: str | None) -> str | None:
     return None
 
 
-def _walkers(tree: ast.Module) -> dict[str, str]:
-    """Map helper key -> worst shape label ("walk:*" beats "read:*")."""
-    sync: dict[str, tuple[ast.FunctionDef, str | None]] = {}
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef):
-            sync[node.name] = (node, None)
-        elif isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef):
-                    sync[f"{node.name}.{item.name}"] = (item, node.name)
+def _class_key(name: str) -> str:
+    """``*Mixin`` classes composing the runner collapse onto one namespace so ``self.<name>``
+    resolves across the split modules (a mixin method is a GatewayRunner method at runtime)."""
+    return "GatewayRunner" if name.endswith("Mixin") or name in _RUNNER_CLASSES else name
+
+
+def _walkers(trees: list[tuple[ast.Module, list[str]]]) -> dict[str, str]:
+    """Map helper key -> worst shape label ("walk:*" beats "read:*") over a module family."""
+    sync: dict[str, tuple[ast.FunctionDef, str | None, list[str]]] = {}
+    for tree, lines in trees:
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                sync[node.name] = (node, None, lines)
+            elif isinstance(node, ast.ClassDef):
+                cls = _class_key(node.name)
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        sync[f"{cls}.{item.name}"] = (item, cls, lines)
     labels: dict[str, str] = {}
     changed = True
     while changed:
         changed = False
-        for key, (fn, cls) in sync.items():
+        for key, (fn, cls, lines) in sync.items():
             best = labels.get(key)
             for call in _body_calls(fn):
-                if _noqa_exempt(_LINES[call.lineno - 1]):
+                if _noqa_exempt(lines[call.lineno - 1]):
                     continue
                 lab = _shape(call)
                 if lab is None:
@@ -143,38 +161,41 @@ def _walkers(tree: ast.Module) -> dict[str, str]:
     return labels
 
 
-_LINES: list[str] = []
-
-
 def _offenders(path: Path, rel: str) -> list[str]:
-    global _LINES
-    src = path.read_text(encoding="utf-8")
-    _LINES = src.splitlines()
-    tree = ast.parse(src)
-    walkers = _walkers(tree)
+    """Single-file form (the mutation arm uses it)."""
+    return _family_offenders([(path, rel)])
+
+
+def _family_offenders(files: list[tuple[Path, str]]) -> list[str]:
+    parsed: list[tuple[str, ast.Module, list[str]]] = []
+    for path, rel in files:
+        src = path.read_text(encoding="utf-8")
+        parsed.append((rel, ast.parse(src), src.splitlines()))
+    walkers = _walkers([(tree, lines) for _rel, tree, lines in parsed])
     found: list[str] = []
 
-    def scan(fn: ast.AsyncFunctionDef, cls: str | None) -> None:
+    def scan(rel: str, lines: list[str], fn: ast.AsyncFunctionDef, cls: str | None) -> None:
         for call in _iter_loop_calls(fn):
             lab = _shape(call)
             if lab is None:
                 callee = _callee_key(call, cls)
                 if callee in walkers:
                     lab = walkers[callee].split(" via ")[0] + f" via {callee}"
-            if lab and not _noqa_exempt(_LINES[call.lineno - 1]):
+            if lab and not _noqa_exempt(lines[call.lineno - 1]):
                 found.append(f"{rel}:{call.lineno} {fn.name} -> {lab}")
 
-    def visit(node: ast.AST, cls: str | None) -> None:
+    def visit(rel: str, lines: list[str], node: ast.AST, cls: str | None) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ClassDef):
-                visit(child, child.name)
+                visit(rel, lines, child, _class_key(child.name))
             elif isinstance(child, ast.AsyncFunctionDef):
-                scan(child, cls)
-                visit(child, cls)
+                scan(rel, lines, child, cls)
+                visit(rel, lines, child, cls)
             else:
-                visit(child, cls)
+                visit(rel, lines, child, cls)
 
-    visit(tree, None)
+    for rel, tree, lines in parsed:
+        visit(rel, lines, tree, None)
     return found
 
 
@@ -183,10 +204,16 @@ def _key(offender: str) -> str:
     return key.split(" via ")[0]
 
 
+def _family_files(anchor: str, sibling_glob: str) -> list[tuple[Path, str]]:
+    anchor_path = ROOT / anchor
+    siblings = sorted(anchor_path.parent.glob(sibling_glob))
+    return [(anchor_path, anchor)] + [(p, p.relative_to(ROOT).as_posix()) for p in siblings]
+
+
 def _all_offenders() -> list[str]:
     out: list[str] = []
-    for rel in SCANNED_FILES:
-        out.extend(_offenders(ROOT / rel, rel))
+    for anchor, sibling_glob in SCANNED_FAMILIES:
+        out.extend(_family_offenders(_family_files(anchor, sibling_glob)))
     return out
 
 
@@ -240,6 +267,8 @@ def test_gate_catches_the_2026_09_24_shape(tmp_path):
 
 
 def test_gate_is_not_vacuous():
-    src = (ROOT / "gateway" / "run.py").read_text(encoding="utf-8")
-    n = sum(isinstance(n, ast.AsyncFunctionDef) for n in ast.walk(ast.parse(src)))
+    n = 0
+    for path, _rel in _family_files(*SCANNED_FAMILIES[0]):
+        src = path.read_text(encoding="utf-8")
+        n += sum(isinstance(n_, ast.AsyncFunctionDef) for n_ in ast.walk(ast.parse(src)))
     assert n >= 200, n

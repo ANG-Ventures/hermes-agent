@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_overlap as kov
 
 FIXTURE = Path(__file__).parent / "fixtures" / "kanban_overlap_0930.json"
@@ -155,15 +156,15 @@ def test_dispatcher_holds_newer_card_10_min_then_releases(
         born = CARDS["t_d979a494"]["created_at"]
 
         clock["now"] = born + 60
-        assert kb.check_respawn_guard(conn, newer) == "overlap_hold"
-        assert kb.check_respawn_guard(conn, older) is None
-        result = kb.dispatch_once(conn, dry_run=True)
+        assert kbd.check_respawn_guard(conn, newer) == "overlap_hold"
+        assert kbd.check_respawn_guard(conn, older) is None
+        result = kbd.dispatch_once(conn, dry_run=True)
         assert (newer, "overlap_hold") in result.respawn_guarded
         assert newer not in [s[0] for s in result.spawned]
         assert older in [s[0] for s in result.spawned]
 
         clock["now"] = born + kov.OVERLAP_HOLD_SECONDS
-        assert kb.check_respawn_guard(conn, newer) != "overlap_hold"
+        assert kbd.check_respawn_guard(conn, newer) != "overlap_hold"
 
 
 def test_operator_requeue_releases_the_hold_early(kanban_home, clock):
@@ -171,10 +172,10 @@ def test_operator_requeue_releases_the_hold_early(kanban_home, clock):
         ids = _replay(conn, clock, ["t_f1437191", "t_d979a494"])
         newer = ids["t_d979a494"]
         clock["now"] = CARDS["t_d979a494"]["created_at"] + 30
-        assert kb.check_respawn_guard(conn, newer) == "overlap_hold"
+        assert kbd.check_respawn_guard(conn, newer) == "overlap_hold"
         with kb.write_txn(conn):
             kb._append_event(conn, newer, "requeued", {"by": "apollo"})
-        assert kb.check_respawn_guard(conn, newer) != "overlap_hold"
+        assert kbd.check_respawn_guard(conn, newer) != "overlap_hold"
 
 
 def test_later_overlap_on_a_held_card_does_not_release_its_hold(kanban_home, clock):
@@ -186,7 +187,7 @@ def test_later_overlap_on_a_held_card_does_not_release_its_hold(kanban_home, clo
         held = ids["t_d979a494"]
         born = CARDS["t_d979a494"]["created_at"]
         clock["now"] = born + 60
-        assert kb.check_respawn_guard(conn, held) == "overlap_hold"
+        assert kbd.check_respawn_guard(conn, held) == "overlap_hold"
 
         card = CARDS["t_f1437191"]
         clock["now"] = born + 120
@@ -205,11 +206,11 @@ def test_later_overlap_on_a_held_card_does_not_release_its_hold(kanban_home, clo
 
         clock["now"] = born + 180
         assert kov.overlap_hold_until(conn, held, ("requeued",)) == born + kov.OVERLAP_HOLD_SECONDS
-        assert kb.check_respawn_guard(conn, held) == "overlap_hold"
+        assert kbd.check_respawn_guard(conn, held) == "overlap_hold"
         # Requeue after the hold still releases it early.
         with kb.write_txn(conn):
             kb._append_event(conn, held, "requeued", {"by": "apollo"})
-        assert kb.check_respawn_guard(conn, held) != "overlap_hold"
+        assert kbd.check_respawn_guard(conn, held) != "overlap_hold"
 
 
 def test_score_pair_features_on_the_live_rows():

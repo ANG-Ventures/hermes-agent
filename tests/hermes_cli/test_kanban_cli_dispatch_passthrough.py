@@ -47,6 +47,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     unreachable from the CLI even though it works from the gateway."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     # Configure max_in_progress in the loaded config.
     fake_config = {
@@ -67,7 +68,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
         captured.update(kwargs)
         return kanban_db.DispatchResult()
 
-    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
 
     args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
     kb_cli._cmd_dispatch(args)
@@ -89,13 +90,14 @@ def test_cli_max_flag_is_additive_and_max_running_overrides_config(isolated_kanb
     "stop once 6 are running")."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     fake_config = {"kanban": {"max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
 
     captured = {}
     monkeypatch.setattr(
-        kanban_db, "dispatch_once",
+        kbd, "dispatch_once",
         lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
     )
 
@@ -118,12 +120,13 @@ def test_cli_dispatch_json_surfaces_respawn_guarded(
 ):
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
     result = kanban_db.DispatchResult(
         respawn_guarded=[("t_open", "active_pr")],
     )
-    monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kwargs: result)
+    monkeypatch.setattr(kbd, "dispatch_once", lambda conn, **kwargs: result)
 
     args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=True)
     assert kb_cli._cmd_dispatch(args) == 0

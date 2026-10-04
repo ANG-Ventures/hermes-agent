@@ -10,7 +10,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+# parity 2026-10-01: the turn body (TurnRunner.run_sync) lives in gateway/run_turn_runner.py.
+RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run_turn_runner.py"
 
 
 def _consume_calls(tree: ast.AST):

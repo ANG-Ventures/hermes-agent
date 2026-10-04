@@ -113,7 +113,7 @@ def test_retry_exhaustion_runs_real_loop_and_renders_honest_notice(message, labe
         patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda model, provider: model),
         patch("agent.model_metadata.get_model_context_length", return_value=200000),
         patch("hermes_cli.config.read_raw_config", return_value={"model": {"announce_route_change": True}}),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
     ):
         result = agent.run_conversation("hello")
 
@@ -129,9 +129,13 @@ def test_retry_exhaustion_runs_real_loop_and_renders_honest_notice(message, labe
 def test_loop_threads_display_separately_from_routing():
     """The production caller must supply the label, not just the unit test."""
     root = Path(__file__).resolve().parents[2]
-    tree = ast.parse((root / "agent/conversation_loop.py").read_text())
+    # Upstream split the loop's error handling into turn_api_error / turn_recovery;
+    # every classified-driven fallback call site across them must thread the label.
+    nodes = []
+    for rel in ("agent/turn_api_error.py", "agent/turn_recovery.py"):
+        nodes.extend(ast.walk(ast.parse((root / rel).read_text())))
     matched = 0
-    for node in ast.walk(tree):
+    for node in nodes:
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if node.func.attr != "_try_activate_fallback":

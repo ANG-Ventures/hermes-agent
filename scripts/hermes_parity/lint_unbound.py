@@ -247,7 +247,7 @@ def lint_source(source: str, *, path: str = "<string>") -> list[UnboundIssue]:
 def lint_file(path: Path, *, repo: Path | None = None) -> list[UnboundIssue]:
     label = str(path.relative_to(repo)) if repo and path.is_relative_to(repo) else str(path)
     try:
-        return lint_source(path.read_text(encoding="utf-8"), path=label)
+        return lint_source(path.read_text(encoding="utf-8-sig"), path=label)
     except SyntaxError as exc:
         return [UnboundIssue(path=label, line=exc.lineno or 0, column=exc.offset or 0, name="<syntax>")]
 

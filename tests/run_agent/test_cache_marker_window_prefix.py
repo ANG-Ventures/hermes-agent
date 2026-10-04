@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from agent.tool_dispatch_helpers import make_tool_result_message
 from plugins.blackbox.prefix_guard import compare, fingerprint_request
-from tests.run_agent.test_tool_call_incremental_persistence import (
+from tests.agent.test_tool_call_incremental_persistence import (
     _make_agent,
     _mock_response,
     _mock_tool_call,

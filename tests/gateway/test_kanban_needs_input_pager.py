@@ -170,10 +170,13 @@ def test_dependency_on_blocked_parent_is_config_keyed(kanban_home):
     with kb.connect_closing() as conn:
         parent = _card(conn, body="no origin", priority=10, reason="parent question")
         child = kb.create_task(conn, title="child", body=ORIGIN, priority=150, assignee=None)
-        # a worker parks the card as `dependency` (no open parent yet: sticky
-        # blocked), then the blocking parent is linked in
-        assert kb.block_task(conn, child, reason="waiting", kind="dependency")
+        # A worker parks the card as `dependency` while the blocking parent is
+        # open. Upstream 42a778ab4b re-kinds a `dependency` block with NO open
+        # parent to sticky `needs_input`, so the parent link exists first; the
+        # fixture writes the waiting state directly because linking demotes a
+        # ready card to `todo`, which block_task (running/ready/review) refuses.
         kb.link_tasks(conn, parent, child)
+        conn.execute("UPDATE tasks SET status='todo', block_kind='dependency' WHERE id=?", (child,))
         assert kb.get_task(conn, child).block_kind == "dependency"
         assert kb.needs_input_page_candidates(conn) == []
         got = kb.needs_input_page_candidates(conn, include_dependency=True)

@@ -95,7 +95,7 @@ def _read_client_creds(creds_path: str) -> Optional[Dict[str, str]]:
     path = os.path.expanduser(creds_path or "")
     try:
         out: Dict[str, str] = {}
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

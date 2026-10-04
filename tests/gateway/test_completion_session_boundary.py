@@ -59,6 +59,9 @@ class _SessionDB:
 
 
 def _runner(adapter, *, session_db=...):
+    def admit(event):
+        event._gateway_accepted = True
+    adapter.handle_message.side_effect = admit
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
@@ -303,11 +306,13 @@ def test_async_delegation_gate_unchanged():
     }
     result = asyncio.run(runner._deliver_completion_notification("text", evt))
 
-    # 2026-08 parity merge: the fork's delivery contract returns the outcome
-    # string "dropped" for a terminal verdict (the durable-outbox ack needs
-    # delivered-vs-dropped); upstream's bool contract used None. The invariant
-    # under test — no injection, delegation-owned gate — is unchanged.
-    assert result == "dropped"
+    # 2026-10 parity merge: the delivery contract is upstream's bool/None again
+    # (True = adapter admission, False = retryable, None = deduplicated or
+    # terminal); the terminal drop writes its own durable outbox receipt
+    # (``acknowledge_event_outbox(outcome="dropped")``) inside the pre-flight,
+    # so callers no longer need the fork's "dropped" outcome string. The
+    # invariant under test — no injection, delegation-owned gate — is unchanged.
+    assert result is None
     adapter.handle_message.assert_not_awaited()
 
 
