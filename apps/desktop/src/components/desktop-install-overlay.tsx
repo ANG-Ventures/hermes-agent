@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
@@ -297,9 +297,9 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
   const copy = t.install
 
   const [state, setState] = useState<DesktopBootstrapState>(EMPTY_STATE)
-  // Set by the subscription effect; called by any user-initiated dismissal so
-  // the in-flight initial snapshot cannot overwrite it.
-  const supersedeSnapshotRef = useRef<(() => void) | null>(null)
+  // Hot coordination, never painted: a live event or a user dismissal flips
+  // `superseded` so the in-flight initial snapshot cannot overwrite it.
+  const snapshotGate = useRef({ superseded: false })
   const [logOpen, setLogOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -337,12 +337,14 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
     // snapshot: otherwise a slow getBootstrapState() lands AFTER the user
     // dismissed a failed install and resurrects it (UI tests shard 2/3,
     // "dismisses a failed install on Escape", red under load 2026-10-03).
-    let superseded = false
+    const gate = snapshotGate.current
+
+    gate.superseded = false
 
     desktop
       .getBootstrapState()
       .then(snapshot => {
-        if (!cancelled && !superseded && snapshot) {
+        if (!cancelled && !gate.superseded && snapshot) {
           setState(snapshot)
         }
       })
@@ -352,16 +354,12 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
       })
 
     const off = desktop.onBootstrapEvent(ev => {
-      superseded = true
+      gate.superseded = true
       setState(prev => applyEvent(prev, ev))
     })
-    supersedeSnapshotRef.current = () => {
-      superseded = true
-    }
 
     return () => {
       cancelled = true
-      supersedeSnapshotRef.current = null
       off?.()
     }
   }, [enabled])
@@ -386,14 +384,17 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
   // Escape dismisses a failed install the same way the footer's Close button
   // does -- local-only, no resetBootstrap + reload. Scoped to the failed
   // state so a running install is still only cancellable via its own button.
-  useEffect(() => {
+  // Layout effect: the listener must be attached in the same commit that
+  // paints the failed state, or an Escape pressed the instant it appears is
+  // dropped (a passive effect runs one tick later).
+  useLayoutEffect(() => {
     if (!state.error) {
       return
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        supersedeSnapshotRef.current?.()
+        snapshotGate.current.superseded = true
         setState(EMPTY_STATE)
       }
     }
@@ -751,7 +752,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
               <div className="flex gap-2">
                 <Button
                   onClick={() => {
-                    supersedeSnapshotRef.current?.()
+                    snapshotGate.current.superseded = true
                     setState(EMPTY_STATE)
                   }}
                   size="sm"
