@@ -40,7 +40,7 @@ def kanban_home(tmp_path, monkeypatch):
 def head_at(monkeypatch):
     """PR head commit time served to the guard; None = unknown (no network)."""
     box = {"at": None}
-    monkeypatch.setattr(kpo, "pr_head_committed_at", lambda repo, n: box["at"])
+    monkeypatch.setattr(kpo, "pr_head_committed_at", lambda repo, n, **kw: box["at"])
     return box
 
 
@@ -220,3 +220,41 @@ def test_birth_refusal_override_is_ledgered(kanban_home, head_at):
         ev = [e.payload for e in kb.list_events(conn, tid) if e.kind == "pr_owner_forced"]
         assert ev == [{"owner": owner, "pr": "ang-ventures/hermes-agent#1624",
                        "reason": "Apollo: owner is wedged, take the fold"}]
+
+
+def test_guard_without_detail_holds_a_stale_owner(kanban_home, head_at):
+    """Prism r2: a caller passing no ``detail`` cannot reclaim, so it must not spawn beside the owner."""
+    with kb.connect() as conn:
+        owner = _run_owner(conn, age=3 * 3600)
+        head_at["at"] = int(time.time()) - 3 * 3600
+        tid = kb.create_task(conn, title=f"follow-up on {PR}", assignee="alice")
+        assert kpo.spawn_owners(conn, tid)[0]["stale"] is True
+        assert kb.check_respawn_guard(conn, tid) == kpo.GUARD_REASON
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, tid, detail=detail) is None
+        assert [o["task_id"] for o in detail["pr_owner_stale"]] == [owner]
+
+
+def test_cached_old_head_never_authorizes_reclaim(monkeypatch):
+    """Prism r1+r2: the owner pushed after the memo was filled; the stale verdict re-fetches."""
+    now = int(time.time())
+    pushed = [now - 3 * 3600]
+    calls = []
+
+    def fake_gh(path):
+        calls.append(path)
+        if "/pulls/" in path:
+            return {"head": {"sha": f"sha{len(calls)}"}}
+        return {"commit": {"committer": {"date": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(pushed[0]))}}}
+
+    monkeypatch.setattr(kpo, "_gh_json", fake_gh)
+    monkeypatch.setattr(kpo, "_HEAD_CACHE", {})
+    owner = {"repo": "ang-ventures/hermes-agent", "number": 1624, "since": now - 3 * 3600}
+    assert kpo.owner_is_stale(dict(owner), now=now) is True   # truly stale: confirmed live
+    pushed[0] = now - 60                                       # owner pushes; memo still holds old time
+    assert kpo.owner_is_stale(dict(owner), now=now) is False
+    # a fresh cached time still short-circuits (no extra fetch)
+    n = len(calls)
+    assert kpo.owner_is_stale(dict(owner), now=now) is False
+    assert len(calls) == n

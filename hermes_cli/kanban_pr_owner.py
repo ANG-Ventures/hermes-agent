@@ -188,11 +188,15 @@ def _gh_json(path: str) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
-def pr_head_committed_at(repo: str, number: int) -> Optional[int]:
-    """Epoch of the PR head commit's committer date (REST), memoized 5 min. None = unknown."""
+def pr_head_committed_at(repo: str, number: int, *, refresh: bool = False) -> Optional[int]:
+    """Epoch of the PR head commit's committer date (REST), memoized 5 min. None = unknown.
+
+    ``refresh=True`` bypasses the memo: a cached time may prove an owner fresh,
+    never authorize reclaiming it (the owner may have pushed since).
+    """
     key = (repo.lower(), int(number))
     hit = _HEAD_CACHE.get(key)
-    if hit and time.time() - hit[0] < _HEAD_CACHE_TTL:
+    if not refresh and hit and time.time() - hit[0] < _HEAD_CACHE_TTL:
         return hit[1]
     pr = _gh_json(f"repos/{repo}/pulls/{number}") or {}
     sha = (pr.get("head") or {}).get("sha")
@@ -215,6 +219,9 @@ def owner_is_stale(owner: dict, *, now: Optional[int] = None,
     if owner.get("since") and now - int(owner["since"]) < STALE_OWNER_SECONDS:
         return False
     at = (head_commit_fn or pr_head_committed_at)(owner["repo"], owner["number"])
+    if head_commit_fn is None and at is not None and now - int(at) >= STALE_OWNER_SECONDS:
+        # A stale verdict reclaims a live run: confirm it against GitHub, not the memo.
+        at = pr_head_committed_at(owner["repo"], owner["number"], refresh=True)
     owner["head_committed_at"] = at
     if at is None:
         return False  # cannot tell: no reclaim, no duplicate

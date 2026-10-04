@@ -2865,7 +2865,11 @@ def check_respawn_guard(
                     pr_owner=fresh[0]["pr_owner"], hold=_kpo.describe(fresh[0]),
                 )
             return _kpo.GUARD_REASON
-        if owners and detail is not None:
+        if owners:
+            if detail is None:
+                # No out-param means nobody can reclaim the stale owner:
+                # hold rather than spawn a second writer beside it.
+                return _kpo.GUARD_REASON
             detail["pr_owner_stale"] = owners
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
