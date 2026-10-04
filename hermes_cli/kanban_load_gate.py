@@ -59,6 +59,25 @@ RLIMIT_NPROC: at ``proc_pause_fraction`` (default 0.80) of the limit it is
 below ``proc_resume_fraction`` (default 0.65). An unreadable count or
 limit leaves the gate load-only (fail open).
 
+2026-10-04 (t_010c27d3, KWLB PR A): a two-signal SPILL BAND on top of the
+states above, so the dispatcher can move portable work to pool hosts before
+the Studio pauses (decision doc "Kanban spill off the Studio is two-signal",
+PRD 2026-10-03_kanban-worker-load-balancing section 5.2.1). Four keys,
+``spill_fraction`` / ``cpu_spill`` / ``cpu_spill_resume`` / ``cpu_pause``,
+all default 1.0, which leaves ``admit()`` exactly as before. They are
+validated as a SET (``cpu_spill_resume < cpu_spill <= cpu_pause <= 1``,
+``0 < spill_fraction <= 1``, ``cpu_spill >= cpu_busy_pause``); a violation
+forces all four to 1.0 and sets ``spill_keys_error``, because a partial edit
+would re-open the 0.70-0.80 CPU edge. ``band`` is ``admitting`` /
+``spilling`` / ``paused`` / ``proc_paused``. Spilling is entered at
+``projected >= spill_above`` OR ``cpu >= cpu_spill`` and left only when
+``projected < spill_resume`` AND ``cpu < cpu_spill_resume``; the flag is
+updated on every tick in every state, and a missing CPU sample is an absent
+leg (never enters, always satisfies the exit). While spilling, the local
+allowance is ``min(load allowance against spill_above, CPU allowance against
+cpu_pause)`` (option D). ``cpu >= cpu_pause`` is the CPU twin of the hard
+pause. ``cpu_headroom`` keeps its own allowance and is a ``spilling`` row.
+
 ``kanban.max_spawn`` stays the hard concurrency ceiling; this gate is the
 governor that decides how fast the host is allowed to approach it.
 
@@ -69,12 +88,15 @@ each tick, then ``record_spawns(n, now=)`` with what was actually spawned.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_WORKER_LOAD_COST = 2.0
 DEFAULT_WORKER_LOAD_COST_MIN = 0.5
@@ -89,6 +111,10 @@ SLOPE_MIN_R2 = 0.5
 DEFAULT_MAX_SPAWN_PER_TICK = 4
 DEFAULT_PROC_PAUSE_FRACTION = 0.80
 DEFAULT_PROC_RESUME_FRACTION = 0.65
+# The four spill-band keys. 1.0 for all four = band off (today's gate).
+SPILL_KEYS = ("spill_fraction", "cpu_spill", "cpu_spill_resume", "cpu_pause")
+SPILL_INERT = 1.0
+SPILL_KEYS_WARN_INTERVAL_SECONDS = 300.0
 SUMMARY_INTERVAL_SECONDS = 300.0
 STATE_FILENAME = "load_gate.json"
 
@@ -99,6 +125,44 @@ def _num(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return float(default)
     return f if f > 0 else float(default)
+
+
+def _spill_keys(
+    cfg: dict, cpu_busy_pause: float
+) -> "tuple[dict[str, float], Optional[str]]":
+    """Validate the four spill keys as one set (PRD D-2c).
+
+    Returns ``(values, error)``. All four absent (or all 1.0) is the inert
+    set with no error. A present key that is not a number in (0, 1], or any
+    ordering violation, refuses the WHOLE set: every key 1.0 plus the rule
+    that failed.
+    """
+    inert = {k: SPILL_INERT for k in SPILL_KEYS}
+    present = [k for k in SPILL_KEYS if cfg.get(k) is not None]
+    if not present:
+        return inert, None
+    vals = dict(inert)
+    for k in present:
+        try:
+            v = float(cfg.get(k))
+        except (TypeError, ValueError):
+            return inert, f"{k}={cfg.get(k)!r} is not a number"
+        if not (0.0 < v <= 1.0):  # also refuses NaN
+            return inert, f"{k}={v:g} is outside (0, 1]"
+        vals[k] = v
+    if all(v == SPILL_INERT for v in vals.values()):
+        return inert, None
+    sr, sp, cp = vals["cpu_spill_resume"], vals["cpu_spill"], vals["cpu_pause"]
+    if not (sr < sp <= cp <= 1.0):
+        return inert, (
+            f"need cpu_spill_resume < cpu_spill <= cpu_pause <= 1, got "
+            f"{sr:g} / {sp:g} / {cp:g}"
+        )
+    if sp < cpu_busy_pause:
+        return inert, (
+            f"need cpu_spill >= cpu_busy_pause, got {sp:g} < {cpu_busy_pause:g}"
+        )
+    return vals, None
 
 
 def _pos_int(value: Any, default: int) -> int:
@@ -159,6 +223,29 @@ class LoadGate:
         self.proc_limit_override: Optional[int] = (
             _pos_int(cfg.get("proc_limit"), 1) if cfg.get("proc_limit") else None
         )
+        spill, self.spill_keys_error = _spill_keys(cfg, self.cpu_busy_pause)
+        self.spill_fraction = spill["spill_fraction"]
+        self.cpu_spill = spill["cpu_spill"]
+        self.cpu_spill_resume = spill["cpu_spill_resume"]
+        self.cpu_pause = spill["cpu_pause"]
+        # Band machinery is armed only by a valid, non-inert key set; inert
+        # keeps every admit() output and band derivation at today's.
+        self.spill_armed = any(v != SPILL_INERT for v in spill.values())
+        self.spill_above = self.spill_fraction * self.pause_above
+        self.spill_resume = self.spill_fraction * self.resume_below
+        if self.spill_keys_error:
+            _log.warning(
+                "kanban load gate: spill keys refused as a set: %s",
+                self.spill_keys_error,
+            )
+        self._spill_warned_at: Optional[float] = None
+        self.spilling = False          # hysteresis flag, updated every tick
+        self.band = "admitting"        # admitting|spilling|paused|proc_paused
+        self.spill_reason: Optional[str] = None  # load|cpu|both|unreadable
+        self.remote_allowed = True     # False only in proc_paused
+        # Per-tick pool block for load_gate.json; reset to planless on every
+        # admit() so a previous tick's plan is never republished (RC-8).
+        self.pool: dict = {"planned": False, "reason": "not_needed"}
         self.procs: Optional[int] = None
         self.proc_limit: Optional[int] = None
         self.proc_paused = False
@@ -356,13 +443,16 @@ class LoadGate:
         ``procs`` / ``proc_limit`` (this uid's process count and its limit)
         drive the process-slot pause; either missing = no process gate.
         """
+        self.pool = {"planned": False, "reason": "not_needed"}
         if not self.enabled:
             self.state, self.allowance, self.reason = "disabled", None, None
             self.last_reason = None
+            self.band, self.spill_reason, self.remote_allowed = "admitting", None, True
             return None, None
         try:
             load1 = float(load1)
         except (TypeError, ValueError):
+            self._mark_unreadable()
             return None, None
         now = time.monotonic() if now is None else float(now)
         self.load1 = load1
@@ -384,6 +474,18 @@ class LoadGate:
         hard = self.update(load1, self.load5)
         self.pending_ramp = self.pending(now)
         proc_hard = self.update_procs(procs, proc_limit)
+        projected = load1 + self.pending_ramp
+        # Every tick, every state: leaving paused must land in spilling even
+        # when paused was entered straight from admitting.
+        self._update_spilling(projected)
+        allowance, reason = self._admit_base(now, load1, hard, proc_hard)
+        return self._apply_band(now, load1, projected, allowance, reason)
+
+    def _admit_base(
+        self, now: float, load1: float, hard: Optional[str], proc_hard: Optional[str]
+    ) -> "tuple[int, Optional[str]]":
+        """The pre-band gate: proc pause, load1 pause / CPU headroom, load
+        headroom. With the spill keys inert this IS ``admit()``."""
         if proc_hard:
             self.state, self.allowance, self.last_reason = "proc_paused", 0, proc_hard
             return 0, proc_hard
@@ -393,15 +495,20 @@ class LoadGate:
                 and self.cpu_busy is not None
                 and self.cpu_busy < self.cpu_busy_pause
             ):
-                return self._admit_on_cpu(now, hard)
+                allowance, pending_cpu = self._cpu_allowance(now, self.cpu_busy_pause)
+                self.allowance = allowance
+                self.state = "cpu_headroom"
+                if allowance == 0:
+                    self.last_reason = (
+                        f"{hard}; cpu_busy={self.cpu_busy:.2f} < {self.cpu_busy_pause:.2f} "
+                        f"but pending cpu={pending_cpu:.1f} cores fills the headroom"
+                    )
+                    return 0, self.last_reason
+                self.last_reason = None
+                return allowance, None
             self.state, self.allowance, self.last_reason = "paused", 0, hard
             return 0, hard
-        headroom = self.pause_above - load1 - self.pending_ramp
-        allowance = 0
-        if headroom > 0:
-            allowance = int(math.floor(headroom / self.cost))
-            allowance = max(allowance, self._empty_host_floor(now))
-        allowance = max(0, min(allowance, self.max_spawn_per_tick))
+        allowance = self._load_allowance(now, load1, self.pause_above)
         self.allowance = allowance
         if allowance == 0:
             self.state = "saturated"
@@ -414,6 +521,114 @@ class LoadGate:
             return 0, self.last_reason
         self.state, self.last_reason = "admitting", None
         return allowance, None
+
+    def _mark_unreadable(self) -> None:
+        """Enabled gate, load1 unreadable: ``admit()`` still returns
+        ``(None, None)``; the band tells the tick builder to run local 0
+        (``gate_unreadable``) while the pool's own probes decide remote.
+
+        A held process-slot pause wins: the unreadable paths return before
+        ``update_procs`` runs, so nothing has cleared it and remote stays off.
+        """
+        if self.proc_paused:
+            self.band, self.spill_reason, self.remote_allowed = "proc_paused", None, False
+            self.pool = {"planned": False, "reason": "proc_paused"}
+            return
+        self.band, self.spill_reason, self.remote_allowed = "paused", "unreadable", True
+
+    def _cpu_over(self, bar: float) -> bool:
+        """CPU at/over ``bar``; a missing sample is an absent leg (False)."""
+        return self.spill_armed and self.cpu_busy is not None and self.cpu_busy >= bar
+
+    def _update_spilling(self, projected: float) -> None:
+        if not self.spill_armed:
+            self.spilling = False
+            return
+        cpu = self.cpu_busy
+        if self.spilling:
+            if projected < self.spill_resume and (
+                cpu is None or cpu < self.cpu_spill_resume
+            ):
+                self.spilling = False
+        elif projected >= self.spill_above or (cpu is not None and cpu >= self.cpu_spill):
+            self.spilling = True
+
+    def _apply_band(
+        self,
+        now: float,
+        load1: float,
+        projected: float,
+        allowance: int,
+        reason: Optional[str],
+    ) -> "tuple[int, Optional[str]]":
+        """Derive the band from the gate's FINAL state (PRD 5.2.1, first
+        matching row wins). Only two rows change the local allowance: the
+        CPU twin of the hard pause and the spilling row; both need an armed
+        key set, so inert keys return ``(allowance, reason)`` untouched."""
+        state = self.state
+        self.remote_allowed = state != "proc_paused"
+        if state == "proc_paused":
+            self.band, self.spill_reason = "proc_paused", None
+            self.pool = {"planned": False, "reason": "proc_paused"}
+            return allowance, reason
+        load_over = self.spill_armed and projected >= self.spill_above
+        if state == "paused":
+            self.band = "paused"
+            self.spill_reason = "both" if self._cpu_over(self.cpu_pause) else "load"
+            return allowance, reason
+        if self._cpu_over(self.cpu_pause):
+            self.band = "paused"
+            self.spill_reason = "both" if load_over else "cpu"
+            why = (
+                f"cpu_busy={self.cpu_busy:.2f} >= cpu_pause={self.cpu_pause:.2f} "
+                f"(no new local workers; spill band)"
+            )
+            self.state, self.allowance, self.last_reason = "paused", 0, why
+            return 0, why
+        if state == "cpu_headroom":
+            if not self.spill_armed:
+                self.band, self.spill_reason = "admitting", None
+                return allowance, reason
+            # A spilling row that keeps today's CPU-headroom allowance.
+            self.band = "spilling"
+            self.spill_reason = "both" if self._cpu_over(self.cpu_spill) else "load"
+            return allowance, reason
+        if not self.spilling:
+            self.band, self.spill_reason = "admitting", None
+            return allowance, reason
+        cpu_over = self._cpu_over(self.cpu_spill)
+        if load_over or cpu_over:
+            self.spill_reason = (
+                "both" if load_over and cpu_over else ("load" if load_over else "cpu")
+            )
+        elif self.band != "spilling" or self.spill_reason not in ("load", "cpu", "both"):
+            self.spill_reason = "load"
+        # else: inside the hysteresis gap, keep the edge that opened it.
+        self.band = "spilling"
+        local = self._load_allowance(now, load1, self.spill_above)
+        if self.cpu_busy is not None:
+            local = min(local, self._cpu_allowance(now, self.cpu_pause)[0])
+        self.allowance = local
+        if local == 0:
+            self.state = "saturated"
+            cpu = "?" if self.cpu_busy is None else f"{self.cpu_busy:.2f}"
+            self.last_reason = (
+                f"spilling ({self.spill_reason}): projected load1={projected:.1f} vs "
+                f"spill_above={self.spill_above:.1f}, cpu_busy={cpu} vs "
+                f"cpu_pause={self.cpu_pause:.2f} leave no local worker"
+            )
+            return 0, self.last_reason
+        self.state, self.last_reason = "admitting", None
+        return local, None
+
+    def _load_allowance(self, now: float, load1: float, bar: float) -> int:
+        """floor((bar - load1 - pending_ramp) / cost), empty-host floor, cap."""
+        headroom = bar - load1 - self.pending_ramp
+        allowance = 0
+        if headroom > 0:
+            allowance = int(math.floor(headroom / self.cost))
+            allowance = max(allowance, self._empty_host_floor(now))
+        return max(0, min(allowance, self.max_spawn_per_tick))
 
     def _empty_host_floor(self, now: float) -> int:
         """1 when the host runs no kanban worker and none is ramping, else 0.
@@ -429,25 +644,20 @@ class LoadGate:
             return 1
         return 0
 
-    def _admit_on_cpu(self, now: float, hard: str) -> "tuple[int, Optional[str]]":
-        """load1 is over the bar but the CPU is not: size from CPU headroom."""
+    def _cpu_allowance(self, now: float, bar: float) -> "tuple[int, float]":
+        """``(allowance, pending_cpu)`` sized from CPU headroom under ``bar``.
+
+        One function, two bars: ``cpu_busy_pause`` for the ``cpu_headroom``
+        row (load1 over the bar, CPU not) and ``cpu_pause`` for the spilling
+        row (option D). Needs a CPU sample.
+        """
         pending_cpu = self.invisible_workers(now) * self.worker_cpu_cost
-        headroom = (self.cpu_busy_pause - self.cpu_busy) * self.ncpu - pending_cpu
+        headroom = (bar - self.cpu_busy) * self.ncpu - pending_cpu
         allowance = 0
         if headroom > 0:
             allowance = int(math.floor(headroom / self.worker_cpu_cost))
             allowance = max(allowance, self._empty_host_floor(now))
-        allowance = max(0, min(allowance, self.max_spawn_per_tick))
-        self.allowance = allowance
-        self.state = "cpu_headroom"
-        if allowance == 0:
-            self.last_reason = (
-                f"{hard}; cpu_busy={self.cpu_busy:.2f} < {self.cpu_busy_pause:.2f} "
-                f"but pending cpu={pending_cpu:.1f} cores fills the headroom"
-            )
-            return 0, self.last_reason
-        self.last_reason = None
-        return allowance, None
+        return max(0, min(allowance, self.max_spawn_per_tick)), pending_cpu
 
     def record_spawns(self, n: int, now: Optional[float] = None) -> None:
         """Book ``n`` workers actually spawned this tick into the ramp window."""
@@ -473,6 +683,9 @@ class LoadGate:
         """
         load1, load5 = sample_loadavg()
         if load1 is None:
+            self.pool = {"planned": False, "reason": "not_needed"}
+            if self.enabled:
+                self._mark_unreadable()
             return None, None
         busy, self._cpu_prev = sample_cpu_busy(self._cpu_prev, block=cpu_block)
         procs, proc_limit = sample_user_procs() if self.enabled else (None, None)
@@ -524,6 +737,17 @@ class LoadGate:
             "proc_pause_fraction": self.proc_pause_fraction,
             "ncpu": self.ncpu,
             "boards": self.boards,
+            "band": self.band,
+            "spill_reason": self.spill_reason,
+            "spilling": self.spilling,
+            "remote_allowed": self.remote_allowed,
+            "spill_above": self.spill_above,
+            "spill_resume": self.spill_resume,
+            "cpu_spill": self.cpu_spill,
+            "cpu_spill_resume": self.cpu_spill_resume,
+            "cpu_pause": self.cpu_pause,
+            "spill_keys_error": self.spill_keys_error,
+            "pool": self.pool,
             "updated_at": time.time(),
         }
 
@@ -538,7 +762,8 @@ class LoadGate:
             f"running={'?' if self.running is None else self.running} "
             f"cpu_busy={'?' if self.cpu_busy is None else f'{self.cpu_busy:.2f}'} "
             f"procs={'?' if self.procs is None else self.procs}"
-            f"/{'?' if not self.proc_limit else self.proc_limit}"
+            f"/{'?' if not self.proc_limit else self.proc_limit} "
+            f"band={self.band}/{self.spill_reason or '-'}"
         )
 
     def log_tick(self, logger, now: Optional[float] = None) -> None:
@@ -546,6 +771,15 @@ class LoadGate:
         if not self.enabled:
             return
         now = time.monotonic() if now is None else float(now)
+        if self.spill_keys_error and (
+            self._spill_warned_at is None
+            or now - self._spill_warned_at >= SPILL_KEYS_WARN_INTERVAL_SECONDS
+        ):
+            logger.warning(
+                "kanban load gate: spill keys refused as a set: %s",
+                self.spill_keys_error,
+            )
+            self._spill_warned_at = now
         if self.state != self._last_logged_state:
             level = logger.warning if self.state == "paused" else logger.info
             if self.state == "proc_paused":
@@ -797,5 +1031,6 @@ def format_state_line(state: Optional[dict], now: Optional[float] = None) -> str
         f"pause_above={state.get('pause_above')} "
         f"max_spawn_per_tick={state.get('max_spawn_per_tick')} "
         f"procs={state.get('procs')}/{state.get('proc_limit')} "
+        f"band={state.get('band')}/{state.get('spill_reason') or '-'} "
         f"(updated {age:.0f}s ago)"
     )

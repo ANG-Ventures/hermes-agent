@@ -478,6 +478,40 @@ def test_lint_manifest_requires_upstream_ref_for_absorbed_entry(tmp_path: Path) 
     assert any("absorbed" in error and "requires upstream_ref" in error for error in result.errors)
 
 
+def test_lint_manifest_refuses_call_site_without_e2e_test(tmp_path: Path) -> None:
+    """D2b (t_96049446): a declared call site with no e2e test fails the whole lint, by name."""
+    entry = _schema_feature("footer fork kwargs", "fork-permanent")
+    entry["call_site"] = "gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line"
+    _write_fork_manifest(tmp_path, [entry])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any(
+        "footer fork kwargs" in error and "_hmwa_runtime_footer_line" in error and "D2b" in error
+        for error in result.errors
+    ), result.errors
+
+
+def test_lint_call_sites_e2e_test_must_be_a_registered_test(tmp_path: Path) -> None:
+    entry = _schema_feature("footer fork kwargs", "fork-permanent")
+    entry["call_site"] = "gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line"
+    entry["call_site_tests"] = ["tests/gateway/test_x.py::test_render"]
+    manifest = _write_fork_manifest(tmp_path, [entry])
+
+    assert any("not in its tests list" in e for e in lint_manifest.lint_call_sites(manifest))
+
+    entry["tests"] = ["tests/gateway/test_x.py::test_render"]
+    manifest.write_text(json.dumps([entry]), encoding="utf-8")
+    assert lint_manifest.lint_call_sites(manifest) == []
+
+
+def test_lint_call_sites_ignores_entries_without_call_site(tmp_path: Path) -> None:
+    manifest = _write_fork_manifest(tmp_path, [_schema_feature("pure helper", "fork-permanent")])
+
+    assert lint_manifest.lint_call_sites(manifest) == []
+
+
 def _census_feature(verdict: str, evidence: str, residual: list[str] | None = None) -> dict[str, object]:
     feature = _schema_feature("census feature", "upstream-intended")
     census: dict[str, object] = {"verdict": verdict, "evidence": evidence}

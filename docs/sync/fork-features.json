@@ -128,6 +128,7 @@
   },
   {
     "feature": "cron scheduler per-job reasoning and script timeout helpers",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/cron/test_cron_script.py::TestRunJobScript",
       "tests/cron/test_per_job_reasoning_effort.py::TestResolution",
@@ -149,6 +150,7 @@
   },
   {
     "feature": "relay-pool session affinity and lane headers",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/agent/test_pool_affinity_header.py",
       "tests/fork_canaries/test_fork_canary_relay_lane_headers.py"
@@ -191,6 +193,7 @@
   },
   {
     "feature": "gateway restart policy, config bridge, and initiator breadcrumb helpers",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/gateway/test_fork_ext_restart_policy.py",
       "tests/gateway/test_restart_cascade.py",
@@ -389,6 +392,7 @@
   },
   {
     "feature": "discord free-response channels: scalar coercion + quoted-bot-mention exemption",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/fork_canaries/test_fork_canary_discord_free_response.py"
     ],
@@ -408,6 +412,7 @@
   },
   {
     "feature": "telegram intake sentinel makes silent inbound update drops visible",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/gateway/test_telegram_intake_sentinel.py",
       "tests/fork_canaries/test_fork_canary_telegram_intake_sentinel.py"
@@ -472,8 +477,41 @@
       "tests/gateway/test_footer_consumer_in_turn.py::test_rendered_footer_leads_with_provider_model",
       "tests/gateway/test_footer_consumer_in_turn.py::test_consumer_passes_provider_from_turn_result",
       "tests/gateway/test_footer_consumer_in_turn.py::test_consumer_kwargs_are_superset_of_pre_split_fork_call",
-      "tests/gateway/test_footer_provider_in_turn_result.py"
+      "tests/gateway/test_footer_provider_in_turn_result.py",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens_wrong_field_shows_precompaction",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_session_key_and_source",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_session_key",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_source"
     ],
+    "call_site": "gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line",
+    "call_site_tests": [
+      "tests/gateway/test_footer_consumer_in_turn.py::test_rendered_footer_leads_with_provider_model",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens_wrong_field_shows_precompaction",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_session_key_and_source",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_session_key",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_source"
+    ],
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "paths": [
       "gateway/runtime_footer.py",
       "gateway/run_turn.py",
