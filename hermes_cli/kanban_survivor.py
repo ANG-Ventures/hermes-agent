@@ -859,7 +859,7 @@ def _fetched_from_remote(path, sha):
     urls = _git(path, "config", "--get-regexp", r"^remote\..*\.url$", check=False)
     remotes = {_url_key(line.split(" ", 1)[1])
                for line in urls.stdout.decode("utf-8", "replace").splitlines() if " " in line}
-    for line in fetch_head.read_text("utf-8", "replace").splitlines():
+    for line in fetch_head.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         tip, _, rest = line.partition("\t")
         _, _, source = rest.rpartition(" of ")
         if not source or _url_key(source) not in remotes:
