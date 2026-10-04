@@ -668,3 +668,5 @@ export async function renderedTranscript(page: Page): Promise<{ bubbles: Rendere
     return { bubbles, fullText: (viewport as HTMLElement).innerText.replace(/\s+/g, ' ') }
   })
 }
+
+// ci-proof t_bf20260d (throwaway, never merged)
