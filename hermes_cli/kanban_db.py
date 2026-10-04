@@ -7584,7 +7584,16 @@ def _carry_run_counters(conn: sqlite3.Connection, run_id: int, metadata: Optiona
     if not isinstance(prior, dict) or key not in prior:
         return metadata
     merged = dict(metadata or {})
-    merged.setdefault(key, prior[key])
+    try:
+        stored = int(prior[key])
+    except (TypeError, ValueError):
+        return merged if key in merged else {**merged, key: prior[key]}
+    try:
+        incoming = int(merged[key]) if key in merged else None
+    except (TypeError, ValueError):
+        incoming = None
+    # keep_max: a counter never goes down through the close (Prism 94214e112dc1).
+    merged[key] = stored if incoming is None else max(stored, incoming)
     return merged
 
 

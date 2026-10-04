@@ -131,9 +131,16 @@ def reapply_placement_env(environ: Optional[MutableMapping[str, str]] = None) ->
         return None
     if not isinstance(values, dict):
         return None
+    pending = {}
     for key, value in values.items():
-        if isinstance(key, str) and key.startswith("TERMINAL_") and isinstance(value, str):
-            env[key] = value
+        if not (isinstance(key, str) and key.startswith("TERMINAL_")):
+            continue
+        if not isinstance(value, str):
+            # A malformed placement is NOT applied: returning the host here
+            # would read as success to reapply_or_record (Prism 361860f7dee5).
+            return None
+        pending[key] = value
+    env.update(pending)
     return str(data.get("host") or "") or None
 
 

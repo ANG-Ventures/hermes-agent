@@ -129,6 +129,41 @@ def test_rc9_reapply_table_after_boot_capture(reapply_state, monkeypatch):
     assert kwh.reapply_failures() == 2 and reapply_state == [1, 2]
 
 
+def test_r6_malformed_placement_counts_as_a_failure(reapply_state, caplog):
+    """Prism 361860f7dee5: a placement whose TERMINAL_* value is not a str is
+    NOT applied, and reapply_or_record must count it, not report the host."""
+    caplog.set_level(logging.WARNING, logger=kwh.__name__)
+    environ: dict = {}
+    kwh.apply_placement(environ, HOST, "/tmp/ws")
+    data = json.loads(environ[kwh.PLACEMENT_ENV])
+    data["env"]["TERMINAL_CWD"] = 7
+    environ[kwh.PLACEMENT_ENV] = json.dumps(data)
+    fresh: dict = {kwh.PLACEMENT_ENV: environ[kwh.PLACEMENT_ENV]}
+    assert kwh.reapply_placement_env(fresh) is None
+    assert "TERMINAL_ENV" not in fresh            # nothing partially applied
+    assert kwh.reapply_or_record("terminal", environ, boot_host="ace-ai") is None
+    assert reapply_state == [1]
+
+
+def test_r6_close_never_lowers_the_reapply_counter(tmp_path, monkeypatch):
+    """Prism 94214e112dc1: _carry_run_counters keeps max(stored, incoming)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alpha")
+        run_id = kb.claim_task(conn, tid).current_run_id
+        kb.merge_run_metadata(conn, run_id, {kwh.REAPPLY_FAILED_KEY: 5})
+        low = kb._carry_run_counters(conn, run_id, {kwh.REAPPLY_FAILED_KEY: 2, "x": 1})
+        absent = kb._carry_run_counters(conn, run_id, {"x": 1})
+        high = kb._carry_run_counters(conn, run_id, {kwh.REAPPLY_FAILED_KEY: 9})
+    assert low[kwh.REAPPLY_FAILED_KEY] == 5 and low["x"] == 1
+    assert absent[kwh.REAPPLY_FAILED_KEY] == 5
+    assert high[kwh.REAPPLY_FAILED_KEY] == 9
+
+
 def test_unreadable_local_workspace_fails_closed(tmp_path, monkeypatch):
     assert kwh.local_workspace_has_content(None) is False
     assert kwh.local_workspace_has_content(str(tmp_path / "missing")) is False
