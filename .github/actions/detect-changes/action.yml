@@ -42,6 +42,11 @@ outputs:
   e2e_desktop_update:
     description: Run the Desktop install/update Electron suite (apps/desktop/e2e/update).
     value: ${{ steps.classify.outputs.e2e_desktop_update }}
+  desktop:
+    description: >-
+      The diff touches apps/desktop/. ci.yaml ANDs it with vars.CI_DESKTOP_JOBS
+      (default off) for every Electron-app job.
+    value: ${{ steps.classify.outputs.desktop }}
   site:
     description: Build the Docusaurus docs site.
     value: ${{ steps.classify.outputs.site }}
