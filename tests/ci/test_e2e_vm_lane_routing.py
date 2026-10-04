@@ -40,10 +40,17 @@ GATE_CASES = [
 ]
 
 
+REPO = "ANG-Ventures/hermes-agent"
+
+
 def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=None,
-            shard="core/test_install_fresh"):
+            shard="core/test_install_fresh", head_repo=REPO):
     ctx = _ctx(event, copy.deepcopy(PLACEMENT_OUTCOMES[placement]), labels)
     ctx["matrix"] = {"shard": shard}
+    ctx.setdefault("github", {})["repository"] = REPO
+    ctx["github"]["event_name"] = event
+    ctx["github"]["event"] = {"pull_request": {"head": {"repo": {"full_name": head_repo}}}} \
+        if event == "pull_request" else {}
     ctx["vars"]["CI_E2E_VM_ENABLED"] = enabled
     ctx["vars"]["CI_E2E_VM_ROUTE"] = route
     ctx["vars"]["CI_E2E_RUNNER"] = e2e_runner
@@ -51,11 +58,26 @@ def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=
 
 
 @pytest.mark.parametrize("enabled,route,vm", GATE_CASES)
-@pytest.mark.parametrize("event", ["pull_request", "push", "workflow_dispatch", "merge_group"])
+@pytest.mark.parametrize("event", ["pull_request", "push", "merge_group"])
 def test_e2e_routes_to_vm_only_when_switch_and_gate_agree(event, enabled, route, vm):
     expr = _tests_yml()["jobs"]["e2e"]["runs-on"]
     got = evaluate(expr, _vm_ctx(event, enabled, route), STATUS)
     assert got == (VM if vm else [BLACKSMITH])
+
+
+@pytest.mark.parametrize("job", ["e2e", "e2e-upgrade"])
+@pytest.mark.parametrize("event,head_repo", [
+    ("pull_request", "someone-else/hermes-agent"),    # fork PR: untrusted code
+    ("pull_request", None),                             # head repo deleted
+    ("workflow_dispatch", REPO),                         # not in the trust list
+    ("schedule", REPO),
+])
+def test_untrusted_events_never_reach_the_vm_class(job, event, head_repo):
+    # Prism P0 (hermes-agent#1689): the class runs seccomp/AppArmor-unconfined on our hosts;
+    # fork PRs must never leave GitHub/Blacksmith (same rule as CI_BLACKSMITH_SLICES).
+    expr = _tests_yml()["jobs"][job]["runs-on"]
+    got = evaluate(expr, _vm_ctx(event, "true", "open", head_repo=head_repo), STATUS)
+    assert got not in (VM,) and "ace-e2e-vm" not in json.dumps(got)
 
 
 @pytest.mark.parametrize("enabled,route,vm", GATE_CASES)
