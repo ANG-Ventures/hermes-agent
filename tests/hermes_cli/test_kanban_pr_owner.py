@@ -189,3 +189,23 @@ def test_concurrent_pr_runs_counts_overlapping_pairs(kanban_home, head_at):
         b = _run_owner(conn, title=f"rebase {PR}", age=50)
         pairs = kpo.concurrent_pr_runs(conn, int(time.time()) - 1000)
         assert [(p["first"], p["second"]) for p in pairs] == [(a, b)]
+
+
+def test_bare_title_ref_inherits_the_parents_pr(kanban_home, head_at):
+    """Live 10-03: t_31fb6cad '#1624 residual: ...' ran beside the owner; its parent's handoff named the PR."""
+    with kb.connect() as conn:
+        owner = _run_owner(conn, title="W7-1: upstream parity sync", metadata={"pr_url": URL})
+        parent = kb.create_task(conn, title="#1624 residual: install-e2e", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, metadata) "
+                         "VALUES (?, 'alice', 'review', 1, 2, ?)", (parent, json.dumps({"pr": PR})))
+        child = kb.create_task(conn, title="#1624 residual: Windows E2E", assignee="alice",
+                               parents=[parent])
+        unrelated = kb.create_task(conn, title="#77 something", assignee="alice", parents=[parent])
+        assert kpo.card_pr_targets(conn, child) == {("ang-ventures/hermes-agent", 1624)}
+        assert kpo.card_pr_targets(conn, unrelated) == set()
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
+        assert detail["owner"] == owner

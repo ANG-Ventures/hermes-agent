@@ -100,14 +100,27 @@ def targets_from(title: Optional[str], idempotency_key: Optional[str],
     return out
 
 
-def card_pr_targets(conn: sqlite3.Connection, task_id: str) -> set:
+_BARE_TITLE_RE = re.compile(r"(?<![\w/#])#(\d+)\b")
+
+
+def card_pr_targets(conn: sqlite3.Connection, task_id: str, _depth: int = 0) -> set:
     row = conn.execute("SELECT title, idempotency_key FROM tasks WHERE id = ?",
                        (task_id,)).fetchone()
     if row is None:
         return set()
     metas = [r[0] for r in conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL", (task_id,))]
-    return targets_from(row[0], row[1], metas)
+    out = targets_from(row[0], row[1], metas)
+    # A bare ``#N`` in the title is the parent's PR when a parent card targets
+    # a PR numbered N (live 10-03: t_31fb6cad "#1624 residual: ..." under
+    # t_34200a86, whose handoff names ANG-Ventures/hermes-agent#1624). Only an
+    # exact number match counts; no repo is guessed.
+    bare = {int(n) for n in _BARE_TITLE_RE.findall(row[0] or "")} - {n for _, n in out}
+    if bare and _depth < 3:
+        for (parent,) in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?",
+                                      (task_id,)).fetchall():
+            out.update(t for t in card_pr_targets(conn, parent, _depth + 1) if t[1] in bare)
+    return out
 
 
 def fmt_pr(target: tuple) -> str:
@@ -250,7 +263,7 @@ def pr_cards(conn: sqlite3.Connection, target: tuple) -> list:
         "SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND ("
         "title LIKE ? OR idempotency_key LIKE ? OR id IN (SELECT task_id FROM task_runs "
         "WHERE metadata LIKE ? OR metadata LIKE ?)) ORDER BY created_at, id",
-        (f"%{repo}#{n}%", f"rebase:{repo}#{n}@%", f"%{repo}#{n}%", f"%{repo}/pull/{n}%"),
+        (f"%#{n}%", f"rebase:{repo}#{n}@%", f"%{repo}#{n}%", f"%{repo}/pull/{n}%"),
     ).fetchall()
     return [(r[0], r[1], r[2]) for r in rows if target in card_pr_targets(conn, r[0])]
 
