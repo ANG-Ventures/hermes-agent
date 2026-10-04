@@ -723,3 +723,147 @@ def test_probe_prior_red_that_never_paged_does_not_suppress(tmp_path, prior_run)
 def test_probe_prior_lookup_is_scoped_to_default_branch(tmp_path):
     got = _probe_route(tmp_path, prior=[])
     assert "branch=main" in got["_curl"]
+
+
+
+# --- main still red (t_30d3de38) -----------------------------------------------
+# 2026-10-04: the e2e-upgrade jobs (no pytest annotation, so the fold cannot see
+# them) failed on main 6 times in 4 h and paged 6 times. A default-branch push red
+# whose every failed job/step was already red in its latest earlier main run that
+# RAN it goes to #logs. Path-classified skips are walked past; a pass pages.
+E2E = "Python tests / e2e-upgrade (core/test_upgrade_path)"
+E2E_STEP = "Run upgrade e2e tests (core/test_upgrade_path)"
+
+
+def _main_jobs(*jobs):
+    """jobs: (name, conclusion, {step: conclusion})"""
+    return {"jobs": [{"id": 700 + i, "name": n, "conclusion": c,
+                      "steps": [{"name": s, "conclusion": sc} for s, sc in steps.items()]}
+                     for i, (n, c, steps) in enumerate(jobs)]
+            + [{"id": 1, "name": "All required checks pass", "conclusion": "failure", "steps": []}]}
+
+
+def _red_e2e():
+    return _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "failure"}))
+
+
+def _main_api(history, *, current=None):
+    """history: newest first, (run_id, created_at, conclusion, jobs)."""
+    api = {"actions/runs/42/jobs": current or _red_e2e(),
+           "runs?branch=main&event=push": {"workflow_runs": [
+               {"id": rid, "created_at": ts, "conclusion": c, "head_branch": "main", "event": "push"}
+               for rid, ts, c, _j in history]}}
+    for rid, _ts, _c, jobs in history:
+        if jobs is not None:
+            api[f"actions/runs/{rid}/jobs"] = jobs
+    return api
+
+
+def _main_route(tmp_path, api) -> dict:
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_API_CURL)
+    (bindir / "curl").chmod(0o755)
+    (tmp_path / "api.json").write_text(json.dumps(api))
+    log = tmp_path / "curl.log"
+    log.write_text("")
+    run = {"name": "CI", "workflow_id": 7, "id": 42, "head_sha": "abc", "conclusion": "failure",
+           "head_branch": "main", "event": "push", "created_at": "2026-10-04T05:00:00Z",
+           "html_url": "https://x/42", "actor": {"login": "Kyzcreig"}}
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
+           "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got["_stdout"] = proc.stdout
+    got["_curl"] = log.read_text()
+    return got
+
+
+def test_main_red_already_red_on_previous_main_run_goes_to_logs(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+    # commit order: only runs created before this one are asked for
+    assert "created=%3C%3D2026-10-04T05:00:00Z" in got["_curl"]
+
+
+def test_main_red_after_the_step_passed_on_main_pages(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "passed on main in run 41" in got["_stdout"]
+
+
+def test_main_red_walks_past_runs_that_skipped_the_job(tmp_path):
+    # path-classified CI: a green run that never ran e2e-upgrade proves nothing
+    skipped = _main_jobs((E2E, "skipped", {}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", skipped),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+
+
+def test_main_red_ignores_a_later_created_run(tmp_path):
+    # An OLDER commit's run that finishes after this one is not "main now"; a run
+    # created AFTER this one (listed by the API) must not count either.
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(43, "2026-10-04T06:00:00Z", "success", green),
+                     (41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    assert _main_route(tmp_path, api)["route"] == "logs"
+
+
+def test_main_red_with_a_new_failing_step_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                         ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"}))
+    lint_green = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                            ("Lint (ruff + ty) / ruff", "success", {"ruff": "success"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", lint_green)], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_with_no_proof_in_history_pages(tmp_path):
+    # the first red of an episode: no earlier run failed the step
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "success",
+                                            _main_jobs((E2E, "skipped", {})))]))
+    assert got["route"] == "alerts", got["_stdout"]
+    assert _main_route(tmp_path, _main_api([]))["route"] == "alerts"
+
+
+def test_main_still_red_api_errors_page(tmp_path):
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", None)])  # prior jobs 404
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    del api["runs?branch=main&event=push"]
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    del api["actions/runs/42/jobs"]
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+
+
+def test_main_still_red_never_applies_to_startup_failure(tmp_path):
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_API_CURL)
+    (bindir / "curl").chmod(0o755)
+    (tmp_path / "api.json").write_text(json.dumps(api))
+    run = {"name": "CI", "workflow_id": 7, "id": 42, "head_sha": "abc", "conclusion": "startup_failure",
+           "head_branch": "main", "event": "push", "created_at": "2026-10-04T05:00:00Z",
+           "html_url": "https://x/42", "actor": {"login": "Kyzcreig"}}
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(tmp_path / "c.log"), "FAKE_API": str(tmp_path / "api.json"),
+           "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+    subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60, check=True)
+    assert "route=alerts" in out.read_text()

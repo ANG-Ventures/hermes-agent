@@ -301,6 +301,76 @@ jobs:
               fi
             fi
           fi
+          # MAIN STILL RED (t_30d3de38). A red default-branch push is a standing
+          # condition, not a new fault, when EVERY failed job/step was already red on
+          # main: walking back through the previous completed push runs of this
+          # workflow on the default branch (newest first, up to 10), each item's
+          # latest run in which it actually RAN failed. A job or step that did not
+          # run (path-classified CI skips it) proves nothing, so the walk goes past
+          # it. Order is commit order (created_at), not completion order: a run for
+          # an OLDER commit that finishes after this one says nothing about main now
+          # (2026-10-04 05:35Z: 00702292's green, done 05:32, re-paged a red main).
+          # Such a red goes to #logs (ci-fail-known, which falls back to #alerts
+          # if that POST fails). On 2026-10-04 the e2e-upgrade jobs (no pytest
+          # annotation, so the fold above cannot see them) paged 6 times in 4 h for
+          # one red main. Names are exact ("job / step", no slice stripping): a new
+          # failing job or step pages. A first red, a step that passed in between,
+          # startup_failure and any API error all page.
+          STILL_RED_RUN=""; STILL_SIG=""
+          WF_CREATED="$(f .created_at)"
+          if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = push ] && [ "$WF_CONCLUSION" = failure ] \
+             && [ -n "$WF_ID" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; then
+            # Items = [job, step] of each failed step ([job, ""] if no step failed).
+            ITEMS="$(api "actions/runs/$WF_RUN_ID/jobs?filter=latest&per_page=100" | jq -c '
+              [.jobs[] | select(.conclusion == "failure")
+                | select(.name | test("Tests complete|All required checks") | not)
+                | . as $j | ([.steps[]? | select(.conclusion == "failure") | [$j.name, .name]]
+                  | if length == 0 then [[$j.name, ""]] else . end)[]] | unique')" || ITEMS=error
+            BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
+            PREVS="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}" \
+              | jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
+                [.workflow_runs[] | select(.id != $id)
+                  | select(.conclusion == "success" or .conclusion == "failure")
+                  | select($created == "" or .created_at < $created)]
+                | sort_by(.created_at) | reverse | .[:10][] | .id')" || PREVS=error
+            if [ "$ITEMS" = error ] || [ "$PREVS" = error ] || [ "$ITEMS" = "[]" ]; then
+              echo "::warning::main-still-red: cannot read this run's failed jobs or main's history; paging"
+            else
+              LEFT="$ITEMS"; COVER=""
+              for prev in $PREVS; do
+                # Per item in a prior run: red (that step failed), green (it ran and passed:
+                # main went green, so this is a new red), unknown (job or step did not run,
+                # e.g. path-classified CI skipped it; look further back).
+                ST="$(api "actions/runs/$prev/jobs?filter=latest&per_page=100" | jq -c --argjson items "$LEFT" '
+                  . as $r | [$items[] as [$j, $s]
+                    | ([$r.jobs[] | select(.name == $j)] | first) as $job
+                    | if $job == null or (["success", "failure"] | index($job.conclusion) | not) then "unknown"
+                      elif $s == "" then (if $job.conclusion == "failure" then "red" else "green" end)
+                      else ([$job.steps[]? | select(.name == $s)] | first) as $st
+                        | if $st == null then "unknown"
+                          elif $st.conclusion == "failure" then "red"
+                          elif $st.conclusion == "success" then "green" else "unknown" end
+                      end]')" || { LEFT=error; break; }
+                if jq -e 'index("green")' <<< "$ST" > /dev/null; then
+                  LEFT=green; echo "page: a failed job/step passed on main in run $prev"; break
+                fi
+                NEXT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] != "red") | .value]' <<< "$LEFT")"
+                [ "$NEXT" != "$LEFT" ] && COVER="${COVER:+$COVER,}$prev"
+                LEFT="$NEXT"
+                [ "$LEFT" = "[]" ] && break
+              done
+              case "$LEFT" in
+                "[]")
+                  STILL_RED_RUN="$COVER"
+                  STILL_SIG="$(jq -r 'map(if .[1] == "" then .[0] else "\(.[0]) / \(.[1])" end) | join("; ")' <<< "$ITEMS")"
+                  ROUTE=logs; CARD="main-still-red (run $COVER)"
+                  echo "main-still-red: run(s) $COVER already failed '$STILL_SIG' -> #logs" ;;
+                error) echo "::warning::main-still-red: cannot read a prior run's jobs; paging" ;;
+                green) ;;
+                *) echo "page: no earlier main run in the last 10 proves $LEFT was already red" ;;
+              esac
+            fi
+          fi
           # MERGED-ANYWAY (t_4e93bc97). A stacked queue merges PR A together with a
           # later group B that contains it, so A can land while A's own group run
           # is red (hermes-agent#1652, 2026-10-03: run 37099128739 red on a uv
@@ -359,6 +429,9 @@ jobs:
             [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
           elif [ -n "$FOLD_RUN" ]; then
             SUMMARY="main red on an already-red test (also failed run $FOLD_RUN): $SIG"
+            [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
+          elif [ -n "$STILL_RED_RUN" ]; then
+            SUMMARY="main still red on the same failure as run(s) $STILL_RED_RUN: $STILL_SIG"
             [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
           fi
           echo "pr=$PR_NUM" >> "$GITHUB_OUTPUT"
