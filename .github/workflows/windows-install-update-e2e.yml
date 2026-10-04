@@ -29,28 +29,39 @@ jobs:
     name: Windows install.ps1 + hermes update E2E (${{ matrix.leg }})
     # Fork: no windows-latest-32-core pool in this org.
     runs-on: windows-latest
-    # Upstream's 32-core pool: ~17 min (one slow runner 28 min, run 36295230146). On hosted
-    # 4-vCPU windows-latest with 2 workers, install.ps1 alone took 678-1541 s (p50 961 s,
-    # 33 installs across runs 37129283920, 37133730727 x3, 37151309078, 37157739858,
-    # 37161445934) and a whole file up to 1824 s. Six files in three serial batches of two
-    # took 63-65 min on a fast runner and hit the 90 min wall on a slow one (run 37161445934,
-    # 3/6 files done). So one batch per leg: each leg runs two files at once on its own
-    # runner, and the leg wall is one file wall (max 1824 s) plus ~2 min of setup.
-    # paths + update_spares is the 3-install leg (update_spares installs two machines); the
-    # same pairing ran in every green 2-worker run (installs 1092-1212 s).
+    # One journey file per leg (6 legs). A file is one module-scoped fixture (install ->
+    # update -> turns), so a file is the smallest unit a leg can hold, and its floor is one
+    # install.ps1. Measured per file over runs 37105724870, 37151309078, 37157739858
+    # (timings.json, 2 files per runner): install.ps1 650-1212 s; post-install test time
+    # fresh 335-352 s (203-217 s of it waiting for gw's gateway-phase lock), gw 203-217 s,
+    # git 108-126 s, interp 147-161 s, paths 239-446 s, spares 94-99 s (spares installs
+    # two machines at once, 1087-1212 s). One file per runner removes the cross-file
+    # gateway-phase wait and the second concurrent install on the same 4 vCPUs.
+    # No shared install job: every fixture runs install.ps1 itself because the install is
+    # the system under test (fresh: a clean machine without git; paths: a non-ASCII profile
+    # with a space; spares: two installs on one host), each into its own fake profile.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - leg: fresh-gw
-            files: tests/e2e/core/windows_update/test_fresh_install_update.py tests/e2e/core/windows_update/test_gateway_across_update.py
-          - leg: git-interp
-            files: tests/e2e/core/windows_update/test_git_and_holders.py tests/e2e/core/windows_update/test_interpreter.py
-          - leg: paths-spares
-            files: tests/e2e/core/windows_update/test_paths_and_acls.py tests/e2e/core/windows_update/test_update_spares_other_installs.py
-    # HERMES_TEST_FILE_TIMEOUT (2400 s) plus setup and upload, so a stuck file is killed
-    # and named by the per-file timeout before the job wall cancels the leg blind.
-    timeout-minutes: 50
+          - leg: fresh
+            files: tests/e2e/core/windows_update/test_fresh_install_update.py
+          - leg: gateway
+            files: tests/e2e/core/windows_update/test_gateway_across_update.py
+          - leg: git-holders
+            files: tests/e2e/core/windows_update/test_git_and_holders.py
+          - leg: interpreter
+            files: tests/e2e/core/windows_update/test_interpreter.py
+          - leg: paths-acls
+            files: tests/e2e/core/windows_update/test_paths_and_acls.py
+          - leg: spares
+            files: tests/e2e/core/windows_update/test_update_spares_other_installs.py
+    # 2x the measured p90 leg wall: 17 green legs over runs 37168966958, 37169022868,
+    # 37170959667 had wall 650-1403 s (p90 1297 s), test step 494-1006 s (p90 812 s) and
+    # setup (checkout + setup-pm) 89-565 s (565 s on a cold cache). The per-file timeout
+    # (2x the test-step p90, rounded up) plus the cold setup max stays under this wall, so a
+    # stuck file is killed and named before the job wall cancels the leg blind.
+    timeout-minutes: 44
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -88,7 +99,7 @@ jobs:
           # install takes 870-1015 s and the cells pass (run 37102491348: 15/15 across the 4
           # files that finished inside the old job wall).
           HERMES_TEST_WORKERS: '2'
-          HERMES_TEST_FILE_TIMEOUT: '2400'
+          HERMES_TEST_FILE_TIMEOUT: '1800'
           # Six journeys each run install.ps1 (a cold PM toolchain + venv + Node deps) on a
           # 4-vCPU hosted runner. A journey is one module-scoped fixture (install -> update
           # -> turns) that runs BEFORE its first cell can print, so pytest is silent for the

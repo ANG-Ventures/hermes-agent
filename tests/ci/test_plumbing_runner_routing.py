@@ -62,10 +62,12 @@ def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
         "&& '[\"self-hosted\",\"Linux\",\"X64\",\"ace-e2e-vm\"]' || ("
         "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
         "&& format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) "
-        "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]')) }}"
+        "|| '[\"ubuntu-latest\"]')) }}"
     )
-    # The static last resort is Blacksmith 4vCPU (2026-10-03): e2e took 26 min
-    # on 2-core ubuntu-latest; a literal, so an unset repo var can never route it.
+    # The static last resort is GitHub-hosted ubuntu-latest (public repo, free
+    # minutes; t_e95fdb01): a literal, so an unset repo var can never route it.
+    # Blacksmith is reachable only through the overflow placement plan.
+    assert "blacksmith" not in job["runs-on"]
     assert "hermes-ci" not in job["runs-on"]
 
 

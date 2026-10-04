@@ -1,4 +1,4 @@
-"""VM-class e2e lane routing (t_78d851d1): kill switch + load gate, Blacksmith fall-through.
+"""VM-class e2e lane routing (t_78d851d1): kill switch + load gate, static fall-through.
 
 Evaluates the REAL ``runs-on`` expressions in tests.yml with the contract suite's own
 GitHub-expression evaluator, so the assertion is about what GitHub would pick, not
@@ -24,7 +24,8 @@ from tests.test_ci_overflow_workflow_contract import (
 )
 
 VM = ["self-hosted", "Linux", "X64", "ace-e2e-vm"]
-BLACKSMITH = "blacksmith-4vcpu-ubuntu-2404"
+# Static tail when neither lane applies (t_e95fdb01: GitHub-hosted, public repo).
+STATIC = "ubuntu-latest"
 STATUS = {"always": True, "cancelled": False, "failure": False, "success": True}
 
 # (CI_E2E_VM_ENABLED, CI_E2E_VM_ROUTE) -> routed to the VM class?
@@ -62,7 +63,7 @@ def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=
 def test_e2e_routes_to_vm_only_when_switch_and_gate_agree(event, enabled, route, vm):
     expr = _tests_yml()["jobs"]["e2e"]["runs-on"]
     got = evaluate(expr, _vm_ctx(event, enabled, route), STATUS)
-    assert got == (VM if vm else [BLACKSMITH])
+    assert got == (VM if vm else [STATIC])
 
 
 @pytest.mark.parametrize("job", ["e2e", "e2e-upgrade"])
@@ -84,20 +85,20 @@ def test_untrusted_events_never_reach_the_vm_class(job, event, head_repo):
 def test_e2e_upgrade_routes_to_vm_only_when_switch_and_gate_agree(enabled, route, vm):
     expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
     got = evaluate(expr, _vm_ctx("pull_request", enabled, route), STATUS)
-    assert got == (VM if vm else BLACKSMITH)
+    assert got == (VM if vm else STATIC)
 
 
 def test_e2e_upgrade_closed_gate_keeps_ci_e2e_runner_override():
     expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
-    ctx = _vm_ctx("pull_request", "true", "closed", e2e_runner="ubuntu-latest")
-    assert evaluate(expr, ctx, STATUS) == "ubuntu-latest"
+    ctx = _vm_ctx("pull_request", "true", "closed", e2e_runner="blacksmith-4vcpu-ubuntu-2404")
+    assert evaluate(expr, ctx, STATUS) == "blacksmith-4vcpu-ubuntu-2404"
 
 
 @pytest.mark.parametrize("shard", ["hosts/test_libc_musl", "core/test_fresh_process_entrypoints"])
 def test_container_sensitive_shards_never_route_to_vm(shard):
     # Proof run 37170873916: musl needs a docker daemon; doctor probes systemctl under /.dockerenv.
     expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
-    assert evaluate(expr, _vm_ctx("pull_request", "true", "open", shard=shard), STATUS) == BLACKSMITH
+    assert evaluate(expr, _vm_ctx("pull_request", "true", "open", shard=shard), STATUS) == STATIC
 
 
 def test_validated_merge_group_plan_still_wins_over_vm_lane():

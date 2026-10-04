@@ -54,6 +54,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from gateway import kanban_wake_freshness as _fresh
+
 logger = logging.getLogger(__name__)
 
 COALESCE_SECONDS = 600.0
@@ -526,7 +528,8 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
     except ValueError:
         payload = None
     kind = r["kind"]
-    item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or ""}
+    item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or "",
+            "event_ts": r["created_at"]}
     if kind == "blocked":
         trig = classify_block(payload)
         if trig is None:
@@ -555,14 +558,14 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
 
 
 def read_card(kb: Any, board: str, task_id: str) -> Optional[dict]:
-    """Current ``{session_id, body, title}`` of a card, or None if it is gone.
+    """Current ``{session_id, body, title, status}`` of a card, or None if it is gone.
 
     Read at DELIVERY time: a held event must follow a re-homed card and honour a
     ``wake: off`` added after it was queued (Prism P1s)."""
     conn = kb.connect_readonly(board=board)
     conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute("SELECT session_id, body, title FROM tasks WHERE id = ?",
+        row = conn.execute("SELECT session_id, body, title, status FROM tasks WHERE id = ?",
                            (task_id,)).fetchone()
     finally:
         conn.close()
@@ -643,7 +646,8 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -
     return False
 
 
-async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
+async def deliver_turn(runner: Any, entry: Any, text: str,
+                       cards: Optional[list[dict]] = None) -> None:
     """Enqueue one handoff turn into ``entry``'s session. Raises on no route."""
     from gateway.platforms.base import MessageEvent, MessageType
 
@@ -665,6 +669,15 @@ async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
             # verified compression lineage and still drops it after a /new
             # (_resolve_async_delegation_session; Prism P1).
             "gateway_session_id": entry.session_id,
+            # Re-checked when a busy session dequeues the turn (t_07ffc6cb).
+            _fresh.META_KEY: [
+                _fresh.card_entry(c.get("board"), c["task_id"],
+                                  [i.get("kind") for i in c.get("items") or []],
+                                  max((i.get("event_ts") or 0 for i in c.get("items") or []),
+                                      default=None),
+                                  render_prompt([c]))
+                for c in cards or []
+            ],
         },
     )
     await adapter.handle_message(event)
@@ -724,6 +737,19 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         if current is None or wake_off(current.get("body")):
             state.pending.pop(key, None)  # card gone, or opted out while held
             continue
+        # t_07ffc6cb: a card that went done/archived while its events were held
+        # needs nothing from its owner any more.
+        live = []
+        for i in card["items"]:
+            if _fresh.is_stale(current.get("status"), str(i.get("kind") or "")):
+                _fresh.log_dropped(card["task_id"], str(i.get("kind")), i.get("event_ts"),
+                                   "owner-wake", current.get("status"), now)
+            else:
+                live.append(i)
+        if not live:
+            state.pending.pop(key, None)
+            continue
+        card["items"] = live
         card["home_sid"] = str(current.get("session_id") or "")
         card["title"] = current.get("title") or card.get("title") or ""
         try:
@@ -755,7 +781,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     for session_key, (entry, cards) in by_session.items():
         text = render_prompt([c for _k, c in cards])
         try:
-            await deliver_turn(runner, entry, text)
+            await deliver_turn(runner, entry, text, [c for _k, c in cards])
         except Exception as exc:
             logger.warning("kanban owner-wake: wake of %s failed (%s); held for retry",
                            session_key, exc)

@@ -315,8 +315,9 @@ def test_live_empty_tool_use_row_renders_named_rider(_home, monkeypatch, stamp, 
                                elapsed_s=7.19)
     assert try_activate_fallback(a) is True
     r = _rows(_home)[0]
-    want = (f"empty response (stop_reason=tool_use, 0 content blocks, {out} out)"
-            f" · hop=relay-200 · sub={seat}")
+    # t_6eddafcd: the chat line says "empty reply"; the raw stop_reason/blocks/out
+    # stays in the route-changes log (record_invalid_response) and the ledger.
+    want = f"empty reply · hop=relay-200 · sub={seat}"
     rider = r["notice_text"].split(" — ", 1)[1].rsplit(",", 1)[0]
     assert rider == want, r["notice_text"]
     assert "claude-alr/claude-fable-5-1 → claude-btpr/claude-fable-5-1" in r["notice_text"]
