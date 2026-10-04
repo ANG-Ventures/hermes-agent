@@ -91,7 +91,15 @@ _POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs",
 # Pool relays that speak the error-class-v2 contract (fallback spec 2026-09-25
 # D2 / Phase 1b). Both lanes: the affinity helper above is apr-only, but the
 # capability header must reach bpr too, so it has its own provider set.
-_POOL_CAPABILITY_PROVIDERS = frozenset({"claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr"})
+# t_c95abb90: the dlr relay faces (claude-dtlr, alias claude-dtlrs; claude-dtlrf)
+# and the bpr relay's tui face (claude-btpr, alias claude-bpr-tui) are the same
+# relay code with error_class_v2 on. A dlr 504 attempt timeout keeps its status
+# under v2 (only a conn-class 429 becomes 503), so it still classifies
+# pool_stalled -> fallback before the stated class is read.
+_POOL_CAPABILITY_PROVIDERS = frozenset({
+    "claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf", "claude-bpr",
+    "claude-dtlr", "claude-dtlrs", "claude-dtlrf", "claude-btpr", "claude-bpr-tui",
+})
 POOL_ACCEPTS_HEADER = "x-hermes-accepts"
 POOL_ACCEPTS_VALUE = "error-class-v2"
 
