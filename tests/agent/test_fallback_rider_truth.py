@@ -1,0 +1,257 @@
+"""t_6eddafcd: fallback riders say what actually happened.
+
+Two lines from 2026-10-03 (session 20261003_194901_3ef14583) were accurate
+but unreadable:
+
+* 21:18:26 alr -> dtlr: ``empty response (stop_reason=tool_use, 0 content
+  blocks, 128 out) · hop=relay-200 · sub=sub-vps-23``. The relay had already
+  re-sent the turn three times (sub-vps-18 x2, sub-vps-23), all billed-empty.
+* 21:25:28 dtlr -> btpr: ``(pool sub stalled mid-turn) ... read timeout on
+  sub-vps-18 (hop unknown)``. A relay 504 ``upstream attempt timed out``
+  after 7m00s, before the first byte, on a lane with no other eligible seat.
+
+Both rendered lines are pinned here through the real failover + renderer,
+with negative controls, plus a table-driven contract: no relay-synthetic body
+renders ``hop unknown``; a body that matches no row still does.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+
+import pytest
+
+from agent import fallback_events as fbe
+from agent import fallback_policy as fp
+from tests.agent.test_fallback_events_ledger import _home, _rows  # noqa: F401
+
+UTC = dt.timezone.utc
+TS = dt.datetime(2026, 10, 4, 4, 25, 28, tzinfo=UTC).timestamp()
+
+
+# ── pure renderer: the two live shapes ───────────────────────────────────
+
+def _empty_row(**floor):
+    fl = {"site": "invalid_response", "stop_reason": "tool_use", "content_blocks": 0,
+          "output_tokens": 128, "served_by": "sub-vps-23",
+          "route_id": "054fb478cf644ad99659e051e75c5620"}
+    fl.update(floor)
+    return {"trigger_class": fp.INVALID_RESPONSE_CLASS, "from_provider": "claude-alr",
+            "seat": fl.get("served_by"), "floor": fl, "ts": TS}
+
+
+def test_empty_reply_relay_gave_up_names_the_attempt_chain():
+    row = _empty_row(relay_retry="gave_up",
+                     relay_attempts=["sub-vps-18", "sub-vps-18", "sub-vps-23"])
+    assert fp.format_cause_rider(row, tz=UTC) == (
+        "empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23)"
+        " — relay retried, gave up, 04:25:28")
+    assert fp.head_label_override(row) == "empty reply, retried ×3"
+
+
+def test_empty_reply_relay_gave_up_without_seat_list_names_last_seat():
+    row = _empty_row(relay_retry="gave_up")
+    assert fp.format_cause_rider(row, tz=UTC) == (
+        "empty reply from Anthropic (last on sub-vps-23) — relay retried, gave up, 04:25:28")
+    assert fp.head_label_override(row) == "empty reply, relay retried"
+
+
+def test_empty_reply_chat_line_drops_raw_stop_reason():
+    """The raw stop_reason/blocks/out stays in the log row, never the chat."""
+    for row in (_empty_row(), _empty_row(relay_retry="gave_up"),
+                _empty_row(relay_retry="gave_up", relay_attempts=["sub-vps-2"])):
+        text = fp.format_cause_rider(row, tz=UTC)
+        assert "stop_reason=" not in text and "content block" not in text, text
+        assert "hop unknown" not in text and "sub unknown" not in text, text
+    # The ledger/log cause still carries the raw evidence.
+    assert fp.invalid_response_cause(_empty_row()) == (
+        "empty response (stop_reason=tool_use, 0 content blocks, 128 out)")
+
+
+def test_empty_reply_without_relay_retry_keeps_hop_and_seat():
+    assert fp.format_cause_rider(_empty_row(), tz=UTC) == (
+        "empty reply · hop=relay-200 · sub=sub-vps-23, 04:25:28")
+    assert fp.head_label_override(_empty_row()) == "empty reply"
+
+
+def test_non_empty_invalid_response_keeps_its_cause():
+    row = _empty_row(content_blocks=None, stop_reason=None, output_tokens=None,
+                     detail="response.choices missing")
+    assert "invalid response" in fp.format_cause_rider(row, tz=UTC)
+    assert fp.head_label_override(row) is None
+
+
+def _seat_timeout_row(**kw):
+    row = {"trigger_class": "conn", "from_provider": "claude-dtlrf", "hop": "relay→bridge",
+           "seat": "sub-vps-18", "http_status": 504, "relay_error": "upstream attempt timed out",
+           "err_head": 'HTTP 504: {"error":"upstream attempt timed out"}',
+           "elapsed_s": 420.0, "pool_eligible": 0, "ts": TS}
+    row.update(kw)
+    return row
+
+
+def test_seat_timeout_names_seat_elapsed_and_lane_wide():
+    row = _seat_timeout_row()
+    assert fp.format_cause_rider(row, tz=UTC) == (
+        "sub-vps-18 did not answer in 7m00s (relay deadline) · pool had no other seat, 04:25:28")
+    assert fp.head_label_override(row) == "seat timed out"
+
+
+def test_seat_timeout_other_seats_existed_has_no_pool_rider():
+    text = fp.format_cause_rider(_seat_timeout_row(pool_eligible=2), tz=UTC)
+    assert text == "sub-vps-18 did not answer in 7m00s (relay deadline), 04:25:28"
+    text = fp.format_cause_rider(_seat_timeout_row(pool_eligible=None), tz=UTC)
+    assert "pool had no other seat" not in text
+
+
+def test_seat_timeout_unknown_seat_and_elapsed():
+    text = fp.format_cause_rider(_seat_timeout_row(seat=None, elapsed_s=None,
+                                                   pool_eligible=None), tz=UTC)
+    assert text == "the seat did not answer before the relay deadline, 04:25:28"
+    assert "read timeout" not in text and "hop unknown" not in text
+
+
+def test_read_timeout_only_for_a_client_side_read_timeout():
+    base = {"trigger_class": "conn", "from_provider": "claude-bpr", "hop": "relay→bridge",
+            "seat": "sub-vps-9", "err_head": "Request timed out.", "ts": TS}
+    assert fp.format_cause_rider(dict(base, exc_name="ReadTimeout"), tz=UTC).startswith(
+        "read timeout to sub-vps-9 bridge")
+    assert fp.format_cause_rider(dict(base, socket_cause="read_timeout"), tz=UTC).startswith(
+        "read timeout")
+    # Same text, no client read-timeout evidence: never "read timeout".
+    assert fp.format_cause_rider(base, tz=UTC).startswith("timed out to sub-vps-9 bridge")
+
+
+def test_pool_deadline_504_is_not_a_read_timeout():
+    row = _seat_timeout_row(relay_error="pool deadline exceeded",
+                            err_head='{"error":"pool deadline exceeded"}')
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert text.startswith("relay deadline exceeded to sub-vps-18 bridge"), text
+    assert text.endswith("· pool had no other seat, 04:25:28")
+    assert fp.head_label_override(row) == "relay deadline"
+
+
+# ── table contract: every relay-synthetic body names its hop ─────────────
+
+@pytest.mark.parametrize("error", sorted(fbe.RELAY_SYNTHETIC_HOP))
+def test_every_relay_synthetic_body_renders_a_known_hop(error):
+    """A relay body with NO x-relay-error-hop header (the lane did not
+    negotiate error-class-v2) never renders ``hop unknown``."""
+    body = {"error": error}
+    agent = type("A", (), {})()
+    fbe.stash_api_error(agent, _Err(body, 504), 504)
+    row = fbe.build_row(agent, "failover", from_provider="claude-dtlrf",
+                        from_model="claude-fable-5-1", to_provider="claude-btpr",
+                        to_model="claude-fable-5-1")
+    assert row["hop"] == fp.normalize_hop(fbe.RELAY_SYNTHETIC_HOP[error])
+    assert row["relay_error"] == error
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert fp.HOP_UNKNOWN not in text, text
+
+
+def test_every_relay_synthetic_body_is_in_the_text_table():
+    """The hop table covers no body the class table cannot classify."""
+    for error in fbe.RELAY_SYNTHETIC_HOP:
+        assert fbe.classify_text(error) != "unclassified", error
+
+
+def test_relay_hop_header_still_wins_over_the_body_table():
+    body = {"error": "upstream attempt timed out"}
+    agent = type("A", (), {})()
+    fbe.stash_api_error(agent, _Err(body, 504, {"x-relay-error-hop": "relay"}), 504)
+    row = fbe.build_row(agent, "failover", from_provider="claude-bpr", from_model="m",
+                        to_provider="x", to_model="m")
+    assert row["hop"] == "relay"
+
+
+def test_unknown_body_still_renders_hop_unknown():
+    """Negative control: a body that matches no relay-synthetic row."""
+    agent = type("A", (), {})()
+    fbe.stash_api_error(agent, _Err({"error": "something new"}, 502), 502)
+    row = fbe.build_row(agent, "failover", from_provider="claude-dtlrf", from_model="m",
+                        to_provider="x", to_model="m")
+    assert not row.get("hop") and not row.get("relay_error")
+    assert fp.HOP_UNKNOWN in fp.format_cause_rider(row, tz=UTC)
+
+
+def test_relay_json_in_exception_text_is_recognised():
+    assert fbe.relay_synthetic_error(
+        None, 'HTTP 504: {"error":"upstream attempt timed out"}') == "upstream attempt timed out"
+    assert fbe.relay_synthetic_error(None, "upstream attempt timed out") is None
+    assert fbe.relay_synthetic_error({"error": {"message": "pool at capacity"}}) is None
+
+
+def test_pool_eligible_header_parsing():
+    assert fbe.pool_eligible({"x-pool-other-eligible": "0"}) == 0
+    assert fbe.pool_eligible({"x-pool-other-eligible": "3"}) == 3
+    assert fbe.pool_eligible({"x-relay-eligible": "0"}) == 0
+    # v2 counts the failing seat too: only 0 proves there was no other.
+    assert fbe.pool_eligible({"x-relay-eligible": "1"}) is None
+    assert fbe.pool_eligible({"x-relay-eligible": "?"}) is None
+    assert fbe.pool_eligible({}) is None
+
+
+class _Resp:
+    def __init__(self, headers):
+        self.headers = headers
+
+    def json(self):
+        raise ValueError
+
+
+class _Err(Exception):
+    def __init__(self, body, status, headers=None):
+        super().__init__(f"HTTP {status}: {body}")
+        self.body = body
+        self.status_code = status
+        self.response = _Resp(headers or {})
+
+
+# ── real failover path: the two live lines end to end ────────────────────
+
+def test_live_2118_empty_reply_line(_home, monkeypatch):
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    usage = type("U", (), {"output_tokens": 128})()
+    resp = type("R", (), {"content": [], "stop_reason": "tool_use", "usage": usage,
+                          "pool_headers": {
+                              "x-pool-served-by": "sub-vps-23",
+                              "x-pool-route-id": "054fb478cf644ad99659e051e75c5620",
+                              "x-pool-empty-content-retried": "gave_up",
+                              "x-pool-empty-content-attempts": "sub-vps-18,sub-vps-18,sub-vps-23",
+                          }})()
+    assert fbe.relay_gave_up_empty(resp)
+    fbe.stash_response_failure(a, "invalid_response", resp, elapsed_s=25.28, repeat=True)
+    assert try_activate_fallback(a) is True
+    text = _rows(_home)[0]["notice_text"]
+    assert text.startswith("🔄 Model fallback (empty reply, retried ×3): "
+                           "claude-alr/claude-fable-5-1 → claude-btpr/claude-fable-5-1"), text
+    assert (" — empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23)"
+            " — relay retried, gave up, ") in text, text
+    for banned in ("stop_reason=", "content block", "hop=relay-200", "hop unknown", "unclassified"):
+        assert banned not in text, (banned, text)
+
+
+def test_live_2125_seat_timeout_line(_home, monkeypatch):
+    from agent.chat_completion_helpers import try_activate_fallback
+    from agent.error_classifier import FailoverReason
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    a.provider = "claude-dtlrf"
+    err = _Err({"error": "upstream attempt timed out"}, 504,
+               {"x-pool-served-by": "sub-vps-18", "x-pool-other-eligible": "0"})
+    fbe.stash_api_error(a, err, 504, elapsed_s=420.0)
+    assert try_activate_fallback(a, reason=FailoverReason.pool_stalled) is True
+    text = _rows(_home)[0]["notice_text"]
+    assert text.startswith("🔄 Model fallback (seat timed out): claude-dtlrf/"), text
+    assert (" — sub-vps-18 did not answer in 7m00s (relay deadline)"
+            " · pool had no other seat, ") in text, text
+    for banned in ("read timeout", "hop unknown", "stalled mid-turn"):
+        assert banned not in text, (banned, text)
