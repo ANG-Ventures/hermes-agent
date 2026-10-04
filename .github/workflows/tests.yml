@@ -625,7 +625,11 @@ jobs:
     # its image; seccomp/apparmor/systempaths are unconfined so bwrap can make its
     # PID namespace (fleet-ops-scripts ci-runners/e2e-vm). Closed gate or switch
     # off -> CI_E2E_RUNNER / Blacksmith exactly as before.
-    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # Two shards stay off the VM class (proof run 37170873916): hosts/test_libc_musl needs a docker
+    # daemon (the class has no socket, so it skips and the suite reads red) and
+    # core/test_fresh_process_entrypoints asserts doctor never probes systemctl, which it does when
+    # /.dockerenv exists.
+    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

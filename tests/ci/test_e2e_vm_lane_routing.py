@@ -40,8 +40,10 @@ GATE_CASES = [
 ]
 
 
-def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=None):
+def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=None,
+            shard="core/test_install_fresh"):
     ctx = _ctx(event, copy.deepcopy(PLACEMENT_OUTCOMES[placement]), labels)
+    ctx["matrix"] = {"shard": shard}
     ctx["vars"]["CI_E2E_VM_ENABLED"] = enabled
     ctx["vars"]["CI_E2E_VM_ROUTE"] = route
     ctx["vars"]["CI_E2E_RUNNER"] = e2e_runner
@@ -67,6 +69,13 @@ def test_e2e_upgrade_closed_gate_keeps_ci_e2e_runner_override():
     expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
     ctx = _vm_ctx("pull_request", "true", "closed", e2e_runner="ubuntu-latest")
     assert evaluate(expr, ctx, STATUS) == "ubuntu-latest"
+
+
+@pytest.mark.parametrize("shard", ["hosts/test_libc_musl", "core/test_fresh_process_entrypoints"])
+def test_container_sensitive_shards_never_route_to_vm(shard):
+    # Proof run 37170873916: musl needs a docker daemon; doctor probes systemctl under /.dockerenv.
+    expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
+    assert evaluate(expr, _vm_ctx("pull_request", "true", "open", shard=shard), STATUS) == BLACKSMITH
 
 
 def test_validated_merge_group_plan_still_wins_over_vm_lane():
