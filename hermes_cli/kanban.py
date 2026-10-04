@@ -43,6 +43,7 @@ from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
 from hermes_constants import get_default_hermes_root
 
 
@@ -1208,12 +1209,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         except kb.sqlite3.Error:  # older/minimal board schema: no PR list
             pr_card_map = {}
 
+    held = held_repo([c.body for c in comments]) if task.status in ("review", "blocked", "ready") else None
     if want_json:
         _print_json({
             "task": _task_to_dict(task),
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "latest_summary": latest_summary,
             "workspace_refusal": refusal,
+            "held_repo": held,
             "parents": parents, "children": children,
             "pr_cards": pr_card_map,
             "parent_links": [{"id": pid, "kind": kind} for pid, kind in parent_links],
@@ -1240,6 +1243,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     guard_line = _fmt_current_respawn_guard(task.status, events)
     if guard_line:
         field("guard", guard_line)
+    if held:
+        field("held", fmt_held_repo(held))
     field("assignee", task.assignee or "-")
     if task.priority:
         field("priority", task.priority)
@@ -3427,6 +3432,13 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     operator = (getattr(args, "operator", None) or "").strip() or None
+    if args.coverage is not None:
+        # Before any write (claim release, comment, transition): a refused
+        # record must not land on the card (t_c5bfb48b).
+        coverage_error = kb.review_coverage_text_error(args.coverage)
+        if coverage_error:
+            print(f"cannot request changes for {tid}: {coverage_error}", file=sys.stderr)
+            return 1
     with kb.connect_closing() as conn:
         # The caller must hold the review run: as its dispatcher-owned worker,
         # or as the operator session that made ``claim --review`` (human lane).
@@ -3483,27 +3495,19 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-        elif args.coverage is not None:
-            kb.add_comment(
-                conn, tid, _profile_author(),
-                "review_coverage: " + str(kb.redact_review_value(args.coverage)),
-                run_id=held_run,
-            )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
             expected_run_id=held_run,
             operator=operator,
+            # The coverage comment is written inside the transition's
+            # transaction, so a refused send-back rolls it back. ``claimer``
+            # authors it; on a parked card it also opens the review run.
+            coverage=args.coverage,
+            claimer=_profile_author(),
             **(
-                {
-                    # Open the review run as this session, and record the
-                    # coverage on it inside the same transaction so the
-                    # coverage gate can pass.
-                    "claimer": _profile_author(),
-                    "coverage": args.coverage,
-                    "session_ref": parked_session,
-                }
+                {"session_ref": parked_session}
                 if parked_session is not None or parked_override
                 else {}
             ),

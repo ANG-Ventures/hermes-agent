@@ -2365,6 +2365,12 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent_admitted(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard and an admission slot."""
+        if getattr(event, "internal", False):
+            # t_07ffc6cb: a kanban wake that waited in the queue may be about a card
+            # that has since gone done/archived.
+            from gateway.kanban_wake_freshness import drop_stale
+            if await drop_stale(event):
+                return None
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -3983,6 +3989,10 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            from gateway.kanban_wake_freshness import drop_stale
+            while pending_event is not None and await drop_stale(pending_event):
+                pending_event = self._promote_queued_event(
+                    session_key, adapter, _dequeue_pending_event(adapter, session_key))
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):

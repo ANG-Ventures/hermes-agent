@@ -54,6 +54,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from gateway import kanban_wake_freshness as _fresh
+
 logger = logging.getLogger(__name__)
 
 COALESCE_SECONDS = 600.0
@@ -94,6 +96,7 @@ _NON_CHAT_PLATFORMS = frozenset({"local", "cli", "tui", "api_server", "webhook",
 _RED_CONCLUSIONS = frozenset({
     "failure", "timed_out", "cancelled", "action_required", "startup_failure",
 })
+_NO_VERDICT_CONCLUSIONS = frozenset({"cancelled", "skipped"})
 
 PrHealthFn = Callable[[str, int], Optional[dict]]
 
@@ -202,6 +205,84 @@ def _gh_json(path: str) -> Optional[Any]:
         return None
 
 
+def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
+    """Every ``key`` row across REST pages of ``path`` (per_page=100), or None when
+    any page is unreadable or the page cap is hit (a partial list is not a verdict).
+    A head with >100 runs spills onto page 2+ (Prism P1)."""
+    rows: list = []
+    sep = "&" if "?" in path else "?"
+    for page in range(1, max_pages + 1):
+        data = _gh_json(f"{path}{sep}per_page=100&page={page}")
+        if not isinstance(data, dict):
+            return None
+        batch = data.get(key) or []
+        rows.extend(batch)
+        if len(batch) < 100:
+            return rows
+    return None
+
+
+def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
+    """Names of the checks that grade the head red (t_65e5d76f).
+
+    A head carries every run ever started on it: override_lint runs twice per
+    push and concurrency cancels the superseded one, so counting any red run
+    read green PRs red. Per key = (workflow, name) the newest run (highest id)
+    that is not cancelled/skipped decides. A key whose runs are ALL cancelled
+    stays red; a failure is only superseded by a later run of the SAME check.
+    ``workflows`` maps check_suite id -> (workflow id, event); without an entry
+    the key is the suite, so a duplicate in another suite is never merged
+    (fails closed). Mirrors hermes-home kanban-review-merge-pass effective_checks().
+    """
+    workflows = workflows or {}
+    live: dict = {}
+    cancelled: dict = {}
+    for i, run in enumerate(runs or []):
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("name") or "?")
+        suite = (run.get("check_suite") or {}).get("id")
+        if suite in workflows:
+            key = ("wf", workflows[suite], name)
+        elif suite is not None:
+            key = ("suite", suite, name)
+        else:
+            key = ("row", i, name)
+        concl = str(run.get("conclusion") or "").lower()
+        if concl in _NO_VERDICT_CONCLUSIONS:
+            if concl == "cancelled":
+                cancelled.setdefault(key, name)
+            continue
+        rank = (int(run.get("id") or 0), i)
+        if key not in live or rank > live[key][0]:
+            live[key] = (rank, name, concl)
+    red = [name for _rank, name, concl in live.values() if concl in _RED_CONCLUSIONS]
+    return red + [name for key, name in cancelled.items() if key not in live]
+
+
+def _needs_workflow_map(runs: list) -> bool:
+    """A name spread over >1 suite with a non-pass row is the only case where
+    merging suites into workflows changes the verdict; skip the REST read otherwise."""
+    suites: dict = {}
+    unsettled = set()
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        name = run.get("name")
+        suites.setdefault(name, set()).add((run.get("check_suite") or {}).get("id"))
+        if str(run.get("conclusion") or "").lower() not in ("success", "skipped", "neutral"):
+            unsettled.add(name)
+    return any(len(v) > 1 and k in unsettled for k, v in suites.items())
+
+
+def _workflow_map(repo: str, sha: str) -> dict:
+    """check_suite id -> (workflow id, event); {} when unreadable. A push run and a
+    pull_request run of one workflow on one sha are separate checks, not re-runs."""
+    rows = _gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or []
+    return {r["check_suite_id"]: (r.get("workflow_id"), r.get("event"))
+            for r in rows if isinstance(r, dict) and r.get("check_suite_id") is not None}
+
+
 def query_pr_health(repo: str, number: int) -> Optional[dict]:
     """``{state, mergeable_state, failing: [check names]}`` or None (unknown)."""
     pr = _gh_json(f"repos/{repo}/pulls/{number}")
@@ -211,10 +292,11 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
            "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": []}
     sha = (pr.get("head") or {}).get("sha")
     if out["state"] == "open" and sha:
-        runs = _gh_json(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
-        for run in (runs or {}).get("check_runs") or []:
-            if isinstance(run, dict) and str(run.get("conclusion") or "") in _RED_CONCLUSIONS:
-                out["failing"].append(str(run.get("name") or "?"))
+        runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
+        if runs is None:
+            return None  # unknown: retried, never read as green (Prism P1)
+        wf = _workflow_map(repo, sha) if _needs_workflow_map(runs) else {}
+        out["failing"] = red_check_names(runs, wf)
     return out
 
 
@@ -446,7 +528,8 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
     except ValueError:
         payload = None
     kind = r["kind"]
-    item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or ""}
+    item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or "",
+            "event_ts": r["created_at"]}
     if kind == "blocked":
         trig = classify_block(payload)
         if trig is None:
@@ -475,14 +558,14 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
 
 
 def read_card(kb: Any, board: str, task_id: str) -> Optional[dict]:
-    """Current ``{session_id, body, title}`` of a card, or None if it is gone.
+    """Current ``{session_id, body, title, status}`` of a card, or None if it is gone.
 
     Read at DELIVERY time: a held event must follow a re-homed card and honour a
     ``wake: off`` added after it was queued (Prism P1s)."""
     conn = kb.connect_readonly(board=board)
     conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute("SELECT session_id, body, title FROM tasks WHERE id = ?",
+        row = conn.execute("SELECT session_id, body, title, status FROM tasks WHERE id = ?",
                            (task_id,)).fetchone()
     finally:
         conn.close()
@@ -563,7 +646,8 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -
     return False
 
 
-async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
+async def deliver_turn(runner: Any, entry: Any, text: str,
+                       cards: Optional[list[dict]] = None) -> None:
     """Enqueue one handoff turn into ``entry``'s session. Raises on no route."""
     from gateway.platforms.base import MessageEvent, MessageType
 
@@ -585,6 +669,15 @@ async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
             # verified compression lineage and still drops it after a /new
             # (_resolve_async_delegation_session; Prism P1).
             "gateway_session_id": entry.session_id,
+            # Re-checked when a busy session dequeues the turn (t_07ffc6cb).
+            _fresh.META_KEY: [
+                _fresh.card_entry(c.get("board"), c["task_id"],
+                                  [i.get("kind") for i in c.get("items") or []],
+                                  max((i.get("event_ts") or 0 for i in c.get("items") or []),
+                                      default=None),
+                                  render_prompt([c]))
+                for c in cards or []
+            ],
         },
     )
     await adapter.handle_message(event)
@@ -644,6 +737,19 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         if current is None or wake_off(current.get("body")):
             state.pending.pop(key, None)  # card gone, or opted out while held
             continue
+        # t_07ffc6cb: a card that went done/archived while its events were held
+        # needs nothing from its owner any more.
+        live = []
+        for i in card["items"]:
+            if _fresh.is_stale(current.get("status"), str(i.get("kind") or "")):
+                _fresh.log_dropped(card["task_id"], str(i.get("kind")), i.get("event_ts"),
+                                   "owner-wake", current.get("status"), now)
+            else:
+                live.append(i)
+        if not live:
+            state.pending.pop(key, None)
+            continue
+        card["items"] = live
         card["home_sid"] = str(current.get("session_id") or "")
         card["title"] = current.get("title") or card.get("title") or ""
         try:
@@ -675,7 +781,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     for session_key, (entry, cards) in by_session.items():
         text = render_prompt([c for _k, c in cards])
         try:
-            await deliver_turn(runner, entry, text)
+            await deliver_turn(runner, entry, text, [c for _k, c in cards])
         except Exception as exc:
             logger.warning("kanban owner-wake: wake of %s failed (%s); held for retry",
                            session_key, exc)

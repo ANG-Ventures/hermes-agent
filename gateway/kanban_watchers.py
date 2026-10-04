@@ -2691,6 +2691,24 @@ class GatewayKanbanWatchersMixin:
                             if wake_agent
                             else set()
                         )
+                        if _wake_kinds:
+                            # t_07ffc6cb: re-read the card at SEND time; a wake
+                            # about a card now done/archived is dropped.
+                            from gateway import kanban_wake_freshness as _fresh
+                            try:
+                                _now_status = await asyncio.to_thread(
+                                    _fresh.read_status, board_slug, sub["task_id"],
+                                )
+                            except Exception as _st_exc:
+                                logger.debug("kanban notifier: status re-read for %s failed: %s",
+                                             sub["task_id"], _st_exc)
+                                _now_status = None
+                            _ev_ts = {ev.kind: ev.created_at for ev in d["events"]}
+                            for _k in sorted(_wake_kinds):
+                                if _fresh.is_stale(_now_status, _k):
+                                    _fresh.log_dropped(sub["task_id"], _k, _ev_ts.get(_k),
+                                                       "notifier", _now_status)
+                                    _wake_kinds.discard(_k)
                         if wake_agent and _self_ids and not _wake_kinds:
                             logger.info(
                                 "kanban notifier: wake skipped for %s on %s/%s: "
@@ -2846,11 +2864,17 @@ class GatewayKanbanWatchersMixin:
                             # push-capable adapters (the non-push /
                             # self-post branch is handled BEFORE the
                             # cursor advance above).
+                            from gateway import kanban_wake_freshness as _fresh
                             await deliver_wake(
                                 adapter,
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
+                                metadata={_fresh.META_KEY: [_fresh.card_entry(
+                                    board_slug, sub["task_id"], _wake_kinds,
+                                    max((ev.created_at for ev in d["events"]), default=None),
+                                    _synth,
+                                )]},
                             )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

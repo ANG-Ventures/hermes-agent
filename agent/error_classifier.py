@@ -227,6 +227,18 @@ _POOL_MODEL_SCOPED_PATTERN = "no eligible sub for the requested model"
 # pool terminally 504'd without rotating. Exact body strings, not status/provider — the 504 does
 # not always survive onto the exception object and the custom-provider label is not stable.
 _POOL_STALLED_PATTERNS = ("upstream attempt timed out", "pool deadline exceeded")
+# The claude-bpx tui bridge's read-phase stall, passed through by the dlr relay: 504
+# ``error.code=tui_turn_timeout`` (bridge/src/tuiRunner.js TUI_ERRORS). Same terminal state as the
+# relay's own 504; it fell to the 5xx floor and was retried up to 3 x 600 s (t_bbb0dec5).
+_BRIDGE_STALLED_CODES = frozenset({"tui_turn_timeout"})
+# Relay no-eligible-sub bodies the relay itself classes ``pool_pressure`` (claude_pool_relay.py
+# _SYNTHETIC_PREFIX_CLASS): every sub that could serve it is operator-drained, or none serves the
+# requested bridge mode. Not a quota cap that frees in seconds, so they skip the pool_exhausted
+# same-provider capacity wait. Exact relay prefixes, matched on the body ``error`` string.
+_POOL_PRESSURE_NO_ELIGIBLE_PREFIXES = (
+    "no eligible sub: every subscription that could serve this request is drained",
+    "no eligible sub: no subscription that serves the requested bridge mode",
+)
 # Account/organization ENTITLEMENT block (2026-08-08): a lapsed subscription makes Anthropic answer
 # every request 403 permission_error "OAuth authentication is currently not allowed for this
 # organization." The token is valid, so the 403 bucket said `auth` and announced "(auth refresh)".
@@ -1008,6 +1020,11 @@ def _relay_verdict(c: _Ctx) -> Optional[Verdict]:
     with an honest reason."""
     if c.status_code in (None, 503) and _is_relay_deploy_drain(c.error, c.body):
         return _V_RELAY_DRAINING
+    # Read-phase stall before the stated class: the relay stamps ``conn`` on its own 504 attempt
+    # timeout (the class names the hop, not the recovery), and ``conn`` retries in place, which
+    # re-enters the same stall for another per_attempt_timeout_s (t_bbb0dec5).
+    if _is_read_phase_stall(c):
+        return _V_POOL_STALLED
     try:
         from agent.fallback_events import relay_error_class as _relay_error_class
         relay_class, _src = _relay_error_class(c.error)
@@ -1016,7 +1033,26 @@ def _relay_verdict(c: _Ctx) -> Optional[Verdict]:
     verdict = _RELAY_CLASS_VERDICTS.get(relay_class) if relay_class else None
     if verdict is not None:
         return verdict
+    if relay_class is None and _relay_body_error(c.body).startswith(_POOL_PRESSURE_NO_ELIGIBLE_PREFIXES):
+        # Un-negotiated bytes get the class the relay states for them under error-class-v2.
+        return _V_RELAY_POOL_PRESSURE
     return _V_STREAM_PARSE if isinstance(c.error, ProviderStreamParseError) else None
+
+
+def _relay_body_error(body: Any) -> str:
+    """The relay-synthetic ``{"error": "<string>"}`` value, lowercased; ``""`` for any other shape."""
+    err = body.get("error") if isinstance(body, dict) else None
+    return err.strip().lower() if isinstance(err, str) else ""
+
+
+def _is_read_phase_stall(c: _Ctx) -> bool:
+    """A box accepted the turn and stalled past its deadline: the relay's exact 504 bodies or the
+    tui bridge's ``tui_turn_timeout`` code. Never a bare 504 or a generic timeout word."""
+    if c.status_code not in (None, 504):
+        return False
+    if c.error_code.lower() in _BRIDGE_STALLED_CODES:
+        return True
+    return any(p in c.msg for p in _POOL_STALLED_PATTERNS)
 
 
 # Fork pool/relay bodies checked BEFORE status classification: each reaches the classifier two

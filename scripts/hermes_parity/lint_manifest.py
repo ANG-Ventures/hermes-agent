@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import glob
 import importlib.util
+import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -67,6 +69,46 @@ def lint_schema(manifest_path: Path) -> list[str]:
             feature.upstream_ref is None or not feature.upstream_ref.strip()
         ):
             errors.append(f"absorbed feature requires upstream_ref: {feature.feature!r}")
+    return errors
+
+
+CENSUS_VERDICTS = frozenset({
+    "KEPT-FORK", "ABSORBED-UPSTREAM", "EQUIVALENT-UPSTREAM", "PARTIAL-UPSTREAM", "DROPPED-THIS-SYNC",
+})
+# Verdicts that tell a sync resolver "upstream's copy is enough". Evidence that names a live
+# fork-only remainder contradicts them: resolving toward upstream would drop that remainder.
+_UPSTREAM_SUFFICIENT = frozenset({"ABSORBED-UPSTREAM", "EQUIVALENT-UPSTREAM"})
+_RESIDUAL_MARKER = re.compile(
+    r"\bpartial\b|\bresidual\b|\bremainder\b|\bfork[- ]only\b|\bfork deltas?\b", re.IGNORECASE
+)
+
+
+def lint_census(manifest_path: Path) -> list[str]:
+    """Check each entry's ``parity_census`` verdict against its own evidence."""
+    with manifest_path.open("r", encoding="utf-8-sig") as fh:
+        raw = json.load(fh)
+    errors: list[str] = []
+    for entry in raw:
+        census = entry.get("parity_census")
+        if census is None:
+            continue
+        name = entry.get("feature")
+        verdict = census.get("verdict")
+        residual = census.get("residual") or []
+        if verdict not in CENSUS_VERDICTS:
+            errors.append(
+                f"invalid parity_census verdict for {name!r}: {verdict!r} "
+                f"(expected one of: {', '.join(sorted(CENSUS_VERDICTS))})"
+            )
+        elif verdict == "PARTIAL-UPSTREAM" and not residual:
+            errors.append(f"PARTIAL-UPSTREAM census for {name!r} requires a non-empty residual list")
+        elif verdict in _UPSTREAM_SUFFICIENT and residual:
+            errors.append(f"{verdict} census for {name!r} lists a residual fork delta; use PARTIAL-UPSTREAM")
+        elif verdict in _UPSTREAM_SUFFICIENT and _RESIDUAL_MARKER.search(str(census.get("evidence", ""))):
+            errors.append(
+                f"{verdict} census for {name!r} has evidence naming a fork-only remainder; "
+                "use PARTIAL-UPSTREAM with a residual list"
+            )
     return errors
 
 
@@ -152,6 +194,7 @@ def lint_manifest(
     if not manifest.exists():
         return ManifestLintResult(False, (f"manifest missing: {manifest.relative_to(repo)}",))
     errors = lint_schema(manifest)
+    errors.extend(lint_census(manifest))
     errors.extend(lint_paths(repo, manifest))
     nodeids = forkdelta.manifest_nodeids(manifest)
     errors.extend(lint_nodeids(repo, nodeids))
