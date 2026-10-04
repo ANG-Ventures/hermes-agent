@@ -13223,6 +13223,9 @@ def promote_task(
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
+    if cur_status in ("done", "archived"):
+        # Same wording as complete: a stale replayed script must read as a no-op.
+        return False, f"{explain_complete_refusal(conn, task_id)}; nothing to promote"
 
     if cur_status not in ("todo", "blocked"):
         hint = (
@@ -13673,6 +13676,8 @@ def triage_resolve_task(
         ).fetchone()
         if row is None:
             return False, f"task {task_id} not found"
+        if row["status"] in ("done", "archived"):
+            return False, f"{explain_complete_refusal(conn, task_id)}; nothing to triage-resolve"
         if row["status"] != "triage":
             hint = {
                 "blocked": "use 'hermes kanban unblock' instead",
