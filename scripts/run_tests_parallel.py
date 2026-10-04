@@ -304,7 +304,13 @@ def _unexecuted_call_site_nodeids(
         except (OSError, JunitError):
             out.append((f, sorted(nodes)))
             continue
-        missing = sorted(n for n in nodes if n not in failed and n not in passed)
+        ran = failed | passed
+        # A registered id covers its parametrized cases (`n[...]`) and, for a
+        # class id, its members (`n::...`): any one of them executing counts.
+        missing = sorted(
+            n for n in nodes
+            if not any(r == n or r.startswith((n + "[", n + "::")) for r in ran)
+        )
         if missing:
             out.append((f, missing))
     return out
