@@ -20,6 +20,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "ChatModelPins/pin-mismatch symbols: fork 15 hits in gateway/, upstream 0; gateway/chat_model_pins.py absent upstream."},
     "surfaces": ["gateway", "cli"]
   },
   {
@@ -35,6 +36,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "tools/approval.py::_is_cron_approval_context + contextvars.copy_context() at tools/delegate_tool.py:2960,:4153",
     "absorbed_date": "2026-08-31",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed (absorbed 2026-08-31, ownership already transferred). _is_cron_approval_context present on both (6/6 hits); upstream extraction 7926cf5e59 (2026-09-02) kept it ContextVar-first. No new D2 item."},
     "surfaces": [
       "cron",
       "gateway"
@@ -53,6 +55,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Fork INVOCATION_ID/darwin exit-code branch in gateway/run_shutdown.py: fork 1, upstream 0. Deliberate deployment divergence (do not upstream), unchanged."},
     "surfaces": [
       "gateway"
     ],
@@ -75,6 +78,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "agent/fork_ext/compaction_ext.py absent upstream; upstream has no hygiene-success announce (only test_hygiene_warning_lifecycle cooldown/notice sink)."},
     "surfaces": [
       "gateway",
       "discord",
@@ -97,6 +101,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "toolsets.py 'messaging'/'moa' and mixture_of_agents: fork present, upstream 0 hits; tools/mixture_of_agents_tool.py absent upstream."},
     "surfaces": [
       "agent"
     ]
@@ -116,6 +121,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
     "absorbed_date": "2026-06-26",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed (upstream #52844, parallel invention converged 2026-07-16). Upstream adapter still threads drop_pending_updates through _start_polling_resilient; fork keeps only the guard tests. No new D2 item."},
     "surfaces": [
       "telegram"
     ]
@@ -135,6 +141,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["cron/fork_ext/scheduler_ext.py::resolve_job_script_timeout (per-job/interval script-timeout ceiling; caller cron/scheduler.py:2242; upstream 0 hits)"], "evidence": "PARTIAL. Per-job reasoning: production on fork calls upstream's cron/scheduler.py::_resolve_job_reasoning_config (4e1dd1a74b, Victor Kyriazakos, 2026-08-20); fork scheduler_ext.resolve_cron_reasoning_config has no production caller (golden runner only). Global script-timeout chain: ledger F07-cron_tools_auth_misc.md row cron/scheduler_script.py::_get_script_timeout NO-PORT-NEEDED (upstream _timeout_from_env_or_config is the identical chain); fork get_script_timeout has no production caller. Residual live fork delta: resolve_job_script_timeout (per-job/interval ceiling, called from cron/scheduler.py:2242), upstream 0 hits."},
     "surfaces": [
       "cron"
     ],
@@ -154,6 +161,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "agent/fork_ext/relay_headers.py absent upstream; upstream X-Hermes-Session-Id hits are session-id sanitizing, not pool affinity/lane stamping."},
     "surfaces": [
       "agent"
     ],
@@ -176,6 +184,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "gateway/fork_ext/restart_codec.py absent upstream; codec symbols fork 16, upstream 0."},
     "surfaces": [
       "gateway"
     ]
@@ -196,6 +205,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "gateway/fork_ext/restart_policy.py absent upstream; restart_policy/initiator symbols in gateway/ fork 24, upstream 0."},
     "surfaces": [
       "gateway"
     ]
@@ -215,6 +225,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "persisted_route_lookup / PersistedSessionRouteLookup: fork 12/31 hits, upstream 0. Upstream hermes_cli/route_identity.py is base-URL normalization, a different concern."},
     "surfaces": [
       "gateway"
     ]
@@ -235,6 +246,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "EQUIVALENT-UPSTREAM", "evidence": "Scope gate: production dispatch on fork uses agent/tool_executor.py::_tool_search_scoped_names + model_tools.py scoped_deferrable_names check, byte-identical to upstream (7427b9d581, teknium1, 2026-05-29). fork_ext/tool_gate.py tool_search_scoped_names / resolve_tool_search_unwrap / strip_blocked_delegate_toolsets have no production caller; only pre_tool_block_from_builtin_gate (a 5-line passthrough) is live. code_execution exemption is moot on both trees: DELEGATE_BLOCKED_TOOLS (identical F/U) does not contain execute_code, so _strip_blocked_tools never strips code_execution. The listed canary tests exist on upstream and exercise upstream code."},
     "surfaces": [
       "agent",
       "delegation"
@@ -255,6 +267,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "session_list_denorm: fork 21 hits, upstream 0; hermes_state_ext.py absent upstream."},
     "surfaces": [
       "state"
     ]
@@ -276,6 +289,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
     "absorbed_date": "2026-07-16",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed (upstream #65895 / 7d27a31ce7, 2026-07-16). class ComputeHost present on both; upstream copy canonical. No new D2 item."},
     "surfaces": [
       "gateway"
     ]
@@ -298,6 +312,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "hermes_undo.py absent upstream; /redo CommandDef fork-only (3109924754, Kyzcreig, 2026-06-15). Upstream has its own coarser user-turn /undo row; the fork's half-turn rewind + redo branch is the contracted delta (its tests pass on fork/main)."},
     "surfaces": [
       "cli",
       "gateway",
@@ -322,6 +337,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["gateway/slash_commands_session.py::_handle_branch_command fork deltas folded into upstream's handler: _branch_point_len stamp (upstream 0 hits), _branch_post_thread_intro, running-agent release on thread branch"], "evidence": "Upstream dbcbd9d9db (teknium1, 2026-09-20, #66023; design by Angello Picasso #66014/#66024): /branch opens a sibling thread by default on Discord/Telegram/Slack/Matrix, --here keeps in-place. Third-party parallel invention, not our submission. Converged THIS sync: ledger CI6-M1-gatewaya.md row test_branch_thread_command.py dropped the fork's Discord-only _handle_branch_command shadow and folded fork deltas (_branch_point_len, thread intro, running-agent release) into upstream's handler; GatewayRunner MRO resolves _handle_branch_command to gateway.slash_commands_session (upstream). Registry row + fork alias are upstream's."},
     "surfaces": [
       "cli",
       "gateway",
@@ -343,6 +359,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "CommandDef('merge'): fork 1, upstream 0."},
     "surfaces": [
       "gateway",
       "discord"
@@ -363,6 +380,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["route-aware ultrafast capability: hermes_cli/models.py::resolve_fast_mode_capability (upstream 0 hits)", "gateway/slash_commands.py::_handle_fast_command shadow handler wins the MRO (defect, follow-up t_0b4d7394)"], "evidence": "/fast is upstream's command (8779a268a7, Teknium, 2026-04-10); fork registry row is byte-identical to upstream (normal/fast/auto/cold). Upstream now has session scope + --global (slash_commands_model.py _apply_fast_selection). Fork delta = ultrafast tier + route-aware capability. DEFECT found: GatewayRunner MRO resolves _handle_fast_command to the fork's gateway/slash_commands.py copy, which rejects 'auto'/'cold' the registry advertises (probe on 2d966948b0: '/fast auto' -> 'Unknown argument: auto'). Same shadow-handler class CI6-M1 fixed for /branch; follow-up card filed."},
     "surfaces": [
       "cli",
       "gateway"
@@ -381,6 +399,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "cc8e5ec2af (scalar coercion, byte-identical upstream); remainder = our open upstream PR #72014",
     "absorbed_date": "2026-08-31",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["plugins/platforms/discord/adapter.py quoted-bot-mention exemption in free-response channels (upstream PR #72014 open)"], "evidence": "Reconfirmed partial absorption: scalar coercion upstream (cc8e5ec2af). Quoted-mention remainder still fork-only ('quoted' in discord plugin: fork 1, upstream 0); our upstream PR #72014 still OPEN (REST read 2026-10-03). No new D2 item."},
     "surfaces": [
       "discord"
     ],
@@ -400,6 +419,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "intake sentinel symbols: fork present, upstream 0."},
     "surfaces": [
       "telegram"
     ],
@@ -418,6 +438,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "vendor checks in tools/cronjob_tools.py: fork 37 hits, upstream 0."},
     "surfaces": [
       "cron",
       "cli",
@@ -437,6 +458,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Upstream tests/plugins/test_telegram_polling_progress_ptb.py lacks the MagicMock-eviction helper (diff shows fork-only _evict_mocked_telegram)."},
     "surfaces": [
       "telegram",
       "ci"
@@ -453,8 +475,9 @@
     ],
     "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest — the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design — so keeping it is also what keeps #80661 landable.",
     "lifecycle": "upstream-intended",
-    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/80661",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/99292",
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "provider_model/context_full/reasoning absent from upstream gateway/runtime_footer.py. upstream_ref #80661 CLOSED unmerged 2026-08-31, superseded by #99292 (OPEN, REST read 2026-10-03); upstream_ref updated."},
     "surfaces": [
       "gateway",
       "discord",
@@ -481,6 +504,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Route-transition announce contract (route_change/announce symbols fork 100, upstream 14 unrelated route_changed client hits); fork tests pass on fork/main."},
     "surfaces": ["gateway", "discord", "telegram", "cli"]
   },
   {
@@ -504,6 +528,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Effort-only announce (from_effort/effort_only): fork present, upstream 0."},
     "surfaces": ["gateway", "discord", "telegram", "cli"]
   },
   {
@@ -522,6 +547,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "CLI 'session limit' cap classification in agent/: fork 4, upstream 0."},
     "surfaces": ["gateway", "discord", "telegram", "cli", "cron"]
   },
   {
@@ -538,6 +564,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/122138",
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Upstream still calls sync_plugin_provider_catalog() at module import (hermes_cli/models_catalog_static.py:405) and keeps eager _PROVIDER_PREFIXES; fork has no module-level call. Our upstream PR #122138 still OPEN."},
     "surfaces": [
       "cli",
       "gateway",
@@ -566,11 +593,32 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/123349",
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "provider_seam/GuardedDict: fork 242 hits, upstream 0 (2 unrelated test names). Our upstream PR #123349 still OPEN. Note: ledger F07-cron_tools_auth_misc.md row hermes_cli/model_switch_providers.py::list_authenticated_providers DROPPED the per-picker snapshot() pinning (facades remain the seam; refresh('picker') kept)."},
     "surfaces": [
       "cli",
       "gateway",
       "cron",
       "desktop"
+    ]
+  },
+  {
+    "feature": "gateway contracts accept the fork warm-client wire (session.create cache_scope, prompt.submit room) — frozen from pipecat-house-voice",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_warm_wire_contract.py",
+      "tests/tui_gateway/contracts/test_fork_warm_client_params.py"
+    ],
+    "paths": [
+      "tui_gateway/contracts/sessions.py",
+      "tui_gateway/contracts/prompt_voice.py",
+      "tests/fixtures/warm_wire_contract.json"
+    ],
+    "why": "The voice hub's warm client (pipecat-house-voice server/tier3_warm_client.py) drives this gateway over /api/ws and sends two params upstream does not know: session.create cache_scope (one prompt-cache scope for the warm pool, L3 t_c16a5ab2; read by methods_session._declared_cache_scope_param) and prompt.submit room (trusted origin room). The 2026-10-01 parity merge 2d966948b0 (#1624) replaced tui_gateway/contracts with extra=forbid models that dropped both; nothing in this repo failed, and on ACE-AI every tier-2 voice turn answered 4000 for ~30 min on 2026-10-03 19:30 PT (t_f146c725). Parity-merge rule: when upstream rewrites a Params model under tui_gateway/contracts, re-add every field in tests/fixtures/warm_wire_contract.json; the fixture is GENERATED by pipecat-house-voice scripts/export_warm_wire_fixture.py (pcv CI fails if its client changes without a re-export; the canary pins payload_sha256), never hand-edit it. RED-proven 2026-10-03 on the 2d966948b0 contract files (4 frames rejected with the incident's exact text) and by widening base.py to extra=allow (unknown-key arm).",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "voice"
     ]
   }
 ]

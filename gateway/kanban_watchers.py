@@ -1465,6 +1465,47 @@ class GatewayKanbanWatchersMixin:
         # (#562) — the caller still refuses on 0 or >1.
         return creator_found or found
 
+    def _wake_route_profile(self, plat: Any, sub: dict) -> Optional[str]:
+        """The chat's ``profile_routes`` match for a wake, or None.
+
+        Raises ``ProfileRouteRejected`` for a route to an unserved profile.
+        """
+        from gateway.session import SessionSource
+
+        route_profile = getattr(self, "_profile_name_for_source", None)
+        if not callable(route_profile):
+            return None
+        return route_profile(SessionSource(
+            platform=plat,
+            chat_id=sub["chat_id"],
+            chat_type=str(sub.get("chat_type") or "") or "group",
+            thread_id=sub.get("thread_id") or None,
+            scope_id=sub.get("scope_id") or None,
+        )) or None
+
+    def _wake_gate_profile(self, plat: Any, sub: dict, profile: Optional[str]) -> str:
+        """The profile whose lane runs this wake's turn, for the contention gate.
+
+        Same resolution as ``_build_wake_source`` (the explicit profile, else
+        the chat's profile route), then THIS gateway's own profile. Never None
+        (``lane_contended`` skips None, so an unstamped sub bypassed the lane
+        gate) and never the literal ``default`` (a ``-p coder`` gateway serves
+        coder). Prism #1679 P1 76556142d195 + 86be5c93cd27.
+        """
+        if profile:
+            return profile
+        try:
+            routed = self._wake_route_profile(plat, sub)
+        except Exception:
+            routed = None  # a rejected route is refused at delivery
+        if routed:
+            return routed
+        active = getattr(self, "_active_profile_name", None)
+        try:
+            return (active() if callable(active) else None) or "default"
+        except Exception:
+            return "default"
+
     def _build_wake_source(
         self,
         plat: Any,
@@ -1492,15 +1533,7 @@ class GatewayKanbanWatchersMixin:
         from gateway.session import SessionSource
 
         if not profile:
-            route_profile = getattr(self, "_profile_name_for_source", None)
-            if callable(route_profile):
-                profile = route_profile(SessionSource(
-                    platform=plat,
-                    chat_id=sub["chat_id"],
-                    chat_type=str(sub.get("chat_type") or "") or "group",
-                    thread_id=sub.get("thread_id") or None,
-                    scope_id=sub.get("scope_id") or None,
-                )) or None
+            profile = self._wake_route_profile(plat, sub)
 
         # Rebuild the creator's real session scope from the chat_type
         # persisted on the subscription row (#56580). build_session_key()
@@ -1595,10 +1628,20 @@ class GatewayKanbanWatchersMixin:
             )
         if not adapter_supports_push(adapter):
             return _fail(f"{platform_str} adapter cannot push a wake turn")
+        sub = {
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "thread_id": str(params.get("thread_id") or "").strip(),
+            "user_id": str(params.get("user_id") or "").strip(),
+            "user_id_alt": str(params.get("user_id_alt") or "").strip(),
+            "scope_id": str(params.get("scope_id") or "").strip(),
+        }
         # Same contention gate as the kanban notifier (t_74bf5296): under
-        # host load or a capped requester lane the caller sends a notify.
+        # host load or a capped lane of the profile that would run the turn,
+        # the caller sends a notify.
         downgrade = await _to_thread_process_service(
-            _wake_downgrade_reason, self, profile or "default",
+            _wake_downgrade_reason, self,
+            self._wake_gate_profile(plat, sub, profile or None),
         )
         if downgrade:
             logger.info(
@@ -1610,14 +1653,6 @@ class GatewayKanbanWatchersMixin:
                 "error": f"downgraded: {downgrade}",
                 "downgraded": downgrade,
             }
-        sub = {
-            "chat_id": chat_id,
-            "chat_type": chat_type,
-            "thread_id": str(params.get("thread_id") or "").strip(),
-            "user_id": str(params.get("user_id") or "").strip(),
-            "user_id_alt": str(params.get("user_id_alt") or "").strip(),
-            "scope_id": str(params.get("scope_id") or "").strip(),
-        }
         try:
             source, identity = self._build_wake_source(
                 plat, adapter, sub, profile=profile or None,
@@ -2126,7 +2161,8 @@ class GatewayKanbanWatchersMixin:
                     # the delivery, so it is never downgraded.
                     if mode in ("notify+wake", "wake") and sub["platform"] != "api_server":
                         wake_downgrade = await _to_thread_process_service(
-                            _wake_downgrade_reason, self, sub.get("notifier_profile"),
+                            _wake_downgrade_reason, self,
+                            self._wake_gate_profile(plat, sub, sub_profile or None),
                         )
                         if wake_downgrade:
                             logger.info(

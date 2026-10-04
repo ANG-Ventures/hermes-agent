@@ -930,6 +930,7 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
+        "overview",   # fork-only (t_66ffcd4f): handler in gateway/slash_commands.py
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

@@ -305,6 +305,25 @@ def _raise_if_blocked(tool_name, result):
 
 # ---- UDS transport (local backend) ---------------------------------------
 
+_AGENT_TOOLS_ALIAS_MODULE = '''\
+"""Neutral import alias for the sandbox tool stubs.
+
+The canonical generated module is ``hermes_tools.py``; it predates the
+wire-neutrality work and its name is load-bearing for existing scripts.
+This alias re-exports it under a brand-free name so model-facing
+descriptions (which egress inside tools[] on every request) can reference
+an import that does not name the application (t_79ef440f).
+"""
+
+from hermes_tools import *  # noqa: F401,F403
+from hermes_tools import (  # noqa: F401
+    ToolCallBlocked,
+    json_parse,
+    shell_quote,
+    retry,
+)
+'''
+
 _UDS_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs."""
 import json, os, socket, shlex, threading, time
@@ -666,6 +685,7 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
+        _ship_file_to_remote(env, f"{sandbox_dir}/agent_tools.py", _AGENT_TOOLS_ALIAS_MODULE)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (tools.thread_context) — else sandbox RPC tool calls lose approval routing.
@@ -964,15 +984,15 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "Scripts run in the session's working directory. Interpreter: "
             "the project's activated venv/conda python when one is active "
             "(VIRTUAL_ENV/CONDA_PREFIX — matches terminal()); otherwise "
-            "Hermes's own python (the common case — stdlib plus Hermes's "
-            "deps; check `import x` before relying on project packages)."
+            "the host process's own python (the common case — stdlib plus its "
+            "bundled deps; check `import x` before relying on project packages)."
         )
     # Remote hosts that fail open to per-call are not worth schema words; the result's
     # `kernel` field tells the truth per call.
     # Session kernels are always on (kernel_mode retired in #96787): persistence is part of the tool's one
     # description, not a bolt-on paragraph behind a dead conditional.
     description = (
-        "Run Python that calls Hermes tools programmatically. Use when you "
+        "Run Python that calls agent tools programmatically. Use when you "
         "need 3+ tool calls with logic between them: filtering/reducing "
         "large outputs before they enter context, branching, or loops "
         "(N pages/files, retry on failure). Use normal tool calls for "
@@ -980,12 +1000,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "Calls run in a persistent session kernel: variables, imports, and "
         "loaded data survive across execute_code calls, so build on earlier "
         "work instead of re-loading it. A timed-out or interrupted call loses that state.\n\n"
-        f"Available via `from hermes_tools import ...`:\n\n"
+        f"Available via `from agent_tools import ...` (alias of the generated RPC stub module):\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"
-        "Helpers require imports: `from hermes_tools import json_parse, shell_quote, retry`. "
+        "Helpers require imports: `from agent_tools import json_parse, shell_quote, retry`. "
         "json_parse(text) — tolerant "
         "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
         "dynamic shell args; retry(fn, max_attempts=3, delay=2) — exponential backoff."
@@ -998,7 +1018,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
             "properties": {
                 "code": {"type": "string", "description": (
                     "Python code to execute. Import tools with "
-                    f"`from hermes_tools import {import_str}` "
+                    f"`from agent_tools import {import_str}` "
                     "and print your final result to stdout.")},
                 "reset": {"type": "boolean", "description": (
                     "Discard the kernel's persistent state and start fresh before running this code.")},

@@ -55,8 +55,10 @@ def _mid_compression_durable_stamp(agent, db: SessionDB, session_id: str) -> Non
     from agent.conversation_compression import _CompressionActivityHeartbeat
 
     heartbeat = _CompressionActivityHeartbeat(agent, interval_seconds=3600.0)
-    # Open the persist window so the tick writes through, exactly like a >60s compression.
-    agent._session_activity_last_persist_mono = 0.0
+    # Open the persist window so the tick writes through, exactly like a >60s compression. -inf, not 0.0:
+    # monotonic() counts from host boot, so 0.0 is inside the 60 s window on a CI VM booted < 60 s ago.
+    from agent.session_activity import SESSION_ACTIVITY_PERSIST_NEVER
+    agent._session_activity_last_persist_mono = SESSION_ACTIVITY_PERSIST_NEVER
     heartbeat._touch("context compression in progress")
     row = db.get_session(session_id)
     assert row["last_activity_description"] == "context compression in progress"
