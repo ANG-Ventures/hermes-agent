@@ -487,9 +487,18 @@ jobs:
     # resolve to an unset variable). Public repo: GitHub-hosted minutes are
     # free; Blacksmith is reached only through the overflow placement plan
     # above, never a hardcoded label (t_e95fdb01, Ace ruling 2026-10-03).
+    # VM-class lane (t_78d851d1, Ace ladder 2026-10-03 rung 3): when the kill switch
+    # CI_E2E_VM_ENABLED is 'true' AND the Studio load gate (hermes-home
+    # scripts/ci-e2e-vm-gate.py) has set CI_E2E_VM_ROUTE=open (an ace-e2e-vm host
+    # reports load1 < nproc-8 and no inference/transcode burst), the job goes to
+    # the ace-e2e-vm runner on ACE-AI / ACE-MEDIA. Otherwise it falls through to
+    # the unchanged static tail below.
+    # TRUST GUARD (same rule as CI_BLACKSMITH_SLICES above): only push, merge_group and same-repo
+    # pull_request may reach the VM class. Fork PRs and workflow_dispatch never leave GitHub /
+    # Blacksmith: the class runs with seccomp/AppArmor unconfined on hosts we live on.
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
     # 45, not 30: e2e measured 26 min on GitHub-hosted (#1624 rounds 4-7).
     timeout-minutes: 45
     steps:
@@ -512,6 +521,11 @@ jobs:
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "messaging"]'
           test-environment: 'true'
           prune-python-cache: true
+          # Restore-only on self-hosted (ace-e2e-vm): saving pushed ~170 MB x3 up the home
+          # uplink and took 12 of the job's 26 min (proof run 37170873916). Hosted runs save.
+          save-tools-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
+          save-python-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
+          save-node-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
 
       - name: Install Node deps and build the Ink TUI
         # tests/e2e/core/terminal drives the real `hermes --tui` over a PTY;
@@ -617,7 +631,16 @@ jobs:
     # split (longest shard now 11.6 min on Blacksmith 4vCPU). Public repo:
     # GitHub-hosted minutes are free, so ubuntu-latest is the default; repo var
     # CI_E2E_RUNNER overrides (t_e95fdb01, Ace ruling 2026-10-03).
-    runs-on: ${{ vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
+    # VM-class lane (t_78d851d1): same switch + gate as the e2e job above. The
+    # ace-e2e-vm runner keeps no-new-privileges (no sudo) and ships bubblewrap in
+    # its image; seccomp/apparmor/systempaths are unconfined so bwrap can make its
+    # PID namespace (fleet-ops-scripts ci-runners/e2e-vm). Closed gate or switch
+    # off -> CI_E2E_RUNNER / ubuntu-latest exactly as before.
+    # Two shards stay off the VM class (proof run 37170873916): hosts/test_libc_musl needs a docker
+    # daemon (the class has no socket, so it skips and the suite reads red) and
+    # core/test_fresh_process_entrypoints asserts doctor never probes systemctl, which it does when
+    # /.dockerenv exists.
+    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -630,6 +653,17 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Persist the runner's git alternate
+        # ace-e2e-vm runners (t_78d851d1) export GIT_ALTERNATE_OBJECT_DIRECTORIES so
+        # checkout borrows objects from a host mirror. The suite spawns git with an
+        # allowlisted env that drops that var, so its local "remote" could not read
+        # them (run 37170424601: "Could not read 64eb1c8c"). Writing the alternate
+        # into the repo makes it env-independent. No-op where the var is unset.
+        run: |
+          [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ] || exit 0
+          printf '%s\n' "$GIT_ALTERNATE_OBJECT_DIRECTORIES" | tr ':' '\n' >> "$(git rev-parse --git-path objects/info/alternates)"
+          git fsck --connectivity-only --no-progress >/dev/null 2>&1 || git count-objects -v
 
       - name: Fetch upstream release tags
         # Fork: the release tags (v2026.*) are cut on NousResearch/hermes-agent and this
@@ -701,9 +735,13 @@ jobs:
         # systemd bus, only the test tmp writable). Ubuntu 24.04 restricts
         # unprivileged user namespaces, which bwrap needs.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # The ace-e2e-vm image ships bwrap and its container has no sudo
+          # (no-new-privileges): install/relax only where bwrap is missing.
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq bubblewrap
+          fi
+          sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
           # The suite's own probe (_bwrap_usable, same flags as every sandboxed
           # run): without it the suite silently runs the updater unsandboxed.
           source .venv/bin/activate
