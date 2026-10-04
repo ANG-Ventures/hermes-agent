@@ -494,7 +494,7 @@ jobs:
     # the unchanged static tail below.
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || github.repository == 'ANG-Ventures/hermes-agent' && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -625,7 +625,7 @@ jobs:
     # its image; seccomp/apparmor/systempaths are unconfined so bwrap can make its
     # PID namespace (fleet-ops-scripts ci-runners/e2e-vm). Closed gate or switch
     # off -> CI_E2E_RUNNER / Blacksmith exactly as before.
-    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ${{ github.repository == 'ANG-Ventures/hermes-agent' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
