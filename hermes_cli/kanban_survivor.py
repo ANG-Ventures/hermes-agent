@@ -802,7 +802,8 @@ def _pinned_submodule(path, parent):
     """True when ``path`` is a checked-out submodule holding no bytes of its own.
 
     The parent's index pins a ``160000`` gitlink at ``path``; the submodule's
-    HEAD is exactly that sha; a remote-tracking ref in the submodule holds it;
+    HEAD is exactly that sha; a remote-tracking ref in the submodule holds it
+    (or FETCH_HEAD shows a configured remote served it by sha);
     and ``status --ignored`` shows nothing. Such a checkout is reproducible from
     the parent commit plus the submodule's remote, so the parent's survivor
     already covers it (t_adf672fb: t_327d1c1b's ``sat/`` clone with an
@@ -828,9 +829,44 @@ def _pinned_submodule(path, parent):
             return False
         held = _git(path, "for-each-ref", "--contains", fields[1], "--format=%(refname)",
                     "refs/remotes", check=False)
-        return held.returncode == 0 and bool(held.stdout.strip())
+        if held.returncode == 0 and held.stdout.strip():
+            return True
+        return _fetched_from_remote(path, fields[1])
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
+
+
+def _url_key(url):
+    url = url.strip().rstrip("/")
+    return url[:-4] if url.endswith(".git") else url
+
+
+def _fetched_from_remote(path, sha):
+    """True when FETCH_HEAD shows a configured remote served a tip holding ``sha``.
+
+    ``git submodule update`` fetches a pinned commit BY SHA when no branch of
+    the submodule's remote contains it (a fork whose gitlink names an upstream
+    merge GitHub serves from the fork network). No remote-tracking ref is
+    written then; FETCH_HEAD is the record that the remote answered for the sha
+    (t_0b0f392d: house-voice ``deps/libpeer`` at 9319aa4 held 5 cards).
+    """
+    head = _git(path, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD", check=False)
+    if head.returncode:
+        return False
+    fetch_head = Path(head.stdout.decode().strip())
+    if not fetch_head.is_file():
+        return False
+    urls = _git(path, "config", "--get-regexp", r"^remote\..*\.url$", check=False)
+    remotes = {_url_key(line.split(" ", 1)[1])
+               for line in urls.stdout.decode("utf-8", "replace").splitlines() if " " in line}
+    for line in fetch_head.read_text("utf-8", "replace").splitlines():
+        tip, _, rest = line.partition("\t")
+        _, _, source = rest.rpartition(" of ")
+        if not source or _url_key(source) not in remotes:
+            continue
+        if _git(path, "merge-base", "--is-ancestor", sha, tip, check=False).returncode == 0:
+            return True
+    return False
 
 
 def _drop_pinned_submodules(repos, parent_of):
