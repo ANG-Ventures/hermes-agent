@@ -424,7 +424,28 @@
     "feature": "discord free-response channels: scalar coercion + quoted-bot-mention exemption",
     "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
-      "tests/fork_canaries/test_fork_canary_discord_free_response.py"
+      "tests/fork_canaries/test_fork_canary_discord_free_response.py",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_quoted_other_bot_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_other_bot_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_nickname_form_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_other_bot_plus_self_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_no_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_only_mention_position_flips_dispatch",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_quoted_mention_outside_free_response_is_upstream_shape",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_exemption_is_scoped_to_free_response_even_without_require_mention",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
+    ],
+    "call_site": "plugins/platforms/discord/adapter.py::DiscordAdapter._discord_message_admission",
+    "call_site_tests": [
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_quoted_other_bot_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_other_bot_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_nickname_form_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_other_bot_plus_self_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_no_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_only_mention_position_flips_dispatch",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_quoted_mention_outside_free_response_is_upstream_shape",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_exemption_is_scoped_to_free_response_even_without_require_mention",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
     ],
     "paths": [
       "plugins/platforms/discord/adapter.py"
