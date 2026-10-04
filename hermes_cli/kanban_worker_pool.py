@@ -28,6 +28,7 @@ board loop). A change that ticks boards concurrently must add a lock here.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import time
@@ -60,6 +61,10 @@ HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\
                          re.IGNORECASE | re.MULTILINE)
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
+IGNORED_PIN_WARN_SECONDS = 300
+
+_log = logging.getLogger(__name__)
+_ignored_pin_warned: Dict[str, float] = {}
 
 
 class PoolError(ValueError):
@@ -277,9 +282,58 @@ def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple
 # -- the classifier (PRD §5.3) ----------------------------------------------
 
 def card_pin(body: Optional[str]) -> Optional[str]:
-    """The card's ``host:<x>`` pin, lower-cased (first line-anchored match)."""
+    """The card's raw ``host:<x>`` line, lower-cased (first line-anchored
+    match). Raw: use :func:`resolve_pin` to decide whether it IS a pin."""
     m = HOST_PIN_RE.search(body or "")
     return m.group(1).lower() if m else None
+
+
+def resolve_pin(body: Optional[str], known_hosts: Iterable[str]) -> Tuple[Optional[str], Optional[str]]:
+    """``(pin, ignored)``. A pin is ONLY ``any``, ``studio`` or a host id the
+    pool registry knows; any other ``host: <word>`` line (an HTTP header, a
+    config snippet) is prose: ``pin`` None, the word returned as ``ignored``.
+    So a card never waits on a host that does not exist."""
+    raw = card_pin(body)
+    if raw is None or raw in (PIN_ANY, PIN_STUDIO) or raw in set(known_hosts or ()):
+        return raw, None
+    return None, raw
+
+
+def note_ignored_pin(card_id: str, word: str) -> None:
+    """One WARN per card per 5 minutes for a ``host:`` line that is not a pin."""
+    now = time.monotonic()
+    last = _ignored_pin_warned.get(card_id)
+    if last is None or now - last >= IGNORED_PIN_WARN_SECONDS:
+        _ignored_pin_warned[card_id] = now
+        _log.warning("kanban pool: card %s: ignored unknown host pin %s (routed by policy)",
+                     card_id, word)
+
+
+def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
+    """Every host id the pool files name (roles hosts with the kanban-worker
+    role, sidecar rows, priority), read WITHOUT validation: a disabled or
+    refused pool still knows its hosts, so a real pin stays fail-closed
+    while prose never becomes one. Unreadable files name nothing."""
+    out: List[str] = []
+    try:
+        roles = _read_json(Path(fleet_dir) / ROLES_FILE)
+    except (OSError, ValueError):
+        roles = None
+    try:
+        side = _read_json(Path(fleet_dir) / SIDECAR_FILE)
+    except (OSError, ValueError):
+        side = None
+    if isinstance(roles, dict) and isinstance(roles.get("hosts"), dict):
+        for hid, row in roles["hosts"].items():
+            r = row.get("roles") if isinstance(row, dict) else None
+            if isinstance(hid, str) and isinstance(r, dict) and ROLE in r:
+                out.append(hid.lower())
+    if isinstance(side, dict):
+        hosts = side.get("hosts")
+        out += [h.lower() for h in (hosts if isinstance(hosts, dict) else {}) if isinstance(h, str)]
+        prio = side.get("priority")
+        out += [h.lower() for h in (prio if isinstance(prio, list) else []) if isinstance(h, str)]
+    return tuple(dict.fromkeys(out))
 
 
 def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_content: bool,
@@ -306,14 +360,14 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         # foreign_lane.worker_command runs the lane with a LOCAL Popen; the
         # ssh terminal backend never sees it, so placement would be a lie.
         return False, "native_command", None
-    pin = card_pin(body)
+    pin, _ignored = resolve_pin(body, pool.hosts or ())
     if pin == PIN_STUDIO:
         return False, "host_studio", None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
-        # Any other pin is a remote pin; an unknown id waits pin_unknown_host
-        # at take() and never falls back to a local spawn.
+        # A KNOWN pool host: a remote pin. A disabled one waits at take()
+        # and never falls back to a local spawn. An unknown word is no pin.
         return True, None, "pin"
     bound = set(pool.studio_bound_skills or ())
     if any(s in bound for s in (skills or ())):

@@ -3689,13 +3689,18 @@ def _native_command_profile(assignee: str, cache: dict) -> bool:
     return cache[assignee]
 
 
+_LINK_CHUNK = 250
+
+
 def _linked_ids(conn, ids) -> set:
     """Ids among ``ids`` with any task link: ONE query per tick (bounded by
     the ready set), not one per row."""
     ids = list(ids)
     out: set = set()
-    for i in range(0, len(ids), 500):
-        chunk = ids[i:i + 500]
+    # Each id is bound twice (parent + child): 250 ids = 500 variables, under
+    # SQLite's historical 999 limit (SQLITE_MAX_VARIABLE_NUMBER < 3.32).
+    for i in range(0, len(ids), _LINK_CHUNK):
+        chunk = ids[i:i + _LINK_CHUNK]
         marks = ",".join("?" * len(chunk))
         for r in conn.execute(
             f"SELECT parent_id, child_id FROM task_links "
@@ -3745,7 +3750,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
         native_command=native,
     )
-    pin = _kwp.card_pin(row["body"])
+    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
+    if ignored is not None:
+        _kwp.note_ignored_pin(row["id"], ignored)
     if ok:
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
@@ -4272,10 +4279,19 @@ def _dispatch_once_locked(
         # No plan this tick (pool disabled, refused, no hosts, proc_paused,
         # or a caller that plans no pool): a REMOTE pin still never runs
         # locally (I-11). It waits until a plan can place it.
+        # A pin is only a host the pool files name: with no pool configured
+        # a ``host: <word>`` line is prose and the card runs locally.
         from hermes_cli import kanban_worker_pool as _kwp
+        _known = None
         for r in ready_rows:
-            _pin = _kwp.card_pin(r["body"])
-            if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
+            if _kwp.card_pin(r["body"]) is None:
+                continue
+            if _known is None:
+                _known = _kwp.known_host_ids(_kb.kanban_home() / "fleet")
+            _pin, _ignored = _kwp.resolve_pin(r["body"], _known)
+            if _ignored is not None:
+                _kwp.note_ignored_pin(r["id"], _ignored)
+            elif _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:

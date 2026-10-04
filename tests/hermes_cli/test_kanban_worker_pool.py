@@ -392,6 +392,7 @@ def test_per_host_profile_overrides_reach_the_classifier(tmp_path):
 
 
 def test_remote_pin_without_a_plan_never_spawns_locally(kanban_home):
+    _write_pool(kanban_home / "fleet")
     with kb.connect_closing() as conn:
         (pinned,) = _make(conn, 1, body="host:ace-ai")
         (plain,) = _make(conn, 1)
@@ -406,9 +407,9 @@ def test_dry_run_checks_the_pin_and_leaves_the_shared_plan_alone(kanban_home):
         (bad,) = _make(conn, 1, body="host:nope")
         (good,) = _make(conn, 1, body="host:ace-ai")
         res, _ = _tick(conn, spillover=plan, spawn_limit=4, dry_run=True)
-    assert [t for t, *_ in res.spawned] == [good]
+    # ``host:nope`` names no pool host: prose, not a pin (Apollo r4 A).
     assert res.placed == [(good, "ace-ai")]
-    assert res.placement_waits[bad] == "pin_unknown_host"
+    assert bad in [t for t, *_ in res.spawned] and bad not in res.placement_waits
     assert plan.budget == 1
 
 
@@ -449,6 +450,7 @@ def test_pin_to_a_host_that_does_not_serve_the_assignee_says_so():
 def test_pool_unavailable_pins_are_logged(kanban_home, caplog):
     import logging
     caplog.set_level(logging.INFO)
+    _write_pool(kanban_home / "fleet")
     with kb.connect_closing() as conn:
         _make(conn, 1, body="host:ace-ai")
         _tick(conn, spillover=None, spawn_limit=4)
@@ -699,3 +701,58 @@ def test_route_scan_is_bounded_per_tick(kanban_home, monkeypatch):
     big = _link_queries(None, 30)
     assert big == small
     assert len(scans) == 2
+
+
+# -- Apollo review r4 (PR #1730) -------------------------------------------
+
+def test_prose_host_line_with_no_pool_spawns_locally(kanban_home):
+    """(A) ``Host: example.com`` is an HTTP header, not a pin: with no pool
+    configured the card runs locally instead of waiting forever."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="Repro:\nHost: example.com\n")
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert spawned == [(tid, None)] and tid not in res.placement_waits
+
+
+def test_prose_host_line_with_a_pool_routes_by_policy(kanban_home):
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="Host: example.com")
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    assert spawned == [(tid, "ace-ai")] and res.placed == [(tid, "ace-ai")]
+
+
+def test_known_pool_host_still_pins(kanban_home):
+    _write_pool(kanban_home / "fleet")
+    assert kwp.resolve_pin("host:ace-ai", kwp.known_host_ids(kanban_home / "fleet")) == ("ace-ai", None)
+    assert kwp.resolve_pin("host:ci-box", kwp.known_host_ids(kanban_home / "fleet")) == ("ci-box", None)
+    assert kwp.resolve_pin("  host: localhost", ("ace-ai",)) == (None, "localhost")
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host:ace-ai")
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=4)
+    assert spawned == [(tid, "ace-ai")]
+
+
+def test_ignored_pin_warns_once_per_card_per_5_minutes(monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger=kwp.__name__)
+    monkeypatch.setattr(kwp, "_ignored_pin_warned", {})
+    clock = [1000.0]
+    monkeypatch.setattr(kwp.time, "monotonic", lambda: clock[0])
+    for _ in range(3):
+        kwp.note_ignored_pin("t_1", "example.com")
+    kwp.note_ignored_pin("t_2", "localhost")
+    clock[0] += kwp.IGNORED_PIN_WARN_SECONDS
+    kwp.note_ignored_pin("t_1", "example.com")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 3 and all("ignored unknown host pin" in m for m in msgs)
+
+
+def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
+    """(B) 1200 ids on a real sqlite capped at the historical 999 variables."""
+    import sqlite3
+    with kb.connect_closing() as conn:
+        a, b = _make(conn, 2)
+        kb.link_tasks(conn, a, b)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        ids = [f"t_fake{i:05d}" for i in range(1198)] + [a, b]
+        assert kbd._linked_ids(conn, ids) == {a, b}

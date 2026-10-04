@@ -71,15 +71,15 @@ def running_split(ledger: Dict[str, Tuple[int, Dict[str, int]]]
     return local, by_host
 
 
-def any_remote_pin(boards, connect) -> bool:
-    """A ready card on any board carries a remote ``host:<id>`` pin."""
+def any_remote_pin(boards, connect, known_hosts=()) -> bool:
+    """A ready card on any board pins a KNOWN pool host (``host:<id>``)."""
     for b in boards:
         slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
         conn = None
         try:
             conn = connect(board=slug)
             for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall():
-                pin = kwp.card_pin(body)
+                pin, _ignored = kwp.resolve_pin(body, known_hosts)
                 if pin is not None and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO):
                     return True
         except Exception:
@@ -136,7 +136,8 @@ class GateTickBuilder:
             gate.pool = {"planned": False, "reason": "proc_paused"}
             return None
         pins_only = gate.band not in ("spilling", "paused")
-        if pins_only and not any_remote_pin(boards, self._connect):
+        if pins_only and not any_remote_pin(boards, self._connect,
+                                            kwp.known_host_ids(self._fleet_dir())):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
