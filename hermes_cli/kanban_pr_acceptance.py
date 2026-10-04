@@ -165,11 +165,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
+        app_ids: dict[str, int | None] = {}
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
-            # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
-            legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
+            # A status satisfies an unpinned context; a pinned context only when the pinned
+            # app's own bot posted it (GitHub accepts that; a human/other-app status is the spoof).
+            legacy = [s for s in statuses if s["context"] == context and
+                      (app_id in (None, -1) or _status_app_id(s, app_ids, profile_home) == app_id)]
             selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
             if not selected:
                 outcomes.append("missing")
@@ -179,10 +182,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
                 outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
+                entry = {"name": context, "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                    "classification": classification, "conclusion": outcome}
+                if not is_run:
+                    entry["satisfied_by"] = f"status({(check.get('creator') or {}).get('login')})"
+                receipt["checks"].append(entry)
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
@@ -202,6 +208,24 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
+
+
+def _status_app_id(status: dict, cache: dict, profile_home: str | None) -> int | None:
+    """App id behind a commit status's creator, or None for a human/unresolvable creator.
+
+    Statuses carry no app id; a GitHub App's bot user is ``<app-slug>[bot]`` (type ``Bot``),
+    and ``GET /apps/{slug}`` is public, so the slug resolves to the id the rule pins."""
+    creator = status.get("creator") or {}
+    login = creator.get("login") or ""
+    if creator.get("type") != "Bot" or not login.endswith("[bot]"):
+        return None
+    slug = login[: -len("[bot]")]
+    if slug not in cache:
+        try:
+            cache[slug] = _api(f"apps/{quote(slug, safe='')}", profile_home=profile_home).get("id")
+        except (_GateAuthError, subprocess.CalledProcessError):
+            cache[slug] = None
+    return cache[slug]
 
 
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
