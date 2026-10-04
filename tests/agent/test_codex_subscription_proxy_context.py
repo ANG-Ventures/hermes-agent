@@ -68,7 +68,7 @@ def advertised(monkeypatch, tmp_path, cpa_registered):
 
 def _ctx(model, provider="cpa", cached=None):
     """Resolve with network probes dead and the persistent cache controlled."""
-    with patch("agent.model_metadata.requests.get", side_effect=AssertionError("no network")), \
+    with patch("agent.model_metadata.model_metadata_http.get", side_effect=AssertionError("no network")), \
          patch("agent.model_metadata.get_cached_context_length", return_value=cached), \
          patch("agent.model_metadata.save_context_length"), \
          patch("agent.model_metadata._query_local_context_length", return_value=None), \
@@ -106,7 +106,7 @@ def test_stale_persisted_api_window_cannot_win(large):
 
 
 def test_cpa_matches_openai_codex(large):
-    with patch("agent.model_metadata.requests.get", side_effect=AssertionError("no network")):
+    with patch("agent.model_metadata.model_metadata_http.get", side_effect=AssertionError("no network")):
         codex = mm._resolve_codex_oauth_context_length("gpt-6.1-sol")
     assert _ctx("gpt-6.1-sol") == codex == 900_000
 

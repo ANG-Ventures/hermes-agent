@@ -223,14 +223,31 @@ def test_process_event_source_does_not_reuse_wrong_profile_origin():
     assert source.profile == "work"
 
 
+class _AdmittingHandler(AsyncMock):
+    """Transport double whose accepted insertion issues the production receipt
+    (``admit_internal_event`` raises WakeNotAccepted without it)."""
+
+    async def _execute_mock_call(self, event, *args, **kwargs):
+        result = await super()._execute_mock_call(event, *args, **kwargs)
+        event._gateway_accepted = True
+        return result
+
+
 @pytest.mark.asyncio
 async def test_async_injection_ack_outcome_distinguishes_delivery_from_ended_session():
+    """Parity 2026-10-01 (ledger F02c): the injection seam speaks upstream's
+    ``True`` (accepted) / ``False`` (retryable) / ``None`` (no route)
+    vocabulary. The pinned-parent "ended session" drop moved out of
+    ``_inject_watch_notification`` into the delivery pre-flight
+    (``_classify_completion_target``; pinned by
+    ``test_completion_delivery.test_json_outbox_drop_requires_proven_terminal_target``),
+    so here the parent id only rides the event as ``gateway_session_id``."""
     from gateway.session import SessionSource
     from gateway.platforms.base import Platform
 
     runner = object.__new__(GatewayRunner)
     adapter = MagicMock()
-    adapter.handle_message = AsyncMock()
+    adapter.handle_message = _AdmittingHandler()
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._profile_adapters = {}
     runner.session_store = MagicMock()
@@ -244,22 +261,23 @@ async def test_async_injection_ack_outcome_distinguishes_delivery_from_ended_ses
             )
         )
     }
-    current = SimpleNamespace(session_id="sess-parent")
-    runner.__dict__["_async_session_store"] = SimpleNamespace(
-        _store=runner.session_store,
-        get_or_create_session=AsyncMock(return_value=current),
-    )
     event = {
         "type": "async_delegation",
         "session_key": "agent:main:telegram:dm:123",
         "parent_session_id": "sess-parent",
     }
 
-    assert await runner._inject_watch_notification("done", event) == "delivered"
+    assert await runner._inject_watch_notification("done", event) is True
+    adapter.handle_message.assert_awaited_once()
+    injected = adapter.handle_message.await_args.args[0]
+    assert injected.metadata["gateway_session_id"] == "sess-parent"
+
+    # An adapter that never issues the acceptance receipt is a retryable
+    # outcome (False), not a delivery and not a drop.
+    adapter.handle_message = AsyncMock()
+    assert await runner._inject_watch_notification("done", event) is False
     adapter.handle_message.assert_awaited_once()
 
-    current.session_id = "sess-new"
-    assert await runner._inject_watch_notification("done", event) == "temporary"
-    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value=None))
-    assert await runner._inject_watch_notification("done", event) == "dropped"
-    assert adapter.handle_message.await_count == 1
+    # No routing metadata at all is None (dropped: nothing any consumer could route).
+    assert await runner._inject_watch_notification("done", {"type": "async_delegation", "session_key": ""}) is None
+    adapter.handle_message.assert_awaited_once()

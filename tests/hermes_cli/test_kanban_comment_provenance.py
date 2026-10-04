@@ -31,6 +31,7 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -301,7 +302,7 @@ def test_rebuild_spec_keeps_the_provenance_columns(fresh_home):
     """A drifted-table rebuild copies only columns present in BOTH shapes, so
     the rebuild spec must carry the new columns or a rebuild silently erases
     provenance that the additive pass just added."""
-    create_sql, _indexes = kb._REBUILD_SPECS["task_comments"]
+    create_sql, _indexes = kbc._REBUILD_SPECS["task_comments"]
     assert "run_id" in create_sql and "session_ref" in create_sql
 
 

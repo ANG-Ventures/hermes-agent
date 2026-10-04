@@ -290,7 +290,7 @@ class WakeState:
 
     def _load(self) -> None:
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return
         if isinstance(raw, dict):

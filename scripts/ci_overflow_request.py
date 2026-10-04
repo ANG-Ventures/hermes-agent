@@ -74,7 +74,7 @@ def main(argv=None) -> int:
     parser.add_argument("--event", default="", help="github.event_name")
     parser.add_argument("--managed", default="", help="explicit Phase-4 placement switch")
     args = parser.parse_args(argv)
-    matrix = json.loads(args.matrix_file.read_text(encoding="utf-8"))
+    matrix = json.loads(args.matrix_file.read_text(encoding="utf-8-sig"))
     durations = rtp._load_durations(ROOT)
     e2e_files = [rtp._format_file(p, ROOT) for p in rtp._discover_files([ROOT / "tests" / "e2e"])]
     args.out_dir.mkdir(parents=True, exist_ok=True)

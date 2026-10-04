@@ -38,6 +38,9 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        # gateway.wake.admit_internal_event requires this receipt; a handler
+        # returning None is not acceptance (same double as the notifier suites).
+        event._gateway_accepted = True
 
 
 class RaisingAdapter(RecordingAdapter):

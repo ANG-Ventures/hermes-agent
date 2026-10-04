@@ -2,9 +2,7 @@
 
 When the gateway shuts down gracefully (hermes update, gateway restart, /restart),
 it writes a .clean_shutdown marker.  On the next startup, if the marker exists,
-suspend_recently_active() is skipped so users don't lose their sessions.
-
-After a crash (no marker), suspension still fires as a safety net for stuck sessions.
+crash-turn recovery is skipped and orphan turn markers are discarded.
 """
 
 from datetime import datetime, timedelta
@@ -23,33 +21,9 @@ def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
     return SessionSource(platform=platform, chat_id=chat_id, user_id=user_id)
 
 
-def _make_store(tmp_path, policy=None):
+def _make_store(tmp_path):
     config = GatewayConfig()
-    if policy:
-        config.default_reset_policy = policy
     return SessionStore(sessions_dir=tmp_path, config=config)
-
-
-# ---------------------------------------------------------------------------
-# SessionStore.suspend_recently_active
-# ---------------------------------------------------------------------------
-
-class TestSuspendRecentlyActive:
-    """Verify suspend_recently_active only marks recent sessions."""
-
-    def test_suspends_recently_active_sessions(self, tmp_path):
-        store = _make_store(tmp_path)
-        source = _make_source()
-        entry = store.get_or_create_session(source)
-        assert not entry.suspended
-
-        count = store.suspend_recently_active()
-        assert count == 1
-
-        # Re-fetch — should be resume_pending (preserved, not wiped)
-        refreshed = store.get_or_create_session(source)
-        assert refreshed.resume_pending
-        assert refreshed.session_id == entry.session_id  # same session preserved
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +67,7 @@ class TestCleanShutdownMarker:
              patch("gateway.status.remove_pid_file"), \
              patch("tools.process_registry.process_registry") as mock_proc_reg, \
              patch("tools.terminal_tool.cleanup_all_environments"), \
-             patch("tools.browser_tool.cleanup_all_browsers"):
+             patch("tools.browser_tool_lifecycle.cleanup_all_browsers"):
             mock_proc_reg.kill_all = MagicMock()
 
             import asyncio
@@ -101,31 +75,6 @@ class TestCleanShutdownMarker:
 
         assert marker.exists(), ".clean_shutdown marker should exist after graceful stop"
 
-
-    def test_no_marker_triggers_suspension(self, tmp_path, monkeypatch):
-        """Without .clean_shutdown marker (crash), suspension should fire."""
-        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
-
-        marker = tmp_path / ".clean_shutdown"
-        assert not marker.exists()
-
-        # Create a store with a recently active session
-        store = _make_store(tmp_path)
-        source = _make_source()
-        entry = store.get_or_create_session(source)
-        assert not entry.suspended
-
-        # Simulate what start() does:
-        if marker.exists():
-            marker.unlink()
-        else:
-            store.suspend_recently_active()
-
-        # Session SHOULD be resume_pending (crash recovery preserves history)
-        with store._lock:
-            store._ensure_loaded_locked()
-            resume_count = sum(1 for e in store._entries.values() if e.resume_pending)
-        assert resume_count == 1, "Session should be resume_pending after crash (no marker)"
 
     def test_marker_written_when_only_cron_work_outlives_the_drain(self, tmp_path, monkeypatch):
         """A cron job past its own drain deadline is terminated and recorded in
@@ -140,7 +89,7 @@ class TestCleanShutdownMarker:
         import cron.scheduler as sched
         import tools.process_registry as _pr
         import tools.terminal_tool as _tt
-        import tools.browser_tool as _bt
+        import tools.browser_tool_lifecycle as _bt
         from tests.gateway.restart_test_helpers import make_restart_runner
 
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
@@ -149,11 +98,13 @@ class TestCleanShutdownMarker:
         runner._restart_drain_timeout = 0.01
         runner._cron_drain_timeout = 0.01  # past the cron floor too (#82161)
         adapter.disconnect = AsyncMock()
-        sched._running_job_ids.add("job-1")
-        sched._running_fire_owners["job-1"] = {
+        # Upstream keys in-flight cron state by (home key, job id).
+        job_key = sched._inflight_key("job-1")
+        sched._running_job_ids.add(job_key)
+        sched._running_fire_owners[job_key] = {
             object(): ("owner-1", sched._get_hermes_home().resolve())
         }
-        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
+        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda *a, **k: 0)
         monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
         monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
         try:
@@ -162,8 +113,8 @@ class TestCleanShutdownMarker:
                  patch("cron.scheduler.mark_job_run"):
                 asyncio.run(runner.stop())
         finally:
-            sched._running_job_ids.discard("job-1")
-            sched._running_fire_owners.pop("job-1", None)
+            sched._running_job_ids.discard(job_key)
+            sched._running_fire_owners.pop(job_key, None)
         assert marker.exists(), (
             ".clean_shutdown must be written when the only work that outlived "
             "the drain was a cron job — no chat session was interrupted"
@@ -198,71 +149,3 @@ class TestCleanShutdownMarker:
 # ---------------------------------------------------------------------------
 # resume_pending freshness gate (#46934)
 # ---------------------------------------------------------------------------
-
-class TestResumePendingFreshnessGate:
-    """A resume_pending session is only returned while it is still fresh.
-
-    ``get_or_create_session`` returns a ``resume_pending`` session so its
-    transcript reloads intact after a restart.  But the idle/daily reset
-    policy keys on ``updated_at``, which is bumped to ``now`` on every
-    message — so a zombie session that keeps receiving messages never trips
-    it and would resume stale context forever.  The freshness gate keys on
-    ``last_resume_marked_at`` (set once at resume-mark, never bumped) so it
-    catches that case.
-    """
-
-    def _mark_resume_pending(self, store, source):
-        """Put the session into resume_pending and return the entry."""
-        store.get_or_create_session(source)
-        count = store.suspend_recently_active()
-        assert count == 1
-        with store._lock:
-            entry = store._entries[store._generate_session_key(source)]
-        assert entry.resume_pending
-        assert entry.last_resume_marked_at is not None
-        return entry
-
-
-    def test_stale_resume_pending_falls_through_to_reset(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_AUTO_CONTINUE_FRESHNESS", "3600")
-        # The freshness gate only applies when the user has opted into
-        # automatic resets — session_reset.mode: none disables it (#61052).
-        from gateway.config import SessionResetPolicy
-        store = _make_store(
-            tmp_path, policy=SessionResetPolicy(mode="idle", idle_minutes=999999)
-        )
-        source = _make_source()
-        entry = self._mark_resume_pending(store, source)
-
-        # Backdate the resume mark past the freshness window. Keep updated_at
-        # fresh (as a per-message zombie would have) so the idle/daily policy
-        # would NOT fire — only the freshness gate should catch this.
-        with store._lock:
-            entry.last_resume_marked_at = datetime.now() - timedelta(seconds=7200)
-            entry.updated_at = datetime.now()
-            store._save()
-
-        fresh = store.get_or_create_session(source)
-        # Zombie detected → brand-new session, not the stale transcript.
-        assert fresh.session_id != entry.session_id
-        assert not fresh.resume_pending
-
-    def test_reset_mode_none_disables_freshness_gate(self, tmp_path, monkeypatch):
-        """session_reset.mode: none opts out of ALL automatic resets —
-        including the resume_pending freshness gate (#61052)."""
-        monkeypatch.setenv("HERMES_AUTO_CONTINUE_FRESHNESS", "3600")
-        from gateway.config import SessionResetPolicy
-        store = _make_store(tmp_path, policy=SessionResetPolicy(mode="none"))
-        source = _make_source()
-        entry = self._mark_resume_pending(store, source)
-
-        with store._lock:
-            entry.last_resume_marked_at = datetime.now() - timedelta(seconds=7200)
-            entry.updated_at = datetime.now()
-            store._save()
-
-        refreshed = store.get_or_create_session(source)
-        # Explicit opt-out honored: same session back, transcript preserved.
-        assert refreshed.session_id == entry.session_id
-        assert refreshed.resume_pending
-

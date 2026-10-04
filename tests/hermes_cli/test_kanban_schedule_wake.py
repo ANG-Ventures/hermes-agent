@@ -24,6 +24,7 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -84,7 +85,7 @@ def _kinds(conn, tid) -> list[str]:
 def test_null_gated_scheduled_25h_old_is_reported(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         old = _scheduled(conn, "old", parked_seconds_ago=25 * HOUR)
-        res = kb.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1)
+        res = kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1)
         assert [tid for tid, _age in res.unwoken_scheduled] == [old]
         assert res.unwoken_scheduled[0][1] >= 25 * HOUR
         line = kb.format_unwoken_scheduled(res.unwoken_scheduled)
@@ -94,7 +95,7 @@ def test_null_gated_scheduled_25h_old_is_reported(kanban_home: Path) -> None:
 def test_null_gated_scheduled_1h_old_is_silent(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         _scheduled(conn, "fresh", parked_seconds_ago=1 * HOUR)
-        res = kb.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1)
+        res = kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1)
         assert res.unwoken_scheduled == []
         assert kb.format_unwoken_scheduled(res.unwoken_scheduled) == ""
 
@@ -140,7 +141,7 @@ def test_cli_schedule_now_wakes_on_next_tick(kanban_home: Path, capsys) -> None:
         assert task.status == "scheduled" and task.next_eligible_at is not None
         assert "schedule_wake_set" in _kinds(conn, tid)
 
-        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
         assert res.woken_scheduled == [tid]
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
@@ -230,9 +231,11 @@ def test_manual_unblock_clears_wake_stamp(kanban_home: Path) -> None:
 
 
 def test_promote_refusal_names_the_scheduled_exit(kanban_home: Path) -> None:
+    # ``force=`` was retired with upstream #106195 (a forced promotion only
+    # reported a success the first claim reverted); the scheduled-exit hint
+    # is what this test pins.
     with kb.connect_closing() as conn:
         tid = _scheduled(conn)
-        for force in (False, True):
-            ok, err = kb.promote_task(conn, tid, actor="op", force=force)
-            assert not ok
-            assert "unblock" in err and "schedule" in err and "--now" in err
+        ok, err = kb.promote_task(conn, tid, actor="op")
+        assert not ok
+        assert "unblock" in err and "schedule" in err and "--now" in err

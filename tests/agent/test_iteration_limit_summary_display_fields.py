@@ -154,14 +154,19 @@ def test_hidden_legacy_placeholder_gets_neutral_payload_on_summary():
     agent._cached_system_prompt = "SYS"
     calls = []
 
-    class _Completions:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return "RAW"
+    # Upstream routes the chat-mode summary through the main loop's request path
+    # (``_build_api_kwargs`` -> ``_interruptible_api_call``) so it keeps the cached
+    # prefix, instead of a direct ``chat.completions.create``. The wire contract under
+    # test is the message list that builder receives.
+    def _build_api_kwargs(api_messages, *a, **k):
+        return {"model": agent.model, "messages": api_messages}
 
-    client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=_Completions()))
+    def _interruptible_api_call(kwargs, *a, **k):
+        calls.append(kwargs)
+        return "RAW"
+
     transport = types.SimpleNamespace(
-        normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY"))
+        normalize_response=lambda _r, **_k: types.SimpleNamespace(content="SUMMARY"))
     msgs = [
         {"role": "user", "content": "q"},
         {"role": "assistant", "content": "", "display_kind": "hidden",
@@ -169,7 +174,8 @@ def test_hidden_legacy_placeholder_gets_neutral_payload_on_summary():
         {"role": "user", "content": "q2"},
         {"role": "assistant", "content": "a"},
     ]
-    with patch.object(agent, "_ensure_primary_openai_client", return_value=client), \
+    with patch.object(agent, "_build_api_kwargs", _build_api_kwargs), \
+            patch.object(agent, "_interruptible_api_call", _interruptible_api_call), \
             patch.object(agent, "_get_transport", return_value=transport):
         assert handle_max_iterations(agent, msgs, 5) == "SUMMARY"
 

@@ -1111,6 +1111,7 @@ def test_hygiene_pre_identity_still_holds():
     assert abs(lhs - stats.pre_tokens) <= 8, (lhs, stats.pre_tokens)
 
 
+@pytest.mark.allow_real_home_io  # deliberate read-only replay against the live lcm.db (skips when absent)
 def test_postfix_reconciles_real_session_sanitized_tail():
     """Real-session replay oracle (Pass-2 bpp B2 — replaces the v0.2 tautology).
     Load a real session from the live lcm.db, build a SANITIZED kept tail
@@ -1197,6 +1198,7 @@ def test_text_part_type_sets_agree_across_sites():
     assert set(api_set) == canonical
 
 
+@pytest.mark.allow_real_home_io  # deliberate read-only replay against the live lcm.db (skips when absent)
 def test_preaxis_reconciles_on_real_sessions():
     """Codifies the §0.13 investigation: the PRE identity holds on real sessions —
     the 00:48 179K gap is NOT a live bug. Guards a future regression that would

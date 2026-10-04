@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from gateway.config import GatewayConfig, Platform, SessionResetPolicy
+from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
 
@@ -25,7 +25,7 @@ def _source() -> SessionSource:
 
 
 def _config() -> GatewayConfig:
-    return GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
+    return GatewayConfig()
 
 
 def _entry(

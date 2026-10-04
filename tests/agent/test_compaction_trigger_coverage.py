@@ -88,20 +88,34 @@ def test_manual_reason_renders_manual_clause_on_both_vocab():
 
 
 def test_every_manual_surface_passes_the_manual_label():
-    """The four manual /compress surfaces each pass the manual trigger label
-    into _compress_context (source-pinned; a new manual surface added without
-    attribution fails the producer-coverage test above only if it uses a NEW
-    label — this one catches it passing NONE at all)."""
+    """The four manual /compress surfaces each carry the manual trigger label
+    into _compress_context. Since the upstream extraction the CLI, TUI and ACP
+    surfaces share ``agent.conversation_compression_manual.compress_now``, so
+    the label is pinned ONCE in that core and each surface must route through
+    it (or pass the literal itself, as the gateway slash handler still does).
+    A new manual surface that calls ``_compress_context`` directly without
+    attribution fails here — its compressions would log trigger=UNATTRIBUTED."""
+    core = REPO / "agent" / "conversation_compression_manual.py"
+    core_text = core.read_text(errors="replace")
+    assert 'trigger_reason="manual_compress_command"' in core_text, (
+        "shared manual-compress core (compress_now) does not pass "
+        "trigger_reason=manual_compress_command"
+    )
     surfaces = {
         "gateway": REPO / "gateway" / "slash_commands.py",
         "tui": REPO / "tui_gateway" / "server.py",
-        "cli": REPO / "cli.py",
-        "acp": REPO / "acp_adapter" / "server.py",
+        "cli": REPO / "hermes_cli" / "cli_session_mixin.py",
+        "acp": REPO / "acp_adapter" / "commands.py",
     }
     for name, path in surfaces.items():
         text = path.read_text(errors="replace")
-        assert 'trigger_reason="manual_compress_command"' in text, (
+        attributed = (
+            'trigger_reason="manual_compress_command"' in text
+            or re.search(r"from agent\.conversation_compression_manual import \(?[^)]*\bcompress_now\b", text)
+        )
+        assert attributed, (
             f"{name} surface ({path.name}) has a manual /compress path that "
-            f"does not pass trigger_reason=manual_compress_command — its "
-            f"compressions log trigger=UNATTRIBUTED"
+            f"neither routes through compress_now nor passes "
+            f"trigger_reason=manual_compress_command — its compressions log "
+            f"trigger=UNATTRIBUTED"
         )

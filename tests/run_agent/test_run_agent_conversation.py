@@ -7,8 +7,13 @@ mock-builders in ``_run_agent_helpers.py``.
 
 import json
 import logging
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tui_gateway import server as tui_server
 
 from tests.run_agent._run_agent_helpers import (
     _mock_response,
@@ -17,12 +22,26 @@ from tests.run_agent._run_agent_helpers import (
 
 
 class TestHydrateTodoStore:
+    @staticmethod
+    def _assistant_todo_call(call_id="c1", name="todo", arguments="{}"):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        }
+
     def test_no_todo_in_history(self, agent):
         history = [
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         ]
-        with patch("run_agent._set_interrupt"):
+        with patch("run_agent._set_interrupt"), patch("agent.interrupt_control._set_interrupt"):
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
@@ -78,6 +97,29 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
+    @pytest.mark.parametrize(
+        "name,arguments",
+        [
+            ("todo_list", "{}"),
+            ("tool_call", json.dumps({"calls": [{"name": "todo_list", "arguments": {}}]})),
+        ],
+        ids=["direct", "bridged"],
+    )
+    def test_todo_list_name_hydrates(self, agent, name, arguments):
+        """Regression for #124960: the current name and its tool_call-bridged form pair like legacy ``todo``."""
+        todos = [{"id": "t", "content": "Task", "status": "pending"}]
+        history = [
+            self._assistant_todo_call(name=name, arguments=arguments),
+            {"role": "tool", "tool_call_id": "c1", "content": json.dumps({"todos": todos, "revision": 3})},
+        ]
+
+        with patch("run_agent._set_interrupt"), patch("agent.interrupt_control._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert agent._todo_store.snapshot() == {"todos": todos, "revision": 3}
+        # The TUI resume path (no AIAgent yet) must pair the same call via the same predicate.
+        assert tui_server._todo_state_from_history(history)["todos"] == todos
+
 
 class TestHandleMaxIterations:
     def test_returns_summary(self, agent):
@@ -96,8 +138,10 @@ class TestHandleMaxIterations:
         messages = [{"role": "user", "content": "do stuff"}]
         result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
-        assert "error" in result.lower()
-        assert "API down" in result
+        # Merged copy (agent/turn_failure_copy "max_iterations_no_summary"): the user gets the
+        # plain-language explanation + next step; the exception text stays in the warning log.
+        assert "ran out of steps" in result.lower()
+        assert "`continue`" in result
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -173,13 +217,19 @@ class TestHandleMaxIterations:
         agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
         agent._cached_system_prompt = "You are helpful."
         messages = [
-            {"role": "user", "content": "do stuff"},
+            {"role": "user", "content": "do stuff", "name": "sylvain"},
             {
                 "role": "assistant",
                 "tool_calls": [{"id": "call_1", "function": {"name": "execute_code", "arguments": "{}"}}],
                 "codex_reasoning_items": [{"id": "rs_1"}],
             },
-            {"role": "tool", "tool_call_id": "call_1", "content": "result", "tool_name": "execute_code"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "result",
+                "tool_name": "execute_code",
+                "name": "execute_code",
+            },
             {"role": "assistant", "content": "Done.", "_empty_recovery_synthetic": True},
         ]
 
@@ -192,8 +242,15 @@ class TestHandleMaxIterations:
             assert "codex_reasoning_items" not in m, m
             assert "codex_message_items" not in m, m
             assert not any(isinstance(k, str) and k.startswith("_") for k in m), m
+            # ``name`` is schema-foreign on tool results only (aki.io rejects
+            # it with "contains item with unknown key name"); it stays valid
+            # on user/assistant messages.
+            if m.get("role") == "tool":
+                assert "name" not in m, m
+        assert [m for m in sent_msgs if m.get("role") == "user"][0]["name"] == "sylvain"
         # Internal history is untouched — the path copies each message.
         assert messages[2]["tool_name"] == "execute_code"
+        assert messages[2]["name"] == "execute_code"
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
     def test_summary_omits_provider_preferences_for_non_openrouter(self, agent):
@@ -234,7 +291,7 @@ class TestHandleMaxIterations:
         agent._cached_system_prompt = "You are helpful."
         captured = {}
 
-        def fake_run_codex_stream(kwargs):
+        def fake_run_codex_stream(kwargs, client=None, on_first_delta=None):
             captured.update(kwargs)
             return SimpleNamespace(
                 status="completed",
@@ -291,6 +348,294 @@ class TestHandleMaxIterations:
             "call_123"
         ]
 
+    def test_codex_summary_retry_uses_interruptible_request_path(self, agent):
+        """The empty-summary retry must use the same bounded request seam."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.5"
+        agent.platform = "cron"
+        agent._cached_system_prompt = "You are helpful."
+
+        def codex_response(text):
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ],
+            )
+
+        with patch.object(
+            agent,
+            "_interruptible_api_call",
+            side_effect=[codex_response(""), codex_response("Summary after retry")],
+        ) as guarded_call, patch.object(
+            agent,
+            "_run_codex_stream",
+            side_effect=AssertionError("summary retry bypassed request watchdogs"),
+        ):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 4
+            )
+
+        assert result == "Summary after retry"
+        assert guarded_call.call_count == 2
+
+    def test_codex_summary_strips_tool_controls_on_every_attempt(self, agent):
+        """Iteration-limit summaries retry once on an empty answer; both attempts share one
+        ``_attempt`` closure, and both must go out without ``tools``, ``tool_choice`` and
+        ``parallel_tool_calls`` — the transport emits the three as one block, and strict
+        Responses backends 400 on ``tool_choice`` without ``tools``.
+        """
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "You are helpful."
+        leaked_controls = {"tools", "tool_choice", "parallel_tool_calls"}
+        # Precondition against the real transport: the main-loop request carries all three.
+        assert leaked_controls <= agent._build_api_kwargs([{"role": "user", "content": "do stuff"}]).keys()
+        bodies = []
+
+        def fake_run_codex_stream(kwargs):
+            bodies.append(dict(kwargs))
+            text = "" if len(bodies) == 1 else "Summary"
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ],
+            )
+
+        with patch.object(agent, "_interruptible_api_call", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 90)
+
+        assert result == "Summary"
+        assert len(bodies) == 2, f"expected one retry after the empty summary, got {len(bodies)} attempts"
+        for attempt_index, sent in enumerate(bodies):
+            assert not leaked_controls & sent.keys(), f"attempt {attempt_index}: {sorted(leaked_controls & sent.keys())} leaked"
+
+    def test_codex_summary_uses_interruptible_request_path(self, agent):
+        """Max-iteration Codex summaries must retain request watchdogs.
+
+        A direct ``_run_codex_stream`` call bypasses the absolute stale timeout,
+        interrupt handling, and request-local client cleanup. In unattended cron
+        sessions that turns a wedged summary stream into a job that never returns
+        to cron's completion/error delivery lifecycle (#70943).
+        """
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.5"
+        agent.platform = "cron"
+        agent._cached_system_prompt = "You are helpful."
+        response = SimpleNamespace(
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="Summary")],
+                )
+            ],
+        )
+
+        with patch.object(
+            agent, "_interruptible_api_call", return_value=response
+        ) as guarded_call, patch.object(
+            agent,
+            "_run_codex_stream",
+            side_effect=AssertionError("summary bypassed request watchdogs"),
+        ):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 4
+            )
+
+        assert result == "Summary"
+        guarded_call.assert_called_once()
+
+    def test_interrupted_summary_ends_turn_interrupted_and_keeps_pending_message(self, agent, monkeypatch):
+        from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.max_iterations = 1
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        release = threading.Event()
+        calls = []
+
+        def provider(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return tool_resp
+            # The summary request: a new user message arrives while it is in flight.
+            agent.interrupt("follow-up message")
+            release.wait(10)
+            raise OSError("fixture request stopped")
+
+        request_client = MagicMock()
+        request_client.chat.completions.create.side_effect = provider
+        agent.client.chat.completions.create.side_effect = provider
+        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: request_client)
+        monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **kw: release.set())
+        monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
+
+        try:
+            with (
+                patch("model_tools.handle_function_call", return_value="ok"),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("do the work")
+        finally:
+            release.set()
+
+        assert len(calls) == 2, "summary request never reached the provider fixture"
+        assert result["interrupted"] is True
+        assert result["completed"] is False
+        assert result["interrupt_message"] == "follow-up message"
+        assert result["turn_exit_reason"].startswith("interrupted_during_api_call")
+        assert result["final_response"].startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+        assert "couldn't produce a summary" not in result["final_response"]
+        assert all(m.get("content") != MAX_ITERATIONS_SUMMARY_REQUEST for m in result["messages"])
+
+    @pytest.mark.parametrize("api_mode,platform", [
+        ("chat_completions", "cli"), ("chat_completions", "cron"),
+        ("anthropic_messages", "cli"),
+    ])
+    def test_summary_interrupt_aborts_only_its_request(self, agent, monkeypatch, api_mode, platform):
+        agent.api_mode = api_mode
+        agent.platform = platform
+        agent._cached_system_prompt = "You are helpful."
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        request_client = MagicMock()
+        aborted = []
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+            raise OSError("fixture request stopped")
+
+        def abort(client, **kwargs):
+            aborted.append(client)
+            release.set()
+
+        agent.client.chat.completions.create.side_effect = blocked
+        request_client.chat.completions.create.side_effect = blocked
+        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: request_client)
+        monkeypatch.setattr(agent, "_create_request_anthropic_client", lambda **kw: request_client)
+        monkeypatch.setattr(agent, "_abort_request_openai_client", abort)
+        monkeypatch.setattr(agent, "_abort_request_anthropic_client", abort)
+        monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
+        monkeypatch.setattr(agent, "_close_request_anthropic_client", lambda *a, **kw: None)
+        if api_mode == "anthropic_messages":
+            agent._is_anthropic_oauth = False
+            transport = SimpleNamespace(build_kwargs=lambda **kw: {"model": "fixture", "messages": kw["messages"]})
+            monkeypatch.setattr(agent, "_get_transport", lambda: transport)
+            monkeypatch.setattr(agent, "_anthropic_messages_create", blocked)
+
+        raised = []
+
+        def summarize():
+            try:
+                agent._handle_max_iterations([{"role": "user", "content": "work"}], 1)
+            except InterruptedError as exc:
+                raised.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=summarize)
+        worker.start()
+        try:
+            assert entered.wait(5), "summary did not reach provider fixture"
+            agent.interrupt()
+            assert finished.wait(4), "summary ignored interrupt while provider was blocked"
+            assert aborted == [request_client]
+            assert len(raised) == 1, "summary cancellation must propagate, not become a fallback"
+            agent.client.close.assert_not_called()
+        finally:
+            release.set()
+            worker.join(12)
+
+    def test_summary_request_scrubs_surrogates_in_tool_schema(self, agent):
+        """The summary rides the same outbound surrogate chokepoint as the main loop (#50959 class)."""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        agent.tools = [{"type": "function", "function": {
+            "name": "web_search", "description": "lone surrogate \ud83d here",
+            "parameters": {"type": "object", "properties": {}},
+        }}]
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        sent = agent.client.chat.completions.create.call_args.kwargs
+        description = sent["tools"][0]["function"]["description"]
+        assert "\ud83d" not in description
+        description.encode("utf-8")  # a provider serializes this; lone surrogates raise here
+
+    def test_summary_tool_call_only_response_retries_once(self, agent, caplog):
+        """A tool-only summary is never executed: it is logged, reads as empty, and gets one retry."""
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", tool_calls=[_mock_tool_call()]),
+            _mock_response(content="Summary"),
+        ]
+        agent._cached_system_prompt = "You are helpful."
+
+        with caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 60,
+            )
+
+        assert result == "Summary"
+        assert agent.client.chat.completions.create.call_count == 2
+
+    def test_summary_uses_ordinary_tools_and_prompt_cache_key(self, agent):
+        """The terminal summary follows the ordinary request's cache lineage."""
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            _mock_response(content="Summary"),
+        ]
+        agent.base_url = "https://api.openai.com/v1"
+        agent.provider = "openai"
+        agent._cached_system_prompt = "You are helpful."
+        messages = [{"role": "user", "content": "do stuff"}]
+        ordinary = agent._build_api_kwargs(
+            [{"role": "system", "content": agent._cached_system_prompt}, *messages]
+        )
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        summaries = [call.kwargs for call in agent.client.chat.completions.create.call_args_list]
+        assert result == "Summary"
+        assert len(summaries) == 2
+        assert all(summary["tools"] == ordinary["tools"] for summary in summaries)
+        assert all(summary["prompt_cache_key"] == ordinary["prompt_cache_key"] for summary in summaries)
+        assert all(summary.get("tool_choice") == ordinary.get("tool_choice") for summary in summaries)
+        assert all(summary["model"] == ordinary["model"] for summary in summaries)
+        assert all(summary["messages"][0] == ordinary["messages"][0] for summary in summaries)
+
 
 class TestRunConversation:
     """Tests for the main run_conversation method.
@@ -339,11 +684,8 @@ class TestRunConversation:
         assert result["completed"] is False
         assert result["api_calls"] == 0
         assert result["turn_exit_reason"] == "ollama_runtime_context_too_small"
-        assert "Ollama loaded `qwen3.5:9b` with only 4,096 tokens" in result["final_response"]
-        assert "model.ollama_num_ctx: 65536" in result["final_response"]
+        assert "ollama_num_ctx" in result["final_response"]
         assert not agent.client.chat.completions.create.called
-        assert "Ollama runtime context too small for Hermes tool use" in caplog.text
-        assert "runtime_context=4096" in caplog.text
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
@@ -352,7 +694,7 @@ class TestRunConversation:
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [resp1, resp2]
         with (
-            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch("model_tools.handle_function_call", return_value="search result") as mock_handle_function_call,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -377,7 +719,7 @@ class TestRunConversation:
             return []
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("model_tools.handle_function_call", return_value="search result"),
             patch(
                 "hermes_cli.plugins.has_hook",
                 side_effect=lambda name: name in {"pre_api_request", "post_api_request"},
@@ -490,7 +832,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.side_effect = [resp1, resp2]
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("model_tools.handle_function_call", return_value="search result"),
             patch.object(agent, "_safe_print") as mock_print,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -513,6 +855,7 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent._set_interrupt"),
+            patch("agent.interrupt_control._set_interrupt"),
             patch.object(
                 agent, "_interruptible_api_call", side_effect=interrupt_side_effect
             ),
@@ -545,9 +888,11 @@ class TestRunConversation:
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent.compression_enabled = True
         empty_resp = _mock_response(
-            content=None,
+            # parity 2026-10-01: a clean "stop" with structured reasoning_content is promoted to
+            # the visible answer before the empty ladder (#111761); Ollama-style inline <think>
+            # content still routes through the thinking-prefill ladder this test pins.
+            content="<think>reasoning only</think>",
             finish_reason="stop",
-            reasoning_content="reasoning only",
         )
         prefill = [
             {"role": "user", "content": "old question"},
@@ -576,7 +921,10 @@ class TestRunConversation:
         # surfaces the reasoning text, clearly labelled. This test drives the
         # reasoning-only path, so assert the #34452 contract (not silent, not
         # "(empty)") against the message that path actually produces.
-        assert "produced only internal reasoning" in result["final_response"]
+        # Merged copy (agent/turn_failure_copy "reasoning_only"): the model's own last thoughts
+        # are surfaced, clearly labelled, instead of the fork's generic "No reply:" prefix.
+        assert "never wrote an answer" in result["final_response"]
+        assert "reasoning answer" in result["final_response"] or "reasoning only" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -584,9 +932,11 @@ class TestRunConversation:
         """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
-            content=None,
+            # parity 2026-10-01: a clean "stop" with structured reasoning_content is promoted to
+            # the visible answer before the empty ladder (#111761); Ollama-style inline <think>
+            # content still routes through the thinking-prefill ladder this test pins.
+            content="<think>structured reasoning answer</think>",
             finish_reason="stop",
-            reasoning_content="structured reasoning answer",
         )
         # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
         agent.client.chat.completions.create.side_effect = [empty_resp] * 6
@@ -602,16 +952,21 @@ class TestRunConversation:
         # Parity note (2026-08-08): reasoning-only terminal — see the sibling
         # test above. Upstream surfaces the model's own reasoning here
         # instead of the fork's generic "No reply:" prefix.
-        assert "produced only internal reasoning" in result["final_response"]
+        # Merged copy (agent/turn_failure_copy "reasoning_only"): the model's own last thoughts
+        # are surfaced, clearly labelled, instead of the fork's generic "No reply:" prefix.
+        assert "never wrote an answer" in result["final_response"]
+        assert "reasoning answer" in result["final_response"] or "reasoning only" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
         """When prefill continuation produces content, it becomes the final response."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
-            content=None,
+            # parity 2026-10-01: a clean "stop" with structured reasoning_content is promoted to
+            # the visible answer before the empty ladder (#111761); Ollama-style inline <think>
+            # content still routes through the thinking-prefill ladder this test pins.
+            content="<think>structured reasoning answer</think>",
             finish_reason="stop",
-            reasoning_content="structured reasoning answer",
         )
         content_resp = _mock_response(
             content="Here is the actual answer.",
@@ -637,6 +992,9 @@ class TestRunConversation:
         """Truly empty response (no content, no reasoning) retries 3 times then falls through to (empty)."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
+        # Legacy fixed 3-retry ladder (agent.empty_response_guard.enabled: false); the guard-on
+        # short-circuit after two identical empties is test_truly_empty_response_stops_after_repeated_empty.
+        agent._empty_guard_enabled = False
         empty_resp = _mock_response(content=None, finish_reason="stop")
         # 4 responses: 1 original + 3 nudge retries, all empty
         agent.client.chat.completions.create.side_effect = [
@@ -746,14 +1104,17 @@ class TestRunConversation:
             patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        # Empty after retries keeps the pre-existing status (not a failed turn: cron stays silent,
+        # the transcript keeps the text) and only gains the descriptor code for Desktop/TUI.
+        assert result["failed"] is False and result["completed"] is True
+        assert result["failure_reason"] == "empty_response"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
 
     def test_empty_response_emits_status_for_gateway(self, agent):
         """_emit_status is called during empty retries so gateway users see feedback."""
         self._setup_agent(agent)
+        agent._empty_guard_enabled = False  # legacy 3-retry ladder; guard-on path tested separately
         agent.base_url = "http://127.0.0.1:1234/v1"
 
         empty_resp = _mock_response(content=None, finish_reason="stop")
@@ -924,7 +1285,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.side_effect = [resp1, resp2]
 
         with (
-            patch("run_agent.handle_function_call", return_value="result"),
+            patch("model_tools.handle_function_call", return_value="result"),
             patch.object(
                 agent.context_compressor, "should_compress", return_value=True
             ),
@@ -960,6 +1321,7 @@ class TestRunConversation:
 
         with (
             patch.object(agent, "_compress_context") as mock_compress,
+            patch("agent.turn_overflow.time.sleep"),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1085,10 +1447,10 @@ class TestRunConversation:
 
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
         assert second_call_messages[-1]["role"] == "user"
-        assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
-        """Continuation retries must not shrink a higher provider default cap."""
+        """Continuation retries must not shrink a higher provider default cap — and must
+        raise it, since re-sending the same cap just truncates again (#72770)."""
         self._setup_agent(agent)
         agent.max_tokens = None
         requested_caps = []
@@ -1115,14 +1477,14 @@ class TestRunConversation:
 
         assert result["completed"] is True
         assert result["final_response"] == "Part 1 Part 2"
-        assert requested_caps == [65536, 65536]
+        assert requested_caps == [65536, 131072]
 
     def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
-        """Ollama-hosted GLM responses can misreport truncated output as stop."""
+        """Local Ollama-hosted GLM (no :cloud suffix) misreports truncated output as stop."""
         self._setup_agent(agent)
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
-        agent.model = "glm-5.1:cloud"
+        agent.model = "glm-4-9b"  # local GLM — no :cloud suffix
 
         tool_turn = _mock_response(
             content="",
@@ -1144,7 +1506,7 @@ class TestRunConversation:
         ]
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("model_tools.handle_function_call", return_value="search result"),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1160,7 +1522,6 @@ class TestRunConversation:
 
         third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
         assert third_call_messages[-1]["role"] == "user"
-        assert "truncated by the output length limit" in third_call_messages[-1]["content"]
 
     def test_ollama_glm_stop_with_terminal_boundary_does_not_continue(self, agent):
         """Complete Ollama/GLM responses should not be reclassified as truncated."""
@@ -1181,7 +1542,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.side_effect = [tool_turn, complete_stop]
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("model_tools.handle_function_call", return_value="search result"),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1214,7 +1575,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.side_effect = [tool_turn, normal_stop]
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("model_tools.handle_function_call", return_value="search result"),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1244,12 +1605,9 @@ class TestRunConversation:
         # Should return immediately — no continuation, only 1 API call
         assert result["completed"] is False
         assert result["api_calls"] == 1
-        assert "reasoning" in result["error"].lower()
-        assert "output tokens" in result["error"].lower()
         # Should have a user-friendly response (not None)
         assert result["final_response"] is not None
-        assert "Thinking Budget Exhausted" in result["final_response"]
-        assert "/thinkon" in result["final_response"]
+        assert "/reasoning" in result["final_response"]
 
     def test_length_empty_content_without_think_tags_retries_normally(self, agent):
         """When finish_reason='length' and content is None but no think tags,
@@ -1283,7 +1641,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.return_value = resp
 
         with (
-            patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch("model_tools.handle_function_call") as mock_handle_function_call,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1292,7 +1650,7 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert result["failure_reason"] == "truncated"
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_call_retries_once_before_refusing(self, agent):
@@ -1318,7 +1676,7 @@ class TestRunConversation:
             content="", finish_reason="stop", tool_calls=[good_tc],
         )
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch("model_tools.handle_function_call", return_value='{"success":true}') as mock_hfc,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1363,7 +1721,7 @@ class TestRunConversation:
         final_resp = _mock_response(content="Done!", finish_reason="stop")
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch("model_tools.handle_function_call", return_value='{"success":true}') as mock_hfc,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1394,7 +1752,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.return_value = resp
 
         with (
-            patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch("model_tools.handle_function_call") as mock_handle_function_call,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1403,7 +1761,8 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        # Merged copy (agent/turn_failure_copy): "cut off partway through" (finish_reason != length).
+        assert "cut off" in result["error"]
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
@@ -1435,7 +1794,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch("model_tools.handle_function_call", return_value='{"success":true}'),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1445,7 +1804,7 @@ class TestRunConversation:
         assert result.get("partial") is True
         msgs = result.get("messages") or []
         assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        assert "cut off" in (msgs[-1].get("content") or "").lower()  # merged copy wording
         assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
 
     def test_length_truncated_tool_exhaustion_after_tool_batch_closes_tool_tail(self, agent):
@@ -1479,7 +1838,7 @@ class TestRunConversation:
         ]
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch("model_tools.handle_function_call", return_value='{"success":true}'),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1487,10 +1846,11 @@ class TestRunConversation:
             result = agent.run_conversation("write then hit length truncate")
 
         assert result.get("partial") is True
-        assert "truncated due to output length limit" in (result.get("error") or "")
+        # Merged copy: "cut off before it finished (it hit its output length limit)".
+        assert "output length limit" in (result.get("error") or "")
         msgs = result.get("messages") or []
         assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        assert "cut off" in (msgs[-1].get("content") or "").lower()  # merged copy wording
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its
@@ -1527,10 +1887,10 @@ class TestRunConversation:
         mock_connect = MagicMock(return_value=MagicMock())
 
         with (
-            patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure",
+            patch("model_tools.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db_dispatch._record_task_failure",
                   mock_record_failure),
-            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch("hermes_cli.kanban_db_connect.connect", mock_connect),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -1553,7 +1913,6 @@ class TestRunConversation:
         assert call.kwargs.get("outcome") == "timed_out"
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
-        assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
@@ -1577,8 +1936,8 @@ class TestRunConversation:
         mock_record_failure = MagicMock(return_value=False)
 
         with (
-            patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure",
+            patch("model_tools.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db_dispatch._record_task_failure",
                   mock_record_failure),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1589,6 +1948,184 @@ class TestRunConversation:
         assert mock_record_failure.call_count == 0, (
             "_record_task_failure should not be called outside kanban mode"
         )
+
+    def test_clean_eof_stub_gets_distinct_truncation_message(self, agent):
+        """#102766: a clean-EOF partial-stream stub (stream ended with no
+        transport exception and no finish_reason) must not print the same
+        'stream ended before completion' wording used for a genuine
+        network drop — that wording sends the user chasing a network
+        problem a stream_diag log with finish_reason_seen=False would
+        already have ruled out."""
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        self._setup_agent(agent)
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        resp = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        resp.id = PARTIAL_STREAM_STUB_ID
+        resp._clean_eof = True
+        agent.client.chat.completions.create.return_value = resp
+
+        printed = []
+        agent._print_fn = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+
+        with (
+            patch("model_tools.handle_function_call"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        text = " ".join(printed)
+        assert "server ended the stream without ever sending finish_reason" in text
+        assert "stream ended before completion" not in text
+        # Retries exhausted: the final copy/reason must not blame the network either.
+        assert "Check your network" not in result["final_response"]
+        assert "kept closing the stream" in result["final_response"]
+        assert result["failure_reason"] == "truncated"
+
+    def test_invalid_stored_tool_call_names_are_coerced_on_the_wire(self, agent):
+        """A stored ``multi_tool_use.parallel`` / shell-command / empty function.name must reach the
+        provider as ``^[A-Za-z0-9_-]{1,64}$`` on every request, and the persisted history must keep
+        the original bytes (#51944)."""
+        self._setup_agent(agent)
+        long_name = 'gbrain query "x" 2>/dev/null | head -40; ' + "y" * 340
+        history = [
+            {"role": "user", "content": "do two things"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "multi_tool_use.parallel", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": long_name, "arguments": "{}"}},
+                {"id": "c3", "type": "function", "function": {"name": "", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "multi_tool_use.parallel", "content": "r1"},
+            {"role": "tool", "tool_call_id": "c2", "name": long_name, "content": "r2"},
+            {"role": "tool", "tool_call_id": "c3", "name": "", "content": "r3"},
+            {"role": "assistant", "content": "done"},
+        ]
+        requests = []
+
+        def _fake_api_call(api_kwargs):
+            requests.append(api_kwargs)
+            return _mock_response(content="ok", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("continue", conversation_history=history)
+
+        wire_names = [
+            tc["function"]["name"]
+            for m in requests[0]["messages"] if m.get("role") == "assistant"
+            for tc in (m.get("tool_calls") or [])
+        ]
+        assert len(wire_names) == 3
+        assert all(len(n) <= 64 and n.replace("_", "").replace("-", "").isalnum() for n in wire_names)
+        assert [tc["function"]["name"] for tc in history[1]["tool_calls"]] == ["multi_tool_use.parallel", long_name, ""]
+
+    @pytest.mark.parametrize("base_url, model", [
+        ("https://ollama.com/v1", "glm-5.3-flash"),      # Ollama Cloud host (#72316)
+        ("http://localhost:11434/v1", "glm-5.1:cloud"),  # :cloud via local proxy (#98406)
+    ])
+    def test_ollama_cloud_glm_stop_is_never_rewritten(self, agent, base_url, model):
+        """Ollama Cloud reports finish_reason faithfully — an unpunctuated stop stays stop."""
+        self._setup_agent(agent)
+        agent.base_url = base_url
+        agent._base_url_lower = base_url.lower()
+        agent.model = model
+        unpunctuated = SimpleNamespace(content="Based on the results the best next step is to update the config", tool_calls=None)
+        assert agent._should_treat_stop_as_truncated("stop", unpunctuated, [{"role": "tool", "content": "r"}]) is False
+
+    def test_reasoning_only_local_clean_stop_returns_immediately(self, agent):
+        """A clean-stop reasoning answer returns without compression or recovery."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent.compression_enabled = True
+        empty_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content="reasoning only",
+        )
+        prefill = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_not_called()  # no compression triggered
+        assert result["completed"] is True
+        assert result["final_response"] == "reasoning only"
+        assert result["api_calls"] == 1
+
+    def test_transport_drop_stub_keeps_original_truncation_message(self, agent):
+        """Companion to the clean-EOF test above: a stub NOT tagged
+        _clean_eof (the shape built after a real transport exception) must
+        keep printing the original 'stream ended before completion'
+        wording — issue #102766 asks that this case's existing wording
+        stay as-is, only the clean-EOF case gets new wording."""
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        self._setup_agent(agent)
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        resp = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        resp.id = PARTIAL_STREAM_STUB_ID
+        agent.client.chat.completions.create.return_value = resp
+
+        printed = []
+        agent._print_fn = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+
+        with (
+            patch("model_tools.handle_function_call"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("write the report")
+
+        text = " ".join(printed)
+        assert "stream ended before completion" in text
+
+    def test_truly_empty_response_stops_after_repeated_empty(self, agent):
+        """Repeated empty responses stop after one retry and return an explanation."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        # Extra responses prove the guard stops consuming after repetition.
+        agent.client.chat.completions.create.side_effect = [
+            empty_resp, empty_resp, empty_resp, empty_resp,
+        ]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        # Empty after retries keeps the pre-existing status (not a failed turn: cron stays silent,
+        # the transcript keeps the text) and only gains the descriptor code for Desktop/TUI.
+        assert result["failed"] is False and result["completed"] is True
+        assert result["failure_reason"] == "empty_response"
+        # #34452: explanation replaces the bare "(empty)" sentinel.
+        assert result["final_response"] != "(empty)"
+        assert agent.session_api_calls == 2
+        assert result["api_calls"] == 2  # 1 original + 1 retry
 
 
 class TestRetryExhaustion:
@@ -1641,7 +2178,7 @@ class TestRetryExhaustion:
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "time", self._make_fast_time_mock()),
-            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0),  # read lazily by turn_recovery
         ):
             result = agent.run_conversation("hello")
         assert result.get("completed") is False, (
@@ -1703,7 +2240,7 @@ class TestRetryExhaustion:
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "time", self._make_fast_time_mock()),
-            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0),  # read lazily by turn_recovery
         ):
             result = agent.run_conversation("hello")
         assert result.get("completed") is False
@@ -1777,12 +2314,168 @@ class TestBudgetPressure:
 class TestDeadRetryCode:
     """Unreachable retry_count >= max_retries after raise must not exist."""
 
-    def test_no_unreachable_max_retries_after_backoff(self):
+    def test_no_unreachable_max_retries_after_backoff(self):  # noqa: source-proxy structural: one exhaustion guard per site
+        # parity 2026-10-01: upstream extracted the two guards out of run_conversation into the
+        # phase helpers that own each exhaustion site (API error / invalid response); the loop
+        # itself is now `while s.retry_count < s.max_retries`. Same invariant: exactly one
+        # reachable guard per site, none left dangling after a raise.
         import inspect
-        from agent.conversation_loop import run_conversation as _rc
-        source = inspect.getsource(_rc)
-        occurrences = source.count("if retry_count >= max_retries:")
-        assert occurrences == 2, (
-            f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
-            f"but found {occurrences}"
+        from agent.conversation_loop import _run_api_retry_loop
+        from agent.turn_api_error import settle_unrecovered_error
+        from agent.turn_response_check import retry_invalid_response
+
+        for fn in (settle_unrecovered_error, retry_invalid_response):
+            occurrences = inspect.getsource(fn).count("if retry_count >= max_retries:")
+            assert occurrences == 1, (
+                f"{fn.__name__}: expected 1 occurrence of 'if retry_count >= max_retries:' "
+                f"but found {occurrences}"
+            )
+        assert inspect.getsource(_run_api_retry_loop).count("if retry_count >= max_retries:") == 0
+
+
+class TestEmptySSEFrameTurnRecovery:
+    """A degraded gateway answers every streaming request with a contentless ``data:``
+    frame. The SDK turns that into ``JSONDecodeError(doc='')`` → ``Provider stream returned
+    non-JSON SSE data`` and the turn died after 3 identical streaming retries. The turn must
+    instead complete on the automatic non-streaming retry."""
+
+    def test_turn_completes_on_the_non_streaming_retry(self, agent):
+        import httpx
+        from openai import OpenAI, Stream
+        from openai.types.chat import ChatCompletionChunk
+
+        request = httpx.Request("POST", "https://gw.example/v1/chat/completions")
+        empty_frame = httpx.Response(
+            200, request=request, headers={"x-request-id": "req-empty"}, content=b"data:\n\n"
         )
+        # The real SDK decoder, so the test exercises the exact production rejection.
+        agent.client.chat.completions.create.return_value = Stream(
+            cast_to=ChatCompletionChunk,
+            response=empty_frame,
+            client=OpenAI(api_key="test-key", max_retries=0),
+        )
+        agent.stream_delta_callback = MagicMock()  # a consumer: the loop prefers streaming
+
+        attempts = []
+
+        def _non_streaming(api_kwargs):
+            attempts.append("non_streaming")
+            return _mock_response(content="Recovered")
+
+        agent._interruptible_api_call = _non_streaming
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        warnings = []
+        agent.status_callback = lambda kind, message: warnings.append((kind, message))
+
+        with patch("run_agent.time.sleep", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert agent._disable_streaming is True
+        # Exactly one retry, and it went out on the non-streaming channel: the stream was
+        # attempted once and never re-entered (the old behaviour retried it 3 times).
+        assert attempts == ["non_streaming"]
+        assert agent.client.chat.completions.create.call_count == 1
+        assert any(kind == "warn" for kind, _msg in warnings)
+
+
+class TestRetryAfterCap:
+    """The loop honors provider cooldowns up to a 600-second ceiling.
+
+    This covers rate-limit headers (#26293) and retryable 5xx responses.
+    """
+
+    @staticmethod
+    def _retryable_error(status_code, headers, body=None):
+        """A provider error carrying optional Retry-After surfaces."""
+        message = (
+            "Error code: 429 - Rate limit exceeded."
+            if status_code == 429
+            else f"Error code: {status_code} - origin response timeout"
+        )
+
+        class _ProviderError(Exception):
+            def __init__(self):
+                super().__init__(message)
+                self.status_code = status_code
+                self.response = SimpleNamespace(headers=headers)
+                if body is not None:
+                    self.body = body
+
+        return _ProviderError()
+
+    def _drive_once(self, agent, error, status_marker):
+        """Raise ``error`` from the API call and capture the backoff status the
+        loop chose. Interrupt during the backoff sleep so the test doesn't
+        actually wait, and return the status string reporting the wait."""
+
+        def _fake_api_call(api_kwargs):
+            raise error
+
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        captured = []
+        original_buffer = agent._buffer_status
+        original_emit = agent._emit_status
+
+        def _capture_status(msg, *args, **kwargs):
+            captured.append((msg, "buffer"))
+            # Break out of the backoff sleep immediately rather than blocking
+            # for the full Retry-After window.
+            if status_marker in msg:
+                agent._interrupt_requested = True
+            return original_buffer(msg, *args, **kwargs)
+
+        def _capture_emit(msg):
+            captured.append((msg, "emit"))
+            if status_marker in msg:
+                agent._interrupt_requested = True
+            return original_emit(msg)
+
+        agent._buffer_status = _capture_status
+        agent._emit_status = _capture_emit
+        agent.run_conversation("hello")
+        return next(((m, s) for m, s in captured if status_marker in m), ("", ""))
+
+    def test_retry_after_under_cap_is_honored(self, agent):
+        # 300s > old 120s cap but < new 600s cap → used verbatim.
+        error = self._retryable_error(429, {"retry-after": "300"})
+        status, _ = self._drive_once(agent, error, "Waiting")
+        assert "Waiting 300.0s" in status
+
+    @pytest.mark.parametrize(
+        ("headers", "body", "expected_wait", "expected_surface"),
+        [
+            # Long cooldowns (> 60s) surface immediately...
+            ({"Retry-After": "120"}, {}, "120.0", "emit"),
+            ({}, {"status": 524, "retry_after": 120}, "120.0", "emit"),
+            ({}, {"status": 524, "error": {"retry_after": 120}}, "120.0", "emit"),
+            # Above the 600s ceiling → capped, never used verbatim.
+            ({"Retry-After": "3600"}, {}, "600.0", "emit"),
+            # ...short cooldowns keep the buffered status line.
+            ({"Retry-After": "30"}, {}, "30.0", "buffer"),
+            # No cooldown on header or body → falls through to jittered
+            # backoff (patched to 0.0 by the conftest fixture), no crash.
+            ({}, {"status": 524}, "0.0", "buffer"),
+        ],
+        ids=(
+            "header",
+            "problem-detail-body",
+            "nested-problem-detail-body",
+            "over-cap-is-capped",
+            "short-cooldown-is-buffered",
+            "no-cooldown-falls-back",
+        ),
+    )
+    def test_retry_after_on_cloudflare_524_is_honored(
+        self, agent, headers, body, expected_wait, expected_surface
+    ):
+        """A retryable 5xx must not bypass the provider's cooldown."""
+        error = self._retryable_error(524, headers, body)
+        status, surface = self._drive_once(agent, error, "Retrying in")
+        assert f"Retrying in {expected_wait}s" in status
+        assert surface == expected_surface

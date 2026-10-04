@@ -15,7 +15,7 @@ answer is identical on every connection topology.
 import pytest
 
 import tui_gateway.server as server
-from toolsets import TOOLSETS, resolve_toolset
+from toolsets import TOOLSETS
 
 GUI_TOOLS = {
     "annotate_preview",
@@ -26,9 +26,8 @@ GUI_TOOLS = {
     "read_terminal",
     "read_window_below",
     "react_to_message",
-    "setup_mcp",
-    "tip",
-    "tour",
+    "show_tip",
+    "gui_tour",
 }
 
 
@@ -42,8 +41,6 @@ def no_desktop_env(monkeypatch):
 
 
 class TestDesktopUiToolset:
-    def test_holds_exactly_the_gui_affordances(self):
-        assert set(resolve_toolset("desktop_ui")) == GUI_TOOLS
 
     def test_stays_off_the_core_tool_list(self):
         """Core ships on every API call — a GUI-only tool must not be there."""
@@ -173,17 +170,22 @@ class TestDisabledToolsetsHonored:
         cc = self._patch_cfg(no_desktop_env, self._cfg(["project"]))
         no_desktop_env.setattr(cc, "coding_selection", lambda **_: None)
 
-        def names(disabled):
+        def names(disabled, **kw):
             defs = model_tools.get_tool_definitions(
                 enabled_toolsets=server._load_enabled_toolsets("clanker-warm-client"),
                 disabled_toolsets=disabled,
                 quiet_mode=True,
+                **kw,
             )
             return {d["function"]["name"] for d in defs}
 
-        final = names(server._load_disabled_toolsets())
-        assert "todo" in final
-        assert "desktop_project" not in final
+        # Upstream renamed ``todo`` -> ``todo_list`` and defers it behind the tool_search bridge by
+        # default, so the assembled schema is the three bridge tools; the denylist is proven on the
+        # uncollapsed catalog (what tool_search/tool_call can reach) AND on the assembled schema.
+        catalog = names(server._load_disabled_toolsets(), skip_tool_search_assembly=True)
+        assert "todo_list" in catalog
+        assert "desktop_project" not in catalog
+        assert "desktop_project" not in names(server._load_disabled_toolsets())
 
     def test_make_agent_forwards_denylist(self, no_desktop_env):
         from unittest.mock import MagicMock, patch

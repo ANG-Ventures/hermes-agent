@@ -11,6 +11,7 @@ import pytest
 
 from gateway import kanban_orphan_menu as om
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 
 S_A = "20261003_141500_aaaa"
 S_B = "20261003_090000_bbbb"
@@ -91,7 +92,7 @@ def test_reply_round_trip_rehomes_and_subscribes(board):
     assert out == f"\u23f3 {a} re-homed to <#{CHAN_B}> (session {S_B}, option 2)."
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, a).session_id == S_B
-        assert [(s["platform"], s["chat_id"]) for s in kb.list_notify_subs(conn, a)] == [("discord", CHAN_B)]
+        assert [(s["platform"], s["chat_id"]) for s in kbn.list_notify_subs(conn, a)] == [("discord", CHAN_B)]
         comments = [c.body for c in kb.list_comments(conn, a)]
     assert any("orphan menu: re-homed to session" in c and "chosen by Ace" in c for c in comments)
 
@@ -164,4 +165,4 @@ async def test_forged_menu_from_a_non_bot_author_is_not_executable(board, monkey
     assert await gr._maybe_orphan_menu_reply(event, src) is None
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, a).session_id is None
-        assert kb.list_notify_subs(conn, a) == []
+        assert kbn.list_notify_subs(conn, a) == []

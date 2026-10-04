@@ -46,6 +46,7 @@ import os
 import re
 import shlex
 import stat
+import sys
 import threading
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -83,7 +84,9 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # matching via the `/hermes` tail, while every real command position
     # (start of text, whitespace, `;`/`&`/`|`, `$(`, backtick, even a
     # U+FFFD from binary-content decoding) still matches.
-    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:restart|stop|uninstall)\b)"
+    # Windows spells the CLI with a launcher suffix (`hermes.exe`, npm-style `hermes.cmd`/`.ps1`);
+    # same command, so the suffix is optional here.
+    r"(?:(?<![/\w.\-])hermes(?:\.(?:exe|cmd|bat|com|ps1))?\s+gateway\s+(?:restart|stop|uninstall)\b)"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -114,8 +117,12 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     #   - the gap between kill and its target tokens is bounded to a single
     #     shell segment ([^\n;|&]*) so it can't greedily span across `;`/`&&`
     #     into unrelated `hermes`/`gateway` path tokens later on the line.
-    r"|(?:\b(?:pkill|kill)\b[^\n;|&]*\bhermes\b[^\n;|&]*\bgateway)"
-    r"|(?:\b(?:pkill|kill)\b[^\n;|&]*\bgateway\b[^\n;|&]*\bhermes)"
+    #   - `taskkill` / `Stop-Process` are the Windows spellings of the same operation;
+    #     `\bp?kill\b` cannot reach inside `taskkill`, so they are named outright.
+    #     Service-control forms (`net stop`, `sc stop`) presuppose a service install
+    #     this guard has no evidence of and stay uncovered.
+    r"|(?:\b(?:pkill|kill|taskkill|stop-process)\b[^\n;|&]*\bhermes\b[^\n;|&]*\bgateway)"
+    r"|(?:\b(?:pkill|kill|taskkill|stop-process)\b[^\n;|&]*\bgateway\b[^\n;|&]*\bhermes)"
 )
 
 
@@ -131,6 +138,160 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 # produce the #30719 respawn loop even though the ssh client itself would
 # survive.  We cannot resolve arbitrary hostnames in a text guard, so an ssh
 # to this machine's own LAN hostname is an accepted residual gap.
+# Branch E: process killers whose TARGET is the interpreter image hosting the gateway. A supervised
+# gateway is literally `python.exe` / `python3.12` (`python -m hermes_cli.main gateway run`), so
+# `taskkill /F /IM python.exe`, `pkill -9 python3` or `killall python` carry no hermes/gateway token
+# yet terminate it (#113667). Token-aware rather than a line regex: option VALUES are never read as
+# targets (`pkill -u <user> chrome`), `-f` cmdline patterns are judged as patterns, and other image
+# names (`taskkill /F /IM agent-browser.exe`) stay available. Numeric-PID kills are out of scope:
+# the explicit PID / `proc_*` id IS the ownership-scoped route the rejection points to.
+_INTERPRETER_IMAGE_RE = re.compile(r"^pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
+_HOST_INTERPRETER_NAME = Path(sys.executable).name.lower() if sys.executable else ""
+_KILLER_VALUE_OPTIONS = {
+    # procps pkill/pgrep options that consume the next token, so the value is never the pattern.
+    "pkill": frozenset({
+        "-g", "--pgroup", "-G", "--group", "-P", "--parent", "-s", "--session", "-t", "--terminal",
+        "-u", "--euid", "-U", "--uid", "-F", "--pidfile", "--ns", "--nslist", "-d", "--delimiter",
+        "--signal", "-O", "--older", "-r", "--runstates", "--cgroup", "-A", "--ignore-ancestors",
+    }),
+    "killall": frozenset({"-s", "--signal", "-u", "--user", "-o", "--older-than", "-y", "--younger-than",
+                          "-n", "--ns", "-Z", "--context"}),
+}
+_KILLER_VALUE_OPTIONS["pgrep"] = _KILLER_VALUE_OPTIONS["pkill"]
+_KILLER_VALUE_OPTIONS["pidof"] = frozenset({"-o", "--omit-pid", "-S", "--separator"})
+# Regex metacharacters a pkill/pgrep ERE may carry around the interpreter name (`^python3?$`, `python.*`).
+_ERE_TAIL = re.compile(r"[.*+?\\\[\](){}|].*$")
+_ERE_WILDCARD_ONLY = re.compile(r"^[.*+?$\s]*$")
+_NAME_KILLERS = frozenset({"pkill", "killall", "taskkill", "stop-process"})
+_NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
+_KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
+# A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
+# (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
+# an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
+# cannot match it. Same hermes+gateway pairing as Branch D, plus the module path.
+_GATEWAY_CMDLINE_TOKEN_RE = re.compile(r"(?i)hermes_cli|\bhermes\b[^\n]*\bgateway\b|\bgateway\b[^\n]*\bhermes\b")
+# Rejection text for Branch E, shared by every tool surface that runs the guard so the agent is
+# pointed at the ownership-scoped route (proc_* id / explicit PID) rather than the shell.
+HOST_INTERPRETER_KILL_REJECTION = (
+    "Blocked: this command kills every process whose image/name matches the Python "
+    "interpreter, which is the process hosting this gateway (and this command). "
+    "Stop only the process you own instead: process(action=\"kill\", session_id=\"proc_…\") "
+    "for a background job Hermes started, or kill/taskkill by its explicit PID."
+)
+
+
+def _is_interpreter_image(value: str, *, substring: bool = False) -> bool:
+    """True when *value* (a process/image name, `*`-wildcard allowed) denotes the Python interpreter
+    that hosts the gateway. *substring*: pkill/pgrep match an ERE anywhere in the name, so `py`
+    reaches `python3` too."""
+    name = value.strip().strip("\"'").lower().removesuffix(".exe")
+    if not name:
+        return False
+    if name.endswith("*"):
+        prefix = name.rstrip("*")
+        return "python".startswith(prefix) or _HOST_INTERPRETER_NAME.startswith(prefix)
+    if _INTERPRETER_IMAGE_RE.match(name) or name == _HOST_INTERPRETER_NAME.removesuffix(".exe"):
+        return True
+    return substring and len(name) >= 2 and "python".startswith(name)
+
+
+def _pattern_reaches_host_interpreter(pattern: str, *, full_cmdline: bool, exact: bool) -> bool:
+    """pkill/pgrep/killall operand semantics: an ERE against the process NAME (or, with `-f`, the full
+    command line). `python -m hermes_cli.main …` is the gateway's own cmdline, so a `-f` pattern
+    that names the interpreter and then only wildcards or a `hermes` token reaches it, while
+    `python mt_add.py` (a specific script) does not."""
+    core = pattern.strip().strip("\"'").lstrip("^")
+    if core.endswith("$"):
+        core = core[:-1]
+    head, _, rest = core.partition(" ") if full_cmdline else (core, "", "")
+    # A literal interpreter name first (`python3.12`: the dot is a version separator, not an ERE
+    # wildcard); only then read the head as an ERE with a metacharacter tail (`python3?`, `python.*`).
+    match = None if _is_interpreter_image(head, substring=not exact) else _ERE_TAIL.search(head)
+    if match:
+        rest = head[match.start():] + " " + rest
+        head = head[: match.start()]
+    if not _is_interpreter_image(head, substring=not exact):
+        return full_cmdline and bool(_GATEWAY_CMDLINE_TOKEN_RE.search(core))
+    return not rest.strip() or bool(_ERE_WILDCARD_ONLY.match(rest)) or "hermes" in rest.lower()
+
+
+def _killer_targets_host_interpreter(name: str, args: list[str]) -> bool:
+    """Whether killer/enumerator *name* with argv *args* would select the host interpreter."""
+    if name in ("pkill", "pgrep", "killall", "pidof"):
+        # pkill/pgrep: ERE anywhere in the name unless -x; killall: exact name unless -r; pidof: exact.
+        exact = name == "pidof" or (name == "killall") != any(t in ("-r", "--regexp", "-x", "--exact") for t in args)
+        full_cmdline = name in ("pkill", "pgrep") and any(t in ("-f", "--full") for t in args)
+        operands: list[str] = []
+        position = 0
+        while position < len(args):
+            token = args[position]
+            if token == "--":
+                operands += args[position + 1:]
+                break
+            if token in _KILLER_VALUE_OPTIONS[name]:
+                position += 2
+                continue
+            if not token.startswith("-"):
+                operands.append(token)
+            position += 1
+        return any(_pattern_reaches_host_interpreter(op, full_cmdline=full_cmdline, exact=exact) for op in operands)
+    if name == "taskkill":
+        for position, token in enumerate(args[:-1]):
+            option = token.lower().lstrip("/-")
+            value = args[position + 1]
+            if option == "im" and _is_interpreter_image(value):
+                return True
+            if option == "fi":
+                filter_match = re.match(r"(?i)\s*['\"]?imagename\s+eq\s+(\S+)", value)
+                if filter_match and _is_interpreter_image(filter_match.group(1)):
+                    return True
+        return False
+    # Stop-Process / Get-Process: `-Name`/`-ProcessName` (also `-Name:value`), comma lists, positional
+    # names for Get-Process.
+    values: list[str] = []
+    for position, token in enumerate(args):
+        option, _, inline_value = token.partition(":")
+        if option.lower() in ("-name", "-processname", "-n"):
+            values.append(inline_value if inline_value else (args[position + 1] if position + 1 < len(args) else ""))
+        elif name == "get-process" and not token.startswith("-") and (position == 0 or not args[position - 1].startswith("-")):
+            values.append(token)
+    return any(_is_interpreter_image(part) for value in values for part in value.split(","))
+
+
+def _segment_names_host_interpreter(tokens: list[str], killers: frozenset[str]) -> bool:
+    """Whether a tokenized segment runs one of *killers* against the host interpreter. The
+    executable is read at the wrapper-peeled position first, then at the first killer token anywhere
+    in the segment (`xargs kill`, Python argv lists)."""
+    index = _executed_command_index(tokens)
+    candidates = [index] if index is not None else []
+    candidates += [i for i, token in enumerate(tokens) if _executable_name(token).lower().removesuffix(".exe") in killers]
+    for position in candidates:
+        name = _executable_name(tokens[position]).lower().removesuffix(".exe")
+        if name in killers and _killer_targets_host_interpreter(name, tokens[position + 1:]):
+            return True
+    return False
+
+
+def contains_host_interpreter_kill(text: str) -> bool:
+    """Branch E entrypoint: a process killer aimed at the interpreter image hosting the gateway, or a
+    name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
+    `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
+    argv lists resolve the same way the shell resolves them."""
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
+    for segment in _iter_command_segments(normalized):
+        joined = " ".join(segment)
+        stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
+        # Python argv lists (`subprocess.run(["taskkill", "/IM", "python.exe"])`) re-split only when
+        # list punctuation was present, so a quoted `-f 'python my_script.py'` stays one operand.
+        for tokens in ([segment, stripped.split()] if stripped != joined else [segment]):
+            if _segment_names_host_interpreter(tokens, _NAME_KILLERS):
+                return True
+            if kill_verb_present and _segment_names_host_interpreter(tokens, _NAME_ENUMERATORS):
+                return True
+    return False
+
+
 _SSH_COMMAND_RE = re.compile(r"(?i)(?:^|\s)(?:/\S*/)?(?:ssh|autossh)\s")
 _LOOPBACK_HOST_RE = re.compile(
     r"(?i)(?:^|[\s@\[:])(?:localhost|(?:::ffff:)?127\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|0\.0\.0\.0)\b"
@@ -362,37 +523,27 @@ _ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
 _PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     r"hermes\s+"
-    # Any global flags before the profile selector (each may carry a value).
-    r"(?:-{1,2}\S+(?:\s+\S+)?\s+)*"
+    # Each flag has one parse: '-' plus its remainder, never two ways to split
+    # '--'. A following flag cannot also be an optional value (#129281).
+    # Possessive token/space runs avoid repartitioning whitespace on failure;
+    # whole flag groups can still backtrack to expose the profile selector.
+    # Do not cap the number of flags: that would silently allow long self-stops.
+    r"(?:-\S++(?:\s++(?!-\S)\S++)?\s++)*"
     # The selector itself: `--profile=<name>` or the space-separated
     # `-p <name>` / `--profile <name>` — exactly the shapes the CLI's
     # `_apply_profile_override` accepts.
     r"(?:--profile=([^\s]+)|(?:-p|--profile)\s+([^\s]+))"
     # Any global flags between the selector and the subcommand.
-    r"(?:\s+-{1,2}\S+(?:\s+\S+)?)*"
+    r"(?:\s++-\S++(?:\s++(?!-\S)\S++)?)*"
     r"\s+gateway\s+(?:restart|stop)"
 )
 
 
 def _current_profile_name() -> Optional[str]:
-    """Return the name of the profile running the guard, if determinable.
+    """Profile running the guard (``hermes_cli.profiles.current_profile_name``); ``None`` if none."""
+    from hermes_cli.profiles import current_profile_name
 
-    Prefers the explicit ``HERMES_PROFILE_NAME`` / ``HERMES_PROFILE`` env
-    (set by the profile launcher and kanban worker spawns), falling back to
-    ``hermes_cli.profiles.get_active_profile_name`` (derived from
-    ``HERMES_HOME``, which the gateway process inherits from its launch
-    profile). Returns ``None`` when neither source yields a name.
-    """
-    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
-        value = os.environ.get(env_name)
-        if value and value.strip():
-            return value.strip()
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-
-        return get_active_profile_name() or None
-    except Exception:
-        return None
+    return current_profile_name()
 
 
 def _named_profile_is_current(named: str) -> bool:
@@ -523,6 +674,8 @@ def _profile_derived_self_names() -> set[str]:
     """
     try:
         from hermes_cli.gateway import (
+            _home_owns_bare_service_name,
+            _profile_name_from_home,
             get_hermes_home,
             get_launchd_label,
             get_service_name,
@@ -531,7 +684,12 @@ def _profile_derived_self_names() -> set[str]:
 
         home = Path(str(get_hermes_home())).resolve()
         default = Path(str(get_default_hermes_root())).resolve()
-        if home != default and home.parent != (default / "profiles").resolve():
+        # Same basis `_profile_suffix` uses: anything else gets the hash
+        # suffix, i.e. a fabricated identity — fail closed.
+        if not (
+            _home_owns_bare_service_name(home)
+            or _profile_name_from_home(home, default)
+        ):
             return set()
         names: set[str] = set()
         label = get_launchd_label()
@@ -820,7 +978,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
         if _lifecycle_targets_only_sibling_gateways(_line):
             continue
         return True
-    return False
+    # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
+    return contains_host_interpreter_kill(normalized)
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -835,6 +994,15 @@ _CONTROL_CHARS = frozenset(";&|()")
 # `CloudStorage` hosts every third-party FileProvider domain (Dropbox,
 # OneDrive, Google Drive, Box, ...) on modern macOS.
 _CLOUD_PLACEHOLDER_MARKERS = frozenset({"Mobile Documents", "CloudStorage"})
+
+
+def _resolve_lenient(path: Path) -> Path:
+    """``path.resolve(strict=False)``, falling back to *path* on OSError (unreadable/long) or
+    ValueError (embedded NUL from decoded binary tokenized as a path) — never crash the guard."""
+    try:
+        return path.resolve(strict=False)
+    except (OSError, ValueError):
+        return path
 
 
 def _is_cloud_placeholder_path(path: Path) -> bool:
@@ -854,6 +1022,11 @@ def _is_cloud_placeholder_path(path: Path) -> bool:
         for index, part in enumerate(parts)
         if index
     )
+
+def _on_cloud_path(path: Path) -> bool:
+    """Lexical OR resolved cloud check: covers direct cloud paths and local symlinks into one."""
+    return _is_cloud_placeholder_path(path) or _is_cloud_placeholder_path(_resolve_lenient(path))
+
 
 # Executables whose arguments are DATA, not commands: search patterns, SQL
 # statements, log filters. None of these can execute their argument text, so
@@ -924,6 +1097,126 @@ _BINARY_SNIFF_BYTES = 4096
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
+
+
+# Whole-walk work limits. The per-file cap and depth bound above limit one read, not the walk: a
+# command can reference arbitrarily many scripts, and the pure-Python shlex pass (quadratic on a
+# giant token) once held the GIL for minutes. These caps bound one whole walk and are charged
+# BEFORE any text reaches shlex. Exhaustion fails closed (an unscanned script could hide a
+# lifecycle command) and is logged at WARNING so an operator can tell it from a real block. Sizes
+# sit well above any legitimate wrapper graph; remote reads are a backend roundtrip each, so they
+# get a far tighter cap.
+# See #78398.
+_MAX_LIFECYCLE_SCAN_BYTES = _MAX_REFERENCED_SCRIPT_BYTES  # 1 MiB across the walk
+_MAX_LIFECYCLE_SCAN_LINES = 16384
+_MAX_LIFECYCLE_SCAN_LINE_BYTES = 64 * 1024
+_MAX_LIFECYCLE_SCAN_PATHS = 1024
+_MAX_LIFECYCLE_SCAN_REMOTE_READS = 64
+
+
+class _LifecycleScanBudget:
+    """Shared work budget for one complete referenced-script walk. ``refusal`` records why the walk
+    failed closed for a reason other than a lifecycle command (budget, size, device, live SQLite,
+    cloud placeholder) so the caller can tell the model the real reason (#113944)."""
+
+    __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining",
+                 "refusal")
+
+    def __init__(self) -> None:
+        # Read the module constants at construction so tests/operators can lower them at runtime.
+        self.bytes_remaining = _MAX_LIFECYCLE_SCAN_BYTES
+        self.lines_remaining = _MAX_LIFECYCLE_SCAN_LINES
+        self.paths_remaining = _MAX_LIFECYCLE_SCAN_PATHS
+        self.remote_reads_remaining = _MAX_LIFECYCLE_SCAN_REMOTE_READS
+        self.refusal: Optional[str] = None
+
+    def charge_text(self, text: str) -> bool:
+        """Charge *text* before tokenization; False when it does not fit."""
+        # UTF-8 is >= one byte per code point, so the char count is a free lower bound.
+        if len(text) > self.bytes_remaining:
+            return False
+        encoded = len(text.encode("utf-8", errors="replace"))
+        if encoded > self.bytes_remaining:
+            return False
+        lines = text.count("\n") + 1
+        if lines > self.lines_remaining:
+            return False
+        # One huge token is the quadratic shlex case; bound the longest physical line (chars, a
+        # lower bound on bytes — tight enough for a DoS bound without a per-line encode).
+        longest = max((len(line) for line in text.split("\n")), default=0)
+        if longest > _MAX_LIFECYCLE_SCAN_LINE_BYTES:
+            return False
+        self.bytes_remaining -= encoded
+        self.lines_remaining -= lines
+        return True
+
+    def charge_path(self) -> bool:
+        """Charge one unique referenced path before any local/remote read."""
+        if self.paths_remaining <= 0:
+            return False
+        self.paths_remaining -= 1
+        return True
+
+    def charge_remote_read(self) -> bool:
+        """Charge one remote-backend read (a network roundtrip each)."""
+        if self.remote_reads_remaining <= 0:
+            return False
+        self.remote_reads_remaining -= 1
+        return True
+
+
+def _capped_read_limit(max_bytes: Optional[int]) -> int:
+    """Per-read byte cap: never above the per-file cap, never negative. One definition so local and
+    remote reads cannot diverge.
+
+    See #76762, #77703.
+    """
+    if max_bytes is None:
+        return _MAX_REFERENCED_SCRIPT_BYTES
+    return min(_MAX_REFERENCED_SCRIPT_BYTES, max(0, int(max_bytes)))
+
+
+def lifecycle_scan_root_within_budget(text: str) -> bool:
+    """Whether *text* may safely enter an optional tokenizer pass (``tools/terminal_tool.py`` gates
+    its launchctl pre-scan on this). A FRESH budget, independent of the full guard's walk: the
+    pre-scan may pass while the walk later exhausts, still fail-closed — only the friendlier
+    launchctl diagnostic is lost. ``False`` is not a verdict: callers must still run the full guard."""
+    try:
+        return _LifecycleScanBudget().charge_text(text)
+    except Exception:
+        return False
+
+
+def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bool:
+    logger.warning(
+        "lifecycle guard scan budget exhausted (%s at depth %d); "
+        "failing closed — see _MAX_LIFECYCLE_SCAN_* in cron/lifecycle_guard.py",
+        what, depth,
+    )
+    budget.refusal = f"the scan budget was exhausted ({what} at depth {depth})"
+    return True
+
+
+def _unreadable_reason(path: Path) -> str:
+    """Name why an *executed* script failed closed without being scanned (live SQLite, device,
+    oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    if has_live_connection(path):
+        return f"`{path}` is a SQLite database open in this gateway process"
+    try:
+        metadata = os.stat(path)
+    except OSError:
+        return f"`{path}` could not be read"
+    if not stat.S_ISREG(metadata.st_mode):
+        return f"`{path}` is not a regular file"
+    return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+
+
+def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
+    logger.warning("lifecycle guard cannot scan referenced script %s: %s; failing closed", path, reason)
+    budget.refusal = reason
+    return True
 
 
 def _split_logical_lines(text: str) -> list[str]:
@@ -1149,6 +1442,15 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
             continue
         return index
     return None
+
+
+def _executed_command_index(segment: list[str]) -> Optional[int]:
+    """Index of the command a segment actually executes (env assignments and wrappers peeled)."""
+    index = _command_token_index(segment)
+    if index is None:
+        return None
+    index = _peel_transparent_prefixes(segment, index)
+    return index if index < len(segment) else None
 
 
 def contains_launchctl_submit_command(command: str) -> bool:
@@ -1860,7 +2162,31 @@ def _has_binary_magic(data: bytes) -> bool:
     return data.startswith(_BINARY_MAGICS)
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
+def _read_referenced_script(
+    path: Path, *, max_bytes: Optional[int] = None
+) -> tuple[Optional[str], bool]:
+    """Read a referenced script without racing SQLite connection lifecycle.
+
+    The registry check must cover the complete ``open``/``read``/``close``
+    sequence. A separate ``has_live_connection`` check would leave a race in
+    which another thread opens SQLite after the check but before this function
+    closes its descriptor, cancelling that connection's POSIX locks.
+    """
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+
+    try:
+        with offline_file_access(path, what="read referenced script"):
+            return _read_referenced_script_unlocked(path, max_bytes=max_bytes)
+    except LiveConnectionError:
+        return None, True
+    except (OSError, ValueError):
+        # Invalid path values, including embedded NULs, are not scripts.
+        return None, False
+
+
+def _read_referenced_script_unlocked(
+    path: Path, *, max_bytes: Optional[int] = None
+) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
 
     This is the shared choke point for every local script read the guard
@@ -1871,7 +2197,9 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     evicted placeholder's ``open()`` can hang preflight indefinitely
     (#88052). The lexical check covers direct cloud paths; the resolved
     check covers local launchers that are symlinks into a cloud subtree.
+    ``max_bytes`` lowers the per-file cap to what the calling walk can still afford.
     """
+    byte_limit = _capped_read_limit(max_bytes)
     if _is_cloud_placeholder_path(path):
         return None, True
     try:
@@ -1926,10 +2254,8 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
             return None, False
         # Read the remainder (bounded). Loop because os.read may return
         # short for non-regular-file-backed descriptors.
-        while len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-            chunk = os.read(
-                descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1 - len(data)
-            )
+        while len(data) <= byte_limit:
+            chunk = os.read(descriptor, byte_limit + 1 - len(data))
             if not chunk:
                 break
             data += chunk
@@ -1952,14 +2278,16 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # Check the size BEFORE stripping: stripping shrinks the buffer, so doing it
     # first would let an oversized file slip under the threshold and skip this
     # fail-closed branch.
-    if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
+    if len(data) > byte_limit:
         return None, True
     if b"\x00" in data:
         data = data.replace(b"\x00", b"")
     return data.decode("utf-8", errors="replace"), False
 
 
-def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bool]:
+def _sanitize_remote_script_text(
+    text: Optional[str], *, max_bytes: Optional[int] = None
+) -> tuple[Optional[str], bool]:
     """Apply the local-read contract to text from a ``read_remote_script`` callback.
 
     The recursion boundary must not trust its callbacks: any backend (SSH,
@@ -1980,7 +2308,8 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
         return None, False
     if "\x00" in text:
         return None, False
-    if len(text.encode("utf-8", errors="replace")) > _MAX_REFERENCED_SCRIPT_BYTES:
+    byte_limit = _capped_read_limit(max_bytes)
+    if len(text.encode("utf-8", errors="replace")) > byte_limit:
         return None, True
     return text, False
 
@@ -2310,17 +2639,36 @@ def _contains_unsafe_gateway_action(
     cwd: Optional[str],
     depth: int,
     visited: set[Path],
+    budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    executed: bool = True,
 ) -> bool:
+    """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
+    (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
+    depth, size, device, live SQLite, cloud) is "nothing to scan" there, never a block (#113944)."""
+    # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
+    if not budget.charge_text(command):
+        return _budget_exhausted(budget, "text", depth) if executed else False
     if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
-        return True
+        return executed
 
     from tools.shell_heredoc import (
         inert_python_heredoc_bodies,
         strip_inert_heredoc_bodies,
     )
+
+    def recurse(text: str, cwd: Optional[str], executed: bool) -> bool:
+        return _contains_unsafe_gateway_action(
+            text,
+            cwd=cwd,
+            depth=depth + 1,
+            visited=visited,
+            budget=budget,
+            read_remote_script=read_remote_script,
+            executed=executed,
+        )
 
     # Python stdin is executable Python source, but not a sequence of shell
     # commands. Scan its lifecycle-shaped calls like a .py file, then exclude
@@ -2329,78 +2677,109 @@ def _contains_unsafe_gateway_action(
     for body in python_bodies:
         if _direct_lifecycle_scan(body):
             return True
+    # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
+    # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
+    # oversized data file mentioned there otherwise fails closed as a "script".
     shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
-    referenced_command = shell_command + "\n" + "\n".join(
-        _mask_read_only_python_paths(body) for body in python_bodies
-    )
+    masked_bodies = [_mask_read_only_python_paths(body) for body in python_bodies]
+    referenced_command = shell_command + "\n" + "\n".join(masked_bodies)
 
     for payload in _iter_shell_command_payloads(shell_command):
-        if _contains_unsafe_gateway_action(
-            payload,
-            cwd=cwd,
-            depth=depth + 1,
-            visited=visited,
-            read_remote_script=read_remote_script,
-        ):
+        if recurse(payload, cwd, executed):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(referenced_command, cwd=cwd):
+    # Paths named only inside a masked body are still READ: an interpreter body that hands
+    # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
+    # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
+    # trip them. Executed candidates come first so a mention never starves a real script's budget.
+    candidates = [
+        (path, executed) for path in _iter_referenced_shell_scripts(referenced_command, cwd=cwd)
+    ]
+    if shell_command != command:
+        # Fork: a path `_mask_read_only_python_paths` removed is a file the body provably only
+        # READS as data (#1017/#1348) — its contents are never executed, so it is not even a
+        # mention. Everything else named in the raw command stays a mention candidate.
+        masked_away: set = set()
+        for body, masked in zip(python_bodies, masked_bodies):
+            if masked != body:
+                masked_away |= (
+                    set(_iter_referenced_shell_scripts(body, cwd=cwd))
+                    - set(_iter_referenced_shell_scripts(masked, cwd=cwd))
+                )
+        candidates += [
+            (path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)
+            if path not in masked_away
+        ]
+
+    for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
-        # resolved check below covers local launchers that are symlinks into
+        # resolved check covers local launchers that are symlinks into
         # a cloud subtree. _read_referenced_script repeats both checks as the
         # shared choke point, so every caller stays covered even if this
         # walk-level short-circuit is bypassed.
-        if _is_cloud_placeholder_path(script_path):
-            return True
-        try:
-            resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
-            # OSError: unreadable/long paths. ValueError: embedded NUL byte
-            # from a binary's decoded contents tokenized as a path — a
-            # guarded path must never crash the guard (#76762).
-            resolved = script_path
-        if _is_cloud_placeholder_path(resolved):
-            return True
+        if _on_cloud_path(script_path):
+            if candidate_executed:
+                return _refuse_unreadable(
+                    budget, script_path,
+                    f"`{script_path}` lives on a cloud-synced path (iCloud Drive / "
+                    "~/Library/CloudStorage) that the guard refuses to open",
+                )
+            continue
+        resolved = _resolve_lenient(script_path)
         if resolved in visited:
             continue
+        if not budget.charge_path():
+            if candidate_executed:
+                return _budget_exhausted(budget, "paths", depth)
+            break  # remaining candidates are all mentions
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        # Never read more than the walk can still afford to tokenize; a file larger than the
+        # remainder fails closed exactly like an oversized one.
+        script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
-            return True
+            if candidate_executed:
+                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+            continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             # The callback's output crosses the same trust boundary as a
             # local read — sanitize it identically before it enters the
             # recursion (binary skip + size fail-closed).
+            if not budget.charge_remote_read():
+                if candidate_executed:
+                    return _budget_exhausted(budget, "remote reads", depth)
+                break
             script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path))
+                read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
-                return True
+                if candidate_executed:
+                    return _refuse_unreadable(
+                        budget, script_path,
+                        f"`{script_path}` read from the backend exceeds the scan cap "
+                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
+                    )
+                continue
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
-        if _contains_unsafe_gateway_action(
-            script_text,
-            cwd=script_dir,
-            depth=depth + 1,
-            visited=visited,
-            read_remote_script=read_remote_script,
-        ):
+        if recurse(script_text, script_dir, candidate_executed):
             return True
     return False
 
 
-def contains_gateway_lifecycle_command_or_referenced_script(
+def scan_gateway_lifecycle(
     command: str,
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-) -> bool:
-    """Detect lifecycle/submit commands, including bounded nested scripts.
+) -> tuple[bool, Optional[str]]:
+    """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
+    size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
+    real lifecycle command or the command is allowed.
 
     Total by construction: this function returns a verdict for *every*
     input and never raises. The direct scans below are pure string
@@ -2415,15 +2794,18 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     every terminal command until the gateway restarts (#77780, #78256),
     which is strictly worse than either verdict.
     """
+    budget = _LifecycleScanBudget()
     try:
         # Includes the direct regex/submit scans at depth 0.
-        return _contains_unsafe_gateway_action(
+        unsafe = _contains_unsafe_gateway_action(
             command,
             cwd=cwd,
             depth=0,
             visited=set(),
+            budget=budget,
             read_remote_script=read_remote_script,
         )
+        return unsafe, budget.refusal if unsafe else None
     except Exception:
         logger.warning(
             "lifecycle guard referenced-script walk failed; "
@@ -2432,16 +2814,26 @@ def contains_gateway_lifecycle_command_or_referenced_script(
         )
         # Pure string scans of the top-level command — cannot raise.
         try:
-            return _direct_lifecycle_scan(command)
+            return _direct_lifecycle_scan(command), None
         except Exception:
             # The data-argument masker tokenizes arbitrary text; if even
             # that fails, fall to the raw regex + submit scan so the guard
             # stays total.
-            return contains_gateway_lifecycle_command(
-                command
-            ) or contains_launchctl_submit_command(command)
+            return (
+                contains_gateway_lifecycle_command(command)
+                or contains_launchctl_submit_command(command)
+            ), None
 
 
+def contains_gateway_lifecycle_command_or_referenced_script(
+    command: str,
+    *,
+    cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> bool:
+    """Detect lifecycle/submit commands, including bounded nested scripts (see
+    ``scan_gateway_lifecycle`` for the contract)."""
+    return scan_gateway_lifecycle(command, cwd=cwd, read_remote_script=read_remote_script)[0]
 
 
 def _resolve_script_path(script_path: str) -> Optional[Path]:
@@ -2476,20 +2868,20 @@ def _resolve_script_path(script_path: str) -> Optional[Path]:
         return None
 
 
-def _read_script_for_scanning(script_path: str) -> str:
-    """Read a cron script with the bounded terminal-script scanner.
+def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
+    """``(text, refusal)``: read a cron script with the bounded terminal-script scanner.
 
-    Non-regular or oversized inputs fail closed by returning a lifecycle-shaped
-    sentinel, while missing/unreadable/unresolvable paths remain empty so
-    ordinary scheduler path validation can report them.
+    Non-regular/oversized/live-SQLite inputs fail closed with a NAMED *refusal*
+    (never a lifecycle-shaped verdict); missing/unreadable/unresolvable paths
+    remain empty so ordinary scheduler path validation can report them.
     """
     resolved = _resolve_script_path(script_path)
     if resolved is None:
-        return ""
+        return "", None
     script_text, unsafe = _read_referenced_script(resolved)
     if unsafe:
-        return "hermes gateway restart"
-    return script_text or ""
+        return "", _unreadable_reason(resolved)
+    return script_text or "", None
 
 
 def check_gateway_lifecycle(
@@ -2510,37 +2902,33 @@ def check_gateway_lifecycle(
     """
     combined = prompt or ""
     python_script = False
+    refusal: Optional[str] = None
     if script:
         resolved_script = _resolve_script_path(script)
-        if resolved_script is not None:
-            try:
-                real_script = resolved_script.resolve(strict=False)
-            except (OSError, ValueError):
-                real_script = resolved_script
-            if _is_cloud_placeholder_path(resolved_script) or _is_cloud_placeholder_path(
-                real_script
-            ):
-                # Attribute the refusal correctly: the script is not known to
-                # contain a lifecycle command — it lives on a cloud-synced
-                # FileProvider path (iCloud Drive / ~/Library/CloudStorage)
-                # that the guard refuses to open because an evicted
-                # placeholder can hang preflight indefinitely (#88052).
-                # Fail closed with the real reason instead of implying a
-                # dangerous lifecycle command.
-                raise GatewayLifecycleBlocked(
-                    "Blocked: the cron script lives on a cloud-synced path "
-                    "(iCloud Drive / ~/Library/CloudStorage). Opening an "
-                    "evicted FileProvider placeholder can hang the guard's "
-                    "preflight scan indefinitely, so it is refused without "
-                    "being read. Move the script to a local, non-cloud path "
-                    "(e.g. ~/.hermes/scripts/) and recreate the job."
-                )
+        if resolved_script is not None and _on_cloud_path(resolved_script):
+            # Attribute the refusal correctly: the script is not known to
+            # contain a lifecycle command — it lives on a cloud-synced
+            # FileProvider path (iCloud Drive / ~/Library/CloudStorage)
+            # that the guard refuses to open because an evicted
+            # placeholder can hang preflight indefinitely (#88052).
+            # Fail closed with the real reason instead of implying a
+            # dangerous lifecycle command.
+            raise GatewayLifecycleBlocked(
+                "Blocked: the cron script lives on a cloud-synced path "
+                "(iCloud Drive / ~/Library/CloudStorage). Opening an "
+                "evicted FileProvider placeholder can hang the guard's "
+                "preflight scan indefinitely, so it is refused without "
+                "being read. Move the script to a local, non-cloud path "
+                "(e.g. ~/.hermes/scripts/) and recreate the job."
+            )
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
-        script_text = _read_script_for_scanning(script)
+        script_text, refusal = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
 
-    if python_script:
+    if refusal:
+        unsafe = True
+    elif python_script:
         # Python is executed by the interpreter, never through a POSIX
         # shell: the shell-script reference walk is a false-positive
         # generator on Python sources (pathlib's "/" operator resolves to
@@ -2548,14 +2936,26 @@ def check_gateway_lifecycle(
         # every innocent .py cron script, #77131). The direct command
         # regex below still scans the full text, so a literal
         # `hermes gateway restart` embedded in a .py script is still
-        # blocked. Non-regular/oversized script files still fail closed
-        # via the lifecycle-shaped sentinel in _read_script_for_scanning.
-        unsafe = _lifecycle_command_scan_with_data_exemption(combined)
+        # blocked. Non-regular/oversized script files fail closed above
+        # (named refusal). The data-exemption masker tokenizes with shlex,
+        # so it is charged against the walk budget (#78398).
+        budget = _LifecycleScanBudget()
+        if not budget.charge_text(combined):
+            unsafe = _budget_exhausted(budget, "text", 0)
+            refusal = budget.refusal
+        else:
+            unsafe = _lifecycle_command_scan_with_data_exemption(combined)
     else:
         script_dir = _resolve_script_directory(script) if script else None
-        unsafe = contains_gateway_lifecycle_command_or_referenced_script(
+        unsafe, refusal = scan_gateway_lifecycle(
             combined,
             cwd=script_dir,
+        )
+    if unsafe and refusal:
+        raise GatewayLifecycleBlocked(
+            f"Blocked: the lifecycle guard could not scan this cron job or referenced script: {refusal}. "
+            "Nothing in the job is known to contain a gateway lifecycle command, but a script "
+            "the job executes must be scannable (a regular text file under 1 MiB) before it can run."
         )
     if unsafe:
         raise GatewayLifecycleBlocked(

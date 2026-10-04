@@ -126,7 +126,9 @@ def test_summarizer_bare_quota_gets_quota_framing():
     # A standalone "quota" error (no 429/rate-limit wording) must still get the
     # provider-quota-limit framing, not fall through to generic text (P2).
     msg = sched._summarize_cron_failure_for_delivery(RECURRING_JOB, "QuotaExceededError: over the limit")
-    assert "quota limit" in msg.lower()
+    # Merged copy table: the billing/quota verdict reads "usage or credit limit is reached".
+    assert "usage or credit limit" in msg.lower()
+    assert "QuotaExceededError" not in msg  # framed, not the generic raw-text notice
 
 
 def test_summarizer_still_handles_real_defect_generically():

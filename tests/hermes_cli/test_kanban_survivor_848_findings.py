@@ -40,6 +40,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import pr_target, rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_survivor as ks
 from hermes_cli import kanban_external_survivor as ext
 
@@ -95,8 +96,8 @@ def _pr(branch="someone-elses/unrelated-work", title="work", body="work"):
 def _card(board, *, workspace=True):
     tid = kb.create_task(board, title="external implementation")
     if workspace:
-        ws = kb.resolve_workspace(kb.get_task(board, tid))
-        kb.set_workspace_path(board, tid, ws)
+        ws = kbw.resolve_workspace(kb.get_task(board, tid))
+        kbw.set_workspace_path(board, tid, ws)
         ws.mkdir(parents=True, exist_ok=True)
         (ws / "implementation.py").write_text("work that lives nowhere else\n")
     return tid
@@ -116,8 +117,8 @@ def test_a_malformed_recorded_ref_holds_instead_of_escaping_the_contract(board):
     (``SurvivorUnavailable`` is a ``ValueError``, and a ``held_reason`` lands).
     """
     tid = _card(board, workspace=False)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     shutil.rmtree(ws, ignore_errors=True)
     with kb.write_txn(board):
         board.execute(
@@ -146,8 +147,8 @@ def test_the_reaper_holds_on_a_malformed_recorded_ref_rather_than_raising(board)
     authority. The bytes asserted are written and read back here.
     """
     tid = _card(board, workspace=False)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     good = {"remote": URL, "branch": f"refs/heads/kanban/{tid}", "sha": HEAD,
             "repository": "repo", "external": True}
@@ -175,8 +176,8 @@ def test_the_same_reaper_rig_without_the_malformed_entry_still_reclaims(board):
     everything -- which would be a different, equally real, defect.
     """
     tid = _card(board, workspace=False)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     good = {"remote": URL, "branch": f"refs/heads/kanban/{tid}", "sha": HEAD,
             "repository": "repo", "external": True}
@@ -196,8 +197,8 @@ def test_the_same_reaper_rig_without_the_malformed_entry_still_reclaims(board):
 def test_a_well_formed_bound_row_is_still_reused(board):
     """Anti-vacuity for the two above: same rig, a DICT ref, and it is REUSED."""
     tid = _card(board, workspace=False)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     shutil.rmtree(ws, ignore_errors=True)
     row = {"kind": "ref", "refs": [{"remote": URL, "branch": f"refs/heads/kanban/{tid}",
                                     "sha": HEAD, "repository": "."}]}
@@ -382,8 +383,8 @@ def test_the_completion_and_reclamation_paths_agree_on_a_mention(board, remote):
     assert the verdicts match, without either reading the other's code.
     """
     tid = _card(board, workspace=False)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     remote["prs"]["example/project"] = _pr(title=f"umbrella changelog mentioning {tid}")
 
     verdicts = []

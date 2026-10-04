@@ -39,6 +39,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_graph as kbg
+from hermes_cli import kanban_db_workspace as kbw
 
 
 @pytest.fixture
@@ -80,7 +82,7 @@ def test_decompose_inherits_board_default_workdir_for_scratch_root(
                 board="proj",
             )
         with kb.connect(board="proj") as conn:
-            child_ids = kb.decompose_triage_task(
+            child_ids = kbg.decompose_triage_task(
                 conn,
                 tid,
                 root_assignee="orchestrator",
@@ -98,8 +100,8 @@ def test_decompose_inherits_board_default_workdir_for_scratch_root(
 
         # Both children must be anchored on the board's shared project
         # tree so the draft can read the survey's output.
-        survey_ws = kb.resolve_workspace(survey, board="proj")
-        draft_ws = kb.resolve_workspace(draft, board="proj")
+        survey_ws = kbw.resolve_workspace(survey, board="proj")
+        draft_ws = kbw.resolve_workspace(draft, board="proj")
 
         assert survey_ws == draft_ws == project, (
             "decomposed children ignored the board default_workdir: "
@@ -128,7 +130,7 @@ def test_decompose_scratch_children_share_a_workspace_when_board_default_set(
                 triage=True, board="shared",
             )
         with kb.connect(board="shared") as conn:
-            child_ids = kb.decompose_triage_task(
+            child_ids = kbg.decompose_triage_task(
                 conn, tid, root_assignee="orch",
                 children=[
                     {"title": "predecessor"},
@@ -140,8 +142,8 @@ def test_decompose_scratch_children_share_a_workspace_when_board_default_set(
             pred = kb.get_task(conn, child_ids[0])
             succ = kb.get_task(conn, child_ids[1])
 
-        pred_ws = kb.resolve_workspace(pred, board="shared")
-        succ_ws = kb.resolve_workspace(succ, board="shared")
+        pred_ws = kbw.resolve_workspace(pred, board="shared")
+        succ_ws = kbw.resolve_workspace(succ, board="shared")
         assert pred_ws == succ_ws, (
             "dependent successor cannot see predecessor output: "
             f"predecessor workspace {pred_ws} != successor workspace {succ_ws}"
@@ -159,7 +161,7 @@ def test_decompose_no_board_default_still_scratch(kanban_home):
                 triage=True, board="plain",
             )
         with kb.connect(board="plain") as conn:
-            child_ids = kb.decompose_triage_task(
+            child_ids = kbg.decompose_triage_task(
                 conn, tid, root_assignee="orch",
                 children=[{"title": "s1"}], author="decomposer",
             )
@@ -196,7 +198,7 @@ def test_decompose_explicit_board_beats_ambient_current_board(
                 triage=True, board="proj",
             )
         with kb.connect(board="proj") as conn:
-            child_ids = kb.decompose_triage_task(
+            child_ids = kbg.decompose_triage_task(
                 conn, tid, root_assignee="orch",
                 children=[{"title": "c1"}, {"title": "c2", "parents": [0]}],
                 author="decomposer",

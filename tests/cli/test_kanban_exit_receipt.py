@@ -57,7 +57,11 @@ def fake_cli(result):
     ("overloaded", "HTTP 503 service unavailable", 75),
     ("overloaded", "API call failed after 3 retries: Our servers are currently "
                    "overloaded. Please try again later.", 75),
-    ("server_error", "HTTP 500 internal server error", 1),
+    # parity 2026-10-01: upstream 3abeca16e6 (#91206) promotes a provider 5xx / hung connection to
+    # EX_TEMPFAIL — a provider outage says nothing about the task, so the dispatcher requeues it
+    # under the rate_limited cooldown + board circuit instead of spending the card's retry budget.
+    # (The fork's #665 had kept an app-level 500 at 1; the exit CLASS stays None either way.)
+    ("server_error", "HTTP 500 internal server error", 75),
     ("tool_error", "tool execution failed", 1),
     (None, "", 0),
 ])

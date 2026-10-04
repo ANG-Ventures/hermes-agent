@@ -781,7 +781,7 @@ def main(argv: list[str]) -> int:
 
     for path in iter_python_files(roots):
         try:
-            source = path.read_text(encoding="utf-8")
+            source = path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
         if "asynccontextmanager" not in source:

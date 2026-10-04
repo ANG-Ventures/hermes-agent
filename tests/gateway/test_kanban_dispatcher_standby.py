@@ -14,6 +14,9 @@ import pytest
 
 from gateway import kanban_watchers as watchers
 from hermes_cli import config, kanban_db as kb
+# Upstream split the dispatcher surface out of kanban_db: the gateway reads dispatch_once /
+# has_spawnable_ready / reap_worker_zombies / resolve_max_in_progress from kanban_db_dispatch.
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 class Clock:
@@ -62,15 +65,15 @@ def harness(tmp_path, monkeypatch):
     )
     cfg = {"kanban": {"dispatch_interval_seconds": 2, "auto_decompose": False}}
     monkeypatch.setattr(config, "load_config", lambda: cfg)
-    monkeypatch.setattr(kb, "resolve_max_in_progress", lambda value: value)
+    monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda value: value)
     # Real empty scratch board: dispatch_once retains its transaction, reapers,
     # and per-board tick lock, but cannot spawn a worker without a task.
     kb.init_db()
     monkeypatch.setattr(kb, "list_boards", lambda **kw: [{"slug": "default"}])
-    dispatch = Mock(wraps=kb.dispatch_once)
+    dispatch = Mock(wraps=kbd.dispatch_once)
     reaper = Mock(return_value=[])
-    monkeypatch.setattr(kb, "dispatch_once", dispatch)
-    monkeypatch.setattr(kb, "reap_worker_zombies", reaper)
+    monkeypatch.setattr(kbd, "dispatch_once", dispatch)
+    monkeypatch.setattr(kbd, "reap_worker_zombies", reaper)
     handles = []
 
     def tracked_open(*args, **kwargs):
@@ -79,6 +82,9 @@ def harness(tmp_path, monkeypatch):
         return handle
 
     monkeypatch.setattr(watchers, "open", tracked_open, raising=False)
+    # Upstream moved _acquire_singleton_lock (the open() under test) into kanban_watchers_common.
+    from gateway import kanban_watchers_common as watchers_common
+    monkeypatch.setattr(watchers_common, "open", tracked_open, raising=False)
     clock = Clock()
     monkeypatch.setattr(watchers, "asyncio", SimpleNamespace(
         sleep=clock.sleep, to_thread=asyncio.to_thread, CancelledError=asyncio.CancelledError,

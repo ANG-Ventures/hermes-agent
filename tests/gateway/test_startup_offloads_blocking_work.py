@@ -43,7 +43,7 @@ def test_prime_system_proxy_cache_is_importable_from_run():
 def test_prime_then_on_loop_read_is_a_cache_hit(monkeypatch):
     """After the boot prime, an adapter connecting ON the loop gets a value
     without any probe — the regression this whole change exists to prevent."""
-    monkeypatch.setattr(base.sys, "platform", "darwin")
+    monkeypatch.setattr(base.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
     base._reset_system_proxy_cache()
     calls = []
 

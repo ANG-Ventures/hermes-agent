@@ -20,6 +20,8 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_per_profile_cap_test_")
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
+        with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
+            fh.write("{}\n")  # identity marker: a bare dir is not a profile
     monkeypatch.setenv("HERMES_HOME", test_home)
     # Purge so `from hermes_cli import kanban_db` re-resolves against the fresh
     # HERMES_HOME. RESTORE afterwards: an unrestored purge hands every later
@@ -36,13 +38,14 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for mod in _saved_modules:
         del sys.modules[mod]
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
     # The purge above also discards the module object that tests/conftest.py's
     # autouse memory-guard fixture patched, so this fresh import carries the
     # REAL ``_system_memory_sample``. On a loaded CI runner (<15% MemAvailable
     # => "elevated") the dispatcher then caps to ONE spawn per tick and
     # ``count("alpha") == 2`` fails — heavy-ci nightly 2026-09-02 (assert 1 == 2).
     # Re-apply the seam on the module we actually yield.
-    monkeypatch.setattr(kanban_db, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     try:
         yield kanban_db
     finally:
@@ -59,14 +62,16 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     """With cap=2: 2 alpha + 2 beta dispatched; remaining 3 alpha + 1 beta
     deferred to skipped_per_profile_capped."""
     kb = isolated_kanban_home_with_profiles
-    with kb.connect_closing() as conn:
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(5):
             kb.create_task(conn, title=f"a{i}", assignee="alpha")
         for i in range(3):
             kb.create_task(conn, title=f"b{i}", assignee="beta")
-    with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
             max_in_progress_per_profile=2,
         )
@@ -85,13 +90,15 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     eligible for dispatch on the next tick (after running tasks complete).
     This verifies the cap is per-tick state, not a permanent block."""
     kb = isolated_kanban_home_with_profiles
-    with kb.connect_closing() as conn:
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         ids = [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
 
     # First tick: cap=1, only 1 alpha dispatched
-    with kb.connect_closing() as conn:
-        res1 = kb.dispatch_once(
+    with kbc.connect_closing() as conn:
+        res1 = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             max_in_progress_per_profile=1,
         )
@@ -101,7 +108,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     # Simulate the running task completing — set it back to done so the
     # 'running' count drops
     spawned_id = res1.spawned[0][0]
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'done', claim_lock = NULL WHERE id = ?",
@@ -109,8 +116,8 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
             )
 
     # Second tick: 1 more alpha should now dispatch
-    with kb.connect_closing() as conn:
-        res2 = kb.dispatch_once(
+    with kbc.connect_closing() as conn:
+        res2 = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             max_in_progress_per_profile=1,
         )

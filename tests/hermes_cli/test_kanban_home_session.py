@@ -12,6 +12,9 @@ from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_graph as kbg
+from hermes_cli import kanban_db_notify as kbn
 
 HOME = "20260922_000000_home"
 OTHER = "20260922_111111_other"
@@ -534,7 +537,7 @@ _ROUND2 = {
     "link": (_ready, _link),
     "unlink": (_linked, _unlink),
     "specify": (_triage, lambda c, t: kb.specify_triage_task(c, t, body="spec")),
-    "decompose": (_triage, lambda c, t: kb.decompose_triage_task(
+    "decompose": (_triage, lambda c, t: kbg.decompose_triage_task(
         c, t, root_assignee="worker-a",
         children=[{"title": "c1", "assignee": "worker-b"}])),
 }
@@ -775,7 +778,7 @@ def test_dispatcher_tick_still_claims_stamped_card(kanban_home, monkeypatch):
     spawned = []
     with kb.connect_closing() as conn:
         tid = _ready(conn, session_id=OTHER)
-        kb.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
+        kbd.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
         assert kb.get_task(conn, tid).status == "running"
     assert spawned == [tid]
 
@@ -794,7 +797,6 @@ import re as _re
 # Writers of tasks.status/assignee/priority/session_id or dispatch-intent
 # events that are NOT guarded, each with the reason it is execution lane.
 EXECUTION_LANE = {
-    "_migrate_add_optional_columns": "schema migration at connect time",
     "record_foreign_action": (
         "callers: _home_session_guarded's wrapper ONLY, after check_home_session "
         "returned an explicit --takeover/foreign_ok override for this card and "
@@ -834,6 +836,27 @@ EXECUTION_LANE = {
         "card (the regex hit is the WHERE status='running'); it cannot "
         "change status, assignee, priority or the claim"),
     "release_stale_claims": "reaper",
+    # Upstream sibling-module writers the facade-only scan never saw (2026-10-01 sync).
+    "_backfill_legacy_inflight_runs": (
+        "callers: kanban_db_connect._migrate_add_optional_columns (schema "
+        "migration at connect time); rewrites legacy run rows, no chat path"),
+    "inherit_creator_origin": (
+        "callers: create_task / decompose child insert, inside the creation txn; "
+        "COALESCEs session_id onto the NEW card only, never re-homes an existing one"),
+    "_reclaim_dead_workers": (
+        "upstream dispatcher-tick helper (kanban_db_dispatch); no CLI verb, tool "
+        "or slash path calls it"),
+    "_apply_default_assignee": (
+        "upstream dispatcher-tick helper (kanban_db_dispatch): assigns "
+        "kanban.default_assignee to unassigned ready cards; no CLI verb, tool or "
+        "slash path calls it"),
+    # Upstream extracted these bodies into private helpers (2026-10-01 sync).
+    # The guard sits on the public caller, so the helper is reached only after
+    # check_home_session already passed (or from the reaper lane).
+    "_claim_and_open_run": "callers: claim_task only (@_home_session_guarded('claim'))",
+    "_extend_live_stale_claim": "callers: release_stale_claims only (reaper)",
+    "_request_review_txn": (
+        "callers: request_review only (@_home_session_guarded('request-review'))"),
     "invalidate_descendants_for_parent_reopen": "cascade of a (guarded) reopen",
     "_release_claim_for_workspace_refusal": "dispatcher spawn refusal",
     "_refuse_reclaim_unproven_death": "reaper",
@@ -862,9 +885,28 @@ def _writers():
     # Slice pre-split lines instead of ast.get_source_segment: that call
     # re-splits the whole ~1 MB kanban_db.py once per function (quadratic),
     # which cost ~70s per scan and pushed this file past the CI per-file wall.
-    src = _module_src(kb)
-    lines = src.split("\n")
+    # The facade AND every kanban_db_* sibling: upstream moved writers
+    # (dispatch/reclaim/heartbeat) into siblings, and a facade-only scan let
+    # them escape the guard check entirely (2026-10-01 parity sync).
+    import importlib
+    import pkgutil
+
+    import hermes_cli as _pkg
+
+    mods = [kb] + [
+        importlib.import_module(f"hermes_cli.{m.name}")
+        for m in pkgutil.iter_modules(_pkg.__path__)
+        if m.name.startswith("kanban_db_")
+    ]
     out = {}
+    for _mod in mods:
+        _scan_writers(_mod, out)
+    return out
+
+
+def _scan_writers(mod, out):
+    src = _module_src(mod)
+    lines = src.split("\n")
     for node in _ast.parse(src).body:
         if not isinstance(node, _ast.FunctionDef):
             continue
@@ -882,12 +924,12 @@ def _writers():
             "UPDATE tasks" in seg and _DYNAMIC_WRITE.search(seg)
         ):
             out[node.name] = node
-    return out
 
 
 def _is_guarded(node):
     return any(
-        isinstance(d, _ast.Call) and getattr(d.func, "id", "") == "_home_session_guarded"
+        isinstance(d, _ast.Call)
+        and (getattr(d.func, "id", "") or getattr(d.func, "attr", "")) == "_home_session_guarded"
         for d in node.decorator_list
     )
 
@@ -921,7 +963,15 @@ def test_every_cli_verb_reaching_a_guarded_writer_binds_the_actor():
     src = _module_src(kc)
     tree = _ast.parse(src)
     funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
-    table = _re.search(r"handlers = \{(.*?)\}", src, _re.S).group(1)
+    # Upstream moved verb bodies into kanban_ops / kanban_boards (re-imported by kanban.py).
+    from hermes_cli import kanban_boards as _kbo, kanban_ops as _kop
+    for _m in (_kop, _kbo):
+        for _n in _ast.parse(_module_src(_m)).body:
+            if isinstance(_n, _ast.FunctionDef):
+                funcs.setdefault(_n.name, _n)
+    # The verb table was `handlers = {...}` inside main(); upstream hoisted it to
+    # module-level `_HANDLERS = {...}`. Accept either; a miss must fail, not pass.
+    table = _re.search(r"(?:_HANDLERS|handlers) = \{(.*?)\}", src, _re.S).group(1)
     verbs = dict(_re.findall(r'"([\w-]+)":\s*(_cmd_\w+)', table))
 
     def reach(fn, seen):
@@ -954,8 +1004,14 @@ def test_every_tool_reaching_a_guarded_writer_binds_the_actor():
     src = _module_src(kt)
     tree = _ast.parse(src)
     handlers = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+    # Registration moved from per-tool `registry.register(handler=...)` calls to
+    # the `_TOOLS` tuple: `("kanban_x", SCHEMA, handler_or_wrapped, emoji)`.
     wrapped = set(_re.findall(r"handler=_with_mutation_actor\((\w+)\)", src))
+    wrapped |= set(_re.findall(r"_SCHEMA,\s*_with_mutation_actor\((\w+)\)", src))
     registered = set(_re.findall(r"handler=(?:_with_mutation_actor\()?(\w+)", src))
+    registered |= set(_re.findall(r"_SCHEMA,\s*(?:_with_mutation_actor\()?(_handle_\w+)", src))
+    registered.discard("_handler")
+    assert len(registered) >= 10, f"tool registration scan found {sorted(registered)}"
     missing = []
     for name in sorted(registered):
         node = handlers.get(name)
@@ -1270,7 +1326,7 @@ def test_takeover_notify_list_shows_taker_chat(kanban_home, monkeypatch):
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
                                foreign_ok="adopt"):
             assert kb.unblock_task(conn, tid)
-        subs = kb.list_notify_subs(conn, tid)
+        subs = kbn.list_notify_subs(conn, tid)
     assert [s["chat_id"] for s in subs] == ["1550"]
 
 
@@ -1454,7 +1510,7 @@ def test_refused_guarded_mutation_with_side_write_records_no_takeover(kanban_hom
 def _running_card(conn, *, session_id=HOME, chat="home-chat"):
     tid = kb.create_task(conn, title="card", assignee="worker-a",
                          session_id=session_id)
-    kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat)
+    kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat)
     # A claim held by another host: no local worker to signal.
     assert kb.claim_task(conn, tid, claimer="otherhost:4242")
     return tid
@@ -1473,7 +1529,7 @@ def test_reclaim_takeover_keeps_home_by_default(kanban_home):
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
         assert task.session_id == HOME
-        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid)] == ["home-chat"]
         (ev,) = _takeover_events(conn, tid)
         assert ev.payload["previous_session"] == HOME
         assert ev.payload["previous_home"] == [
@@ -1553,7 +1609,7 @@ def _historical_rehome(conn, monkeypatch):
     # Pre-fix shape: the takeover ADDED the taker's chat next to the home's.
     # One-subscriber-per-card (t_484a3c72) no longer writes it, so the
     # historical row is written explicitly.
-    kb.add_notify_sub(conn, task_id=tid, platform="discord",
+    kbn.add_notify_sub(conn, task_id=tid, platform="discord",
                       chat_id="taker-chat", also=True)
     ev = _takeover_events(conn, tid)[0]
     payload = {k: v for k, v in ev.payload.items()
@@ -1575,7 +1631,7 @@ def test_restore_without_taker_chat_keeps_every_sub(kanban_home, monkeypatch):
         assert rows[0]["remove_subs"] == [] and rows[0]["note"]
         assert mod.apply(conn, rows, sub_window=30) == 1
         assert kb.get_task(conn, tid).session_id == HOME
-        assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
+        assert {s["chat_id"] for s in kbn.list_notify_subs(conn, tid)} == {
             "home-chat", "taker-chat"}
         # With the taker named, only the taker's sub goes.
         tid2 = _historical_rehome(conn, monkeypatch)
@@ -1585,7 +1641,7 @@ def test_restore_without_taker_chat_keeps_every_sub(kanban_home, monkeypatch):
                 if r["task_id"] == tid2]
         assert mod.apply(conn, rows, sub_window=30,
                          taker_chats={("discord", "taker-chat", "")}) == 1
-        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid2)] == ["home-chat"]
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid2)] == ["home-chat"]
 
 
 def test_restore_rechecks_home_inside_apply(kanban_home, monkeypatch):
@@ -1616,9 +1672,9 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
             assert kb.reclaim_task(conn, tid, reason="load")
         assert kb.get_task(conn, tid).session_id == OTHER
         # Pre-fix shape (see _historical_rehome).
-        kb.add_notify_sub(conn, task_id=tid, platform="discord",
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord",
                           chat_id="taker-chat", also=True)
-        assert {s["chat_id"] for s in kb.list_notify_subs(conn, tid)} == {
+        assert {s["chat_id"] for s in kbn.list_notify_subs(conn, tid)} == {
             "home-chat", "taker-chat"}
     mod = _restore_mod()
     now = int(time.time())
@@ -1631,7 +1687,7 @@ def test_restore_script_undoes_reclaim_rehome(kanban_home, monkeypatch):
             {"platform": "discord", "chat_id": "taker-chat", "thread_id": ""}]
         assert mod.apply(conn, rows, sub_window=30) == 1
         assert kb.get_task(conn, tid).session_id == HOME
-        assert [s["chat_id"] for s in kb.list_notify_subs(conn, tid)] == ["home-chat"]
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid)] == ["home-chat"]
         # Idempotent: the second pass skips (home no longer the taker's).
         again = mod.plan(conn, since=now - 60, until=now + 60,
                          by_session=None, sub_window=30)
@@ -1653,15 +1709,15 @@ def test_restore_never_removes_another_thread_of_the_taker_chat(kanban_home, mon
         (ev,) = _takeover_events(conn, tid)
         assert ev.payload["taker_chat"] == {
             "platform": "slack", "chat_id": "C1", "thread_id": "thread-A"}
-        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
+        kbn.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
                           thread_id="thread-A")
         # Another conversation, same chat, different thread, same window.
-        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
+        kbn.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1",
                           thread_id="thread-B", also=True)
         rows = mod.plan(conn, since=now - 60, until=now + 60,
                         by_session=None, sub_window=30)
         assert rows[0]["remove_subs"] == [
             {"platform": "slack", "chat_id": "C1", "thread_id": "thread-A"}]
         assert mod.apply(conn, rows, sub_window=30) == 1
-        left = {(s["chat_id"], s["thread_id"] or "") for s in kb.list_notify_subs(conn, tid)}
+        left = {(s["chat_id"], s["thread_id"] or "") for s in kbn.list_notify_subs(conn, tid)}
         assert ("C1", "thread-B") in left and ("C1", "thread-A") not in left

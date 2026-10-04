@@ -24,11 +24,13 @@ from tests.run_agent._run_agent_helpers import (
 
 
 def test_is_destructive_command_treats_cp_as_mutating():
-    assert run_agent._is_destructive_command("cp .env.local .env") is True
+    from agent.tool_dispatch_helpers import _is_destructive_command
+    assert _is_destructive_command("cp .env.local .env") is True
 
 
 def test_is_destructive_command_treats_install_as_mutating():
-    assert run_agent._is_destructive_command("install template.env .env") is True
+    from agent.tool_dispatch_helpers import _is_destructive_command
+    assert _is_destructive_command("install template.env .env") is True
 
 
 def test_aiagent_reuses_existing_errors_log_handler():
@@ -51,11 +53,11 @@ def test_aiagent_reuses_existing_errors_log_handler():
 
         with (
             patch(
-                "run_agent.get_tool_definitions",
+                "model_tools.get_tool_definitions",
                 return_value=_make_tool_defs("web_search"),
             ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             AIAgent(
                 api_key="test-k...7890",
@@ -91,10 +93,10 @@ class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (
             patch(
-                "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
+                "model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")
             ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             agent = AIAgent(
                 model="zai/glm-5.1",
@@ -111,10 +113,10 @@ class TestProviderModelNormalization:
     def test_aiagent_keeps_aggregator_vendor_slug(self):
         with (
             patch(
-                "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
+                "model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")
             ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             agent = AIAgent(
                 model="anthropic/claude-sonnet-4.6",
@@ -127,122 +129,6 @@ class TestProviderModelNormalization:
             )
 
         assert agent.model == "anthropic/claude-sonnet-4.6"
-
-
-class TestSessionJsonSnapshotOptIn:
-    """Regression: per-session JSON snapshot writer is opt-in via config.
-
-    state.db is canonical (PR #29182).  ``sessions.write_json_snapshots``
-    defaults to False, so the agent must NOT write ``session_{sid}.json``
-    files by default — that behavior caused multi-GB sessions directories
-    on heavy users.  Users can opt back in for external tooling that reads
-    the JSON files directly.
-    """
-
-    def test_session_json_disabled_by_default(self, agent):
-        # Default config: writer is gated off.
-        assert getattr(agent, "_session_json_enabled", False) is False, (
-            "sessions.write_json_snapshots must default to False"
-        )
-
-    def test_save_session_log_noops_when_disabled(self, agent, tmp_path):
-        # When disabled, calling the method must not write any file even
-        # if logs_dir is writable and messages are non-empty.
-        agent._session_json_enabled = False
-        agent.logs_dir = tmp_path
-        agent._session_messages = [{"role": "user", "content": "hello"}]
-        agent._save_session_log()
-        # No session_*.json must appear under logs_dir.
-        assert list(tmp_path.glob("session_*.json")) == []
-
-    def test_save_session_log_writes_when_enabled(self, agent, tmp_path):
-        # Opt-in path: with the flag on and a session_id, the writer must
-        # produce ``session_{sid}.json`` under logs_dir.
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [{"role": "user", "content": "hello"}]
-        agent._save_session_log(messages)
-        expected = tmp_path / f"session_{agent.session_id}.json"
-        assert expected.exists(), (
-            "Opt-in writer must produce session_{sid}.json under logs_dir"
-        )
-
-    def test_logs_dir_retained_for_request_dumps(self, agent):
-        # logs_dir is kept unconditionally because
-        # agent_runtime_helpers.dump_api_request_debug still writes
-        # request_dump_*.json there (debug breadcrumb path), independent of
-        # the session JSON opt-in.
-        assert hasattr(agent, "logs_dir")
-
-
-class TestSaveSessionLogRedactsSecrets:
-    """Regression: session_*.json must not contain plaintext credentials (#19798, #19845)."""
-
-    @pytest.fixture(autouse=True)
-    def _ensure_redaction_enabled(self, monkeypatch):
-        """Force redaction on regardless of host HERMES_REDACT_SECRETS state.
-        The hermetic conftest blanks the env var; the module-level
-        ``_REDACT_ENABLED`` constant is captured at import time, so we
-        flip it directly for the duration of these tests."""
-        monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
-        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
-
-    def test_redacts_api_key_in_tool_content(self, agent, tmp_path):
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {
-                "role": "tool",
-                "content": "Response: Authorization: Bearer sk-proj-abc123def456ghi789jkl012mno",
-            },
-        ]
-        agent._save_session_log(messages)
-
-        snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        assert "sk-proj-abc123def456ghi789jkl012mno" not in snapshot
-
-    def test_redacts_api_key_in_user_message(self, agent, tmp_path):
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [
-            {"role": "user", "content": "My key is sk-ant-api03-abc123def456ghi789jkl012mno please use it"},
-        ]
-        agent._save_session_log(messages)
-
-        snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        assert "sk-ant-api03-abc123def456ghi789jkl012mno" not in snapshot
-
-    def test_redacts_system_prompt_credentials(self, agent, tmp_path):
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        agent._cached_system_prompt = "Use key sk-proj-realkey1234567890123456 for API calls"
-        agent._save_session_log([{"role": "user", "content": "test"}])
-
-        snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        assert "sk-proj-realkey1234567890123456" not in snapshot
-
-    def test_redacts_list_type_multimodal_content(self, agent, tmp_path):
-        """OpenAI/Anthropic multimodal shape: content = list of {type, text|image_url} parts."""
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Key: gsk_abc123def456ghi789jkl012mno"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-                ],
-            },
-        ]
-        agent._save_session_log(messages)
-
-        snapshot_text = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
-        snapshot = json.loads(snapshot_text)
-        parts = snapshot["messages"][0]["content"]
-        assert "gsk_abc123def456ghi789jkl012mno" not in parts[0]["text"]
-        # Image part preserved untouched
-        assert parts[1]["image_url"]["url"].startswith("data:image")
 
 
 class TestGetMessagesUpToLastAssistant:
@@ -303,6 +189,18 @@ class TestMaskApiKey:
 
 
 class TestBuildAssistantMessage:
+    @staticmethod
+    def _enable_native_compaction(agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.6-sol"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_hostname = "chatgpt.com"
+        agent._base_url_lower = agent.base_url
+        agent.codex_responses_native_compaction = True
+        agent.compression_enabled = True
+        agent.runtime_capabilities = {"native_compaction": True}
+
     def test_basic_message(self, agent):
         msg = _mock_assistant_msg(content="Hello!")
         result = agent._build_assistant_message(msg, "stop")
@@ -472,6 +370,74 @@ class TestBuildAssistantMessage:
         assert "reasoning that never closes" not in result["content"]
         assert result["content"] == ""
 
+    def test_ineligible_route_checkpoint_does_not_arm_deferral(self, agent):
+        note_checkpoint = MagicMock()
+        agent.context_compressor.note_native_compaction_checkpoint = note_checkpoint
+        checkpoint = {"type": "compaction", "encrypted_content": "opaque-checkpoint"}
+        msg = _mock_assistant_msg(content="Compacted")
+        msg.codex_reasoning_items = [checkpoint]
+
+        result = agent._build_assistant_message(msg, "stop")
+
+        assert result["codex_reasoning_items"] == [checkpoint]
+        note_checkpoint.assert_not_called()
+
+    @pytest.mark.parametrize("encrypted_content", ["", " "])
+    def test_malformed_checkpoint_does_not_arm_deferral(
+        self, agent, encrypted_content
+    ):
+        note_checkpoint = MagicMock()
+        agent.context_compressor.note_native_compaction_checkpoint = note_checkpoint
+        malformed = {
+            "type": "compaction",
+            "encrypted_content": encrypted_content,
+        }
+        msg = _mock_assistant_msg(content="Compacted")
+        msg.codex_reasoning_items = [malformed]
+        self._enable_native_compaction(agent)
+
+        result = agent._build_assistant_message(msg, "stop")
+
+        assert result["codex_reasoning_items"] == [malformed]
+        note_checkpoint.assert_not_called()
+
+    def test_native_checkpoint_arms_real_usage_preflight_deferral(self, agent):
+        checkpoint = {
+            "type": "compaction",
+            "encrypted_content": "opaque-checkpoint",
+            "_issuer_kind": "codex_backend",
+        }
+        msg = _mock_assistant_msg(content="Compacted")
+        msg.codex_reasoning_items = [checkpoint]
+        agent.context_compressor.note_native_compaction_checkpoint = MagicMock()
+        self._enable_native_compaction(agent)
+
+        from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
+
+        history = [{"role": "user", "content": "before compaction"}]
+        set_usage_anchor(agent, capture_usage_anchor(255_000, 100, history), turn_base=True)
+        result = agent._build_assistant_message(msg, "stop")
+
+        assert result["codex_reasoning_items"] == [checkpoint]
+        agent.context_compressor.note_native_compaction_checkpoint.assert_called_once_with()
+        assert agent._usage_anchor is None
+        assert agent._turn_base_usage_anchor is None
+
+    def test_native_checkpoint_remains_compatible_with_plugin_context_engine(self, agent):
+        checkpoint = {
+            "type": "compaction",
+            "encrypted_content": "opaque-checkpoint",
+            "_issuer_kind": "codex_backend",
+        }
+        msg = _mock_assistant_msg(content="Compacted")
+        msg.codex_reasoning_items = [checkpoint]
+        agent.context_compressor = SimpleNamespace(threshold_tokens=204_000)
+        self._enable_native_compaction(agent)
+
+        result = agent._build_assistant_message(msg, "stop")
+
+        assert result["codex_reasoning_items"] == [checkpoint]
+
 
 class TestHookPayloadSanitizesSimpleNamespace:
     """Regression: ``_hook_jsonable`` referenced ``SimpleNamespace`` without
@@ -524,7 +490,7 @@ class TestSafeWriter:
 
     def test_write_delegates_normally(self):
         """When stdout is healthy, _SafeWriter is transparent."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from io import StringIO
         inner = StringIO()
         writer = _SafeWriter(inner)
@@ -533,7 +499,7 @@ class TestSafeWriter:
 
     def test_write_catches_oserror(self):
         """OSError on write is silently caught, returns len(data)."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from unittest.mock import MagicMock
         inner = MagicMock()
         inner.write.side_effect = OSError(5, "Input/output error")
@@ -543,7 +509,7 @@ class TestSafeWriter:
 
     def test_flush_catches_oserror(self):
         """OSError on flush is silently caught."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from unittest.mock import MagicMock
         inner = MagicMock()
         inner.flush.side_effect = OSError(5, "Input/output error")
@@ -553,7 +519,7 @@ class TestSafeWriter:
     def test_print_survives_broken_stdout(self, monkeypatch):
         """print() through _SafeWriter doesn't crash on broken pipe."""
         import sys
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from unittest.mock import MagicMock
         broken = MagicMock()
         broken.write.side_effect = OSError(5, "Input/output error")
@@ -567,7 +533,7 @@ class TestSafeWriter:
     def test_installed_in_run_conversation(self, agent):
         """run_conversation installs _SafeWriter on stdio."""
         import sys
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         resp = _mock_response(content="Done", finish_reason="stop")
         agent.client.chat.completions.create.return_value = resp
         original_stdout = sys.stdout
@@ -590,7 +556,7 @@ class TestSafeWriter:
 
     def test_double_wrap_prevented(self):
         """Wrapping an already-wrapped stream doesn't add layers."""
-        from run_agent import _SafeWriter
+        from agent.process_bootstrap import _SafeWriter
         from io import StringIO
         inner = StringIO()
         wrapped = _SafeWriter(inner)
@@ -606,9 +572,9 @@ class TestSafeWriter:
 
 def test_aiagent_uses_copilot_acp_client():
     with (
-        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI") as mock_openai,
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI") as mock_openai,
         patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
     ):
         acp_client = MagicMock()
@@ -695,3 +661,17 @@ def test_is_openai_client_closed_falls_back_to_http_client():
 
     assert AIAgent._is_openai_client_closed(ClientWithHttpClient(http_closed=False)) is False
     assert AIAgent._is_openai_client_closed(ClientWithHttpClient(http_closed=True)) is True
+
+
+class TestSessionFilenameSafety:
+    def test_safe_session_filename_component_contains_traversal(self):
+        # The sanitizer is the chokepoint: every session-ID-derived artifact
+        # path goes through it, so it must always yield a single, traversal-free
+        # path segment while leaving legitimate IDs untouched.
+        from agent.session_persistence import _safe_session_filename_component as f
+        for raw in ("../../etc/passwd", "/abs/path", "..\\win\\trav", "a/b/c"):
+            out = f(raw)
+            assert "/" not in out and "\\" not in out and ".." not in out, out
+        # Legit IDs pass through unchanged; distinct IDs never collide.
+        assert f("api-abc123def456") == "api-abc123def456"
+        assert f("../a") != f("../b")

@@ -110,7 +110,10 @@ def test_no_agent_supplied_still_renders_and_does_not_blame_disk():
     """Back-compat: existing callers invoke this unbound with one arg."""
     out = _explain(None)
     assert out
-    assert "session storage could not be written" in out
+    # F04 ruling (parity 2026-10-01): with no agent there is no evidence to weigh, so the
+    # upstream i18n default renders (upstream's own tests pin it); it names possible causes
+    # and `hermes doctor` without asserting disk-full.
+    assert "couldn't save this conversation" in out
     assert "the disk is full" not in out.lower()
 
 

@@ -174,6 +174,20 @@ def notice_env(monkeypatch):
             os.environ["HERMES_HOME"] = prev_home
 
 
+def _arm_builtin_compressor(cc, threshold: int) -> None:
+    """Point the built-in compressor at ``threshold`` AND anchor it on a real provider reading.
+
+    Upstream 0f4587e336f: every compaction gate asks real usage first, so a rough estimate over
+    threshold on a compressor that has never seen a provider ``prompt_tokens`` reading DEFERS one
+    request (``should_defer_preflight_to_real_usage``). These fixtures build a fresh agent per
+    turn and the mock provider reports ``prompt_tokens: 10`` forever, so a cold compressor would
+    never anchor and preflight compaction could never fire. Model turn N+1 of a live session
+    instead: the prior response already priced the transcript at the threshold.
+    """
+    cc.threshold_tokens = threshold
+    cc.last_real_prompt_tokens = threshold
+
+
 def _chat_requests(handler) -> list:
     return [r for r in handler.captured_requests if "messages" in r]
 
@@ -288,7 +302,7 @@ class TestConfabNoticeEndToEnd:
             agent.context_compressor = cc
         else:
             cc = agent.context_compressor
-            cc.threshold_tokens = 2000
+            _arm_builtin_compressor(cc, 2000)
         resp = MagicMock()
         resp.choices = [MagicMock()]
         resp.choices[0].message.content = "compacted summary"
@@ -351,7 +365,7 @@ class TestConfabNoticeEndToEnd:
                                     provider="unit-test", context_length=200_000, platform="pytest")
                 agent.context_compressor = cc
             else:
-                agent.context_compressor.threshold_tokens = 2000
+                _arm_builtin_compressor(agent.context_compressor, 2000)
                 agent.context_compressor._generate_summary = lambda *a, **kw: "compacted summary"
             calls = []
             if fallback:
@@ -480,7 +494,7 @@ class TestConfabNoticeEndToEnd:
                                     provider="unit-test", context_length=200_000, platform="pytest")
                 agent.context_compressor = cc
             else:
-                agent.context_compressor.threshold_tokens = 8000
+                _arm_builtin_compressor(agent.context_compressor, 8000)
                 agent.context_compressor._generate_summary = lambda *a, **kw: "compacted summary"
             response = MagicMock()
             response.choices = [MagicMock()]
@@ -586,7 +600,7 @@ class TestConfabNoticeEndToEnd:
                                 provider="unit-test", context_length=200_000, platform="pytest")
             agent.context_compressor = cc
         else:
-            agent.context_compressor.threshold_tokens = 2000
+            _arm_builtin_compressor(agent.context_compressor, 2000)
             agent.context_compressor._generate_summary = lambda *a, **kw: "compacted summary"
         compress = agent.context_compressor.compress
         def one_compaction(*args, **kwargs):
@@ -650,7 +664,7 @@ class TestConfabNoticeEndToEnd:
                          "content": f"turn {i} " + " ".join(f"w{j}" for j in range(900))})
         agent = make_agent(stream=stream)
         agent.compression_enabled = True
-        agent.context_compressor.threshold_tokens = 2000
+        _arm_builtin_compressor(agent.context_compressor, 2000)
         agent.context_compressor._generate_summary = lambda *a, **kw: "compacted summary"
         compress = agent.context_compressor.compress
         seen = []
@@ -710,7 +724,11 @@ class TestConfabNoticeEndToEnd:
         event = next(m for m in db.get_messages_as_conversation(sid)
                      if is_metadata_only_tool_notice(m))
         user = {"role": "user", "content": "preserved head"}
-        history = [user, event, {"role": "assistant", "content": "dropped"},
+        # The folded middle carries real weight: upstream's commit path re-anchors the
+        # just-delivered reply (#118900) AND the last user turn behind the engine output, so a
+        # candidate built from one-word rows would not shrink and the commit-site anti-growth
+        # guard would refuse the whole compaction (fixture artefact, not the contract under test).
+        history = [user, event, {"role": "assistant", "content": "dropped " * 200},
                    {"role": "user", "content": "dropped too"},
                    {"role": "assistant", "content": "also dropped"}]
         agent = make_agent(stream=stream)
@@ -720,9 +738,15 @@ class TestConfabNoticeEndToEnd:
                 {"role": "assistant", "content": "summary"}]
         agent.context_compressor.compress = engine
         compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+        assert compressed is not history
         event_at = next(i for i, row in enumerate(compressed)
                         if is_metadata_only_tool_notice(row))
-        assert event_at == (1 if survives == "predecessor" else len(compressed) - 1)
+        # The notice follows its surviving predecessor, or the engine's output (the summary
+        # boundary) when nothing survived. Rows the commit path re-anchors around the engine
+        # output (#118900 reply, the user-turn anchor) must never pull it off that neighbour.
+        assert event_at >= 1
+        assert compressed[event_at - 1]["content"] == (
+            "preserved head" if survives == "predecessor" else "summary")
 
     def test_compaction_notice_short_overlap_cannot_rebind_to_equal_tail(self, notice_env, stream):
         make_agent, handler, db, sid, _ = notice_env
@@ -737,7 +761,10 @@ class TestConfabNoticeEndToEnd:
         agent = make_agent(stream=stream)
         agent.context_compressor.compress = lambda input_rows, **kwargs: [dict(twin)]
         compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
-        assert len(compressed) == 2
+        # Exactly one twin survives and the notice sits right behind it (never rebound to the
+        # equal tail twin). Upstream #118900 re-anchors the folded assistant reply after the
+        # engine output, so the list is longer than the engine's two rows.
+        assert [m.get("content") for m in compressed if m.get("role") == "user"] == ["same"]
         assert compressed[0]["content"] == "same"
         assert is_metadata_only_tool_notice(compressed[1])
 
@@ -754,7 +781,8 @@ class TestConfabNoticeEndToEnd:
         agent = make_agent(stream=stream)
         agent.context_compressor.compress = lambda rows, **kw: [dict(twin)]
         compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
-        assert len(compressed) == 2
+        # See test_compaction_notice_short_overlap_cannot_rebind_to_equal_tail (#118900).
+        assert [m.get("content") for m in compressed if m.get("role") == "user"] == ["same"]
         assert compressed[0]["content"] == twin["content"]
         assert is_metadata_only_tool_notice(compressed[1])
 
@@ -900,7 +928,11 @@ class TestConfabNoticeEndToEnd:
         assert not getattr(agent, "_empty_content_retries", 0)
         assert not any(m.get("_dropped_toolcall_nudge") for m in result["messages"])
         assert len([r for r in db.get_messages(sid) if r["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND]) == 4
-        assert not [r for r in db.get_messages(sid) if r["role"] == "assistant"]
+        # No MODEL-authored assistant row survives (the re-prompt pairs are scaffolding). The
+        # Hermes-authored ``failed_turn`` boundary upstream appends to close a failed turn's
+        # user tail (8f0322da5b8; the fork gateway's _hmwa_close_failed_turn, #108033) is allowed.
+        assert not [r for r in db.get_messages(sid)
+                    if r["role"] == "assistant" and r.get("display_kind") != "failed_turn"]
 
     def test_tool_notice_and_dropped_call_share_budget(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
@@ -916,7 +948,11 @@ class TestConfabNoticeEndToEnd:
         assert result["failed"] is True
         assert not getattr(agent, "_empty_content_retries", 0)
         assert not any(m.get("_dropped_toolcall_nudge") for m in result["messages"])
-        assert not [r for r in db.get_messages(sid) if r["role"] == "assistant"]
+        # No MODEL-authored assistant row survives (the re-prompt pairs are scaffolding). The
+        # Hermes-authored ``failed_turn`` boundary upstream appends to close a failed turn's
+        # user tail (8f0322da5b8; the fork gateway's _hmwa_close_failed_turn, #108033) is allowed.
+        assert not [r for r in db.get_messages(sid)
+                    if r["role"] == "assistant" and r.get("display_kind") != "failed_turn"]
 
     def test_status_shown_once_and_row_persisted(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env

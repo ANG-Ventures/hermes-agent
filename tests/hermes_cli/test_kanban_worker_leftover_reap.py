@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 pytestmark = [
     pytest.mark.skipif(
@@ -123,18 +124,19 @@ def test_completed_worker_listener_is_reaped_on_exit(conn):
     with kb._worker_processes_lock:
         kb._worker_processes[worker.pid] = worker
     kb._register_worker_identity(worker.pid, tid, task.current_run_id, spawned_at)
-    assert kb._set_worker_pid(conn, tid, worker.pid)
+    assert kbd._set_worker_pid(conn, tid, worker.pid)
     srv_pid, port = (int(x) for x in worker.stdout.readline().split())
     _STARTED.append(srv_pid)
     assert _listening(port)
 
-    assert kb.complete_task(conn, tid, summary="done")
+    assert kb.complete_task(conn, tid, summary="done", metadata={"tests_run": 1},
+                            expected_run_id=task.current_run_id)
     worker.stdin.write("go\n")
     worker.stdin.flush()
     deadline = time.monotonic() + 10
     exited: list[int] = []
     while time.monotonic() < deadline and worker.pid not in exited:
-        exited += kb.reap_worker_zombies()
+        exited += kbd.reap_worker_zombies()
         time.sleep(0.05)
     assert worker.pid in exited
     assert kb._pid_alive(srv_pid), "listener died with its worker; test proves nothing"
@@ -200,8 +202,10 @@ def test_orphan_sweep_sends_one_logs_line_only_when_it_reaped(conn, tmp_path, mo
     monkeypatch.setattr(kb, "_notify_orphan_sweep", lambda board, reaped: sent.append(reaped))
     root = tmp_path / "ws"
     tid = kb.create_task(conn, title="done card", assignee="worker")
-    assert kb.claim_task(conn, tid) is not None
-    assert kb.complete_task(conn, tid, summary="done")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    assert kb.complete_task(conn, tid, summary="done", metadata={"tests_run": 1},
+                            expected_run_id=claimed.current_run_id)
     (root / tid).mkdir(parents=True)
     assert kb.sweep_terminal_workspace_orphans(conn, root=root, min_terminal_age=0) == {}
     assert sent == []
@@ -214,15 +218,15 @@ def test_orphan_sweep_sends_one_logs_line_only_when_it_reaped(conn, tmp_path, mo
 
 def test_dispatch_tick_runs_both_reaps(conn, monkeypatch):
     calls: dict = {}
-    monkeypatch.setattr(kb, "reap_worker_zombies", lambda: [4242])
+    monkeypatch.setattr(kbd, "reap_worker_zombies", lambda: [4242])
     monkeypatch.setattr(kb, "reap_exited_worker_leftovers",
                         lambda c, pids: calls.setdefault("exit", list(pids)) and ["t_x"])
     monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans",
                         lambda c, board=None: calls.setdefault("sweep", board) or {})
-    res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default")
+    res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default")
     assert calls["exit"] == [4242]
     assert calls["sweep"] == "default"
     assert res.worker_leftovers_reaped == ["t_x"]
     calls.clear()
-    kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
+    kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
     assert calls == {}, "a dry run must not signal anything"

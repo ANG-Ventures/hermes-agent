@@ -123,7 +123,9 @@ class TestFooterIsMetadataNotText:
 
         server_path = pathlib.Path(server.__file__)
         src = server_path.read_text()
-        start = src.find('payload = {"text": raw, "usage"')
+        # Upstream moved the payload literal into prompt_turn._complete_turn_payload; the
+        # prompt.submit worker in server.py receives it and attaches the footer there.
+        start = src.find('payload, raw, status = _complete_turn_payload(')
         assert start != -1, "prompt.submit completion payload construction not found"
         end = src.find('_emit("message.complete"', start)
         assert end != -1, "message.complete emit not found after payload construction"

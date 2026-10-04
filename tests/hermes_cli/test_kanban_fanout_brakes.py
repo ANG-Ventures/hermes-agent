@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -184,7 +185,7 @@ def test_dispatcher_never_spawns_a_triage_card(kanban_home, all_assignees_spawna
             conn, title="parked", assignee="argus", forced_status="triage",
         )
         live = kb.create_task(conn, title="live", assignee="argus")
-        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
     assert parked not in spawns
     assert live in spawns
 
@@ -414,8 +415,8 @@ def test_dispatch_skips_spawn_over_ceiling_and_pages_once(
     monkeypatch.setattr(kanban_budget, "_run_notify", lambda argv: sent.append(argv))
 
     with kb.connect_closing() as conn:
-        res1 = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
-        res2 = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res1 = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res2 = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
 
     assert spawns == []
     assert res1.budget_paused is True
@@ -476,7 +477,7 @@ def test_dispatch_tick_reads_ledgers_once_across_boards(
     budget_cache: dict = {}
     for slug in ("alpha", "beta"):
         with kb.connect_closing(board=slug) as conn:
-            res = kb.dispatch_once(
+            res = kbd.dispatch_once(
                 conn,
                 board=slug,
                 spawn_fn=_fake_spawn_factory(spawns),
@@ -506,7 +507,7 @@ def test_dispatch_spawns_under_ceiling(
     )
     monkeypatch.setattr(kanban_budget, "_run_notify", lambda argv: None)
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
     assert res.budget_paused is False
     assert spawns == [tid]
 
@@ -523,7 +524,7 @@ def test_ceiling_unset_is_off(kanban_home, monkeypatch, all_assignees_spawnable)
     )
     monkeypatch.setattr(kanban_budget, "_load_config", lambda: {})
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
     assert res.budget_paused is False
     assert spawns == [tid]
 
@@ -549,7 +550,7 @@ def test_recovery_clears_marker_and_reports_once(
     sent: list[list[str]] = []
     monkeypatch.setattr(kanban_budget, "_run_notify", lambda argv: sent.append(argv))
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
     assert res.budget_paused is False
     assert not marker.exists()
     assert spawns == [tid]
@@ -582,7 +583,7 @@ def test_dry_run_never_writes_a_marker_or_pages(
     sent: list[list[str]] = []
     monkeypatch.setattr(kanban_budget, "_run_notify", lambda argv: sent.append(argv))
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), dry_run=True,
         )
     assert res.budget_paused is False
@@ -615,7 +616,7 @@ def test_pause_without_a_notify_script_is_a_silent_noop(
     monkeypatch.setattr(kanban_budget, "_run_notify", lambda argv: sent.append(argv))
     assert not (kanban_home / "scripts" / "notify.py").exists()
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
     assert res.budget_paused is True
     assert spawns == []
     assert sent == []

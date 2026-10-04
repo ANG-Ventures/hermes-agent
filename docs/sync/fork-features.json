@@ -222,7 +222,7 @@
   {
     "feature": "tool-search unwrap scope gate and delegate code_execution inheritance exemption",
     "tests": [
-      "tests/run_agent/test_tool_call_guardrail_runtime.py",
+      "tests/agent/test_tool_call_guardrail_runtime.py",
       "tests/tools/test_tool_search.py::TestRegression_ToolsetScoping::test_search_catalog_is_scoped_to_session_toolsets",
       "tests/tools/test_tool_search.py::TestRegression_ToolsetScoping::test_scoped_deferrable_names_helper",
       "tests/tools/test_delegate_toolset_scope.py::TestToolsetIntersection::test_strip_blocked_removes_delegation"
@@ -309,7 +309,7 @@
   {
     "feature": "slash command /branch (alias /fork) incl. Discord context-inheriting thread spawn",
     "tests": [
-      "tests/cli/test_branch_command.py",
+      "tests/hermes_cli/test_branch_command.py",
       "tests/gateway/test_discord_branch_thread_merge.py::TestBranchDiscordThread"
     ],
     "paths": [
@@ -428,10 +428,10 @@
   {
     "feature": "test hygiene: evict MagicMock telegram modules before the real-PTB polling suite",
     "tests": [
-      "tests/test_telegram_polling_progress_ptb.py"
+      "tests/plugins/test_telegram_polling_progress_ptb.py"
     ],
     "paths": [
-      "tests/test_telegram_polling_progress_ptb.py"
+      "tests/plugins/test_telegram_polling_progress_ptb.py"
     ],
     "why": "PR #640 (fork/main 640e57bd84). ~29 gateway unit-test files install a MagicMock under the telegram module names via sys.modules.setdefault so they can run without PTB. In a COMBINED run any of them executing first poisons this suite: importorskip finds the mock and 'succeeds', every telegram import binds MagicMock attributes, and all tests fail with \"object MagicMock can't be used in await expression\" — while passing in isolation. The fix evicts any telegram sys.modules entry whose __file__ is not a str, then reloads the adapter. NO CANARY BY DESIGN: asserting the helper exists would be a change-detector test (AGENTS.md: 'behavior contracts over snapshots'), and reproducing the pollution needs 29 mock-installing modules imported first. This entry exists so a merge reviewer knows the eviction block is LOAD-BEARING and must survive a tests/ resolution toward upstream — its absence produces an order-dependent flake invisible to CI slicing that happens to separate the files. Census: OUTSTANDING upstream.",
     "lifecycle": "upstream-intended",

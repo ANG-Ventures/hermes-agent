@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -49,7 +50,7 @@ def stub_workspace(conn, tmp_path, *, stub_at_dispatch=False):
     was recorded), as it was on t_2df0cc1d.
     """
     tid = kb.create_task(conn, title="workspace with a linked worktree")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.mkdir(parents=True, exist_ok=True)
     remote = tmp_path / f"{tid}.git"
     git(tmp_path, "init", "--bare", str(remote))
@@ -65,10 +66,10 @@ def stub_workspace(conn, tmp_path, *, stub_at_dispatch=False):
     git(repo, "push", "origin", "HEAD:refs/heads/published")
     stub = ws / "baseline"
     if not stub_at_dispatch:
-        kb.set_workspace_path(conn, tid, ws)
+        kbw.set_workspace_path(conn, tid, ws)
     git(repo, "worktree", "add", "--detach", str(stub), "HEAD")
     if stub_at_dispatch:
-        kb.set_workspace_path(conn, tid, ws)
+        kbw.set_workspace_path(conn, tid, ws)
     return tid, ws, repo, stub
 
 

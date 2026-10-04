@@ -436,7 +436,7 @@ class _PrimaryCoolingDown(Exception):
 
 def _load_prompt(name: str) -> str:
     path = os.path.join(_PROMPT_DIR, name)
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8-sig") as fh:
         return fh.read()
 
 

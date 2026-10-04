@@ -15,6 +15,7 @@ import pytest
 
 from hermes_cli import kanban_budget as kbud
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd  # the dispatcher's guard seam
 
 THREE_HOURS = 3 * 3600
 
@@ -85,14 +86,14 @@ def test_starved_card_is_paged_once_naming_card_and_hold(board, pages, monkeypat
         _backdate(conn, held, THREE_HOURS)
         low = kb.create_task(conn, title="low", assignee="daedalus-opus", priority=58)
 
-        real_guard = kb.check_respawn_guard
+        real_guard = kbd.check_respawn_guard
 
         def _guard(c, task_id, *a, **k):
             if task_id == held:
                 return "active_pr"
             return real_guard(c, task_id, *a, **k)
 
-        monkeypatch.setattr(kb, "check_respawn_guard", _guard)
+        monkeypatch.setattr(kbd, "check_respawn_guard", _guard)
         order, res = _tick(conn)
         assert order == [low]
         assert [t for t, _, _ in res.priority_starved] == [held]
@@ -113,7 +114,7 @@ def test_no_page_under_threshold_or_without_lower_priority_admission(board, page
         _backdate(conn, young, 3600)  # 1 h < 2 h threshold
         old_top = kb.create_task(conn, title="old-top", assignee="daedalus", priority=90)
         _backdate(conn, old_top, THREE_HOURS)
-        monkeypatch.setattr(kb, "check_respawn_guard",
+        monkeypatch.setattr(kbd, "check_respawn_guard",
                             lambda c, tid, *a, **k: "active_pr" if tid in (young, old_top) else None)
         kb.create_task(conn, title="low", assignee="daedalus", priority=58)
         _tick(conn)
@@ -127,7 +128,7 @@ def test_no_page_when_nothing_lower_was_admitted(board, pages, monkeypatch):
         held = kb.create_task(conn, title="held", assignee="daedalus", priority=62)
         _backdate(conn, held, THREE_HOURS)
         higher = kb.create_task(conn, title="higher", assignee="daedalus", priority=80)
-        monkeypatch.setattr(kb, "check_respawn_guard",
+        monkeypatch.setattr(kbd, "check_respawn_guard",
                             lambda c, tid, *a, **k: "active_pr" if tid == held else None)
         order, res = _tick(conn)
         assert order == [higher]
@@ -148,7 +149,7 @@ def test_failed_page_is_retried_next_tick(board, monkeypatch):
         held = kb.create_task(conn, title="held", assignee="daedalus", priority=62)
         _backdate(conn, held, THREE_HOURS)
         kb.create_task(conn, title="low", assignee="daedalus", priority=1)
-        monkeypatch.setattr(kb, "check_respawn_guard",
+        monkeypatch.setattr(kbd, "check_respawn_guard",
                             lambda c, tid, *a, **k: "active_pr" if tid == held else None)
         _tick(conn)
         _tick(conn)

@@ -38,7 +38,7 @@ class ForkDeltaReport:
 
 
 def load_manifest(path: Path) -> list[ForkFeature]:
-    with path.open("r", encoding="utf-8") as fh:
+    with path.open("r", encoding="utf-8-sig") as fh:
         raw = json.load(fh)
     features: list[ForkFeature] = []
     for entry in raw:

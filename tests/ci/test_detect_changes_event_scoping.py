@@ -131,7 +131,8 @@ def test_merge_group_tests_only_batch_narrows_lanes(tmp_path):
     assert outputs["nix"] == "false"
     assert outputs["uv_lock"] == "false"
     assert outputs["rust"] == "false"
-    assert outputs["installer"] == "false"
+    assert outputs["bootstrap"] == "false"
+    assert outputs["desktop_updater"] == "false"
     assert outputs["test_scope"] == "full"
 
 
@@ -155,9 +156,13 @@ def test_merge_group_core_batch_runs_full_matrix(tmp_path):
     )
     assert outputs["python"] == "true"
     assert outputs["python_prod"] == "true"
-    assert outputs["docker"] == "true"
-    assert outputs["nix"] == "true"
     assert outputs["scan"] == "true"
+    # The slow lanes follow their own paths (classify_changes: docker = docker
+    # meta / dependency manifests / PM / tests/docker, nix = flake + manifests);
+    # a core Python change no longer starts them on a PR or a queue candidate.
+    # Every push to main still runs them all (see ``test_classify_changes.py``).
+    assert outputs["docker"] == "false"
+    assert outputs["nix"] == "false"
     assert outputs["test_scope"] == "full"
 
 
@@ -168,7 +173,7 @@ def test_merge_group_workflow_change_forces_every_lane(tmp_path):
         [".github/workflows/ci.yaml"],
     )
     for lane in ("python", "python_prod", "frontend", "site", "scan", "deps",
-                 "uv_lock", "npm_lock", "installer", "rust", "nix", "ci_review"):
+                 "uv_lock", "npm_lock", "bootstrap", "desktop_updater", "rust", "nix", "ci_review"):
         assert outputs[lane] == "true", lane
     assert outputs["test_scope"] == "full"
 
@@ -215,7 +220,7 @@ def test_malformed_payload_fails_open(tmp_path, overrides):
     outputs, gh_args, _ = _run(tmp_path, overrides, ["tests/gateway/test_foo.py"])
     assert gh_args == "", "must not call the compare API without a valid base/head pair"
     for lane in ("python", "python_prod", "frontend", "site", "scan", "deps",
-                 "uv_lock", "npm_lock", "installer", "rust", "nix"):
+                 "uv_lock", "npm_lock", "bootstrap", "desktop_updater", "rust", "nix"):
         assert outputs[lane] == "true", lane
     assert outputs["test_scope"] == "full"
 

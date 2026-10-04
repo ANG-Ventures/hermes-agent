@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban
 
 
@@ -18,7 +19,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
     with kb.connect_closing() as conn:
         yield conn
 
@@ -34,7 +35,7 @@ def test_provider_capped_then_recovers(board, monkeypatch, lane):
                               io.BytesIO(b'{"eligible_count":1}')])
     monkeypatch.setattr("urllib.request.urlopen", probe)
     spawn = Mock(return_value=777777)
-    first = kb.dispatch_once(board, spawn_fn=spawn)
+    first = kbd.dispatch_once(board, spawn_fn=spawn)
     assert first.spawned == []
     spawn.assert_not_called()
     current = kb.get_task(board, tid)
@@ -43,7 +44,7 @@ def test_provider_capped_then_recovers(board, monkeypatch, lane):
     assert current.current_run_id is None
     event = board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='deferred'", (tid,)).fetchone()
     assert json.loads(event[0]) == {"reason": "provider_capped", "provider": "pool", "reset_at": 123}
-    second = kb.dispatch_once(board, spawn_fn=spawn)
+    second = kbd.dispatch_once(board, spawn_fn=spawn)
     assert second.spawned[0][0] == tid
     assert probe.call_args.kwargs["timeout"] == 1
 
@@ -53,7 +54,7 @@ def test_no_configured_probe_preserves_spawn(board, monkeypatch):
     probe = Mock(side_effect=AssertionError("must not access network"))
     monkeypatch.setattr("urllib.request.urlopen", probe)
     tid = kb.create_task(board, title="probe", assignee="a")
-    assert kb.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned[0][0] == tid
+    assert kbd.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned[0][0] == tid
     probe.assert_not_called()
 
 
@@ -77,7 +78,7 @@ def test_capped_pool_uses_profile_fallback_per_run(board, monkeypatch, tmp_path,
     def spawn(task, workspace, **kwargs):
         observed.append((task.model_override, task.provider_override))
         return 777777
-    assert kb.dispatch_once(board, spawn_fn=spawn).spawned[0][0] == tid
+    assert kbd.dispatch_once(board, spawn_fn=spawn).spawned[0][0] == tid
     assert observed == [("gpt-5.5", "openai-codex")]
     persisted = kb.get_task(board, tid)
     assert persisted.model_override is None and persisted.provider_override is None
@@ -92,7 +93,7 @@ def test_pool_below_configured_minimum_defers_without_fallback(board, monkeypatc
     }})
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: io.BytesIO(b'{"eligible_count":1}'))
     tid = kb.create_task(board, title="minimum", assignee="a", model_override="m", provider_override="pool")
-    assert kb.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned == []
+    assert kbd.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned == []
     assert kb.get_task(board, tid).status == "ready"
 
 
@@ -190,11 +191,11 @@ def test_real_health_http_defers_then_admits(board, tmp_path):
         "pool": f"http://127.0.0.1:{server.server_port}/health"}}}), encoding="utf-8")
     ids = [kb.create_task(board, title="http", assignee="a", model_override="pool/model") for _ in range(2)]
     try:
-        assert kb.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned == []
+        assert kbd.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned == []
         assert requests == ["/health"]
         state.clear()
         state["eligible_count"] = 2
-        result = kb.dispatch_once(board, spawn_fn=lambda *a: 777777)
+        result = kbd.dispatch_once(board, spawn_fn=lambda *a: 777777)
         assert {r[0] for r in result.spawned} == set(ids)
         assert requests == ["/health", "/health"]
     finally:
@@ -209,7 +210,7 @@ def test_unknown_health_never_blocks_work(board, monkeypatch, payload):
         "provider_health_probes": {"pool": "http://localhost/health"}}})
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: io.BytesIO(payload))
     tid = kb.create_task(board, title="unknown", assignee="a", model_override="pool/m")
-    assert kb.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned[0][0] == tid
+    assert kbd.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned[0][0] == tid
 
 
 def test_probe_timeout_never_blocks_work(board, monkeypatch):
@@ -217,4 +218,4 @@ def test_probe_timeout_never_blocks_work(board, monkeypatch):
         "provider_health_probes": {"pool": "http://localhost/health"}}})
     monkeypatch.setattr("urllib.request.urlopen", Mock(side_effect=TimeoutError))
     tid = kb.create_task(board, title="timeout", assignee="a", model_override="pool/m")
-    assert kb.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned[0][0] == tid
+    assert kbd.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned[0][0] == tid

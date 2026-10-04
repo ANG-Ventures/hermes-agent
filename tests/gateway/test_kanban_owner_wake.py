@@ -20,6 +20,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_notify as kbn
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
 
@@ -243,8 +244,8 @@ def test_burst_is_one_turn_and_window_holds_then_lists(env):
 def test_card_without_live_operator_home_gets_line_only(env, session):
     tid = _card(env, session=session)
     with kb.connect_closing() as conn:
-        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=OTHER_CHAT,
-                          chat_type="group", user_id=HUMAN, delivery_mode="notify")
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=OTHER_CHAT,
+                           chat_type="group", user_id=HUMAN, delivery_mode="notify")
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     assert _tick(env) == [], "no turn for a card with no live operator home"
     assert [m["chat_id"] for m in env["adapter"].sent] == [OTHER_CHAT], "today's line still posts"
@@ -283,8 +284,8 @@ def test_event_made_by_owner_session_is_not_news(env):
 def test_notify_wake_sub_on_owner_chat_is_not_doubled(env):
     tid = _card(env)
     with kb.connect_closing() as conn:
-        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
-                          chat_type="group", user_id=HUMAN, delivery_mode="notify+wake")
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
+                           chat_type="group", user_id=HUMAN, delivery_mode="notify+wake")
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     handled = _tick(env)
     owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
@@ -402,8 +403,8 @@ def test_p1_fresh_event_survives_expiry_of_old_ones(env):
 def test_p1_sub_for_another_participant_does_not_suppress_owner_wake(env):
     tid = _card(env)
     with kb.connect_closing() as conn:
-        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
-                          chat_type="group", user_id="220000000000000001",
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
+                           chat_type="group", user_id="220000000000000001",
                           delivery_mode="notify+wake")
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     handled = _tick(env)

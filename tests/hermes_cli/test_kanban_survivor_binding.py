@@ -27,6 +27,7 @@ import pytest
 from tests.hermes_cli._survivor_gh_fake import rest_pr
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 HEAD = "a1" * 20
 MERGE = "b2" * 20
@@ -117,8 +118,8 @@ def test_unrelated_live_claim_is_refused(board, unrelated, kwargs, monkeypatch):
 def test_unrelated_live_claim_does_not_delete_the_workspace(board, unrelated):
     """The consequence, not just the return value: the bytes must survive."""
     tid = _claimed_card(board)
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "implementation.py").write_text("work that lives nowhere else\n")
 
@@ -180,8 +181,8 @@ def test_a_mention_does_not_delete_the_workspace(board, unrelated, field):
     """
     tid = _claimed_card(board)
     unrelated[0][field] = f"mentions {tid} in passing"
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "implementation.py").write_text("work that lives nowhere else\n")
 
@@ -540,8 +541,8 @@ def _reclaimable(board, tid):
     delete. With the directory present, an in-tree capture answers first and
     the recorded survivor is never consulted.
     """
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
-    kb.set_workspace_path(board, tid, ws)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    kbw.set_workspace_path(board, tid, ws)
     shutil.rmtree(ws, ignore_errors=True)
     return ws
 
@@ -606,10 +607,19 @@ def test_a_worker_using_the_cli_override_gains_no_reclamation_authority(
     """
     from hermes_cli import kanban_survivor as ks
 
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_whatever")
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "4242")
-
     tid = _claimed_card(board)
+    # The grant must name THIS card and ITS live run: upstream's ``_worker_run_id_for``
+    # refuses cross-card mutation, and ``complete`` checks ``expected_run_id`` against
+    # the card's current run. Neither is what this test is about: model the owning
+    # worker (a running run the grant points at).
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_runs (id, task_id, profile, status, started_at) "
+            "VALUES (4242, ?, 'worker', 'running', 1)", (tid,))
+        board.execute(
+            "UPDATE tasks SET status='running', current_run_id=4242 WHERE id=?", (tid,))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "4242")
     assert _cli(board, monkeypatch, ["complete", tid, "--result", "shipped",
                                      "--survivor-pr", PR, "--survivor-unbound"]) == 0
     # The worker did complete the card -- reported, not asserted away.
@@ -637,8 +647,10 @@ def test_the_operator_cli_renders_the_override_hint(board, unrelated, monkeypatc
 
 @pytest.mark.parametrize("grant", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"])
 def test_the_worker_cli_withholds_the_override_hint(board, unrelated, monkeypatch, capsys, grant):
-    monkeypatch.setenv(grant, "t_whatever")
     tid = _claimed_card(board)
+    # A task grant must name THIS card (upstream's ``_worker_run_id_for`` refuses
+    # cross-card mutation before the survivor gate runs); the run grant is opaque.
+    monkeypatch.setenv(grant, tid if grant == "HERMES_KANBAN_TASK" else "t_whatever")
     assert _cli(board, monkeypatch, ["complete", tid, "--survivor-pr", PR,
                                      "--metadata", '{"changed_files": ["code.py"]}']) == 1
     err = capsys.readouterr().err
@@ -697,7 +709,8 @@ def test_a_redispatched_worker_cannot_read_the_override_off_its_own_card(
     from tools import kanban_tools as kt
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-    monkeypatch.setattr(kt, "_connect", lambda *a, **k: (kb, board))
+    # Upstream replaced the fork's ``_connect`` with the ``_board`` context manager.
+    monkeypatch.setattr(kt, "_board", lambda *a, **k: contextlib.nullcontext((kb, board)))
     shown = kt._handle_show({"task_id": tid})
     assert tid in shown, "the card must still be readable"
     assert "--survivor-unbound" not in shown

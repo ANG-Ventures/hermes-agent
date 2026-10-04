@@ -41,6 +41,7 @@ def _task(kb):
 def spawn_env(monkeypatch, tmp_path):
     """Run the REAL spawn env builder under a release-pinned dispatcher env."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     decoy = tmp_path / "decoy_release"
     pkg = decoy / "hermes_cli"
@@ -65,15 +66,27 @@ def spawn_env(monkeypatch, tmp_path):
     # Fakes scoped to the spawn call only: the probe arm needs the real Popen.
     with monkeypatch.context() as m:
         m.setattr("subprocess.Popen", _fake_popen)
-        m.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+        m.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
         m.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
-        kb._default_spawn(_task(kb), str(workspace))
+        kbd._default_spawn(_task(kb), str(workspace))
     return captured["env"], decoy
 
 
 def test_worker_env_drops_inherited_pythonpath_and_pythonhome(spawn_env):
-    env, _decoy = spawn_env
-    assert "PYTHONPATH" not in env
+    env, decoy = spawn_env
+    # Upstream's ``_propagate_module_import_root`` (#122299) re-pins ONLY the tree this
+    # dispatcher imports (``kanban_db_dispatch.__file__``'s repo root, plus its committed
+    # dependency site-packages) when the worker argv is the ``-m hermes_cli.main`` form —
+    # the same pin the fork applies to its native-lane runner. The inherited release pin
+    # must still be gone: nothing but the dispatcher's own import root may ride along.
+    import pathlib
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    own_root = str(pathlib.Path(kbd.__file__).resolve().parents[1])
+    entries = [e for e in env.get("PYTHONPATH", "").split(os.pathsep) if e]
+    assert str(decoy) not in entries
+    for entry in entries:
+        assert entry == own_root or entry.startswith(own_root + os.sep), entry
     assert "PYTHONHOME" not in env
 
 

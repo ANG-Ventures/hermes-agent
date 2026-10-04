@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def git(repo, *args):
@@ -89,7 +90,7 @@ def home_clone_task(conn, tmp_path, *, publish=True):
     git(source, "config", "user.email", "test@example.invalid")
     commit(source, "code.py", "value = 1\n", "base")
     tid = kb.create_task(conn, title="home clone work")
-    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
     ws.parent.mkdir(parents=True, exist_ok=True)
     git(tmp_path, "clone", "--no-local", str(source), str(ws))
     git(ws, "config", "user.name", "Worker")
@@ -108,7 +109,7 @@ def home_clone_task(conn, tmp_path, *, publish=True):
         git(source, "push", str(mirror), "HEAD:refs/heads/main")
         remote_sha = None
     git(ws, "remote", "add", "origin", str(mirror))
-    kb.set_workspace_path(conn, tid, ws)
+    kbw.set_workspace_path(conn, tid, ws)
     return tid, ws, local, remote_sha
 
 

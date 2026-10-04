@@ -583,15 +583,13 @@ def test_isolated_provider_worker_inherits_protection_and_progress_hook() -> Non
 
     assert observed["protected"] is True
     assert observed["thread"] != caller
-    assert progress == ["tick"]
+    # The hook must reach the isolated worker thread; the seam wrapper adds its own dispatch ticks.
+    assert "tick" in progress
 
 
 def test_isolated_provider_worker_inherits_caller_contextvars() -> None:
-    from tools.approval import (
-        get_current_session_key,
-        reset_current_session_key,
-        set_current_session_key,
-    )
+    from tools.approval import get_current_session_key
+    from tools.approval_context import reset_current_session_key, set_current_session_key
 
     arbitrary = contextvars.ContextVar("isolated-provider-test", default="missing")
     arbitrary_token = arbitrary.set("caller-value")

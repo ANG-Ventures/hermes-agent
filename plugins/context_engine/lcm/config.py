@@ -191,7 +191,7 @@ def _hermes_config_yaml() -> dict[str, Any]:
     global _config_yaml_cache
     cfg_path = _hermes_config_path()
     try:
-        text = cfg_path.read_text(encoding="utf-8")
+        text = cfg_path.read_text(encoding="utf-8-sig")
     except Exception:
         return {}
     key_path = str(cfg_path)
@@ -203,7 +203,7 @@ def _hermes_config_yaml() -> dict[str, Any]:
             # another thread already cached; parsing that would store (and
             # return) the older config over the newer entry.
             try:
-                text = cfg_path.read_text(encoding="utf-8")
+                text = cfg_path.read_text(encoding="utf-8-sig")
             except Exception:
                 return {}
             with _CONFIG_YAML_CACHE_LOCK:
@@ -222,7 +222,7 @@ def _load_hermes_config_yaml(text: str | None = None) -> dict[str, Any]:
     """Parse config.yaml. Uncached -- call _hermes_config_yaml() instead."""
     if text is None:
         try:
-            text = _hermes_config_path().read_text(encoding="utf-8")
+            text = _hermes_config_path().read_text(encoding="utf-8-sig")
         except Exception:
             return {}
     if yaml is not None:

@@ -44,6 +44,7 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_workspace as kbw
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     conn = kb.connect()
@@ -101,11 +102,12 @@ def stale_bases(tid):
     This is the exact state whose refusal names ``--survivor-pr``.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_workspace as kbw
     with kb.connect_closing() as conn:
-        ws = kb.resolve_workspace(kb.get_task(conn, tid))
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
         (ws / "qa-output").mkdir(parents=True, exist_ok=True)
         (ws / "qa-output" / "verdict.md").write_text("APPROVED\n")
-        kb.set_workspace_path(conn, tid, ws)
+        kbw.set_workspace_path(conn, tid, ws)
         with kb.write_txn(conn):
             conn.execute(
                 "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -122,6 +124,7 @@ def complete(**args):
 
 def task_state(tid):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_workspace as kbw
     with kb.connect_closing() as conn:
         return kb.get_task(conn, tid), kb.latest_run(conn, tid)
 
@@ -220,6 +223,7 @@ def test_tool_survivor_ref_rejection_is_redacted(worker_env, remote):
     assert "oauth2" not in error
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_workspace as kbw
     with kb.connect_closing() as conn:
         rows = conn.execute(
             "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
@@ -296,11 +300,12 @@ def two_vanished_repos(tid):
     ``--survivor-pr <repo>=owner/repo#N`` — the remedy the tool could not send.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_workspace as kbw
     with kb.connect_closing() as conn:
-        ws = kb.resolve_workspace(kb.get_task(conn, tid))
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
         (ws / "qa-output").mkdir(parents=True, exist_ok=True)
         (ws / "qa-output" / "verdict.md").write_text("APPROVED\n")
-        kb.set_workspace_path(conn, tid, ws)
+        kbw.set_workspace_path(conn, tid, ws)
         with kb.write_txn(conn):
             conn.execute(
                 "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "

@@ -36,10 +36,6 @@ def test_few_messages_huge_content_triggers_gate():
     ) is True
 
 
-
-
-
-
 def test_content_above_threshold_triggers():
     """A single message comfortably above the threshold trips branch (b)."""
     # ~threshold*4 chars => ~threshold tokens; +1000 tokens of margin so the
@@ -65,9 +61,3 @@ def test_content_below_threshold_does_not_trigger():
     assert _should_run_preflight_estimate(
         messages, PROTECT_FIRST_N, PROTECT_LAST_N, THRESHOLD_TOKENS
     ) is False
-
-
-
-
-
-
