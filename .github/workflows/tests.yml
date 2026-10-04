@@ -519,6 +519,11 @@ jobs:
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "messaging"]'
           test-environment: 'true'
           prune-python-cache: true
+          # Restore-only on self-hosted (ace-e2e-vm): saving pushed ~170 MB x3 up the home
+          # uplink and took 12 of the job's 26 min (proof run 37170873916). Hosted runs save.
+          save-tools-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
+          save-python-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
+          save-node-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
 
       - name: Install Node deps and build the Ink TUI
         # tests/e2e/core/terminal drives the real `hermes --tui` over a PTY;
