@@ -154,7 +154,9 @@ def _unhandled_update(app, update_id):
             "id": f"poll-{update_id}", "question": "q?", "total_voter_count": 0,
             "is_closed": False, "is_anonymous": True, "type": "regular",
             "allows_multiple_answers": False,
-            "options": [{"text": "a", "voter_count": 0}, {"text": "b", "voter_count": 0}],
+            # persistent_id: required since Bot API 9.6 (PTB 22.8); older PTB keeps it in api_kwargs.
+            "options": [{"persistent_id": "a", "text": "a", "voter_count": 0},
+                        {"persistent_id": "b", "text": "b", "voter_count": 0}],
         },
     }, app.bot)
 
