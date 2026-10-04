@@ -2824,6 +2824,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     summary = getattr(args, "summary", None)
     superseded_by = getattr(args, "superseded_by", None)
     draft_ok = getattr(args, "draft_ok", None)
+    external = getattr(args, "external", None)
+    watcher = getattr(args, "watcher", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -2835,9 +2837,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
                          or survivor_unbound or survivor_none or survivor_reason or superseded_by
-                         or draft_ok is not None):
+                         or draft_ok is not None or external is not None or watcher is not None):
         return _err(
-            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --survivor-ref / "
+            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --external / "
+            "--watcher / --survivor-ref / "
             "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
@@ -2867,7 +2870,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # acceptance contract that protects complete.
             # A superseded close has no work for the judge to grade; gating it
             # would push the worker back into exiting silently.
-            gate_err = None if superseded_by is not None else _goal_gate_error(
+            gate_err = None if (superseded_by is not None or external is not None) else _goal_gate_error(
                 conn, tid, (summary or args.result or "").strip(), "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.")
@@ -2892,6 +2895,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
                     draft_ok=draft_ok,
+                    external=external,
+                    watcher=watcher,
                 )
             except kb.LiveClaimError:
                 failed.append(tid)
@@ -2909,7 +2914,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 no_receipt = True
                 print(f"cannot complete {tid}: {receipt_err}.", file=sys.stderr)
                 continue
-            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
+            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError,
+                    kb.ExternalCloseError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
@@ -2939,6 +2945,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 if getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review, NOT done: "
                           f"{outcome or 'handoff names a still-OPEN PR'}")
+                elif external is not None:
+                    print(f"Completed {tid} (external: {external.strip()}, watcher {watcher.strip()})")
                 else:
                     print(f"Completed {tid}")
                 override = _draft_override_of(conn, tid, last_event)

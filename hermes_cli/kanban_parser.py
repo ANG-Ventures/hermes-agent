@@ -520,6 +520,15 @@ _SPECS = [
                   "Closes it done with outcome 'superseded'; no --result/--summary required, "
                   "but the pointer must be non-empty (an unnamed supersede is a silent delete "
                   "of the work)."),
+        _arg("--external", metavar="URL",
+             help="Terminal close for a card whose remaining step is an outside party's (an "
+                  "upstream maintainer merge): closes it done with outcome 'external', no "
+                  "--result/--summary/receipt/survivor PR required. URL = the upstream PR/issue "
+                  "(http/https). Requires --watcher."),
+        _arg("--watcher", metavar="ID",
+             help="With --external: the watcher that reopens the card when the upstream closes "
+                  "unmerged (e.g. the external-card-watch cron id). Recorded on the run and the "
+                  "completed event."),
         _arg("--draft-ok", metavar="REASON",
              help="Audited per-card override for the DRAFT-PR refusal: the handoff names a "
                   "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)
