@@ -12,7 +12,6 @@ Kept out of ``gateway.slash_commands`` so it is testable without a gateway runne
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -63,7 +62,7 @@ def render_overview(
     argv = build_argv(session_id, args, script, python or sys.executable)
     try:
         p = run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
-                stdin=subprocess.DEVNULL, env={**os.environ})
+                stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return f"/overview: session-overview.py did not finish in {timeout} s; try `/overview fast`."
     except OSError as exc:
