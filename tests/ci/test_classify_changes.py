@@ -123,11 +123,11 @@ CASES = {
     # the Python side must run even when nothing else in the PR is Python.
     "generated gateway contract → python + frontend": (
         ["apps/shared/src/gateway-contract.generated.ts"],
-        _lanes(python=True, frontend=True, e2e_desktop_core=True),
+        _lanes(python=True, frontend=True, e2e_desktop_core=True, desktop=True),
     ),
     "gateway OpenRPC document → python + frontend": (
         ["apps/shared/src/gateway-contract.openrpc.json"],
-        _lanes(python=True, frontend=True, e2e_desktop_core=True),
+        _lanes(python=True, frontend=True, e2e_desktop_core=True, desktop=True),
     ),
     "desktop slash-registry JSON → python + frontend": (
         ["apps/desktop/src/lib/desktop-slash-registry.json"],
@@ -224,13 +224,13 @@ CASES = {
     # files change — not on every hermes_state.py PR.
     "windows.ps1 → desktop_updater": (
         ["scripts/desktop-update/windows.ps1"],
-        _lanes(python=True, desktop_updater=True, e2e_desktop_update=True, e2e_upgrade=True, bootstrap=True),
+        _lanes(python=True, desktop_updater=True, e2e_desktop_update=True, e2e_upgrade=True, bootstrap=True, desktop=True),
     ),
     # The shipped updater page is exercised by the desktop Electron suite;
     # a page-only change must run that suite as well as the server tests.
     "updater ui.html → frontend + desktop_updater": (
         ["scripts/desktop-update/ui.html"],
-        _lanes(python=True, frontend=True, desktop_updater=True, e2e_desktop_update=True),
+        _lanes(python=True, frontend=True, desktop_updater=True, e2e_desktop_update=True, desktop=True),
     ),
     "desktop-update test → desktop_updater": (
         ["tests/scripts/desktop_update/test_desktop_update_windows_progress.py"],
@@ -324,7 +324,7 @@ CASES = {
     ),
     "shared package eslint config → ci_review": (
         ["apps/shared/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, ci_review=True, desktop=True),
     ),
     "bootstrap-installer eslint config → ci_review": (
         ["apps/bootstrap-installer/eslint.config.mjs"],
@@ -342,7 +342,7 @@ CASES = {
     # and the Tauri app's non-Rust sources.
     "install.sh → bootstrap lane": (
         ["scripts/install.sh"],
-        _lanes(python=True, bootstrap=True, python_prod=True, e2e_upgrade=True, e2e_desktop_update=True),
+        _lanes(python=True, bootstrap=True, python_prod=True, e2e_upgrade=True, e2e_desktop_update=True, desktop=True),
     ),
     "setup-hermes.sh → bootstrap lane": (
         ["setup-hermes.sh"],
@@ -376,7 +376,7 @@ CASES = {
     ),
     "updater → e2e_upgrade + desktop update": (
         ["hermes_cli/update_cmd_git.py"],
-        _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True, bootstrap=True),
+        _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True, bootstrap=True, desktop=True),
     ),
     "PM → e2e_upgrade + docker": (["pm/environments.py"], _lanes(python=True, scan=True, e2e_upgrade=True, docker=True, bootstrap=True)),
     "desktop backend spawn → desktop core": (
@@ -427,8 +427,21 @@ def test_run_e2e_label_turns_every_slow_lane_on_and_nothing_else(files):
     labelled = classify(files, run_e2e=True)
     assert {lane for lane in SLOW_LANES if labelled[lane]} == SLOW_LANES
     unlabelled = classify(files)
-    assert {k: v for k, v in labelled.items() if k not in SLOW_LANES} == \
-        {k: v for k, v in unlabelled.items() if k not in SLOW_LANES}
+    # `desktop` follows the desktop E2E lanes, so the label turns it on too.
+    derived = SLOW_LANES | {"desktop"}
+    assert labelled["desktop"]
+    assert {k: v for k, v in labelled.items() if k not in derived} == \
+        {k: v for k, v in unlabelled.items() if k not in derived}
+
+
+@pytest.mark.parametrize("files,expected", CASES.values(), ids=CASES.keys())
+def test_desktop_gate_covers_every_desktop_suite(files, expected):
+    """ci.yaml requires desktop=='true' before any desktop suite runs, so a
+    diff that starts a desktop E2E lane must also set `desktop`."""
+    for labelled in (False, True):
+        lanes = classify(files, run_e2e=labelled)
+        if lanes["e2e_desktop_core"] or lanes["e2e_desktop_update"]:
+            assert lanes["desktop"], files
 
 
 def test_every_slow_lane_path_matches_a_tracked_file():

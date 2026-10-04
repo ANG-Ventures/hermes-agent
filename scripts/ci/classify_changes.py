@@ -40,7 +40,8 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
-* ``desktop``     — the diff touches ``apps/desktop/``. ci.yaml ANDs it with the
+* ``desktop``     — the diff touches a desktop surface (``_DESKTOP_SURFACE``) or
+  turns on either desktop E2E lane. ci.yaml ANDs it with the
   ``CI_DESKTOP_JOBS`` repo variable (default off) for every Electron-app job.
 
 Install/update path (Ace 2026-10-03, t_bf20260d): ``_INSTALL_PATHS`` turn on
@@ -86,6 +87,8 @@ import sys
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 # Shipped page outside those packages, exercised by the desktop Electron suite.
 _FRONTEND_FILES = {"scripts/desktop-update/ui.html"}
+# Trees whose code ships inside (or is driven by) the Electron app.
+_DESKTOP_SURFACE = ("apps/desktop/", "apps/shared/", "scripts/desktop-update/")
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yaml", "Dockerfile", ".dockerignore") # docker setup
 _NIX_PATHS = ("nix/",) # nix files
@@ -453,9 +456,15 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
-        "desktop": any(f.startswith("apps/desktop/") for f in files),
         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
     }
+    # Every path that routes to a desktop suite counts, not just apps/desktop/:
+    # with CI_DESKTOP_JOBS=on the gate must not skip a suite the diff guards.
+    ret["desktop"] = (
+        any(f.startswith(_DESKTOP_SURFACE) for f in files)
+        or ret["e2e_desktop_core"]
+        or ret["e2e_desktop_update"]
+    )
     if any(_is_install_path(f) for f in files):
         ret["e2e_upgrade"] = True
     if not files or any(f.startswith(".github/") for f in files):
