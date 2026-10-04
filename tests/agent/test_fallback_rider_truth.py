@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import anthropic  # noqa: F401  (first import outside the home I/O guard, as in the sibling tests)
 import pytest
 
 from agent import fallback_events as fbe
@@ -149,10 +150,21 @@ def test_every_relay_synthetic_body_renders_a_known_hop(error):
     assert fp.HOP_UNKNOWN not in text, text
 
 
-def test_every_relay_synthetic_body_is_in_the_text_table():
-    """The hop table covers no body the class table cannot classify."""
-    for error in fbe.RELAY_SYNTHETIC_HOP:
-        assert fbe.classify_text(error) != "unclassified", error
+def test_relay_synthetic_classes_match_the_relay_contract():
+    """Bodies the relay files as conn / pool_pressure / quota_model classify
+    the same here (claude-pool ``_SYNTHETIC_CLASS``). The four the text table
+    does not name (client cancelled, dispatch error, confirm probe, /v1/models)
+    keep their hop; their class stays the text table's call."""
+    relay_class = {
+        "pool at capacity": "pool_pressure", "upstream connect timed out": "conn",
+        "upstream attempt timed out": "conn", "pool deadline exceeded": "conn",
+        "upstream unreachable on every box": "conn", "upstream unreachable": "conn",
+        "upstream capacity unavailable for the requested model": "pool_pressure",
+        "overflow_exhausted": "pool_pressure", "no eligible sub": "quota_model",
+    }
+    for error, cls in relay_class.items():
+        assert error in fbe.RELAY_SYNTHETIC_HOP
+        assert fbe.classify_text(error) == cls, error
 
 
 def test_relay_hop_header_still_wins_over_the_body_table():
