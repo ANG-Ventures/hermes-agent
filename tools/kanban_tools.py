@@ -874,7 +874,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # model reads a tool_error as terminal and blocks.
             return tool_error(
                 f"kanban_complete blocked: {supersede_err}. Your task is still in-flight "
-                f"(no state change). Retry with a non-empty superseded_by naming what "
+                f"(no state change). Retry with a short (<=500 chars), non-empty superseded_by naming what "
                 f"satisfied the premise.")
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list

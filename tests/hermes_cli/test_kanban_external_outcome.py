@@ -79,6 +79,44 @@ def test_external_without_evidence_is_refused_unmutated(kanban_home, external, w
         assert "completion_blocked_external" in kinds and "completed" not in kinds
 
 
+
+# Prism P1 24d29f964b77 (t_66b4d355): an evidence field over the cap was sliced
+# to 500 chars BEFORE validation, so a cut URL still passed the regex and a cut
+# watcher id was stored as if it named the watcher. Overlong is now refused,
+# audited, and the card is untouched -- for every capped completion field.
+_LONG_URL = URL + "?" + "a" * kb._SUPERSEDED_POINTER_MAX
+
+
+@pytest.mark.parametrize("kwargs,exc,event,why", [
+    (dict(external=_LONG_URL, watcher="w"), kb.ExternalCloseError,
+     "completion_blocked_external", "url is"),
+    (dict(external=URL, watcher="w" * (kb._SUPERSEDED_POINTER_MAX + 1)), kb.ExternalCloseError,
+     "completion_blocked_external", "watcher is"),
+    (dict(superseded_by="t_" + "a" * kb._SUPERSEDED_POINTER_MAX, summary="x"),
+     kb.EmptySupersedeError, "completion_blocked_empty_supersede", "superseded_by is"),
+    (dict(draft_ok="r" * (kb._SUPERSEDED_POINTER_MAX + 1), summary="x"),
+     kb.EmptyDraftOverrideError, "completion_blocked_empty_draft_override", "draft_ok is"),
+], ids=["external-url", "watcher", "superseded_by", "draft_ok"])
+def test_overlong_evidence_is_refused_not_truncated(kanban_home, kwargs, exc, event, why):
+    with kb.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        with pytest.raises(exc, match=why + r" \d+ chars, over the 500-char cap"):
+            kb.complete_task(conn, tid, **kwargs)
+        assert kb.get_task(conn, tid).status == "blocked"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert event in kinds and "completed" not in kinds
+
+
+def test_evidence_at_the_cap_is_stored_verbatim(kanban_home):
+    url = URL + "?" + "a" * (kb._SUPERSEDED_POINTER_MAX - len(URL) - 1)
+    watcher = "w" * kb._SUPERSEDED_POINTER_MAX
+    assert len(url) == kb._SUPERSEDED_POINTER_MAX
+    with kb.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        assert kb.complete_task(conn, tid, external=url, watcher=watcher) is True
+        assert kb.list_runs(conn, tid)[-1].metadata["external"] == {"url": url, "watcher": watcher}
+
+
 def test_external_run_counts_as_success_downstream(kanban_home):
     with kb.connect_closing() as conn:
         parent = _blocked_task(conn)

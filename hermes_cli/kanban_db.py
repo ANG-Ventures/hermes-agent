@@ -9262,8 +9262,17 @@ def _claim_is_live(trow) -> bool:
     )
 
 # Evidence pointer for a superseded close, capped so a worker cannot paste a
-# whole transcript into the durable field the board renders.
+# whole transcript into the durable field the board renders. An overlong value
+# is REFUSED, never sliced: a cut URL can still look valid while naming a
+# different resource, and a cut watcher id no longer names the watcher.
 _SUPERSEDED_POINTER_MAX = 500
+
+
+def _overlong(value: str) -> str:
+    """The refusal reason for an evidence field over the cap, else ``""``."""
+    if len(value) > _SUPERSEDED_POINTER_MAX:
+        return f"is {len(value)} chars, over the {_SUPERSEDED_POINTER_MAX}-char cap"
+    return ""
 
 
 class EmptySupersedeError(ValueError):
@@ -9275,8 +9284,15 @@ class EmptySupersedeError(ValueError):
     recoverable user error the worker can retry.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, why: str = ""):
         self.task_id = task_id
+        if why:
+            # Overlong pointer (refused rather than truncated).
+            super().__init__(
+                f"completion blocked: {task_id} superseded_by {why}; pass a short pointer "
+                f"(card id, PR url or sha), not a transcript. {task_id} is unchanged"
+            )
+            return
         super().__init__(
             f"completion blocked: {task_id} was completed as superseded with an empty "
             f"superseded_by; name the card, PR or sha that satisfied the premise "
@@ -9308,8 +9324,14 @@ class EmptyDraftOverrideError(ValueError):
     (t_f38605be); the reason is the audit record, so an empty one is refused.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, why: str = ""):
         self.task_id = task_id
+        if why:
+            super().__init__(
+                f"completion blocked: {task_id} draft_ok {why}; give a one-line reason. "
+                f"{task_id} is still in-flight (no state change)"
+            )
+            return
         super().__init__(
             f"completion blocked: {task_id} passed an empty draft_ok; give the reason "
             f"the named DRAFT PR is intentionally left open, e.g. 'CI vehicle for "
@@ -9509,21 +9531,25 @@ def complete_task(
     # thing that must not be blank. Gate it before any filesystem work, and
     # emit the audit event the same way the card gates do.
     if superseded_by is not None:
-        superseded_by = str(superseded_by).strip()[:_SUPERSEDED_POINTER_MAX]
-        if not superseded_by:
+        superseded_by = str(superseded_by).strip()
+        too_long = _overlong(superseded_by)
+        if not superseded_by or too_long:
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "completion_blocked_empty_supersede",
-                    {"reason": "empty_superseded_pointer"},
+                    {"reason": "overlong_superseded_pointer" if too_long
+                     else "empty_superseded_pointer"},
                 )
-            raise EmptySupersedeError(task_id)
+            raise EmptySupersedeError(task_id, too_long)
     run_outcome = "superseded" if superseded_by else "completed"
     if external is not None or watcher is not None:
-        external = str(external or "").strip()[:_SUPERSEDED_POINTER_MAX]
-        watcher = str(watcher or "").strip()[:_SUPERSEDED_POINTER_MAX]
+        external = str(external or "").strip()
+        watcher = str(watcher or "").strip()
         why = ("has no --external url" if not external
+               else f"url {_overlong(external)}" if _overlong(external)
                else "url is not http(s)" if not re.match(r"https?://\S+$", external)
                else "has no --watcher" if not watcher
+               else f"watcher {_overlong(watcher)}" if _overlong(watcher)
                else "cannot also be superseded" if superseded_by else "")
         if why:
             with write_txn(conn):
@@ -9531,14 +9557,15 @@ def complete_task(
             raise ExternalCloseError(task_id, why)
         run_outcome = "external"
     if draft_ok is not None:
-        draft_ok = str(draft_ok).strip()[:_SUPERSEDED_POINTER_MAX]
-        if not draft_ok:
+        draft_ok = str(draft_ok).strip()
+        too_long = _overlong(draft_ok)
+        if not draft_ok or too_long:
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "completion_blocked_empty_draft_override",
-                    {"reason": "empty_draft_ok"},
+                    {"reason": "overlong_draft_ok" if too_long else "empty_draft_ok"},
                 )
-            raise EmptyDraftOverrideError(task_id)
+            raise EmptyDraftOverrideError(task_id, too_long)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
