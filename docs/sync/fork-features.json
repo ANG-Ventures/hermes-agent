@@ -153,7 +153,24 @@
     "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/agent/test_pool_affinity_header.py",
-      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py"
+      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_non_pool_provider_carries_none"
+    ],
+    "call_site": "agent/chat_completion_helpers.py::_build_anthropic_kwargs",
+    "call_site_tests": [
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_non_pool_provider_carries_none"
     ],
     "paths": [
       "agent/fork_ext/relay_headers.py",
