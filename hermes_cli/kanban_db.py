@@ -16004,9 +16004,27 @@ def reap_exited_worker_leftovers(
     (= sid) is only free for reuse after that, so a recycled session leader
     is always born too late to qualify. Returns the task ids that had
     leftovers.
+
+    ``exited_pids`` is a hint, not the authority. Two callers consume the
+    same ``Popen.poll()`` receipt — the gateway's per-tick
+    ``reap_worker_zombies`` (``gateway/kanban_watchers.py``, which only logs)
+    and ``dispatch_once`` — and whichever polls first takes the pid out of
+    ``_worker_processes``; the other sees ``[]``. Measured 2026-10-03: a
+    worker (t_630c9711, pid 49943) was reaped by the gateway loop at 14:35:55,
+    ``dispatch_once`` saw no exits, and the worker's setsid'd ``upsmon -F``
+    (run env intact, ``NOTIFYCMD`` → ``wall`` every 2 min → a BEL on every
+    tty → the Mac Studio chimed for six hours) was never swept. So this also
+    walks :data:`_worker_identities` for every registered worker whose handle
+    is gone from ``_worker_processes`` (= already polled by someone) and
+    treats it as exited too. Identity is popped exactly once either way.
     """
     reaped_cards: list[str] = []
-    for pid in exited_pids:
+    pending: list[int] = [int(p) for p in exited_pids]
+    with _worker_processes_lock:
+        for pid in list(_worker_identities):
+            if pid not in _worker_processes and pid not in pending:
+                pending.append(pid)
+    for pid in pending:
         with _worker_processes_lock:
             ident = _worker_identities.pop(int(pid), None)
         if ident is None:

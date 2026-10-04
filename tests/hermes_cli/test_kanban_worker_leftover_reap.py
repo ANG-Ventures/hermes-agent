@@ -151,6 +151,79 @@ def test_completed_worker_listener_is_reaped_on_exit(conn):
     assert kb.reap_exited_worker_leftovers(conn, exited) == []
 
 
+def test_leftovers_reaped_when_exit_receipt_was_consumed_elsewhere(conn):
+    """The gateway loop polls ``reap_worker_zombies`` every tick and only
+    LOGS the pids; ``dispatch_once`` then calls this reaper with ``[]``. The
+    worker's registered identity must still drive the sweep (2026-10-03:
+    t_630c9711's setsid'd ``upsmon`` + ``wall`` beeped the Studio for 6 h)."""
+    tid = kb.create_task(conn, title="card", assignee="worker")
+    task = kb.claim_task(conn, tid)
+    assert task is not None
+    spawned_at = time.time()
+    worker = subprocess.Popen(
+        [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, text=True, encoding="utf-8", start_new_session=True,
+    )
+    with kb._worker_processes_lock:
+        kb._worker_processes[worker.pid] = worker
+    kb._register_worker_identity(worker.pid, tid, task.current_run_id, spawned_at)
+    assert kbd._set_worker_pid(conn, tid, worker.pid)
+    srv_pid, port = (int(x) for x in worker.stdout.readline().split())
+    _STARTED.append(srv_pid)
+    assert _listening(port)
+
+    assert kb.complete_task(conn, tid, summary="done", metadata={"tests_run": 1},
+                            expected_run_id=task.current_run_id)
+    worker.stdin.write("go\n")
+    worker.stdin.flush()
+    # The OTHER consumer (gateway tick) takes the poll() receipt and drops it.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and worker.pid not in kbd.reap_worker_zombies():
+        time.sleep(0.05)
+    with kb._worker_processes_lock:
+        assert worker.pid not in kb._worker_processes
+        assert worker.pid in kb._worker_identities
+    assert kb._pid_alive(srv_pid), "listener died with its worker; test proves nothing"
+
+    # dispatch_once's view: nothing exited this tick.
+    assert kb.reap_exited_worker_leftovers(conn, [], grace=2.0) == [tid]
+    assert _gone(srv_pid), "listener outlived its worker because another poller consumed the exit"
+    assert not _listening(port)
+    with kb._worker_processes_lock:
+        assert worker.pid not in kb._worker_identities
+    assert kb.reap_exited_worker_leftovers(conn, []) == []
+
+
+def test_live_worker_identity_is_not_treated_as_exited(conn):
+    """A registered worker whose handle is still retained has NOT exited;
+    the identity walk must leave it (and its children) alone."""
+    tid = kb.create_task(conn, title="card", assignee="worker")
+    task = kb.claim_task(conn, tid)
+    assert task is not None
+    worker = subprocess.Popen(
+        [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, text=True, encoding="utf-8", start_new_session=True,
+    )
+    _STARTED.append(worker.pid)
+    with kb._worker_processes_lock:
+        kb._worker_processes[worker.pid] = worker
+    kb._register_worker_identity(worker.pid, tid, task.current_run_id, time.time())
+    srv_pid, port = (int(x) for x in worker.stdout.readline().split())
+    _STARTED.append(srv_pid)
+    try:
+        assert kb.reap_exited_worker_leftovers(conn, [], grace=0.5) == []
+        assert kb._pid_alive(worker.pid) and kb._pid_alive(srv_pid)
+        assert _listening(port)
+        with kb._worker_processes_lock:
+            assert worker.pid in kb._worker_identities
+    finally:
+        worker.kill()
+        worker.wait(5)
+        with kb._worker_processes_lock:
+            kb._worker_processes.pop(worker.pid, None)
+            kb._worker_identities.pop(worker.pid, None)
+
+
 def _spawn_orphan(cwd: Path) -> int:
     out = subprocess.run([sys.executable, "-c", _ORPHAN, str(cwd)],
                          capture_output=True, text=True, encoding="utf-8",
