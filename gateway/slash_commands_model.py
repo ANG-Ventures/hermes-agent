@@ -801,64 +801,178 @@ class GatewayModelCommandsMixin:
             return None  # Picker sent — adapter handles the response
         return t("gateway.reasoning.status", level=level, scope=scope, display=display_state)
 
-    def _apply_fast_selection(self, session_key: str, value: str, persist: bool = False) -> str:
-        """Apply a /fast argument (typed or picked) and return the reply."""
+    def _apply_fast_selection(self, session_key: str, value: str, persist: bool, ctx: dict) -> str:
+        """Apply a /fast argument (typed or picked) and return the reply.
+
+        Session-scoped by default and durably persisted (gateway_session_tiers.yaml); ``persist``
+        (``--global``) writes agent.service_tier. ``ctx`` is ``_fast_route_context``: the reply names
+        the resolved Fast family. Typed arguments and picker taps share the same route gate.
+        """
         selection = _FAST_SELECTIONS.get(value)
         if selection is None:
             return t("gateway.fast.unknown_arg", arg=value)
         tier, saved_value, label_key = selection
+        if tier is not None:
+            refusal = self._fast_selection_refusal(tier, persist, ctx)
+            if refusal:
+                return refusal
         label = t(label_key) if label_key else value.upper()
+        family_label = t(f"gateway.fast.family_{self._fast_verdict(tier, persist, ctx).family}")
         self._service_tier = tier
-        if persist and self._save_gateway_config_key("agent.service_tier", saved_value):
-            self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
+        if persist:
+            if self._save_gateway_config_key("agent.service_tier", saved_value):
+                # Global wins: drop this session's override, in memory and on disk. A failed disk clear
+                # would let the old session tier win again after a restart, so it is not "saved".
+                if self._persist_session_service_tier(session_key, None, clear=True):
+                    self._set_session_service_tier_override(session_key, None, clear=True)
+                    self._evict_cached_agent(session_key)
+                    return t("gateway.fast.route_saved", family=family_label, label=label)
+            # Config write (or the session-tier clear) failed: fall back to the session override (an existing one would otherwise
+            # win on the next resolve), in memory only. ``self._service_tier`` is runner state, so the
+            # change is honestly gateway-process-wide until restart, NOT this-session-only.
+            self._set_session_service_tier_override(session_key, tier)
             self._evict_cached_agent(session_key)
-            return t("gateway.fast.saved", label=label)
-        # Session override — also the fallback after a failed config write (as /reasoning --global).
+            return t("gateway.fast.route_session_only", family=family_label, label=label)
+        # Session override, durably persisted so it survives a restart. A persistence failure keeps
+        # the in-memory override live, but the change is then honestly process-wide until restart.
         self._set_session_service_tier_override(session_key, tier)
         self._evict_cached_agent(session_key)
-        return t("gateway.fast.session_only", label=label)
+        if self._persist_session_service_tier(session_key, tier):
+            return t("gateway.fast.route_saved", family=family_label, label=label)
+        return t("gateway.fast.route_session_only", family=family_label, label=label)
 
-    async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /fast — the CLI Priority Processing toggle; session-scoped unless ``--global``
-        (persists agent.service_tier, parity with /model)."""
-        from agent.fast_mode import service_tier_word
-        from gateway.run import _load_gateway_config, _resolve_gateway_model
+    def _fast_selection_refusal(self, tier: str, persist: bool, ctx: dict) -> Optional[str]:
+        """Why a Fast tier cannot be enabled, or None (priority/auto/cold use the base verdict,
+        ultrafast its own). ``--global`` gates on the configured gateway route, where the persisted
+        default applies; a session toggle gates on the session's resolved route."""
+        verdict = self._fast_verdict(tier, persist, ctx)
+        if persist:
+            if verdict.supported:
+                return None
+            if tier == "ultrafast":
+                return t("gateway.fast.route_unavailable", reason=verdict.reason)
+            return t("gateway.fast.not_supported")
+        if ctx["persisted_preference"] and ctx["preference_unavailable"]:
+            return t("gateway.fast.preference_unavailable", route=ctx["route"])
+        if not verdict.supported:
+            return t("gateway.fast.route_unavailable", reason=verdict.reason)
+        return None
+
+    def _fast_verdict(self, tier: Optional[str], persist: bool, ctx: dict):
+        """The Fast capability a selection applies to: the configured gateway route for ``--global``
+        (where agent.service_tier takes effect), else the session's resolved route."""
+        ultra = tier == "ultrafast"
+        if not persist:
+            return ctx["ultrafast_capability"] if ultra else ctx["capability"]
+        from gateway.run import _resolve_gateway_model
         from hermes_cli.models import resolve_fast_mode_capability_for_configured_route
 
-        # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
-        args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
-        session_key = self._session_key_for_source(event.source)
-        self._service_tier = self._resolve_session_service_tier(session_key=session_key)
+        _, provider, api_mode = self._configured_route_identity(ctx["user_config"])
+        return resolve_fast_mode_capability_for_configured_route(
+            model=_resolve_gateway_model(ctx["user_config"]), provider=provider, api_mode=api_mode,
+            tier="ultrafast" if ultra else None,
+        )
+
+    async def _fast_route_context(self, event: MessageEvent, session_key: str) -> Optional[dict]:
+        """Resolve the session's route (persisted session preference > channel > config) and its
+        Fast verdicts without checking out credentials; None when the persisted route is unreadable."""
+        from gateway.run import _load_gateway_config
+        from hermes_cli.models import resolve_fast_mode_capability
+
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
-        # Fork: route-aware verdict (an unpinned provider resolves against the model's native route);
-        # the model-only wrapper is banned from call sites (tests/cli/test_fast_route_capability.py).
-        _, provider, api_mode = self._configured_route_identity(user_config)
-        if not resolve_fast_mode_capability_for_configured_route(
-                model=model, provider=provider, api_mode=api_mode).supported:
-            return t("gateway.fast.not_supported")
-        ultrafast = resolve_fast_mode_capability_for_configured_route(
-            model=model, provider=provider, api_mode=api_mode, tier="ultrafast").supported
-        if args == "ultrafast" and not ultrafast:
-            return t("gateway.fast.ultrafast_not_supported", model=model)
-        if args and args != "status":
-            return self._apply_fast_selection(session_key, args, persist=persist_global)
-        mode = service_tier_word(self._service_tier)
-        status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
+        lookup = await asyncio.to_thread(self._persisted_session_route_identity, session_key)
+        if lookup.state == "unavailable":
+            return None
+        model, provider, api_mode = self._resolve_configured_session_route_identity(
+            source=event.source, session_key=session_key, user_config=user_config,
+            persisted_route_lookup=lookup,
+        )
+        capability = resolve_fast_mode_capability(model=model, provider=provider, api_mode=api_mode)
+        route = f"{provider or '<unknown>'}/{model or '<unset>'}"
+        logger.debug("Fast capability route=%s api_mode=%s family=%s supported=%s",
+                     route, api_mode or "", capability.family, capability.supported)
+        return {
+            "user_config": user_config,
+            "capability": capability,
+            "ultrafast_capability": resolve_fast_mode_capability(
+                model=model, provider=provider, api_mode=api_mode, tier="ultrafast"),
+            "route": route,
+            "persisted_preference": lookup.identity,
+            "preference_unavailable": session_key in getattr(self, "_session_model_override_unavailable", set()),
+        }
+
+    async def _send_fast_picker(
+        self, event: MessageEvent, session_key: str, ctx: dict, persist: bool, tier: Optional[str],
+    ) -> bool:
+        """Interactive picker (parity with /model, /reasoning), shown only when the configured gateway
+        route carries Fast. False = no picker sent; the caller replies with the text status."""
+        from agent.fast_mode import service_tier_word
+        from gateway.run import _resolve_gateway_model
+        from hermes_cli.models import resolve_fast_mode_capability_for_configured_route
+
+        try:
+            _, provider, api_mode = self._configured_route_identity(ctx["user_config"])
+            route = dict(model=_resolve_gateway_model(ctx["user_config"]), provider=provider, api_mode=api_mode)
+            if not resolve_fast_mode_capability_for_configured_route(**route).supported:
+                return False
+            ultrafast = resolve_fast_mode_capability_for_configured_route(**route, tier="ultrafast").supported
+        except Exception:
+            return False
+        mode = service_tier_word(tier)
 
         async def _on_fast_choice(_chat_id: str, value: str) -> str:
-            return self._apply_fast_selection(session_key, value, persist=persist_global)
+            return self._apply_fast_selection(session_key, value, persist, ctx)
 
-        picker_sent = await self._try_send_choice_picker(
+        return bool(await self._try_send_choice_picker(
             event,
             session_key,
-            title=t("gateway.fast.picker_title", mode=status),
+            title=t("gateway.fast.picker_title", mode=mode),
             choices=[
                 {"value": v, "label": t(f"gateway.fast.choice_{v}"), "is_current": mode == v}
                 for v in ("fast", "normal", "auto", "cold", *(("ultrafast",) if ultrafast else ()))
             ],
             on_choice_selected=_on_fast_choice,
+        ))
+
+    def _fast_status_reply(self, ctx: dict, tier: Optional[str]) -> str:
+        """Text status: the session route's Fast state and family, or why Fast is off there."""
+        from agent.fast_mode import BOUNDED_MODES, STATIC_TIERS
+
+        if ctx["persisted_preference"] and ctx["preference_unavailable"]:
+            return t("gateway.fast.preference_unavailable", route=ctx["route"])
+        capability, ultrafast = ctx["capability"], ctx["ultrafast_capability"]
+        status_capability = (
+            ultrafast
+            if tier == "ultrafast" or (tier is None and not capability.supported and ultrafast.supported)
+            else capability
         )
-        if picker_sent:
+        if not status_capability.supported:
+            key = "gateway.fast.preference_off" if ctx["persisted_preference"] else "gateway.fast.route_off"
+            return t(key, reason=status_capability.reason)
+        if tier in BOUNDED_MODES:
+            state = tier
+        else:
+            state = t("gateway.fast.state_on" if tier in STATIC_TIERS else "gateway.fast.state_off")
+        return t(
+            "gateway.fast.preference_status" if ctx["persisted_preference"] else "gateway.fast.route_status",
+            state=state,
+            family=t(f"gateway.fast.family_{status_capability.family}"),
+            route=ctx["route"],
+        )
+
+    async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /fast (normal|fast|auto|cold|ultrafast|status), gated on the session's resolved
+        route; session-scoped unless ``--global`` (persists agent.service_tier, parity with /model)."""
+        # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
+        args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
+        session_key = self._session_key_for_source(event.source)
+        tier = self._resolve_session_service_tier(session_key=session_key)
+        self._service_tier = tier
+        ctx = await self._fast_route_context(event, session_key)
+        if ctx is None:
+            return t("gateway.fast.preference_unavailable", route="<unreadable>")
+        if args and args != "status":
+            return self._apply_fast_selection(session_key, args, persist_global, ctx)
+        if await self._send_fast_picker(event, session_key, ctx, persist_global, tier):
             return None  # Picker sent — adapter handles the response
-        return t("gateway.fast.status", mode=status)
+        return self._fast_status_reply(ctx, tier)
