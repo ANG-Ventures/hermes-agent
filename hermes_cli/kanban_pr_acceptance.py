@@ -90,12 +90,20 @@ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
     return env
 
 
+def _is_human_lane(assignee: str | None) -> bool:
+    """``human`` / ``human:<name>``: the review lane's operator sentinel, not a profile."""
+    from hermes_cli.kanban_db import is_human_reviewer
+    return is_human_reviewer(assignee)
+
+
 def _assignee_profile_home(assignee: str | None) -> str | None:
     """Home whose ``gh`` login must read the contract repo — the assignee's, resolved
-    exactly as the dispatcher resolves the worker's home — or None (unassigned) so the
-    ambient login is used. An assigned card whose profile cannot be resolved is an
-    identity failure (``auth``), never a silent fall-through to the ambient login."""
-    if not assignee:
+    exactly as the dispatcher resolves the worker's home — or None so the ambient login
+    is used: unassigned cards, and the ``human``/``human:<name>`` review lane, which has
+    no profile by design and completes as the operator. Any other assigned card whose
+    profile cannot be resolved is an identity failure (``auth``), never a silent
+    fall-through to the ambient login."""
+    if not assignee or _is_human_lane(assignee):
         return None
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
     try:
@@ -110,6 +118,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
                "pr_url": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
+    human_lane = bool(assignee) and _is_human_lane(assignee)
+    if human_lane:
+        receipt["login"] = "ambient (human lane)"
     try:
         profile_home = _assignee_profile_home(assignee)
         declared = _PR.fullmatch(contract)
@@ -181,7 +192,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["ok"] = receipt["classification"] == "success"
         return receipt
     except _GateAuthError as exc:
-        login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
+        login = (f"assignee profile {assignee!r}'s gh login" if assignee and not human_lane
+                 else "the ambient gh login")
         receipt.update(classification="auth",
                        detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
                               "fix that profile's GitHub credentials/access to the repository, then retry completion.")
