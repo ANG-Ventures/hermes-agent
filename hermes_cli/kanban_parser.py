@@ -747,6 +747,18 @@ _SPECS = [
         _arg("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)"),
     ], help="Live-stream task_events to the terminal (Ctrl+C to exit)"),
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
+    _cmd("session-closeout", [
+        _arg("session_ids", nargs="+", metavar="SESSION_ID",
+             help="Session id(s) whose cards (tasks.session_id) are closed out; pass every id of the chat lineage"),
+        _arg("--out", metavar="PATH", help="Write the markdown here (e.g. plans/closeouts/<date>_<name>.md)"),
+        _arg("--vault-out", metavar="PATH", help="Also write it into the Obsidian vault (e.g. <vault>/AI/Closeouts/x.md)"),
+        _arg("--vault", metavar="DIR", help="Vault root used to check that vault doc paths named by cards exist"),
+        _arg("--root", metavar="DIR", help="Fleet root holding kanban.db, state.db, blackbox/ (default: kanban home)"),
+        _arg("--no-network", action="store_true", help="Skip GitHub PR state reads (states print UNREAD)"),
+        _arg("--check", action="store_true", help="Exit 1 when any ang-closeout gate FAILs"),
+        _json_flag(help="Print the machine summary (counts, cards_listed, gates, open, cost) as JSON"),
+    ], help="Render one Obsidian-ready closeout for a session's cards: accounting, waves, rulings, "
+            "open remainder, cost, incidents, docs, ang-closeout gates (read-only)"),
     _cmd("home-index", [
         _arg("--check", action="store_true", help="Report drift only; exit 1 when drift >= 1"),
         _json_flag(),
