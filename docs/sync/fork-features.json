@@ -141,7 +141,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
-    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "EQUIVALENT-UPSTREAM", "evidence": "PARTIAL. Per-job reasoning: production on fork calls upstream's cron/scheduler.py::_resolve_job_reasoning_config (4e1dd1a74b, Victor Kyriazakos, 2026-08-20); fork scheduler_ext.resolve_cron_reasoning_config has no production caller (golden runner only). Global script-timeout chain: ledger F07-cron_tools_auth_misc.md row cron/scheduler_script.py::_get_script_timeout NO-PORT-NEEDED (upstream _timeout_from_env_or_config is the identical chain); fork get_script_timeout has no production caller. Residual live fork delta: resolve_job_script_timeout (per-job/interval ceiling, called from cron/scheduler.py:2242), upstream 0 hits."},
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["cron/fork_ext/scheduler_ext.py::resolve_job_script_timeout (per-job/interval script-timeout ceiling; caller cron/scheduler.py:2242; upstream 0 hits)"], "evidence": "PARTIAL. Per-job reasoning: production on fork calls upstream's cron/scheduler.py::_resolve_job_reasoning_config (4e1dd1a74b, Victor Kyriazakos, 2026-08-20); fork scheduler_ext.resolve_cron_reasoning_config has no production caller (golden runner only). Global script-timeout chain: ledger F07-cron_tools_auth_misc.md row cron/scheduler_script.py::_get_script_timeout NO-PORT-NEEDED (upstream _timeout_from_env_or_config is the identical chain); fork get_script_timeout has no production caller. Residual live fork delta: resolve_job_script_timeout (per-job/interval ceiling, called from cron/scheduler.py:2242), upstream 0 hits."},
     "surfaces": [
       "cron"
     ],
@@ -337,7 +337,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
-    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "EQUIVALENT-UPSTREAM", "evidence": "Upstream dbcbd9d9db (teknium1, 2026-09-20, #66023; design by Angello Picasso #66014/#66024): /branch opens a sibling thread by default on Discord/Telegram/Slack/Matrix, --here keeps in-place. Third-party parallel invention, not our submission. Converged THIS sync: ledger CI6-M1-gatewaya.md row test_branch_thread_command.py dropped the fork's Discord-only _handle_branch_command shadow and folded fork deltas (_branch_point_len, thread intro, running-agent release) into upstream's handler; GatewayRunner MRO resolves _handle_branch_command to gateway.slash_commands_session (upstream). Registry row + fork alias are upstream's."},
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["gateway/slash_commands_session.py::_handle_branch_command fork deltas folded into upstream's handler: _branch_point_len stamp (upstream 0 hits), _branch_post_thread_intro, running-agent release on thread branch"], "evidence": "Upstream dbcbd9d9db (teknium1, 2026-09-20, #66023; design by Angello Picasso #66014/#66024): /branch opens a sibling thread by default on Discord/Telegram/Slack/Matrix, --here keeps in-place. Third-party parallel invention, not our submission. Converged THIS sync: ledger CI6-M1-gatewaya.md row test_branch_thread_command.py dropped the fork's Discord-only _handle_branch_command shadow and folded fork deltas (_branch_point_len, thread intro, running-agent release) into upstream's handler; GatewayRunner MRO resolves _handle_branch_command to gateway.slash_commands_session (upstream). Registry row + fork alias are upstream's."},
     "surfaces": [
       "cli",
       "gateway",
@@ -380,7 +380,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
-    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "EQUIVALENT-UPSTREAM", "evidence": "/fast is upstream's command (8779a268a7, Teknium, 2026-04-10); fork registry row is byte-identical to upstream (normal/fast/auto/cold). Upstream now has session scope + --global (slash_commands_model.py _apply_fast_selection). Fork delta = ultrafast tier + route-aware capability. DEFECT found: GatewayRunner MRO resolves _handle_fast_command to the fork's gateway/slash_commands.py copy, which rejects 'auto'/'cold' the registry advertises (probe on 2d966948b0: '/fast auto' -> 'Unknown argument: auto'). Same shadow-handler class CI6-M1 fixed for /branch; follow-up card filed."},
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["route-aware ultrafast capability: hermes_cli/models.py::resolve_fast_mode_capability (upstream 0 hits)", "gateway/slash_commands.py::_handle_fast_command shadow handler wins the MRO (defect, follow-up t_0b4d7394)"], "evidence": "/fast is upstream's command (8779a268a7, Teknium, 2026-04-10); fork registry row is byte-identical to upstream (normal/fast/auto/cold). Upstream now has session scope + --global (slash_commands_model.py _apply_fast_selection). Fork delta = ultrafast tier + route-aware capability. DEFECT found: GatewayRunner MRO resolves _handle_fast_command to the fork's gateway/slash_commands.py copy, which rejects 'auto'/'cold' the registry advertises (probe on 2d966948b0: '/fast auto' -> 'Unknown argument: auto'). Same shadow-handler class CI6-M1 fixed for /branch; follow-up card filed."},
     "surfaces": [
       "cli",
       "gateway"
@@ -399,7 +399,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "cc8e5ec2af (scalar coercion, byte-identical upstream); remainder = our open upstream PR #72014",
     "absorbed_date": "2026-08-31",
-    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed partial absorption: scalar coercion upstream (cc8e5ec2af). Quoted-mention remainder still fork-only ('quoted' in discord plugin: fork 1, upstream 0); our upstream PR #72014 still OPEN (REST read 2026-10-03). No new D2 item."},
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["plugins/platforms/discord/adapter.py quoted-bot-mention exemption in free-response channels (upstream PR #72014 open)"], "evidence": "Reconfirmed partial absorption: scalar coercion upstream (cc8e5ec2af). Quoted-mention remainder still fork-only ('quoted' in discord plugin: fork 1, upstream 0); our upstream PR #72014 still OPEN (REST read 2026-10-03). No new D2 item."},
     "surfaces": [
       "discord"
     ],
