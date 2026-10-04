@@ -22,12 +22,12 @@ can discard one. Two signals:
   dispatched. Logged at WARNING with the exact missing range.
 
 This file is a *complement* to the shipped
-``tests/gateway/test_telegram_intake_sentinel.py``: it locks the properties a
-parity merge is most likely to erode — the group ``-1`` registration priority
-and the no-false-alarm rules — rather than re-testing the happy path.
+``tests/gateway/test_telegram_intake_sentinel.py``: it locks the no-false-alarm
+rules a parity merge is most likely to erode rather than re-testing the happy
+path. The group ``-1`` registration priority is driven through the real PTB
+Application in ``tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py``.
 """
 
-import inspect
 import logging
 import sys
 from unittest.mock import MagicMock
@@ -90,35 +90,8 @@ def _intake_infos(caplog):
     ]
 
 
-# --------------------------------------------------------------------------- #
-# Registration priority — the property that makes the sentinel *complete*
-# --------------------------------------------------------------------------- #
-
-def test_sentinel_is_registered_in_a_group_below_every_other_handler():
-    """The sentinel is only trustworthy if nothing can discard an update
-    before it observes one. Group ``-1`` guarantees it runs ahead of the
-    default group ``0`` handlers (filters, auth prefilter, text batching).
-
-    RED-PROVABLE: in plugins/platforms/telegram/adapter.py (~L2294) change
-    ``group=-1`` to ``group=0`` (or drop the kwarg) — the source assertion
-    below fails because no negative group remains on the sentinel
-    registration."""
-    src = inspect.getsource(TelegramAdapter)
-    assert "_observe_intake_update" in src, (
-        "the intake sentinel handler was removed from the adapter entirely"
-    )
-    # Locate the add_handler call that registers the sentinel and confirm it
-    # carries a negative group.
-    idx = src.find("TypeHandler(Update, self._observe_intake_update)")
-    assert idx != -1, (
-        "the sentinel is no longer registered as a TypeHandler over all Updates"
-    )
-    window = src[idx: idx + 400]
-    assert "group=-1" in window, (
-        "the intake sentinel lost its group=-1 priority; a group>=0 handler "
-        "can discard an update before the sentinel observes it, which "
-        "reopens the exact blind spot #639 closed."
-    )
+# Registration priority (group -1, blocking, over every Update) is driven through the real PTB
+# Application in tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py.
 
 
 # --------------------------------------------------------------------------- #

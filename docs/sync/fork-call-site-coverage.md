@@ -22,7 +22,7 @@ Verdicts:
 
 Lint (D2b, `scripts/hermes_parity/lint_manifest.py::lint_call_sites`): an entry that sets
 `call_site` must list `call_site_tests` (nodeids that drive it), each also in `tests` so the
-collection lint covers it. Only the footer entry declares `call_site` today. Each presence-only
+collection lint covers it. The footer and telegram intake sentinel entries declare `call_site`. Each presence-only
 row below has a child card of t_96049446. That card adds the e2e tests AND the `call_site` /
 `call_site_tests` fields, after which the lint holds the line.
 
@@ -43,7 +43,7 @@ row below has a child card of t_96049446. That card adds the e2e tests AND the `
 | 16 | /merge | gateway slash dispatch → merge handler | `tests/gateway/test_discord_branch_thread_merge.py::TestMergeCommand` | covered |
 | 17 | /fast | turn request build → `resolve_fast_mode_capability` | `tests/gateway/test_turn_request_overrides.py::test_provider_request_overrides_merged_under_fast_mode` (not registered); `tests/gateway/test_fast_command.py` | covered (shadow-handler defect tracked by t_0b4d7394) |
 | 18 | discord free-response: scalar coercion + quoted-mention exemption | `plugins/platforms/discord/adapter.py` message gate (`other_bots_mentioned` block, ~L2093–2113) | coercion: `_discord_free_response_channels()` is called directly (covered). Quoted-mention: the canary *replicates* the gate's logic instead of driving the adapter's message path | **presence-only** (quoted-mention half) |
-| 19 | telegram intake sentinel | `TelegramAdapter` app setup: `app.add_handler(TypeHandler(Update, self._observe_intake_update), group=-1)` (~L3124) | `_observe_intake_update` is driven directly (covered). Registration and group=-1 are checked only by reading source text (`test_telegram_intake_sentinel.py` ~L225, canary ~L110) | **presence-only** (registration half) |
+| 19 | telegram intake sentinel | `TelegramAdapter._register_handlers` (initial `connect()` and the init-retry rebuild): `app.add_handler(TypeHandler(Update, self._observe_intake_update), group=-1)` | `tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py` (real `connect()` + PTB `process_update`: registration group/type/block on both builds, ingest line before a group-0 handler, and present when it raises or filters the update out; red under removal and under `group=0`). `_observe_intake_update` itself: `test_telegram_intake_sentinel.py` | covered (`call_site` declared, lint-enforced) |
 | 20 | cron refuses cross-vendor model/provider pairs | `tools/cronjob_tools.py::cronjob(action="create"/"update")` | `tests/tools/test_cronjob_tools.py::TestModelProviderVendorConsistency::test_create_rejected_on_cross_vendor_pair`, `…::test_update_rejected_when_only_provider_changes` | covered |
 | 21 | test hygiene: evict MagicMock telegram modules | test-only | — | n/a |
 | 22 | runtime footer fork fields | `gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line` → `build_footer_line` | `tests/gateway/test_footer_consumer_in_turn.py` (end-to-end render) + `tests/gateway/test_footer_consumer_kwargs_isolated.py` (per-kwarg wiring + render, each red under its own mutation) | covered (`call_site` declared, lint-enforced) |
