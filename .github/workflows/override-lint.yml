@@ -9,10 +9,51 @@
 #   ubuntu-latest      public repo: GitHub-hosted. Private ANG-Ventures repos use the org's metered runner label.
 name: override-lint
 
-# path-filter-exempt: the check reads the PR BODY; `edited` must re-run it on a body-only change, and a path-filtered check would skip those.
+# paths: the files the lint reads for hits (README "Caller path filters"). A PR outside them has no
+# hits, so it passes whatever its body says. `edited` still re-runs the check on a body edit of a PR
+# inside them: GitHub evaluates the filter against the PR's whole diff, not against the edit. Not a
+# required check, so a filtered-out run does not leave a PR pending.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+    paths:
+      - '**'
+      # Never read for hits (no CODE_EXT): docs, data, media, config.
+      - '!**.md'
+      - '!**.json'
+      - '!**.jsonl'
+      - '!**.txt'
+      - '!**.log'
+      - '!**.csv'
+      - '!**.sse'
+      - '!**.patch'
+      - '!**.diff'
+      - '!**.html'
+      - '!**.svg'
+      - '!**.png'
+      - '!**.jpg'
+      - '!**.jpeg'
+      - '!**.gif'
+      - '!**.webp'
+      - '!**.pdf'
+      - '!**.yml'
+      - '!**.yaml'
+      - '!**.toml'
+      - '!**.plist'
+      - '!**.service'
+      - '!**.ini'
+      - '!**.cfg'
+      - '!**.lock'
+      # Never read for hits: test paths (the lint's is_test()).
+      - '!**/tests/**'
+      - '!**/test/**'
+      - '!**/__tests__/**'
+      - '!**/testdata/**'
+      - '!**/fixtures/**'
+      - '!**/test_*'
+      - '!**/conftest.py'
+      # Fail open on a change to this caller (SHA bump, input change).
+      - '.github/workflows/override-lint.yml'
 
 permissions:
   contents: read
