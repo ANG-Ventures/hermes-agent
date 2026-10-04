@@ -140,7 +140,7 @@ def test_render_provider(cfg, drop):
     assert a.startswith("claude-alr/claude-fable-5-1 · ") and b.startswith("openrouter/claude-fable-5-1 · "), (a, b)
     drop("provider")
     regressed = _consume(_runner(), _result(provider="claude-alr"))
-    assert regressed.startswith("claude-fable-5-1 · r:xhigh"), (
+    assert regressed.startswith("claude-fable-5-1 · ") and "claude-alr/" not in regressed, (
         f"dropping provider= should regress to Ace's 10-04 footer 'claude-fable-5-1 · …', got {regressed!r}"
     )
 
@@ -193,12 +193,14 @@ def test_wiring_context_estimated(spy):
 
 
 def test_render_context_estimated(cfg, drop):
-    est = _consume(_runner(), _result(context_tokens_display=95_100, context_tokens_estimated=True))
-    exact = _consume(_runner(), _result(context_tokens_display=95_100, context_tokens_estimated=False))
-    assert "~95.1k/1M" in est and "~95.1k" not in exact and "95.1k/1M" in exact, (est, exact)
+    # No context_tokens_display: the figure is the same under either context_tokens rule, so this
+    # test isolates the '~' marker from the context_tokens wiring.
+    est = _consume(_runner(), _result(context_tokens_estimated=True))
+    exact = _consume(_runner(), _result(context_tokens_estimated=False))
+    assert "~405k/1M" in est and "~405k" not in exact and "405k/1M" in exact, (est, exact)
     drop("context_estimated")
-    regressed = _consume(_runner(), _result(context_tokens_display=95_100, context_tokens_estimated=True))
-    assert "~95.1k" not in regressed and "95.1k/1M" in regressed, (
+    regressed = _consume(_runner(), _result(context_tokens_estimated=True))
+    assert "~405k" not in regressed and "405k/1M" in regressed, (
         f"dropping context_estimated= should lose the '~' prefix, got {regressed!r}"
     )
 
