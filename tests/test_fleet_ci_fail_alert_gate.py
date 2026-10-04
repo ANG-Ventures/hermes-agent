@@ -288,7 +288,7 @@ def test_page_names_scheduled_vs_merge(tmp_path, event, trigger, actor):
 _FAKE_API_CURL = r"""#!/usr/bin/env bash
 url=""
 for a in "$@"; do case "$a" in https://*) url="$a" ;; esac; done
-echo "$url" >> "$FAKE_CURL_LOG"
+echo "$url | $*" >> "$FAKE_CURL_LOG"
 python3 - "$url" "$FAKE_API" <<'PY'
 import json, sys
 url, path = sys.argv[1], sys.argv[2]
@@ -766,7 +766,7 @@ def _main_api(history, *, current=None):
     return api
 
 
-def _main_route(tmp_path, api) -> dict:
+def _main_route(tmp_path, api, env_extra=None) -> dict:
     step = _route_step()
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -783,7 +783,8 @@ def _main_route(tmp_path, api) -> dict:
     env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
            "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
-           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"],
+           **(env_extra or {})}
     proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
@@ -932,6 +933,47 @@ def test_main_red_step_passed_in_a_cancelled_run_pages(tmp_path):
 
 def test_main_red_cancelled_run_that_never_finished_the_job_is_walked_past(tmp_path):
     cut = _main_jobs((E2E, "cancelled", {E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+
+
+# --- a stalled or failing route never stops the page (Prism P1 cc0510af974c / 8c9d210ef980) ------
+def test_route_step_is_bounded_and_cannot_skip_the_post():
+    job = _workflow()["jobs"]["notify-on-failure"]
+    route = _route_step()
+    assert route.get("continue-on-error") is True
+    assert 0 < route["timeout-minutes"] < job["timeout-minutes"]
+    post = next(s for s in job["steps"] if s.get("name", "").startswith("Sign and POST"))
+    assert "failure()" not in str(post.get("if", "")) and "steps.route.outcome" not in str(post.get("if", ""))
+
+
+def test_main_still_red_api_calls_are_time_bounded(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]))
+    calls = [line for line in got["_curl"].splitlines() if "api.github.com" in line]
+    assert calls and all("--max-time" in c and "--connect-timeout" in c for c in calls), calls
+
+
+def test_main_still_red_spent_budget_pages(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]),
+                      env_extra={"ROUTE_BUDGET_S": "0"})
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "actions/runs/" not in got["_curl"]
+
+
+# --- a step that passed inside a cancelled / timed-out JOB is a recovery (Prism P1 cb7d09e76216) --
+@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
+def test_main_red_step_passed_in_a_cancelled_job_pages(tmp_path, conclusion):
+    passed = _main_jobs((E2E, conclusion, {E2E_STEP: "success", "later step": conclusion}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", conclusion, passed),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_cancelled_job_that_never_reached_the_step_is_walked_past(tmp_path):
+    cut = _main_jobs((E2E, "cancelled", {"Set up job": "success"}))
     api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)

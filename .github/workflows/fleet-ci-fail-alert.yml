@@ -94,6 +94,10 @@ jobs:
       # Unknown names, API errors, and "no previous run" all fail LOUD (#alerts).
       - name: Route (page gate; known-red -> #logs unless green->red transition)
         id: route
+        # Bounded and non-fatal (Prism P1 cc0510af974c / 8c9d210ef980): a stalled or failing
+        # history lookup must never stop the POST below, which then defaults to #alerts.
+        timeout-minutes: 4
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -211,7 +215,10 @@ jobs:
               PR_NUM="$(sed -nE 's#^.*\(\#([0-9]+)\)$#\1#p' <<< "$WF_SUBJECT")"
             fi
           fi
-          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          # Every GitHub call is bounded and the whole walk has a budget; past it api() fails,
+          # which pages (#alerts) with time left in the 10-minute job for the POST.
+          ROUTE_DEADLINE=$((SECONDS + ${ROUTE_BUDGET_S:-150}))
+          api() { [ "$SECONDS" -lt "$ROUTE_DEADLINE" ] || return 1; curl -fsS --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
           run_jobs() {  # run id -> {"jobs": [every job]}, following pages; rc!=0 on an API error or an incomplete list
             # A run can carry > 100 jobs. One page would drop a failed job (missed page) or a job
             # that passed (main looks still red): Prism P1 30c28a402d93 / 8adcbc19fb8b, 2026-10-04.
@@ -361,8 +368,8 @@ jobs:
                 ST="$(run_jobs "$prev" | jq -c --argjson items "$LEFT" '
                   . as $r | [$items[] as [$j, $s]
                     | ([$r.jobs[] | select(.name == $j)] | first) as $job
-                    | if $job == null or (["success", "failure"] | index($job.conclusion) | not) then "unknown"
-                      elif $s == "" then (if $job.conclusion == "failure" then "red" else "green" end)
+                    | if $job == null then "unknown"
+                      elif $s == "" then ({"failure": "red", "success": "green"}[$job.conclusion // ""] // "unknown")
                       else ([$job.steps[]? | select(.name == $s)] | first) as $st
                         | if $st == null then "unknown"
                           elif $st.conclusion == "failure" then "red"
