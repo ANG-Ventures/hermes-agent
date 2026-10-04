@@ -18,28 +18,6 @@ import pytest
 from cron.fork_ext import scheduler_ext
 
 
-@pytest.fixture
-def hermes_env(tmp_path, monkeypatch):
-    """Isolate HERMES_HOME for each test so jobs/scripts don't leak."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / "scripts").mkdir()
-    (home / "cron").mkdir()
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    # Reload modules that cache get_hermes_home() at import time.
-    import importlib
-    import hermes_constants
-    importlib.reload(hermes_constants)
-    import cron.jobs
-    importlib.reload(cron.jobs)
-    import cron.scheduler
-    importlib.reload(cron.scheduler)
-
-    return home
-
-
 
 # ---------------------------------------------------------------------------
 # resolve_job_script_timeout: precedence + clamp contract

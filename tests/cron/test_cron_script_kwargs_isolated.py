@@ -33,36 +33,6 @@ _WHERE = "call site = cron.scheduler._job_script_kwargs -> _run_job_script (scri
 
 
 @pytest.fixture
-def hermes_env(tmp_path):
-    """Isolate HERMES_HOME for each test so jobs/scripts don't leak."""
-    import importlib
-    import hermes_constants
-    import cron.jobs
-    import cron.scheduler
-
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / "scripts").mkdir()
-    (home / "cron").mkdir()
-    # Modules that cache get_hermes_home() at import time. Snapshot their namespaces so
-    # teardown puts back the exact pre-test objects (home paths, locks, class identities)
-    # instead of leaving this test's tmp home cached for later tests in the worker.
-    modules = (hermes_constants, cron.jobs, cron.scheduler)
-    saved = [(mod, dict(mod.__dict__)) for mod in modules]
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("HERMES_HOME", str(home))
-        try:
-            for mod in modules:
-                importlib.reload(mod)
-            yield home
-        finally:
-            for mod, namespace in reversed(saved):
-                mod.__dict__.clear()
-                mod.__dict__.update(namespace)
-
-
-@pytest.fixture
 def sched(hermes_env, monkeypatch):
     import cron.scheduler as sched
 
