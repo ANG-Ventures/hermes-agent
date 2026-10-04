@@ -605,3 +605,97 @@ def test_aborted_placement_is_not_reported_placed(kanban_home, monkeypatch):
     assert len(spawned) == 1 and res.spawned == [] and res.placed == []
     res = kb.DispatchResult(spawned=[("a", "x", ""), ("b", "x", "")], placed=[("c", "ace-ai")])
     assert kbd._local_spawn_count(res) == 2
+
+
+# -- Apollo review r3 (PR #1730) -------------------------------------------
+
+def test_boot_placement_is_captured_before_the_env_loses_it(monkeypatch):
+    """RC-9 late capture: ``main()`` records placed=<host> while the variable
+    is still there; a later drop is then LOUD, not a silent local run."""
+    from hermes_cli import kanban_worker_hosts as kwh
+
+    recorded = []
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
+    monkeypatch.setattr(kwh, "_reapply", {"failed": 0, "warned": False})
+    monkeypatch.setattr(kwh, "_record_reapply_failure", recorded.append)
+    env: dict = {}
+    kwh.apply_placement(env, _host(), "/tmp/ws")
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, env[kwh.PLACEMENT_ENV])
+    kwh.capture_boot_placement()                   # what main() runs first
+    monkeypatch.delenv(kwh.PLACEMENT_ENV)          # an env file / bridge dropped it
+    kwh.capture_boot_placement()                   # a later import must not erase it
+    assert kwh.BOOT_PLACED_HOST == "ace-ai"
+    assert kwh.reapply_or_record("terminal") is None and recorded == [1]
+
+
+def test_paused_review_does_not_hold_a_pool_admission(kanban_home, monkeypatch):
+    """Reviews only run locally: a paused tick must not reserve the pool's
+    last admission for one and starve a portable card that could place."""
+    from hermes_cli import kanban_provider_health as kph
+
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kph, "configured_pool_spawns_per_eligible", lambda: 1)
+    monkeypatch.setattr(kph, "pool_key", lambda provider: "P")
+    monkeypatch.setattr(kph, "pool_budget_eligible", lambda *a, **k: 1)
+    monkeypatch.setattr(kb, "_pool_in_flight", lambda conn: {})
+    with kb.connect_closing() as conn:
+        (rv,) = _make(conn, 1, priority=9)
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (rv,))
+        conn.commit()
+        (rd,) = _make(conn, 1)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert spawned == [(rd, "ace-ai")] and res.placed == [(rd, "ace-ai")]
+
+
+@pytest.mark.parametrize("cap,placed", [(0, 0), (1, 1), (2, 2)])
+def test_max_new_caps_local_and_remote_spawns(kanban_home, cap, placed):
+    """CLI ``--max N`` is a TOTAL cap: remote placements count against it."""
+    with kb.connect_closing() as conn:
+        _make(conn, 3, body="host:ace-ai")
+        res, spawned = _tick(conn, spillover=_plan(free=3), spawn_limit=4, max_new=cap)
+    assert len(spawned) == placed and len(res.placed) == placed
+
+
+def test_cli_passes_max_as_the_total_cap(kanban_home, monkeypatch):
+    import argparse
+
+    from hermes_cli import config as _config
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_load_gate as klg
+
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (1.0, 1.0))
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.1, None))
+    captured: dict = {}
+    monkeypatch.setattr(kbd, "dispatch_once",
+                        lambda conn, **kw: captured.update(kw) or kb.DispatchResult())
+    kb_cli._cmd_dispatch(argparse.Namespace(dry_run=True, max=1, failure_limit=2, json=False))
+    assert captured["max_new"] == 1
+
+
+def _link_queries(conn, extra_beta):
+    from hermes_cli import kanban_worker_hosts as kwh  # noqa: F401
+    with kb.connect_closing() as c:
+        c.execute("DELETE FROM tasks")
+        c.commit()
+        _make(c, extra_beta, assignee="beta")
+        _make(c, 2)
+        stmts = []
+        c.set_trace_callback(stmts.append)
+        _tick(c, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        c.set_trace_callback(None)
+    return sum(1 for q in stmts if "task_links" in q)
+
+
+def test_route_scan_is_bounded_per_tick(kanban_home, monkeypatch):
+    """Link queries do not grow with the ready backlog, and a row a cheaper
+    rule already refuses (non-allowlisted profile) costs no workspace scan."""
+    from hermes_cli import kanban_worker_hosts as kwh
+
+    scans = []
+    monkeypatch.setattr(kwh, "local_workspace_has_content", lambda p: scans.append(p) or False)
+    small = _link_queries(None, 0)
+    scans.clear()
+    big = _link_queries(None, 30)
+    assert big == small
+    assert len(scans) == 2
