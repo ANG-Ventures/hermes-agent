@@ -45,7 +45,7 @@ REPO = "ANG-Ventures/hermes-agent"
 
 
 def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=None,
-            shard="core/test_install_fresh", head_repo=REPO):
+            shard="core/test_install_fresh", head_repo=REPO, vm_shards="core/test_install_fresh"):
     ctx = _ctx(event, copy.deepcopy(PLACEMENT_OUTCOMES[placement]), labels)
     ctx["matrix"] = {"shard": shard}
     ctx.setdefault("github", {})["repository"] = REPO
@@ -55,6 +55,7 @@ def _vm_ctx(event, enabled, route, labels=None, placement="skipped", e2e_runner=
     ctx["vars"]["CI_E2E_VM_ENABLED"] = enabled
     ctx["vars"]["CI_E2E_VM_ROUTE"] = route
     ctx["vars"]["CI_E2E_RUNNER"] = e2e_runner
+    ctx["vars"]["CI_E2E_VM_SHARDS"] = vm_shards
     return ctx
 
 
@@ -97,8 +98,38 @@ def test_e2e_upgrade_closed_gate_keeps_ci_e2e_runner_override():
 @pytest.mark.parametrize("shard", ["hosts/test_libc_musl", "core/test_fresh_process_entrypoints"])
 def test_container_sensitive_shards_never_route_to_vm(shard):
     # Proof run 37170873916: musl needs a docker daemon; doctor probes systemctl under /.dockerenv.
+    # Even when an operator lists them in CI_E2E_VM_SHARDS.
     expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
-    assert evaluate(expr, _vm_ctx("pull_request", "true", "open", shard=shard), STATUS) == STATIC
+    ctx = _vm_ctx("pull_request", "true", "open", shard=shard, vm_shards=shard)
+    assert evaluate(expr, ctx, STATUS) == STATIC
+
+
+# (CI_E2E_VM_SHARDS, shard) -> routed? Exact comma-delimited names only (t_38cee27b).
+SLICE_CASES = [
+    (None, "core/test_upgrade_path", False),             # unset: no shard routes
+    ("", "core/test_upgrade_path", False),
+    ("core/test_upgrade_path", "core/test_upgrade_path", True),
+    ("git/test_shallow_install,core/test_upgrade_path", "core/test_upgrade_path", True),
+    ("git/test_shallow_install,core/test_upgrade_path", "git/test_shallow_install", True),
+    ("git/test_shallow_install,core/test_upgrade_path", "pm/test_generation_gc", False),
+    ("core/test_upgrade_path_extra", "core/test_upgrade_path", False),  # no prefix match
+    ("x/core/test_upgrade_path", "core/test_upgrade_path", False),      # no suffix match
+]
+
+
+@pytest.mark.parametrize("vm_shards,shard,vm", SLICE_CASES)
+def test_only_named_upgrade_shards_route_to_vm(vm_shards, shard, vm):
+    # 2026-10-04: all 31 shards on 2 one-slot runners -> 180 min wall vs 16 hosted. The class
+    # takes a bounded slice the Studio gate has slots for; the rest stays hosted.
+    expr = _tests_yml()["jobs"]["e2e-upgrade"]["runs-on"]
+    ctx = _vm_ctx("merge_group", "true", "open", shard=shard, vm_shards=vm_shards)
+    assert evaluate(expr, ctx, STATUS) == (VM if vm else STATIC)
+
+
+def test_e2e_job_is_not_bound_by_the_shard_slice():
+    # The single e2e job is counted by the gate's floor on its own; the slice var never gates it.
+    expr = _tests_yml()["jobs"]["e2e"]["runs-on"]
+    assert evaluate(expr, _vm_ctx("push", "true", "open", vm_shards=None), STATUS) == VM
 
 
 def test_validated_merge_group_plan_still_wins_over_vm_lane():
