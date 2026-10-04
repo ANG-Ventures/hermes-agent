@@ -92,6 +92,10 @@ extractions. New inline fork edits to god-files need a written why-not-fork_ext.
 ## fork-features.json schema v2 (B5 hardened)
 Fields: `lifecycle` ∈ {upstream-intended, fork-permanent, absorbed}, `upstream_ref`
 (URL|null), `absorbed_date` (ISO|null).
+- **`parity_census`** (per-sync D2/D3 verdict) `verdict` ∈ {KEPT-FORK, ABSORBED-UPSTREAM,
+  EQUIVALENT-UPSTREAM, PARTIAL-UPSTREAM, DROPPED-THIS-SYNC}. ABSORBED/EQUIVALENT mean upstream's
+  copy is enough to resolve toward; when any fork-only delta survives, the verdict is
+  PARTIAL-UPSTREAM with a non-empty `residual` list naming it. `lint-manifest` enforces this.
 - **Legacy default:** entries missing `lifecycle` are treated as `fork-permanent`
   (the safe default — maximum protection) by all consumers.
 - **Lint rollout:** warn-only for missing lifecycle in the first release; strict
