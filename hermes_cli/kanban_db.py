@@ -142,8 +142,11 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # satisfied elsewhere (evidence = the ``superseded_by`` pointer, no artifact).
 # Every reader that asks "did this task succeed" must treat it like
 # ``completed``, or a superseded card reads as never-run and gets respawned.
-SUCCESS_RUN_OUTCOMES = ("completed", "superseded")
-_SUCCESS_RUN_OUTCOMES_SQL = "('completed', 'superseded')"
+# ``external`` (t_768c9e91) is the terminal close for a card whose remaining
+# step belongs to someone outside the fleet (an upstream maintainer merge):
+# evidence = the upstream URL + the watcher that reopens it, no artifact.
+SUCCESS_RUN_OUTCOMES = ("completed", "superseded", "external")
+_SUCCESS_RUN_OUTCOMES_SQL = "('completed', 'superseded', 'external')"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -3464,6 +3467,64 @@ def is_operator_home(session_id: Any) -> bool:
 class UnhomedCreateError(ValueError):
     """``create`` would mint a card no session can drive (``unhomed``)."""
 
+# Who is minting a card (t_6281f908, Ace 2026-10-03 14:42 option A, D-O1/D-O2).
+# Automated minters (a dispatched worker, a cron script, the gateway's
+# in-process ``/kanban``) with no resolvable home are REFUSED unless they say
+# ``--unhomed`` / ``--session``; a hand-typed CLI/TUI create only WARNS.
+# ``script`` = no marker and no TTY (launchd/systemd openers): refused, as
+# since t_09fea045.
+CREATE_ORIGIN_WORKER = "worker"
+CREATE_ORIGIN_CRON = "cron"
+CREATE_ORIGIN_GATEWAY = "gateway"
+CREATE_ORIGIN_HAND = "hand"
+CREATE_ORIGIN_SCRIPT = "script"
+# Set by cron/scheduler_script.py on every script-job child (HERMES_CRON_SCRIPT
+# is also set there when the gh shim is installed).
+CRON_JOB_ID_ENV = "HERMES_CRON_JOB_ID"
+# Set by ``kanban.run_slash`` for a ``/kanban`` typed in the CLI or TUI (never
+# the gateway, which is classified first). Not ``HERMES_INTERACTIVE``: agent
+# subprocesses (-q runs, workers) inherit that env flag.
+HAND_TYPED_SLASH: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "kanban_hand_typed_slash", default=False
+)
+
+
+def classify_create_origin() -> str:
+    """The minter class of THIS process: worker > cron > gateway > hand > script."""
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return CREATE_ORIGIN_WORKER
+    if any((os.environ.get(v) or "").strip() for v in (CRON_JOB_ID_ENV, "HERMES_CRON_SCRIPT")):
+        return CREATE_ORIGIN_CRON
+    if _process_is_gateway():
+        return CREATE_ORIGIN_GATEWAY
+    if HAND_TYPED_SLASH.get():
+        return CREATE_ORIGIN_HAND  # a typed CLI/TUI ``/kanban`` (the TUI slash worker's stdin is a pipe)
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return CREATE_ORIGIN_HAND
+    except (ValueError, OSError):
+        pass
+    return CREATE_ORIGIN_SCRIPT
+
+
+def _minted_by(origin: str) -> dict:
+    """``created`` event provenance the orphan watch infers a home from."""
+    out: dict = {"class": origin}
+    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    job = (os.environ.get(CRON_JOB_ID_ENV) or "").strip()
+    script = (os.environ.get("HERMES_CRON_SCRIPT") or "").strip()
+    if task:
+        out["task"] = task
+    if run.isdigit():
+        out["run_id"] = int(run)
+    if job:
+        out["cron_job"] = job
+    if script:
+        out["cron_script"] = os.path.basename(script)
+    return out
+
+
 # Suite-compat escape for the require_home refusal: the test suite's hermetic
 # environment sets it so the hundreds of fixture ``kanban create`` calls that
 # predate the refusal keep working; the refusal's own tests unset it. Not a
@@ -5451,25 +5512,29 @@ def create_task(
         creator_task_id=creator_task_id,
     )
     session_id, inherited_origin = birth
-    # ``require_home`` (the ``hermes kanban create`` CLI): a caller with NO
-    # session identity, no homed parent and no worker run would mint an
-    # ``unhomed`` card that no session can drive. Refuse; a cron/script says
-    # whose it is (``--session <sid>`` or ``--home operator``). An explicit
-    # ``--session none`` is a deliberate choice and stays allowed; so does a
-    # dispatched worker's fan-out (execution lane) (t_09fea045).
+    # ``require_home`` (the ``hermes kanban create`` CLI and the
+    # ``kanban_create`` tool): a caller with NO session identity and no homed
+    # parent/worker lineage would mint an ``unhomed`` card that no session can
+    # drive. Refuse a worker / cron / gateway / script minter (D-O1,
+    # t_6281f908; t_09fea045 for scripts); a hand-typed CLI/TUI create is
+    # allowed and the CLI warns (D-O2). ``--unhomed`` / ``--session none`` /
+    # ``--home operator`` is an explicit choice and always allowed.
+    create_origin = classify_create_origin()
     if (
         require_home
         and not session_explicit
         and is_unhomed(session_id)
-        and not (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and create_origin != CREATE_ORIGIN_HAND
         and (os.environ.get(ALLOW_UNHOMED_CREATE_ENV) or "").strip() != "1"
     ):
         raise UnhomedCreateError(
-            "kanban: refused create: no home session (no session identity, "
-            "no homed --parent). An unhomed card is undrivable: no session "
-            "can unblock/complete it. Pass --home operator (fleet operator "
+            f"kanban: refused create ({create_origin}): no home session (no "
+            "session identity, no homed --parent). An unhomed card is "
+            "undrivable: no session can unblock/complete it. Pass --session "
+            "<sid> (or --parent <homed card>), --home operator (fleet operator "
             f"pseudo-session {OPERATOR_HOME_SESSION}, owned by any "
-            f"{'/'.join(sorted(OPERATOR_PROFILES))} session) or --session <sid>."
+            f"{'/'.join(sorted(OPERATOR_PROFILES))} session), or --unhomed to "
+            "mint it unhomed on purpose (the orphan watch then infers a home)."
         )
     body = stamp_origin_body(
         body,
@@ -5767,6 +5832,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
@@ -8667,6 +8733,7 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     # collides with goal_run_status's OWN use of that string to mean
     # "ownership lost".
     "superseded": "done",
+    "external": "done",
     "review_requested": "review",
     "changes_requested": "changes_requested",
     "blocked": "blocked",
@@ -9258,8 +9325,17 @@ def _claim_is_live(trow) -> bool:
     )
 
 # Evidence pointer for a superseded close, capped so a worker cannot paste a
-# whole transcript into the durable field the board renders.
+# whole transcript into the durable field the board renders. An overlong value
+# is REFUSED, never sliced: a cut URL can still look valid while naming a
+# different resource, and a cut watcher id no longer names the watcher.
 _SUPERSEDED_POINTER_MAX = 500
+
+
+def _overlong(value: str) -> str:
+    """The refusal reason for an evidence field over the cap, else ``""``."""
+    if len(value) > _SUPERSEDED_POINTER_MAX:
+        return f"is {len(value)} chars, over the {_SUPERSEDED_POINTER_MAX}-char cap"
+    return ""
 
 
 class EmptySupersedeError(ValueError):
@@ -9271,12 +9347,36 @@ class EmptySupersedeError(ValueError):
     recoverable user error the worker can retry.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, why: str = ""):
         self.task_id = task_id
+        if why:
+            # Overlong pointer (refused rather than truncated).
+            super().__init__(
+                f"completion blocked: {task_id} superseded_by {why}; pass a short pointer "
+                f"(card id, PR url or sha), not a transcript. {task_id} is unchanged"
+            )
+            return
         super().__init__(
             f"completion blocked: {task_id} was completed as superseded with an empty "
             f"superseded_by; name the card, PR or sha that satisfied the premise "
             f"(an unnamed supersede is a silent delete of the work)"
+        )
+
+
+class ExternalCloseError(ValueError):
+    """Raised by ``complete_task`` when an ``external`` close lacks its evidence.
+
+    An external close (t_768c9e91) is terminal only because a watcher reopens
+    the card when the outside gate flips; without the upstream URL and the
+    watcher id it is an unwatched drop of the work. Nothing is mutated.
+    """
+
+    def __init__(self, task_id: str, why: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: {task_id} external close {why}; pass --external "
+            f"<http(s) url of the upstream PR/issue> and --watcher <id of the watcher that "
+            f"reopens the card when it merges or closes>. {task_id} is unchanged"
         )
 
 
@@ -9287,8 +9387,14 @@ class EmptyDraftOverrideError(ValueError):
     (t_f38605be); the reason is the audit record, so an empty one is refused.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, why: str = ""):
         self.task_id = task_id
+        if why:
+            super().__init__(
+                f"completion blocked: {task_id} draft_ok {why}; give a one-line reason. "
+                f"{task_id} is still in-flight (no state change)"
+            )
+            return
         super().__init__(
             f"completion blocked: {task_id} passed an empty draft_ok; give the reason "
             f"the named DRAFT PR is intentionally left open, e.g. 'CI vehicle for "
@@ -9404,8 +9510,18 @@ def complete_task(
     survivor_reason: Optional[str] = None,
     superseded_by: Optional[str] = None,
     draft_ok: Optional[str] = None,
+    external: Optional[str] = None,
+    watcher: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``external`` + ``watcher`` (t_768c9e91) close a card whose remaining step
+    is an outside party's (an upstream maintainer merge): the closing run's
+    outcome is ``external``, the URL and the watcher id are the evidence (run
+    metadata ``external`` and the ``completed`` event), and no summary, receipt
+    or survivor PR is required. The watcher, not the card, owns the wait: it
+    reopens the card when the upstream closes unmerged. Both are required and
+    the URL must be http(s) (:class:`ExternalCloseError`, audited, no mutation).
 
     ``draft_ok`` is the audited per-card override for the DRAFT-PR refusal
     (t_f38605be): a non-empty reason lets a handoff name an intentionally-open
@@ -9478,24 +9594,41 @@ def complete_task(
     # thing that must not be blank. Gate it before any filesystem work, and
     # emit the audit event the same way the card gates do.
     if superseded_by is not None:
-        superseded_by = str(superseded_by).strip()[:_SUPERSEDED_POINTER_MAX]
-        if not superseded_by:
+        superseded_by = str(superseded_by).strip()
+        too_long = _overlong(superseded_by)
+        if not superseded_by or too_long:
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "completion_blocked_empty_supersede",
-                    {"reason": "empty_superseded_pointer"},
+                    {"reason": "overlong_superseded_pointer" if too_long
+                     else "empty_superseded_pointer"},
                 )
-            raise EmptySupersedeError(task_id)
+            raise EmptySupersedeError(task_id, too_long)
     run_outcome = "superseded" if superseded_by else "completed"
+    if external is not None or watcher is not None:
+        external = str(external or "").strip()
+        watcher = str(watcher or "").strip()
+        why = ("has no --external url" if not external
+               else f"url {_overlong(external)}" if _overlong(external)
+               else "url is not http(s)" if not re.match(r"https?://\S+$", external)
+               else "has no --watcher" if not watcher
+               else f"watcher {_overlong(watcher)}" if _overlong(watcher)
+               else "cannot also be superseded" if superseded_by else "")
+        if why:
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_blocked_external", {"reason": why})
+            raise ExternalCloseError(task_id, why)
+        run_outcome = "external"
     if draft_ok is not None:
-        draft_ok = str(draft_ok).strip()[:_SUPERSEDED_POINTER_MAX]
-        if not draft_ok:
+        draft_ok = str(draft_ok).strip()
+        too_long = _overlong(draft_ok)
+        if not draft_ok or too_long:
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "completion_blocked_empty_draft_override",
-                    {"reason": "empty_draft_ok"},
+                    {"reason": "overlong_draft_ok" if too_long else "empty_draft_ok"},
                 )
-            raise EmptyDraftOverrideError(task_id)
+            raise EmptyDraftOverrideError(task_id, too_long)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -9526,7 +9659,10 @@ def complete_task(
 
     # Reject stale workers before doing filesystem work or recording a hold.
     candidate = get_task(conn, task_id)
-    if candidate is None or candidate.status not in ('running', 'ready', 'blocked', 'review'):
+    # An external close also takes a ``triage`` card: the external-wait card
+    # parked there by a block loop is exactly what the verb exists to end.
+    closable = ('running', 'ready', 'blocked', 'review') + (('triage',) if external else ())
+    if candidate is None or candidate.status not in closable:
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
@@ -9577,7 +9713,7 @@ def complete_task(
     if (
         expected_run_id is not None
         and candidate.status == 'running' and not review_claimed
-        and not approve_head_sha and not superseded_by
+        and not approve_head_sha and not superseded_by and not external
         and configured_receipt_gate()
     ):
         from hermes_cli import kanban_receipt as _receipt
@@ -9598,7 +9734,7 @@ def complete_task(
     negative_trigger: Optional[str] = None
     if (
         candidate.status == 'running' and not review_claimed
-        and not approve_head_sha and not superseded_by
+        and not approve_head_sha and not superseded_by and not external
         and configured_negative_handoff_review()
     ):
         from hermes_cli import kanban_negative_handoff as _neg
@@ -9807,6 +9943,10 @@ def complete_task(
         if not (summary or "").strip() and not (result or "").strip():
             # The pointer is the evidence; give the board a readable line too.
             summary = f"Premise already satisfied; superseded by {superseded_by}."
+    if external:
+        metadata = dict(metadata or {}, external={"url": external, "watcher": watcher})
+        if not (summary or "").strip() and not (result or "").strip():
+            summary = f"External: {external} (watcher {watcher} reopens on upstream close)."
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
@@ -9840,9 +9980,10 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND (status IN ('running', 'ready', 'blocked', 'review')
+                        OR (? AND status = 'triage'))
                 """,
-                (result, now, task_id),
+                (result, now, task_id, bool(external)),
             )
         else:
             cur = conn.execute(
@@ -9920,6 +10061,8 @@ def complete_task(
             # Read by the gateway notifier to say "premise superseded by X"
             # instead of the generic done ping.
             completed_payload["superseded_by"] = superseded_by
+        if external:
+            completed_payload["external"] = {"url": external, "watcher": watcher}
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway

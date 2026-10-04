@@ -1,0 +1,96 @@
+"""The ``/overview`` gateway command: this chat's session card overview, self-serve.
+
+The report is built by the fleet's ``scripts/session-overview.py`` (the ONE overview tool:
+board census, live PR/deploy probes, header accounting, what-flips-it groups). This command
+only resolves the invoking chat's session id, runs that script with ``--lineage`` (every
+session id of the chat counts), and returns its Discord-shaped text. The gateway adapter
+splits a reply longer than the platform cap.
+
+Kept out of ``gateway.slash_commands`` so it is testable without a gateway runner.
+"""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+import sys
+from pathlib import Path
+from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+SCRIPT_REL = Path("scripts") / "session-overview.py"
+# A full census with live GitHub + deploy readbacks measured 25 s on 939 cards (2026-10-03).
+TIMEOUT_S = 240
+# session-overview.py's stderr line for an empty census (exit 2): "no born-here cards for <ids>"
+NO_CARDS_MARK = "no born-here cards for"
+
+
+def overview_script(root: Optional[Path] = None) -> Path:
+    if root is None:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root()
+    return Path(root) / SCRIPT_REL
+
+
+def overview_child_env() -> dict:
+    """Env for session-overview.py: the active (served) profile's home and its own credentials. The target home is
+    named explicitly (the bound override, else this process's home) so the secret scope is that profile's."""
+    from tools.environments.local import served_profile_child_env
+    from hermes_constants import get_hermes_home
+
+    return served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
+
+
+def build_argv(session_id: str, args: str, script: Path, python: str) -> list[str]:
+    """argv for the script. ``/overview fast`` skips the GitHub/deploy reads (board numbers only)."""
+    argv = [python, str(script), session_id, "--lineage"]
+    words = (args or "").split()
+    if "fast" in words or "--no-network" in words:
+        argv.append("--no-network")
+    return argv
+
+
+def render_overview(
+    session_id: Optional[str],
+    args: str = "",
+    *,
+    root: Optional[Path] = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    python: Optional[str] = None,
+    timeout: int = TIMEOUT_S,
+    child_env: Optional[Callable[[], dict]] = None,
+) -> str:
+    """Reply text for ``/overview``. Never raises: every failure is a one-line reason."""
+    child_env = child_env or overview_child_env
+    if not session_id:
+        return ("/overview: this chat has no session yet, so there are no session cards. "
+                "Send any message to open the session, then retry.")
+    script = overview_script(root)
+    if not script.is_file():
+        return f"/overview: {script} is not installed on this host."
+    argv = build_argv(session_id, args, script, python or sys.executable)
+    try:
+        # Prism P1 566b41b037f9: the child acts for the INVOKING profile. Under multiplex that profile is bound in
+        # ContextVars (asyncio.to_thread carries them here), not in os.environ: build the env from its home and
+        # its own credentials (gh / GitHub reads), never the launch profile's.
+        env = child_env()
+    except Exception as exc:  # noqa: BLE001 - an unbuildable env is reported, never a spawn on the launch env
+        return f"/overview: could not build this profile's child environment ({type(exc).__name__}: {exc})"
+    try:
+        p = run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
+                stdin=subprocess.DEVNULL, env=env)
+    except subprocess.TimeoutExpired:
+        return f"/overview: session-overview.py did not finish in {timeout} s; try `/overview fast`."
+    except OSError as exc:
+        return f"/overview: could not run session-overview.py ({type(exc).__name__}: {exc})"
+    out = (p.stdout or "").strip()
+    # rc=2 is also argparse's usage-error code: only the script's own empty-census line means "no cards"
+    if p.returncode == 2 and not out and NO_CARDS_MARK in (p.stderr or ""):
+        return f"/overview: no cards were born in this chat's sessions ({session_id} and its lineage)."
+    if p.returncode != 0 or not out:
+        err = ((p.stderr or "").strip().splitlines() or [f"rc={p.returncode}"])[-1][:300]
+        logger.warning("/overview failed rc=%s: %s", p.returncode, err)
+        return f"/overview: session-overview.py failed (rc={p.returncode}): {err}"
+    return out

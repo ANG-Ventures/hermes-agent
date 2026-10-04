@@ -110,52 +110,56 @@ def test_child_of_operator_card_inherits_operator_home(kanban_home):
 
 def test_cli_create_refuses_implicit_unhomed(kanban_home, capsys):
     """RED before t_09fea045: this minted an undrivable ``unhomed`` card."""
-    out = kc.run_slash("create 'cron card' --assignee human:apollo --json")
+    out = kc._run_slash("create 'cron card' --assignee human:apollo --json")
     assert "refused create" in out and "--home operator" in out
     with kb.connect_closing() as conn:
         assert kb.list_tasks(conn) == []
 
 
 def test_cli_create_home_operator(kanban_home):
-    created = json.loads(kc.run_slash("create 'cron card' --home operator --json"))
+    created = json.loads(kc._run_slash("create 'cron card' --home operator --json"))
     assert created["session_id"] == kb.OPERATOR_HOME_SESSION
-    named = json.loads(kc.run_slash("create 'aegis card' --home operator:aegis --json"))
+    named = json.loads(kc._run_slash("create 'aegis card' --home operator:aegis --json"))
     assert named["session_id"] == "operator:aegis"
 
 
 def test_cli_create_home_rejects_non_operator_and_session_combo(kanban_home):
-    assert "expected 'operator'" in kc.run_slash("create 'x' --home apollo")
-    assert "mutually exclusive" in kc.run_slash(
+    assert "expected 'operator'" in kc._run_slash("create 'x' --home apollo")
+    assert "mutually exclusive" in kc._run_slash(
         f"create 'x' --home operator --session {APOLLO_SID}")
     with kb.connect_closing() as conn:
         assert kb.list_tasks(conn) == []
 
 
 def test_cli_create_explicit_session_or_env_needs_no_home(kanban_home, monkeypatch):
-    explicit = json.loads(kc.run_slash(f"create 'x' --session {APOLLO_SID} --json"))
+    explicit = json.loads(kc._run_slash(f"create 'x' --session {APOLLO_SID} --json"))
     assert explicit["session_id"] == APOLLO_SID
     # ``--session none`` is a deliberate, explicit opt-out: still allowed.
-    none = json.loads(kc.run_slash("create 'y' --session none --json"))
+    none = json.loads(kc._run_slash("create 'y' --session none --json"))
     assert none["session_id"] is None
     monkeypatch.setenv("HERMES_SESSION_ID", APOLLO_SID)
-    env = json.loads(kc.run_slash("create 'z' --json"))
+    env = json.loads(kc._run_slash("create 'z' --json"))
     assert env["session_id"] == APOLLO_SID
 
 
 def test_cli_create_under_homed_parent_needs_no_home(kanban_home):
     with kb.connect_closing() as conn:
         parent = kb.create_task(conn, title="p", session_id=APOLLO_SID)
-    child = json.loads(kc.run_slash(f"create 'c' --parent {parent} --json"))
+    child = json.loads(kc._run_slash(f"create 'c' --parent {parent} --json"))
     assert child["session_id"] == APOLLO_SID
 
 
-def test_cli_create_in_worker_run_keeps_execution_lane(kanban_home, monkeypatch):
+def test_cli_create_in_unhomed_worker_run_is_refused_without_unhomed(kanban_home, monkeypatch):
+    """t_6281f908 D-O1: a worker with no homed lineage no longer mints an
+    unhomed card silently; ``--unhomed`` keeps the old execution-lane result."""
     with kb.connect_closing() as conn:
         worker_card = kb.create_task(conn, title="w", session_id=None,
                                      session_explicit=True)
     monkeypatch.setenv("HERMES_KANBAN_TASK", worker_card)
-    created = json.loads(kc.run_slash("create 'fanout' --json"))
-    assert created["session_id"] is None  # unhomed, as before
+    out = kc._run_slash("create 'fanout' --json")
+    assert "refused create (worker)" in out
+    created = json.loads(kc._run_slash("create 'fanout' --unhomed --json"))
+    assert created["session_id"] is None  # unhomed, on purpose
 
 
 def test_library_create_default_is_unchanged(kanban_home):

@@ -768,6 +768,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if getattr(args, "unhomed", False):
+        if getattr(args, "session", None) is not None or (getattr(args, "home", None) or "").strip():
+            print("kanban: --unhomed is exclusive with --session/--home", file=sys.stderr)
+            return 2
+        args.session = "none"
     home_flag = (getattr(args, "home", None) or "").strip()
     if home_flag:
         if getattr(args, "session", None) is not None:
@@ -839,6 +844,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    if (task.unhomed and getattr(args, "session", None) is None
+            and not getattr(args, "json", False)):
+        # D-O2 (t_6281f908): a hand-typed create with no session is allowed
+        # but says so; the orphan watch will try to infer its home. Not with
+        # --json: ``run_slash`` merges stderr into its output, and the JSON
+        # carries ``"unhomed": true`` for a machine reader anyway.
+        print(
+            f"\n⚠  {task_id} has no home session (no session identity, no "
+            "homed --parent): its lifecycle lines fall back to #logs until it "
+            f"is re-homed (`hermes kanban rehome {task_id} --session <sid>`).",
+            file=sys.stderr,
+        )
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
@@ -2824,6 +2841,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     summary = getattr(args, "summary", None)
     superseded_by = getattr(args, "superseded_by", None)
     draft_ok = getattr(args, "draft_ok", None)
+    external = getattr(args, "external", None)
+    watcher = getattr(args, "watcher", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -2835,9 +2854,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
                          or survivor_unbound or survivor_none or survivor_reason or superseded_by
-                         or draft_ok is not None):
+                         or draft_ok is not None or external is not None or watcher is not None):
         return _err(
-            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --survivor-ref / "
+            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --external / "
+            "--watcher / --survivor-ref / "
             "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
@@ -2867,7 +2887,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # acceptance contract that protects complete.
             # A superseded close has no work for the judge to grade; gating it
             # would push the worker back into exiting silently.
-            gate_err = None if superseded_by is not None else _goal_gate_error(
+            gate_err = None if (superseded_by is not None or external is not None) else _goal_gate_error(
                 conn, tid, (summary or args.result or "").strip(), "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.")
@@ -2892,6 +2912,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
                     draft_ok=draft_ok,
+                    external=external,
+                    watcher=watcher,
                 )
             except kb.LiveClaimError:
                 failed.append(tid)
@@ -2909,7 +2931,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 no_receipt = True
                 print(f"cannot complete {tid}: {receipt_err}.", file=sys.stderr)
                 continue
-            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
+            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError,
+                    kb.ExternalCloseError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
@@ -2939,6 +2962,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 if getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review, NOT done: "
                           f"{outcome or 'handoff names a still-OPEN PR'}")
+                elif external is not None:
+                    print(f"Completed {tid} (external: {external.strip()}, watcher {watcher.strip()})")
                 else:
                     print(f"Completed {tid}")
                 override = _draft_override_of(conn, tid, last_event)
@@ -3813,6 +3838,29 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def rehome_apply(conn, task_id: str, sid: str, row: Optional[dict], target) -> bool:
+    """Stamp ``sid`` as the card's home and subscribe its chat (``target``, a
+    ``HomeTarget``). Shared by ``rehome`` and the gateway's orphan-menu reply
+    (t_6281f908). False = unknown id."""
+    if not kb.set_task_session(conn, task_id, sid):
+        return False
+    try:
+        origin = json.loads((row or {}).get("origin_json") or "{}")
+    except (TypeError, ValueError):
+        origin = {}
+    origin = origin if isinstance(origin, dict) else {}
+    kbn.add_notify_sub(
+        conn, task_id=task_id,
+        platform=target.platform, chat_id=target.chat_id,
+        thread_id=target.thread_id or None,
+        chat_type=origin.get("chat_type") or None,
+        user_id=origin.get("user_id") or None,
+        scope_id=origin.get("scope_id") or None,
+        notifier_profile=origin.get("profile") or _profile_author(),
+    )
+    return True
+
+
 def _cmd_rehome(args: argparse.Namespace) -> int:
     """Re-home a card (t_808bc8e6): stamp ``--session`` as its home and
     subscribe that session's origin chat. The orphan alert names this verb."""
@@ -3839,24 +3887,10 @@ def _cmd_rehome(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        if not kb.set_task_session(conn, args.task_id, sid):
+        if not rehome_apply(conn, args.task_id, sid, row, home.target):
             print(f"cannot rehome {args.task_id} (unknown id)", file=sys.stderr)
             return 1
-        try:
-            origin = json.loads((row or {}).get("origin_json") or "{}")
-        except (TypeError, ValueError):
-            origin = {}
-        origin = origin if isinstance(origin, dict) else {}
         target = home.target
-        kbn.add_notify_sub(
-            conn, task_id=args.task_id,
-            platform=target.platform, chat_id=target.chat_id,
-            thread_id=target.thread_id or None,
-            chat_type=origin.get("chat_type") or None,
-            user_id=origin.get("user_id") or None,
-            scope_id=origin.get("scope_id") or None,
-            notifier_profile=origin.get("profile") or _profile_author(),
-        )
     print(f"Re-homed {args.task_id} to session {sid} "
           f"({target.platform}:{target.chat_id}"
           + (f":{target.thread_id}" if target.thread_id else "") + ")")
@@ -4504,9 +4538,13 @@ def run_slash(rest: str, *, session_id: Optional[str] = None) -> str:
     ``None`` falls back to :func:`_caller_session_id`'s normal resolution.
     """
     token = _SLASH_SESSION_ID.set((session_id or "").strip() or None)
+    # A typed CLI/TUI ``/kanban`` is hand-typed (D-O2, t_6281f908); the
+    # gateway's in-process call is classified as ``gateway`` before this.
+    hand = kb.HAND_TYPED_SLASH.set(True)
     try:
         return _run_slash(rest)
     finally:
+        kb.HAND_TYPED_SLASH.reset(hand)
         _SLASH_SESSION_ID.reset(token)
 
 
