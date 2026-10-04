@@ -56,9 +56,13 @@ _RULING = re.compile(
 _STAMP = re.compile(r"Ace (?:ruled\b.*?)?((?:20\d\d-)?\d\d-\d\d \d\d:\d\d)")
 _ROOT_CAUSE = re.compile(r"root[ -]cause", re.I)
 _RETRACT = re.compile(r"\bCORRECTION\b|\bretract(?:ed|ion|s)?\b|\bFALSE-DONE\b", re.I)
-_PROOF = re.compile(r"live-evidence:\s*yes|\b(?:live|native)[ -]pro(?:of|ven)\b|\bGATE-PROVEN\b", re.I)
+# Affirmative declarations only: "live-evidence: yes", "live proof: <obs>", "GATE-PROVEN",
+# "live-verified". A bare mention ("please attach live proof", "where is the native proof?") is not proof.
+_PROOF = re.compile(r"live-evidence:\s*yes\b|\b(?:live|native)[ -]proof\s*:\s*\S|\bGATE-PROVEN\b|\blive-verified\b",
+                    re.I)
 # A proof mention on a line that also negates it ("no live proof", "native proof failed") is not proof.
-_NEGATED = re.compile(r"\b(?:no|not|without|missing|failed|fails|pending|unproven|cannot|can't|blocked)\b", re.I)
+_NEGATED = re.compile(r"\b(?:no|not|without|missing|failed|fails|pending|unproven|cannot|can't|blocked|todo|"
+                      r"please|need|needs|attach|collect)\b|\?", re.I)
 _CLOSE_ON = re.compile(r"close-on:\s*([^\n]{1,200})", re.I)
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 _CLOSE_RECORD = re.compile(r"SUPERSED|\bCLOSED:|\bclosed\b", re.I)
@@ -230,7 +234,7 @@ def _add(a, b):
 
 def worker_cost(root: Path, card_ids: list[str]) -> dict:
     """Blackbox turns whose chat_id is a card id (kanban worker turns), per profile."""
-    per, tot = {}, list(_ZERO)
+    per, tot, unreadable = {}, list(_ZERO), []
     for name, path in turns_dbs(root):
         try:
             with _ro(path) as conn:
@@ -240,28 +244,31 @@ def worker_cost(root: Path, card_ids: list[str]) -> dict:
                     r = conn.execute(f"SELECT {_COST_COLS} FROM turns WHERE chat_id IN ({_ph(len(chunk))})",
                                      chunk).fetchone()
                     row = _add(row, r)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            unreadable.append(f"{name}: {exc}")
             continue
         if row[0]:
             per[name] = row
             tot = _add(tot, row)
-    return {"per_profile": per, "total": tot}
+    return {"per_profile": per, "total": tot, "unreadable": unreadable}
 
 
 def session_turn_cost(root: Path, sess: dict) -> list:
     """The session's own turns: blackbox turn_id is ``<session_id>:<task>:…`` (agent/turn_context.py).
     Read from the owning profile's turns.db only, so another conversation in the same chat never counts."""
-    owner = dict(turns_dbs(root)).get(sess.get("profile") or "default")
+    prof = sess.get("profile") or "default"
+    owner = dict(turns_dbs(root)).get(prof)
     if owner is None:
-        return list(_ZERO)
+        return {"row": list(_ZERO), "unreadable": f"no blackbox turns.db for profile {prof}"}
     lo = f"{sess['id']}:"
     hi = f"{sess['id']};"   # ';' sorts right after ':' -> a PK range scan, no LIKE
     try:
         with _ro(owner) as conn:
-            return _add(list(_ZERO), conn.execute(
-                f"SELECT {_COST_COLS} FROM turns WHERE turn_id >= ? AND turn_id < ?", (lo, hi)).fetchone())
-    except sqlite3.Error:
-        return list(_ZERO)
+            return {"row": _add(list(_ZERO), conn.execute(
+                f"SELECT {_COST_COLS} FROM turns WHERE turn_id >= ? AND turn_id < ?", (lo, hi)).fetchone()),
+                    "unreadable": None}
+    except sqlite3.Error as exc:
+        return {"row": list(_ZERO), "unreadable": f"{prof}: {exc}"}
 
 
 # --------------------------------------------------------------------------- PR state
@@ -346,8 +353,9 @@ def card_prs(card: dict) -> list[tuple[str, int]]:
             md = None
         for text in _opr.recorded_pr_refs(md):   # pr_url[s], pr, own_prs, survivor refs/claims
             add(text)
-    if not found:
-        add(card.get("result") or "")
+    if not found:   # prose fallback: the result AND every run summary (request_review/--summary handoffs)
+        for text in [card.get("result") or ""] + [r.get("summary") or "" for r in card["runs"]]:
+            add(text)
     return found
 
 
@@ -371,7 +379,8 @@ def close_recorded(card: dict, repo: str, number: int) -> bool:
     full ref) together with SUPERSEDED / CLOSED: / closed."""
     texts = [card.get("result") or ""] + [r.get("summary") or "" for r in card["runs"]] + \
             [x.get("body") or "" for x in card["comments"]]
-    pat = re.compile(rf"(?:{re.escape(repo)})?#{number}\b|github\.com/{re.escape(repo)}/pull/{number}\b", re.I)
+    pat = re.compile(rf"(?<![\w./-]){re.escape(repo)}#{number}\b|(?<![\w./-])#{number}\b"
+                     rf"|github\.com/{re.escape(repo)}/pull/{number}\b", re.I)
     return any(pat.search(ln) and _CLOSE_RECORD.search(ln) for t in texts for ln in t.splitlines())
 
 
@@ -516,7 +525,7 @@ def build(root: Path, sids: list[str], *, pr_query: Optional[PrQuery] = None, ne
     # docs/skills named
     docs = collections.OrderedDict()
     for c in cards:
-        for t in [c.get("result") or ""] + [r.get("summary") or "" for r in c["runs"]] + \
+        for t in [c.get("body") or "", c.get("result") or ""] + [r.get("summary") or "" for r in c["runs"]] + \
                  [x.get("body") or "" for x in c["comments"]]:
             for m in _DOC_PATH.finditer(t):
                 p = m.group(1).rstrip(".,;:)")
@@ -584,16 +593,19 @@ def gates(r: dict) -> list[dict]:
       "(FALSE-DONE)", not false_done and not unread,
       f"false-done={len(false_done)} {' '.join(false_done[:12])}; fleet PR states unreadable={unread}")
     g("0", "Hardening pass recorded", False, "not derivable from the board; run ang-harden and record it")
+    eligible = [c for c in cards if c["prs"] and c["status"] == "done"]
     g("1", "E2E / live proof on cards with PRs",
-      all(c["proof"] for c in cards if c["prs"] and c["status"] == "done"),
+      bool(eligible) and all(c["proof"] for c in eligible),
       f"{sum(1 for c in cards if c['prs'] and c['proof'])}/{sum(1 for c in cards if c['prs'])} PR cards carry a "
       "live-evidence/live-proof line")
     g("2", "Acceptance criteria", False, "per-card criteria are prose; not machine-checkable here")
     g("3", "Constitution/Invariants", False, "no ang-spec invariants section attached to a session")
     missing_docs = [d["path"] for d in r["docs"] if d["exists"] is False]
+    unchecked = [d["path"] for d in r["docs"] if d["exists"] is None]
     checked = sum(1 for d in r["docs"] if d["exists"] is not None)
-    g("4", "Skills/docs named by cards exist on disk", checked > 0 and not missing_docs,
-      f"{len(r['docs'])} paths named, {checked} checkable, {len(missing_docs)} missing" + (f": {', '.join(missing_docs[:8])}" if missing_docs else ""))
+    g("4", "Skills/docs named by cards exist on disk", bool(r["docs"]) and not missing_docs and not unchecked,
+      f"{len(r['docs'])} paths named, {checked} checkable, {len(unchecked)} unchecked "
+      f"(repo-relative or no --vault), {len(missing_docs)} missing" + (f": {', '.join(missing_docs[:8])}" if missing_docs else ""))
     g("5", "Obsidian overview written", bool(r.get("vault_written")), r.get("vault_written") or "no --vault-out given")
     open_prs = sorted({f"{repo}#{n}" for c, (repo, n), s in fleet if s == "OPEN"})
     closed = sorted({f"{repo}#{n}" for c, (repo, n), s in fleet if s == "CLOSED" and not close_recorded(c, repo, n)})
@@ -670,10 +682,13 @@ def render(r: dict) -> str:
     # cost
     L.append("## Cost (blackbox turns.db + state.db)\n")
     for s in r["cost"]["sessions"]:
+        st = s["session_turns"]
+        own = f"UNKNOWN — ledger unreadable ({st['unreadable']})" if st["unreadable"] else _tok(st["row"])
         L.append(f"- Session `{s['id']}` ({s['profile']} profile) state.db estimate {_money(s['state_db_usd'])}; "
-                 f"its own turns (turn_id prefix): {_tok(s['session_turns'])}")
+                 f"its own turns (turn_id prefix): {own}")
     w = r["cost"]["workers"]
-    L.append(f"- Worker turns on this session's cards (chat_id = card id, every profile): {_tok(w['total'])}")
+    inc = f" — INCOMPLETE, unreadable ledgers: {'; '.join(w['unreadable'])}" if w["unreadable"] else ""
+    L.append(f"- Worker turns on this session's cards (chat_id = card id, every profile): {_tok(w['total'])}{inc}")
     for name, row in sorted(w["per_profile"].items(), key=lambda x: -x[1][1]):
         L.append(f"  - {name}: {_tok(row)}")
     L.append("")

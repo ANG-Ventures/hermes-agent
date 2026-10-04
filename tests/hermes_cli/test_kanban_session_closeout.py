@@ -73,6 +73,7 @@ def _fixture(home):
     ids["gated"] = _card(d, "W9-3: gated", block=(f"waits on {ids['ace']}", "dependency"))
     ids["noflip"] = _card(d, "W9-4: stuck", block=("hmm", "dependency"))
     kb.add_comment(d, ids["w"], "apollo", "Ace ruled 10-03 14:42: option A, refuse at birth.")
+    kb.add_comment(d, ids["w"], "w", "live proof: ran the verb on the live board, 969/969")
     kb.add_comment(d, ids["r"], "apollo", "The root cause is a TZ-dependent ps lstart parse.")
     kb.add_comment(d, ids["body"], "w", "CORRECTION: the earlier count was wrong. close-on: never")
     kb.add_comment(d, ids["noflip"], "w", "Ace 2026-10-03 23:54 'boil the ocean'")
@@ -207,7 +208,7 @@ def test_session_turns_come_from_the_owning_profile_by_turn_id_prefix(root):
                 b.execute("INSERT INTO turns VALUES (?, 'chan', ?, 'estimated', 1, 1, 1, 1)", (tid, usd))
     (sess,) = _build(root)["cost"]["sessions"]
     assert sess["profile"] == "athena" and sess["state_db_usd"] == 7.5
-    assert sess["session_turns"][:2] == [1, 2.0]
+    assert sess["session_turns"]["row"][:2] == [1, 2.0] and sess["session_turns"]["unreadable"] is None
 
 
 def test_cli_verb_writes_both_outputs_and_check_exit(root, tmp_path, capsys):
@@ -277,3 +278,50 @@ def test_card_queries_chunk_past_the_sqlite_variable_limit(root, monkeypatch):
     monkeypatch.setattr(sc, "_CHUNK", 5)
     cards, bad = sc.load_cards(root, [SID])
     assert not bad and len(cards) == 12 and all(len(c["comments"]) == 1 for c in cards)
+
+
+def test_prism_r2_requests_are_not_proof_close_records_bind_exact_repo_summary_prs(root):
+    d = _conn(root)
+    req = _card(d, "r4 A: request", status="done", result="ANG-Ventures/a#1 merged")
+    for body in ("Please attach live proof before closing", "Where is the native proof?",
+                 "TODO: collect live proof before closing"):
+        kb.add_comment(d, req, "w", body)
+    other = _card(d, "r4 B: other repo close", status="done", result="ANG-Ventures/a#42 see notes")
+    kb.add_comment(d, other, "w", "ANG-Ventures/b#42 closed")
+    summ = _card(d, "r4 C: summary only", status="review")
+    d.execute("INSERT INTO task_runs(task_id, profile, status, started_at, summary) VALUES (?,?,?,?,?)",
+              (summ, "w", "done", 1, "handed off ANG-Ventures/a#7 for review"))
+    d.commit(); d.close()
+    states = {("ANG-Ventures/a", 1): "MERGED", ("ANG-Ventures/a", 42): "CLOSED", ("ANG-Ventures/a", 7): "OPEN"}
+    r = sc.build(root, [SID], pr_query=lambda repo, n: states.get((repo, n)))
+    by = {c["id"]: c for c in r["cards"]}
+    assert not by[req]["proof"]
+    gates = {g["row"]: g for g in r["gates"]}
+    assert "ANG-Ventures/a#42" in gates["6b'"]["evidence"]       # b#42's close does not explain a#42
+    assert "ANG-Ventures/a#7" in gates["6b"]["evidence"]         # summary-only handoff PR is found
+    assert gates["1"]["status"] == "FAIL"
+
+
+def test_prism_r2_no_eligible_card_and_unchecked_docs_never_pass(root):
+    d = _conn(root)
+    c = _card(d, "r5 A: open pr", status="review", result="ANG-Ventures/a#9",
+              body="see skills/x/SKILL.md and AI/Fleet/Thing.md")
+    d.close()
+    (root / "skills-shared" / "x").mkdir(parents=True)
+    (root / "skills-shared" / "x" / "SKILL.md").write_text("x", encoding="utf-8")
+    r = sc.build(root, [SID], pr_query=lambda repo, n: "OPEN")
+    gates = {g["row"]: g for g in r["gates"]}
+    assert gates["1"]["status"] == "FAIL"                         # no done PR card: no evidence
+    assert gates["4"]["status"] == "FAIL" and "1 unchecked" in gates["4"]["evidence"]
+    assert {d["path"] for d in r["docs"]} == {"skills/x/SKILL.md", "AI/Fleet/Thing.md"}
+    assert c
+
+
+def test_prism_r2_unreadable_ledgers_are_reported_not_zero(root):
+    _fixture(root)
+    bad = root / "profiles" / "daedalus" / "blackbox" / "turns.db"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"not a sqlite database at all, just bytes" * 10)
+    r = _build(root)
+    assert r["cost"]["workers"]["unreadable"] and r["cost"]["workers"]["unreadable"][0].startswith("daedalus:")
+    assert "INCOMPLETE, unreadable ledgers" in sc.render(r)
