@@ -2850,6 +2850,28 @@ def check_respawn_guard(
                 detail["eligible_at"] = hold_until
             return "overlap_hold"
 
+    # 0b. One running card per PR (t_cb70d390). A fresh owner holds the card;
+    #     a stale one (run and PR head both >2 h old) is left in
+    #     ``detail["pr_owner_stale"]`` for the dispatcher to reclaim.
+    if lane == "ready":
+        from . import kanban_pr_owner as _kpo
+
+        owners = _kpo.spawn_owners(conn, task_id, now=now)
+        fresh = [o for o in owners if not o["stale"]]
+        if fresh:
+            if detail is not None:
+                detail.update(
+                    pr=fresh[0]["pr"], owner=fresh[0]["task_id"],
+                    pr_owner=fresh[0]["pr_owner"], hold=_kpo.describe(fresh[0]),
+                )
+            return _kpo.GUARD_REASON
+        if owners:
+            if detail is None:
+                # No out-param means nobody can reclaim the stale owner:
+                # hold rather than spawn a second writer beside it.
+                return _kpo.GUARD_REASON
+            detail["pr_owner_stale"] = owners
+
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
     #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
@@ -4722,6 +4744,11 @@ def _dispatch_once_locked(
             conn, row["id"], pr_state_resolver=pr_state_resolver,
             detail=guard_detail,
         )
+        stale_owners = guard_detail.pop("pr_owner_stale", None)
+        if guard_reason is None and stale_owners:
+            guard_reason = _kb._reassign_stale_pr_owners(
+                conn, row["id"], stale_owners, guard_detail, dry_run=dry_run,
+            )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             if guard_detail:

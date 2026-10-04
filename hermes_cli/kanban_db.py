@@ -5568,6 +5568,7 @@ def create_task(
         skills_auto_added.append(MILESTONE_QA_SKILL)
 
 
+    pr_owner_forced: Optional[dict] = None
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -5582,6 +5583,19 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+        # One running card per PR (t_cb70d390): a rebase helper for a PR
+        # whose owner card is running is refused at birth, owner named.
+        # ``force_reason`` (CLI ``--force "<reason>"``) overrides it; the
+        # override is ledgered as a ``pr_owner_forced`` event below.
+        from hermes_cli import kanban_pr_owner as _kpo
+
+        try:
+            _kpo.refuse_rebase_card_at_birth(conn, idempotency_key)
+        except _kpo.PrOwnerBusyError as exc:
+            if not force_reason:
+                raise
+            pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
+                               "reason": force_reason}
 
     now = int(time.time())
 
@@ -5863,6 +5877,8 @@ def create_task(
                             **({"reason": force_reason} if forced else {}),
                         },
                     )
+                if pr_owner_forced:
+                    _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 overlap_hits: list[dict] = []
                 if duplicate_guard:
                     # Same-incident gate (t_ba30f0de): another session minted
@@ -17220,6 +17236,50 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
         (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
          pr_comment["id"], pr_comment["created_at"]),
     ).fetchone() is not None
+
+def _reassign_stale_pr_owners(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owners: list,
+    detail: dict,
+    *,
+    dry_run: bool = False,
+) -> Optional[str]:
+    """Reclaim each STALE running owner of ``task_id``'s PRs (t_cb70d390).
+
+    The PR passes to ``task_id``; the old owner goes back to its queue and is
+    held by ``pr_owner_busy`` while the new card runs. Returns None when every
+    owner was reclaimed (spawn may proceed), else ``pr_owner_busy``: a reclaim
+    that cannot prove the old worker dead (``reclaim_task`` fails closed) never
+    becomes a second writer.
+    """
+    from . import kanban_pr_owner as _kpo
+
+    for owner in owners:
+        reason = (
+            f"{_kpo.REASSIGN_EVENT}: {owner['pr']} had no push and no new run for "
+            f"{_kpo.STALE_OWNER_SECONDS // 3600} h; reassigned to {task_id}"
+        )
+        if dry_run:
+            continue
+        ok = False
+        try:
+            ok = reclaim_task(conn, owner["task_id"], reason=reason)
+        except Exception:
+            _log.exception("kanban dispatch: stale PR owner reclaim failed for %s",
+                           owner["task_id"])
+        if not ok:
+            detail.update(pr=owner["pr"], owner=owner["task_id"],
+                          hold=f"stale owner {owner['task_id']} could not be reclaimed")
+            return _kpo.GUARD_REASON
+        payload = {"pr": owner["pr"], "from": owner["task_id"], "to": task_id,
+                   "owner_since": owner.get("since"),
+                   "head_committed_at": owner.get("head_committed_at")}
+        with write_txn(conn):
+            _append_event(conn, owner["task_id"], _kpo.REASSIGN_EVENT, payload)
+            _append_event(conn, task_id, _kpo.REASSIGN_EVENT, payload)
+    return None
+
 
 # ``hold`` of an active_pr decline whose OPEN own-PR is mergeable. The gateway
 # watcher enqueues that PR on the land queue instead of paging (t_5a9deed5).
