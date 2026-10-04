@@ -222,26 +222,37 @@ def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
     return None
 
 
-def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
-    """Names of the checks that grade the head red (t_65e5d76f).
+def red_check_names(runs: list, workflows: Optional[dict] = None,
+                    superseded: frozenset = frozenset()) -> list[str]:
+    """Names of the checks that grade the head red (t_65e5d76f, t_fb481152).
 
     A head carries every run ever started on it: override_lint runs twice per
     push and concurrency cancels the superseded one, so counting any red run
     read green PRs red. Per key = (workflow, name) the newest run (highest id)
     that is not cancelled/skipped decides. A key whose runs are ALL cancelled
-    stays red; a failure is only superseded by a later run of the SAME check.
+    stays red unless the same check also has a newer skipped/neutral run (a
+    re-trigger that skipped the job is not a cancelled check). A failure is
+    only superseded by a later run of the SAME check.
     ``workflows`` maps check_suite id -> (workflow id, event); without an entry
     the key is the suite, so a duplicate in another suite is never merged
-    (fails closed). Mirrors hermes-home kanban-review-merge-pass effective_checks().
+    (fails closed). ``superseded`` holds check_suite ids of CANCELLED workflow
+    runs that a newer run of the same (workflow, event) replaced: every row in
+    them (its cancelled jobs and the failure an ``if: always()`` aggregate
+    wrote while cancelling) is dropped; the newer run decides, and while it is
+    still running the check is pending, not red. Mirrors hermes-home
+    kanban-review-merge-pass effective_checks().
     """
     workflows = workflows or {}
     live: dict = {}
     cancelled: dict = {}
+    passed_over: dict = {}   # key -> newest id of a skipped/neutral run
     for i, run in enumerate(runs or []):
         if not isinstance(run, dict):
             continue
         name = str(run.get("name") or "?")
         suite = (run.get("check_suite") or {}).get("id")
+        if suite is not None and suite in superseded:
+            continue
         if suite in workflows:
             key = ("wf", workflows[suite], name)
         elif suite is not None:
@@ -249,38 +260,68 @@ def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
         else:
             key = ("row", i, name)
         concl = str(run.get("conclusion") or "").lower()
+        rid = int(run.get("id") or 0)
         if concl in _NO_VERDICT_CONCLUSIONS:
             if concl == "cancelled":
-                cancelled.setdefault(key, name)
+                prev = cancelled.get(key)
+                cancelled[key] = (max(rid, prev[0]) if prev else rid, name)
+            else:
+                passed_over[key] = max(rid, passed_over.get(key, 0))
             continue
-        rank = (int(run.get("id") or 0), i)
+        rank = (rid, i)
         if key not in live or rank > live[key][0]:
             live[key] = (rank, name, concl)
     red = [name for _rank, name, concl in live.values() if concl in _RED_CONCLUSIONS]
-    return red + [name for key, name in cancelled.items() if key not in live]
+    return red + [name for key, (rid, name) in cancelled.items()
+                  if key not in live and passed_over.get(key, -1) <= rid]
 
 
 def _needs_workflow_map(runs: list) -> bool:
-    """A name spread over >1 suite with a non-pass row is the only case where
-    merging suites into workflows changes the verdict; skip the REST read otherwise."""
+    """Merging suites into workflows only changes the verdict when a name with a
+    non-pass row spreads over >1 suite, or a cancelled row sits on a head with >1
+    suite (a cancelled workflow run a re-trigger may have superseded); skip the
+    REST read otherwise."""
     suites: dict = {}
     unsettled = set()
+    any_cancelled = False
     for run in runs or []:
         if not isinstance(run, dict):
             continue
         name = run.get("name")
         suites.setdefault(name, set()).add((run.get("check_suite") or {}).get("id"))
-        if str(run.get("conclusion") or "").lower() not in ("success", "skipped", "neutral"):
+        concl = str(run.get("conclusion") or "").lower()
+        if concl not in ("success", "skipped", "neutral"):
             unsettled.add(name)
-    return any(len(v) > 1 and k in unsettled for k, v in suites.items())
+        any_cancelled = any_cancelled or concl == "cancelled"
+    if any(len(v) > 1 and k in unsettled for k, v in suites.items()):
+        return True
+    return any_cancelled and len(set().union(*suites.values())) > 1
 
 
-def _workflow_map(repo: str, sha: str) -> dict:
-    """check_suite id -> (workflow id, event); {} when unreadable. A push run and a
-    pull_request run of one workflow on one sha are separate checks, not re-runs."""
-    rows = _gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or []
-    return {r["check_suite_id"]: (r.get("workflow_id"), r.get("event"))
-            for r in rows if isinstance(r, dict) and r.get("check_suite_id") is not None}
+def _superseded_suites(rows: list) -> frozenset:
+    """check_suite ids of CANCELLED workflow runs with a newer run of the same
+    (workflow, event) on the head: GitHub cancels the first of two near-identical
+    triggers (t_fb481152: #1718 head 94ad2960, Docker/CI/override-lint/sast/
+    secret-scan all cancelled at 08:19:23 and re-run at 08:19:24)."""
+    newest: dict = {}
+    for r in rows:
+        wk = (r.get("workflow_id"), r.get("event"))
+        newest[wk] = max(newest.get(wk, 0), int(r.get("id") or 0))
+    return frozenset(
+        r["check_suite_id"] for r in rows
+        if str(r.get("conclusion") or "").lower() == "cancelled"
+        and r.get("workflow_id") is not None and r.get("id") is not None
+        and int(r["id"]) < newest[(r.get("workflow_id"), r.get("event"))])
+
+
+def _workflow_runs(repo: str, sha: str) -> tuple[dict, frozenset]:
+    """(check_suite id -> (workflow id, event), superseded suite ids); ({}, {})
+    when unreadable. A push run and a pull_request run of one workflow on one sha
+    are separate checks, not re-runs."""
+    rows = [r for r in (_gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or [])
+            if isinstance(r, dict) and r.get("check_suite_id") is not None]
+    wf = {r["check_suite_id"]: (r.get("workflow_id"), r.get("event")) for r in rows}
+    return wf, _superseded_suites(rows)
 
 
 def query_pr_health(repo: str, number: int) -> Optional[dict]:
@@ -295,8 +336,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
         if runs is None:
             return None  # unknown: retried, never read as green (Prism P1)
-        wf = _workflow_map(repo, sha) if _needs_workflow_map(runs) else {}
-        out["failing"] = red_check_names(runs, wf)
+        wf, superseded = _workflow_runs(repo, sha) if _needs_workflow_map(runs) else ({}, frozenset())
+        out["failing"] = red_check_names(runs, wf, superseded)
     return out
 
 

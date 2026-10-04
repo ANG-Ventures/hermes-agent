@@ -449,6 +449,141 @@ def test_red_check_names_rules():
     assert ow.red_check_names([_run(1, "timed_out", 1, "e2e")]) == ["e2e"]
 
 
+# --- re-triggered workflow runs (t_fb481152) --------------------------------
+
+# ANG-Ventures/hermes-agent#1716 head e76641293: the two override_lint rows, the
+# cancelled one 6 s before the identical re-trigger that passed.
+_SHA_1716 = "e76641293ab35ee4de3a90ea215e2f4242a19d27"
+_RUNS_1716 = [
+    {"id": 111388156989, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "success", "check_suite": {"id": 100724626287}},
+    {"id": 111388147366, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "cancelled", "check_suite": {"id": 100724617396}},
+]
+_WF_1716 = [
+    {"id": 37186083245, "check_suite_id": 100724626287, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "success"},
+    {"id": 37186079963, "check_suite_id": 100724617396, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "cancelled"},
+]
+
+# ANG-Ventures/hermes-agent#1718 head 94ad2960: every workflow was triggered twice
+# 1 s apart and GitHub cancelled the first set. The green Docker re-run SKIPPED its
+# publish jobs (so their only verdict rows are the cancelled ones), and the cancelled
+# CI run's always() aggregate wrote a FAILURE while the newer CI run was still going.
+_SHA_1718 = "94ad296012c75806b74f0481a42548e541ff1fed"
+_DOCKER_OLD, _DOCKER_NEW, _CI_OLD, _CI_NEW, _OL_OLD, _OL_NEW = (
+    100731181019, 100731182812, 100731181671, 100731183727, 100731181669, 100731183662)
+
+
+def _row(rid, suite, concl, name, status="completed"):
+    return {"id": rid, "name": name, "status": status, "conclusion": concl,
+            "check_suite": {"id": suite}}
+
+
+_RUNS_1718 = [
+    _row(111395931391, _DOCKER_NEW, "skipped", "merge"),
+    _row(111395931085, _DOCKER_NEW, "skipped", "publish"),
+    _row(111395931036, _DOCKER_NEW, "skipped", "Docker phase requirements met"),
+    _row(111395701466, _DOCKER_NEW, "success", "Detect affected areas"),
+    _row(111395644061, _DOCKER_NEW, "success", "Resolve release phase"),
+    _row(111395644032, _CI_OLD, "failure", "All required checks pass"),
+    _row(111395643404, _DOCKER_OLD, "cancelled", "Docker phase requirements met"),
+    _row(111395643354, _DOCKER_OLD, "cancelled", "merge"),
+    _row(111395643248, _DOCKER_OLD, "cancelled", "publish"),
+    _row(111395642464, _DOCKER_OLD, "cancelled", "Detect affected areas"),
+    _row(111395638931, _DOCKER_OLD, "cancelled", "Resolve release phase"),
+    _row(111395640160, _CI_OLD, "cancelled", "Detect affected areas"),
+    _row(111396234081, _CI_NEW, None, "Python tests / Run tests slice 3/16", "in_progress"),
+    _row(111395642183, _OL_NEW, "success", "override_lint / override_lint"),
+    _row(111395639950, _OL_OLD, "cancelled", "override_lint / override_lint"),
+]
+_WF_1718 = [
+    {"id": 37188536850, "check_suite_id": _DOCKER_OLD, "workflow_id": 304434613,
+     "event": "pull_request", "conclusion": "cancelled"},
+    {"id": 37188537099, "check_suite_id": _CI_OLD, "workflow_id": 340224912,
+     "event": "pull_request", "conclusion": "cancelled"},
+    {"id": 37188537097, "check_suite_id": _OL_OLD, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "cancelled"},
+    {"id": 37188537568, "check_suite_id": _DOCKER_NEW, "workflow_id": 304434613,
+     "event": "pull_request", "conclusion": "success"},
+    {"id": 37188537908, "check_suite_id": _CI_NEW, "workflow_id": 340224912,
+     "event": "pull_request", "conclusion": None},
+    {"id": 37188537882, "check_suite_id": _OL_NEW, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "success"},
+]
+
+
+def _fake_repo_gh(monkeypatch, repo, number, sha, runs, workflow_runs):
+    def fake(path):
+        if path == f"repos/{repo}/pulls/{number}":
+            return {"state": "open", "merged_at": None, "mergeable_state": "blocked",
+                    "head": {"sha": sha}}
+        if path.startswith(f"repos/{repo}/commits/{sha}/check-runs"):
+            return {"check_runs": runs if path.endswith("&page=1") else []}
+        if path.startswith(f"repos/{repo}/actions/runs?head_sha={sha}"):
+            if workflow_runs is None:
+                return None
+            return {"workflow_runs": workflow_runs if path.endswith("&page=1") else []}
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+
+
+def test_pr_1716_two_row_override_lint_is_not_red(monkeypatch):
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1716, _SHA_1716, _RUNS_1716, _WF_1716)
+    health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1716)
+    assert health["failing"] == []
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_pr_1718_superseded_workflow_runs_are_not_red(monkeypatch):
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1718, _SHA_1718, _RUNS_1718, _WF_1718)
+    health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1718)
+    assert health["failing"] == []
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_pr_1718_unreadable_workflow_runs_fail_closed(monkeypatch):
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1718, _SHA_1718, _RUNS_1718, None)
+    failing = ow.query_pr_health("ANG-Ventures/hermes-agent", 1718)["failing"]
+    assert "All required checks pass" in failing and "publish" in failing
+
+
+def test_failure_in_the_newer_run_still_reads_red(monkeypatch):
+    runs = _RUNS_1718 + [_row(111396999999, _CI_NEW, "failure", "All required checks pass")]
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1718, _SHA_1718, runs, _WF_1718)
+    assert ow.query_pr_health("ANG-Ventures/hermes-agent", 1718)["failing"] == [
+        "All required checks pass"]
+
+
+def test_superseded_suites_rules():
+    wf = [{"id": 1, "check_suite_id": 11, "workflow_id": 7, "event": "pull_request",
+           "conclusion": "cancelled"},
+          {"id": 2, "check_suite_id": 12, "workflow_id": 7, "event": "pull_request",
+           "conclusion": "success"},
+          {"id": 3, "check_suite_id": 13, "workflow_id": 7, "event": "push",
+           "conclusion": "cancelled"},
+          {"id": 4, "check_suite_id": 14, "workflow_id": 8, "event": "pull_request",
+           "conclusion": "failure"},
+          {"id": 5, "check_suite_id": 15, "workflow_id": 8, "event": "pull_request",
+           "conclusion": "success"}]
+    # only a CANCELLED run with a newer run of the same (workflow, event) is superseded:
+    # the push run has no newer push sibling, and a failed run is never hidden this way
+    assert ow._superseded_suites(wf) == frozenset({11})
+    # the newest run of a workflow is never superseded, even when cancelled
+    assert ow._superseded_suites([dict(wf[1], conclusion="cancelled"), wf[0]]) == frozenset({11})
+
+
+def test_cancelled_then_skipped_same_check():
+    wf = {1: (10, "pull_request"), 2: (10, "pull_request")}
+    # a newer skipped run of the same check supersedes the cancelled one
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(2, "skipped", 2)], wf) == []
+    # an OLDER skipped run does not: the cancel is the latest word
+    assert ow.red_check_names([_run(1, "skipped", 1), _run(2, "cancelled", 2)], wf) == ["lint"]
+    # rows in a superseded suite are dropped whatever their conclusion
+    assert ow.red_check_names([_run(1, "failure", 1)], wf, frozenset({1})) == []
+
+
 def test_heartbeat_is_never_a_trigger_pure():
     assert "heartbeat" not in ow.SCAN_KINDS
     assert ow.is_stuck("heartbeat", {}) is False
