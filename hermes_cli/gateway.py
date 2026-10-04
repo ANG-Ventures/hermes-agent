@@ -3448,6 +3448,12 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
 
     # systemd_unit_is_current is the HERMES_HOME-sync chokepoint; its env mutation persists for the regenerate below.
     current = systemd_unit_is_current(system=system)
+    # Runs on every gateway boot: a scratch-home gateway whose name collided with the host's unit
+    # rewrote it (t_8749a807). Only the home the unit pins may rewrite it.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
+    if not current and (service_writes_disabled("rewrite the gateway unit") or not definition_belongs_to_home(
+            unit_path, get_hermes_home(), "rewrite")):
+        return False
     if _retire_hermes_replace_dropin(system=system):
         _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
         print(f"↻ Removed the stale Hermes --replace drop-in from the gateway {_service_scope_label(system)} service")
@@ -3634,6 +3640,7 @@ def systemd_install(
     run_as_user: str | None = None,
     enable_on_startup: bool = True,
     non_interactive: bool = False,
+    force_unit_path: bool = False,
 ):
     if system:
         _require_root_for_system_service("install")
@@ -3654,8 +3661,12 @@ def systemd_install(
     # Existing system units already pin HERMES_HOME; adopt it before any regenerate.
     if unit_path.exists():
         _sync_hermes_home_from_systemd_unit(system=system)
+        from hermes_cli.gateway_service_owner import definition_belongs_to_home
+        if not force_unit_path and not definition_belongs_to_home(unit_path, get_hermes_home(), "overwrite"):
+            return
 
-    if unit_path.exists() and not force:
+    # --force-unit-path repoints the unit at this home, so it writes rather than refreshing in place.
+    if unit_path.exists() and not (force or force_unit_path):
         if not systemd_unit_is_current(system=system):
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
@@ -5480,6 +5491,7 @@ def _install_systemd_from_cli(args, *, force: bool, system: bool, run_as_user) -
     systemd_install(
         force=force, system=system, run_as_user=run_as_user,
         enable_on_startup=start_on_login, non_interactive=non_interactive,
+        force_unit_path=getattr(args, "force_unit_path", False),
     )
     if start_now:
         systemd_start(system=system)
@@ -5500,12 +5512,19 @@ def _cmd_install(args):
     if _service_mgmt_blocked():
         _no_backend_exit("install", "termux")
     backend = _service_backend()
-    if backend == "systemd":
-        if refuses_container_user_scope_install(system):
+    force_unit_path = getattr(args, "force_unit_path", False)
+    if backend == "systemd" and refuses_container_user_scope_install(system):
+        sys.exit(1)
+    if backend in ("systemd", "launchd"):
+        from hermes_cli.gateway_service_owner import refuse_foreign_home_install, service_writes_disabled
+        if service_writes_disabled("install the gateway service") or refuse_foreign_home_install(
+                get_hermes_home(), force_unit_path):
             sys.exit(1)
+    if backend == "systemd":
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
-        launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
+        launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
+                        force_unit_path=force_unit_path)
     elif backend == "windows":
         _gw_windows().install(
             force=force,

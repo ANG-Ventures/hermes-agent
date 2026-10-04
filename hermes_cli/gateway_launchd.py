@@ -549,6 +549,11 @@ def refresh_launchd_plist_if_needed() -> bool:
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
         return False
+    # Every gateway boot refreshes: only the home the plist pins may rewrite it (t_8749a807).
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
+    if service_writes_disabled("rewrite the gateway plist") or not definition_belongs_to_home(
+            plist_path, _gw().get_hermes_home(), "rewrite"):
+        return False
 
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
@@ -608,14 +613,19 @@ def refresh_launchd_plist_if_needed() -> bool:
     return True
 
 
-def launchd_install(force: bool = False, *, start_now: bool = True):
+def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False):
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
     # loading it. A gateway that launchd already runs is still reloaded; this install did not start it.
     load = start_now or _gw()._launchctl_label_supervising_process(label)
 
-    if plist_path.exists() and not force:
+    if plist_path.exists() and not force_unit_path:
+        from hermes_cli.gateway_service_owner import definition_belongs_to_home
+        if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "overwrite"):
+            return
+    # --force-unit-path repoints the plist at this home, so it writes rather than refreshing in place.
+    if plist_path.exists() and not (force or force_unit_path):
         if _gw().launchd_plist_is_current():
             print(f"Service already installed at: {plist_path}")
             print("Use --force to reinstall")
@@ -692,7 +702,9 @@ def launchd_start():
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
         new_plist = _gw().generate_launchd_plist()
-        if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
+        from hermes_cli.gateway_service_owner import service_writes_disabled
+        if service_writes_disabled("regenerate the gateway plist") or _gw()._refuse_temp_home_service_write(
+                new_plist, "launchd plist"):
             sys.exit(1)
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)

@@ -5754,6 +5754,10 @@ def _default_spawn(
     )
     env[KANBAN_OWNER_PID_ENV] = KANBAN_OWNER_PID_PENDING
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # A worker never writes the host's gateway service definitions: a scratch E2E gateway a worker
+    # started rewrote ACE-AI's real unit on boot (t_8749a807). Inherited by every child it spawns.
+    from hermes_cli.gateway_service_owner import INSTALL_DISABLED_ENV
+    env[INSTALL_DISABLED_ENV] = "1"
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
