@@ -84,8 +84,10 @@ def test_typed_slash_counts_as_hand_but_interactive_env_does_not(kanban_home, mo
     ``HERMES_INTERACTIVE`` leaks into agent subprocesses, so it is NOT a marker."""
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     assert kb.classify_create_origin() == "script"
-    out = kc.run_slash("create 'typed in the TUI' --assignee daedalus --json")
+    out = kc.run_slash("create 'typed in the TUI' --assignee daedalus")
     assert "has no home session" in out and "refused" not in out
+    # --json stays parseable (run_slash merges stderr): no warning there.
+    assert json.loads(kc.run_slash("create 'typed json' --assignee daedalus --json"))["unhomed"] is True
 
 
 def test_typed_slash_inside_gateway_is_still_gateway(kanban_home, monkeypatch):
@@ -108,7 +110,7 @@ def test_worker_outranks_cron_and_gateway(kanban_home, monkeypatch):
 ])
 def test_no_home_no_flag(kanban_home, monkeypatch, capsys, origin, refused):
     _as(origin, monkeypatch, worker_card=_unhomed_worker_card())
-    out = _cli("create 'orphan?' --assignee daedalus --json")
+    out = _cli("create 'orphan?' --assignee daedalus")
     with kb.connect_closing() as conn:
         titles = [t.title for t in kb.list_tasks(conn)]
     if refused:

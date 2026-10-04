@@ -2943,10 +2943,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    if task.unhomed and getattr(args, "session", None) is None:
+    if (task.unhomed and getattr(args, "session", None) is None
+            and not getattr(args, "json", False)):
         # D-O2 (t_6281f908): a hand-typed create with no session is allowed
-        # but says so (stderr, so --json stdout stays parseable); the orphan
-        # watch will try to infer its home.
+        # but says so; the orphan watch will try to infer its home. Not with
+        # --json: ``run_slash`` merges stderr into its output, and the JSON
+        # carries ``"unhomed": true`` for a machine reader anyway.
         print(
             f"\n⚠  {task_id} has no home session (no session identity, no "
             "homed --parent): its lifecycle lines fall back to #logs until it "
