@@ -3430,20 +3430,25 @@ def _service_definition_is_hermes_generated(installed: str, kind: str) -> bool:
     """True when ``installed`` has the shape this CLI's generator writes.
 
     The generated launchd plist always runs ``/usr/bin/osascript`` as ``ProgramArguments[0]``
-    (``launchd_program_arguments``); the generated systemd unit's ``ExecStart=`` always begins with
-    the ``.hermes/bin/hermes`` launcher that ``_prepare_service_launcher`` publishes. A definition
-    whose launcher is anything else (``venv/bin/python -m hermes_cli.main``, a checkout venv, an
-    operator-hardened form) was written by someone other than this CLI.
+    (``launchd_program_arguments``); the generated systemd unit's ``ExecStart=`` is
+    ``installation_command``: the ``.hermes/bin/hermes`` launcher that ``_prepare_service_launcher``
+    publishes, or, on Nix/developer installs with no store Python, ``runtime_command``'s
+    ``<python> -I -c "...import hermes_bootstrap..."``. A definition whose launcher is anything else
+    (``venv/bin/python -m hermes_cli.main``, a checkout venv, an operator-hardened form) was written by
+    someone other than this CLI.
     """
     text = installed.lstrip("\ufeff")
     if kind == "launchd plist":
         m = re.search(r"<key>ProgramArguments</key>\s*<array>\s*<string>(.*?)</string>", text, flags=re.S)
         return bool(m) and m.group(1).strip() == "/usr/bin/osascript"
-    m = re.search(r"^ExecStart=\s*\"?([^\"\s]+)", text, flags=re.M)
+    m = re.search(r"^ExecStart=\s*(.*)$", text, flags=re.M)
     if not m:
         return False
-    launcher = m.group(1)
-    return launcher.endswith("/.hermes/bin/hermes") or launcher.endswith("/.hermes/bin/hermes.cmd")
+    exec_start = m.group(1)
+    launcher = re.match(r"\"?([^\"\s]+)", exec_start)
+    if launcher and launcher.group(1).endswith(("/.hermes/bin/hermes", "/.hermes/bin/hermes.cmd")):
+        return True
+    return bool(re.match(r"\"?[^\"\s]+\"?\s+\"?-I\"?\s+\"?-c\"?\s", exec_start)) and "import hermes_bootstrap" in exec_start
 
 
 def _refuse_foreign_service_overwrite(existing_path: Path, kind: str, *, force: bool = False) -> bool:

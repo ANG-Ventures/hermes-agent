@@ -59,6 +59,13 @@ Environment="HERMES_HOME=/home/ace/.hermes"
 ExecStart="/home/ace/.hermes/.hermes/bin/hermes" "gateway" "run"
 """
 
+# Nix/developer installs (no store Python): installation_command falls back to runtime_command.
+DEV_GENERATED_UNIT = """[Unit]
+Description=Hermes Gateway
+[Service]
+ExecStart="/home/ace/src/hermes-agent/venv/bin/python" "-I" "-c" "import os, sys, runpy; import hermes_bootstrap; runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)" "gateway" "run"
+"""
+
 
 # ---------------------------------------------------------------- predicate
 @pytest.mark.parametrize(
@@ -69,6 +76,8 @@ ExecStart="/home/ace/.hermes/.hermes/bin/hermes" "gateway" "run"
         ("\ufeff" + GENERATED_PLIST, "launchd plist", True),
         (CHECKOUT_UNIT, "systemd unit", False),
         (GENERATED_UNIT, "systemd unit", True),
+        (DEV_GENERATED_UNIT, "systemd unit", True),
+        (CHECKOUT_UNIT.replace('"-m"', '"-I" "-c" "import os"'), "systemd unit", False),
         ("[Service]\nExecStart=/home/ace/.hermes/.hermes/bin/hermes gateway run\n", "systemd unit", True),
         ("not a service definition at all", "systemd unit", False),
         ("not a service definition at all", "launchd plist", False),
@@ -196,3 +205,21 @@ def test_refresh_still_updates_an_outdated_generated_unit(systemd):
     assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is True
     assert systemd.unit.read_text(encoding="utf-8") == GENERATED_UNIT
     assert ("daemon-reload",) in systemd.systemctl
+
+
+@pytest.mark.parametrize("store_python", [False, True], ids=["nix-or-developer", "store"])
+def test_the_real_generator_output_is_classified_as_generated(tmp_path, monkeypatch, store_python):
+    """Whatever ExecStart generate_systemd_unit writes on this install kind, the guard must own it,
+    or refresh refuses the CLI's own unit on every start/update (Prism P1 on #1742)."""
+    import hermes_cli._launchers as launchers
+
+    monkeypatch.setattr(launchers, "resolve_store_python",
+                        lambda root: (tmp_path / "bin" / "python3") if store_python else None)
+    unit = gateway_cli.generate_systemd_unit(system=False)
+    assert gateway_cli._service_definition_is_hermes_generated(unit, "systemd unit") is True
+
+
+def test_refresh_updates_an_outdated_developer_install_unit(systemd):
+    systemd.unit.write_text(DEV_GENERATED_UNIT.replace("Hermes Gateway", "Old"), encoding="utf-8")
+    assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is True
+    assert systemd.unit.read_text(encoding="utf-8") == GENERATED_UNIT
