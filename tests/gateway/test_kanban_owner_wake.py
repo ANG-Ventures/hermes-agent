@@ -396,6 +396,34 @@ def test_superseded_suite_on_a_later_workflow_page_still_merges(monkeypatch):
     assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == []
 
 
+def _paged_check_runs(monkeypatch, page_fn):
+    def fake(path):
+        if path == "repos/ANG-Ventures/hermes-home/pulls/2694":
+            return {"state": "open", "merged_at": None, "mergeable_state": "clean",
+                    "head": {"sha": _SHA_2694}}
+        if "/check-runs" in path:
+            return page_fn(int(path.rsplit("page=", 1)[1]))
+        return {"workflow_runs": []}
+    monkeypatch.setattr(ow, "_gh_json", fake)
+
+
+def test_unreadable_later_check_run_page_is_unknown_not_green(monkeypatch):
+    """Prism P1 (#1706 r2): a failure on page 1 + an unreadable page 2 must not read green."""
+    page1 = [{"id": n, "name": f"c{n}", "conclusion": "success", "check_suite": {"id": 1}}
+             for n in range(99)] + [{"id": 99, "name": "tests", "conclusion": "failure",
+                                     "check_suite": {"id": 1}}]
+    _paged_check_runs(monkeypatch, lambda page: {"check_runs": page1} if page == 1 else None)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694) is None
+
+
+def test_page_cap_exhausted_is_unknown(monkeypatch):
+    """Prism P1 (#1706 r2): every page full up to the cap is a partial list, not a verdict."""
+    full = [{"id": n, "name": f"c{n}", "conclusion": "success", "check_suite": {"id": 1}}
+            for n in range(100)]
+    _paged_check_runs(monkeypatch, lambda page: {"check_runs": full})
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694) is None
+
+
 def _run(rid, concl, suite, name="lint"):
     return {"id": rid, "name": name, "conclusion": concl, "check_suite": {"id": suite}}
 

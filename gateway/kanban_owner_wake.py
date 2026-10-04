@@ -205,7 +205,8 @@ def _gh_json(path: str) -> Optional[Any]:
 
 def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
     """Every ``key`` row across REST pages of ``path`` (per_page=100), or None when
-    any page is unreadable. A head with >100 runs spills onto page 2+ (Prism P1)."""
+    any page is unreadable or the page cap is hit (a partial list is not a verdict).
+    A head with >100 runs spills onto page 2+ (Prism P1)."""
     rows: list = []
     sep = "&" if "?" in path else "?"
     for page in range(1, max_pages + 1):
@@ -215,8 +216,8 @@ def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
         batch = data.get(key) or []
         rows.extend(batch)
         if len(batch) < 100:
-            break
-    return rows
+            return rows
+    return None
 
 
 def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
@@ -289,7 +290,9 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
            "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": []}
     sha = (pr.get("head") or {}).get("sha")
     if out["state"] == "open" and sha:
-        runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs") or []
+        runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
+        if runs is None:
+            return None  # unknown: retried, never read as green (Prism P1)
         wf = _workflow_map(repo, sha) if _needs_workflow_map(runs) else {}
         out["failing"] = red_check_names(runs, wf)
     return out
