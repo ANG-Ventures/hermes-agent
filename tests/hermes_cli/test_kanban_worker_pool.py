@@ -70,7 +70,8 @@ def _tick(conn, *, spillover, spawn_limit, spawn_paused=None, spawned=None):
         return 4242
 
     res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_paused=spawn_paused,
-                            spawn_limit=spawn_limit, spillover=spillover)
+                            spawn_limit=spawn_limit, spillover=spillover,
+                            reconcile_orphans=False)
     return res, spawned
 
 

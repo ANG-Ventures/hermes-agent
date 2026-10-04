@@ -72,7 +72,7 @@ def tick(tmp_path, monkeypatch):
     st = SimpleNamespace(
         ledger={s: (0, {}) for s in BOARDS}, band="paused", allowance=(0, "paused"),
         admitted=[], booked=[], probes=[], calls=[], plans=[], events=[],
-        local_spawns={}, remote_takes={},
+        local_spawns={}, remote_takes={}, probes_at_entry=[],
     )
     monkeypatch.setattr(kb, "count_running_by_placement", lambda boards: dict(st.ledger))
 
@@ -99,6 +99,7 @@ def tick(tmp_path, monkeypatch):
     def fake_dispatch(conn, *, board=None, spawn_paused=None, spawn_limit=None,
                       spillover=None, **kw):
         st.events.append(("enter", board, threading.get_ident()))
+        st.probes_at_entry.append(len(st.probes))
         res = kb.DispatchResult()
         st.calls.append((board, spawn_limit, spawn_paused))
         st.plans.append(spillover)
@@ -168,8 +169,9 @@ async def test_ac14_one_plan_per_tick_shared_by_every_board(tick):
     first = tick.plans[:3]
     # ONE plan object for all boards; probes <= enabled hosts (ci-box is disabled).
     assert first[0] is not None and all(p is first[0] for p in first)
-    assert sorted(tick.probes[:2]) == ["ace-ai", "ace-media"] and len(tick.probes) <= 2 * (
-        len(tick.plans) // len(BOARDS) + 1)
+    assert sorted(tick.probes[:2]) == ["ace-ai", "ace-media"]
+    # Two probes before board 1 and none added by boards 2 and 3 of that tick.
+    assert tick.probes_at_entry[:3] == [2, 2, 2], tick.probes_at_entry
     # Board 1 took ace-ai, board 2 ace-media, board 3 found the pool full.
     assert first[0].budget == 0
     # Paused tick: every board gets an int local budget of 0, never None.
