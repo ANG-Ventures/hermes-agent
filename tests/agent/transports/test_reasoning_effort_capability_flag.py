@@ -189,3 +189,47 @@ class TestAuxiliaryPath:
         kw = _build_call_kwargs("aux-proxy", "three-level-model", MSGS, reasoning_config={"enabled": True, "effort": "max"}, base_url="http://127.0.0.1:9/v1")
         assert kw["reasoning_effort"] == "high"
         assert "reasoning" not in (kw.get("extra_body") or {})
+
+
+class TestNoProviderNameGate:
+    """Contract over every registered profile: the reasoning wire controls a request carries are a
+    function of the profile's declared capabilities and hooks, never of its name. (The AST form of
+    this check is banned by the root rubric — tests never read source — so it is behavioural: the
+    same profile under a different name must produce byte-identical reasoning controls.)"""
+
+    def _controls(self, profile, model):
+        from agent.reasoning_effort import REASONING_CONTROL_KEYS
+
+        kw = _kw(profile, model, {"enabled": True, "effort": "high"}, supports_reasoning=True)
+        flat = {k: v for k, v in kw.items() if k in REASONING_CONTROL_KEYS}
+        flat.update({f"extra_body.{k}": v for k, v in (kw.get("extra_body") or {}).items() if k in REASONING_CONTROL_KEYS})
+        return flat
+
+    def test_renaming_a_profile_changes_no_reasoning_control(self):
+        import copy
+
+        from providers import _REGISTRY, _discover_providers
+
+        _discover_providers()
+        checked = 0
+        for name, profile in list(_REGISTRY.items()):
+            if profile.api_mode != "chat_completions" or name != profile.name:
+                continue
+            model = profile.fallback_models[0] if profile.fallback_models else "some-model"
+            renamed = copy.copy(profile)
+            renamed.name = f"renamed-{name}"
+            assert self._controls(profile, model) == self._controls(renamed, model), name
+            checked += 1
+        assert checked >= 10
+
+    def test_every_flagged_profile_emits_for_a_ladder_level(self):
+        from providers import _REGISTRY, _discover_providers
+
+        _discover_providers()
+        for name, profile in list(_REGISTRY.items()):
+            if profile.api_mode != "chat_completions" or not getattr(profile, "supports_reasoning_effort", False):
+                continue
+            model = profile.fallback_models[0] if profile.fallback_models else "some-model"
+            if profile.supported_reasoning_efforts(model) == ():
+                continue
+            assert self._controls(profile, model), name
