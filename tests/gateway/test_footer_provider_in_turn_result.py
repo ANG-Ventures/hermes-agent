@@ -12,6 +12,13 @@ extraction rebuilt ``run_sync``'s result dicts WITHOUT the fork's
   machinery in ``_announce_and_persist_served_route`` became dead code while
   its unit tests stayed green (they call the method directly).
 
+PAIRED TESTS. This file pins only the PRODUCER half. The CONSUMER half (the
+``build_footer_line`` call in ``GatewayTurnMixin._hmwa_runtime_footer_line``,
+gateway/run_turn.py) and the rendered end-to-end footer are pinned by
+``tests/gateway/test_footer_consumer_in_turn.py``. On 2026-10-04 (t_829a3079) this
+file stayed green while the consumer dropped ``provider=``. The next split that moves
+either half must move both tests.
+
 These are deliberately SOURCE contracts (the fork's established pattern for
 the run.py god-file): they pin that the wiring exists, complementing the
 behavioural unit tests that pin what each piece does in isolation.

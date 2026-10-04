@@ -468,10 +468,16 @@
   {
     "feature": "gateway runtime footer fork fields: provider_model, context_full, reasoning",
     "tests": [
-      "tests/fork_canaries/test_fork_canary_runtime_footer_fields.py"
+      "tests/fork_canaries/test_fork_canary_runtime_footer_fields.py",
+      "tests/gateway/test_footer_consumer_in_turn.py::test_rendered_footer_leads_with_provider_model",
+      "tests/gateway/test_footer_consumer_in_turn.py::test_consumer_passes_provider_from_turn_result",
+      "tests/gateway/test_footer_consumer_in_turn.py::test_consumer_kwargs_are_superset_of_pre_split_fork_call",
+      "tests/gateway/test_footer_provider_in_turn_result.py"
     ],
     "paths": [
-      "gateway/runtime_footer.py"
+      "gateway/runtime_footer.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_runner.py"
     ],
     "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest — the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design — so keeping it is also what keeps #80661 landable.",
     "lifecycle": "upstream-intended",
