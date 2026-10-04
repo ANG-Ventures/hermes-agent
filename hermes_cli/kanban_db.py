@@ -12867,7 +12867,7 @@ def request_changes(
     coverage_text = str(redact_review_value(coverage or "")).strip()
     if coverage_text:
         # Validate the whole record before any write (t_c5bfb48b), so no
-        # refusal path can leave it behind.
+        # rejected call can leave it behind.
         coverage_error = review_coverage_text_error(coverage_text)
         if coverage_error:
             return False, coverage_error
