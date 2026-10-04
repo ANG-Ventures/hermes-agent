@@ -11034,8 +11034,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # / caption when no native quote is present.
         reply_to_id = None
         reply_to_text = None
+        reply_to_author_id = None
+        reply_to_is_own = False
         if message.reply_to_message:
             reply_to_id = str(message.reply_to_message.message_id)
+            # Platform-verified authorship of the replied-to message: text is
+            # user-forgeable, the author id is not (t_3ad14889 untrusted menus).
+            _ref_from = getattr(message.reply_to_message, "from_user", None)
+            if _ref_from is not None and getattr(_ref_from, "id", None) is not None:
+                reply_to_author_id = str(_ref_from.id)
+                reply_to_is_own = self._is_own_message(message.reply_to_message)
             quote = getattr(message, "quote", None)
             quote_text = getattr(quote, "text", None) if quote is not None else None
             if quote_text:
@@ -11078,6 +11086,8 @@ class TelegramAdapter(BasePlatformAdapter):
             platform_update_id=update_id,
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
+            reply_to_is_own_message=reply_to_is_own,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,

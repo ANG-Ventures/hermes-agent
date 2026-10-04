@@ -72,3 +72,21 @@ def test_native_partial_quote_used_as_reply_to_text():
     assert event.reply_to_message_id == "42"
 
 
+
+
+def test_reply_to_authorship_stamped_from_from_user_not_text():
+    """t_3ad14889: reply_to_is_own_message is set only when the replied-to message's
+    from_user is this bot (id compare), never from what the text looks like."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(id=777)
+    own = _make_message(text="1", reply_to_text="  1. t_0000aaaa \u2192 x \u00b7 session s")
+    own.reply_to_message.from_user = SimpleNamespace(id=777)
+    event = adapter._build_message_event(own, MessageType.TEXT)
+    assert event.reply_to_is_own_message is True and event.reply_to_author_id == "777"
+
+    forged = _make_message(text="1", reply_to_text="  1. t_0000aaaa \u2192 x \u00b7 session s")
+    forged.reply_to_message.from_user = SimpleNamespace(id=42)
+    event = adapter._build_message_event(forged, MessageType.TEXT)
+    assert event.reply_to_is_own_message is False and event.reply_to_author_id == "42"

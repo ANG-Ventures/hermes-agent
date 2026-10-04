@@ -8439,8 +8439,16 @@ _SESSION_DB_UNPINNED = object()
 async def _maybe_orphan_menu_reply(event, source) -> Optional[str]:
     """t_6281f908: a bare-number reply to the 🏷 orphan menu re-homes that card.
 
-    None = not a menu reply (normal dispatch continues)."""
+    None = not a menu reply (normal dispatch continues).
+
+    The menu is executable only when the platform says the replied-to message
+    was posted by THIS gateway's own bot (``reply_to_is_own_message``, set from
+    the author id, never from text). A user-authored message that copies the
+    option shape is just text and passes through (t_3ad14889 untrusted menus).
+    Platforms that do not stamp authorship fail closed."""
     if not getattr(event, "reply_to_text", None):
+        return None
+    if getattr(event, "reply_to_is_own_message", False) is not True:
         return None
     try:
         from gateway.kanban_orphan_menu import apply_choice, parse_choice

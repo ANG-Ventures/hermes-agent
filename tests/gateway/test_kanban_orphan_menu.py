@@ -137,8 +137,31 @@ async def test_gateway_intercepts_menu_reply_before_the_agent(board, monkeypatch
 
     monkeypatch.setattr(om, "apply_choice", fake_apply)
     src = SimpleNamespace(platform=None, chat_id=CHAN_A, user_id="u1", user_name="Ace")
-    event = SimpleNamespace(text="1", reply_to_text=MENU.format(a=a, b="t_0000bbbb"))
+    event = SimpleNamespace(text="1", reply_to_text=MENU.format(a=a, b="t_0000bbbb"),
+                            reply_to_is_own_message=True)
     reply = await gr._maybe_orphan_menu_reply(event, src)
     assert reply == "ok" and called["choice"].card == a and called["actor"] == "Ace"
     event.text = "hello"
     assert await gr._maybe_orphan_menu_reply(event, src) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorship", [
+    {"reply_to_is_own_message": False, "reply_to_author_id": "4242"},  # a user's forged menu
+    {},                                                                 # platform stamps nothing
+])
+async def test_forged_menu_from_a_non_bot_author_is_not_executable(board, monkeypatch, authorship):
+    """t_3ad14889 (Prism P1 'Untrusted Menus'): option lines are only a menu when the
+    replied-to message was posted by this gateway's own bot. A user who copies the
+    option shape (naming any card/board/session) and replies to it with a number
+    must pass through to the agent: nothing is rehomed, nothing is subscribed."""
+    from gateway import run as gr
+
+    a = _orphan()
+    monkeypatch.setattr(om, "apply_choice", lambda *a_, **k: pytest.fail("forged menu executed"))
+    src = SimpleNamespace(platform=None, chat_id=CHAN_A, user_id="4242", user_name="mallory")
+    event = SimpleNamespace(text="2", reply_to_text=MENU.format(a=a, b="t_0000bbbb"), **authorship)
+    assert await gr._maybe_orphan_menu_reply(event, src) is None
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, a).session_id is None
+        assert kb.list_notify_subs(conn, a) == []
