@@ -33,6 +33,17 @@ def _route_step() -> dict:
     return next(s for s in steps if s.get("id") == "route")
 
 
+def _script(tmp_path: Path, body: str) -> str:
+    """Write a step's script to a file: run as `bash <file>`, not `bash -c <script>`.
+
+    The suite's live-system guard parses every subprocess argv, and its cost grows
+    with argv length squared; a ~20 KB inline script took ~10 s per call in CI.
+    """
+    path = tmp_path / "step.sh"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
 # Hermetic stand-in for curl: answers the tag lookup from FAKE_TAG_CODE/FAKE_TAG_SHA
 # and logs every URL, so no test touches the network.
 _FAKE_CURL = r"""#!/usr/bin/env bash
@@ -68,7 +79,7 @@ def _route(tmp_path: Path, *, event: str, branch: str, conclusion: str = "failur
            "FAKE_CURL_LOG": str(log), "FAKE_TAG_CODE": tag_code, "FAKE_TAG_SHA": tag_sha,
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_curl"] = log.read_text()
@@ -186,7 +197,7 @@ def test_known_red_predecessor_is_the_latest_COMPLETED_run_not_latest_created(tm
            "FAKE_CURL_LOG": str(tmp_path / "log"), "FAKE_RUNS": json.dumps(runs), "GH_TOKEN": "x",
            "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     assert got["route"] == "alerts", proc.stdout
@@ -229,7 +240,7 @@ def _post(tmp_path, *, known_code, alerts_code):
            "WF_BRANCH": "main", "WF_SHA": "abc", "WF_RUN_ID": "42", "WF_URL": "https://x/42",
            "WF_ACTOR": "k", "REPO": "o/r", "WF_EVENT": "push", "EVENT_NAME": "workflow_run",
            "GITHUB_RUN_ID": "7"}
-    proc = subprocess.run(["bash", "-c", post["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, post["run"])], env=env, capture_output=True, text=True, timeout=30)
     return proc, log.read_text().split("\n")
 
 
@@ -275,7 +286,7 @@ def test_page_names_scheduled_vs_merge(tmp_path, event, trigger, actor):
            "WF_NAME": "Install & Update E2E", "WF_BRANCH": "main", "WF_SHA": "abc", "WF_RUN_ID": "42",
            "WF_URL": "https://x/42", "WF_ACTOR": "github-merge-queue[bot]", "REPO": "o/r",
            "WF_EVENT": event, "EVENT_NAME": "workflow_run", "GITHUB_RUN_ID": "7"}
-    proc = subprocess.run(["bash", "-c", post["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, post["run"])], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     body = json.loads(log.read_text().splitlines()[0])
     assert body["trigger"] == trigger
@@ -342,7 +353,7 @@ def _queue_route(tmp_path, api: dict, *, run_id=42, pr="1328", branch="", subjec
            "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_stdout"] = proc.stdout
@@ -531,7 +542,7 @@ def _replay(tmp_path: Path, run_id: int, api: dict) -> dict:
            "FAKE_CURL_LOG": str(d / "curl.log"), "FAKE_API": str(d / "api.json"), "GH_TOKEN": "x",
            "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main", "REPLAY_RUN_ID": "",
            "RUN_JSON": json.dumps(payload), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=120)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_stdout"] = proc.stdout
@@ -665,7 +676,7 @@ def _probe_route(tmp_path, *, actor="Kyzcreig", title="placement probe hand1 #0"
            "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_curl"] = log.read_text()
@@ -785,7 +796,7 @@ def _main_route(tmp_path, api, env_extra=None) -> dict:
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"],
            **(env_extra or {})}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_stdout"] = proc.stdout
@@ -873,7 +884,7 @@ def test_main_still_red_never_applies_to_startup_failure(tmp_path):
            "FAKE_CURL_LOG": str(tmp_path / "c.log"), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60, check=True)
+    subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60, check=True)
     assert "route=alerts" in out.read_text()
 
 
