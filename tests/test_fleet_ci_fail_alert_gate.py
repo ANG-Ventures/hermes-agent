@@ -295,7 +295,14 @@ url, path = sys.argv[1], sys.argv[2]
 table = json.load(open(path))
 for key in sorted(table, key=len, reverse=True):
     if key in url:
-        print(json.dumps(table[key])); sys.exit(0)
+        data = table[key]
+        if isinstance(data, dict) and "jobs" in data:  # paginate like GitHub (per_page default 30)
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(url).query)
+            per, page = int(q.get("per_page", ["30"])[0]), int(q.get("page", ["1"])[0])
+            data = {"total_count": data.get("total_count", len(data["jobs"])),
+                    "jobs": data["jobs"][(page - 1) * per:page * per]}
+        print(json.dumps(data)); sys.exit(0)
 sys.exit(22)
 PY
 """
@@ -867,3 +874,47 @@ def test_main_still_red_never_applies_to_startup_failure(tmp_path):
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
     subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60, check=True)
     assert "route=alerts" in out.read_text()
+
+
+# --- truncated jobs (Prism P1 30c28a402d93, 2026-10-04) ------------------------------------------
+# A run can carry > 100 jobs. Reading only the first page drops a failed job (a new red behind a
+# known one goes to #logs or folds) or a job that passed (main looks still red). Every page is
+# read; a list shorter than total_count pages.
+def _filler(n):
+    return [(f"filler {i}", "success", {"run": "success"}) for i in range(n)]
+
+
+def test_main_red_new_failed_job_past_the_first_jobs_page_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *_filler(120),
+                         ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "page=2" in got["_curl"]
+
+
+def test_main_red_prior_pass_past_the_first_jobs_page_pages(tmp_path):
+    green_late = _main_jobs(*_filler(120), (E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green_late),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_jobs_list_shorter_than_total_count_pages(tmp_path):
+    current = _red_e2e()
+    current["total_count"] = 150  # API says 150; only 2 jobs ever come back
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_fold_blocked_by_an_extra_red_job_past_the_first_jobs_page(tmp_path):
+    # Prior generation (FleetReview #1470): an extra unannotated red job blocks the fold. It must
+    # still block when it sits on page 2 of the jobs list.
+    api = _other_pr_queue_api()
+    jobs = api["actions/runs/42/jobs"]["jobs"]
+    jobs += [{"id": 2000 + i, "name": f"filler {i}", "conclusion": "success"} for i in range(120)]
+    jobs.append({"id": 950, "name": "OS-specific tests / Windows-only tests", "conclusion": "failure"})
+    api["check-runs/950/annotations"] = [{"message": "Process completed with exit code 1."}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "Windows-only tests" in got["summary"]

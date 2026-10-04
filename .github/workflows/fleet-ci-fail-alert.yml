@@ -212,9 +212,24 @@ jobs:
             fi
           fi
           api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          run_jobs() {  # run id -> {"jobs": [every job]}, following pages; rc!=0 on an API error or an incomplete list
+            # A run can carry > 100 jobs. One page would drop a failed job (missed page) or a job
+            # that passed (main looks still red): Prism P1 30c28a402d93 / 8adcbc19fb8b, 2026-10-04.
+            local page=1 resp total acc='[]'
+            while :; do
+              resp="$(api "actions/runs/$1/jobs?filter=latest&per_page=100&page=$page")" || return 1
+              total="$(jq -er '.total_count | numbers' <<< "$resp")" || return 1
+              acc="$(jq -c --argjson acc "$acc" '$acc + .jobs' <<< "$resp")" || return 1
+              [ "$(jq length <<< "$acc")" -ge "$total" ] && break
+              # A short page before total_count, or more than 1000 jobs: incomplete, so fail (page).
+              { [ "$(jq '.jobs | length' <<< "$resp")" -gt 0 ] && [ "$page" -lt 10 ]; } || return 1
+              page=$((page + 1))
+            done
+            jq -c '{jobs: .}' <<< "$acc"
+          }
           sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
             local jobs failed id name ann got items=""
-            jobs="$(api "actions/runs/$1/jobs?filter=latest&per_page=100")" || return 1
+            jobs="$(run_jobs "$1")" || return 1
             failed="$(jq -r '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"' <<< "$jobs")" || return 1
             while IFS=$'\t' read -r id name; do
               [ -n "$id" ] || continue
@@ -321,7 +336,7 @@ jobs:
           if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = push ] && [ "$WF_CONCLUSION" = failure ] \
              && [ -n "$WF_ID" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; then
             # Items = [job, step] of each failed step ([job, ""] if no step failed).
-            ITEMS="$(api "actions/runs/$WF_RUN_ID/jobs?filter=latest&per_page=100" | jq -c '
+            ITEMS="$(run_jobs "$WF_RUN_ID" | jq -c '
               [.jobs[] | select(.conclusion == "failure")
                 | select(.name | test("Tests complete|All required checks") | not)
                 | . as $j | ([.steps[]? | select(.conclusion == "failure") | [$j.name, .name]]
@@ -341,7 +356,7 @@ jobs:
                 # Per item in a prior run: red (that step failed), green (it ran and passed:
                 # main went green, so this is a new red), unknown (job or step did not run,
                 # e.g. path-classified CI skipped it; look further back).
-                ST="$(api "actions/runs/$prev/jobs?filter=latest&per_page=100" | jq -c --argjson items "$LEFT" '
+                ST="$(run_jobs "$prev" | jq -c --argjson items "$LEFT" '
                   . as $r | [$items[] as [$j, $s]
                     | ([$r.jobs[] | select(.name == $j)] | first) as $job
                     | if $job == null or (["success", "failure"] | index($job.conclusion) | not) then "unknown"
