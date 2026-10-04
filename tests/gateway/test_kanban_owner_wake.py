@@ -352,9 +352,11 @@ def _fake_gh(monkeypatch, runs, workflow_runs, calls=None):
             return {"state": "open", "merged_at": None, "mergeable_state": "clean",
                     "head": {"sha": _SHA_2694}}
         if path.startswith(f"repos/ANG-Ventures/hermes-home/commits/{_SHA_2694}/check-runs"):
-            return {"check_runs": runs}
+            return {"check_runs": runs} if path.endswith("&page=1") else {"check_runs": []}
         if path.startswith("repos/ANG-Ventures/hermes-home/actions/runs?head_sha="):
-            return workflow_runs
+            if callable(workflow_runs):
+                return workflow_runs(path)
+            return workflow_runs if path.endswith("&page=1") else {"workflow_runs": []}
         raise AssertionError(path)
     monkeypatch.setattr(ow, "_gh_json", fake)
 
@@ -378,6 +380,20 @@ def test_all_pass_head_skips_the_workflow_read(monkeypatch):
     _fake_gh(monkeypatch, runs, _WF_2694, calls)
     assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == []
     assert not any("actions/runs" in c for c in calls)
+
+
+def test_superseded_suite_on_a_later_workflow_page_still_merges(monkeypatch):
+    """Prism P1 (#1706): >100 workflow runs on a head. The cancelled run's suite is
+    on page 2; reading page 1 only left it suite-keyed and the PR read red."""
+    filler = [{"check_suite_id": 900000 + n, "workflow_id": 1, "event": "push"} for n in range(100)]
+    pages = {1: filler,
+             2: [{"check_suite_id": s, "workflow_id": 368437559, "event": "pull_request"}
+                 for s in (100688518781, 100688518866, 100688523611)]}
+
+    def wf_pages(path):
+        return {"workflow_runs": pages.get(int(path.rsplit("page=", 1)[1]), [])}
+    _fake_gh(monkeypatch, _RUNS_2694, wf_pages)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == []
 
 
 def _run(rid, concl, suite, name="lint"):

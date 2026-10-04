@@ -203,6 +203,22 @@ def _gh_json(path: str) -> Optional[Any]:
         return None
 
 
+def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
+    """Every ``key`` row across REST pages of ``path`` (per_page=100), or None when
+    any page is unreadable. A head with >100 runs spills onto page 2+ (Prism P1)."""
+    rows: list = []
+    sep = "&" if "?" in path else "?"
+    for page in range(1, max_pages + 1):
+        data = _gh_json(f"{path}{sep}per_page=100&page={page}")
+        if not isinstance(data, dict):
+            return None
+        batch = data.get(key) or []
+        rows.extend(batch)
+        if len(batch) < 100:
+            break
+    return rows
+
+
 def red_check_names(runs: list, workflows: Optional[dict] = None) -> list[str]:
     """Names of the checks that grade the head red (t_65e5d76f).
 
@@ -259,8 +275,7 @@ def _needs_workflow_map(runs: list) -> bool:
 def _workflow_map(repo: str, sha: str) -> dict:
     """check_suite id -> (workflow id, event); {} when unreadable. A push run and a
     pull_request run of one workflow on one sha are separate checks, not re-runs."""
-    data = _gh_json(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")
-    rows = (data.get("workflow_runs") or []) if isinstance(data, dict) else []
+    rows = _gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or []
     return {r["check_suite_id"]: (r.get("workflow_id"), r.get("event"))
             for r in rows if isinstance(r, dict) and r.get("check_suite_id") is not None}
 
@@ -274,8 +289,7 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
            "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": []}
     sha = (pr.get("head") or {}).get("sha")
     if out["state"] == "open" and sha:
-        data = _gh_json(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
-        runs = (data.get("check_runs") or []) if isinstance(data, dict) else []
+        runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs") or []
         wf = _workflow_map(repo, sha) if _needs_workflow_map(runs) else {}
         out["failing"] = red_check_names(runs, wf)
     return out
