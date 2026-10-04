@@ -3389,6 +3389,7 @@ def dispatch_once(
     reconcile_orphans: bool = True,
     budget_cache: Optional[dict] = None,
     spillover_fn=None,
+    spillover=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -3430,6 +3431,7 @@ def dispatch_once(
             pr_gate_prefetch=pr_gate_prefetch,
             budget_cache=budget_cache,
             spillover_fn=spillover_fn,
+            spillover=spillover,
         )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -3458,6 +3460,7 @@ def dispatch_once(
                 pr_gate_prefetch=pr_gate_prefetch,
                 budget_cache=budget_cache,
                 spillover_fn=spillover_fn,
+                spillover=spillover,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -4710,11 +4713,17 @@ def _dispatch_once_locked(
             break
         local_free = ready_local is None or local_spawned < ready_local
         pool_free = spillover is not None and spillover.budget > 0
+        route, route_arg = row_route.get(row["id"], ("local", None))
         if not local_free and not pool_free:
             # No slot anywhere: same early stop the intersected budget gave.
+            # The row that hit the wall still says why it waits.
+            if spillover is not None:
+                result.placement_waits[row["id"]] = (
+                    _route_wait(route, route_arg, False, spillover)
+                    or ("pin_host_full" if route == "pin" else "pool_full")
+                )
             ready_scan_complete = False
             break
-        route, route_arg = row_route.get(row["id"], ("local", None))
         wait = _route_wait(route, route_arg, local_free, spillover)
         if wait is not None:
             result.placement_waits[row["id"]] = wait
