@@ -97,7 +97,7 @@ class GateTickBuilder:
     after this (PRD I-12): the shared plan's ledger is unlocked."""
 
     def __init__(self, load_gate, *, fleet_dir: Callable, kanban_cfg: Callable,
-                 ledger: Callable, connect: Callable, probe=kwp.probe_host) -> None:
+                 ledger: Callable, connect: Callable, probe: Optional[Callable] = None) -> None:
         self.gate = load_gate
         self._fleet_dir = fleet_dir
         self._kanban_cfg = kanban_cfg
@@ -142,7 +142,8 @@ class GateTickBuilder:
         if not pool.pool_hosts and not pool.disabled:
             gate.pool = {"planned": False, "reason": "no_hosts"}
             return None
-        plan = kwp.plan(list(pool.pool_hosts), remote_by_host, probe=self._probe,
+        plan = kwp.plan(list(pool.pool_hosts), remote_by_host,
+                        probe=self._probe or kwp.probe_host,
                         disabled=pool.disabled, config=pool)
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         gate.pool = plan.snapshot()
