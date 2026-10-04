@@ -5262,6 +5262,11 @@ def _run_job_script(
 
         strip_overlay(env)
         _apply_cron_default_gh_lane(env, path)
+        # Mark the child as a cron script so ``hermes kanban create`` can
+        # classify it (refused when no home resolves, D-O1 t_6281f908) and
+        # record which job minted a card (the orphan watch maps it to the
+        # job's deliver chat).
+        env["HERMES_CRON_JOB_ID"] = str(job_id or job_name or path.name)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).

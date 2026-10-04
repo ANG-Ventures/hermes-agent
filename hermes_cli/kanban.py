@@ -704,6 +704,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "own: create REFUSES a card that would be born "
                                "unhomed. Accepts 'operator' or "
                                "'operator:<name>'; exclusive with --session.")
+    p_create.add_argument("--unhomed", action="store_true", default=False,
+                          help="Mint the card with NO home session on purpose "
+                               "(same as --session none). Without it a worker, "
+                               "cron or gateway create that resolves no home is "
+                               "refused; the orphan watch infers a home for "
+                               "unhomed cards (t_6281f908).")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -2864,6 +2870,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if getattr(args, "unhomed", False):
+        if getattr(args, "session", None) is not None or (getattr(args, "home", None) or "").strip():
+            print("kanban: --unhomed is exclusive with --session/--home", file=sys.stderr)
+            return 2
+        args.session = "none"
     home_flag = (getattr(args, "home", None) or "").strip()
     if home_flag:
         if getattr(args, "session", None) is not None:
@@ -2932,6 +2943,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    if task.unhomed and getattr(args, "session", None) is None:
+        # D-O2 (t_6281f908): a hand-typed create with no session is allowed
+        # but says so (stderr, so --json stdout stays parseable); the orphan
+        # watch will try to infer its home.
+        print(
+            f"\n⚠  {task_id} has no home session (no session identity, no "
+            "homed --parent): its lifecycle lines fall back to #logs until it "
+            f"is re-homed (`hermes kanban rehome {task_id} --session <sid>`).",
+            file=sys.stderr,
+        )
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -6758,6 +6779,29 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def rehome_apply(conn, task_id: str, sid: str, row: Optional[dict], target) -> bool:
+    """Stamp ``sid`` as the card's home and subscribe its chat (``target``, a
+    ``HomeTarget``). Shared by ``rehome`` and the gateway's orphan-menu reply
+    (t_6281f908). False = unknown id."""
+    if not kb.set_task_session(conn, task_id, sid):
+        return False
+    try:
+        origin = json.loads((row or {}).get("origin_json") or "{}")
+    except (TypeError, ValueError):
+        origin = {}
+    origin = origin if isinstance(origin, dict) else {}
+    kb.add_notify_sub(
+        conn, task_id=task_id,
+        platform=target.platform, chat_id=target.chat_id,
+        thread_id=target.thread_id or None,
+        chat_type=origin.get("chat_type") or None,
+        user_id=origin.get("user_id") or None,
+        scope_id=origin.get("scope_id") or None,
+        notifier_profile=origin.get("profile") or _profile_author(),
+    )
+    return True
+
+
 def _cmd_rehome(args: argparse.Namespace) -> int:
     """Re-home a card (t_808bc8e6): stamp ``--session`` as its home and
     subscribe that session's origin chat. The orphan alert names this verb."""
@@ -6784,24 +6828,10 @@ def _cmd_rehome(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        if not kb.set_task_session(conn, args.task_id, sid):
+        if not rehome_apply(conn, args.task_id, sid, row, home.target):
             print(f"cannot rehome {args.task_id} (unknown id)", file=sys.stderr)
             return 1
-        try:
-            origin = json.loads((row or {}).get("origin_json") or "{}")
-        except (TypeError, ValueError):
-            origin = {}
-        origin = origin if isinstance(origin, dict) else {}
         target = home.target
-        kb.add_notify_sub(
-            conn, task_id=args.task_id,
-            platform=target.platform, chat_id=target.chat_id,
-            thread_id=target.thread_id or None,
-            chat_type=origin.get("chat_type") or None,
-            user_id=origin.get("user_id") or None,
-            scope_id=origin.get("scope_id") or None,
-            notifier_profile=origin.get("profile") or _profile_author(),
-        )
     print(f"Re-homed {args.task_id} to session {sid} "
           f"({target.platform}:{target.chat_id}"
           + (f":{target.thread_id}" if target.thread_id else "") + ")")

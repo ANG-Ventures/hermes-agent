@@ -149,13 +149,17 @@ def test_cli_create_under_homed_parent_needs_no_home(kanban_home):
     assert child["session_id"] == APOLLO_SID
 
 
-def test_cli_create_in_worker_run_keeps_execution_lane(kanban_home, monkeypatch):
+def test_cli_create_in_unhomed_worker_run_is_refused_without_unhomed(kanban_home, monkeypatch):
+    """t_6281f908 D-O1: a worker with no homed lineage no longer mints an
+    unhomed card silently; ``--unhomed`` keeps the old execution-lane result."""
     with kb.connect_closing() as conn:
         worker_card = kb.create_task(conn, title="w", session_id=None,
                                      session_explicit=True)
     monkeypatch.setenv("HERMES_KANBAN_TASK", worker_card)
-    created = json.loads(kc.run_slash("create 'fanout' --json"))
-    assert created["session_id"] is None  # unhomed, as before
+    out = kc.run_slash("create 'fanout' --json")
+    assert "refused create (worker)" in out
+    created = json.loads(kc.run_slash("create 'fanout' --unhomed --json"))
+    assert created["session_id"] is None  # unhomed, on purpose
 
 
 def test_library_create_default_is_unchanged(kanban_home):

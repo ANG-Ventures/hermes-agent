@@ -5385,6 +5385,58 @@ class UnhomedCreateError(ValueError):
     """``create`` would mint a card no session can drive (``unhomed``)."""
 
 
+# Who is minting a card (t_6281f908, Ace 2026-10-03 14:42 option A, D-O1/D-O2).
+# Automated minters (a dispatched worker, a cron script, the gateway's
+# in-process ``/kanban``) with no resolvable home are REFUSED unless they say
+# ``--unhomed`` / ``--session``; a hand-typed CLI/TUI create only WARNS.
+# ``script`` = no marker and no TTY (launchd/systemd openers): refused, as
+# since t_09fea045.
+CREATE_ORIGIN_WORKER = "worker"
+CREATE_ORIGIN_CRON = "cron"
+CREATE_ORIGIN_GATEWAY = "gateway"
+CREATE_ORIGIN_HAND = "hand"
+CREATE_ORIGIN_SCRIPT = "script"
+# Set by cron/scheduler.py on every script-job child (HERMES_CRON_SCRIPT is
+# also set there when the gh shim is installed).
+CRON_JOB_ID_ENV = "HERMES_CRON_JOB_ID"
+
+
+def classify_create_origin() -> str:
+    """The minter class of THIS process: worker > cron > gateway > hand > script."""
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return CREATE_ORIGIN_WORKER
+    if any((os.environ.get(v) or "").strip() for v in (CRON_JOB_ID_ENV, "HERMES_CRON_SCRIPT")):
+        return CREATE_ORIGIN_CRON
+    if _process_is_gateway():
+        return CREATE_ORIGIN_GATEWAY
+    if (os.environ.get("HERMES_INTERACTIVE") or "").strip() == "1":
+        return CREATE_ORIGIN_HAND  # the TUI slash worker (stdin is a pipe)
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return CREATE_ORIGIN_HAND
+    except (ValueError, OSError):
+        pass
+    return CREATE_ORIGIN_SCRIPT
+
+
+def _minted_by(origin: str) -> dict:
+    """``created`` event provenance the orphan watch infers a home from."""
+    out: dict = {"class": origin}
+    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    job = (os.environ.get(CRON_JOB_ID_ENV) or "").strip()
+    script = (os.environ.get("HERMES_CRON_SCRIPT") or "").strip()
+    if task:
+        out["task"] = task
+    if run.isdigit():
+        out["run_id"] = int(run)
+    if job:
+        out["cron_job"] = job
+    if script:
+        out["cron_script"] = os.path.basename(script)
+    return out
+
+
 # Suite-compat escape for the require_home refusal: the test suite's hermetic
 # environment sets it so the hundreds of fixture ``kanban create`` calls that
 # predate the refusal keep working; the refusal's own tests unset it. Not a
@@ -7354,25 +7406,29 @@ def create_task(
         conn, session_id, parents, explicit=session_explicit
     )
     session_id, inherited_origin = birth
-    # ``require_home`` (the ``hermes kanban create`` CLI): a caller with NO
-    # session identity, no homed parent and no worker run would mint an
-    # ``unhomed`` card that no session can drive. Refuse; a cron/script says
-    # whose it is (``--session <sid>`` or ``--home operator``). An explicit
-    # ``--session none`` is a deliberate choice and stays allowed; so does a
-    # dispatched worker's fan-out (execution lane) (t_09fea045).
+    # ``require_home`` (the ``hermes kanban create`` CLI and the
+    # ``kanban_create`` tool): a caller with NO session identity and no homed
+    # parent/worker lineage would mint an ``unhomed`` card that no session can
+    # drive. Refuse a worker / cron / gateway / script minter (D-O1,
+    # t_6281f908; t_09fea045 for scripts); a hand-typed CLI/TUI create is
+    # allowed and the CLI warns (D-O2). ``--unhomed`` / ``--session none`` /
+    # ``--home operator`` is an explicit choice and always allowed.
+    create_origin = classify_create_origin()
     if (
         require_home
         and not session_explicit
         and is_unhomed(session_id)
-        and not (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and create_origin != CREATE_ORIGIN_HAND
         and (os.environ.get(ALLOW_UNHOMED_CREATE_ENV) or "").strip() != "1"
     ):
         raise UnhomedCreateError(
-            "kanban: refused create: no home session (no session identity, "
-            "no homed --parent). An unhomed card is undrivable: no session "
-            "can unblock/complete it. Pass --home operator (fleet operator "
+            f"kanban: refused create ({create_origin}): no home session (no "
+            "session identity, no homed --parent). An unhomed card is "
+            "undrivable: no session can unblock/complete it. Pass --session "
+            "<sid> (or --parent <homed card>), --home operator (fleet operator "
             f"pseudo-session {OPERATOR_HOME_SESSION}, owned by any "
-            f"{'/'.join(sorted(OPERATOR_PROFILES))} session) or --session <sid>."
+            f"{'/'.join(sorted(OPERATOR_PROFILES))} session), or --unhomed to "
+            "mint it unhomed on purpose (the orphan watch then infers a home)."
         )
     body = stamp_origin_body(
         body,
@@ -7759,6 +7815,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}

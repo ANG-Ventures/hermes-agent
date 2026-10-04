@@ -8435,6 +8435,29 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
+
+async def _maybe_orphan_menu_reply(event, source) -> Optional[str]:
+    """t_6281f908: a bare-number reply to the 🏷 orphan menu re-homes that card.
+
+    None = not a menu reply (normal dispatch continues)."""
+    if not getattr(event, "reply_to_text", None):
+        return None
+    try:
+        from gateway.kanban_orphan_menu import apply_choice, parse_choice
+
+        choice = parse_choice(getattr(event, "text", None), event.reply_to_text)
+    except Exception:
+        logger.debug("orphan menu parse failed", exc_info=True)
+        return None
+    if choice is None:
+        return None
+    actor = str(getattr(source, "user_name", None) or getattr(source, "user_id", None) or "")
+    try:
+        return await asyncio.to_thread(apply_choice, choice, actor=actor)
+    except Exception as exc:
+        logger.warning("orphan menu rehome failed: %s", exc)
+        return f"\u26a0 {choice.card or 'card'} not re-homed: {exc}"
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -23980,6 +24003,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         e,
                     )
                 _up_state.persistent.update_prompt_pending = False
+
+        # Orphan-card menu (t_6281f908): a bare-number reply to the 🏷 #alerts
+        # line re-homes that option's card. Anything else passes through.
+        if not is_internal:
+            _orphan_reply = await _maybe_orphan_menu_reply(event, source)
+            if _orphan_reply is not None:
+                return _orphan_reply
 
         # Intercept messages that are responses to a pending clarify.
         # Open-ended prompts and "Other" responses are captured as free text;

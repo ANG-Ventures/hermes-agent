@@ -1706,6 +1706,10 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    unhomed, unhomed_error = _parse_bool_arg(args, "unhomed")
+    if unhomed_error:
+        return tool_error(unhomed_error)
+    unhomed = bool(unhomed)
     goal_max_turns = args.get("goal_max_turns")
     # Fork arg name `model_override` is the surviving contract (tests +
     # schema); also accept upstream's `model` alias. Upstream added
@@ -1774,7 +1778,11 @@ def _handle_create(args: dict, **kw) -> str:
                     initial_status=str(initial_status), triage=bool(triage),
                 ),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                session_id=session_id,
+                session_id=None if unhomed else session_id,
+                session_explicit=unhomed,
+                # D-O1 (t_6281f908): a worker/cron/gateway create that
+                # resolves no home is refused unless ``unhomed`` is passed.
+                require_home=True,
                 duplicate_guard=True,
                 force_reason=force_reason,
             )
@@ -2827,6 +2835,14 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "unhomed": {
+                "type": "boolean",
+                "description": (
+                    "Mint the card with no home session on purpose. Without "
+                    "it, a create that resolves no home (no session, no homed "
+                    "parent) is refused."
                 ),
             },
             "wake": {
