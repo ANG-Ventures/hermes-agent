@@ -160,6 +160,7 @@ jobs:
       e2e_upgrade: ${{ steps.gate-lanes.outputs.e2e_upgrade }}
       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
+      desktop: ${{ steps.gate-lanes.outputs.desktop }}
       # Not lane booleans: raw classifier values, never release-forced.
       test_scope: ${{ steps.classify.outputs.test_scope }}
       changed_files: ${{ steps.classify.outputs.changed_files }}
@@ -176,17 +177,34 @@ jobs:
       - name: Force all lanes on release
         # Overwrite the classifier outputs with 'true' when inputs.release.
         # ci_review stays raw: it only ever feeds the PR review-label gate.
+        #
+        # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+        # `desktop` (apps/desktop/** changed) is ANDed with the repo var here, so
+        # every Electron-app job reads one output. A release run forces it on.
+        #
+        # The install/update lanes (e2e_upgrade -> e2e-upgrade shards + the
+        # Windows install + update E2E legs; bootstrap -> Bootstrap installer)
+        # are path-gated on pull_request only. merge_group forces them on, and
+        # push has an empty diff (every lane on): a PR run is never the only
+        # gate (t_e8c5045e).
         id: gate-lanes
         env:
           RELEASE: ${{ inputs.release }}
+          EVENT_NAME: ${{ github.event_name }}
+          DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
           python3 - <<'PY'
           import json, os
           values = json.loads(os.environ['CLASSIFIED'])
+          release = os.environ['RELEASE'] == 'true'
+          if os.environ['EVENT_NAME'] == 'merge_group':
+              values.update(e2e_upgrade='true', bootstrap='true')
+          if not release and os.environ['DESKTOP_JOBS'] != 'on':
+              values['desktop'] = 'false'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for lane, value in values.items():
-                  if os.environ['RELEASE'] == 'true' and value in ('true', 'false'):
+                  if release and value in ('true', 'false'):
                       value = 'true'
                   if '\n' in value or '\r' in value:
                       continue
@@ -274,6 +292,10 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
+    with:
+      # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+      # Off: the UI test shards skip and the apps/desktop check units are left out.
+      desktop: ${{ needs.detect.outputs.desktop == 'true' }}
 
   rust-tests:
     name: Rust tests
@@ -333,7 +355,8 @@ jobs:
     needs: detect
     # The deterministic core suite (apps/desktop/e2e/core): transcript
     # integrity, boot/respawn/orphans, clarify+approval. Required; retries 0.
-    if: needs.detect.outputs.e2e_desktop_core == 'true'
+    # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+    if: needs.detect.outputs.desktop == 'true' && needs.detect.outputs.e2e_desktop_core == 'true'
     uses: ./.github/workflows/e2e-desktop-core.yml
 
   e2e-desktop-update:
@@ -343,7 +366,8 @@ jobs:
     # first run, "Update now" hand-off/relaunch, concurrent-update refusal.
     # Advisory until it has proven stable on CI: its shards run with continue-on-error, so a
     # red shard shows on the PR but does not fail all-checks-pass.
-    if: needs.detect.outputs.e2e_desktop_update == 'true'
+    # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+    if: needs.detect.outputs.desktop == 'true' && needs.detect.outputs.e2e_desktop_update == 'true'
     uses: ./.github/workflows/e2e-desktop-update.yml
 
   docs-site:

@@ -3,6 +3,13 @@ name: JS Tests
 
 on:
   workflow_call:
+    inputs:
+      # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+      desktop:
+        description: Run the apps/desktop checks (UI test shards + desktop check units). A caller that passes nothing gets them.
+        type: boolean
+        required: false
+        default: true
 
 jobs:
   check:
@@ -124,7 +131,15 @@ jobs:
       # sharded. The script errors if a skip matches no unit, so a rename of
       # that script cannot silently drop the suite from both jobs.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs --skip 'apps/desktop::check:test:ui'
+        env:
+          DESKTOP: ${{ inputs.desktop }}
+        run: |
+          skips=(--skip 'apps/desktop::check:test:ui')
+          if [ "$DESKTOP" != true ]; then
+            # desktop-ci: the remaining apps/desktop units (CI_DESKTOP_JOBS off).
+            skips+=(--skip 'apps/desktop::check:lint' --skip 'apps/desktop::check:test:desktop:platforms' --skip 'apps/desktop::check:test:desktop:all')
+          fi
+          node .github/scripts/run-workspace-checks.mjs "${skips[@]}"
 
   ui-tests:
     # apps/desktop ``check:test:ui`` was the whole critical path of this
@@ -138,6 +153,8 @@ jobs:
     # before. Same command as ``check:test:ui`` (``npm run test:ui``) plus the
     # shard flag.
     name: UI tests (shard ${{ matrix.shard }}/3)
+    # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+    if: inputs.desktop
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

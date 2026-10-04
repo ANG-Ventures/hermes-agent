@@ -40,6 +40,12 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``desktop``     — the diff touches ``apps/desktop/``. ci.yaml ANDs it with the
+  ``CI_DESKTOP_JOBS`` repo variable (default off) for every Electron-app job.
+
+Install/update path (Ace 2026-10-03, t_bf20260d): ``_INSTALL_PATHS`` turn on
+``e2e_upgrade`` and ``bootstrap`` on a pull request. ci.yaml forces both on for
+merge_group, so the merge gate always runs them.
 
 ``docker``, ``nix`` and the E2E lanes take most of the larger-runner minutes.
 An ordinary product change does not start them on a pull request. Every push
@@ -293,6 +299,32 @@ _E2E_LANE_EXCLUDES = {
 _DOCKER_PATHS = (*_DOCKER_META, *_DEP_MANIFESTS, *_NPM_MANIFESTS, "pm/", "tests/docker/")
 _NIX_LANE_PATHS = (*_NIX_PATHS, *_NIX_FILES, *_DEP_MANIFESTS, *_NPM_MANIFESTS)
 
+# The install/update path (Ace 2026-10-03, t_bf20260d). e2e-upgrade, the
+# Windows install + update E2E legs (both gated on ``e2e_upgrade``) and the
+# Bootstrap installer start on a pull request when the diff touches one of
+# these, in addition to each lane's own path list above.
+_INSTALL_PATHS = (
+    "hermes_cli/update",
+    "hermes_cli/install",
+    "hermes_cli/venv_sync",
+    "hermes_cli/source_completion",
+    "hermes_cli/psutil_android",
+    "hermes_cli/_update",
+    "hermes_bootstrap",
+    "pm/",
+    "scripts/install",
+    "uv.lock",
+    "pyproject.toml",
+    "tests/e2e/core/upgrade/",
+    "tests/e2e/core/windows_update/",
+)
+_INSTALL_FILES = {"package.json", "package-lock.json"}
+
+
+def _is_install_path(p: str) -> bool:
+    return p.startswith(_INSTALL_PATHS) or p in _INSTALL_FILES or p.endswith(".ps1")
+
+
 # A pull request with this label runs every slow lane, whatever it touches.
 RUN_E2E_LABEL = "run-e2e"
 
@@ -414,14 +446,18 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         "uv_lock": any(f in ("pyproject.toml", "uv.lock") for f in files),
         "npm_lock": npm_lock,
         "bootstrap": any(
-            f.startswith(_BOOTSTRAP_PATHS) or f in _BOOTSTRAP_FILES for f in files
+            f.startswith(_BOOTSTRAP_PATHS) or f in _BOOTSTRAP_FILES or _is_install_path(f)
+            for f in files
         ),
         "desktop_updater": any(_is_desktop_updater(f) for f in files),
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
+        "desktop": any(f.startswith("apps/desktop/") for f in files),
         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
     }
+    if any(_is_install_path(f) for f in files):
+        ret["e2e_upgrade"] = True
     if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
         ret["python_prod"] = True
@@ -436,6 +472,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         ret["desktop_updater"] = True
         ret["rust"] = True
         ret["ci_review"] = True
+        ret["desktop"] = True
         ret.update(dict.fromkeys(_slow_lanes([]), True))
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
