@@ -265,8 +265,11 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # The classifier allowlist is every profile SOME enabled host serves
     # (global list + per-host overrides); take() still checks the host.
     served = tuple(dict.fromkeys([*gprofiles, *(p for h in hosts for p in h.profiles)]))
+    # ``hosts`` is every host the pool files KNOW, placement-eligible or not:
+    # a pin on a dropped host (role but no row, row not in priority) must
+    # still resolve as a pin and wait at take(), never fall back (Prism 4271004b).
     return PoolConfig(
-        hosts=tuple(h for h in prio if h in rows),
+        hosts=tuple(dict.fromkeys([*(h for h in prio if h in rows), *known_host_ids(fleet_dir)])),
         profiles=served,
         studio_bound_skills=tuple(sidecar.get("studio_bound_skills") or ()),
         pool_hosts=tuple(hosts), disabled=tuple(disabled), warnings=tuple(warnings),
@@ -460,7 +463,9 @@ class SpilloverPlan:
         if pin is not None:
             host = self.hosts.get(pin)
             if host is None:
-                self.refusal = "pin_host_disabled" if pin in self.disabled else "pin_unknown_host"
+                self.refusal = ("pin_host_disabled" if pin in self.disabled
+                                else "pin_host_dropped" if pin in (self.config.hosts or ())
+                                else "pin_unknown_host")
                 return None
             if assignee not in host.profiles:
                 self.refusal = "pin_profile"  # the pinned host does not serve this assignee

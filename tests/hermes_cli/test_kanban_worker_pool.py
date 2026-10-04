@@ -756,3 +756,26 @@ def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
         ids = [f"t_fake{i:05d}" for i in range(1198)] + [a, b]
         assert kbd._linked_ids(conn, ids) == {a, b}
+
+
+# -- Apollo review r5 (PR #1730) -------------------------------------------
+
+def test_pin_on_a_known_but_dropped_host_waits_and_never_spawns(kanban_home):
+    """Prism 4271004b: ace-media has the kanban-worker role but no sidecar
+    row, so the pool drops it. A card pinned to it still IS pinned: with a
+    healthy ace-ai plan and free local slots it waits ``pin_host_dropped``."""
+    fleet = kanban_home / "fleet"
+    side = _write_pool(fleet)
+    del side["hosts"]["ace-media"]
+    side["priority"].remove("ace-media")
+    _write_pool(fleet, sidecar=side)
+    cfg = kwp.read_pool(fleet)
+    spill = kwp.plan(list(cfg.pool_hosts), {}, probe=lambda h: (1.0, 16),
+                     disabled=cfg.disabled, config=cfg)
+    spill.band, spill.spill_reason = "spilling", "load"
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host:ace-media")
+        res, spawned = _tick(conn, spillover=spill, spawn_limit=4)
+    assert spawned == []
+    assert res.placement_waits.get(tid) == "pin_host_dropped"
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
