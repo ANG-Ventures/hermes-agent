@@ -1293,7 +1293,7 @@ VIDEO_ANALYZE_SCHEMA = {
     "name": "video_analyze",
     "description": (
         "Analyze a video from a URL or local file path using a multimodal AI model. "
-        "Sends the video to a video-capable model (e.g. Gemini) for understanding. "
+        "Sends the video to a video-capable model for understanding. "
         "Use this for video files — for images, use vision_analyze instead. "
         "Supports mp4, webm, mov, avi, mkv, mpeg formats. "
         "Note: large videos (>20 MB) may be slow; max ~50 MB."

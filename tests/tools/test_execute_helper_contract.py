@@ -36,7 +36,11 @@ def run(code, reset=False):
 
 def test_schema_helper_instructions_work_across_kernel_lifetimes():
     description = registry.get_schema("execute_code")["description"]
-    imports = "\n".join(re.findall(r"`(from hermes_tools import [\w, ]+)`", description))
+    # The description names the import module (brand-neutral alias since
+    # t_79ef440f); whatever it teaches must actually execute, so extract the
+    # imports verbatim from the schema instead of pinning a module name.
+    imports = "\n".join(re.findall(r"`(from \w+ import [\w, ]+)`", description))
+    assert imports, "schema description names no helper imports to execute"
     for reset, reused in ((False, False), (False, True), (True, False)):
         result = run(PROBE.format(imports=imports), reset=reset)
         assert result["status"] == "success", result

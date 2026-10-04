@@ -567,6 +567,9 @@ def test_request_review_tool_schema_names_the_legal_reviewer_forms() -> None:
     from tools.kanban_tools import KANBAN_REQUEST_REVIEW_SCHEMA as schema
 
     desc = schema["parameters"]["properties"]["reviewer"]["description"]
-    assert "argus" in desc
+    # t_79ef440f: agent/profile names were scrubbed out of model-facing
+    # descriptions (they egress in tools[] on every request); the legal
+    # forms the description must still pin are the human sentinel and the
+    # config fallback, not a specific fleet profile name.
     assert "human" in desc
     assert "kanban.review_assignee" in desc

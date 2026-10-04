@@ -14,8 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import copy
 
-from hermes_constants import display_hermes_home
-
 logger = logging.getLogger(__name__)
 
 # Per-turn identity of the CREATING agent's model, so ``cronjob(action="create")``
@@ -1586,7 +1584,7 @@ def _cronjob_schema_overrides() -> dict:
     static schema is built once per process, but the multiplexed gateway serves every profile from
     that process, so a path baked in at import would name the launch profile's home (#95685)."""
     params = copy.deepcopy(CRONJOB_SCHEMA["parameters"])
-    params["properties"]["script"]["description"] = _script_description(display_hermes_home())
+    params["properties"]["script"]["description"] = _script_description("the profile home")
     return {"parameters": params}
 
 
@@ -1594,9 +1592,9 @@ CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
 
-Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
+Jobs run on the main agent model (whatever the main agent model is set to when they fire) unless pinned.
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever the main agent model is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1612,7 +1610,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "pinned": {
                 "type": "boolean",
-                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later `hermes model` / `/model` changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
+                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later main-model changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
             },
             "prompt": {
                 "type": "string",
@@ -1637,15 +1635,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "model": {
                 "type": "object",
-                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"gpt-5.6-sol\" with a sibling provider=\"openai-codex\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable. Explicit flagship models require allow_flagship_reason.",
+                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"<name>\" with a sibling provider=\"<provider>\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable. Explicit flagship models require allow_flagship_reason.",
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "Provider name (e.g. 'openrouter', 'anthropic', or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
+                        "description": "Provider name (e.g. 'openrouter' or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
                     },
                     "model": {
                         "type": "string",
-                        "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
+                        "description": "Model name (e.g. 'provider/model-name', 'model-name')"
                     }
                 },
                 "required": ["model"]
@@ -1665,7 +1663,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "script": {
                 "type": "string",
-                "description": _script_description("the profile HERMES_HOME")
+                "description": _script_description("the profile home")
             },
             "monitor": {
                 "type": "string",

@@ -6,14 +6,14 @@ from typing import Any
 from hermes_cli import kanban_review_schema as _review_schema
 
 _DESC_TASK_ID_DEFAULT = (
-    "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env "
-    "(the task the dispatcher spawned you to work on)."
+    "Task id. If omitted, defaults to the task the dispatcher spawned "
+    "you to work on."
 )
 
 _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
+    "active board the usual way: the board database path and board slug "
+    "from the process env → the 'current' symlink under the kanban "
     "home → 'default'. Pass an explicit slug only when the caller (e.g. "
     "a Telegram routing layer) needs to override the env-pinned active "
     "board for this one call."
@@ -148,8 +148,8 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Optional list of absolute paths to deliverable "
                 "files you produced during this run — generated "
                 "charts, PDFs, spreadsheets, images, archives. "
-                "Examples: [\"~/.hermes/cache/scratch/q3-revenue.png\", "
-                "\"~/.hermes/cache/scratch/report.pdf\"]. The gateway notifier "
+                "Examples: [\"~/q3-revenue.png\", "
+                "\"~/report.pdf\"]. The gateway notifier "
                 "uploads each path as a native attachment to the "
                 "subscribed chat (images embed inline, everything "
                 "else uploads as a file) so the deliverable "
@@ -244,7 +244,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "Optional list of absolute paths to deliverable "
                 "files this handoff names — generated charts, "
                 "PDFs, spreadsheets, images, archives. Examples: "
-                "['~/.hermes/cache/scratch/q3-revenue.png', '~/.hermes/cache/scratch/report.pdf']. "
+                "['~/q3-revenue.png', '~/report.pdf']. "
                 "A review handoff is the last implementer "
                 "transition, so the kernel copies these into the "
                 "task's durable attachments before the reviewer's "
@@ -346,8 +346,8 @@ KANBAN_ATTACH_SCHEMA = _schema(
 KANBAN_ATTACH_URL_SCHEMA = _schema(
     "kanban_attach_url",
     (
-        "Attach a file to a task by URL — Hermes downloads it server-side "
-        "and stores it as a real attachment (capped at 25 MB). Use when "
+        "Attach a file to a task by URL — the file is downloaded "
+        "server-side and stored as a real attachment (capped at 25 MB). Use when "
         "you have a link rather than the bytes. Only http/https URLs are "
         "accepted."
     ),
@@ -414,7 +414,7 @@ KANBAN_CREATE_SCHEMA = _schema(
         },
         "tenant": _prop("string", (
                 "Optional namespace for multi-project isolation. "
-                "Defaults to HERMES_TENANT env if set."
+                "Defaults to the process env's tenant if set."
         )),
         "priority": _prop("integer", (
                 "Dispatcher tiebreaker. Higher = picked sooner "
@@ -510,8 +510,8 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "to use the profile default."
         )),
         "provider": _prop("string", (
-                "Provider the 'model' belongs to (e.g. 'openrouter', "
-                "'anthropic', 'nous'). Set this whenever the model "
+                "Provider the 'model' belongs to (e.g. 'openrouter' "
+                "or 'custom:<name>'). Set this whenever the model "
                 "is not from the assignee profile's configured "
                 "provider — a model name alone is resolved against "
                 "the profile's provider and will fail if it belongs "
@@ -714,7 +714,8 @@ _FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'t
                           'model_override': {'type': 'string',
                                              'description': 'Per-task model override. Pins the '
                                                             'dispatched worker to this model '
-                                                            '(passed as `hermes -m MODEL`) instead '
+                                                            '(the worker is launched with this as '
+                                                            'its model) instead '
                                                             "of the assignee profile's default "
                                                             'model. Use this to run one task on a '
                                                             'stronger/cheaper model without '
