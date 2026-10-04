@@ -169,6 +169,88 @@ def test_core_toolset_has_no_brand_tokens():
     )
 
 
+# Env-var-shaped tokens a description may name that are NOT read via a quoted
+# literal in runtime source. Enumerated, each with why it is not an env var.
+NON_ENV_IDENTIFIERS = {
+    "LINE_NUM": "read_file output-format placeholder ('LINE_NUM|CONTENT')",
+    "MANAGE_ROLES": "Discord permission name, not a process env var",
+}
+
+_ENV_SHAPED = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]{2,}\b")
+_SOURCE_SKIP_DIRS = {".git", "tests", "node_modules", ".venv", "venv", "web", "ui-tui", "website"}
+
+
+def _runtime_source_blob():
+    parts = []
+    for d, dirs, files in os.walk(REPO):
+        dirs[:] = [x for x in dirs if x not in _SOURCE_SKIP_DIRS and not x.startswith(".")]
+        for f in files:
+            if f.endswith(".py"):
+                try:
+                    with open(os.path.join(d, f), encoding="utf-8", errors="ignore") as fh:
+                        parts.append(fh.read())
+                except OSError:
+                    continue
+    return "\n".join(parts)
+
+
+def test_described_env_vars_exist_in_runtime():
+    """A description must never name an env var the runtime does not read.
+
+    t_75ae32f2 (Prism P1 on #1682): the brand scrub shortened
+    ``HERMES_KANBAN_TASK``/``_DB``/``_BOARD``/``HERMES_TENANT`` to invented
+    ``KANBAN_*`` names in the kanban schemas. The brand gate went green, but
+    an agent that set the documented names would be ignored and could target
+    the wrong board or tenant. Scrubbing must describe the DEFAULT, not
+    rename the variable. Every env-var-shaped token in any description must
+    appear as a quoted string literal in non-test source (the shape of an
+    ``os.environ`` lookup) or be enumerated in NON_ENV_IDENTIFIERS.
+    """
+    from tools.registry import registry, discover_builtin_tools
+
+    discover_builtin_tools()
+    entries = registry._snapshot_entries()
+    if not entries:
+        raise RuntimeError("tool registry is empty — refusing to report green")
+
+    blob = _runtime_source_blob()
+    if len(blob) < 100_000:
+        raise RuntimeError("runtime source scan found almost nothing — refusing to report green")
+
+    failures = []
+    seen = set()
+    for entry in entries:
+        descs = []
+        _description_strings(entry.schema, entry.name, descs)
+        for path, text in descs:
+            for m in _ENV_SHAPED.finditer(text):
+                name = m.group(0)
+                if name in NON_ENV_IDENTIFIERS or (path, name) in seen:
+                    continue
+                seen.add((path, name))
+                if not re.search(r"[\"']" + re.escape(name) + r"[\"']", blob):
+                    failures.append(f"{path}: {name!r} is not read anywhere in runtime source")
+    assert not failures, (
+        f"{len(failures)} description(s) name env vars the runtime never reads "
+        "(describe the default instead of inventing a name):\n" + "\n".join(failures[:50])
+    )
+
+
+def test_non_env_identifiers_still_described():
+    """Anti-drift: an allowlisted token no description uses any more is a stale hole."""
+    from tools.registry import registry, discover_builtin_tools
+
+    discover_builtin_tools()
+    used = set()
+    for entry in registry._snapshot_entries():
+        descs = []
+        _description_strings(entry.schema, entry.name, descs)
+        for _, text in descs:
+            used.update(_ENV_SHAPED.findall(text))
+    stale = sorted(set(NON_ENV_IDENTIFIERS) - used)
+    assert not stale, f"NON_ENV_IDENTIFIERS entries no description uses: {stale}"
+
+
 def test_exclusions_still_exist():
     """SPEC L11 anti-deletion: an exclusion whose tool vanished is drift."""
     from tools.registry import registry, discover_builtin_tools
