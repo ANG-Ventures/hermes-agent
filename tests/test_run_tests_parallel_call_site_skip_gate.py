@@ -26,6 +26,14 @@ def test_a():
 
 def test_b():
     pytest.skip("optional dep missing")
+
+@pytest.mark.parametrize("x", [1, 2])
+def test_p(x):
+    pass
+
+class TestK:
+    def test_m(self):
+        pass
 """
 
 
@@ -76,7 +84,7 @@ def test_skipped_registered_nodeid_is_red_even_when_a_sibling_passed(tmp_path, m
     repo = _repo(tmp_path, [f"{_REL}::test_b"])
     monkeypatch.setattr(mod, "_JUNIT_DIR", tmp_path / "junit")
     _junit(mod, repo, tmp_path / "junit")
-    assert _guard(mod, repo, {"passed": 1, "skipped": 1}) is True
+    assert _guard(mod, repo, {"passed": 4, "skipped": 1}) is True
     assert f"{_REL}::test_b" in capsys.readouterr().out
 
 
@@ -85,7 +93,17 @@ def test_registered_nodeid_that_ran_is_green(tmp_path, monkeypatch):
     repo = _repo(tmp_path, [f"{_REL}::test_a"])
     monkeypatch.setattr(mod, "_JUNIT_DIR", tmp_path / "junit")
     _junit(mod, repo, tmp_path / "junit")
-    assert _guard(mod, repo, {"passed": 1, "skipped": 1}) is False
+    assert _guard(mod, repo, {"passed": 4, "skipped": 1}) is False
+
+
+def test_parametrized_and_class_registered_ids_count_their_cases(tmp_path, monkeypatch):
+    # tests/gateway/test_footer_consumer_in_turn.py::test_rendered_footer_leads_with_provider_model
+    # is registered bare; junit reports only `...[case]` ids (#1743 slice 13 false RED).
+    mod = _runner()
+    repo = _repo(tmp_path, [f"{_REL}::test_p", f"{_REL}::TestK"])
+    monkeypatch.setattr(mod, "_JUNIT_DIR", tmp_path / "junit")
+    _junit(mod, repo, tmp_path / "junit")
+    assert _guard(mod, repo, {"passed": 4, "skipped": 1}) is False
 
 
 def test_registered_nodeid_not_collected_is_red(tmp_path, monkeypatch, capsys):
@@ -93,7 +111,7 @@ def test_registered_nodeid_not_collected_is_red(tmp_path, monkeypatch, capsys):
     repo = _repo(tmp_path, [f"{_REL}::test_a", f"{_REL}::test_renamed_away"])
     monkeypatch.setattr(mod, "_JUNIT_DIR", tmp_path / "junit")
     _junit(mod, repo, tmp_path / "junit")
-    assert _guard(mod, repo, {"passed": 1, "skipped": 1}) is True
+    assert _guard(mod, repo, {"passed": 4, "skipped": 1}) is True
     out = capsys.readouterr().out
     assert f"{_REL}::test_renamed_away" in out and f"{_REL}::test_a\n" not in out
 
