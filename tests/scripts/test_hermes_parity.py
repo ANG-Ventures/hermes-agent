@@ -569,6 +569,16 @@ def test_lint_manifest_rejects_unknown_census_verdict(tmp_path: Path) -> None:
     assert any("invalid parity_census verdict" in error for error in result.errors)
 
 
+def test_repo_fork_manifest_call_sites_all_have_e2e_tests() -> None:
+    """D2b on the LIVE registry (t_96049446, Ace 10-04 12:13: "make sure we have regression testing
+    for that next time"). The fixture tests above prove the rule; this one proves the shipped
+    manifest obeys it, so stripping a ``call_site_tests`` list (or adding a ``call_site`` without
+    one) turns CI red on main instead of silently re-opening the footer class."""
+    manifest = Path(__file__).resolve().parents[2] / "docs" / "sync" / "fork-features.json"
+
+    assert lint_manifest.lint_call_sites(manifest) == []
+
+
 def test_repo_fork_manifest_census_verdicts_agree_with_evidence() -> None:
     manifest = Path(__file__).resolve().parents[2] / "docs" / "sync" / "fork-features.json"
 

@@ -895,16 +895,31 @@ def test_77_boards_locked_index_skips_within_250ms(mod, fleet77, caplog):
     assert any(f"session={SID} unavailable=" in r.getMessage() for r in caplog.records)
 
 
-def test_77_boards_27_concurrent_first_turns_all_within_ceiling(mod, fleet77):
-    """The 10:00-12:00 shape: 27 session inits, 8 at a time, 77 boards."""
+def test_77_boards_27_concurrent_first_turns_all_within_ceiling(mod, fleet77, caplog):
+    """The 10:00-12:00 shape: 27 session inits, 8 at a time, 77 boards.
+
+    The ceiling is the hard contract (I5).  Whether the home session's read
+    lands inside BUDGET_S depends on how starved the runner is: a hosted CI
+    runner running ~30 probe threads missed it 3 times on 10-04 and the
+    plugin correctly failed open.  So: cards when a read answered, and a
+    miss only through the budget path, never an error or another chain's card.
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     sids = [SID] + [f"20260924_1200{i:02d}_cccccc" for i in range(26)]
-    with ThreadPoolExecutor(8) as ex:
-        res = list(ex.map(lambda s: _timed(mod, session_id=s), sids))
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        with ThreadPoolExecutor(8) as ex:
+            res = list(ex.map(lambda s: _timed(mod, session_id=s), sids))
     worst = max(took for _, took in res)
     assert worst < mod.BUDGET_S + SLACK_S, worst
-    assert res[0][0] and "t_home" in res[0][0]["context"]
+    assert all(out is None or "foreign" not in out["context"] for out, _ in res)
+    out = res[0][0]
+    lines = [r.getMessage() for r in caplog.records if f"session={SID} " in r.getMessage()]
+    if out is None:
+        # Designed fail-open only (I5): budget expiry or a busy index lock.
+        assert any("unavailable=timeout" in m or "locked" in m for m in lines), lines
+    else:
+        assert "t_home" in out["context"], out
 
 
 def test_failed_exact_read_falls_back_to_the_successful_fallback_read(mod, home, monkeypatch):

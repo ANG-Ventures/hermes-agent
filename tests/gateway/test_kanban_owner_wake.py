@@ -718,3 +718,35 @@ def test_worker_only_gateway_skips_the_scan(env, monkeypatch):
     env["runner"]._active_profile_name = lambda: "daedalus"
     monkeypatch.setattr(ow, "scan", lambda *a, **k: (_ for _ in ()).throw(AssertionError("scanned")))
     assert asyncio.run(ow.tick(env["runner"], now=1.0, state=_held_state(env, 0))) == 0
+
+
+# --- t_121bd42e: cancelled-then-rerun ordering + the wake names the run url --
+
+def test_cancel_then_rerun_success_same_check_is_green():
+    # [cancelled@t0, success@t0+17s], one check: the newer run decides
+    runs = [_run(1, "cancelled", 1, "override_lint / override_lint"),
+            _run(2, "success", 1, "override_lint / override_lint")]
+    assert ow.red_check_names(runs) == []
+
+
+def test_trailing_cancel_after_success_keeps_current_rule():
+    # [success@t0, cancelled@t0+17s]: a cancel carries no verdict and the same-sha
+    # success still grades the head (mirrors kanban-review-merge-pass effective_checks)
+    runs = [_run(1, "success", 1), _run(2, "cancelled", 1)]
+    assert ow.red_check_names(runs) == []
+    # a cancel with no other verdict on the check is still red
+    assert ow.red_check_names([_run(2, "cancelled", 1)]) == ["lint"]
+
+
+def test_red_wake_text_names_the_judged_check_run_url(monkeypatch):
+    url_old = "https://github.com/o/r/runs/1"
+    url_new = "https://github.com/o/r/runs/2"
+    runs = [dict(_row(1, 7, "success", "e2e"), html_url=url_old),
+            dict(_row(2, 7, "failure", "e2e"), html_url=url_new)]
+    _fake_repo_gh(monkeypatch, "o/r", 5, "a" * 40, runs, [])
+    health = ow.query_pr_health("o/r", 5)
+    assert health["failing"] == ["e2e"]
+    assert health["failing_urls"] == [url_new]   # the newest run, the one that judged red
+    assert ow.pr_is_red_or_dirty(health) == f"red: e2e <{url_new}>"
+    # an older health dict without urls still renders names only
+    assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["e2e"]}) == "red: e2e"

@@ -153,7 +153,24 @@
     "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/agent/test_pool_affinity_header.py",
-      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py"
+      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_non_pool_provider_carries_none"
+    ],
+    "call_site": "agent/chat_completion_helpers.py::_build_anthropic_kwargs",
+    "call_site_tests": [
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_non_pool_provider_carries_none"
     ],
     "paths": [
       "agent/fork_ext/relay_headers.py",
@@ -198,7 +215,20 @@
       "tests/gateway/test_fork_ext_restart_policy.py",
       "tests/gateway/test_restart_cascade.py",
       "tests/gateway/test_auto_continue_interrupted_turns.py",
-      "tests/gateway/test_reboot_resume_reason.py"
+      "tests/gateway/test_reboot_resume_reason.py",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_wiring",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
+    ],
+    "call_site": "gateway/run.py::_bridge_config_to_env",
+    "call_site_tests": [
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_wiring",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
     ],
     "paths": [
       "gateway/fork_ext/restart_policy.py",
@@ -394,7 +424,28 @@
     "feature": "discord free-response channels: scalar coercion + quoted-bot-mention exemption",
     "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
-      "tests/fork_canaries/test_fork_canary_discord_free_response.py"
+      "tests/fork_canaries/test_fork_canary_discord_free_response.py",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_quoted_other_bot_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_other_bot_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_nickname_form_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_other_bot_plus_self_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_no_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_only_mention_position_flips_dispatch",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_quoted_mention_outside_free_response_is_upstream_shape",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_exemption_is_scoped_to_free_response_even_without_require_mention",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
+    ],
+    "call_site": "plugins/platforms/discord/adapter.py::DiscordAdapter._discord_message_admission",
+    "call_site_tests": [
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_quoted_other_bot_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_other_bot_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_nickname_form_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_other_bot_plus_self_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_no_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_only_mention_position_flips_dispatch",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_quoted_mention_outside_free_response_is_upstream_shape",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_exemption_is_scoped_to_free_response_even_without_require_mention",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
     ],
     "paths": [
       "plugins/platforms/discord/adapter.py"
