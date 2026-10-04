@@ -38,6 +38,10 @@ class PromptSubmitParams(SessionParams):
     # fork (turn_system_context capability, advertised on session.create/resume/info): per-turn trusted
     # metadata appended to the ephemeral system prompt for THIS turn only — never in the user text.
     system_context: str | None = None
+    # fork: the trusted origin room the voice warm client (pipecat-house-voice tier3_warm_client)
+    # sends on EVERY turn beside ``system_context``. Accepted and not read by the handler (the room
+    # reaches the model via ``system_context`` / the text); forbidding it fails every turn (t_f146c725).
+    room: str | None = None
     # Desktop-generated large-paste preview (first ~1000 chars); TITLE input only, never the model turn.
     title_preview: str | None = None
     truncate_before_user_ordinal: int | None = None
