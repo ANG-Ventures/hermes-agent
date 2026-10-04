@@ -325,6 +325,86 @@ def test_pr_red_or_dirty_pure():
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["lint"]}) == "red: lint"
 
 
+# --- cancelled duplicate check runs (t_65e5d76f) ------------------------------
+
+# The real set on ANG-Ventures/hermes-home#2694 head 0a6680ba789e: two
+# concurrency-cancelled override_lint runs and the success that superseded them,
+# each in its own check suite, all workflow 368437559 / pull_request.
+_SHA_2694 = "0a6680ba789e159616aa8a0b3bd876937c5c54c1"
+_RUNS_2694 = [
+    {"id": 111348374621, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "cancelled", "check_suite": {"id": 100688518781}},
+    {"id": 111348374885, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "cancelled", "check_suite": {"id": 100688518866}},
+    {"id": 111348380187, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "success", "check_suite": {"id": 100688523611}},
+]
+_WF_2694 = {"workflow_runs": [
+    {"check_suite_id": s, "workflow_id": 368437559, "event": "pull_request"}
+    for s in (100688518781, 100688518866, 100688523611)]}
+
+
+def _fake_gh(monkeypatch, runs, workflow_runs, calls=None):
+    def fake(path):
+        if calls is not None:
+            calls.append(path)
+        if path == "repos/ANG-Ventures/hermes-home/pulls/2694":
+            return {"state": "open", "merged_at": None, "mergeable_state": "clean",
+                    "head": {"sha": _SHA_2694}}
+        if path.startswith(f"repos/ANG-Ventures/hermes-home/commits/{_SHA_2694}/check-runs"):
+            return {"check_runs": runs}
+        if path.startswith("repos/ANG-Ventures/hermes-home/actions/runs?head_sha="):
+            return workflow_runs
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+
+
+def test_pr_2694_superseded_cancels_are_not_red(monkeypatch):
+    _fake_gh(monkeypatch, _RUNS_2694, _WF_2694)
+    health = ow.query_pr_health("ANG-Ventures/hermes-home", 2694)
+    assert health["failing"] == []
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_pr_2694_unreadable_workflow_map_fails_closed(monkeypatch):
+    _fake_gh(monkeypatch, _RUNS_2694, None)
+    health = ow.query_pr_health("ANG-Ventures/hermes-home", 2694)
+    assert health["failing"] == ["override_lint / override_lint"] * 2
+
+
+def test_all_pass_head_skips_the_workflow_read(monkeypatch):
+    calls: list = []
+    runs = [dict(r, conclusion="success") for r in _RUNS_2694]
+    _fake_gh(monkeypatch, runs, _WF_2694, calls)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == []
+    assert not any("actions/runs" in c for c in calls)
+
+
+def _run(rid, concl, suite, name="lint"):
+    return {"id": rid, "name": name, "conclusion": concl, "check_suite": {"id": suite}}
+
+
+def test_red_check_names_rules():
+    wf = {1: (10, "pull_request"), 2: (10, "pull_request"), 3: (20, "pull_request"),
+          4: (10, "push")}
+    # all runs of a check cancelled: stays red
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(2, "cancelled", 2)], wf) == ["lint"]
+    # a later failure is never hidden by an earlier success
+    assert ow.red_check_names([_run(1, "success", 1), _run(2, "failure", 2)], wf) == ["lint"]
+    # a re-run success supersedes an earlier failure of the SAME check
+    assert ow.red_check_names([_run(1, "failure", 1), _run(2, "success", 2)], wf) == []
+    # skipped is no verdict: the failure still decides
+    assert ow.red_check_names([_run(1, "failure", 1), _run(2, "skipped", 2)], wf) == ["lint"]
+    # another workflow's same-named success hides nothing
+    assert ow.red_check_names([_run(1, "failure", 1), _run(3, "success", 3)], wf) == ["lint"]
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(3, "success", 3)], wf) == ["lint"]
+    # a push run is not a re-run of the pull_request run
+    assert ow.red_check_names([_run(1, "failure", 1), _run(4, "success", 4)], wf) == ["lint"]
+    # one suite: the newest run decides
+    assert ow.red_check_names([_run(1, "failure", 1), _run(2, "success", 1)]) == []
+    assert ow.red_check_names([_run(1, "timed_out", 1, "e2e")]) == ["e2e"]
+
+
 def test_heartbeat_is_never_a_trigger_pure():
     assert "heartbeat" not in ow.SCAN_KINDS
     assert ow.is_stuck("heartbeat", {}) is False
