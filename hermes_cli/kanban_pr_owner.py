@@ -272,7 +272,8 @@ def pr_cards(conn: sqlite3.Connection, target: tuple) -> list:
     rows = conn.execute(
         "SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND ("
         "title LIKE ? OR idempotency_key LIKE ? OR id IN (SELECT task_id FROM task_runs "
-        "WHERE metadata LIKE ? OR metadata LIKE ?)) ORDER BY created_at, id",
+        # rowid, not id: ids are random hex, so a same-second tie on id is a coin flip.
+        "WHERE metadata LIKE ? OR metadata LIKE ?)) ORDER BY created_at, rowid",
         (f"%#{n}%", f"rebase:{repo}#{n}@%", f"%{repo}#{n}%", f"%{repo}/pull/{n}%"),
     ).fetchall()
     return [(r[0], r[1], r[2]) for r in rows if target in card_pr_targets(conn, r[0])]
