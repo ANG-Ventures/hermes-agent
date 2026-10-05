@@ -821,3 +821,58 @@ def test_quoted_environment_file_is_ignored_like_systemd(tmp_path):
     unit = tmp_path / "u.service"
     unit.write_text(f'[Service]\nEnvironment=HERMES_HOME=/srv/a\nEnvironmentFile="{env_file}"\n', encoding="utf-8")
     assert gw._hermes_home_pinned_by_unit(unit) == "/srv/a"
+
+
+class TestDropInsDecideTheOwner:
+    """Prism 4858f713d757 (#1740 @89400941): the owner is the EFFECTIVE HERMES_HOME, fragment plus drop-ins.
+    A fragment pinning A with a drop-in repinning B is B's unit; reading the fragment alone let A rewrite or
+    remove B's running gateway and refused B."""
+
+    def test_dropin_repin_wins(self, tmp_path):
+        unit = tmp_path / "user" / "hermes-gateway.service"
+        (unit.parent / "hermes-gateway.service.d").mkdir(parents=True)
+        unit.write_text(REAL_UNIT.format(home="/srv/a"), encoding="utf-8")
+        (unit.parent / "hermes-gateway.service.d" / "10-home.conf").write_text(
+            '[Service]\nEnvironment="HERMES_HOME=/srv/b"\n', encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/b"
+
+    def test_dropins_apply_in_basename_order_and_prefix_dirs_count(self, tmp_path):
+        unit = tmp_path / "user" / "hermes-gateway.service"
+        for d in ("hermes-gateway.service.d", "hermes-.service.d", "service.d"):
+            (unit.parent / d).mkdir(parents=True)
+        unit.write_text(REAL_UNIT.format(home="/srv/a"), encoding="utf-8")
+        (unit.parent / "hermes-gateway.service.d" / "10-x.conf").write_text(
+            "[Service]\nEnvironment=HERMES_HOME=/srv/b\n", encoding="utf-8")
+        (unit.parent / "hermes-.service.d" / "20-y.conf").write_text(
+            "[Service]\nEnvironment=HERMES_HOME=/srv/c\n", encoding="utf-8")
+        (unit.parent / "service.d" / "05-z.conf").write_text(
+            "[Service]\nEnvironment=HERMES_HOME=/srv/z\n", encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/c"
+
+    def test_non_conf_files_are_ignored(self, tmp_path):
+        unit = tmp_path / "user" / "hermes-gateway.service"
+        (unit.parent / "hermes-gateway.service.d").mkdir(parents=True)
+        unit.write_text(REAL_UNIT.format(home="/srv/a"), encoding="utf-8")
+        (unit.parent / "hermes-gateway.service.d" / "10-home.conf.bak").write_text(
+            "[Service]\nEnvironment=HERMES_HOME=/srv/b\n", encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/a"
+
+    def test_dropin_user_is_the_service_user(self, tmp_path):
+        unit = tmp_path / "user" / "hermes-gateway.service"
+        (unit.parent / "hermes-gateway.service.d").mkdir(parents=True)
+        unit.write_text("[Service]\nUser=alice\n", encoding="utf-8")
+        (unit.parent / "hermes-gateway.service.d" / "10-user.conf").write_text("[Service]\nUser=bob\n",
+                                                                                  encoding="utf-8")
+        assert gw._read_systemd_user_from_unit(unit) == "bob"
+
+    def test_install_refuses_the_fragment_home_when_a_dropin_repins(self, systemd_unit, homes):
+        """The scratch caller matches the FRAGMENT's pin; the drop-in makes the unit the real home's."""
+        systemd_unit.path.write_text(REAL_UNIT.format(home=homes.scratch), encoding="utf-8")
+        dropins = systemd_unit.path.parent / "hermes-gateway.service.d"
+        dropins.mkdir()
+        (dropins / "50-home.conf").write_text(f'[Service]\nEnvironment="HERMES_HOME={homes.real}"\n',
+                                              encoding="utf-8")
+        before = systemd_unit.path.read_text(encoding="utf-8")
+        with pytest.raises(SystemExit):
+            gw.systemd_install(force=True, non_interactive=True)
+        assert systemd_unit.path.read_text(encoding="utf-8") == before

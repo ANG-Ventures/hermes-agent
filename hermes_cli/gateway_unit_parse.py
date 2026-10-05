@@ -178,17 +178,102 @@ def _env_file_vars(text: str) -> dict:
 
 
 def pinned_hermes_home(unit_path: Path, account_home: str | None = None) -> str | None:
-    """``HERMES_HOME`` pinned by the unit file at *unit_path* (plus its ``EnvironmentFile=`` bodies), as
-    systemd resolves it; None when the file is unreadable or pins nothing."""
+    """``HERMES_HOME`` pinned by the unit at *unit_path* (fragment, its drop-ins, and their
+    ``EnvironmentFile=`` bodies), as systemd resolves it; None when the fragment is unreadable or pins nothing."""
+    texts = unit_texts(unit_path)
+    if texts is None:
+        return None
+    return environment_of(texts, account_home or manager_home_for_unit(unit_path)).get("HERMES_HOME") or None
+
+
+# systemd's unit search path (systemd.unit(5) "Unit File Load Path"), highest priority first. Drop-in
+# directories are looked up in EVERY one of them, not only beside the fragment.
+_SYSTEM_LOOKUP_DIRS = ("/etc/systemd/system.control", "/run/systemd/system.control", "/run/systemd/transient",
+                       "/run/systemd/generator.early", "/etc/systemd/system", "/etc/systemd/system.attached",
+                       "/run/systemd/system", "/run/systemd/system.attached", "/run/systemd/generator",
+                       "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system",
+                       "/run/systemd/generator.late")
+
+
+def _is_system_unit(unit_path: Path) -> bool:
+    path = str(unit_path)
+    return any(path == d or path.startswith(d + "/") for d in _SYSTEM_LOOKUP_DIRS)
+
+
+def _user_lookup_dirs(fragment_dir: str) -> list[str]:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    # The fragment's own directory is the user config dir systemd --user reads ($XDG_CONFIG_HOME/systemd/user,
+    # resolved by the caller against the account home); the rest are the fixed user search path.
+    return [fragment_dir + ".control", f"{runtime}/systemd/user.control", f"{runtime}/systemd/transient",
+            f"{runtime}/systemd/generator.early", fragment_dir, "/etc/systemd/user", f"{runtime}/systemd/user",
+            "/run/systemd/user", f"{runtime}/systemd/generator", "/usr/local/share/systemd/user",
+            "/usr/share/systemd/user", "/usr/local/lib/systemd/user", "/usr/lib/systemd/user",
+            f"{runtime}/systemd/generator.late"]
+
+
+def _dropin_names(name: str) -> list[str]:
+    """Unit names whose ``<name>.d/`` directories apply to *name*, most specific first (dropin.c
+    ``unit_file_expand_dropin_names``): the name, its dash-prefix names (``a-b-c.service`` -> ``a-b-.service``,
+    ``a-.service``), then the unit-type top level (``service``)."""
+    stem, dot, suffix = name.rpartition(".")
+    if not dot:
+        return [name]
+    names = [name]
+    prefix = stem
+    while True:
+        chopped = False
+        while True:
+            dash = prefix.rfind("-")
+            if dash <= 0:
+                prefix = ""
+                break
+            if dash + 1 != len(prefix) or chopped:
+                prefix = prefix[:dash + 1]
+                break
+            prefix, chopped = prefix[:dash], True
+        if not prefix:
+            break
+        names.append(f"{prefix}.{suffix}")
+    return names + [suffix]
+
+
+def dropin_paths(unit_path: Path) -> list[Path]:
+    """The ``*.conf`` drop-ins systemd applies to the unit at *unit_path*, in application order: every
+    ``<name>.d/`` of every lookup directory, one file per basename (a higher-priority directory masks the same
+    basename further down), applied in basename order so a later file overrides an earlier one."""
+    unit_path = Path(unit_path)
+    if _is_system_unit(unit_path):
+        frag = str(unit_path.parent)
+        lookup = list(_SYSTEM_LOOKUP_DIRS) if frag in _SYSTEM_LOOKUP_DIRS else [frag, *_SYSTEM_LOOKUP_DIRS]
+    else:
+        lookup = _user_lookup_dirs(str(unit_path.parent))
+    chosen: dict[str, Path] = {}
+    for directory in dict.fromkeys(lookup):
+        for name in _dropin_names(unit_path.name):
+            d = Path(directory) / f"{name}.d"
+            try:
+                entries = sorted(d.iterdir())
+            except OSError:
+                continue
+            for f in entries:
+                if f.name.endswith(".conf") and f.name not in chosen:
+                    chosen[f.name] = f
+    return [chosen[k] for k in sorted(chosen)]
+
+
+def unit_texts(unit_path: Path) -> list[str] | None:
+    """The fragment's text followed by each applicable drop-in's, in the order systemd applies them; None when
+    the fragment is unreadable. An unreadable drop-in or one masked to ``/dev/null`` contributes nothing."""
     try:
-        text = unit_path.read_text(encoding="utf-8-sig")
+        texts = [Path(unit_path).read_text(encoding="utf-8-sig")]
     except (OSError, ValueError):
         return None
-    return environment_of([text], account_home or manager_home_for_unit(unit_path)).get("HERMES_HOME") or None
-
-
-_SYSTEM_UNIT_DIRS = ("/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system",
-                     "/usr/lib/systemd/system", "/lib/systemd/system")
+    for p in dropin_paths(unit_path):
+        try:
+            texts.append(p.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+    return texts
 
 
 def manager_home_for_unit(unit_path: Path) -> str:
@@ -199,8 +284,7 @@ def manager_home_for_unit(unit_path: Path) -> str:
     Both come from the passwd database by uid (``systemctl --user`` reaches the manager of this process's
     uid), never from ``HOME`` / ``HERMES_REAL_HOME``, which the caller controls."""
     import pwd
-    path = str(unit_path)
-    uid = 0 if any(path == d or path.startswith(d + "/") for d in _SYSTEM_UNIT_DIRS) else os.getuid()
+    uid = 0 if _is_system_unit(unit_path) else os.getuid()
     try:
         return pwd.getpwuid(uid).pw_dir
     except KeyError:

@@ -1229,14 +1229,14 @@ def _systemctl_show(properties: tuple[str, ...], *, system: bool) -> dict[str, s
 
 def _unit_environment_value(unit_path: Path, name: str) -> str | None:
     """Effective value of ``NAME`` in the ``[Service]`` environment of the unit file at *unit_path*, read with
-    systemd's grammar (``hermes_cli.gateway_unit_parse``, the parser shared with the fleet lint); None when
-    the file is unreadable or the variable is not set."""
-    from hermes_cli.gateway_unit_parse import environment_of, manager_home_for_unit
-    try:
-        text = unit_path.read_text(encoding="utf-8-sig")
-    except (OSError, ValueError):
+    systemd's grammar (``hermes_cli.gateway_unit_parse``, the parser shared with the fleet lint), drop-ins
+    included (a drop-in that repins ``HERMES_HOME`` decides the owner); None when the file is unreadable or
+    the variable is not set."""
+    from hermes_cli.gateway_unit_parse import environment_of, manager_home_for_unit, unit_texts
+    texts = unit_texts(unit_path)
+    if texts is None:
         return None
-    return environment_of([text], manager_home_for_unit(unit_path)).get(name, "").strip() or None
+    return environment_of(texts, manager_home_for_unit(unit_path)).get(name, "").strip() or None
 
 
 def _hermes_home_pinned_by_unit(unit_path: Path) -> str | None:
@@ -2814,12 +2814,14 @@ def _system_service_identity(run_as_user: str | None = None) -> tuple[str, str, 
 
 
 def _read_systemd_user_from_unit(unit_path: Path) -> str | None:
-    if not unit_path.exists():
-        return None
-    for line in unit_path.read_text(encoding="utf-8-sig").splitlines():
-        if line.startswith("User="):
-            return line.split("=", 1)[1].strip() or None
-    return None
+    """The effective ``[Service] User=`` of the unit (fragment, then drop-ins; the last assignment wins), or None."""
+    from hermes_cli.gateway_unit_parse import unit_assignments, unit_texts
+    texts = unit_texts(unit_path) if unit_path.exists() else None
+    user = None
+    for section, key, val in (a for t in texts or [] for a in unit_assignments(t)):
+        if section == "Service" and key == "User":
+            user = val or None
+    return user
 
 
 def _default_system_service_user() -> str | None:

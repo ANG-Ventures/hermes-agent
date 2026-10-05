@@ -918,6 +918,20 @@ def _install_default_before_removal(
     return True
 
 
+def _undo_default_preinstall(
+    target: Optional[tuple[str, bool]], home: Path, definition: Optional[Path], had_definition: bool,
+) -> Optional[Path]:
+    """Remove (disable + unlink) a default definition that a failed preinstall wrote; one that existed before
+    is never touched. Returns the definition when it is still on disk afterwards, else None."""
+    if target is None or definition is None or had_definition or not definition.exists():
+        return None
+    try:
+        _service_op(*target, "uninstall", home)
+    except Exception as exc:
+        print(f"  ⚠ could not remove the default's half-installed service definition ({exc})")
+    return definition if definition.exists() else None
+
+
 def _restart_default(
     plan_default: ProfileGateway,
     target: Optional[tuple[str, bool]],
@@ -1148,12 +1162,22 @@ def apply_migration(plan: MigrationPlan, *, served_wait: float = _SERVED_WAIT_SE
         print(f"  ✓ default: gateway.multiplex_profiles: true ({plan.default_home / 'config.yaml'})")
         # ORDER: the default's definition is written (not started) BEFORE anything is removed, so a refused
         # write is learned while every secondary still has its service; removal is the last destructive step.
+        definition = _definition_path(*target, plan.default_home) if target is not None else None
+        had_definition = definition is not None and definition.exists()
         try:
             preinstalled = _install_default_before_removal(plan, target, run_as_user=run_as_user)
         except Exception as exc:
-            # Nothing destructive has happened: every secondary still runs under its own service. Undo the
-            # only write (the flag), forget the manifest, and stop; no gateway needs compensating.
+            # Nothing destructive has happened: every secondary still runs under its own service. Undo every
+            # write: the flag, AND a definition the install wrote (and maybe enabled) before a later step raised;
+            # left behind, it boots the default standalone next to the secondaries on their bot tokens.
+            leftover = _undo_default_preinstall(target, plan.default_home, definition, had_definition)
             _write_multiplex_flag(plan.default_home, plan.multiplex_flag_on)
+            if leftover is not None:
+                _print([f"✗ Migration failed before removing anything: the default's gateway service could not be "
+                        f"installed ({exc}), and the definition it wrote could not be removed: {leftover}.",
+                        f"  Manifest kept at {_manifest_path(plan.default_home)}; remove that definition, then "
+                        f"re-run {MIGRATE_COMMAND}."])
+                return False
             _manifest_path(plan.default_home).unlink(missing_ok=True)
             _print([f"✗ Migration refused before removing anything: the default's gateway service could not be "
                     f"installed ({exc}).", "  Every per-profile gateway is untouched; fix the refusal and re-run "

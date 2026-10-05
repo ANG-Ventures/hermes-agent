@@ -641,6 +641,57 @@ def test_refused_default_install_aborts_before_any_removal(fleet, monkeypatch, c
     assert not (fleet.root / gm.MANIFEST_NAME).exists()
 
 
+def _failing_after_write(fleet, monkeypatch, *, uninstall_fails=False):
+    """The default's install writes (and enables) its definition, then a later step raises."""
+    from hermes_cli import gateway as gw
+    unit = gw.get_systemd_unit_path(system=False)
+    monkeypatch.setattr(gm, "_definition_path", lambda kind, system, home: unit if _name(home) == "default" else None)
+    real_op = gm._service_op
+
+    def _op(kind, system, verb, home, *, run_as_user=None):
+        if _name(home) == "default" and verb == "install":
+            real_op(kind, system, verb, home, run_as_user=run_as_user)
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            unit.write_text("[Service]\nExecStart=/x\n", encoding="utf-8")
+            raise RuntimeError("systemctl enable failed after the unit was written")
+        if _name(home) == "default" and verb == "uninstall":
+            if uninstall_fails:
+                raise RuntimeError("uninstall refused")
+            unit.unlink(missing_ok=True)
+        real_op(kind, system, verb, home, run_as_user=run_as_user)
+
+    monkeypatch.setattr(gm, "_service_op", _op)
+    return unit
+
+
+def test_failed_preinstall_removes_the_definition_it_wrote(fleet, monkeypatch, capsys):
+    """Prism 49c77d8aa2ac (#1740 @89400941): a default install that fails AFTER writing (and enabling) its
+    definition must not leave it behind: at the next boot it would run standalone next to the untouched
+    secondaries on their bot tokens. The definition is uninstalled, then flag and manifest are rolled back."""
+    unit = _failing_after_write(fleet, monkeypatch)
+    before = dict(fleet.services)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "refused before removing anything" in out
+    assert not unit.exists()
+    assert ("default", "uninstall") in fleet.ops
+    assert ("default", "systemd", False) not in fleet.enabled
+    assert fleet.services == before
+    assert _config_flag(fleet.root) is False
+    assert not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_failed_preinstall_rollback_failure_keeps_the_manifest(fleet, monkeypatch, capsys):
+    """Same failure, and the definition cannot be removed: recovery information stays on disk."""
+    unit = _failing_after_write(fleet, monkeypatch, uninstall_fails=True)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert unit.exists()
+    assert "could not be removed" in out
+    assert (fleet.root / gm.MANIFEST_NAME).exists()
+    assert [op for op in fleet.ops if op[0] != "default" and op[1] in ("stop", "uninstall")] == []
+
+
 def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(fleet, monkeypatch, capsys):
     """Flag flipped, secondaries gone, default never came up (the process died mid-apply): the re-run
     must finish the migration from the manifest — with the recorded User= — instead of reporting
