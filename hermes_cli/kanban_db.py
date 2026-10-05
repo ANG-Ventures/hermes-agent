@@ -7156,6 +7156,10 @@ def _validate_comment_provenance(
     return run_id, session_ref
 
 
+# Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
+_CLAIMED_AUTHOR_MAX = 200
+
+
 def add_comment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7164,6 +7168,7 @@ def add_comment(
     *,
     run_id: Optional[int] = None,
     session_ref: Optional[str] = None,
+    claimed_author: Optional[str] = None,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -7171,11 +7176,22 @@ def add_comment(
     ``hermes_cli.kanban_identity.resolve_comment_provenance``), never from
     caller-supplied tool args or comment text — the same rule ``author`` already
     follows.
+
+    ``claimed_author`` is an author label the caller asked for but was not
+    allowed to use (``kanban comment --author`` without the operator token).
+    It is recorded on the ``commented`` event and the journal only; every
+    reader of ``task_comments.author`` keeps seeing the real author.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if claimed_author is not None:
+        if not isinstance(claimed_author, str) or not claimed_author.strip():
+            raise ValueError("claimed_author must be a non-empty string")
+        if len(claimed_author) > _CLAIMED_AUTHOR_MAX:
+            raise ValueError(f"claimed_author longer than {_CLAIMED_AUTHOR_MAX} chars")
+        claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
     if _is_delegated_child():
@@ -7188,12 +7204,15 @@ def add_comment(
         conn.execute("PRAGMA query_only=OFF")
         try:
             return _add_comment_txn(
-                conn, task_id, author, body, run_id, session_ref, now
+                conn, task_id, author, body, run_id, session_ref, now,
+                claimed_author,
             )
         finally:
             conn.execute("PRAGMA query_only=ON")
             _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
-    return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now)
+    return _add_comment_txn(
+        conn, task_id, author, body, run_id, session_ref, now, claimed_author
+    )
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7215,6 +7234,7 @@ def _add_comment_txn(
     run_id: Optional[int],
     session_ref: Optional[str],
     now: int,
+    claimed_author: Optional[str] = None,
 ) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -7239,6 +7259,7 @@ def _add_comment_txn(
                 # Non-secret fingerprint only, so the event log stays
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
+                **({"claimed_author": claimed_author} if claimed_author else {}),
             },
             run_id=run_id,
         )
@@ -7262,6 +7283,7 @@ def _add_comment_txn(
                     "session_ref": session_ref,
                     "created_at": now,
                     "comment_id": int(cur.lastrowid or 0),
+                    **({"claimed_author": claimed_author} if claimed_author else {}),
                 },
                 actor=author.strip(),
                 run_id=run_id,
