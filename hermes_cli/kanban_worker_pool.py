@@ -531,14 +531,20 @@ def advance_streak(prev: Optional[Mapping], at: Optional[float], band: str, *,
                    hot_streak: int, clear_streak: int, now: float,
                    discard_after_s: float) -> dict:
     """One sample's step of the per-host hysteresis (F-5). A repeated ``at``
-    is a no-op; UNKNOWN resets; state older than ``discard_after_s`` is
-    discarded first."""
+    is a no-op; state older than ``discard_after_s`` is discarded first.
+
+    UNKNOWN neither builds nor erases a streak (I-3, F-5 addendum t_36840c8a):
+    the state is kept as-is, ``updated`` included, so an earned hot verdict
+    still needs ``clear_streak`` fresh non-hot samples and a host that stays
+    UNKNOWN past ``discard_after_s`` starts over. ``plan()`` refuses the
+    UNKNOWN tick itself."""
     st = dict(prev) if isinstance(prev, Mapping) else {}
     updated = st.get("updated")
     if not isinstance(updated, (int, float)) or now - float(updated) > discard_after_s:
         st = {}
     if band == BAND_UNKNOWN or at is None:
-        return {"at": None, "hot": False, "hot_run": 0, "clear_run": 0, "updated": now}
+        return {"at": st.get("at"), "hot": bool(st.get("hot")), "hot_run": int(st.get("hot_run") or 0),
+                "clear_run": int(st.get("clear_run") or 0), "updated": st.get("updated")}
     if st.get("at") == at:
         return st
     hot, hot_run, clear_run = bool(st.get("hot")), int(st.get("hot_run") or 0), int(st.get("clear_run") or 0)
