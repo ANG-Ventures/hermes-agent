@@ -328,6 +328,9 @@ def test_pr_red_or_dirty_pure():
 _GATE, _ROLLUP = "Review label gate / Review label gate", "All required checks pass"
 
 
+_ONLY_LABELS = frozenset({"review-labels"})
+
+
 @pytest.mark.parametrize(("failing", "labels", "mss", "want"), [
     # t_9479baf8: the CI-sensitive review-label gate alone (+ the aggregator it fails), no label yet -> label pending
     ([_GATE, _ROLLUP], [], "blocked", None),
@@ -342,9 +345,56 @@ _GATE, _ROLLUP = "Review label gate / Review label gate", "All required checks p
     ([_GATE, _ROLLUP], [], "dirty", "dirty (merge conflict)"),
 ])
 def test_review_label_gate_is_label_pending_not_red(failing, labels, mss, want):
-    health = {"state": "open", "mergeable_state": mss, "failing": failing, "labels": labels}
+    health = {"state": "open", "mergeable_state": mss, "failing": failing, "labels": labels,
+              "rollup_failed_jobs": _ONLY_LABELS}
     assert ow.pr_is_red_or_dirty(health) == want
     assert ow.label_pending(health) is (want in (None, "dirty (merge conflict)"))
+
+
+@pytest.mark.parametrize("jobs", [
+    None,                                         # aggregator annotations unreadable: fail closed, wake
+    frozenset({"review-labels", "tests"}),        # a real job failure the rollup names
+    frozenset({"tests"}),                         # Prism P1 c585adb654b0: tests SKIPPED although detect says python
+])
+def test_rollup_failing_for_another_reason_still_wakes(jobs):
+    health = {"state": "open", "mergeable_state": "blocked", "failing": [_GATE, _ROLLUP], "labels": [],
+              "rollup_failed_jobs": jobs}
+    assert ow.label_pending(health) is False
+    assert ow.pr_is_red_or_dirty(health) == f"red: {_GATE}, {_ROLLUP}"
+
+
+def test_rollup_failed_jobs_parses_evaluate_needs_annotation():
+    # the real annotations on hermes-agent#1770's failing aggregator run 111884312146 (2026-10-05 17:06Z)
+    ann = [{"annotation_level": "failure", "message": "Process completed with exit code 1."},
+           {"annotation_level": "failure", "message": "1 job(s) failed: review-labels"},
+           {"annotation_level": "failure", "message": "review-labels concluded 'failure'; expected 'success' or 'skipped'"}]
+    assert ow.rollup_failed_jobs(ann) == frozenset({"review-labels"})
+    assert ow.rollup_failed_jobs([{"message": "2 job(s) failed: lint, tests"}]) == frozenset({"lint", "tests"})
+    assert ow.rollup_failed_jobs([{"message": "Process completed with exit code 1."}]) is None
+    assert ow.rollup_failed_jobs(None) is None
+
+
+@pytest.mark.parametrize(("ann", "want"), [
+    ([{"message": "1 job(s) failed: review-labels"}], None),
+    ([{"message": "1 job(s) failed: tests"}], f"red: {_GATE}, {_ROLLUP}"),
+    (None, f"red: {_GATE}, {_ROLLUP}"),
+])
+def test_query_pr_health_reads_the_rollup_annotation(monkeypatch, ann, want):
+    sha = "5422e9c36d2e5b3b26e62c0bd11ffa3086256619"
+
+    def fake(path):
+        if path == "repos/ANG-Ventures/hermes-agent/pulls/1770":
+            return {"state": "open", "merged_at": None, "mergeable_state": "blocked", "head": {"sha": sha},
+                    "labels": []}
+        if path.startswith(f"repos/ANG-Ventures/hermes-agent/commits/{sha}/check-runs"):
+            rows = [{"id": 1, "name": _GATE, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}},
+                    {"id": 2, "name": _ROLLUP, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}}]
+            return {"check_runs": rows if path.endswith("&page=1") else []}
+        if path == "repos/ANG-Ventures/hermes-agent/check-runs/2/annotations?per_page=100":
+            return ann
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+    assert ow.pr_is_red_or_dirty(ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)) == want
 
 
 def test_query_pr_health_carries_labels(monkeypatch):
@@ -358,6 +408,8 @@ def test_query_pr_health_carries_labels(monkeypatch):
             rows = [{"id": 1, "name": _GATE, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}},
                     {"id": 2, "name": _ROLLUP, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}}]
             return {"check_runs": rows if path.endswith("&page=1") else []}
+        if path == "repos/ANG-Ventures/hermes-agent/check-runs/2/annotations?per_page=100":
+            return [{"message": "1 job(s) failed: review-labels"}]
         raise AssertionError(path)
     monkeypatch.setattr(ow, "_gh_json", fake)
     health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)

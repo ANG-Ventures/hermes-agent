@@ -140,14 +140,35 @@ _REQUIRED_ROLLUP_RE = re.compile(r"^(?:.+ / )?All required checks pass$")
 REVIEW_LABEL = "ci-reviewed"
 
 
+# scripts/ci/evaluate_needs.py prints ``::error::N job(s) failed: a, b`` on the aggregator run.
+_ROLLUP_FAILED_RE = re.compile(r"^\d+ job\(s\) failed: (.+)$")
+_LABEL_JOB = "review-labels"
+
+
+def rollup_failed_jobs(annotations: Optional[list]) -> Optional[frozenset]:
+    """The jobs the aggregator run says failed, from its ``N job(s) failed: ...`` annotation, or None (unreadable)."""
+    for a in annotations or []:
+        m = _ROLLUP_FAILED_RE.match(str((a or {}).get("message") or "").strip())
+        if m:
+            return frozenset(x.strip() for x in m.group(1).split(",") if x.strip())
+    return None
+
+
 def label_pending(health: Optional[dict]) -> bool:
-    """True when the only red checks are the review-label gate (+ the required-checks aggregator) and the PR has no
-    ``ci-reviewed`` label yet. Labelled and still red is a real red (the gate re-ran and failed)."""
-    names = [str(n) for n in (health or {}).get("failing") or [] if n]
-    if REVIEW_LABEL in [str(x).strip().lower() for x in (health or {}).get("labels") or []]:
+    """True when the only red checks are the review-label gate (+ the required-checks aggregator), the aggregator
+    itself says it failed ONLY on ``review-labels`` (Prism P1 c585adb654b0: it also fails alone on a classifier
+    inconsistency, e.g. tests skipped while detect says python), and the PR has no ``ci-reviewed`` label yet.
+    Labelled and still red is a real red (the gate re-ran and failed)."""
+    health = health or {}
+    names = [str(n) for n in health.get("failing") or [] if n]
+    if REVIEW_LABEL in [str(x).strip().lower() for x in health.get("labels") or []]:
         return False
-    return any(_LABEL_GATE_RE.match(n) for n in names) and all(
-        _LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in names)
+    if not (any(_LABEL_GATE_RE.match(n) for n in names)
+            and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in names)):
+        return False
+    if any(_REQUIRED_ROLLUP_RE.match(n) for n in names):
+        return health.get("rollup_failed_jobs") == frozenset({_LABEL_JOB})
+    return True
 
 
 def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
@@ -371,7 +392,19 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         out["failing"] = [str(r.get("name") or "?") for r in red]
         # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
         out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
+        rollup = [r for r in red if _REQUIRED_ROLLUP_RE.match(str(r.get("name") or ""))]
+        if rollup and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) and r_id(rollup[0]):
+            # only read when label_pending could hinge on it; unreadable -> None -> not label pending (wakes)
+            out["rollup_failed_jobs"] = rollup_failed_jobs(
+                _gh_json(f"repos/{repo}/check-runs/{r_id(rollup[0])}/annotations?per_page=100"))
     return out
+
+
+def r_id(run: dict) -> Optional[int]:
+    try:
+        return int(run.get("id"))
+    except (TypeError, ValueError):
+        return None
 
 
 def default_pr_health() -> Optional[PrHealthFn]:
