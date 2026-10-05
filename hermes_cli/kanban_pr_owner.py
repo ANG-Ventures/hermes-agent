@@ -269,10 +269,12 @@ def spawn_owners(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] =
 def pr_cards(conn: sqlite3.Connection, target: tuple) -> list:
     """Every non-archived card working on ``target``, oldest first: ``[(id, status, assignee)]``."""
     repo, n = target
+    # Tiebreak on rowid (insertion order), not the random hex id: two cards
+    # created in the same second otherwise named a random one the owner.
     rows = conn.execute(
         "SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND ("
         "title LIKE ? OR idempotency_key LIKE ? OR id IN (SELECT task_id FROM task_runs "
-        "WHERE metadata LIKE ? OR metadata LIKE ?)) ORDER BY created_at, id",
+        "WHERE metadata LIKE ? OR metadata LIKE ?)) ORDER BY created_at, rowid",
         (f"%#{n}%", f"rebase:{repo}#{n}@%", f"%{repo}#{n}%", f"%{repo}/pull/{n}%"),
     ).fetchall()
     return [(r[0], r[1], r[2]) for r in rows if target in card_pr_targets(conn, r[0])]

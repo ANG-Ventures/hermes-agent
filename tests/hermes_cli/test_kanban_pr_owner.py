@@ -79,6 +79,23 @@ def test_second_card_on_a_running_pr_is_refused_with_owner_named(kanban_home, he
         assert detail["pr"] == "ang-ventures/hermes-agent#1624"
 
 
+def test_same_second_owner_wins_over_a_lower_sorting_helper_id(kanban_home, head_at):
+    """Main red 10-05 (t_471ee369): owner and helper created in one second were
+    ordered by their random hex ids, so ~half the time the helper was named owner."""
+    with kb.connect() as conn:
+        owner = _run_owner(conn)
+        for _ in range(64):
+            helper = kb.create_task(conn, title=f"fix red slice on {PR}", assignee="daedalus-fable")
+            if helper < owner:
+                break
+        assert helper < owner
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at = (SELECT created_at FROM tasks WHERE id = ?)",
+                         (owner,))
+        assert kpo.pr_cards(conn, ("ang-ventures/hermes-agent", 1624))[0][0] == owner
+        assert kpo.pr_owner_card(conn, ("ang-ventures/hermes-agent", 1624)) == owner
+
+
 def test_rebase_helper_is_refused_at_birth_naming_the_owner(kanban_home, head_at):
     with kb.connect() as conn:
         owner = _run_owner(conn)
