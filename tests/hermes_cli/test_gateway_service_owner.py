@@ -18,6 +18,7 @@ from hermes_cli import gateway_launchd
 from hermes_cli.gateway_service_owner import INSTALL_DISABLED_ENV
 
 _REAL_RETIRE_DROPIN = gw._retire_hermes_replace_dropin
+_REAL_IS_CURRENT = gw.systemd_unit_is_current
 LEGACY_DROPIN = ("# Added to end the gateway respawn storm\n[Service]\nExecStart=\n"
                  "ExecStart=/usr/bin/hermes gateway run --replace\n")
 
@@ -233,8 +234,157 @@ class TestSystemdWriters:
         assert systemd_unit.calls == []
 
 
+class TestRefusalLeavesTheEnvironmentAlone:
+    """A refused mutation must not adopt the other home into os.environ (Prism on #1740: the setup wizard
+    caught the refusal and went on with the FOREIGN home as its HERMES_HOME; a second refresh then passed)."""
+
+    @pytest.fixture
+    def system_scope(self, monkeypatch):
+        monkeypatch.setattr(gw, "_require_root_for_system_service", lambda action: None)
+        monkeypatch.setattr(gw, "_read_systemd_user_from_unit", lambda path: None)
+        monkeypatch.setattr(gw, "_ensure_system_service_linger", lambda *a, **k: True, raising=False)
+        # The production compare, with its os.environ adoption: that adoption is what these tests pin.
+        monkeypatch.setattr(gw, "systemd_unit_is_current", _REAL_IS_CURRENT)
+
+    def test_refused_system_install_keeps_the_callers_home(self, systemd_unit, homes, system_scope):
+        with pytest.raises(SystemExit):
+            gw.systemd_install(system=True, force=True, non_interactive=True)
+        assert Path(gw.get_hermes_home()) == homes.scratch
+        assert gw._explicit_hermes_home() == homes.scratch
+        # Nothing adopted: a second, forced attempt is refused the same way, not admitted as "its own".
+        with pytest.raises(SystemExit):
+            gw.systemd_install(system=True, force=True, non_interactive=True)
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+
+    def test_refused_system_refresh_keeps_the_callers_home(self, systemd_unit, homes, system_scope):
+        assert gw.refresh_systemd_unit_if_needed(system=True) is False
+        assert Path(gw.get_hermes_home()) == homes.scratch
+        assert gw.refresh_systemd_unit_if_needed(system=True) is False
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+
+    def test_refused_system_uninstall_keeps_the_callers_home_and_the_unit(self, systemd_unit, homes, system_scope,
+                                                                          monkeypatch):
+        monkeypatch.setattr(gw, "_systemd_scope_preamble", lambda action, system, **k: system)
+        gw.systemd_uninstall(system=True)
+        assert Path(gw.get_hermes_home()) == homes.scratch
+        assert systemd_unit.path.exists()
+        assert all(call[0] not in ("stop", "disable") for call in systemd_unit.calls)
+
+    def test_setup_wizard_catch_path_keeps_the_callers_home(self, systemd_unit, homes, system_scope, monkeypatch):
+        from hermes_cli import gateway_setup_wizard as wiz
+        started = []
+        monkeypatch.setattr(gw, "prompt_yes_no", lambda *a, **k: True)
+        monkeypatch.setattr(gw, "is_wsl", lambda: False)
+        monkeypatch.setattr(gw, "prompt_linux_gateway_install_scope", lambda: "system")
+        monkeypatch.setattr(gw, "_default_system_service_user", lambda: "ace")
+        monkeypatch.setattr(gw, "_system_service_identity",
+                            lambda run_as_user=None: ("ace", "ace", str(homes.real.parent), 1000))
+        monkeypatch.setattr(gw.os, "geteuid", lambda: 0, raising=False)
+        monkeypatch.setattr(gw, "_setup_service_action", lambda *a, **k: started.append(a))
+        wiz._wizard_install_service("systemd")
+        assert started == [], "a refused install must not start the other home's service"
+        assert Path(gw.get_hermes_home()) == homes.scratch
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+
+
+class TestRemovers:
+    def test_legacy_unit_removal_skips_a_unit_pinning_another_home(self, systemd_unit, homes, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(homes.real))
+        own = tmp_path / "systemd" / "hermes.service"
+        own.write_text(REAL_UNIT.format(home=homes.real), encoding="utf-8")
+        monkeypatch.setattr(gw, "_find_legacy_hermes_units", lambda: [
+            ("hermes.service", own, False), ("hermes-gateway-old.service", systemd_unit.path, False)])
+        systemd_unit.path.write_text(REAL_UNIT.format(home=homes.scratch), encoding="utf-8")
+        removed, remaining = gw.remove_legacy_hermes_units(interactive=False)
+        assert removed == 1 and not own.exists()
+        assert remaining == [systemd_unit.path] and systemd_unit.path.exists()
+
+    def test_worker_kill_switch_blocks_legacy_unit_removal(self, systemd_unit, homes, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(homes.real))
+        monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
+        monkeypatch.setattr(gw, "_find_legacy_hermes_units", lambda: [("hermes.service", systemd_unit.path, False)])
+        removed, remaining = gw.remove_legacy_hermes_units(interactive=False)
+        assert removed == 0 and remaining == [systemd_unit.path] and systemd_unit.path.exists()
+        assert systemd_unit.calls == []
+
+    def test_uninstall_leaves_another_homes_unit(self, systemd_unit, monkeypatch):
+        monkeypatch.setattr(gw, "_systemd_scope_preamble", lambda action, system, **k: system)
+        gw.systemd_uninstall(system=False)
+        assert systemd_unit.path.exists() and systemd_unit.calls == []
+
+    def test_worker_kill_switch_blocks_uninstall_of_own_unit(self, systemd_unit, homes, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(homes.real))
+        monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
+        monkeypatch.setattr(gw, "_systemd_scope_preamble", lambda action, system, **k: system)
+        gw.systemd_uninstall(system=False)
+        assert systemd_unit.path.exists() and systemd_unit.calls == []
+
+
+class TestRunAsUserRemap:
+    """P2 890f17d44d83: a --system unit installed with --run-as-user pins the SERVICE user's home
+    (/home/alice/.hermes), not root's; the operator's reinstall from /root/.hermes owns it."""
+
+    def test_reinstall_of_a_remapped_system_unit_is_admitted(self, systemd_unit, tmp_path, monkeypatch):
+        root_home, alice_home = tmp_path / "root", tmp_path / "alice"
+        for h in (root_home / ".hermes", alice_home / ".hermes"):
+            h.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
+        monkeypatch.setenv("HERMES_HOME", str(root_home / ".hermes"))
+        monkeypatch.setattr(gw, "_require_root_for_system_service", lambda action: None)
+        monkeypatch.setattr(gw, "_read_systemd_user_from_unit", lambda path: "alice")
+        monkeypatch.setattr(gw, "_system_service_identity",
+                            lambda run_as_user=None: ("alice", "alice", str(alice_home), 1001))
+        monkeypatch.setattr(gw, "_ensure_system_service_linger", lambda *a, **k: True, raising=False)
+        monkeypatch.setattr(gw, "_native_service_homes", lambda: {(root_home / ".hermes").resolve()})
+        systemd_unit.path.write_text(REAL_UNIT.format(home=alice_home / ".hermes"), encoding="utf-8")
+        monkeypatch.setattr(gw, "generate_systemd_unit", lambda system=False, run_as_user=None:
+                            "User=alice\n" + REAL_UNIT.format(home=alice_home / ".hermes"))
+        gw.systemd_install(system=True, force=True, run_as_user="alice", non_interactive=True)
+        assert systemd_unit.path.read_text(encoding="utf-8").startswith("User=alice")
+        assert ("daemon-reload",) in systemd_unit.calls
+
+
 class TestPinnedHomeParsing:
     """The owner check reads HERMES_HOME the way systemd does; a missed pin reads as "unowned"."""
+
+    def test_comment_inside_a_continuation_does_not_lose_the_pin(self, tmp_path):
+        # systemd.syntax: a comment line inside a continued line is skipped and the continuation goes on.
+        unit = tmp_path / "u.service"
+        unit.write_text('[Service]\nEnvironment="PATH=/usr/bin" \\\n# the home\n  "HERMES_HOME=/srv/other"\n',
+                        encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/other"
+
+    def test_only_the_service_section_pins(self, tmp_path):
+        unit = tmp_path / "u.service"
+        unit.write_text('[Unit]\nEnvironment="HERMES_HOME=/srv/other"\n[Service]\nExecStart=/x\n'
+                        '[Install]\nEnvironment="HERMES_HOME=/srv/install"\n', encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) is None
+        unit.write_text('[Service]\nEnvironment="HERMES_HOME=/srv/other"\n[Install]\nEnvironment=\n',
+                        encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/other", "an [Install] reset must not clear [Service]"
+
+    def test_environment_file_overrides_environment(self, tmp_path):
+        env_file = tmp_path / "gw.env"
+        env_file.write_text("HERMES_HOME=/srv/from-file\n", encoding="utf-8")
+        unit = tmp_path / "u.service"
+        unit.write_text(f'[Service]\nEnvironment="HERMES_HOME=/srv/inline"\nEnvironmentFile=-{env_file}\n',
+                        encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/from-file"
+        unit.write_text(f'[Service]\nEnvironment="HERMES_HOME=/srv/inline"\nEnvironmentFile=-{tmp_path}/missing\n',
+                        encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/inline"
+
+    def test_parser_follows_systemd_grammar_end_to_end(self):
+        """ONE parser (vendored from the fleet gateway-unit lint): section state, continuation across a
+        comment, quoted multi-assign words, specifier expansion, reset, EnvironmentFile and UnsetEnvironment."""
+        from hermes_cli import gateway_unit_parse as p
+        assert list(p.unit_assignments("[Service]\nA=1 \\\n# c\n 2\n")) == [("Service", "A", "1  2")]
+        text = ('[Service]\nEnvironment="A=x y" B=%%h \\\n; note\n C=%h/.v\nUnsetEnvironment=B\n'
+                '[Install]\nEnvironment=\n')
+        assert p.environment_of([text], "/home/u") == {"A": "x y", "C": "/home/u/.v"}
+        files = {"/etc/gw.env": 'C="/srv/file"\n'}
+        assert p.environment_of(["[Service]\nEnvironment=C=/inline\nEnvironmentFile=/etc/gw.env\n"], None,
+                                env_files=files) == {"C": "/srv/file"}
 
     @pytest.mark.parametrize("line", [
         'Environment="PATH=/usr/bin" "HERMES_HOME={home}"',
@@ -429,3 +579,34 @@ class TestInstallCommand:
 def test_execute_code_children_keep_the_worker_kill_switch():
     from tools.code_execution_env import _HERMES_CHILD_ALLOWED
     assert INSTALL_DISABLED_ENV in _HERMES_CHILD_ALLOWED
+
+
+class TestChokepointLint:
+    """``scripts/check_service_definition_writers.py`` (CI lint): every service-definition write/remove in
+    the gateway modules reaches ``assert_may_mutate``; a writer that bypasses it is a lint failure."""
+
+    @pytest.fixture
+    def guard(self):
+        import importlib.util
+        repo = Path(gw.__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "check_service_definition_writers", repo / "scripts" / "check_service_definition_writers.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_the_shipped_gateway_modules_pass(self, guard):
+        assert guard.main([]) == 0
+
+    def test_a_bypassing_writer_is_flagged(self, guard, tmp_path, monkeypatch):
+        bad = tmp_path / "hermes_cli" / "gateway_launchd.py"
+        bad.parent.mkdir()
+        bad.write_text(
+            "def ok(plist_path):\n    assert_may_mutate(plist_path, 'x')\n    plist_path.write_text('a')\n"
+            "def via_helper(plist_path):\n    ok(plist_path)\n    plist_path.unlink()\n"
+            "def bad(unit_path):\n    unit_path.write_text('b')\n"
+            "def marker(path):\n    path.write_text('not a definition')\n",
+            encoding="utf-8")
+        monkeypatch.setattr(guard, "ROOT", tmp_path)
+        problems = guard.scan_file(bad)
+        assert len(problems) == 1 and "bad() mutates unit_path" in problems[0]

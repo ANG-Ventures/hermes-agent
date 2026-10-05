@@ -591,15 +591,15 @@ def test_explicit_migrate_with_no_standalone_secondaries_still_flips_flag_and_re
 
 
 def test_failed_default_bringup_compensates_to_one_detached_gateway(fleet, monkeypatch, capsys):
-    """#110850: the last step (install/start the default) is the one that can fail after the
-    destructive ones. It must not leave the flag on with no gateway anywhere. The compensator can
-    no longer rebuild the fleet (the flipped host lock refuses it), and the recorded service
-    manager is the very thing that just failed — so it falls back to ONE detached gateway."""
+    """#110850: the last step (start the default) is the one that can fail after the destructive ones.
+    It must not leave the flag on with no gateway anywhere. The compensator can no longer rebuild the
+    fleet (the flipped host lock refuses it), and the recorded service manager is the very thing that
+    just failed — so it falls back to ONE detached gateway."""
     real_op = gm._service_op
 
     def _refusing(kind, system, verb, home, *, run_as_user=None):
-        if verb == "install" and _name(home) == "default":
-            raise ValueError("Refusing to install the gateway system service as root; pass --run-as-user root")
+        if verb in ("start", "restart") and _name(home) == "default":
+            raise ValueError(f"systemctl {verb} failed: unit not found")
         real_op(kind, system, verb, home, run_as_user=run_as_user)
 
     monkeypatch.setattr(gm, "_service_op", _refusing)
@@ -617,17 +617,36 @@ def test_failed_default_bringup_compensates_to_one_detached_gateway(fleet, monke
     assert not after.blocked and after.standalone_secondaries == []
 
 
+def test_refused_default_install_aborts_before_any_removal(fleet, monkeypatch, capsys):
+    """t_8749a807 (Prism on #1740, premature removal): the default's service definition is WRITTEN before
+    any secondary is removed, so an install the writers refuse (another home's unit, an unadmitted home, the
+    worker kill switch, a root refusal) is learned while every per-profile gateway still has its service.
+    Nothing is removed, the flag is put back, no manifest is left behind, and no compensation runs."""
+    real_op = gm._service_op
+
+    def _refusing(kind, system, verb, home, *, run_as_user=None):
+        if verb == "install" and _name(home) == "default":
+            raise RuntimeError(f"gateway service install for {home} was refused")  # what _service_op raises on SystemExit
+        real_op(kind, system, verb, home, run_as_user=run_as_user)
+
+    monkeypatch.setattr(gm, "_service_op", _refusing)
+    before = dict(fleet.services)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "refused before removing anything" in out
+    assert "Restoring one host gateway" not in out
+    assert fleet.services == before, "every secondary keeps its service"
+    assert [op for op in fleet.ops if op[1] in ("stop", "uninstall")] == []
+    assert _config_flag(fleet.root) is False
+    assert not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
 def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(fleet, monkeypatch, capsys):
     """Flag flipped, secondaries gone, default never came up (the process died mid-apply): the re-run
     must finish the migration from the manifest — with the recorded User= — instead of reporting
     'already multiplexed' over a fleet with no gateway at all."""
     fleet.services["coder"] = ("systemd", True)
     monkeypatch.setattr(gm, "_systemd_service_user", lambda home, services: "root" if _name(home) == "coder" else None)
-    with pytest.MonkeyPatch.context() as dying:
-        dying.setattr(gm, "_restart_default", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
-        with pytest.raises(KeyboardInterrupt):
-            gm.apply_migration(gm.build_migration_plan(), served_wait=0.1)
-    assert _config_flag(fleet.root) is True and "coder" not in fleet.services and "default" not in fleet.services
     installs = []
     real_op = gm._service_op
 
@@ -637,9 +656,18 @@ def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(flee
         real_op(kind, system, verb, home, run_as_user=run_as_user)
 
     monkeypatch.setattr(gm, "_service_op", _recording)
+    with pytest.MonkeyPatch.context() as dying:
+        dying.setattr(gm, "_restart_default", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            gm.apply_migration(gm.build_migration_plan(), served_wait=0.1)
+    # The default's unit (with the recorded User=) was written BEFORE the secondaries were removed.
+    assert _config_flag(fleet.root) is True and "coder" not in fleet.services
+    assert installs == [("default", "systemd", True, "root")]
+    assert fleet.services["default"] == ("systemd", True)
     plan = gm.build_migration_plan()
     assert plan.interrupted and not plan.already_multiplexed
     assert gm.apply_migration(plan, served_wait=5.0) is True
+    # The resume restarts the unit the interrupted apply already wrote; it does not install a second time.
     assert installs == [("default", "systemd", True, "root")]
     assert "serves 3 profiles" in capsys.readouterr().out
 
