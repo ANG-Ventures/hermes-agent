@@ -93,7 +93,7 @@ def test_stale_pressure_is_unknown_not_hot(sig):
         d = p.detail["ace-ai"]
         assert p.slots["ace-ai"] == 0 and d["reachable"] is False and d["band"] == kwp.BAND_UNKNOWN
         assert d["hot"] is False and d["pressure"] == "pressure unknown (stale 130s)"
-    state = json.loads(sig.state_path.read_text())["hosts"]["ace-ai"]
+    state = json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]
     assert state["hot"] is False and state["hot_run"] == 0
     # The file turns fresh and hot: the streak starts from zero (UNKNOWN reset).
     fleet.set("ace-ai", 0.95)
@@ -108,7 +108,7 @@ def test_two_takes_on_one_hot_probe_still_admit(sig):
     p = _plan(fleet, sig)
     assert p.take("alpha", pin="ace-ai").name == "ace-ai"
     assert p.take("alpha", pin="ace-ai").name == "ace-ai"
-    assert json.loads(sig.state_path.read_text())["hosts"]["ace-ai"]["hot_run"] == 1
+    assert json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]["hot_run"] == 1
 
 
 def test_hot_after_two_samples_clear_after_three(sig):
@@ -128,7 +128,7 @@ def test_repeated_remote_at_is_a_noop(sig):
     for _ in range(4):  # same at four ticks running: one sample
         p = _plan(fleet, sig)
     assert p.slots["ace-ai"] == 4
-    assert json.loads(sig.state_path.read_text())["hosts"]["ace-ai"]["hot_run"] == 1
+    assert json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]["hot_run"] == 1
 
 
 def test_streak_state_older_than_3x_stale_is_discarded(sig):
@@ -238,7 +238,7 @@ def test_read_signal_false_plan_is_byte_identical_on_replay():
         import replay_driver
     finally:
         sys.path.remove(str(FIXTURES))
-    assert replay_driver.replay() == replay_driver.GOLDEN.read_text(encoding="utf-8")
+    assert replay_driver.replay() == replay_driver.GOLDEN.read_text(encoding="utf-8-sig")
 
 
 def test_read_signal_config_key():
@@ -343,7 +343,7 @@ def test_e2e_hot_ace_ai_places_on_ace_media(board, caplog):
     _res, spawned = _dispatch(plan)
     assert spawned == [(tid, "ace-media")]
     builder.record_placements([(tid, "ace-media")])
-    led = json.loads((board / "var" / "placement" / "host-reservations.kanban.json").read_text())
+    led = json.loads((board / "var" / "placement" / "host-reservations.kanban.json").read_text(encoding="utf-8-sig"))
     assert led["consumer"] == "kanban" and led["ttl_s"] == 180
     assert led["hosts"]["ace-media"]["busy_units"] == 1
     for line in caplog.messages:

@@ -92,7 +92,7 @@ def read_all(directory: Path, policy, *, now: Optional[float] = None) -> List[Re
     for path in paths:
         consumer = path.name[len(FILE_PREFIX):-len(FILE_SUFFIX)]
         try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue
         if not isinstance(doc, dict) or not isinstance(doc.get("hosts"), dict):
@@ -150,7 +150,7 @@ def projected(host: str, load1: float, reservations: Iterable[Reservation], *,
 @contextlib.contextmanager
 def _locked(path: Path, wait_s: float = LOCK_WAIT_SECONDS):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path.with_name(path.name + ".lock"), "a", encoding="utf-8")  # noqa: SIM115 - closed in finally
+    fh = open(path.with_name(path.name + ".lock"), "ab")  # noqa: SIM115  # windows-footgun: ok (binary lock handle, never read)
     try:
         if fcntl is not None:
             deadline = time.monotonic() + wait_s
@@ -173,7 +173,7 @@ def update_json(path: Path, fn: Callable[[Mapping], Mapping]) -> dict:
     path = Path(path)
     with _locked(path):
         try:
-            old = json.loads(path.read_text(encoding="utf-8"))
+            old = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             old = {}
         new = dict(fn(old if isinstance(old, dict) else {}))

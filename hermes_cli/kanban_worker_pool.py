@@ -517,7 +517,7 @@ def read_pressure(remote_now: Optional[float], text: str, *, stale_after_s: floa
 
 def _load_state(path: Path) -> dict:
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        doc = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     hosts = doc.get("hosts") if isinstance(doc, dict) else None

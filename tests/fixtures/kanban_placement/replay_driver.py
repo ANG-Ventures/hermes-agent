@@ -19,7 +19,7 @@ def _hosts():
 
 
 def replay(**plan_kw) -> str:
-    ticks = json.loads(FIXTURE.read_text(encoding="utf-8"))["ticks"]
+    ticks = json.loads(FIXTURE.read_text(encoding="utf-8-sig"))["ticks"]
     out = []
     for n, t in enumerate(ticks):
         answers = t["probe"]
