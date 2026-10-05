@@ -23,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -57,7 +58,7 @@ def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, s
     no yolo/approval env inherited from the invoking agent."""
     home = home.resolve()
     assert home != real_user_home(), f"refusing to run a probe against the real HOME: {home}"
-    env = {k: v for k, v in os.environ.items()
+    env = {k: v for k, v in environ_snapshot().items()
            if not (k.endswith(_STRIP_SUFFIXES) or k.startswith(_STRIP_PREFIXES)) and k not in _DROP}
     env.update(
         HOME=str(home),

@@ -58,6 +58,27 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _one_shot_pool_plan(gate, config):
+    """The gateway's ONE pool plan for a one-shot dispatch (KWLB), or None.
+
+    None (no gate, refused pool, nothing to plan) keeps remote pins waiting
+    ``pool_unavailable``; they never run locally.
+    """
+    if gate is None:
+        return None
+    try:
+        from gateway.kanban_gate_tick import live_boards, running_split, standalone_builder
+
+        kcfg = (config or {}).get("kanban") if isinstance(config, dict) else None
+        builder = standalone_builder(gate, lambda: kcfg if isinstance(kcfg, dict) else {})
+        boards = live_boards()
+        _local, remote_by_host = running_split(builder._ledger(boards))
+        return builder.plan_pool(boards, remote_by_host)
+    except Exception as exc:
+        print(f"warning: kanban pool plan failed, remote pins wait: {exc}", file=sys.stderr)
+        return None
+
+
 def _one_shot_load_gate(conn, args, config, additive):
     """Apply ``kanban.dispatch_load_gate`` to one ``kanban dispatch`` call.
 
@@ -87,6 +108,7 @@ def _one_shot_load_gate(conn, args, config, additive):
         gate = _klg.gate_from_config(config if isinstance(config, dict) else None)
     except Exception:
         return out
+    out["gate"] = gate
     load1, load5 = _klg.sample_loadavg()
     if not gate.enabled or load1 is None:
         out["info"] = {"state": "disabled" if not gate.enabled else "unavailable"}
@@ -233,6 +255,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
             spawn_paused=gate["spawn_paused"],
             spawn_limit=gate["spawn_limit"],
+            spillover=_one_shot_pool_plan(gate.get("gate"), _cfg),
+            # --max is additive across local AND remote spawns (total budget).
+            max_new=additive,
         )
         if gate["override"] is not None and not args.dry_run and res.spawned:
             # Attribute any load episode to the override on every card it

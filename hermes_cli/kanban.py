@@ -3779,6 +3779,12 @@ def _print_stranded_by_triage(stranded) -> None:
     )
 
 
+def _cmd_session_closeout(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_session_closeout
+
+    return kanban_session_closeout.run(args)
+
+
 def _cmd_home_index(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_home_index
 
@@ -4502,7 +4508,7 @@ _HANDLERS = {
     "triage-resolve": _cmd_triage_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
-    "home-index": _cmd_home_index,
+    "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-status": _cmd_notify_status,

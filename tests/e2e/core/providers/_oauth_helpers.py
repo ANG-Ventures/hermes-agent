@@ -22,6 +22,7 @@ from typing import Any, Callable
 import hermes_yaml as yaml
 
 from tests.fakes.providers.anthropic_messages import ApiError, AnthropicMessagesServer, Reply, Response, Text, ToolUse
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TAG_VAR = "OAUTH_E2E_TAG"
@@ -49,7 +50,7 @@ class FakeHome:
         assert fixture != real_root and fixture.parent != real_root / "profiles", (
             f"fixture HERMES_HOME {fixture} is the real install's live home")
         env = {
-            k: v for k, v in os.environ.items()
+            k: v for k, v in environ_snapshot().items()
             if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_ENV_SUFFIXES)
         }
         env.update({

@@ -1247,6 +1247,10 @@ hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
 hermes kanban stats [--json]                           # per-status + per-assignee counts
+hermes kanban session-closeout <sid>... [--out PATH] [--vault-out PATH] [--vault DIR]
+        [--root DIR] [--no-network] [--check] [--json]  # read-only closeout of a session's cards on every board:
+                                                        # status accounting, waves/rounds, rulings, open remainder,
+                                                        # blackbox cost, root-cause ledger, ang-closeout gates
 hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]

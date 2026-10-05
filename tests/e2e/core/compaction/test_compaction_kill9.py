@@ -38,6 +38,7 @@ from tests.e2e.core.compaction._helpers import (
     generate_transcript,
     good_summary,
 )
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO = Path(__file__).resolve().parents[4]
 HIGH_THRESHOLD = 60_000
@@ -88,7 +89,7 @@ def _child_env(home: Path) -> dict:
     # Probe hygiene: tmp HOME/HERMES_HOME, no provider keys. The in-test db guard detects pytest by
     # process ancestry and would read this tmp $HOME/.hermes as the production root; the documented
     # child-process escape hatch is safe because every path here lives under tmp_path.
-    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    env = {k: v for k, v in environ_snapshot().items() if not k.endswith("_API_KEY")}
     env.update(HOME=str(home), HERMES_HOME=str(home / ".hermes"), PYTHONPATH=str(REPO), PYTHONUNBUFFERED="1",
                HERMES_STATE_DB_GUARD_BYPASS="1")
     return env

@@ -49,6 +49,7 @@ from tests.e2e.core.upgrade._helpers import WORKTREE, isolated_env
 
 import hermes_cli.config as C
 from hermes_cli.config_defaults import DEFAULT_CONFIG
+from tests.e2e.environ_snapshot import environ_snapshot
 
 LATEST = int(DEFAULT_CONFIG["_config_version"])
 
@@ -1020,7 +1021,7 @@ def gen_dotenv(seed: int) -> tuple[str, list[str], dict[str, str]]:
 
 @pytest.fixture
 def env_restore(monkeypatch):
-    saved = dict(os.environ)
+    saved = environ_snapshot()
     monkeypatch.setenv("PATH", _BASE_PATH)
     monkeypatch.setenv("HERMES_MULTIPLEX_PROFILES", "0")
     yield

@@ -3418,18 +3418,25 @@ class GatewayKanbanWatchersMixin:
                 load_gate.worker_load_cost, load_gate.ramp_seconds,
                 load_gate.max_spawn_per_tick, load_gate.load5_floor,
             )
-        def _sample_spawn_pause() -> "tuple[Optional[int], Optional[str]]":
-            """(allowance, reason) for this tick; (None, None) = no limit.
+        # KWLB v0.1: ONE GateTick per tick (band, LOCAL allowance, ONE shared
+        # pool plan). The gate's slope sees LOCAL workers only (PRD 5.2.4).
+        from gateway.kanban_gate_tick import GateTickBuilder, format_tick_line
 
-            Host-wide running count feeds the gate's load-per-worker slope
-            (t_bf26e8f1); CPU busy is sampled inside ``admit_now``.
-            """
-            running = None
-            if load_gate.enabled:
-                from hermes_cli import kanban_load_gate as _klg_mod
+        def _kanban_cfg_now() -> dict:
+            try:
+                cfg = _load_config()
+            except Exception:
+                return {}
+            k = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            return k if isinstance(k, dict) else {}
 
-                running = _klg_mod.count_running_workers()
-            return load_gate.admit_now(running=running)
+        _gate_ticks = GateTickBuilder(
+            load_gate,
+            fleet_dir=lambda: _kb.kanban_home() / "fleet",
+            kanban_cfg=_kanban_cfg_now,
+            ledger=lambda boards: _kb.count_running_by_placement(boards),
+            connect=lambda board=None: _kb.connect(board=board),
+        )
 
         _proc_paged = {"episode": False}
 
@@ -3509,7 +3516,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None, spillover=None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -3565,6 +3572,7 @@ class GatewayKanbanWatchersMixin:
                     spawn_limit=spawn_limit,
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
+                    spillover=spillover,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -3625,7 +3633,9 @@ class GatewayKanbanWatchersMixin:
             # that have spawnable work, rotating the first pick every tick
             # (t_f78d1938: consumed in fixed board order, default first, the
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
-            _allowance, _spawn_paused = _sample_spawn_pause()
+            _tick = _gate_ticks.build(boards)
+            _allowance, _spawn_paused = _tick.local_allowance, _tick.spawn_paused
+            _placed: list = []
             # Host-exhaustion transient blocks clear when the host does
             # (t_b660edb6); requeued inside each board's dispatch tick.
             _requeue_note = _host_recovery_note(load_gate)
@@ -3692,13 +3702,21 @@ class GatewayKanbanWatchersMixin:
                         f"load gate: this tick's allowance of {_allowance} "
                         f"spawn(s) is used by other boards"
                     )
+                # spawn_limit is an int whenever the gate is enabled (0 when
+                # paused): the LOCAL budget only (I-11). Boards tick strictly
+                # sequentially in this thread: the shared plan is unlocked (I-12).
                 res = _tick_once_for_board(
                     slug, budget_cache, _paused,
-                    None if _paused else _limit,
+                    None if _allowance is None else (0 if _paused else _limit),
                     requeue_note=_requeue_note,
+                    spillover=_tick.remote_plan,
                 )
                 out.append((slug, res))
-                _n = len(getattr(res, "spawned", None) or []) if res is not None else 0
+                _res_placed = list(getattr(res, "placed", None) or []) if res is not None else []
+                _placed.extend(_res_placed)
+                # Local spawns only (by id, never spawned - placed): the
+                # split was over the LOCAL allowance.
+                _n = _kbd._local_spawn_count(res) if res is not None else 0
                 _tick_spawned += _n
                 if _spare is not None:
                     # Quota this board did not use (concurrency cap, demand
@@ -3734,6 +3752,9 @@ class GatewayKanbanWatchersMixin:
                 load_gate.boards = {
                     k: v for k, v in _board_stats.items() if v["ready"] > 0
                 }
+            if _tick.remote_plan is not None:
+                load_gate.pool = _tick.remote_plan.snapshot()
+                logger.info("%s", format_tick_line(load_gate, _tick, _tick_spawned, _placed))
             _finish_gate_tick(_tick_spawned)
             return out
 

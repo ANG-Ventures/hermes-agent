@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1407,13 +1408,24 @@ class TestReadProcessCmdlinePsFallback:
     """Tests for _read_process_cmdline falling back to ps on non-Linux."""
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
+        # Both earlier tiers must be unable to answer; otherwise psutil reads the
+        # runner's real process table for this pid and the host decides the result.
+        def denied(pid):
+            raise PermissionError(f"psutil denied for {pid}")
+
+        ps_calls = []
+
+        def fake_run(args, **kwargs):
+            ps_calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n")
+
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
-        monkeypatch.setattr(
-            status.subprocess, "run",
-            lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),
-        )
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=denied))
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
         result = status._read_process_cmdline(873)
         assert result == "/usr/libexec/bluetoothuserd"
+        assert ps_calls and "873" in ps_calls[0]
 
 
     def test_proc_cmdline_takes_priority_over_ps(self, monkeypatch):

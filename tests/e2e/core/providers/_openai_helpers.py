@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterator, Mapping
 import hermes_yaml as yaml
 
 from tests.e2e.core._pending_fixes import known_gate
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TURN_TIMEOUT = 150.0
@@ -125,7 +126,7 @@ class Home:
         real_root = Path(pwd.getpwuid(os.getuid()).pw_dir, ".hermes").resolve()  # windows-footgun: ok — every file here is skipif(not linux)
         fixture = self.hermes_home.resolve()
         assert fixture != real_root and fixture.parent != real_root / "profiles", "fixture is a live home"
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_ENV_SUFFIXES)}
         env.update({
             "HOME": str(self.home), "HERMES_HOME": str(self.hermes_home), "PYTHONPATH": str(REPO_ROOT),
