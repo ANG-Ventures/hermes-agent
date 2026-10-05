@@ -13,6 +13,8 @@ user-facing guidance:
   never quarantines the handle;
 * a sibling process holding the write lock when the detach runs is waited out, not a lost write;
 * a quarantine that lands while the detach waits stops it: nothing is committed on the file;
+* a sibling open that re-arms the sync triggers after this handle failed open does not cost the
+  next canonical write (the handle detaches again);
 """
 
 import sqlite3
@@ -239,3 +241,68 @@ def test_quarantine_while_detach_waits_commits_nothing(tmp_path):
     finally:
         db.close()
         reset_storage_state(db_path)
+
+
+def test_failed_open_handle_detaches_again_after_a_sibling_open_rearms_triggers(tmp_path, monkeypatch):
+    """Torture-chamber race (t_6f0a146b): writer A fails open between a sibling B's stale-breadcrumb
+    read and B's FTS DDL, so B's CREATE TRIGGER IF NOT EXISTS re-arms the sync triggers over the still
+    corrupt index. A's next canonical write hits those triggers and must detach again, not raise."""
+    db_path = tmp_path / "state.db"
+    a = SessionDB(db_path=db_path)
+    b = None
+    try:
+        _seed(a, rows=5)
+        _stomp_fts_shadow(db_path)
+        real_ensure = SessionDB._ensure_fts_schema
+        fired = []
+
+        def a_fails_open_mid_open(self, cursor, table_name, ddl):
+            if self is not a and not fired:
+                fired.append(True)
+                a.append_message("s1", "user", "A fails open while B opens")
+            return real_ensure(self, cursor, table_name, ddl)
+
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", a_fails_open_mid_open)
+        b = SessionDB(db_path=db_path)
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", real_ensure)
+        if not a._fts_stale:
+            pytest.skip("this SQLite build defers FTS shadow corruption past the insert trigger")
+        raw = sqlite3.connect(str(db_path))
+        try:
+            rearmed = raw.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_fts_insert'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        assert rearmed == 1, "precondition: B's open re-armed the sync triggers over the corrupt index"
+
+        a.append_message("s1", "user", "A writes after B re-armed")
+
+        assert _contents(db_path)[-1] == "A writes after B re-armed"
+        assert a._db_corrupt is False
+    finally:
+        if b is not None:
+            b.close()
+        a.close()
+
+
+def test_failed_open_handle_with_nothing_rearmed_does_not_detach_again(tmp_path):
+    """The converse: a stale handle whose triggers are still detached reports the FTS error as not
+    its to absorb (no write retry loop), and leaves the breadcrumb alone."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        _seed(db, rows=5)
+        _stomp_fts_shadow(db_path)
+        db.append_message("s1", "user", "fails open")
+        if not db._fts_stale:
+            pytest.skip("this SQLite build defers FTS shadow corruption past the insert trigger")
+        exc = sqlite3.DatabaseError('fts5: corrupt structure record for table "messages_fts"')
+        exc.sqlite_errorcode = 267
+
+        assert db._enter_fts_fail_open(exc) is False
+        assert db._fts_stale is True
+        db.append_message("s1", "user", "still lands")
+        assert _contents(db_path)[-1] == "still lands"
+    finally:
+        db.close()
