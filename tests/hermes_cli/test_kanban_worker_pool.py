@@ -470,6 +470,20 @@ def test_pool_unavailable_pins_are_logged(kanban_home, caplog):
 
 
 
+def test_remote_pin_below_a_prose_host_header_still_waits_without_a_plan(kanban_home):
+    """Prism 56085b64 (Pin Bypass): a ``Host:`` header above a real pin made
+    ``resolve_pin`` return both a pin and an ignored word, and the no-plan
+    branch only recorded ``pool_unavailable`` when nothing was ignored, so
+    the remote pin spawned LOCALLY (breaks I-11)."""
+    _write_pool(kanban_home / "fleet")
+    with kb.connect_closing() as conn:
+        (pinned,) = _make(conn, 1, body="Host: example.com\nhost:ace-ai")
+        (plain,) = _make(conn, 1)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert spawned == [(plain, None)]
+    assert res.placement_waits[pinned] == "pool_unavailable"
+
+
 # -- Apollo review r1 (PR #1730) -------------------------------------------
 
 def test_reservation_is_refunded_when_launch_fails_before_spawn(kanban_home):

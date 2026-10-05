@@ -4302,7 +4302,9 @@ def _dispatch_once_locked(
             _pin, _ignored = _kwp.resolve_pin(r["body"], _known)
             if _ignored is not None:
                 _kwp.note_ignored_pin(r["id"], _ignored)
-            elif _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
+            # Not ``elif``: a prose ``Host:`` line above a real pin returns
+            # BOTH, and the pin must still wait (Prism 56085b64).
+            if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:
