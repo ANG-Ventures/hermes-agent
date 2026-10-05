@@ -126,6 +126,17 @@ class ProviderProfile:
     # other providers (including an unregistered fallback) get ordinary details only.
     native_reasoning_details_type: str | None = None
 
+    # supports_reasoning_effort: the chat-completions wire takes OpenAI's top-level
+    # ``reasoning_effort`` field. Capability, not identity: the transport emits the
+    # user's effort (clamped onto ``supported_reasoning_efforts(model)``, default the
+    # OpenAI-compatible vocabulary) for ANY profile that declares it, with no
+    # provider-name branch — a proxy fronting several vendors (CLIProxyAPI) declares
+    # it once and the knob reaches every model it serves. Profiles whose wire shape
+    # is bespoke (``extra_body.reasoning``, ``thinking`` toggles) keep emitting it
+    # from ``build_api_kwargs_extras``; the generic emission only fills a request
+    # the profile's own hooks left without a reasoning control. Unset stays unset.
+    supports_reasoning_effort: bool = False
+
     # ── External-process providers (auth_type="external_process") ──
     # An agent CLI driven over stdio (ACP) rather than an HTTP endpoint. These
     # describe how to launch it; hermes_cli/auth.py's
@@ -339,6 +350,13 @@ class ProviderProfile:
         block on network I/O — answer from a cache and return None while
         cold.
         """
+        return None
+
+    def reasoning_effort_overrides(self, model: str | None) -> dict[str, str] | None:
+        """Declared vendor mapping consulted before the nearest-weaker clamp for *model*
+        (e.g. Kimi K3's ``medium → high``: ``high`` is its positional middle AND server
+        default, so rounding down to ``low`` would be the wrong neighbour). None = none.
+        Only read for profiles with ``supports_reasoning_effort``."""
         return None
 
     def create_client(self, **client_kwargs: Any) -> Any | None:

@@ -196,3 +196,88 @@ def test_plain_hand_clone_inside_clone_still_refuses(board, scratch):
     with pytest.raises(survivor.SurvivorUnavailable) as caught:
         _complete(board, tid, ws)
     assert NESTED in str(caught.value)
+
+
+# --- recursive and by-sha-fetched pins (t_0b0f392d) --------------------------
+
+
+@pytest.fixture
+def three_level(tmp_path):
+    """project -> components/mid -> third_party/leaf, all pinned and clean."""
+    leaf = _init(tmp_path / "remotes" / "leaf", "leaf.c")
+    mid = _init(tmp_path / "remotes" / "mid", "mid.c")
+    git(mid, "submodule", "add", str(leaf), "third_party/leaf")
+    git(mid, "commit", "-m", "pin leaf")
+    project = _init(tmp_path / "remotes" / "project3")
+    git(project, "submodule", "add", str(mid), "components/mid")
+    git(project, "commit", "-m", "pin mid")
+    ws = tmp_path / "workspace3"
+    ws.mkdir()
+    git(ws, "clone", "--recurse-submodules", str(project), "sat")
+    sat = ws / "sat"
+    leaf_co = sat / "components" / "mid" / "third_party" / "leaf"
+    assert (leaf_co / ".git").exists(), "fixture: second-level submodule must be checked out"
+    (sat / "code.py").write_text("value = 2\n")
+    return ws, sat, leaf_co
+
+
+def test_recursive_clean_pinned_submodules_complete(board, three_level):
+    ws, _sat, _leaf = three_level
+    tid = _card(board, ws)
+    result = _complete(board, tid, ws)
+    assert _captured(result) == {"sat"}, result
+
+
+def test_dirty_second_level_submodule_still_refuses(board, three_level):
+    ws, _sat, leaf = three_level
+    (leaf / "leaf.c").write_text("value = 9\n")
+    tid = _card(board, ws)
+    with pytest.raises(survivor.SurvivorUnavailable) as caught:
+        _complete(board, tid, ws)
+    assert NESTED in str(caught.value)
+
+
+@pytest.fixture
+def pinned_off_branch(tmp_path):
+    """Gitlink names a commit no branch of the remote holds; clone fetches it by sha.
+
+    The house-voice shape: sat pins libpeer 9319aa4, an upstream merge that the
+    fork's branches do not contain, so the submodule has no remote-tracking ref
+    holding HEAD -- only FETCH_HEAD records that the remote served it.
+    """
+    lib = _init(tmp_path / "remotes" / "forklib", "lib.c")
+    git(lib, "config", "uploadpack.allowAnySHA1InWant", "true")
+    git(lib, "checkout", "-b", "side")
+    (lib / "lib.c").write_text("value = 7\n")
+    git(lib, "commit", "-am", "side only")
+    side = git(lib, "rev-parse", "HEAD")
+    project = _init(tmp_path / "remotes" / "project-side")
+    git(project, "submodule", "add", "-b", "side", str(lib), "deps/lib")
+    git(project, "commit", "-m", "pin side")
+    git(lib, "checkout", "main")
+    git(lib, "branch", "-D", "side")  # no branch holds the pin any more
+    ws = tmp_path / "workspace-side"
+    ws.mkdir()
+    git(ws, "clone", "--recurse-submodules", str(project), "sat")
+    sub = ws / "sat" / "deps" / "lib"
+    assert git(sub, "rev-parse", "HEAD") == side
+    assert not git(sub, "for-each-ref", "--contains", side, "refs/remotes"), \
+        "fixture: no remote-tracking ref may hold the pin"
+    (ws / "sat" / "code.py").write_text("value = 2\n")
+    return ws, sub
+
+
+def test_submodule_fetched_by_sha_from_its_remote_completes(board, pinned_off_branch):
+    ws, _sub = pinned_off_branch
+    tid = _card(board, ws)
+    result = _complete(board, tid, ws)
+    assert _captured(result) == {"sat"}, result
+
+
+def test_fetch_head_from_unconfigured_url_still_refuses(board, pinned_off_branch, tmp_path):
+    ws, sub = pinned_off_branch
+    git(sub, "remote", "set-url", "origin", str(tmp_path / "elsewhere"))
+    tid = _card(board, ws)
+    with pytest.raises(survivor.SurvivorUnavailable) as caught:
+        _complete(board, tid, ws)
+    assert NESTED in str(caught.value)
