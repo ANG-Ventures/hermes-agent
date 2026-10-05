@@ -24,13 +24,21 @@ import pytest
 
 import hermes_cli.gateway as gateway_cli
 
+GENERATED_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.hermes.gateway</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/osascript</string><string>-e</string><string>x</string></array>
+</dict></plist>
+"""
+
 
 @pytest.fixture
 def launchd_seam(monkeypatch, tmp_path):
     """Neutralize process-side effects; record every launchctl invocation."""
     calls = []
     plist_path = tmp_path / "ai.hermes.gateway.plist"
-    plist_path.write_text("<plist>whatever</plist>", encoding="utf-8")
+    # Generated (osascript) shape: a foreign plist is preserved on purpose and takes another path.
+    plist_path.write_text(GENERATED_PLIST, encoding="utf-8")
 
     monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
     monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
@@ -94,3 +102,19 @@ def test_failed_refresh_routes_to_bounded_bootstrap_not_the_90s_kickstart(monkey
     )
     bootstraps = [c for c in launchd_seam if c[:2] == ["launchctl", "bootstrap"]]
     assert bootstraps, "the bounded bootstrap revival must run instead"
+
+
+def test_protected_foreign_plist_skips_the_raw_bootstrap(monkeypatch, launchd_seam):
+    """A refresh that deliberately left a foreign plist alone also returns False, but the job is still
+    registered: a raw bootstrap would fail EIO and drop to a detached gateway. Use the kickstart path."""
+    monkeypatch.delenv(gateway_cli._FOREIGN_SERVICE_OVERWRITE_ENV, raising=False)
+    gateway_cli.get_launchd_plist_path().write_text(
+        GENERATED_PLIST.replace("/usr/bin/osascript", "/opt/venv/bin/python"), encoding="utf-8"
+    )
+    monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
+
+    with pytest.raises(gateway_cli.subprocess.TimeoutExpired):
+        gateway_cli.launchd_restart()
+
+    assert not [c for c in launchd_seam if c[:2] == ["launchctl", "bootstrap"]]
+    assert [c for c in launchd_seam if c[:2] == ["launchctl", "kickstart"] and "-k" in c]

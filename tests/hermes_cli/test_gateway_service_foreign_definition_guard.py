@@ -90,6 +90,14 @@ ExecStart="/home/ace/src/hermes-agent/venv/bin/python" "-I" "-c" "import os, sys
         ("[Service]\nExecStart=/home/ace/.hermes/bin/hermes gateway run\nExecStart=/usr/bin/true\n", "systemd unit", False),
         ("[Service]\nExecStart=/usr/bin/true\nExecStart=/home/ace/.hermes/bin/hermes gateway run\n", "systemd unit", False),
         ("not a service definition at all", "launchd plist", False),
+        # launchd runs `Program` instead of ProgramArguments[0]: a wrapper there is foreign
+        (GENERATED_PLIST.replace("<key>ProgramArguments</key>", "<key>Program</key><string>/usr/local/bin/wrap</string><key>ProgramArguments</key>"), "launchd plist", False),
+        (GENERATED_PLIST.replace("<key>ProgramArguments</key>", "<key>Program</key><string>/usr/bin/osascript</string><key>ProgramArguments</key>"), "launchd plist", True),
+        # a commented-out generated block does not make the active (foreign) ProgramArguments ours
+        (FLEET_PLIST.replace("<key>ProgramArguments</key>", "<!-- <key>ProgramArguments</key><array><string>/usr/bin/osascript</string></array> --><key>ProgramArguments</key>", 1), "launchd plist", False),
+        # systemd accepts whitespace before the key and around `=`
+        ("[Service]\nExecStart=/home/ace/.hermes/bin/hermes gateway run\n  ExecStart =\n ExecStart = /srv/venv/bin/python -m hermes_cli.main\n", "systemd unit", False),
+        ("[Service]\n  ExecStart = /home/ace/.hermes/bin/hermes gateway run\n", "systemd unit", True),
     ],
 )
 def test_generated_shape_predicate(text, kind, generated):

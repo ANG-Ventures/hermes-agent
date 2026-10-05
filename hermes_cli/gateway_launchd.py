@@ -826,7 +826,14 @@ def launchd_restart():
                 print("⚠ launchd did not revive the gateway after its graceful exit — forcing restart")
             else:
                 print(f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart")
-        if not refresh_ok and _gw().get_launchd_plist_path().exists() and not _gw().launchd_plist_is_current():
+        if (
+            not refresh_ok
+            and _gw().get_launchd_plist_path().exists()
+            and not _gw().launchd_plist_is_current()
+            # A foreign plist the refresh deliberately left alone is still registered: a raw bootstrap
+            # would fail EIO. Fall through to the kickstart path, which handles loaded and unloaded jobs.
+            and not _gw()._service_definition_is_protected(_gw().get_launchd_plist_path(), "launchd plist")
+        ):
             # The refresh attempted a reload and launchd never re-registered
             # the (rewritten) job: kickstart would hang on the same wall. The
             # bootout already happened inside the refresh — bootstrap is the

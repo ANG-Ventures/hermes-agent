@@ -3439,9 +3439,21 @@ def _service_definition_is_hermes_generated(installed: str, kind: str) -> bool:
     """
     text = installed.lstrip("\ufeff")
     if kind == "launchd plist":
-        m = re.search(r"<key>ProgramArguments</key>\s*<array>\s*<string>(.*?)</string>", text, flags=re.S)
-        return bool(m) and m.group(1).strip() == "/usr/bin/osascript"
-    lines = re.findall(r"^ExecStart=\s*(.*)$", text, flags=re.M)
+        import plistlib
+
+        # Parse, never regex: a commented-out <ProgramArguments> must not count, and launchd runs
+        # `Program` (when present) instead of ProgramArguments[0]. Unparseable means not ours.
+        try:
+            data = plistlib.loads(text.encode("utf-8"))
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        args = data.get("ProgramArguments")
+        program = data.get("Program", args[0] if isinstance(args, list) and args else None)
+        return program == "/usr/bin/osascript" and isinstance(args, list) and args[:1] == ["/usr/bin/osascript"]
+    # systemd allows leading whitespace and whitespace around `=`.
+    lines = re.findall(r"^[ \t]*ExecStart[ \t]*=[ \t]*(.*)$", text, flags=re.M)
     if not lines:
         return False
     # Every ExecStart= must be ours: systemd runs them all (oneshot) or the last one wins (simple), and a
@@ -3462,6 +3474,25 @@ def _service_definition_is_hermes_generated(installed: str, kind: str) -> bool:
     return True
 
 
+def _foreign_service_overwrite_allowed(force: bool = False) -> bool:
+    return force or os.environ.get(_FOREIGN_SERVICE_OVERWRITE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _service_definition_is_protected(existing_path: Path, kind: str) -> bool:
+    """Silent twin of ``_refuse_foreign_service_overwrite``: True when a refresh of ``existing_path``
+    is skipped on purpose (foreign or unreadable definition, no override), so callers can tell a
+    deliberately preserved definition apart from a refresh that failed to reload."""
+    if _foreign_service_overwrite_allowed():
+        return False
+    try:
+        installed = existing_path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not _service_definition_is_hermes_generated(installed, kind)
+
+
 def _refuse_foreign_service_overwrite(existing_path: Path, kind: str, *, force: bool = False) -> bool:
     """Refuse to regenerate a gateway service definition this CLI did not write.
 
@@ -3477,7 +3508,7 @@ def _refuse_foreign_service_overwrite(existing_path: Path, kind: str, *, force: 
     operator says otherwise (``--force`` or ``HERMES_ALLOW_FOREIGN_SERVICE_OVERWRITE=1``). Returns True
     when the write must be skipped.
     """
-    if force or os.environ.get(_FOREIGN_SERVICE_OVERWRITE_ENV, "").strip().lower() in ("1", "true", "yes"):
+    if _foreign_service_overwrite_allowed(force):
         return False
     try:
         installed = existing_path.read_text(encoding="utf-8-sig")
