@@ -989,3 +989,65 @@ def test_main_red_cancelled_job_that_never_reached_the_step_is_walked_past(tmp_p
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+
+
+# --- Prism round 4 on e9718495 (t_1a8e095b) ------------------------------------------------------
+# f-abb7efb339835ba6: a job that failed with NO failed step (job timeout, runner lost) is a stepless
+# item [job, ""]. It is the same fault only if the earlier run's job ALSO failed with no failed step;
+# an earlier failure on a named step is a different fault and must page.
+def test_main_red_stepless_failure_after_a_named_step_failure_pages(tmp_path):
+    hang = _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=hang)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert got["summary"] == "" and "different fault" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_stepless_failure_after_a_stepless_failure_goes_to_logs(tmp_path):
+    hang = _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", hang)], current=hang)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E}"
+
+
+# f-ac6b7f1a201ac052: a job-level timed_out is a failure. A new timed-out job next to a known red
+# must page, and a prior timed-out step is red evidence, not "did not run".
+def test_main_red_new_timed_out_job_next_to_a_known_red_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                         ("Python tests / Run tests slice 3/16", "timed_out", {"Run tests": "cancelled"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_prior_timed_out_step_is_red_evidence(tmp_path):
+    timed = _main_jobs((E2E, "timed_out", {E2E_STEP: "timed_out"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "timed_out", timed)],
+                    current=_main_jobs((E2E, "timed_out", {E2E_STEP: "timed_out"})))
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+def test_fold_blocked_by_an_extra_timed_out_job(tmp_path):
+    # sig_of feeds the queue dedupe and the already-red fold: a timed-out job must enter SIG.
+    api = _other_pr_queue_api(extra_job="OS-specific tests / Windows-only tests")
+    api["actions/runs/42/jobs"]["jobs"][-1]["conclusion"] = "timed_out"
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "Windows-only tests" in got["summary"]
+
+
+# f-96b4792f11201e3e: two jobs with one display name cannot be told apart by name. Pick-first could
+# match the wrong one, so a duplicate failed name in this run, or in the prior run, pages.
+def test_main_red_duplicate_failed_job_name_in_this_run_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (E2E, "failure", {E2E_STEP: "failure"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_duplicate_job_name_in_the_prior_run_pages(tmp_path):
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "not unique" in got["_stdout"], got["_stdout"]

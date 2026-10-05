@@ -237,7 +237,7 @@ jobs:
           sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
             local jobs failed id name ann got items=""
             jobs="$(run_jobs "$1")" || return 1
-            failed="$(jq -r '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"' <<< "$jobs")" || return 1
+            failed="$(jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "\(.id)\t\(.name)"' <<< "$jobs")" || return 1
             while IFS=$'\t' read -r id name; do
               [ -n "$id" ] || continue
               got="$(api "check-runs/$id/annotations?per_page=100" < /dev/null)" || return 1
@@ -342,11 +342,17 @@ jobs:
           WF_CREATED="$(f .created_at)"
           if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = push ] && [ "$WF_CONCLUSION" = failure ] \
              && [ -n "$WF_ID" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; then
-            # Items = [job, step] of each failed step ([job, ""] if no step failed).
+            # Items = [job, step] of each failed step ([job, ""] if no step failed, e.g. a job
+            # timeout). timed_out counts as failed (Prism P1 f-ac6b7f1a201ac052). A failed job
+            # whose name is not unique in the run cannot be matched by name, so the jq errors
+            # and the red pages (Prism P1 f-96b4792f11201e3e).
             ITEMS="$(run_jobs "$WF_RUN_ID" | jq -c '
-              [.jobs[] | select(.conclusion == "failure")
+              def bad: . == "failure" or . == "timed_out";
+              (.jobs | group_by(.name) | map(select(length > 1) | .[0].name)) as $dup
+              | [.jobs[] | select(.conclusion | bad)
                 | select(.name | test("Tests complete|All required checks") | not)
-                | . as $j | ([.steps[]? | select(.conclusion == "failure") | [$j.name, .name]]
+                | if (.name | IN($dup[])) then error("ambiguous job name: \(.name)") else . end
+                | . as $j | ([.steps[]? | select(.conclusion | bad) | [$j.name, .name]]
                   | if length == 0 then [[$j.name, ""]] else . end)[]] | unique')" || ITEMS=error
             BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
             PREVS="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}" \
@@ -364,19 +370,35 @@ jobs:
                 # eb4c30f2ca3e, 2026-10-04). The per-item check below decides what each run shows.
                 # Per item in a prior run: red (that step failed), green (it ran and passed:
                 # main went green, so this is a new red), unknown (job or step did not run,
-                # e.g. path-classified CI skipped it; look further back).
+                # e.g. path-classified CI skipped it; look further back). A stepless item
+                # [job, ""] is red only if that job also failed with no failed step there; a job
+                # that failed on a named step is a different fault (Prism P1 f-abb7efb339835ba6).
+                # A job name that is not unique in the prior run cannot be matched: page
+                # (Prism P1 f-96b4792f11201e3e).
                 ST="$(run_jobs "$prev" | jq -c --argjson items "$LEFT" '
+                  def bad: . == "failure" or . == "timed_out";
                   . as $r | [$items[] as [$j, $s]
-                    | ([$r.jobs[] | select(.name == $j)] | first) as $job
-                    | if $job == null then "unknown"
-                      elif $s == "" then ({"failure": "red", "success": "green"}[$job.conclusion // ""] // "unknown")
+                    | [$r.jobs[] | select(.name == $j)] as $same | ($same | first) as $job
+                    | if ($same | length) > 1 then "ambiguous"
+                      elif $job == null then "unknown"
+                      elif $s == "" then
+                        (if ($job.conclusion // "") == "success" then "green"
+                         elif ($job.conclusion // "" | bad) | not then "unknown"
+                         elif [$job.steps[]? | select(.conclusion | bad)] == [] then "red"
+                         else "differs" end)
                       else ([$job.steps[]? | select(.name == $s)] | first) as $st
                         | if $st == null then "unknown"
-                          elif $st.conclusion == "failure" then "red"
+                          elif ($st.conclusion // "" | bad) then "red"
                           elif $st.conclusion == "success" then "green" else "unknown" end
                       end]')" || { LEFT=error; break; }
                 if jq -e 'index("green")' <<< "$ST" > /dev/null; then
                   LEFT=green; echo "page: a failed job/step passed on main in run $prev"; break
+                fi
+                if jq -e 'index("differs")' <<< "$ST" > /dev/null; then
+                  LEFT=green; echo "page: a job that failed with no failed step failed on a named step in run $prev (a different fault)"; break
+                fi
+                if jq -e 'index("ambiguous")' <<< "$ST" > /dev/null; then
+                  LEFT=green; echo "page: a failed job name is not unique in run $prev"; break
                 fi
                 NEXT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] != "red") | .value]' <<< "$LEFT")"
                 [ "$NEXT" != "$LEFT" ] && COVER="${COVER:+$COVER,}$prev"
