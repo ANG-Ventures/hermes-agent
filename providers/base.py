@@ -91,6 +91,16 @@ class ProviderProfile:
     # (e.g. Xiaomi MiMo, which returns 400 "text is not set").
     supports_vision_tool_messages: bool = True
 
+    # Request SHAPES this lane cannot serve at all, independent of the model
+    # (``"tools"``: a non-empty tools[]; ``"images"``: a native image part). A
+    # relay face that answers such a request 400 declares it here (the claude-bpx
+    # interactive/tui lanes: ``{"images"}`` while Phase 1 is image-less), and the
+    # fallback chain walker skips the hop for a request carrying that shape with
+    # one INFO line — no banner, no HTTP round-trip (agent/fallback_capability.py,
+    # t_1ed37625). Explicit opt-in: unlike ``supports_vision`` (default False,
+    # catalog-resolved), an empty set claims nothing.
+    unsupported_request_shapes: frozenset = frozenset()
+
     # True only when this provider's Chat Completions endpoint explicitly
     # documents ``prompt_cache_key`` as an accepted request body field.  This
     # is deliberately opt-in: many OpenAI-compatible endpoints reject unknown

@@ -3718,6 +3718,17 @@ def try_activate_fallback(
         if fb_provider in quota_skipped:
             logger.debug("Fallback skip: %s is quota-exhausted per the usage registry", fb_provider)
             continue
+        # A lane that declares it cannot serve this request's SHAPE (tools[] on an
+        # interactive bridge with hostTools off, a native image part on a Phase 1
+        # tui face) would only answer 400 and cost a banner plus a round-trip
+        # (2026-10-05 13:27 / 14:16: two dead hops per tool turn). One INFO line,
+        # no ledger row, no HTTP call; the chain order is untouched (t_1ed37625).
+        from agent.fallback_capability import lane_incapable_shape, stamped_request_shape
+
+        _incapable = lane_incapable_shape(fb_provider, stamped_request_shape(agent))
+        if _incapable:
+            logger.info("skipped %s: lane_incapable(%s)", fb_provider, _incapable)
+            continue
         # A relay deploy-drain refuses EVERY model on the failing provider, so a
         # same-provider entry (a MODEL fallback, e.g. fable -> opus on claude-bpr)
         # only collects the same 503 (2026-09-30 13:03, 5 sessions). Skip entries
