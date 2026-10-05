@@ -23,6 +23,11 @@ _HERMES_CORE_TOOLS = [
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
     "todo_list", "memory",
+    # Background-review mem0 write. Resident here so the review fork, which inherits the parent's
+    # tools[] for cache parity, can see it; its check_fn hides it unless
+    # memory.background_review_mem0_write is on with mem0 configured, and the fork's dispatch
+    # whitelist admits it only under the same knob.
+    "mem0_remember",
     "session_search",
     "clarify",
     "execute_code", "delegate_task",

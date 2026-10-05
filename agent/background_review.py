@@ -455,6 +455,19 @@ _MEMORY_REVIEW_PROMPT = (
     "matching target. If nothing is worth saving, just say 'Nothing to save.' and stop."
 )
 
+# Appended to memory-reviewing prompts when memory.background_review_mem0_write is on: durable facts
+# go to mem0, the flat files keep pointers, and their replace/remove are proposals (staged by the
+# unattended delete gate, never applied).
+_MEMORY_REVIEW_MEM0_CLAUSE = (
+    "\n\nLong-term memory: a DURABLE fact about the user or their environment (a preference, a "
+    "standing decision or correction, an account/device/topology pointer, a long-lived plan or "
+    "constraint) goes to mem0 via the mem0_remember tool, one fact per call. MEMORY.md and USER.md "
+    "hold short pointers only: add a pointer there only when a future session needs it before it "
+    "could search. Any replace/remove you make there is a PROPOSAL for a human, not an edit. Never "
+    "save work-narration, status, speculation, one-off requests or anything stale within a week; "
+    "when in doubt, do not save."
+)
+
 # Shared shape contract for anything written into a skill. The failure mode this prevents is the
 # hoarding library: one references/ file per session, incident narration instead of rules, PR numbers
 # and quotes as content, and duplicating what the repo's AGENTS.md / the tool schemas already teach.
@@ -721,7 +734,7 @@ def _collect_review_call_details(review_messages: List[Dict]) -> Tuple[set, dict
     """Map review-agent tool_call ids -> parsed call arguments for notify tools. Result JSON only
     says "Entry added"; the call arguments carry action, target and content previews. Restricting
     to notify tools keeps helper tools from surfacing as memory work just because they succeeded."""
-    notify_tools = {"memory", "skill_manage"}
+    notify_tools = {"memory", "skill_manage", "mem0_remember"}
     all_tool_call_ids: set = set()
     call_details: dict = {}
     for msg in review_messages or []:
@@ -832,7 +845,14 @@ def summarize_background_review_actions(
             continue
         # Wrapper MCP servers may return a top-level list/scalar; only dict payloads carry
         # ``success``/``_change``.
-        if not isinstance(data, dict) or not data.get("success"):
+        if not isinstance(data, dict):
+            continue
+        if (call_details.get(tcid) or {}).get("tool") == "mem0_remember":
+            # Own result contract ({"result", "verdict"}), no "success" key.
+            if str(data.get("verdict", "")).startswith("stored"):
+                actions.append("Long-term memory (mem0) updated")
+            continue
+        if not data.get("success"):
             continue
         actions.extend(_action_lines(data, call_details.get(tcid) or {}, verbose))
     return actions
@@ -1242,6 +1262,11 @@ def _track_review_fork(agent: Any, review_agent: Any, *, register: bool) -> None
                     agent._active_children.remove(review_agent)
 
 
+def _mem0_remember_resident(agent: Any) -> bool:
+    """mem0_remember is in the agent's tools[] (its check_fn admits it only when the knob is on)."""
+    return "mem0_remember" in {(t.get("function") or {}).get("name") for t in getattr(agent, "tools", None) or []}
+
+
 def _review_tool_whitelist(
     review_agent: Any, task_cfg: Optional[Dict[str, Any]], review_memory: bool = False,
 ) -> Tuple[set, set]:
@@ -1258,6 +1283,10 @@ def _review_tool_whitelist(
     # starved the loop (read_file also registers the read with the read-before-write guard).
     # Write tools stay denied — autonomous maintenance goes through skill_manage's validation.
     whitelist |= {"read_file", "search_files"}
+    # mem0_remember (opt-in, memory.background_review_mem0_write): admitted only on a memory-reviewing
+    # pass, and only when its check_fn put it in the inherited tools[] (else the model cannot see it).
+    if "memory" in whitelist and _mem0_remember_resident(review_agent):
+        whitelist.add("mem0_remember")
     # ``extra_tools`` admits named parent tools (e.g. a human-gated proposal tool). The whitelist
     # can only admit, never advertise: a listed tool must already exist in the inherited schema.
     # Read-only file tools are whitelisted too (#61521, #39996): the model naturally reaches for
@@ -1338,6 +1367,9 @@ def _run_review_fork(
     # tell the model that memory is available, or it will burn iterations on denied calls.
     memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
     memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
+    if "mem0_remember" in review_whitelist:
+        memory_phrase_deny += ", mem0_remember for durable facts"
+        memory_phrase_prompt = "memory, mem0_remember and skill "
     set_thread_tool_whitelist(
         review_whitelist,
         deny_msg_fmt=(
@@ -1524,6 +1556,8 @@ def spawn_background_review_thread(
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
+    if review_memory and _mem0_remember_resident(agent):
+        prompt += _MEMORY_REVIEW_MEM0_CLAUSE
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "
