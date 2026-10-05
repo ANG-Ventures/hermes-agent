@@ -291,11 +291,31 @@ class BridgeExtractor:
 
     # -- provider plumbing --------------------------------------------------
     @staticmethod
+    def _op_binary() -> str:
+        """The real 1Password CLI, skipping any ``gh-shim`` PATH dir.
+
+        Agent processes carry a fleet shim dir (``var/gh-shim``) first on PATH whose ``op``
+        refuses ``read`` under ``HERMES_AGENT`` (exit 77) to stop tool-call probe loops. This
+        router is the gateway's own sanctioned secret read, not a tool call, so it must reach the
+        real binary: ``OP_BIN`` if set, else the first executable ``op`` outside a gh-shim dir.
+        """
+        explicit = os.environ.get("OP_BIN", "").strip()
+        if explicit:
+            return explicit
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if not d or "gh-shim" in d:
+                continue
+            candidate = os.path.join(d, "op")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return "op"
+
+    @staticmethod
     def _op_read(ref: str) -> str:
         import subprocess
         try:
             out = subprocess.run(
-                ["op", "read", ref],
+                [BridgeExtractor._op_binary(), "read", ref],
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=20,
