@@ -17907,6 +17907,10 @@ def count_running_by_placement(boards) -> "dict[str, tuple[int, dict[str, int]]]
             finally:
                 conn.execute("ROLLBACK")
         except Exception:
+            # An unreadable board hides its running workers: report it as
+            # UNKNOWN (total None) so the gate falls back to its floor instead
+            # of over-admitting on an undercount (Prism r9 capacity undercount).
+            out[slug] = (None, {})
             continue
         finally:
             if conn is not None:

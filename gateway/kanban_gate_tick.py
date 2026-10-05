@@ -57,8 +57,10 @@ def running_split(ledger: Dict[str, Tuple[int, Dict[str, int]]]
     ``running_local = max(0, total - remote)``; None when no board was read
     (the gate then keeps plain floor(), as with an unknown count).
     """
-    if not ledger:
-        return None, {}
+    if not ledger or any(t is None for t, _ in ledger.values()):
+        # No board read, or ANY board unreadable: the local count is unknown
+        # and the gate keeps its floor (never over-admit on an undercount).
+        return None, {h: n for _t, hosts in ledger.values() for h, n in hosts.items()} if ledger else {}
     total = sum(t for t, _ in ledger.values())
     by_host: Dict[str, int] = {}
     for _t, hosts in ledger.values():

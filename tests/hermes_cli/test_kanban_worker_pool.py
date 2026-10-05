@@ -334,7 +334,12 @@ def test_count_running_by_placement_skips_unopenable_board(kanban_home, monkeypa
 
     monkeypatch.setattr(kb, "connect", connect)
     out = kb.count_running_by_placement([{"slug": "default"}, {"slug": "broken"}])
-    assert out == {"default": (1, {"ace-ai": 1})}
+    # Prism r9 capacity undercount: an unreadable board is reported as UNKNOWN
+    # (None), never silently dropped, so the gate falls back to its floor.
+    assert out == {"default": (1, {"ace-ai": 1}), "broken": (None, {})}
+    from gateway.kanban_gate_tick import running_split
+    assert running_split(out) == (None, {"ace-ai": 1})
+    assert running_split({"default": (1, {"ace-ai": 1})}) == (0, {"ace-ai": 1})
 
 
 def test_paused_tick_without_a_plan_spawns_nothing(kanban_home):
