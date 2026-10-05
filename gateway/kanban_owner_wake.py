@@ -132,12 +132,30 @@ def is_stuck(kind: str, payload: Optional[dict]) -> bool:
     return kind == "reclaimed" and bool((payload or {}).get("heartbeat_stale"))
 
 
+# hermes-agent's review-labels.yml: a CI-sensitive diff is red on this gate (and the aggregator it fails) until
+# a maintainer applies ``ci-reviewed``. On a review handback that is the review being asked for, not a PR that
+# cannot land: the merge pass owns it (HELD-NEEDS-LABEL, or fleet-merge applies the label on an operator APPROVE).
+_LABEL_GATE_RE = re.compile(r"^(?:.+ / )?Review label gate$")
+_REQUIRED_ROLLUP_RE = re.compile(r"^(?:.+ / )?All required checks pass$")
+REVIEW_LABEL = "ci-reviewed"
+
+
+def label_pending(health: Optional[dict]) -> bool:
+    """True when the only red checks are the review-label gate (+ the required-checks aggregator) and the PR has no
+    ``ci-reviewed`` label yet. Labelled and still red is a real red (the gate re-ran and failed)."""
+    names = [str(n) for n in (health or {}).get("failing") or [] if n]
+    if REVIEW_LABEL in [str(x).strip().lower() for x in (health or {}).get("labels") or []]:
+        return False
+    return any(_LABEL_GATE_RE.match(n) for n in names) and all(
+        _LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in names)
+
+
 def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
-    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, unknown)."""
+    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown)."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
-    names = list(health.get("failing") or [])
+    names = [] if label_pending(health) else list(health.get("failing") or [])
     urls = list(health.get("failing_urls") or [])
     failing = [f"{n} <{u}>" if u else str(n)
                for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
@@ -341,7 +359,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
     if not isinstance(pr, dict) or not pr.get("state"):
         return None
     out = {"state": "merged" if pr.get("merged_at") else str(pr["state"]),
-           "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": []}
+           "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": [],
+           "labels": [str((x or {}).get("name") or "") for x in pr.get("labels") or [] if isinstance(x, dict)]}
     sha = (pr.get("head") or {}).get("sha")
     if out["state"] == "open" and sha:
         runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")

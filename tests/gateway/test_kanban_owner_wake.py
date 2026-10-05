@@ -325,6 +325,47 @@ def test_pr_red_or_dirty_pure():
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["lint"]}) == "red: lint"
 
 
+_GATE, _ROLLUP = "Review label gate / Review label gate", "All required checks pass"
+
+
+@pytest.mark.parametrize(("failing", "labels", "mss", "want"), [
+    # t_9479baf8: the CI-sensitive review-label gate alone (+ the aggregator it fails), no label yet -> label pending
+    ([_GATE, _ROLLUP], [], "blocked", None),
+    ([_GATE], ["bug"], "blocked", None),
+    # a real red next to the gate still wakes, and names every red check
+    ([_GATE, _ROLLUP, "tests / pytest"], [], "blocked", f"red: {_GATE}, {_ROLLUP}, tests / pytest"),
+    # labelled and STILL red: the gate re-ran after the label and failed -> a real red
+    ([_GATE, _ROLLUP], ["ci-reviewed"], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    # the aggregator alone is not the label gate
+    ([_ROLLUP], [], "blocked", f"red: {_ROLLUP}"),
+    # label pending never hides a merge conflict
+    ([_GATE, _ROLLUP], [], "dirty", "dirty (merge conflict)"),
+])
+def test_review_label_gate_is_label_pending_not_red(failing, labels, mss, want):
+    health = {"state": "open", "mergeable_state": mss, "failing": failing, "labels": labels}
+    assert ow.pr_is_red_or_dirty(health) == want
+    assert ow.label_pending(health) is (want in (None, "dirty (merge conflict)"))
+
+
+def test_query_pr_health_carries_labels(monkeypatch):
+    sha = "5422e9c36d2e5b3b26e62c0bd11ffa3086256619"
+
+    def fake(path):
+        if path == "repos/ANG-Ventures/hermes-agent/pulls/1770":
+            return {"state": "open", "merged_at": None, "mergeable_state": "blocked", "head": {"sha": sha},
+                    "labels": [{"name": "fleet"}]}
+        if path.startswith(f"repos/ANG-Ventures/hermes-agent/commits/{sha}/check-runs"):
+            rows = [{"id": 1, "name": _GATE, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}},
+                    {"id": 2, "name": _ROLLUP, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}}]
+            return {"check_runs": rows if path.endswith("&page=1") else []}
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+    health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)
+    assert health["labels"] == ["fleet"]
+    assert sorted(health["failing"]) == sorted([_GATE, _ROLLUP])
+    assert ow.pr_is_red_or_dirty(health) is None   # the #1770 handback 2026-10-05 17:04Z: no 'cannot land' wake
+
+
 # --- cancelled duplicate check runs (t_65e5d76f) ------------------------------
 
 # The real set on ANG-Ventures/hermes-home#2694 head 0a6680ba789e: two
