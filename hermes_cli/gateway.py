@@ -2745,6 +2745,25 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
     return removed, remaining
 
 
+class LegacyUnitsRemain(RuntimeError):
+    """Legacy gateway units survived a removal attempt; starting a gateway now would fight them for the bot token."""
+
+    def __init__(self, remaining: list[Path]):
+        self.remaining = list(remaining)
+        super().__init__("legacy gateway unit(s) still installed: " + ", ".join(str(p) for p in self.remaining)
+                         + " (remove them with `sudo hermes gateway migrate-legacy`)")
+
+
+def remove_legacy_units_or_raise() -> None:
+    """Remove every legacy unit non-interactively; raise :class:`LegacyUnitsRemain` when any is left.
+    ``remove_legacy_hermes_units`` reports what it could not remove (a refused unit, system scope without
+    root, a failed stop) in its return value, never by raising: a caller about to START a gateway must
+    check it, or the new gateway runs next to a legacy one on the same bot token (Prism 19071f3898ec)."""
+    _removed, remaining = remove_legacy_hermes_units(interactive=False)
+    if remaining:
+        raise LegacyUnitsRemain(remaining)
+
+
 def print_systemd_scope_conflict_warning() -> None:
     scopes = get_installed_systemd_scopes()
     if len(scopes) < 2:
@@ -3857,7 +3876,13 @@ def systemd_install(
             print_legacy_unit_warning()
             print()
             if non_interactive or prompt_yes_no("Remove the legacy unit(s) before installing?", True):
-                remove_legacy_hermes_units(interactive=False)
+                try:
+                    remove_legacy_units_or_raise()
+                except LegacyUnitsRemain as exc:
+                    # Non-zero, so no caller (`install --start-now`, setup's ensure_gateway_service) starts
+                    # the new unit next to a legacy gateway still holding the bot token.
+                    print_error(f"  {exc}")
+                    sys.exit(1)
                 print()
 
     scope_label = _service_scope_label(system)

@@ -729,6 +729,29 @@ def test_legacy_units_are_removed_only_after_the_default_is_installed(fleet, mon
     assert ("default", "start") in fleet.ops
 
 
+@pytest.mark.parametrize("default_has_unit", [False, True])
+def test_legacy_units_left_behind_abort_before_the_default_starts(fleet, monkeypatch, capsys, default_has_unit):
+    """Prism 19071f3898ec (#1766 @ca89c470): remove_legacy_hermes_units reports what it could not remove
+    (a refused unit, a system-scope unit without root, a failed stop) in its returned tuple, never by
+    raising. Discarded, the migration started the default next to a legacy gateway on the same bot token.
+    Neither the apply (install+start, or restart of an existing unit) nor its compensator may start a
+    gateway while one remains; the manifest is kept so the re-run resumes once the unit is gone."""
+    from hermes_cli import gateway as gw
+    if default_has_unit:
+        fleet.services["default"] = ("systemd", False)
+    left = Path("/etc/systemd/system/hermes.service")
+    monkeypatch.setattr(gw, "has_legacy_hermes_units", lambda: True)
+    monkeypatch.setattr(gw, "remove_legacy_hermes_units", lambda interactive=True, dry_run=False: (0, [left]))
+    spawned = []
+    monkeypatch.setattr(gm, "_spawn_detached_gateway", lambda home: spawned.append(home) or True)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert not [op for op in fleet.ops if op[0] == "default" and op[1] in ("start", "restart")]
+    assert spawned == []
+    assert str(left) in out
+    assert (fleet.root / gm.MANIFEST_NAME).exists()
+
+
 def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(fleet, monkeypatch, capsys):
     """Flag flipped, secondaries gone, default never came up (the process died mid-apply): the re-run
     must finish the migration from the manifest — with the recorded User= — instead of reporting

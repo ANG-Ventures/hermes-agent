@@ -938,13 +938,14 @@ def _undo_default_preinstall(
 
 def _remove_legacy_units_after_install(kind: str, system: bool, home: Path) -> None:
     """The legacy-unit cleanup the migration's install defers (``remove_legacy_units=False``): run once the
-    default's definition is installed, right before it starts and would flap-fight them for the bot token."""
+    default's definition is in place, right before every service-manager start or restart of it, which would
+    flap-fight them for the bot token. Raises ``LegacyUnitsRemain`` when any is left, so the default is never started next to one."""
     if kind != "systemd":
         return
     from hermes_cli import gateway as gw
     with _home_env(home):
         if gw.has_legacy_hermes_units():
-            gw.remove_legacy_hermes_units(interactive=False)
+            gw.remove_legacy_units_or_raise()
 
 
 def _restart_default(
@@ -963,6 +964,7 @@ def _restart_default(
     """
     if plan_default.service is not None:
         kind, system = plan_default.service
+        _remove_legacy_units_after_install(kind, system, default_home)
         _service_op(kind, system, "restart", default_home)
         return f"restarted the default gateway via {kind}"
     if target is not None:
@@ -1306,8 +1308,15 @@ def rollback_migration(default_home: Optional[Path] = None) -> bool:
         return True
 
     target, run_as_user = _target_from_manifest(manifest)
+    from hermes_cli.gateway import LegacyUnitsRemain
     try:
         print(f"  ✓ {_restart_default(default_gw, target, default_home, run_as_user=run_as_user)}")
+    except LegacyUnitsRemain as exc:
+        # A legacy gateway is still installed (and still serving): any gateway started here, detached
+        # included, would fight it for the bot token. Keep the manifest; the re-run resumes once it is gone.
+        print(f"  ✗ default: not started: {exc}")
+        print(incomplete)
+        return False
     except Exception as exc:
         # The recorded service manager is exactly what the failed apply could not drive (a refused
         # system-unit install, a read-only unit dir). Falling back to a detached gateway still
