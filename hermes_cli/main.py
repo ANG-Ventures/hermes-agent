@@ -202,6 +202,15 @@ def _warn_if_unsupervised_pid1(pid: "int | None" = None) -> None:
     )
 
 
+def _capture_kanban_placement() -> None:
+    """RC-9 boot record for a placed kanban worker, taken before env files
+    or the config bridge can drop ``KANBAN_WORKER_PLACEMENT``. Others pay
+    one dict lookup."""
+    if os.environ.get("KANBAN_WORKER_PLACEMENT"):
+        from hermes_cli.kanban_worker_hosts import capture_boot_placement
+        capture_boot_placement()
+
+
 def _set_process_title() -> None:
     """Cosmetic: show 'hermes' instead of 'python3.xx' in ps/top/htop.
 
@@ -3659,6 +3668,7 @@ def _default_to_chat(args) -> None:
 def main():
     """Main entry point for hermes CLI."""
     _set_process_title()
+    _capture_kanban_placement()
     _warn_if_unsupervised_pid1()
     _advertise_agent_env()
     _apply_process_env_files()

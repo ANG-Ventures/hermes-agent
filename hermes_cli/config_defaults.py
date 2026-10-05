@@ -2326,12 +2326,15 @@ DEFAULT_CONFIG = {
         # and never
         # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
         # pause also needs load5 < pause_above. See kanban_load_gate.py.
-        # Worker hosts (t_5981ff03): while dispatch_load_gate holds this host,
-        # eligible scratch cards may spawn with their terminal + file tools on
-        # a second machine over the ssh backend. List of {name, ssh_host,
-        # ssh_user, max_workers, pause_above, profiles}. Empty = off.
-        # See kanban_worker_hosts.py.
-        "worker_hosts": [],
+        # Worker pool (KWLB v0.1): while the Studio gate is spilling/paused
+        # (or a ready card pins host:<id>), portable cards spawn with their
+        # terminal + file tools on a fleet host over ssh. Hosts come from
+        # <kanban_home>/fleet/fleet-roles.json (role kanban-worker) + the
+        # kanban-pool.json sidecar, not from config. enabled: false = no pool
+        # plan, every card local. The old kanban.worker_hosts list is
+        # retired: set next to a kanban-worker role, the pool places nothing.
+        # See kanban_worker_pool.py.
+        "worker_pool": {"enabled": True},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,

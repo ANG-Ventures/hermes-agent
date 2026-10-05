@@ -5,55 +5,18 @@
 # ANG-Ventures/fleet-floor-workflows (never a moving tag).
 #
 # Placeholders:
-#   debd27598fa6c6a4a250e211f7501f3698984120   40-char commit SHA of the central repo
+#   b701cc0171ab91c92237672b8fcee9efe2e6af5d   40-char commit SHA of the central repo
 #   ubuntu-latest      public repo: GitHub-hosted. Private ANG-Ventures repos use the org's metered runner label.
 name: override-lint
 
-# paths: the files the lint reads for hits (README "Caller path filters"). A PR outside them has no
-# hits, so it passes whatever its body says. `edited` still re-runs the check on a body edit of a PR
-# inside them: GitHub evaluates the filter against the PR's whole diff, not against the edit. Not a
-# required check, so a filtered-out run does not leave a PR pending.
+# path-filter-exempt: no `paths:` on purpose (Prism 7782a5f9dbf6, t_0e51de69). GitHub drops a filtered
+# workflow when the PR diff has more than 3,000 files and none of the first 3,000 match, so a big PR whose
+# code files sort late would skip the lint silently. The lint already ignores non-code and test files
+# itself (README "Caller path filters"), so an unfiltered run on a docs-only PR finds no hits and passes.
+# Not a required check.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-    paths:
-      - '**'
-      # Never read for hits (no CODE_EXT): docs, data, media, config.
-      - '!**.md'
-      - '!**.json'
-      - '!**.jsonl'
-      - '!**.txt'
-      - '!**.log'
-      - '!**.csv'
-      - '!**.sse'
-      - '!**.patch'
-      - '!**.diff'
-      - '!**.html'
-      - '!**.svg'
-      - '!**.png'
-      - '!**.jpg'
-      - '!**.jpeg'
-      - '!**.gif'
-      - '!**.webp'
-      - '!**.pdf'
-      - '!**.yml'
-      - '!**.yaml'
-      - '!**.toml'
-      - '!**.plist'
-      - '!**.service'
-      - '!**.ini'
-      - '!**.cfg'
-      - '!**.lock'
-      # Never read for hits: test paths (the lint's is_test()).
-      - '!**/tests/**'
-      - '!**/test/**'
-      - '!**/__tests__/**'
-      - '!**/testdata/**'
-      - '!**/fixtures/**'
-      - '!**/test_*'
-      - '!**/conftest.py'
-      # Fail open on a change to this caller (SHA bump, input change).
-      - '.github/workflows/override-lint.yml'
 
 permissions:
   contents: read
@@ -61,7 +24,7 @@ permissions:
 
 jobs:
   override_lint:
-    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@debd27598fa6c6a4a250e211f7501f3698984120
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@b701cc0171ab91c92237672b8fcee9efe2e6af5d
     with:
       runner: ubuntu-latest
       # Repos whose skills live elsewhere: pass the dirs grepped for the named override (warning only).

@@ -137,7 +137,10 @@ def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
-    failing = [str(n) for n in (health.get("failing") or []) if n]
+    names = list(health.get("failing") or [])
+    urls = list(health.get("failing_urls") or [])
+    failing = [f"{n} <{u}>" if u else str(n)
+               for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
     if failing:
         parts.append("red: " + ", ".join(failing[:6]))
     if str(health.get("mergeable_state") or "").lower() == "dirty":
@@ -224,7 +227,14 @@ def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
 
 def red_check_names(runs: list, workflows: Optional[dict] = None,
                     superseded: frozenset = frozenset()) -> list[str]:
-    """Names of the checks that grade the head red (t_65e5d76f, t_fb481152).
+    """Names of the checks that grade the head red; see red_check_runs()."""
+    return [str(r.get("name") or "?") for r in red_check_runs(runs, workflows, superseded)]
+
+
+def red_check_runs(runs: list, workflows: Optional[dict] = None,
+                   superseded: frozenset = frozenset()) -> list[dict]:
+    """The check-run rows that grade the head red (t_65e5d76f, t_fb481152); the
+    newest judging run per check, so its ``html_url`` is the one to open (t_121bd42e).
 
     A head carries every run ever started on it: override_lint runs twice per
     push and concurrency cancels the superseded one, so counting any red run
@@ -264,15 +274,16 @@ def red_check_names(runs: list, workflows: Optional[dict] = None,
         if concl in _NO_VERDICT_CONCLUSIONS:
             if concl == "cancelled":
                 prev = cancelled.get(key)
-                cancelled[key] = (max(rid, prev[0]) if prev else rid, name)
+                if prev is None or rid >= prev[0]:
+                    cancelled[key] = (rid, run)
             else:
                 passed_over[key] = max(rid, passed_over.get(key, 0))
             continue
         rank = (rid, i)
         if key not in live or rank > live[key][0]:
-            live[key] = (rank, name, concl)
-    red = [name for _rank, name, concl in live.values() if concl in _RED_CONCLUSIONS]
-    return red + [name for key, (rid, name) in cancelled.items()
+            live[key] = (rank, run, concl)
+    red = [run for _rank, run, concl in live.values() if concl in _RED_CONCLUSIONS]
+    return red + [run for key, (rid, run) in cancelled.items()
                   if key not in live and passed_over.get(key, -1) <= rid]
 
 
@@ -337,7 +348,10 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         if runs is None:
             return None  # unknown: retried, never read as green (Prism P1)
         wf, superseded = _workflow_runs(repo, sha) if _needs_workflow_map(runs) else ({}, frozenset())
-        out["failing"] = red_check_names(runs, wf, superseded)
+        red = red_check_runs(runs, wf, superseded)
+        out["failing"] = [str(r.get("name") or "?") for r in red]
+        # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
+        out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
     return out
 
 
