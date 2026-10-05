@@ -277,9 +277,10 @@ jobs:
         # A canary tag build whose environment carries NO R2 secret or var at
         # all (a fork without a release bucket) skips admission, so every
         # build job skips and this run ends green instead of failing at the
-        # archive step. Partial R2 config still runs and fails loudly.
+        # archive step. Partial R2 config still runs and fails loudly. Any
+        # disposable input is not a plain canary build: admission must judge it.
         id: r2
-        if: contains(inputs.tag, '+canary.') && inputs.release-phase == '' && inputs.build_commit == '' && inputs.channel == '' && inputs.disposable_channel == ''
+        if: contains(inputs.tag, '+canary.') && inputs.release-phase == '' && inputs.build_commit == '' && inputs.channel == '' && inputs.disposable_channel == '' && inputs.disposable_run == ''
         env:
           CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
           CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}

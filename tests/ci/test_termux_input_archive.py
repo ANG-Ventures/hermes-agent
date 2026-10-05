@@ -133,6 +133,10 @@ def test_canary_build_skips_green_when_r2_is_not_provisioned(tmp_path):
     # Only the canary tag build may skip; stable, commit and channel builds always need R2.
     for dispatch in ("candidate", "commit", "channel"):
         assert not gate(probe["if"], DOWNLOADABLE_DISPATCHES[dispatch], {}, job_if=False), dispatch
+    # Disposable inputs on a canary tag are not a plain canary build: the probe must not
+    # turn admission's rejection into a green skip (Prism b4bfc20a62fa on #1763).
+    for disposable in ({"disposable_run": "98765"}, {"disposable_channel": "native-preview"}):
+        assert not gate(probe["if"], {**canary, **disposable}, {}, job_if=False), disposable
     skipped = {"r2": {"outputs": {"skip": "true"}}}
     built = {"r2": {"outputs": {"skip": "false"}}}
     for step in (archive, admission):
