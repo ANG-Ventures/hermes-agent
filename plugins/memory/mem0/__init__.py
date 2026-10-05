@@ -1378,7 +1378,8 @@ class Mem0MemoryProvider(MemoryProvider):
     @staticmethod
     def _bgr_norm_hash(text: str) -> str:
         import hashlib
-        return hashlib.md5(" ".join((text or "").lower().split()).encode("utf-8")).hexdigest()
+        # Case is kept: paths, hostnames and ids are case-sensitive pointers.
+        return hashlib.md5(" ".join((text or "").split()).encode("utf-8")).hexdigest()
 
     def _bgr_nearest(self, client, fact: str):
         """``(text, cosine)`` of the closest stored fact search returns, or ``(None, 0.0)``. Falls
@@ -1390,8 +1391,8 @@ class Mem0MemoryProvider(MemoryProvider):
             return None, 0.0
         vecs = self._dedup_embed([fact] + texts)
         if not vecs or len(vecs) != len(texts) + 1:
-            norm = " ".join(fact.lower().split())
-            same = next((t for t in texts if " ".join(t.lower().split()) == norm), None)
+            norm = " ".join(fact.split())
+            same = next((t for t in texts if " ".join(t.split()) == norm), None)
             return (same, 1.0) if same else (texts[0], 0.0)
         scored = [(t, self._dedup_cos(vecs[0], v)) for t, v in zip(texts, vecs[1:])]
         return max(scored, key=lambda tv: tv[1])
@@ -1419,11 +1420,21 @@ class Mem0MemoryProvider(MemoryProvider):
                              "refusing to write into a default bucket.", "verdict": "refused"}
         if self._is_breaker_open():
             return {"error": "Mem0 temporarily unavailable.", "verdict": "error"}
+        from .capture_scrub import scan as _secret_scan
+        if (hits := _secret_scan(fact) + _secret_scan(supersedes or "")):
+            # Deterministic boundary BEFORE any search/embed/add: the model's "never the secret"
+            # instruction is not one. The ledger gets the verdict, never the text.
+            self._bgr_ledger({"fact": "[withheld: secret-shaped]", "verdict": "refused_secret",
+                              "patterns": sorted(set(hits))})
+            return {"error": "Refused: the fact looks like it contains a secret ("
+                             + ", ".join(sorted(set(hits))) + "). Store a pointer, never the secret.",
+                    "verdict": "refused_secret"}
         out: Dict[str, Any]
         try:
             client = self._get_client()
             norm_hash = self._bgr_norm_hash(fact)
-            hit = self._unwrap_results(client.search_meta_filtered(fact, {"dedup_hash": norm_hash}, top_k=1))
+            hit = [] if supersedes else self._unwrap_results(
+                client.search_meta_filtered(fact, {"dedup_hash": norm_hash}, top_k=1))
             if self._drop_forgotten(hit):
                 out = {"result": "Already stored (exact match); nothing written.", "verdict": "deduped_exact"}
             else:

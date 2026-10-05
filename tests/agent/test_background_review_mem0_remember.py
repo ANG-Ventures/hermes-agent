@@ -156,7 +156,7 @@ def test_knob_off_tool_absent_everywhere(mem0_home):
 def test_ladder_dedups_supersedes_and_ledgers(mem0_home, tmp_path):
     fake = mem0_home(knob=True)
     first = _dispatch("Ace lives in Los Osos, CA.")
-    exact = _dispatch("ace lives in  Los Osos, CA.")
+    exact = _dispatch("Ace lives in  Los Osos, CA.")
     assert (first["verdict"], exact["verdict"]) == ("stored", "deduped_exact")
     assert len(fake.rows) == 1
 
@@ -215,3 +215,36 @@ def test_summary_surfaces_mem0_store_only():
         {"role": "tool", "tool_call_id": "b", "content": json.dumps({"result": "dup", "verdict": "deduped_exact"})},
     ]
     assert summarize_background_review_actions(msgs, []) == ["Long-term memory (mem0) updated"]
+
+
+def test_case_differs_is_not_an_exact_duplicate(mem0_home):
+    fake = mem0_home(knob=True)
+    assert _dispatch("The checkout lives at /srv/Repo.")["verdict"] == "stored"
+    assert _dispatch("The checkout lives at /srv/repo.", supersedes="The checkout lives at /srv/Repo.")["verdict"] == "stored_supersedes"
+    assert len(fake.rows) == 2
+
+
+def test_correction_back_to_an_old_value_is_recorded(mem0_home):
+    fake = mem0_home(knob=True)
+    _dispatch("The lane is alr.")
+    _dispatch("The lane is dtlr.", supersedes="The lane is alr.")
+    back = _dispatch("The lane is alr.", supersedes="The lane is dtlr.")
+    assert back["verdict"] == "stored_supersedes"
+    assert len(fake.rows) == 3
+
+
+def test_secret_shaped_fact_is_refused_before_any_network_call(mem0_home, tmp_path):
+    fake = mem0_home(knob=True)
+    out = _dispatch("Ace's GitHub token is ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8")
+    assert out["verdict"] == "refused_secret"
+    assert fake.calls == [] and fake.rows == []
+    ledger = (tmp_path / "state" / "background-review-mem0.jsonl").read_text()
+    assert "ghp_" not in ledger
+
+
+def test_provider_switched_away_from_mem0_refuses(mem0_home, tmp_path):
+    fake = mem0_home(knob=True)
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n  provider: holographic\n  background_review_mem0_write: true\n")
+    out = _dispatch("Ace prefers tea.")
+    assert "error" in out and fake.rows == []

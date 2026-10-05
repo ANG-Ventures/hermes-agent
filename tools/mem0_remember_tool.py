@@ -65,24 +65,32 @@ def _knob_on() -> bool:
 @no_cache_check_fn
 def check_mem0_remember_requirements() -> bool:
     """Opt-in knob on, mem0 is the configured provider, and mem0 has a reachable config."""
-    from hermes_cli.config import cfg_get, load_config_readonly
-
     if not _knob_on():
         return False
-    if str(cfg_get(load_config_readonly(), "memory", "provider", default="") or "").strip() != "mem0":
+    if not _mem0_selected():
         return False
     from plugins.memory.mem0 import Mem0MemoryProvider
 
     return Mem0MemoryProvider().is_available()
 
 
+def _mem0_selected() -> bool:
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    return str(cfg_get(load_config_readonly(), "memory", "provider", default="") or "").strip() == "mem0"
+
+
 def _get_provider():
+    """Cached per (home, effective mem0 config): a config edit in a running gateway builds a new one."""
+    from plugins.memory.mem0 import _load_config
     from hermes_constants import hermes_home_key
 
-    key = hermes_home_key()
+    key = (hermes_home_key(), json.dumps(_load_config(), sort_keys=True, default=str))
     with _providers_lock:
         provider = _providers.get(key)
         if provider is None:
+            for old in [k for k in _providers if k[0] == key[0]]:
+                _providers.pop(old, None)
             from plugins.memory.mem0 import Mem0MemoryProvider
 
             provider = Mem0MemoryProvider()
@@ -100,6 +108,8 @@ def mem0_remember_tool(fact: str, supersedes: str = "") -> str:
         return tool_error("Missing required parameter: fact")
     if not _knob_on():
         return tool_error(f"mem0_remember is off (memory.{CONFIG_KEY} is false).")
+    if not _mem0_selected():
+        return tool_error("mem0_remember is off (memory.provider is not mem0).")
     try:
         provider = _get_provider()
     except Exception as e:
