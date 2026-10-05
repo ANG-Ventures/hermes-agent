@@ -2698,6 +2698,7 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
 
     def _remove_units(units: list[tuple[str, Path]], *, system: bool) -> None:
         nonlocal removed
+        attempted = False
         for name, path in units:
             # Per item, in the loop that removes it: a refused unit is never stopped, disabled or unlinked.
             try:
@@ -2705,6 +2706,7 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
             except ServiceMutationRefused:
                 remaining.append(path)
                 continue
+            attempted = True
             try:
                 _run_systemctl(["stop", name], system=system, check=False, timeout=90)
                 _run_systemctl(["disable", name], system=system, check=False, timeout=30)
@@ -2714,6 +2716,8 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
             except (OSError, RuntimeError) as e:
                 print(f"  ⚠ Could not remove {path}: {e}")
                 remaining.append(path)
+        if not attempted:  # every unit refused: the manager is not touched at all
+            return
         with contextlib.suppress(RuntimeError):
             _run_systemctl(["daemon-reload"], system=system, check=False, timeout=30)
 
