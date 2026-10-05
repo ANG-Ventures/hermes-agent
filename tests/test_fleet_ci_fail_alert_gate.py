@@ -767,7 +767,7 @@ def _red_e2e():
 
 def _main_api(history, *, current=None):
     """history: newest first, (run_id, created_at, conclusion, jobs)."""
-    api = {"actions/runs/42/jobs": current or _red_e2e(),
+    api = {"actions/runs/42/jobs": current or _red_e2e(), "/annotations": [],
            "runs?branch=main&event=push": {"workflow_runs": [
                {"id": rid, "created_at": ts, "conclusion": c, "head_branch": "main", "event": "push"}
                for rid, ts, c, _j in history]}}
@@ -1082,7 +1082,8 @@ QLINT = "Quarantine list lint + evidence gate"
 
 
 def _tc(qlint):
-    return (TC, "failure", {QLINT: qlint, "Fail on skipped or failed required tests": "failure"})
+    # an e2e-upgrade red trips the e2e-upgrade gate step, which is derivative of that job
+    return (TC, "failure", {QLINT: qlint, "Fail on skipped or failed e2e-upgrade shards": "failure"})
 
 
 def test_main_red_new_quarantine_gate_failure_in_tests_complete_pages(tmp_path):
@@ -1119,3 +1120,91 @@ def test_main_red_large_jobs_pages_do_not_ride_on_argv(tmp_path):
     prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
     got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+# --- Prism round 1 on e7b489f4 (t_1a8e095b) ------------------------------------------------------
+# 569d6f572e69 "Excluded Recovery": created_at has 1 s precision. A main run created in the same
+# second cannot be ordered against this one, so the red pages instead of dropping that run.
+def test_main_red_same_second_predecessor_pages(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T05:00:00Z", "success", green),
+                     (40, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+# b0cbda43048e "Dropped Timeouts": an aggregate job that timed out with no failed step (its running
+# step cancelled) is a stepless item in ITEMS and in sig_of, not dropped.
+def _tc_timeout():
+    return (TC, "timed_out", {QLINT: "cancelled"})
+
+
+def test_main_red_tests_complete_timeout_next_to_a_known_red_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc_timeout())
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_fold_blocked_by_a_tests_complete_timeout(tmp_path):
+    api = _other_pr_queue_api()
+    tc = next(j for j in api["actions/runs/42/jobs"]["jobs"] if j["name"] == TC)
+    tc["conclusion"], tc["steps"] = "timed_out", [{"name": QLINT, "conclusion": "cancelled"}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert TC in got["summary"]
+
+
+# 5515ab6c4f85 "Coarse Deduplication": a job/step match cannot tell two tests apart. A NEW pytest
+# node id in an already-red slice pages; the same node id stays a standing red.
+SLICE = "Python tests / Run tests slice 12/16"
+QTEST2 = "tests/tools/test_other.py::test_new_regression"
+
+
+def test_main_red_new_test_in_an_already_red_slice_pages(tmp_path):
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
+    prior = {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
+    api["check-runs/700/annotations"] = _ann(QTEST2)
+    api["check-runs/800/annotations"] = _ann(QTEST)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and QTEST2 in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_same_test_in_an_already_red_slice_goes_to_logs(tmp_path):
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
+    prior = {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
+    api["check-runs/700/annotations"] = _ann(QTEST)
+    api["check-runs/800/annotations"] = _ann(QTEST)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs", got["_stdout"]
+
+
+# 891d36986f43 "missing-work gate failures": a Tests complete gate step that failed while none of
+# its prerequisite jobs stopped (the requested e2e-upgrade shards were SKIPPED) is a new fault.
+RUFF = ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"})
+
+
+def test_main_red_gate_failing_on_skipped_shards_next_to_a_known_red_pages(tmp_path):
+    current = _main_jobs(RUFF, (E2E, "skipped", {}),
+                         (TC, "failure", {QLINT: "success", "Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _main_jobs(RUFF))], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_gate_failing_on_skipped_shards_twice_goes_to_logs(tmp_path):
+    jobs = _main_jobs(RUFF, (E2E, "skipped", {}),
+                      (TC, "failure", {QLINT: "success", "Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", jobs)], current=jobs))
+    assert got["route"] == "logs", got["_stdout"]
+
+
+def test_main_red_skip_gate_now_vs_derivative_gate_before_pages(tmp_path):
+    # the gate failed before only because e2e-upgrade failed; now it fails on a skip: different fault
+    current = _main_jobs((E2E, "skipped", {}),
+                         (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                       (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts" and "different fault" in got["_stdout"], got["_stdout"]
+
