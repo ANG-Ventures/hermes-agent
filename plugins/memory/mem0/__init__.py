@@ -1339,7 +1339,12 @@ class Mem0MemoryProvider(MemoryProvider):
         keep the 15s default → byte-identical to before this widening.
         """
         import urllib.request as _u
-        key = os.environ.get("OPENAI_API_KEY", "") or (self._config.get("openai_api_key", "") if self._config else "")
+        # Profile-scoped (multiplex: never the launch profile's key); no key -> caller's fallback.
+        try:
+            key = get_secret("OPENAI_API_KEY", "") or ""
+        except UnscopedSecretError:
+            key = ""
+        key = key or (self._config.get("openai_api_key", "") if self._config else "")
         if not key or not texts:
             return None
         model = (self._config.get("dedup_embed_model") if self._config else None) or "text-embedding-3-small"
