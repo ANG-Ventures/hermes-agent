@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -55,7 +56,8 @@ UNSTATED_MAX_SLOTS = 64
 def _num(value) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    # json.loads accepts NaN/Infinity; int(inf) raises.
+    return float(value) if math.isfinite(value) else None
 
 
 def _get(doc: Mapping, *path, default=None):
@@ -84,32 +86,40 @@ class PlacementPolicy:
         v = _get(self.doc, *path)
         return v if v is not None else _get(_FALLBACK, *path)
 
+    def _pick_num(self, path, fallback_path=None) -> Optional[float]:
+        """A numeric key; a value the file sets with the wrong type falls back."""
+        v = _num(_get(self.doc, *path))
+        return v if v is not None else _num(_get(_FALLBACK, *(fallback_path or path)))
+
+    def _pick_str(self, *path) -> Optional[str]:
+        v = _get(self.doc, *path)
+        return v if isinstance(v, str) and v else _get(_FALLBACK, *path)
+
     @property
     def stale_after_s(self) -> float:
-        return _num(self._pick("stale_after_s")) or 120.0
+        return self._pick_num(("stale_after_s",)) or 120.0
 
     @property
     def pressure_path(self) -> str:
-        return str(self._pick("pressure_path", "linux"))
+        return str(self._pick_str("pressure_path", "linux"))
 
     def host_class(self, host: str) -> str:
-        return str(self._pick("hosts", host, "class") or DEFAULT_CLASS)
+        return self._pick_str("hosts", host, "class") or DEFAULT_CLASS
 
     def kanban_band(self, host: str) -> KanbanBand:
         cls = self.host_class(host)
 
-        def pick(*p) -> Any:
-            v = _get(self.doc, "classes", cls, CONSUMER, *p)
-            return v if v is not None else _get(_FALLBACK, "classes", DEFAULT_CLASS, CONSUMER, *p)
+        def pick(*p) -> float:
+            return self._pick_num(("classes", cls, CONSUMER, *p), ("classes", DEFAULT_CLASS, CONSUMER, *p))
 
         return KanbanBand(warm=float(pick("warm", "load_ratio")), hot=float(pick("hot", "load_ratio")),
                           hot_streak=int(pick("hot_streak")), clear_streak=int(pick("clear_streak")))
 
     def consumer(self, name: str, key: str):
-        return self._pick("consumers", name, key)
+        return self._pick_num(("consumers", name, key))
 
     def max_slots(self, host: str, consumer: str) -> int:
-        v = _num(self._pick("hosts", host, "max_slots", consumer))
+        v = self._pick_num(("hosts", host, "max_slots", consumer))
         return int(v) if v is not None and v >= 0 else UNSTATED_MAX_SLOTS
 
 

@@ -509,3 +509,35 @@ def test_one_shot_pool_plan_seeds_remote_by_host_for_the_ledger(monkeypatch):
     assert kanban_ops._one_shot_pool_plan(object(), {"kanban": {}}) == "PLAN"
     assert b._remote_by_host == {"ace-ai": 2}
     assert b.plan_calls == [{"ace-ai": 2}]
+
+
+@pytest.mark.parametrize("bad", ["invalid", None, True, [], {}, float("inf"), float("nan")])
+def test_schema1_value_of_the_wrong_type_falls_back_to_the_prd_value(tmp_path, bad):
+    """The module promises "never raises": a mistyped schema-1 key reads as unset."""
+    doc = {"schema": 1, "stale_after_s": bad, "pressure_path": {"linux": bad},
+           "classes": {"linux-shared": {"kanban": {"warm": {"load_ratio": bad}, "hot": {"load_ratio": bad},
+                                                   "hot_streak": bad, "clear_streak": bad}}},
+           "consumers": {"kanban": {"cpu_est_prior": bad, "ramp_s": bad, "ttl_s": bad}},
+           "hosts": {"ace-ai": {"class": bad, "max_slots": {"kanban": bad}}}}
+    (tmp_path / pp.POLICY_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    policy = pp.load(tmp_path)
+    assert policy.source == "file"
+    assert policy.kanban_band("ace-ai") == POLICY.kanban_band("ace-ai")
+    assert policy.stale_after_s == POLICY.stale_after_s
+    if not isinstance(bad, str):  # a string is a legal path / class name
+        assert policy.pressure_path == POLICY.pressure_path
+        assert policy.host_class("ace-ai") == POLICY.host_class("ace-ai")
+    assert policy.max_slots("ace-ai", "kanban") == POLICY.max_slots("ace-ai", "kanban")
+    for key in ("cpu_est_prior", "ramp_s", "ttl_s"):
+        assert policy.consumer("kanban", key) == POLICY.consumer("kanban", key)
+
+
+def test_schema1_numeric_values_still_win(tmp_path):
+    doc = {"schema": 1, "classes": {"linux-shared": {"kanban": {"hot_streak": 5, "hot": {"load_ratio": 0.9}}}},
+           "consumers": {"kanban": {"ttl_s": 240}}}
+    (tmp_path / pp.POLICY_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    policy = pp.load(tmp_path)
+    band = policy.kanban_band("ace-ai")
+    assert (band.hot_streak, band.hot) == (5, 0.9)
+    assert band.clear_streak == POLICY.kanban_band("ace-ai").clear_streak
+    assert policy.consumer("kanban", "ttl_s") == 240
