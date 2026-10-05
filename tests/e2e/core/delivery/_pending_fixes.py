@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional
 
 import pytest
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -58,7 +59,7 @@ def gap_open(pr: int) -> bool:
     with tempfile.TemporaryDirectory(prefix=f"gap-{pr}-") as tmp:
         home = Path(tmp) / "home"
         (home / ".hermes").mkdir(parents=True)
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if not k.startswith(("PYTEST_", "HERMES_")) and not k.endswith("_API_KEY")}
         env.update({"HOME": str(home), "HERMES_HOME": str(home / ".hermes"),
                     "PYTHONPATH": str(REPO_ROOT), **extra_env})

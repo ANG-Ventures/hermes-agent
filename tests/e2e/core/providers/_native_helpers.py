@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import hermes_yaml as yaml
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TURN_TIMEOUT = 180.0
@@ -58,7 +59,7 @@ class NativeHome:
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Allowlisted env: no inherited credentials, HERMES_* or TERMINAL_* can reroute the child."""
         env = {
-            k: v for k, v in os.environ.items()
+            k: v for k, v in environ_snapshot().items()
             if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_ENV_SUFFIXES)
         }
         env.update({

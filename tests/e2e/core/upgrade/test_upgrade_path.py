@@ -64,6 +64,7 @@ import hermes_yaml as yaml
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade import _helpers as H
 from tests.fakes.fake_llm_provider import FakeLLMServer
+from tests.e2e.environ_snapshot import environ_snapshot
 
 pytestmark = [
     pytest.mark.platforms("linux"),
@@ -81,7 +82,7 @@ CLI_TIMEOUT = 600
 
 def _git(*args: str, cwd: Path, check: bool = True) -> str:
     cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                        env={**environ_snapshot(), "GIT_TERMINAL_PROMPT": "0"})
     if check and cp.returncode != 0:
         raise AssertionError(f"git {args} failed in {cwd}: {cp.stderr}")
     return cp.stdout.strip()
@@ -383,7 +384,7 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     # the updater must cross that interpreter boundary during the retry.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    uv_env = {k: v for k, v in environ_snapshot().items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
                          "--python", base_python], cwd=str(install),

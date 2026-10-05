@@ -31,6 +31,7 @@ from typing import Any, Callable, Iterable
 import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall, write_hermes_home
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 FIXTURE_MCP_SERVER = Path(__file__).with_name("fixture_mcp_server.py")
@@ -92,7 +93,7 @@ class ParityHome:
         # Allowlist, not denylist: the runner may itself be a Hermes process whose
         # TERMINAL_CWD / HERMES_* / credential env would silently reroute the child.
         env = {
-            k: v for k, v in os.environ.items()
+            k: v for k, v in environ_snapshot().items()
             if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_ENV_SUFFIXES)
         }
         env.update({

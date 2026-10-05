@@ -64,6 +64,7 @@ from tests.e2e.core.windows._helpers import (
     wait_until,
 )
 from tests.fakes.fake_llm_provider import write_hermes_home
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 OPT_IN_ENV = "HERMES_E2E_WINDOWS_INSTALL"
@@ -103,7 +104,7 @@ def harness_git(*args: str, cwd: Path | None = None, env: dict[str, str] | None 
                 timeout: float = 600.0) -> str:
     """The driver's own git (never the product's). Raises on failure: it is plumbing."""
     assert REAL_GIT, "harness needs git on PATH to stage serve.git"
-    base = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    base = {k: v for k, v in environ_snapshot().items() if not k.startswith("GIT_")}
     base.update(env or {})
     res = subprocess.run([REAL_GIT, "-c", "safe.directory=*", *args], cwd=cwd, env=base,
                          capture_output=True, timeout=timeout)
@@ -193,7 +194,7 @@ class Machine:
     # -- environment ----------------------------------------------------------
 
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if k in _PASSTHROUGH_ENV and not k.upper().endswith(_SECRET_SUFFIXES)}
         roaming = self.profile / "AppData" / "Roaming"
         self.local.mkdir(parents=True, exist_ok=True)

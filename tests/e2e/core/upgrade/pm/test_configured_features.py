@@ -34,6 +34,7 @@ from tests.e2e.core.upgrade import _install_helpers as I
 from tests.e2e.core.upgrade.pm import _pm as P
 from tests.e2e.core.upgrade.test_upgrade_path import _RETRY_PREFIX, _refs, make_leg
 from tests.fakes.fake_llm_provider import FakeLLMServer
+from tests.e2e.environ_snapshot import environ_snapshot
 
 pytestmark = [
     pytest.mark.platforms("linux"),
@@ -138,7 +139,7 @@ def migrated(tmp_path_factory, provider):
         pytest.skip("no release tag reachable before HEAD (fetch tags)")
     leg = make_leg(tmp_path_factory.mktemp("pm-legacy") / "leg", None)
     no_cfg = leg.root / "uv-config"
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    uv_env = {k: v for k, v in environ_snapshot().items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(leg.install / "venv"), XDG_CONFIG_HOME=str(no_cfg),
                   XDG_CONFIG_DIRS=str(no_cfg))
     uv = I.real_uv()

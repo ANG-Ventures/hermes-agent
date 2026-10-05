@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO = Path(__file__).resolve().parents[4]
 PY = sys.executable
@@ -110,7 +111,7 @@ class Board:
 
     # env / processes -------------------------------------------------------
     def env(self) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if not k.startswith("HERMES_") and not k.endswith(("_API_KEY", "_TOKEN"))}
         env.pop("PYTEST_CURRENT_TEST", None)
         env.update({

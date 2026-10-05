@@ -43,6 +43,7 @@ from pathlib import Path
 import pytest
 
 from tests.e2e._stub_openai_bridge import StubBridge
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO = Path(__file__).resolve().parents[2]
 DRIVER = Path(__file__).with_name("_owns_transcript_driver.py")
@@ -85,7 +86,7 @@ def _run_lane(tmp_path: Path, owns: bool, *, sabotage_omit: bool = False) -> dic
             f"terminal:\n  cwd: {work}\n"
         )
         env = {
-            k: v for k, v in os.environ.items()
+            k: v for k, v in environ_snapshot().items()
             if not k.startswith(("HERMES_", "PYTEST_")) and k not in ("TERMINAL_CWD",)
         }
         env.update({
