@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from hermes_cli import placement_ledger as _ledger
+from hermes_cli import placement_policy as _policy
 
 ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
@@ -251,6 +252,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     warnings: List[str] = []
     hosts: List[PoolHost] = []
     disabled: List[str] = []
+    policy = _policy.load(fleet_dir)
     for i, hid in enumerate(prio):
         row = rows.get(hid)
         if row is None:
@@ -258,6 +260,11 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             continue
         if not row["enabled"]:
             disabled.append(hid)
+            continue
+        if not policy.targets(hid):
+            # Placement PRD I-1: the runtime assertion, not only the lint.
+            warnings.append(f"kanban pool: {hid} is targets:false in placement-policy.json "
+                            "(never a placement target; host dropped)")
             continue
         if hid not in with_role:
             warnings.append(f"kanban pool: {hid} is enabled but has no {ROLE} role (host dropped)")
