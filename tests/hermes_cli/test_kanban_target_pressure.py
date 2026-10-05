@@ -95,7 +95,54 @@ def test_stale_pressure_is_unknown_not_hot(sig):
         assert d["hot"] is False and d["pressure"] == "pressure unknown (stale 130s)"
     state = json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]
     assert state["hot"] is False and state["hot_run"] == 0
-    # The file turns fresh and hot: the streak starts from zero (UNKNOWN reset).
+    # The file turns fresh and hot: UNKNOWN built no streak, so one hot sample admits.
+    fleet.set("ace-ai", 0.95)
+    assert _plan(fleet, sig).slots["ace-ai"] == 4
+
+
+def _unknown(fleet, kind):
+    """One UNKNOWN tick of ``kind``: a stale file, or an unreachable host."""
+    if kind == "stale":
+        fleet.set("ace-ai", 0.95, age=130)
+    else:
+        fleet.text["ace-ai"] = ""  # empty probe text = pressure unreadable
+        fleet.now["ace-ai"] += 30.0
+
+
+@pytest.mark.parametrize("kind", ["stale", "unreadable"])
+@pytest.mark.parametrize("seq, want", [
+    # An earned hot survives an UNKNOWN tick: the next hot sample still refuses.
+    (("hot", "hot", "unknown", "hot"), [4, 0, 0, 0]),
+    # Readmission after UNKNOWN still waits for 3 fresh non-hot samples.
+    (("hot", "hot", "unknown", "ok", "ok", "ok"), [4, 0, 0, 0, 0, 4]),
+    # A sampler flapping hot/unknown never admits once the streak is earned.
+    (("hot", "unknown", "hot", "unknown", "hot", "unknown", "hot"), [4, 0, 0, 0, 0, 0, 0]),
+])
+def test_unknown_does_not_erase_an_earned_hot(sig, kind, seq, want):
+    """QA t_1302fe6c: UNKNOWN used to reset {hot, hot_run, clear_run}, so a
+    hot host was readmitted on its next fresh hot sample (t_36840c8a)."""
+    fleet = Fleet()
+    seen = []
+    for step in seq:
+        if step == "unknown":
+            _unknown(fleet, kind)
+        else:
+            fleet.set("ace-ai", 0.95 if step == "hot" else 0.1)
+        seen.append(_plan(fleet, sig).slots["ace-ai"])
+    assert seen == want, seen
+
+
+def test_unknown_past_the_discard_window_starts_over(sig):
+    """The 3x-stale discard still bounds a host that stays UNKNOWN: UNKNOWN
+    does not refresh ``updated``, so the earned hot is dropped after 360 s."""
+    fleet = Fleet()
+    for _ in range(2):
+        fleet.set("ace-ai", 0.95)
+        _plan(fleet, sig)
+    for _ in range(4):
+        sig.clock_box["t"] += 100
+        _unknown(fleet, "stale")
+        assert _plan(fleet, sig).slots["ace-ai"] == 0
     fleet.set("ace-ai", 0.95)
     assert _plan(fleet, sig).slots["ace-ai"] == 4
 
