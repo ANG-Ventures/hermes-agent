@@ -2699,23 +2699,23 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
     def _remove_units(units: list[tuple[str, Path]], *, system: bool) -> None:
         nonlocal removed
         attempted = False
-        for name, path in units:
+        for name, unit_path in units:
             # Per item, in the loop that removes it: a refused unit is never stopped, disabled or unlinked.
             try:
-                assert_may_mutate(path, "remove the legacy unit", _service_home_for_unit(path, system))
+                assert_may_mutate(unit_path, "remove the legacy unit", _service_home_for_unit(unit_path, system))
             except ServiceMutationRefused:
-                remaining.append(path)
+                remaining.append(unit_path)
                 continue
             attempted = True
             try:
                 _run_systemctl(["stop", name], system=system, check=False, timeout=90)
                 _run_systemctl(["disable", name], system=system, check=False, timeout=30)
-                path.unlink(missing_ok=True)
-                print(f"  ✓ Removed {path}")
+                unit_path.unlink(missing_ok=True)
+                print(f"  ✓ Removed {unit_path}")
                 removed += 1
             except (OSError, RuntimeError) as e:
-                print(f"  ⚠ Could not remove {path}: {e}")
-                remaining.append(path)
+                print(f"  ⚠ Could not remove {unit_path}: {e}")
+                remaining.append(unit_path)
         if not attempted:  # every unit refused: the manager is not touched at all
             return
         with contextlib.suppress(RuntimeError):
