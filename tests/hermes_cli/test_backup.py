@@ -199,6 +199,8 @@ class TestShouldExclude:
             ".worktrees/argus/t_064c65a9/head/setup.py",
             "var/ramscratch-stage-20260925-0512/worktrees/f.txt",
             "var/subvps-stage/sub-vps-1/etc/hosts",
+            "var/subs-portal/site/shards/d221f9326aeb.json.br",
+            "var/pin-surfaces/default-20261004T085206Z.witness.json",
         ):
             assert _should_exclude(Path(p)), p
         # the walk prunes the DIR itself (prune sites pass a trailing "_" sentinel)
@@ -210,6 +212,8 @@ class TestShouldExclude:
         assert not _should_exclude(Path("kanban.db"))
         assert not _should_exclude(Path("var/other-stage/a.txt"))
         assert not _should_exclude(Path("var/ramscratch-notes.md"))
+        assert not _should_exclude(Path("var/subs-portal/site/index.html"))
+        assert not _should_exclude(Path("var/subs-portal/fleetreview-ingest.log"))
         # root-anchored: same names deeper in the tree are kept
         assert not _should_exclude(Path("skills/x/kanban/workspaces/note.md"))
         assert not _should_exclude(Path("skills/x/.worktrees/note.md"))
@@ -1145,6 +1149,37 @@ class TestBackupEdgeCases:
         assert exc.value.code == 1
         unreadable.chmod(0o600)
         assert run_backup(Namespace(output=str(tmp_path / "out4.zip"))) is True
+
+    def test_file_deleted_after_scan_is_a_warning_not_a_failure(self, tmp_path, monkeypatch, capsys):
+        """A file the scan listed and a writer deleted before the zip reached it (r40, t_d107bcf5:
+        5,755 rotated scratch files turned a 3 h Sunday full into rc 1) is a WARN with a count and
+        the run is complete; a file that still exists but cannot be read stays an error."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        doomed = hermes_home / "skills" / "rotated.md"
+        doomed.write_text("gone soon\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+
+        real_iter = backup_mod._iter_backup_files
+
+        def _iter_then_delete(*a, **kw):
+            listed = list(real_iter(*a, **kw))
+            doomed.unlink()
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _iter_then_delete)
+        out_zip = tmp_path / "out.zip"
+        assert backup_mod.run_backup(Namespace(output=str(out_zip))) is True
+        out = capsys.readouterr().out
+        assert "Backup complete" in out and "WARN: 1 file(s) were deleted after the scan" in out
+        assert "skills/rotated.md" in out
+        with zipfile.ZipFile(out_zip) as zf:
+            names = zf.namelist()
+            assert "skills/rotated.md" not in names and "config.yaml" in names
+            assert zf.testzip() is None
 
     def test_empty_hermes_home(self, tmp_path, monkeypatch):
         """Backup handles empty hermes home (no files to back up)."""
