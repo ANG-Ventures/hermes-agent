@@ -183,3 +183,50 @@ def test_stable_dispatch_and_failure(monkeypatch, tmp_path):
     assert release.dispatch_desktop_build(
         "v1.2.3+canary.20260818T103000Z", "owner/repo"
     ) is False
+
+
+def test_oversized_canary_changelog_publishes_the_frame_instead_of_failing(canary_repo, monkeypatch):
+    # 2026-10-04 run 37203419975: a canary with since=None listed 13,025 commits; GitHub refused the
+    # draft (HTTP 422, body > 125,000 chars) after the tag was pushed. Nobody re-runs a scheduled
+    # canary with --no-changelog, so cmd_canary falls back to the commit-free frame on its own.
+    git, _remote, calls = canary_repo
+    git("commit", "--allow-empty", "-qm", "feat: next")
+    asked = []
+
+    def changelog(*_args, no_changelog=False, **_kwargs):
+        asked.append(no_changelog)
+        return "frame only" if no_changelog else "x" * (release.CANARY_BODY_BUDGET + 1)
+
+    monkeypatch.setattr(release, "generate_changelog", changelog)
+    bodies = []
+    inner = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if argv[:3] == ["gh", "release", "create"]:
+            with open(argv[argv.index("--notes-file") + 1], encoding="utf-8") as notes:
+                bodies.append(notes.read())
+        return inner(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    release.cmd_canary(SimpleNamespace(date="20260818T103000Z", publish=True, no_changelog=False,
+                                       remote="origin"))
+
+    assert asked == [False, True]
+    assert bodies == ["frame only"]
+    assert any(call[1:3] == ["workflow", "run"] for call in calls)
+
+
+def test_canary_changelog_within_budget_is_published_whole(canary_repo, monkeypatch):
+    git, _remote, _calls = canary_repo
+    git("commit", "--allow-empty", "-qm", "feat: next")
+    asked = []
+
+    def changelog(*_args, no_changelog=False, **_kwargs):
+        asked.append(no_changelog)
+        return "full notes"
+
+    monkeypatch.setattr(release, "generate_changelog", changelog)
+    release.cmd_canary(SimpleNamespace(date="20260818T103000Z", publish=True, no_changelog=False,
+                                       remote="origin"))
+
+    assert asked == [False]
