@@ -344,28 +344,34 @@ def _systemd_service_user(home: Path, services: list[tuple[str, bool]]) -> Optio
 
 
 def _service_op(kind: str, system: bool, verb: str, home: Path, *, run_as_user: Optional[str] = None) -> None:
-    """``stop`` / ``uninstall`` / ``start`` / ``restart`` / ``install`` / ``enable`` on ``home``'s service."""
+    """``stop`` / ``uninstall`` / ``start`` / ``restart`` / ``install`` / ``enable`` on ``home``'s service.
+
+    A refused step (``ServiceMutationRefused``, a ``sys.exit`` in a backend) is a ``SystemExit``; it is
+    re-raised as ``RuntimeError`` for EVERY verb, never only ``install``: apply's compensator catches
+    ``Exception``, so a refused ``start`` after the removals escaped it and left the host with no gateway."""
+    try:
+        _service_op_unguarded(kind, system, verb, home, run_as_user=run_as_user)
+    except SystemExit as exc:
+        raise RuntimeError(f"gateway service {verb} for {home} was refused") from exc
+
+
+def _service_op_unguarded(kind: str, system: bool, verb: str, home: Path, *, run_as_user: Optional[str] = None) -> None:
     if kind == "s6":
         return _s6_slot_op(verb, home)
     from hermes_cli import gateway as gw
     with _home_env(home):
         if verb == "install":
-            try:
-                if kind == "launchd":
-                    # Written, not loaded: the migration installs the default BEFORE the secondaries are
-                    # removed, so loading here (RunAtLoad) would start it against their still-live bot tokens.
-                    gw.launchd_install(start_now=False)
-                elif kind == "windows":
-                    # Non-interactive: the migration already asked; prompting here would hang a
-                    # supervised/`--yes` run on a console that has no operator.
-                    from hermes_cli import gateway_windows as gww
-                    gww.install(start_now=True, start_on_login=True)
-                else:
-                    gw.systemd_install(system=system, run_as_user=run_as_user, non_interactive=True)
-            except SystemExit as exc:
-                # A refused write (another home's definition, worker kill switch) is a failed step,
-                # never a silent success followed by starting someone else's service.
-                raise RuntimeError(f"gateway service install for {home} was refused") from exc
+            if kind == "launchd":
+                # Written, not loaded: the migration installs the default BEFORE the secondaries are
+                # removed, so loading here (RunAtLoad) would start it against their still-live bot tokens.
+                gw.launchd_install(start_now=False)
+            elif kind == "windows":
+                # Non-interactive: the migration already asked; prompting here would hang a
+                # supervised/`--yes` run on a console that has no operator.
+                from hermes_cli import gateway_windows as gww
+                gww.install(start_now=True, start_on_login=True)
+            else:
+                gw.systemd_install(system=system, run_as_user=run_as_user, non_interactive=True)
             return
         if verb == "enable":
             # Boot enablement only: the migration's uninstall of every secondary destroys their

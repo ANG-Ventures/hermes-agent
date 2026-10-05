@@ -184,7 +184,27 @@ def pinned_hermes_home(unit_path: Path, account_home: str | None = None) -> str 
         text = unit_path.read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
         return None
-    return environment_of([text], account_home or str(Path.home())).get("HERMES_HOME") or None
+    return environment_of([text], account_home or manager_home_for_unit(unit_path)).get("HERMES_HOME") or None
+
+
+_SYSTEM_UNIT_DIRS = ("/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system",
+                     "/usr/lib/systemd/system", "/lib/systemd/system")
+
+
+def manager_home_for_unit(unit_path: Path) -> str:
+    """What systemd expands ``%h`` to for the unit at *unit_path*: the home of the user running the service
+    manager. System manager: root's home (``User=`` does not change it). User manager: the ACCOUNT home, never
+    the caller's ``HOME`` - a scratch process with ``HOME=/srv/scratch`` read another account's
+    ``HERMES_HOME=%h/.hermes`` as its own scratch home and passed the ownership check (Prism on #1740)."""
+    import pwd
+    from hermes_constants import get_real_home
+    path = str(unit_path)
+    if any(path == d or path.startswith(d + "/") for d in _SYSTEM_UNIT_DIRS):
+        try:
+            return pwd.getpwuid(0).pw_dir
+        except KeyError:
+            return "/root"
+    return get_real_home()
 
 
 def _spec(v: str, account_home: str | None) -> str:

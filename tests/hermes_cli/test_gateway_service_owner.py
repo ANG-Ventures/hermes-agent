@@ -610,3 +610,52 @@ class TestChokepointLint:
         monkeypatch.setattr(guard, "ROOT", tmp_path)
         problems = guard.scan_file(bad)
         assert len(problems) == 1 and "bad() mutates unit_path" in problems[0]
+
+
+class TestSpecifierHome:
+    """Prism P1 b548fb4f89f3 (#1740): ``%h`` is the SERVICE MANAGER's home, never the caller's ``HOME``."""
+
+    def test_user_unit_percent_h_uses_the_account_home_not_a_scratch_home(self, tmp_path, monkeypatch):
+        alice, scratch = tmp_path / "home" / "alice", tmp_path / "srv" / "scratch"
+        monkeypatch.setenv("HOME", str(scratch))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(alice))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: scratch))
+        unit = tmp_path / "user" / "hermes-gateway.service"
+        unit.parent.mkdir()
+        unit.write_text('[Service]\nEnvironment="HERMES_HOME=%h/.hermes"\n', encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == f"{alice}/.hermes"
+        from hermes_cli.gateway_service_owner import pinned_home
+        assert pinned_home(unit) == f"{alice}/.hermes"
+
+    def test_system_unit_percent_h_is_the_system_manager_home(self, monkeypatch):
+        import pwd
+        from hermes_cli.gateway_unit_parse import manager_home_for_unit
+        monkeypatch.setenv("HOME", "/srv/scratch")
+        assert manager_home_for_unit(Path("/etc/systemd/system/hermes-gateway.service")) == pwd.getpwuid(0).pw_dir
+
+
+class TestUnknownServiceUser:
+    """CI slice 10 on eb7f3ded: an unknown --run-as-user crashed the ownership check with a bare
+    ValueError before the install's own handling; an unknown account is not a foreign home."""
+
+    def test_unknown_run_as_user_does_not_crash_the_chokepoint(self, monkeypatch, tmp_path):
+        seen = {}
+        monkeypatch.setattr(gw, "_require_root_for_system_service", lambda action: None)
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: tmp_path / "u.service")
+
+        def _identity(run_as_user=None):
+            raise ValueError(f"Unknown user: {run_as_user}")
+
+        monkeypatch.setattr(gw, "_system_service_identity", _identity)
+
+        class _Stop(Exception):
+            pass
+
+        def _chokepoint(path, action, pinned, **kw):
+            seen["pinned"] = pinned
+            raise _Stop
+
+        monkeypatch.setattr("hermes_cli.gateway_service_owner.assert_may_mutate", _chokepoint)
+        with pytest.raises(_Stop):
+            gw.systemd_install(system=True, run_as_user="nosuchuser-xyz", non_interactive=True)
+        assert seen["pinned"] == gw._service_home_for_unit(tmp_path / "u.service", True)

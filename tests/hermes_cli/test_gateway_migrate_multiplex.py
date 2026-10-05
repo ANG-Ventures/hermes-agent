@@ -1051,3 +1051,18 @@ def test_standalone_profile_is_listed_left_alone_and_not_a_fold_target(fleet):
     assert payload["standalone_by_config"] == list(plan.standalone_by_config)
     assert "ops" not in [p["profile"] for p in payload["profiles"]]
     assert any("ops" in line for line in gm.format_plan(plan, dry_run=True))
+
+
+def test_a_refused_step_after_removal_reaches_the_compensator(monkeypatch):
+    """Prism P1 b55e7a3ef445 (#1740): only `install` turned a SystemExit into RuntimeError, so a refused
+    `start` after the removals escaped apply's `except Exception` compensator. Every verb converts now."""
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused
+
+    def _refused(*a, **k):
+        raise ServiceMutationRefused("pins another home")
+
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gw, "_service_call", _refused)
+    for verb in ("start", "restart", "stop", "uninstall"):
+        with pytest.raises(RuntimeError, match=f"gateway service {verb} for .* was refused"):
+            _REAL_SERVICE_OP("systemd", False, verb, Path("/nonexistent/hermes"))

@@ -1231,12 +1231,12 @@ def _unit_environment_value(unit_path: Path, name: str) -> str | None:
     """Effective value of ``NAME`` in the ``[Service]`` environment of the unit file at *unit_path*, read with
     systemd's grammar (``hermes_cli.gateway_unit_parse``, the parser shared with the fleet lint); None when
     the file is unreadable or the variable is not set."""
-    from hermes_cli.gateway_unit_parse import environment_of
+    from hermes_cli.gateway_unit_parse import environment_of, manager_home_for_unit
     try:
         text = unit_path.read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
         return None
-    return environment_of([text], str(Path.home())).get(name, "").strip() or None
+    return environment_of([text], manager_home_for_unit(unit_path)).get(name, "").strip() or None
 
 
 def _hermes_home_pinned_by_unit(unit_path: Path) -> str | None:
@@ -3831,8 +3831,13 @@ def systemd_install(
     # host service). Checked on the caller's own home: the system-unit sync below replaces it. Raises
     # SystemExit(1): a refusal that returned normally made callers START the other home's service.
     from hermes_cli.gateway_service_owner import assert_may_mutate
-    pinned_home = _service_home_for_unit(unit_path, system) if not (system and run_as_user) else Path(
-        _hermes_home_for_target_user(_system_service_identity(run_as_user)[2]))
+    pinned_home = _service_home_for_unit(unit_path, system)
+    if system and run_as_user:
+        try:
+            pinned_home = Path(_hermes_home_for_target_user(_system_service_identity(run_as_user)[2]))
+        except ValueError:
+            # Unknown account: not a foreign home. generate_systemd_unit refuses it below with the real error.
+            pass
     assert_may_mutate(unit_path, "install the gateway unit", pinned_home, install=True,
                       force_unit_path=force_unit_path, admit_home=_explicit_hermes_home() or get_hermes_home())
 
@@ -3860,7 +3865,7 @@ def systemd_install(
     if unit_path.exists() and not (force or force_unit_path):
         if not systemd_unit_is_current(system=system):
             if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
-                return
+                sys.exit(1)  # a normal return let callers START the protected unit / migrate past it
             offer_legacy_unit_removal()
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
@@ -3894,7 +3899,7 @@ def systemd_install(
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
         sys.exit(1)
     if unit_path.exists() and _refuse_foreign_service_overwrite(unit_path, "systemd unit", force=force):
-        return
+        sys.exit(1)
     offer_legacy_unit_removal()
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)

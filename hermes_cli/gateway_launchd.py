@@ -639,7 +639,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
             # A protected (foreign) plist is refused here, before the "outdated" repair path, so the
             # operator never sees a "could not be reloaded ... --force" hint for a definition we protect.
             if _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist"):
-                return
+                sys.exit(1)  # a normal return let callers START the protected plist / migrate past it
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
             if _gw().refresh_launchd_plist_if_needed():
                 print("✓ Service definition updated")
@@ -659,7 +659,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
         sys.exit(1)
     if plist_path.exists() and _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist", force=force):
-        return
+        sys.exit(1)
     print(f"Installing launchd service to: {plist_path}")
     _gw()._prepare_service_launcher()
     plist_path.write_text(new_plist, encoding="utf-8")
