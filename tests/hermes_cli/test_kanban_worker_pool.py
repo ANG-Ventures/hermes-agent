@@ -339,6 +339,8 @@ def test_count_running_by_placement_skips_unopenable_board(kanban_home, monkeypa
     assert out == {"default": (1, {"ace-ai": 1}), "broken": (None, {})}
     from gateway.kanban_gate_tick import running_split
     assert running_split(out) == (None, {"ace-ai": 1})
+    # Prism r10 :60 — remote counts SUM across boards on the unknown path too.
+    assert running_split({"a": (None, {"ace-ai": 2}), "b": (3, {"ace-ai": 1})}) == (None, {"ace-ai": 3})
     assert running_split({"default": (1, {"ace-ai": 1})}) == (0, {"ace-ai": 1})
 
 
