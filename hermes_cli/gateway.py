@@ -3817,14 +3817,16 @@ def systemd_install(
     if refuse_foreign_home_install(caller_home or get_hermes_home(), force_unit_path):
         sys.exit(1)
 
-    # Offer to remove legacy units first: alongside the new unit they flap-fight for the bot token.
-    if has_legacy_hermes_units():
-        print()
-        print_legacy_unit_warning()
-        print()
-        if non_interactive or prompt_yes_no("Remove the legacy unit(s) before installing?", True):
-            remove_legacy_hermes_units(interactive=False)
+    def offer_legacy_unit_removal() -> None:
+        # Legacy units flap-fight the new unit for the bot token. Called only once every refusal below has
+        # passed: removing them for an install that then refuses leaves the host with no gateway.
+        if has_legacy_hermes_units():
             print()
+            print_legacy_unit_warning()
+            print()
+            if non_interactive or prompt_yes_no("Remove the legacy unit(s) before installing?", True):
+                remove_legacy_hermes_units(interactive=False)
+                print()
 
     unit_path = get_systemd_unit_path(system=system)
     scope_label = _service_scope_label(system)
@@ -3843,12 +3845,14 @@ def systemd_install(
         if not systemd_unit_is_current(system=system):
             if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
                 return
+            offer_legacy_unit_removal()
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:
                 _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
             print(f"✓ {scope_label.capitalize()} service definition updated")
         else:
+            offer_legacy_unit_removal()
             print(f"Service already installed at: {unit_path}")
             print("Use --force to reinstall")
             # An existing, current unit may still be DISABLED (a host whose unit predates
@@ -3875,6 +3879,7 @@ def systemd_install(
         sys.exit(1)
     if unit_path.exists() and _refuse_foreign_service_overwrite(unit_path, "systemd unit", force=force):
         return
+    offer_legacy_unit_removal()
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)
     unit_path.write_text(new_unit, encoding="utf-8")

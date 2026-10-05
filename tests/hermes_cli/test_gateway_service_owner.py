@@ -137,6 +137,36 @@ class TestSystemdWriters:
         assert f"HERMES_HOME={homes.scratch}" in systemd_unit.path.read_text(encoding="utf-8")
         assert Path(gw.get_hermes_home()) == homes.scratch
 
+    @pytest.fixture
+    def legacy_units(self, monkeypatch):
+        removed = []
+        monkeypatch.setattr(gw, "has_legacy_hermes_units", lambda: True)
+        monkeypatch.setattr(gw, "remove_legacy_hermes_units",
+                            lambda interactive=True, dry_run=False: removed.append(interactive) or (1, []))
+        return removed
+
+    def test_refused_install_removes_no_legacy_units(self, systemd_unit, legacy_units):
+        # Removing the legacy units and then refusing the install left the host with no gateway at all.
+        with pytest.raises(SystemExit):
+            gw.systemd_install(non_interactive=True)
+        assert legacy_units == []
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+
+    def test_foreign_definition_refusal_removes_no_legacy_units(self, systemd_unit, homes, legacy_units, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(homes.real))  # own home: the foreign-launcher guard refuses
+        hand_managed = ("ExecStart=/opt/v/venv/bin/python -m hermes_cli.main gateway run --replace\n"
+                        f'Environment="HERMES_HOME={homes.real}"\n')
+        systemd_unit.path.write_text(hand_managed, encoding="utf-8")
+        gw.systemd_install(non_interactive=True)
+        assert legacy_units == []
+        assert systemd_unit.path.read_text(encoding="utf-8") == hand_managed
+
+    def test_admitted_install_still_removes_legacy_units(self, systemd_unit, homes, legacy_units):
+        systemd_unit.path.unlink()
+        gw.systemd_install(non_interactive=True)
+        assert legacy_units == [False]
+        assert systemd_unit.path.exists()
+
     def test_worker_kill_switch_blocks_direct_install(self, systemd_unit, homes, monkeypatch):
         # ensure_gateway_service / setup wizard / migrate call systemd_install without _cmd_install.
         systemd_unit.path.unlink()
