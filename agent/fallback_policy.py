@@ -1068,6 +1068,8 @@ def _lane_incapable_cause(row: Mapping[str, Any]) -> str:
     code = str(row.get("lane_code") or "").strip().lower()
     if code == "mode_not_allowed":
         return "lane closed to this delivery mode"
+    if code == "contentalias:history_tool":
+        return "lane cannot alias this transcript's tool history"
     shape = LANE_INCAPABLE_CODES.get(code) if code else None
     return f"lane cannot serve {shape}" if shape else LANE_INCAPABLE_CAUSE
 
@@ -1082,7 +1084,8 @@ def _lane_incapable_body(row: Mapping[str, Any], seat: str) -> str:
         # No machine code on the row: the hop is whatever the relay stated (or
         # unknown), rendered by the shared segment like every other class.
         return f"{_lane_incapable_cause(row)} {_hop_segment(normalize_hop(row.get('hop')), seat, st)}"
-    where = "at the relay" if code == "mode_not_allowed" else "at the bridge"
+    where = ("at the relay" if code == "mode_not_allowed"
+             else "at the DPX aliaser" if code.startswith("contentalias:") else "at the bridge")
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
     return (f"{_lane_incapable_cause(row)} — {st} {code} {where} "
             f"({LANE_INCAPABLE_NOT_ANTHROPIC}){seat_seg}")

@@ -33,6 +33,7 @@ unclassified Anthropic 400, and the banner names our bridge as the source.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, FrozenSet, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,17 @@ LANE_INCAPABLE_CODES: Mapping[str, Optional[str]] = {
     "tui_tools_unsupported": SHAPE_TOOLS,
     "tui_images_unsupported": SHAPE_IMAGES,
     "mode_not_allowed": None,
+    # The DPX content-aliaser (dpx-content-alias internal/contentalias) refusing a
+    # request whose HISTORY carries a tool_use / tool_result it cannot alias. The
+    # bridge wraps that deterministic 400 as 502 ``tui_upstream_error`` ("API Error:
+    # 400 contentalias:history_tool"), so by status it read as a transient server
+    # error: 3 in-place retries here, 4 relay hops (2026-10-05 13:20, 13:27, 14:16
+    # on sub-vps-21/22/15/13). Deterministic for the lane + this transcript.
+    "contentalias:history_tool": SHAPE_TOOLS,
 }
+# The aliaser's error family in message text (``contentalias:<reason>``); only
+# history_tool is a lane-shape refusal, the rest stay with their status class.
+_CONTENTALIAS_RE = re.compile(r"contentalias:([a-z_]+)")
 
 _IMAGE_PART_TYPES = frozenset(("image_url", "input_image", "image"))
 
@@ -131,20 +142,31 @@ def lane_incapable_code(code: Any) -> Optional[str]:
     return c if c in LANE_INCAPABLE_CODES else None
 
 
-def body_lane_incapable_code(body: Any) -> Optional[str]:
+def message_lane_incapable_code(text: Any) -> Optional[str]:
+    """``contentalias:history_tool`` when the aliaser's refusal rides inside a message
+    (the bridge's 502 ``tui_upstream_error`` wrapper), else None."""
+    if not text:
+        return None
+    m = _CONTENTALIAS_RE.search(str(text))
+    return lane_incapable_code(f"contentalias:{m.group(1)}") if m else None
+
+
+def body_lane_incapable_code(body: Any, text: Any = None) -> Optional[str]:
     """The lane-incapable code carried by an error body: OpenAI SDK ``body`` is the
     inner ``error`` object (``{"type", "code", "message"}``); the Anthropic SDK and a
-    raw relay body carry it under ``error.code`` / ``error.error_code``."""
-    if not isinstance(body, dict):
-        return None
-    for key in ("code", "error_code"):
-        hit = lane_incapable_code(body.get(key))
-        if hit:
-            return hit
-    inner = body.get("error")
-    if isinstance(inner, dict):
+    raw relay body carry it under ``error.code`` / ``error.error_code``. A bridge
+    ``tui_upstream_error`` wrapper names the aliaser refusal in its message instead."""
+    if isinstance(body, dict):
         for key in ("code", "error_code"):
-            hit = lane_incapable_code(inner.get(key))
+            hit = lane_incapable_code(body.get(key))
             if hit:
                 return hit
-    return None
+        inner = body.get("error")
+        if isinstance(inner, dict):
+            for key in ("code", "error_code"):
+                hit = lane_incapable_code(inner.get(key))
+                if hit:
+                    return hit
+            text = text or inner.get("message")
+        text = text or body.get("message")
+    return message_lane_incapable_code(text)

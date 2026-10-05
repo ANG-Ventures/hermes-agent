@@ -1824,7 +1824,7 @@ def _lane_incapable_code(c: "_Ctx") -> Optional[str]:
     error object); the extracted ``c.error_code`` is checked first (t_1ed37625)."""
     from agent.fallback_capability import body_lane_incapable_code, lane_incapable_code
 
-    return lane_incapable_code(c.error_code) or body_lane_incapable_code(c.body)
+    return lane_incapable_code(c.error_code) or body_lane_incapable_code(c.body, c.msg)
 
 
 def _extract_error_code(body: dict) -> str:

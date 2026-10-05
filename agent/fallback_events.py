@@ -245,7 +245,7 @@ def classify_trigger(*, text: Optional[str] = None,
     # (t_1ed37625: "tools[] must be empty (52 tools)" rendered "unclassified").
     from agent.fallback_capability import body_lane_incapable_code
 
-    if body_lane_incapable_code(body) or reason == LANE_INCAPABLE_CLASS:
+    if body_lane_incapable_code(body, text) or reason == LANE_INCAPABLE_CLASS:
         return LANE_INCAPABLE_CLASS, "relay_code"
     cls = classify_text(text, http_status=http_status, exc_name=exc_name,
                         reason=reason)
@@ -1151,7 +1151,7 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             # refused the shape itself (t_1ed37625).
             from agent.fallback_capability import body_lane_incapable_code
 
-            code = body_lane_incapable_code(body)
+            code = body_lane_incapable_code(body, text)
             if code:
                 row["lane_code"] = code
                 row["hop"] = "relay" if code == "mode_not_allowed" else "relay→bridge"

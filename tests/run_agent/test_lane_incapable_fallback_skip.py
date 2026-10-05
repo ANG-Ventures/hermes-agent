@@ -44,6 +44,14 @@ IMAGES_BODY = {"error": {"type": "invalid_request_error", "code": "tui_images_un
 MODE_BODY = {"error": {"type": "invalid_request_error", "code": "mode_not_allowed",
                        "message": "this sub does not serve x-hermes-bpx-mode: tui"}}
 PLAIN_400 = {"error": {"type": "invalid_request_error", "message": "messages: field required"}}
+# dtlr 502 (agent.log 2026-10-05 13:22:13, relay transient_retry overloaded:false): the bridge
+# wraps the DPX content-aliaser's deterministic 400 as a 502 tui_upstream_error.
+ALIASER_502 = {"error": {"type": "api_error", "code": "tui_upstream_error",
+                         "message": "the interactive session reported an upstream error row for this "
+                                    "turn (API Error: 400 contentalias:history_tool)"}}
+OTHER_502 = {"error": {"type": "api_error", "code": "tui_upstream_error",
+                       "message": "the interactive session reported an upstream error row for this "
+                                  "turn (API Error: 529 overloaded)"}}
 
 
 def _status_error(status: int, body_json: dict, *, base: str = BASE,
@@ -69,6 +77,32 @@ def test_bridge_codes_classify_lane_incapable(body, code):
     assert c.reason is FailoverReason.lane_incapable
     assert c.should_fallback is True and c.retryable is False
     assert c.error_context.get("error_code") == code
+
+
+def test_dtlr_502_wrapping_aliaser_history_tool_is_lane_incapable():
+    """Step 3 (Apollo 15:20): not opaque, not transient. Fail over at once, no in-place retry."""
+    c = classify_api_error(_status_error(502, ALIASER_502), provider="claude-dtlr", model="claude-fable-5-1")
+    assert c.reason is FailoverReason.lane_incapable
+    assert c.retryable is False and c.should_fallback is True
+    assert c.error_context.get("error_code") == "contentalias:history_tool"
+
+
+def test_other_tui_upstream_502_keeps_server_error_class():
+    c = classify_api_error(_status_error(502, OTHER_502), provider="claude-dtlr", model="claude-fable-5-1")
+    assert c.reason is not FailoverReason.lane_incapable
+
+
+def test_ledger_and_rider_for_the_aliaser_502():
+    cls, src = fbe.classify_trigger(text=f"Error code: 502 - {ALIASER_502}", http_status=502,
+                                    body=ALIASER_502["error"])
+    assert (cls, src) == ("lane_incapable", "relay_code")
+    row = {"trigger_class": "lane_incapable", "lane_code": "contentalias:history_tool",
+           "hop": "bridge→anthropic", "seat": "sub-vps-21", "http_status": 502,
+           "from_provider": "claude-dtlr", "attempts": 1, "first_err_ts": _ts(13, 27, 47)}
+    rider = fp.format_cause_rider(row, tz=_dt.timezone.utc)
+    assert rider.startswith("lane cannot alias this transcript's tool history")
+    assert "502 contentalias:history_tool at the DPX aliaser" in rider
+    assert "not Anthropic" in rider and "on sub-vps-21" in rider and "(Anthropic 502)" not in rider
 
 
 def test_plain_400_keeps_format_error():
