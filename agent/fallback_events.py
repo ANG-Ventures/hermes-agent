@@ -19,6 +19,14 @@ Three pieces:
   failover site still records WHAT failed.
 * ``record`` — best-effort insert via the Blackbox plugin (I3: a telemetry
   failure never breaks a turn).
+
+Where the rows live: table ``fallback_events`` in ``<home>/blackbox/turns.db``
+(per profile home). ``state/fallback_events.db`` is NOT the store; no code
+writes it (a 0-byte file there is a stray). One-line query::
+
+    sqlite3 ~/.hermes/blackbox/turns.db "select datetime(ts,'unixepoch','localtime'),
+      kind, trigger_class, from_provider, to_provider, seat, request_ids,
+      prompt_tokens, elapsed_s, notice_text from fallback_events order by id desc limit 20"
 """
 
 from __future__ import annotations
