@@ -421,8 +421,8 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
 
 @dataclass(frozen=True)
 class HostSample:
-    """One probe round-trip: ``/proc/loadavg``, ``nproc``, the remote clock
-    and the raw pressure file text ("" when unreadable)."""
+    """One probe round-trip: ``/proc/loadavg``, the online core count, the
+    remote clock and the raw pressure file text ("" when unreadable)."""
 
     load1: float
     ncpu: int
@@ -430,12 +430,19 @@ class HostSample:
     pressure_text: str = ""
 
 
+# ncpu = online cores (KWLB D-3), not ``nproc``: load1 counts every runnable
+# task on the host, while ``nproc`` honours the probing user's cgroup quota
+# (kanbanw's user-1001.slice CPUQuota=800% made it print 8 on 24/32 cores,
+# t_2dc3be98), which shrank the v0.1 refuse line to 0.8 x 8 = 6.4 load1.
+_NCPU_CMD = "getconf _NPROCESSORS_ONLN"
+
+
 def _probe_cmd(pressure_path: Optional[str]) -> str:
     if pressure_path is None:
-        return "cat /proc/loadavg; nproc"
+        return f"cat /proc/loadavg; {_NCPU_CMD}"
     import shlex
     # ONE round-trip (RC9): the age is remote_now - at, both from this host.
-    return f"cat /proc/loadavg; nproc; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
+    return f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
 
 
 def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
