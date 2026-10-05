@@ -582,35 +582,118 @@ def test_execute_code_children_keep_the_worker_kill_switch():
     assert INSTALL_DISABLED_ENV in _HERMES_CHILD_ALLOWED
 
 
+_REPO = Path(gw.__file__).resolve().parents[1]
+
+
+def _load_script(name: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, _REPO / "scripts" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestChokepointLint:
     """``scripts/check_service_definition_writers.py`` (CI lint): every service-definition write/remove in
-    the gateway modules reaches ``assert_may_mutate``; a writer that bypasses it is a lint failure."""
+    the gateway modules is DOMINATED by ``assert_may_mutate`` — the call precedes the mutation on the same
+    path, unconditionally. A call that is merely present (unreachable, conditional, or after the write)
+    is the hole with one layer of paint (Apollo's send-back on #1740 @eb7f3ded)."""
 
     @pytest.fixture
     def guard(self):
-        import importlib.util
-        repo = Path(gw.__file__).resolve().parents[1]
-        spec = importlib.util.spec_from_file_location(
-            "check_service_definition_writers", repo / "scripts" / "check_service_definition_writers.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
+        return _load_script("check_service_definition_writers")
+
+    @pytest.fixture
+    def scan(self, guard, tmp_path, monkeypatch):
+        monkeypatch.setattr(guard, "ROOT", tmp_path)
+        (tmp_path / "hermes_cli").mkdir()
+
+        def _scan(body: str) -> list[str]:
+            f = tmp_path / "hermes_cli" / "gateway_launchd.py"
+            f.write_text(body, encoding="utf-8")
+            return guard.scan_file(f)
+        return _scan
 
     def test_the_shipped_gateway_modules_pass(self, guard):
         assert guard.main([]) == 0
 
-    def test_a_bypassing_writer_is_flagged(self, guard, tmp_path, monkeypatch):
-        bad = tmp_path / "hermes_cli" / "gateway_launchd.py"
-        bad.parent.mkdir()
-        bad.write_text(
+    def test_a_naked_writer_is_flagged(self, scan):
+        problems = scan(
             "def ok(plist_path):\n    assert_may_mutate(plist_path, 'x')\n    plist_path.write_text('a')\n"
             "def via_helper(plist_path):\n    ok(plist_path)\n    plist_path.unlink()\n"
             "def bad(unit_path):\n    unit_path.write_text('b')\n"
-            "def marker(path):\n    path.write_text('not a definition')\n",
-            encoding="utf-8")
-        monkeypatch.setattr(guard, "ROOT", tmp_path)
-        problems = guard.scan_file(bad)
+            "def marker(path):\n    path.write_text('not a definition')\n")
         assert len(problems) == 1 and "bad() mutates unit_path" in problems[0]
+
+    def test_an_unreachable_chokepoint_call_is_flagged(self, scan):
+        """Apollo's mutation: `pass; if False: assert_may_mutate(...)` passed the presence check."""
+        problems = scan(
+            "def systemd_install(unit_path):\n    pass\n    if False:\n        assert_may_mutate(unit_path, 'x')\n"
+            "    unit_path.write_text('b')\n")
+        assert len(problems) == 1 and "systemd_install() mutates unit_path" in problems[0]
+
+    def test_a_chokepoint_call_after_the_write_is_flagged(self, scan):
+        problems = scan(
+            "def systemd_install(unit_path):\n    unit_path.write_text('b')\n    assert_may_mutate(unit_path, 'x')\n")
+        assert len(problems) == 1 and "systemd_install() mutates unit_path" in problems[0]
+
+    def test_a_conditional_chokepoint_call_is_flagged(self, scan):
+        problems = scan(
+            "def systemd_install(unit_path, force):\n    if force:\n        assert_may_mutate(unit_path, 'x')\n"
+            "    unit_path.write_text('b')\n")
+        assert len(problems) == 1
+
+    def test_a_swallowed_refusal_is_flagged(self, scan):
+        """``try: assert_may_mutate(...) except ServiceMutationRefused: pass`` falls through to the write."""
+        problems = scan(
+            "def refresh(unit_path):\n    try:\n        assert_may_mutate(unit_path, 'x')\n"
+            "    except ServiceMutationRefused:\n        pass\n    unit_path.write_text('b')\n")
+        assert len(problems) == 1
+        assert scan(
+            "def refresh(unit_path):\n    try:\n        assert_may_mutate(unit_path, 'x')\n"
+            "    except ServiceMutationRefused:\n        return False\n    unit_path.write_text('b')\n") == []
+
+    def test_a_helper_that_can_return_before_the_chokepoint_does_not_guard(self, scan):
+        """A callee counts only when its own body cannot leave before the chokepoint."""
+        leaky = ("def _check(unit_path):\n    if not unit_path.exists():\n        return\n    assert_may_mutate(unit_path, 'x')\n"
+                 "def remove(unit_path):\n    _check(unit_path)\n    unit_path.unlink()\n")
+        assert len(scan(leaky)) == 1
+        tight = ("def _check(unit_path):\n    from x import assert_may_mutate\n    assert_may_mutate(unit_path, 'x')\n"
+                 "def remove(unit_path):\n    _check(unit_path)\n    unit_path.unlink()\n")
+        assert scan(tight) == []
+
+    def test_dominance_reaches_into_nested_blocks_and_closures(self, scan):
+        """The live tree's shapes: a write nested under if/with after the chokepoint; a closure defined
+        after it; a per-item admission loop whose refusals `continue`; an assignment of the returned home."""
+        assert scan(
+            "def install(unit_path):\n    home = assert_may_mutate(unit_path, 'x', install=True)\n"
+            "    if unit_path.exists():\n        with lock():\n            unit_path.write_text('b')\n"
+            "    def _later():\n        unit_path.unlink()\n    _later()\n") == []
+        assert scan(
+            "def remove_legacy(units):\n    for name, path, sys_ in units:\n        try:\n"
+            "            assert_may_mutate(path, 'remove')\n        except ServiceMutationRefused:\n            continue\n"
+            "    def _remove_units(units):\n        for name, unit_path in units:\n            unit_path.unlink()\n"
+            "    _remove_units(units)\n") == []
+        # ...and the same loop with the admission AFTER the removal is still a hole.
+        assert len(scan(
+            "def remove_legacy(units):\n    def _remove_units(units):\n        for name, unit_path in units:\n"
+            "            unit_path.unlink()\n    _remove_units(units)\n    for name, path, sys_ in units:\n"
+            "        assert_may_mutate(path, 'remove')\n")) == 1
+
+
+def test_vendored_unit_parser_matches_the_fleet_lint():
+    """``gateway_unit_parse`` carries ``unit_assignments`` / ``_unit_words`` / ``_env_file_vars`` VERBATIM
+    from hermes-home ``scripts/lib/gateway_unit_lint.py`` (bd12fc94c3f6). The writers' ownership check and
+    the fleet drift lint must read a unit identically; a drift on either side updates BOTH and this pin."""
+    import ast
+    import hashlib
+    from hermes_cli import gateway_unit_parse
+    src = Path(gateway_unit_parse.__file__).read_text(encoding="utf-8")
+    segs = {n.name: ast.get_source_segment(src, n) for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.FunctionDef)}
+    joined = "\n".join(segs[k] for k in ("unit_assignments", "_unit_words", "_env_file_vars"))
+    assert hashlib.sha256(joined.encode("utf-8")).hexdigest() == (
+        "4db743407b9d1ef4e93342ce2fc2500c272fd58973a8d319d7a4ca4379dc429e")
 
 
 class TestSpecifierHome:
