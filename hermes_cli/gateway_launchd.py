@@ -718,9 +718,11 @@ def launchd_start():
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
         new_plist = _gw().generate_launchd_plist()
-        from hermes_cli.gateway_service_owner import service_writes_disabled
-        if service_writes_disabled("regenerate the gateway plist") or _gw()._refuse_temp_home_service_write(
-                new_plist, "launchd plist"):
+        # Regenerating a missing plist is an implicit install: same admission as `gateway install`.
+        from hermes_cli.gateway_service_owner import refuse_foreign_home_install, service_writes_disabled
+        if (service_writes_disabled("regenerate the gateway plist")
+                or refuse_foreign_home_install(_gw().get_hermes_home(), False)
+                or _gw()._refuse_temp_home_service_write(new_plist, "launchd plist")):
             sys.exit(1)
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)

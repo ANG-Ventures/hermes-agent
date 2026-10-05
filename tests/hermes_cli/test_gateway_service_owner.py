@@ -292,6 +292,20 @@ class TestLaunchdWriters:
             gateway_launchd.launchd_install(start_now=False)
         assert not plist.exists()
 
+    def test_start_self_heal_refuses_a_scratch_home(self, tmp_path, homes, monkeypatch):
+        # `gateway start` regenerates a missing plist: an implicit install, so it takes install's admission.
+        plist = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gw, "_native_service_homes", lambda: {homes.real.resolve()})
+        monkeypatch.setattr(gw, "_home_owns_bare_service_name", lambda home: False)
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist)
+        monkeypatch.setattr(gw, "generate_launchd_plist", lambda: "<plist>scratch</plist>")
+        monkeypatch.setattr(gw, "_prepare_service_launcher", lambda *a, **k: pytest.fail("launcher prepared"))
+        monkeypatch.setattr(gateway_launchd, "_launchd_bootstrap_and_kickstart",
+                            lambda *a, **k: pytest.fail("launchctl ran"))
+        with pytest.raises(SystemExit):
+            gateway_launchd.launchd_start()
+        assert not plist.exists()
+
 
 class TestMigration:
     def test_worker_kill_switch_refuses_before_any_service_is_removed(self, monkeypatch, tmp_path):
