@@ -620,8 +620,10 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     # loading it. A gateway that launchd already runs is still reloaded; this install did not start it.
     # The writer itself honours the worker kill switch: setup, migrate and ensure_gateway_service call it
     # without going through `gateway install`.
-    from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
-    if service_writes_disabled("install the gateway plist"):
+    from hermes_cli.gateway_service_owner import (
+        definition_belongs_to_home, refuse_foreign_home_install, service_writes_disabled)
+    if service_writes_disabled("install the gateway plist") or refuse_foreign_home_install(
+            _gw().get_hermes_home(), force_unit_path):
         sys.exit(1)
     load = start_now or _gw()._launchctl_label_supervising_process(label)
 

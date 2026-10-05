@@ -1039,6 +1039,12 @@ def apply_migration(plan: MigrationPlan, *, served_wait: float = _SERVED_WAIT_SE
     if plan.already_multiplexed:
         print("✓ Already multiplexed — nothing to do.")
         return True
+    # Before resume and preflight alike: the default's reinstall (and the compensator's) refuses under the
+    # worker kill switch, so starting or resuming here would remove the secondaries' services and put
+    # nothing back. A worker never changes the host's gateway services.
+    from hermes_cli.gateway_service_owner import service_writes_disabled
+    if service_writes_disabled("migrate the gateway services"):
+        return False
     target, run_as_user = _resume_target(plan)
     manifest = plan.manifest
     if manifest is not None:

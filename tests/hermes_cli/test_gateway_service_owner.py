@@ -56,6 +56,8 @@ def systemd_unit(tmp_path, homes, monkeypatch):
     monkeypatch.setattr(gw, "_run_systemctl", lambda args, **kw: calls.append(tuple(args)) or
                         SimpleNamespace(returncode=0, stdout="", stderr=""))
     monkeypatch.setattr(gw, "has_legacy_hermes_units", lambda: False)
+    # Both homes may own a host service, so what refuses below is the OWNERSHIP check, not admission.
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {homes.real.resolve(), homes.scratch.resolve()})
     monkeypatch.setattr(gw, "_ensure_linger_enabled", lambda *a, **k: True)
     monkeypatch.setattr(gw, "print_systemd_scope_conflict_warning", lambda: None)
     monkeypatch.setattr(gw, "print_legacy_unit_warning", lambda: None)
@@ -155,6 +157,50 @@ class TestSystemdWriters:
         assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
 
 
+    @pytest.fixture
+    def system_scope(self, monkeypatch):
+        monkeypatch.setattr(gw, "_require_root_for_system_service", lambda action: None)
+        monkeypatch.setattr(gw, "_read_systemd_user_from_unit", lambda path: None)
+        monkeypatch.setattr(gw, "_ensure_system_service_linger", lambda *a, **k: True, raising=False)
+
+    def test_system_install_checks_the_callers_home_before_adopting_the_units(
+            self, systemd_unit, system_scope):
+        # HERMES_HOME is explicitly the scratch home; the system unit pins the real one. Adopting the
+        # unit's home first made the ownership check compare the unit with itself and --force rewrote it.
+        with pytest.raises(SystemExit):
+            gw.systemd_install(system=True, force=True, non_interactive=True)
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+        assert ("daemon-reload",) not in systemd_unit.calls
+
+    def test_system_refresh_checks_the_callers_home_before_adopting_the_units(
+            self, systemd_unit, monkeypatch, capsys):
+        def is_current(system=False):  # the production chokepoint adopts the unit's home, then compares
+            gw._sync_hermes_home_from_systemd_unit(system=system)
+            return False
+        monkeypatch.setattr(gw, "systemd_unit_is_current", is_current)
+        assert gw.refresh_systemd_unit_if_needed(system=True) is False
+        assert systemd_unit.path.read_text(encoding="utf-8") == systemd_unit.original
+        assert "Refusing to rewrite" in capsys.readouterr().out
+
+    def test_sudo_stripped_home_still_adopts_the_system_unit(self, systemd_unit, homes, system_scope, monkeypatch):
+        # sudo strips HERMES_HOME (the process falls back to its native default, root's): adoption is what
+        # names the right home, and the unit is that home's own.
+        monkeypatch.delenv("HERMES_HOME")
+        monkeypatch.setattr(gw, "_native_service_homes", lambda: {gw.get_hermes_home().resolve()})
+        gw.systemd_install(system=True, force=True, non_interactive=True)
+        assert Path(gw.get_hermes_home()) == homes.real
+        assert f"HERMES_HOME={homes.real}" in systemd_unit.path.read_text(encoding="utf-8")
+
+    def test_direct_install_refuses_a_scratch_home(self, systemd_unit, homes, monkeypatch):
+        # setup / ensure_gateway_service call systemd_install without `gateway install`'s admission check.
+        monkeypatch.setattr(gw, "_native_service_homes", lambda: {homes.real.resolve()})
+        systemd_unit.path.unlink()
+        with pytest.raises(SystemExit):
+            gw.systemd_install(non_interactive=True)
+        assert not systemd_unit.path.exists()
+        assert systemd_unit.calls == []
+
+
 class TestPinnedHomeParsing:
     """The owner check reads HERMES_HOME the way systemd does; a missed pin reads as "unowned"."""
 
@@ -173,6 +219,21 @@ class TestPinnedHomeParsing:
         unit.write_text('[Service]\nEnvironment="HERMES_HOME=/a"\nEnvironment="HERMES_HOME=/b"\n', encoding="utf-8")
         assert gw._hermes_home_pinned_by_unit(unit) == "/b"
         unit.write_text('[Service]\nEnvironment="HERMES_HOME=/a"\nEnvironment=\n', encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) is None
+
+    @pytest.mark.parametrize("body", [
+        'Environment = "HERMES_HOME={home}"',
+        'Environment="PATH=/usr/bin" \\\n    "HERMES_HOME={home}"',
+        'Environment=\\\n HERMES_HOME={home}',
+    ])
+    def test_spacing_and_continuation_lines_pin_the_home(self, tmp_path, body):
+        unit = tmp_path / "u.service"
+        unit.write_text("[Service]\n" + body.format(home="/srv/other") + "\n", encoding="utf-8")
+        assert gw._hermes_home_pinned_by_unit(unit) == "/srv/other"
+
+    def test_commented_assignment_pins_nothing(self, tmp_path):
+        unit = tmp_path / "u.service"
+        unit.write_text('[Service]\n# Environment="HERMES_HOME=/srv/other"\n', encoding="utf-8")
         assert gw._hermes_home_pinned_by_unit(unit) is None
 
     def test_quoted_value_with_escapes_round_trips(self, tmp_path):
@@ -214,6 +275,31 @@ class TestLaunchdWriters:
         with pytest.raises(SystemExit):
             gateway_launchd.launchd_install(start_now=False)
         assert not plist.exists()
+
+
+    def test_direct_install_refuses_a_scratch_home(self, tmp_path, homes, monkeypatch):
+        plist = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gw, "_native_service_homes", lambda: {homes.real.resolve()})
+        monkeypatch.setattr(gw, "_home_owns_bare_service_name", lambda home: False)
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist)
+        monkeypatch.setattr(gw, "_launchctl_label_supervising_process", lambda label: False)
+        monkeypatch.setattr(gw, "generate_launchd_plist", lambda: "<plist>scratch</plist>")
+        monkeypatch.setattr(gw, "_prepare_service_launcher", lambda *a, **k: pytest.fail("launcher prepared"))
+        monkeypatch.setattr(gateway_launchd.subprocess, "run", lambda *a, **k: pytest.fail("launchctl ran"))
+        with pytest.raises(SystemExit):
+            gateway_launchd.launchd_install(start_now=False)
+        assert not plist.exists()
+
+
+class TestMigration:
+    def test_worker_kill_switch_refuses_before_any_service_is_removed(self, monkeypatch, tmp_path):
+        from hermes_cli import gateway_migrate as gm
+        monkeypatch.setenv(INSTALL_DISABLED_ENV, "1")
+        for name in ("_remove_secondary_gateways", "_write_manifest", "_write_multiplex_flag", "_resume_target"):
+            monkeypatch.setattr(gm, name, lambda *a, **k: pytest.fail("migration touched the host"))
+        plan = SimpleNamespace(already_multiplexed=False, manifest={"version": 1}, blocked=False,
+                               default_home=tmp_path)
+        assert gm.apply_migration(plan) is False
 
 
 class TestInstallCommand:

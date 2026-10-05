@@ -1227,8 +1227,28 @@ def _systemctl_show(properties: tuple[str, ...], *, system: bool) -> dict[str, s
     return _parse_kv_pairs(result.stdout.splitlines()) if result.returncode == 0 else {}
 
 
+def _unit_directives(text: str, key: str) -> list[str]:
+    """Values of every ``key=`` directive in unit *text*, read the way systemd reads them: blank space
+    around ``=`` is allowed, a trailing backslash continues the line (joined with a space), and ``#``/``;``
+    lines are comments."""
+    values: list[str] = []
+    logical = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not logical and line[:1] in ("#", ";"):
+            continue
+        if line.endswith("\\"):
+            logical += line[:-1] + " "
+            continue
+        logical, line = "", logical + line
+        name, sep, value = line.partition("=")
+        if sep and name.strip() == key:
+            values.append(value.strip())
+    return values
+
+
 def _unit_environment_value(unit_path: Path, name: str) -> str | None:
-    """Value of one ``Environment="NAME=…"`` directive in the unit file at *unit_path*, with
+    """Value of one ``Environment="NAME=…"`` assignment in the unit file at *unit_path*, with
     systemd's ``\\"``/``\\\\``/``%%`` quoting undone; None when the file or the key is absent."""
     try:
         text = unit_path.read_text(encoding="utf-8-sig")
@@ -1237,11 +1257,7 @@ def _unit_environment_value(unit_path: Path, name: str) -> str | None:
     # systemd semantics: one Environment= line may carry several quoted assignments, a later assignment
     # wins, and an empty ``Environment=`` resets every assignment before it.
     value: str | None = None
-    for line in text.splitlines():
-        body = line.strip()
-        if not body.startswith("Environment="):
-            continue
-        body = body[len("Environment=") :].strip()
+    for body in _unit_directives(text, "Environment"):
         if not body:
             value = None
             continue
@@ -1278,6 +1294,16 @@ def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
         unit_home = _parse_kv_pairs(env_line.split()).get("HERMES_HOME", "").strip()
     if unit_home and os.environ.get("HERMES_HOME", "").strip() != unit_home:
         os.environ["HERMES_HOME"] = unit_home
+
+
+def _explicit_hermes_home() -> Path | None:
+    """The caller's own HERMES_HOME, read BEFORE the unit sync above can replace it; None when unset.
+
+    The sync exists for the sudo-stripped case (HERMES_HOME unset, HOME=/root). A caller that named its
+    home keeps it for ownership checks: adopting the unit's home first makes the check compare the unit
+    with itself, so a colliding service name could rewrite another install's unit.
+    """
+    return get_hermes_home() if os.environ.get("HERMES_HOME", "").strip() else None
 
 
 def _read_systemd_unit_properties(
@@ -3464,6 +3490,8 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     if not unit_path.exists():
         return False
 
+    # Authorised home first: the sync below replaces an explicit HERMES_HOME with the unit's own.
+    caller_home = _explicit_hermes_home()
     # systemd_unit_is_current is the HERMES_HOME-sync chokepoint; its env mutation persists for the regenerate below.
     current = systemd_unit_is_current(system=system)
     # Runs on every gateway boot: a scratch-home gateway whose name collided with the host's unit
@@ -3472,7 +3500,7 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
     if (not current or _hermes_replace_dropin(system=system) is not None) and (
             service_writes_disabled("rewrite the gateway unit")
-            or not definition_belongs_to_home(unit_path, get_hermes_home(), "rewrite")):
+            or not definition_belongs_to_home(unit_path, caller_home or get_hermes_home(), "rewrite")):
         return False
     if _retire_hermes_replace_dropin(system=system):
         _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
@@ -3668,8 +3696,14 @@ def systemd_install(
     # without going through `gateway install`.
     # A refusal exits non-zero: callers (`gateway install`, setup, ensure_gateway_service) go on to START the
     # service, and the unit they would start is the other home's.
-    from hermes_cli.gateway_service_owner import definition_belongs_to_home, service_writes_disabled
+    from hermes_cli.gateway_service_owner import (
+        definition_belongs_to_home, refuse_foreign_home_install, service_writes_disabled)
     if service_writes_disabled("install the gateway unit"):
+        sys.exit(1)
+    # Same home admission as `gateway install`, before anything is removed or written: a scratch home
+    # (e.g. /srv/ci/...) must not get a persistent host service through setup or ensure_gateway_service.
+    caller_home = _explicit_hermes_home()
+    if refuse_foreign_home_install(caller_home or get_hermes_home(), force_unit_path):
         sys.exit(1)
 
     # Offer to remove legacy units first: alongside the new unit they flap-fight for the bot token.
@@ -3689,7 +3723,8 @@ def systemd_install(
     # repoints the unit at the caller's home, so adopting the old one would regenerate it unchanged.
     if unit_path.exists() and not force_unit_path:
         _sync_hermes_home_from_systemd_unit(system=system)
-        if not definition_belongs_to_home(unit_path, get_hermes_home(), "overwrite"):
+        # A caller that named its home is checked against THAT home, not the one the sync just adopted.
+        if not definition_belongs_to_home(unit_path, caller_home or get_hermes_home(), "overwrite"):
             sys.exit(1)
 
     # --force-unit-path repoints the unit at this home, so it writes rather than refreshing in place.
