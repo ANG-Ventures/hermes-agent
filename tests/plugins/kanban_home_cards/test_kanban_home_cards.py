@@ -861,6 +861,8 @@ def _timed(mod, **kw):
 
 # Scheduling slack for a loaded CI runner; the ceiling itself is BUDGET_S.
 SLACK_S = 0.1
+# 27 concurrent first turns on a starved hosted runner (see the test below).
+CONCURRENT_SLACK_S = 0.5
 
 
 def test_77_boards_warm_turn_renders_home_cards_within_ceiling(mod, fleet77):
@@ -911,7 +913,14 @@ def test_77_boards_27_concurrent_first_turns_all_within_ceiling(mod, fleet77, ca
         with ThreadPoolExecutor(8) as ex:
             res = list(ex.map(lambda s: _timed(mod, session_id=s), sids))
     worst = max(took for _, took in res)
-    assert worst < mod.BUDGET_S + SLACK_S, worst
+    # The wait loop exits at BUDGET_S by construction; what lands past it is
+    # post-deadline CPU (render, log, thread starts) on 27 calls + ~30 probe
+    # threads.  A starved 2-vCPU hosted runner put that at 0.3265 s once
+    # (merge_group 37349144561, 10-05) against an idle ~0.04 s.  The single-call
+    # tests above pin the 250 ms degrade with SLACK_S; this one guards a turn
+    # HELD on a read (cold state.db reads take seconds; PROBE_MAX_S is 30 s),
+    # so its slack is sized to the starved runner and stays under such a hold.
+    assert worst < mod.BUDGET_S + CONCURRENT_SLACK_S, worst
     assert all(out is None or "foreign" not in out["context"] for out, _ in res)
     out = res[0][0]
     lines = [r.getMessage() for r in caplog.records if f"session={SID} " in r.getMessage()]
