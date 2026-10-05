@@ -153,8 +153,11 @@ def _unhandled_update(app, update_id):
         "poll": {
             "id": f"poll-{update_id}", "question": "q?", "total_voter_count": 0,
             "is_closed": False, "is_anonymous": True, "type": "regular",
-            "allows_multiple_answers": False,
-            "options": [{"text": "a", "voter_count": 0}, {"text": "b", "voter_count": 0}],
+            "allows_multiple_answers": False, "allows_revoting": False, "members_only": False,
+            "options": [
+                {"text": "a", "voter_count": 0, "persistent_id": "opt-a"},
+                {"text": "b", "voter_count": 0, "persistent_id": "opt-b"},
+            ],
         },
     }, app.bot)
 
