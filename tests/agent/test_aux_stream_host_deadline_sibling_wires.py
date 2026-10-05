@@ -17,6 +17,7 @@ billed to completion on a socket nobody is waiting for.
 
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,6 +83,30 @@ def test_codex_stream_stops_at_the_host_deadline_not_its_own_ceiling():
     elapsed = time.monotonic() - start
     assert elapsed < 5.0, f"stream outlived the host deadline by {elapsed:.1f}s"
     assert yielded[0] < 100
+
+
+def test_codex_timed_out_watchdog_never_outlives_create():
+    """The watchdog that fired is joined before ``create()`` returns. Left running, it went on
+    closing the client and creating loggers after the test ended, and pytest's next
+    ``catching_logs`` iterated ``loggerDict`` under it ("dictionary changed size during
+    iteration", merge_group run 37241316286). Unjoined, ~75% of attempts leak the thread;
+    repeat so the check does not hinge on one scheduling roll."""
+    def _live_forever():
+        while True:
+            time.sleep(0.02)
+            yield _codex_content_event()
+
+    for attempt in range(10):
+        adapter = _make_codex_adapter(_live_forever())
+        threads_before = set(threading.enumerate())
+        with (
+            patch("agent.codex_runtime._consume_codex_event_stream", _consume_codex),
+            aux.aux_stream_deadline(time.monotonic() + 0.1),
+            pytest.raises(TimeoutError),
+        ):
+            adapter.create(messages=[{"role": "user", "content": "summarize"}], timeout=300)
+        leftover = [t.name for t in threading.enumerate() if t not in threads_before and t.is_alive()]
+        assert not leftover, f"attempt {attempt}: watchdog thread outlived create(): {leftover}"
 
 
 def test_codex_stream_without_host_deadline_keeps_its_ceiling():
