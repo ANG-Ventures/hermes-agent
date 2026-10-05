@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterable
 import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import FakeLLMServer, Response, Text, ToolCall
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 ENV_PROBE = "echo SNAPSHOT-BEGIN; env | sort; echo CWD=$(pwd); echo SNAPSHOT-END"
@@ -56,7 +57,7 @@ def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, s
     """Child env: fake HOME (profile root anchor) + HERMES_HOME under it, nothing credential-shaped."""
     home = home.resolve()
     assert home != real_user_home() and home / ".hermes" != real_user_home() / ".hermes", home
-    env = {k: v for k, v in os.environ.items()
+    env = {k: v for k, v in environ_snapshot().items()
            if not (k.endswith(_STRIP_SUFFIXES) or k.startswith(_STRIP_PREFIXES))}
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "XDG_STATE_HOME",
                 "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",

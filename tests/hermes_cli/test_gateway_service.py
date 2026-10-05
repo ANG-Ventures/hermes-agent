@@ -162,7 +162,8 @@ class TestServiceUnitRefreshOptOut:
 
     def _stale_unit(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "gateway.service"
-        unit_path.write_text("ExecStart=/srv/checkout/venv/bin/python -m gateway\n", encoding="utf-8")
+        # An outdated unit this CLI generated (the launcher shape), so the refresh owns it.
+        unit_path.write_text("ExecStart=/home/u/.hermes/bin/hermes gateway run --old-flag\n", encoding="utf-8")
         calls = []
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "systemd_unit_is_current", lambda system=False: False)
@@ -515,6 +516,7 @@ class TestLaunchdServiceRecovery:
         be delegated to a detached helper instead."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -590,6 +592,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -641,6 +644,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -693,6 +697,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)

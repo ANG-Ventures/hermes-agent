@@ -2302,9 +2302,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         is_qwen_portal=_is_qwen,
         is_github_models=_is_gh,
         is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
-        is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
-        is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
-        is_lmstudio=_is_lmstudio,
+        effort_route=_legacy_effort_route(agent),
         is_custom_provider=agent.provider == "custom",
         qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
@@ -2314,6 +2312,18 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         provider_name=agent.provider,
     ))
+
+
+def _legacy_effort_route(agent):
+    """Top-level ``reasoning_effort`` vocabulary for an unregistered route, resolved from the endpoint
+    host (Moonshot/Kimi direct, Tencent TokenHub); None = the route has no top-level knob."""
+    from agent.reasoning_effort import kimi_effort_route, tokenhub_effort_route
+
+    if any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")):
+        return kimi_effort_route(agent.model)
+    if base_url_host_matches(agent._base_url_lower, "tokenhub.tencentmaas.com"):
+        return tokenhub_effort_route()
+    return None
 
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:

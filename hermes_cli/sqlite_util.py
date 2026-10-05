@@ -25,7 +25,7 @@ def open_db(
     synchronous_full: bool = False,
     row_factory=sqlite3.Row,
     check_same_thread: bool = True,
-    wal_lock_retries: int = 1,
+    wal_lock_retries: int = 8,
     initialize: Callable[[sqlite3.Connection], None] | None = None,
 ) -> sqlite3.Connection:
     """Open ``path`` (parent created), apply the PRAGMA set, run ``initialize``; closed if anything raises.
@@ -36,6 +36,8 @@ def open_db(
     fallback and the never-live-downgrade invariant; a raw ``PRAGMA journal_mode=WAL`` bypasses all
     three. Only the transient ``database is locked`` from that pragma is retried (``wal_lock_retries``):
     a first opener initializing a shared DB can make it ignore the busy timeout, notably on Windows.
+    The default retries (~1.3s of backoff): with a single try, 4 processes racing a fresh DB lost
+    43/1200 opens to that error on macOS; with 8, none did (cron replicas claiming one fire).
     """
     from hermes_state_wal import apply_wal_with_fallback
 

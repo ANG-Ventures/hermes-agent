@@ -75,7 +75,9 @@ class TestSystemdWriters:
 
     def test_boot_refresh_still_rewrites_its_own_stale_unit(self, systemd_unit, homes, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(homes.real))
-        systemd_unit.path.write_text("ExecStart=old\n" + f'Environment="HERMES_HOME={homes.real}"\n')
+        # A generator-shaped launcher, so main's foreign-definition guard (#1742) admits the rewrite.
+        systemd_unit.path.write_text("ExecStart=/opt/v/.hermes/bin/hermes gateway run --old\n"
+                                     + f'Environment="HERMES_HOME={homes.real}"\n')
         # refresh's own test belt refuses a generated unit naming a pytest tmpdir; any marker-free body works.
         monkeypatch.setattr(gw, "generate_systemd_unit", lambda system=False, run_as_user=None: "ExecStart=new\n")
         assert gw.refresh_systemd_unit_if_needed(system=False) is True

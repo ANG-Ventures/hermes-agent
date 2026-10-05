@@ -7552,6 +7552,7 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    metadata = _carry_run_counters(conn, run_id, metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -7569,6 +7570,31 @@ def _end_run(
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
+
+
+def _carry_run_counters(conn: sqlite3.Connection, run_id: int, metadata: Optional[dict]) -> Optional[dict]:
+    """Keep worker-written run counters (``placement_reapply_failed``, KWLB
+    RC-9) through the close: the closing metadata replaces the column."""
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    try:
+        prior = json.loads(row["metadata"]) if row and row["metadata"] else {}
+    except (TypeError, ValueError):
+        return metadata
+    key = _kwh.REAPPLY_FAILED_KEY
+    if not isinstance(prior, dict) or key not in prior:
+        return metadata
+    merged = dict(metadata or {})
+    try:
+        stored = int(prior[key])
+    except (TypeError, ValueError):
+        return merged if key in merged else {**merged, key: prior[key]}
+    try:
+        incoming = int(merged[key]) if key in merged else None
+    except (TypeError, ValueError):
+        incoming = None
+    # keep_max: a counter never goes down through the close (Prism 94214e112dc1).
+    merged[key] = stored if incoming is None else max(stored, incoming)
+    return merged
 
 
 def _first_line(text: Optional[str], limit: int) -> str:
@@ -17852,18 +17878,77 @@ def _check_dispatch_file_collisions(
         _record_dispatch_collision_warning(conn, task_id, collisions)
 
 
-def _default_spillover_plan(conn):
-    """Spillover capacity from ``kanban.worker_hosts`` (None when unset)."""
-    try:
-        from hermes_cli.config import load_config
-        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
-        hosts_cfg = kanban_cfg.get("worker_hosts")
-    except Exception:
-        return None
-    hosts = _kwh.parse_worker_hosts(hosts_cfg)
-    if not hosts:
-        return None
-    return _kwh.plan_spillover(conn, hosts)
+def count_running_by_placement(boards) -> "dict[str, tuple[int, dict[str, int]]]":
+    """ONE pass per board: ``slug -> (running_total, running_remote_by_host)``.
+
+    Both numbers come from the same connection, so they cannot disagree on
+    which boards were read (KWLB PRD 5.2.4, RC-7). A board that fails to open
+    or query is ABSENT (0 to both counts). Each DB file is counted once.
+    """
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    out: "dict[str, tuple[int, dict[str, int]]]" = {}
+    seen: "set[str]" = set()
+    for meta in enumerating_each(boards):
+        slug = (meta.get("slug") if isinstance(meta, dict) else None) or DEFAULT_BOARD
+        conn = None
+        try:
+            with enumerating_boards():
+                path = str(kanban_db_path(slug).expanduser().resolve())
+                if path in seen:
+                    continue
+                conn = connect(board=slug)
+            # ONE read snapshot: a run that starts or ends between the two
+            # queries cannot land in one count and not the other.
+            conn.execute("BEGIN")
+            try:
+                total = _count_running_strict(conn)
+                remote = _kwp.running_by_host(conn)
+            finally:
+                conn.execute("ROLLBACK")
+        except Exception:
+            # An unreadable board hides its running workers: report it as
+            # UNKNOWN (total None) so the gate falls back to its floor instead
+            # of over-admitting on an undercount (Prism r9 capacity undercount).
+            out[slug] = (None, {})
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        seen.add(path)
+        out[slug] = (int(total), dict(remote))
+    return out
+
+
+def merge_run_metadata(conn: sqlite3.Connection, run_id: int, values: dict,
+                       *, keep_max: Iterable[str] = ()) -> None:
+    """Merge ``values`` into one run's metadata JSON (other keys kept).
+
+    A key in ``keep_max`` is a monotonic counter: inside the write txn the
+    stored value becomes ``max(stored, incoming)``, so concurrent writers
+    landing out of order can never lower it.
+    """
+    with write_txn(conn):
+        row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return
+        try:
+            meta = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        values = dict(values)
+        for key in keep_max:
+            old = meta.get(key)
+            if key in values and isinstance(old, int) and not isinstance(old, bool):
+                values[key] = max(old, values[key])
+        meta.update(values)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps(meta, ensure_ascii=False), run_id))
 
 
 def count_running_tasks_host() -> Optional[int]:

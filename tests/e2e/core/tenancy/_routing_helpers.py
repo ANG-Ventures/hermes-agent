@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterable
 import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import Error, FakeLLMServer, Text
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -57,7 +58,7 @@ def hermetic_env(home: Path, hermes_home: Path | None = None, proxy: str | None 
     # The state-db guard is bypassed below, so prove first that this child can never reach the
     # real install: its HOME (and therefore every profile root) lives outside the real home.
     assert fake != real_home and real_home / ".hermes" not in (fake, *fake.parents), fake
-    env = {k: v for k, v in os.environ.items()
+    env = {k: v for k, v in environ_snapshot().items()
            if not (k.endswith(_STRIP_SUFFIXES) or k.startswith(_STRIP_PREFIXES))}
     env.update(
         HOME=str(home),

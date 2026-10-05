@@ -33,6 +33,17 @@ def _route_step() -> dict:
     return next(s for s in steps if s.get("id") == "route")
 
 
+def _script(tmp_path: Path, body: str) -> str:
+    """Write a step's script to a file: run as `bash <file>`, not `bash -c <script>`.
+
+    The suite's live-system guard parses every subprocess argv, and its cost grows
+    with argv length squared; a ~20 KB inline script took ~10 s per call in CI.
+    """
+    path = tmp_path / "step.sh"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
 # Hermetic stand-in for curl: answers the tag lookup from FAKE_TAG_CODE/FAKE_TAG_SHA
 # and logs every URL, so no test touches the network.
 _FAKE_CURL = r"""#!/usr/bin/env bash
@@ -68,7 +79,7 @@ def _route(tmp_path: Path, *, event: str, branch: str, conclusion: str = "failur
            "FAKE_CURL_LOG": str(log), "FAKE_TAG_CODE": tag_code, "FAKE_TAG_SHA": tag_sha,
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_curl"] = log.read_text()
@@ -186,7 +197,7 @@ def test_known_red_predecessor_is_the_latest_COMPLETED_run_not_latest_created(tm
            "FAKE_CURL_LOG": str(tmp_path / "log"), "FAKE_RUNS": json.dumps(runs), "GH_TOKEN": "x",
            "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     assert got["route"] == "alerts", proc.stdout
@@ -229,7 +240,7 @@ def _post(tmp_path, *, known_code, alerts_code):
            "WF_BRANCH": "main", "WF_SHA": "abc", "WF_RUN_ID": "42", "WF_URL": "https://x/42",
            "WF_ACTOR": "k", "REPO": "o/r", "WF_EVENT": "push", "EVENT_NAME": "workflow_run",
            "GITHUB_RUN_ID": "7"}
-    proc = subprocess.run(["bash", "-c", post["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, post["run"])], env=env, capture_output=True, text=True, timeout=30)
     return proc, log.read_text().split("\n")
 
 
@@ -275,7 +286,7 @@ def test_page_names_scheduled_vs_merge(tmp_path, event, trigger, actor):
            "WF_NAME": "Install & Update E2E", "WF_BRANCH": "main", "WF_SHA": "abc", "WF_RUN_ID": "42",
            "WF_URL": "https://x/42", "WF_ACTOR": "github-merge-queue[bot]", "REPO": "o/r",
            "WF_EVENT": event, "EVENT_NAME": "workflow_run", "GITHUB_RUN_ID": "7"}
-    proc = subprocess.run(["bash", "-c", post["run"]], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, post["run"])], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     body = json.loads(log.read_text().splitlines()[0])
     assert body["trigger"] == trigger
@@ -288,14 +299,21 @@ def test_page_names_scheduled_vs_merge(tmp_path, event, trigger, actor):
 _FAKE_API_CURL = r"""#!/usr/bin/env bash
 url=""
 for a in "$@"; do case "$a" in https://*) url="$a" ;; esac; done
-echo "$url" >> "$FAKE_CURL_LOG"
+echo "$url | $*" >> "$FAKE_CURL_LOG"
 python3 - "$url" "$FAKE_API" <<'PY'
 import json, sys
 url, path = sys.argv[1], sys.argv[2]
 table = json.load(open(path))
 for key in sorted(table, key=len, reverse=True):
     if key in url:
-        print(json.dumps(table[key])); sys.exit(0)
+        data = table[key]
+        if isinstance(data, dict) and "jobs" in data:  # paginate like GitHub (per_page default 30)
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(url).query)
+            per, page = int(q.get("per_page", ["30"])[0]), int(q.get("page", ["1"])[0])
+            data = {"total_count": data.get("total_count", len(data["jobs"])),
+                    "jobs": data["jobs"][(page - 1) * per:page * per]}
+        print(json.dumps(data)); sys.exit(0)
 sys.exit(22)
 PY
 """
@@ -335,7 +353,7 @@ def _queue_route(tmp_path, api: dict, *, run_id=42, pr="1328", branch="", subjec
            "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_stdout"] = proc.stdout
@@ -524,7 +542,7 @@ def _replay(tmp_path: Path, run_id: int, api: dict) -> dict:
            "FAKE_CURL_LOG": str(d / "curl.log"), "FAKE_API": str(d / "api.json"), "GH_TOKEN": "x",
            "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main", "REPLAY_RUN_ID": "",
            "RUN_JSON": json.dumps(payload), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=120)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_stdout"] = proc.stdout
@@ -658,7 +676,7 @@ def _probe_route(tmp_path, *, actor="Kyzcreig", title="placement probe hand1 #0"
            "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
     got["_curl"] = log.read_text()
@@ -723,3 +741,524 @@ def test_probe_prior_red_that_never_paged_does_not_suppress(tmp_path, prior_run)
 def test_probe_prior_lookup_is_scoped_to_default_branch(tmp_path):
     got = _probe_route(tmp_path, prior=[])
     assert "branch=main" in got["_curl"]
+
+
+
+# --- main still red (t_30d3de38) -----------------------------------------------
+# 2026-10-04: the e2e-upgrade jobs (no pytest annotation, so the fold cannot see
+# them) failed on main 6 times in 4 h and paged 6 times. A default-branch push red
+# whose every failed job/step was already red in its latest earlier main run that
+# RAN it goes to #logs. Path-classified skips are walked past; a pass pages.
+E2E = "Python tests / e2e-upgrade (core/test_upgrade_path)"
+E2E_STEP = "Run upgrade e2e tests (core/test_upgrade_path)"
+
+
+def _main_jobs(*jobs):
+    """jobs: (name, conclusion, {step: conclusion})"""
+    return {"jobs": [{"id": 700 + i, "name": n, "conclusion": c,
+                      "steps": [{"name": s, "conclusion": sc} for s, sc in steps.items()]}
+                     for i, (n, c, steps) in enumerate(jobs)]
+            + [{"id": 1, "name": "All required checks pass", "conclusion": "failure", "steps": []}]}
+
+
+def _red_e2e():
+    return _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "failure"}))
+
+
+def _main_api(history, *, current=None):
+    """history: newest first, (run_id, created_at, conclusion, jobs)."""
+    api = {"actions/runs/42/jobs": current or _red_e2e(), "/annotations": [],
+           "runs?branch=main&event=push": {"workflow_runs": [
+               {"id": rid, "created_at": ts, "conclusion": c, "head_branch": "main", "event": "push"}
+               for rid, ts, c, _j in history]}}
+    for rid, _ts, _c, jobs in history:
+        if jobs is not None:
+            api[f"actions/runs/{rid}/jobs"] = jobs
+    return api
+
+
+def _main_route(tmp_path, api, env_extra=None) -> dict:
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_API_CURL)
+    (bindir / "curl").chmod(0o755)
+    (tmp_path / "api.json").write_text(json.dumps(api))
+    log = tmp_path / "curl.log"
+    log.write_text("")
+    run = {"name": "CI", "workflow_id": 7, "id": 42, "head_sha": "abc", "conclusion": "failure",
+           "head_branch": "main", "event": "push", "created_at": "2026-10-04T05:00:00Z",
+           "html_url": "https://x/42", "actor": {"login": "Kyzcreig"}}
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
+           "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"],
+           **(env_extra or {})}
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got["_stdout"] = proc.stdout
+    got["_curl"] = log.read_text()
+    return got
+
+
+def test_main_red_already_red_on_previous_main_run_goes_to_logs(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+    # commit order: only runs created before this one are asked for
+    assert "created=%3C%3D2026-10-04T05:00:00Z" in got["_curl"]
+
+
+def test_main_red_after_the_step_passed_on_main_pages(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "passed on main in run 41" in got["_stdout"]
+
+
+def test_main_red_walks_past_runs_that_skipped_the_job(tmp_path):
+    # path-classified CI: a green run that never ran e2e-upgrade proves nothing
+    skipped = _main_jobs((E2E, "skipped", {}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", skipped),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+
+
+def test_main_red_ignores_a_later_created_run(tmp_path):
+    # An OLDER commit's run that finishes after this one is not "main now"; a run
+    # created AFTER this one (listed by the API) must not count either.
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(43, "2026-10-04T06:00:00Z", "success", green),
+                     (41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    assert _main_route(tmp_path, api)["route"] == "logs"
+
+
+def test_main_red_with_a_new_failing_step_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                         ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"}))
+    lint_green = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                            ("Lint (ruff + ty) / ruff", "success", {"ruff": "success"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", lint_green)], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_with_no_proof_in_history_pages(tmp_path):
+    # the first red of an episode: no earlier run failed the step
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "success",
+                                            _main_jobs((E2E, "skipped", {})))]))
+    assert got["route"] == "alerts", got["_stdout"]
+    assert _main_route(tmp_path, _main_api([]))["route"] == "alerts"
+
+
+def test_main_still_red_api_errors_page(tmp_path):
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", None)])  # prior jobs 404
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    del api["runs?branch=main&event=push"]
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    del api["actions/runs/42/jobs"]
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+
+
+def test_main_still_red_never_applies_to_startup_failure(tmp_path):
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_API_CURL)
+    (bindir / "curl").chmod(0o755)
+    (tmp_path / "api.json").write_text(json.dumps(api))
+    run = {"name": "CI", "workflow_id": 7, "id": 42, "head_sha": "abc", "conclusion": "startup_failure",
+           "head_branch": "main", "event": "push", "created_at": "2026-10-04T05:00:00Z",
+           "html_url": "https://x/42", "actor": {"login": "Kyzcreig"}}
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(tmp_path / "c.log"), "FAKE_API": str(tmp_path / "api.json"),
+           "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
+           "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
+    subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60, check=True)
+    assert "route=alerts" in out.read_text()
+
+
+# --- truncated jobs (Prism P1 30c28a402d93, 2026-10-04) ------------------------------------------
+# A run can carry > 100 jobs. Reading only the first page drops a failed job (a new red behind a
+# known one goes to #logs or folds) or a job that passed (main looks still red). Every page is
+# read; a list shorter than total_count pages.
+def _filler(n):
+    return [(f"filler {i}", "success", {"run": "success"}) for i in range(n)]
+
+
+def test_main_red_new_failed_job_past_the_first_jobs_page_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *_filler(120),
+                         ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "page=2" in got["_curl"]
+
+
+def test_main_red_prior_pass_past_the_first_jobs_page_pages(tmp_path):
+    green_late = _main_jobs(*_filler(120), (E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green_late),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_jobs_list_shorter_than_total_count_pages(tmp_path):
+    current = _red_e2e()
+    current["total_count"] = 150  # API says 150; only 2 jobs ever come back
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_fold_blocked_by_an_extra_red_job_past_the_first_jobs_page(tmp_path):
+    # Prior generation (FleetReview #1470): an extra unannotated red job blocks the fold. It must
+    # still block when it sits on page 2 of the jobs list.
+    api = _other_pr_queue_api()
+    jobs = api["actions/runs/42/jobs"]["jobs"]
+    jobs += [{"id": 2000 + i, "name": f"filler {i}", "conclusion": "success"} for i in range(120)]
+    jobs.append({"id": 950, "name": "OS-specific tests / Windows-only tests", "conclusion": "failure"})
+    api["check-runs/950/annotations"] = [{"message": "Process completed with exit code 1."}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "Windows-only tests" in got["summary"]
+
+
+# --- cancelled runs are evidence too (Prism P1 daaf469b6e2e / eb4c30f2ca3e, 2026-10-04) ----------
+def test_main_red_step_passed_in_a_cancelled_run_pages(tmp_path):
+    # older run red, next run passed e2e but was cancelled on another job, now red again
+    passed = _main_jobs((E2E, "success", {E2E_STEP: "success"}), ("Lint (ruff + ty) / ruff", "cancelled", {}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", passed),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_cancelled_run_that_never_finished_the_job_is_walked_past(tmp_path):
+    cut = _main_jobs((E2E, "cancelled", {E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+
+
+# --- a stalled or failing route never stops the page (Prism P1 cc0510af974c / 8c9d210ef980) ------
+def test_route_step_is_bounded_and_cannot_skip_the_post():
+    job = _workflow()["jobs"]["notify-on-failure"]
+    route = _route_step()
+    assert route.get("continue-on-error") is True
+    assert 0 < route["timeout-minutes"] < job["timeout-minutes"]
+    post = next(s for s in job["steps"] if s.get("name", "").startswith("Sign and POST"))
+    assert "failure()" not in str(post.get("if", "")) and "steps.route.outcome" not in str(post.get("if", ""))
+
+
+def test_main_still_red_api_calls_are_time_bounded(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]))
+    calls = [line for line in got["_curl"].splitlines() if "api.github.com" in line]
+    assert calls and all("--max-time" in c and "--connect-timeout" in c for c in calls), calls
+
+
+def test_main_still_red_spent_budget_pages(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]),
+                      env_extra={"ROUTE_BUDGET_S": "0"})
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "actions/runs/" not in got["_curl"]
+
+
+# --- a step that passed inside a cancelled / timed-out JOB is a recovery (Prism P1 cb7d09e76216) --
+@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
+def test_main_red_step_passed_in_a_cancelled_job_pages(tmp_path, conclusion):
+    passed = _main_jobs((E2E, conclusion, {E2E_STEP: "success", "later step": conclusion}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", conclusion, passed),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_cancelled_job_that_never_reached_the_step_is_walked_past(tmp_path):
+    cut = _main_jobs((E2E, "cancelled", {"Set up job": "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+
+
+# --- Prism round 4 on e9718495 (t_1a8e095b) ------------------------------------------------------
+# f-abb7efb339835ba6: a job that failed with NO failed step (job timeout, runner lost) is a stepless
+# item [job, ""]. It is the same fault only if the earlier run's job ALSO failed with no failed step;
+# an earlier failure on a named step is a different fault and must page.
+def test_main_red_stepless_failure_after_a_named_step_failure_pages(tmp_path):
+    hang = _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=hang)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert got["summary"] == "" and "different fault" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_stepless_failure_after_a_stepless_failure_goes_to_logs(tmp_path):
+    hang = _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "cancelled"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", hang)], current=hang)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E}"
+
+
+# f-ac6b7f1a201ac052: a job-level timed_out is a failure. A new timed-out job next to a known red
+# must page, and a prior timed-out step is red evidence, not "did not run".
+def test_main_red_new_timed_out_job_next_to_a_known_red_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                         ("Python tests / Run tests slice 3/16", "timed_out", {"Run tests": "cancelled"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_prior_timed_out_step_is_red_evidence(tmp_path):
+    timed = _main_jobs((E2E, "timed_out", {E2E_STEP: "timed_out"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "timed_out", timed)],
+                    current=_main_jobs((E2E, "timed_out", {E2E_STEP: "timed_out"})))
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+def test_fold_blocked_by_an_extra_timed_out_job(tmp_path):
+    # sig_of feeds the queue dedupe and the already-red fold: a timed-out job must enter SIG.
+    api = _other_pr_queue_api(extra_job="OS-specific tests / Windows-only tests")
+    api["actions/runs/42/jobs"]["jobs"][-1]["conclusion"] = "timed_out"
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert "Windows-only tests" in got["summary"]
+
+
+# f-96b4792f11201e3e: two jobs with one display name cannot be told apart by name. Pick-first could
+# match the wrong one, so a duplicate failed name in this run, or in the prior run, pages.
+def test_main_red_duplicate_failed_job_name_in_this_run_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (E2E, "failure", {E2E_STEP: "failure"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_duplicate_job_name_in_the_prior_run_pages(tmp_path):
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "not unique" in got["_stdout"], got["_stdout"]
+
+
+# --- Prism round 5 on 6117082a (t_1a8e095b) ------------------------------------------------------
+# "Ambiguous steps" (:389): two steps with one name in a job cannot be told apart by name. A failed
+# step name that repeats in this run's job, or in the prior run's job, pages.
+def test_main_red_duplicate_failed_step_name_in_this_run_pages(tmp_path):
+    current = {"jobs": [{"id": 700, "name": E2E, "conclusion": "failure",
+                         "steps": [{"name": E2E_STEP, "conclusion": "failure"},
+                                   {"name": E2E_STEP, "conclusion": "failure"}]}]}
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_duplicate_step_name_in_the_prior_run_pages(tmp_path):
+    # prior: first "Test" failed, the second (if: always()) passed; now the second fails too
+    prior = {"jobs": [{"id": 700, "name": E2E, "conclusion": "failure",
+                       "steps": [{"name": E2E_STEP, "conclusion": "failure"},
+                                 {"name": E2E_STEP, "conclusion": "success"}]}]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "not unique" in got["_stdout"], got["_stdout"]
+
+
+# "Retain independent failures inside Tests complete" (:352): the aggregate job's own quarantine
+# lint + evidence gate is an independent check. Its failure next to a known red pages; its
+# derivative "Fail on skipped or failed ..." step alone does not add an item.
+TC = "Python tests / Tests complete"
+QLINT = "Quarantine list lint + evidence gate"
+
+
+def _tc(qlint):
+    # an e2e-upgrade red trips the e2e-upgrade gate step, which is derivative of that job
+    return (TC, "failure", {QLINT: qlint, "Fail on skipped or failed e2e-upgrade shards": "failure"})
+
+
+def test_main_red_new_quarantine_gate_failure_in_tests_complete_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("failure"))
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("success"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_derivative_tests_complete_failure_is_not_an_item(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("success"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+
+
+def test_fold_blocked_by_a_quarantine_gate_failure_in_tests_complete(tmp_path):
+    # sig_of feeds the queue dedupe and the already-red fold: the independent step enters SIG.
+    api = _other_pr_queue_api()
+    tc = next(j for j in api["actions/runs/42/jobs"]["jobs"] if j["name"] == TC)
+    tc["steps"] = [{"name": QLINT, "conclusion": "failure"},
+                   {"name": "Fail on skipped or failed required tests", "conclusion": "failure"}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert f"{TC} / {QLINT}" in got["summary"]
+
+
+# Prism P2 "Argument Limit" (:229): a 100-job page is ~240 KB (run 37243401496), over Linux's
+# 128 KiB per-argument cap, so the jobs accumulator must not ride on argv. Big pages still route.
+def test_main_red_large_jobs_pages_do_not_ride_on_argv(tmp_path):
+    def fat(i):
+        return (f"filler {i}", "success", {f"step {k} " + "x" * 200: "success" for k in range(12)})
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+# --- Prism round 1 on e7b489f4 (t_1a8e095b) ------------------------------------------------------
+# 569d6f572e69 "Excluded Recovery": created_at has 1 s precision. A main run created in the same
+# second cannot be ordered against this one, so the red pages instead of dropping that run.
+def test_main_red_same_second_predecessor_pages(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T05:00:00Z", "success", green),
+                     (40, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+# b0cbda43048e "Dropped Timeouts": an aggregate job that timed out with no failed step (its running
+# step cancelled) is a stepless item in ITEMS and in sig_of, not dropped.
+def _tc_timeout():
+    return (TC, "timed_out", {QLINT: "cancelled"})
+
+
+def test_main_red_tests_complete_timeout_next_to_a_known_red_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc_timeout())
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_fold_blocked_by_a_tests_complete_timeout(tmp_path):
+    api = _other_pr_queue_api()
+    tc = next(j for j in api["actions/runs/42/jobs"]["jobs"] if j["name"] == TC)
+    tc["conclusion"], tc["steps"] = "timed_out", [{"name": QLINT, "conclusion": "cancelled"}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert TC in got["summary"]
+
+
+# 5515ab6c4f85 "Coarse Deduplication": a job/step match cannot tell two tests apart. A NEW pytest
+# node id in an already-red slice pages; the same node id stays a standing red.
+SLICE = "Python tests / Run tests slice 12/16"
+QTEST2 = "tests/tools/test_other.py::test_new_regression"
+
+
+def test_main_red_new_test_in_an_already_red_slice_pages(tmp_path):
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
+    prior = {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
+    api["check-runs/700/annotations"] = _ann(QTEST2)
+    api["check-runs/800/annotations"] = _ann(QTEST)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and QTEST2 in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_same_test_in_an_already_red_slice_goes_to_logs(tmp_path):
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
+    prior = {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
+    api["check-runs/700/annotations"] = _ann(QTEST)
+    api["check-runs/800/annotations"] = _ann(QTEST)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs", got["_stdout"]
+
+
+# 891d36986f43 "missing-work gate failures": a Tests complete gate step that failed while none of
+# its prerequisite jobs stopped (the requested e2e-upgrade shards were SKIPPED) is a new fault.
+RUFF = ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"})
+
+
+def test_main_red_gate_failing_on_skipped_shards_next_to_a_known_red_pages(tmp_path):
+    current = _main_jobs(RUFF, (E2E, "skipped", {}),
+                         (TC, "failure", {QLINT: "success", "Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _main_jobs(RUFF))], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_gate_failing_on_skipped_shards_twice_goes_to_logs(tmp_path):
+    jobs = _main_jobs(RUFF, (E2E, "skipped", {}),
+                      (TC, "failure", {QLINT: "success", "Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", jobs)], current=jobs))
+    assert got["route"] == "logs", got["_stdout"]
+
+
+def test_main_red_skip_gate_now_vs_derivative_gate_before_pages(tmp_path):
+    # the gate failed before only because e2e-upgrade failed; now it fails on a skip: different fault
+    current = _main_jobs((E2E, "skipped", {}),
+                         (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                       (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts" and "different fault" in got["_stdout"], got["_stdout"]
+
+
+# --- Prism round 2 on 1c0d16a5 (t_1a8e095b) ------------------------------------------------------
+# d12fe5a4bf6d: two EARLIER main runs created in the same second cannot be ordered either.
+def test_main_red_tied_predecessors_page(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green),
+                     (40, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+# 8a4efca8c2ad: a CANCELLED prerequisite is not an item, so the gate step that points at it stays one.
+def test_main_red_cancelled_slice_next_to_a_known_red_pages(tmp_path):
+    gate = "Fail on skipped or failed required tests"
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (SLICE, "cancelled", {"Run tests": "cancelled"}),
+                         (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure", gate: "failure"}))
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                       (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure", gate: "success"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def _slice_red(prior_tests, current_tests, *, older=None):
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
+    hist = [(41, "2026-10-04T04:00:00Z", "failure", {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]})]
+    if older is not None:
+        hist.append((40, "2026-10-04T03:00:00Z", "failure", {"jobs": [dict(j, id=j["id"] + 200) for j in red["jobs"]]}))
+    api = _main_api(hist, current=red)
+    api["check-runs/700/annotations"] = _ann(*current_tests)
+    api["check-runs/800/annotations"] = _ann(*prior_tests)
+    if older is not None:
+        api["check-runs/900/annotations"] = _ann(*older)
+    return api
+
+
+# 13f5bb458e0c: the node check is against the step's LATEST execution, not any older run. Run 41
+# passed A (failed B in the same step); an older run failing A proves nothing about main now.
+def test_main_red_test_that_passed_in_the_latest_red_run_pages(tmp_path):
+    a, b = "tests/x.py::test_a", "tests/x.py::test_b"
+    got = _main_route(tmp_path, _slice_red([b], [a], older=[a]))
+    assert got["route"] == "alerts" and a in got["_stdout"], got["_stdout"]
+
+
+# 702860bc5678: node ids are compared whole; a parameter id with "; " must not collapse two tests.
+def test_main_red_semicolon_parameter_ids_are_not_truncated(tmp_path):
+    got = _main_route(tmp_path, _slice_red(["tests/x.py::test_case[a; c]"], ["tests/x.py::test_case[a; b]"]))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_same_semicolon_parameter_id_goes_to_logs(tmp_path):
+    t = "tests/x.py::test_case[a; b]"
+    got = _main_route(tmp_path, _slice_red([t], [t]))
+    assert got["route"] == "logs", got["_stdout"]
+

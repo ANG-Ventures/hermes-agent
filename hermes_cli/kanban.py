@@ -310,10 +310,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+        refusal = "delegate_task child contexts cannot mutate Kanban tasks via the CLI"
+        _record_refused_block(args, refusal)
+        return _err(f"kanban: {refusal}")
 
     refusal = _non_owner_lifecycle_refusal(args)
     if refusal:
+        _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
@@ -558,6 +561,26 @@ def _lifecycle_target_ids(args: argparse.Namespace) -> list[str]:
         ids.append(args.task_id)
     ids.extend(getattr(args, "ids", None) or [])
     return ids
+
+
+def _record_refused_block(args: argparse.Namespace, refusal: str) -> None:
+    """Comment a refused ``block`` on each target card so the refusal is visible on the board.
+
+    Without it the card stays ``running`` with an idle worker and nothing says
+    why (t_0809e21a). A comment is the one write a delegate child may make
+    (``kanban_db.add_comment`` marks it ``(subagent)``); failures only warn.
+    """
+    if getattr(args, "kanban_action", None) != "block":
+        return
+    body = f"kanban block REFUSED, the block did not land and the card status is unchanged: {refusal}"
+    for tid in _lifecycle_target_ids(args):
+        try:
+            run_id, session_ref = safe_comment_provenance(tid)
+            with kbc.connect_closing() as conn:
+                kb.add_comment(conn, tid, _profile_author(), body,
+                               run_id=run_id, session_ref=session_ref)
+        except Exception as exc:
+            print(f"kanban: could not record the refused block on {tid}: {exc}", file=sys.stderr)
 
 
 def _non_owner_lifecycle_refusal(args: argparse.Namespace) -> Optional[str]:
@@ -3779,6 +3802,12 @@ def _print_stranded_by_triage(stranded) -> None:
     )
 
 
+def _cmd_session_closeout(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_session_closeout
+
+    return kanban_session_closeout.run(args)
+
+
 def _cmd_home_index(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_home_index
 
@@ -4502,7 +4531,7 @@ _HANDLERS = {
     "triage-resolve": _cmd_triage_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
-    "home-index": _cmd_home_index,
+    "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-status": _cmd_notify_status,

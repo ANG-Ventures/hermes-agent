@@ -28,6 +28,7 @@ import hermes_yaml as yaml
 
 from tests.e2e.core.parity._helpers import hermes_argv, kill_tagged, tagged_pids, wait_until
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall, write_hermes_home
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 FIXTURE_SERVER = Path(__file__).with_name("mcp_fixture_server.py")
@@ -91,7 +92,7 @@ class E2EHome:
         fixture = self.hermes_home.resolve()
         assert fixture != real_root and fixture.parent != real_root / "profiles", fixture
         assert fixture == (self.home / ".hermes").resolve(), fixture
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_ENV_SUFFIXES)}
         env.update({
             "HOME": str(self.home), "HERMES_HOME": str(self.hermes_home), "PYTHONPATH": str(REPO_ROOT),
@@ -177,7 +178,7 @@ class HttpMcpServer:
     def start(self) -> "HttpMcpServer":
         with contextlib.suppress(FileNotFoundError):
             self.port_file.unlink()
-        env = {k: v for k, v in os.environ.items() if k in _PASSTHROUGH_ENV}
+        env = {k: v for k, v in environ_snapshot().items() if k in _PASSTHROUGH_ENV}
         env.update({"PYTHONPATH": str(REPO_ROOT), "MCPE2E_TRANSPORT": "http", "MCPE2E_LOG": str(self.log),
                     "MCPE2E_PORT_FILE": str(self.port_file), "MCPE2E_PORT": str(self.port),
                     "PARITY_TREE_TAG": self.tag, **self.env})

@@ -46,6 +46,7 @@ croniter_mod = pytest.importorskip("croniter")
 
 from tests.e2e.core.delivery import _cron_clock as H  # noqa: E402
 from tests.e2e.core.delivery._pending_fixes import gap_open  # noqa: E402
+from tests.e2e.environ_snapshot import environ_snapshot
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="flock/SIGKILL multi-process soak is Linux-only")
@@ -595,7 +596,7 @@ def _run_scenario(sc: Scenario, soak_env) -> Dict[str, int]:
     # cadence); they are diagnostics, not scheduling, and are covered by tests/cron.
     monkeypatch.setattr(jobs, "record_ticker_heartbeat", lambda **_kw: None)
     H.install(H.VirtualClock(control.clock_file), control, monkeypatch.setattr)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env = {k: v for k, v in environ_snapshot().items() if not k.startswith("PYTEST_")}
     env["PYTHONPATH"] = str(REPO_ROOT)
     soak = Soak(sc, hermes_home, control, env)
     try:
@@ -649,7 +650,7 @@ def test_two_replicas_contend_for_every_fire(soak_env):
     clock = H.VirtualClock(control.clock_file)
     H.install(clock, control, monkeypatch.setattr)
     H.install_claim_barrier(control, monkeypatch.setattr)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env = {k: v for k, v in environ_snapshot().items() if not k.startswith("PYTEST_")}
     env["PYTHONPATH"] = str(REPO_ROOT)
     clock.set(datetime(2026, 3, 1, 0, 0, 30, tzinfo=UTC).timestamp())
     names = {}

@@ -217,13 +217,43 @@ def _kanban_handler(tool_name: str) -> Callable:
                        f"Valid parameters: {', '.join(sorted(properties))}. Nothing changed.")
                 return fn(args, **kw)
             except _Reject as e:
-                return e.args[0]
+                return _loud_refusal(tool_name, args, e.args[0])
             except Exception as e:
                 if not isinstance(e, ValueError):
                     logger.exception(f"{tool_name} failed")
-                return tool_error(f"{tool_name}: {e}")
+                return _loud_refusal(tool_name, args, tool_error(f"{tool_name}: {e}"))
         return wrapper
     return deco
+
+
+# Refusals of these tools are written to the card thread as well as returned to
+# the caller: a refused block otherwise leaves the card ``running`` with an idle
+# worker and nothing on the board saying why (t_0809e21a, t_791348ae run 4).
+_LOUD_REFUSAL_TOOLS = frozenset({"kanban_block"})
+
+
+def _loud_refusal(tool_name: str, args: dict, error: str) -> str:
+    """Return *error* unchanged; for :data:`_LOUD_REFUSAL_TOOLS` also comment it on the card."""
+    if tool_name not in _LOUD_REFUSAL_TOOLS:
+        return error
+    tid = args.get("task_id") if isinstance(args.get("task_id"), str) else None
+    tid = tid or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return error
+    try:
+        message = json.loads(error).get("error", error)
+    except (ValueError, AttributeError):
+        message = error
+    body = (f"{tool_name} REFUSED, the block did not land and the card status is unchanged: "
+            f"{_redact(message)}")
+    try:
+        run_id, session_ref = safe_comment_provenance(str(tid))
+        with _board(args.get("board") if isinstance(args.get("board"), str) else None) as (kb, conn):
+            kb.add_comment(conn, str(tid), author=_persisted_identity(), body=body,
+                           run_id=run_id, session_ref=session_ref)
+    except Exception:
+        logger.warning("%s refusal could not be recorded on %s", tool_name, tid, exc_info=True)
+    return error
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> None:
