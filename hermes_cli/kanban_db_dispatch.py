@@ -3022,21 +3022,32 @@ def check_respawn_guard(
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
     newest_pr_comment_at = 0
+    assignee_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assignee = str(assignee_row["assignee"] or "") if assignee_row else ""
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at, author FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"]) or ""
         found = [match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body)]
         if found:
             pr_urls.extend(found)
-            newest_pr_comment_at = max(newest_pr_comment_at, int(c["created_at"] or 0))
+            # Only the assignee's own PR comment (or the kernel's completion
+            # routing comment, author ``kanban``) can supersede a handoff: the
+            # reviewer's send-back note and Prism's review posted right after a
+            # changes_requested name the same PR but are not the worker acting
+            # on it. Counting them held every merge-pass send-back behind
+            # active_pr and paged #alerts (t_da538470).
+            if c["author"] in {assignee, "kanban"} - {""}:
+                newest_pr_comment_at = max(newest_pr_comment_at, int(c["created_at"] or 0))
     if pr_urls:
         if _kb._unused_operator_intent_after_pr(conn, task_id):
             return None
-        # A handoff AFTER the newest PR comment (operator reassign to a
-        # different profile, reviewer changes_requested, review reopen) names
-        # the profile that must now work on THAT PR — a closer or the
+        # A handoff AFTER the assignee's newest PR comment (operator reassign
+        # to a different profile, reviewer changes_requested, review reopen)
+        # names the profile that must now work on THAT PR — a closer or the
         # implementer finishing it, not a duplicate implementation (#111910).
         # Strictly after: a same-second tie stays guarded (fail closed).
         handoff_events = conn.execute(
