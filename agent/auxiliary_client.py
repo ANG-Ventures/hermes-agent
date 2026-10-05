@@ -1693,8 +1693,16 @@ class _CodexStreamGuard:
     def finish(self) -> None:
         """Owner ``finally``: stop the watchdog and release FDs a stranger-thread timeout only shut down."""
         self.stream_finished.set()
-        if self._timer is not None:
-            self._timer.cancel()
+        # cancel() cannot stop a callback already running; join it so the owner returns only after
+        # the stranger thread is done (else it sets timeout_release_pending after the check below and
+        # the FD release is skipped). Loop: a fire racing stream_finished may have re-armed _timer.
+        timer = self._timer
+        while timer is not None:
+            timer.cancel()
+            timer.join(5.0)
+            if self._timer is timer:
+                break
+            timer = self._timer
         # Gated on timeout_release_pending, NOT timed_out: after a hard-cancel the shared
         # client must stay usable for other sessions.
         if self.timeout_release_pending.is_set():
