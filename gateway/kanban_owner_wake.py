@@ -132,12 +132,69 @@ def is_stuck(kind: str, payload: Optional[dict]) -> bool:
     return kind == "reclaimed" and bool((payload or {}).get("heartbeat_stale"))
 
 
+# hermes-agent's review-labels.yml: a CI-sensitive diff is red on this gate (and the aggregator it fails) until
+# a maintainer applies ``ci-reviewed``. On a review handback that is the review being asked for, not a PR that
+# cannot land: the merge pass owns it (HELD-NEEDS-LABEL, or fleet-merge applies the label on an operator APPROVE).
+_LABEL_GATE_RE = re.compile(r"^(?:.+ / )?Review label gate$")
+_REQUIRED_ROLLUP_RE = re.compile(r"^(?:.+ / )?All required checks pass$")
+REVIEW_LABEL = "ci-reviewed"
+
+
+# scripts/ci/evaluate_needs.py prints ``::error::N job(s) failed: a, b`` on the aggregator run.
+_ROLLUP_FAILED_RE = re.compile(r"^\d+ job\(s\) failed: (.+)$")
+_LABEL_JOB = "review-labels"
+# review-labels.yml "Fail on missing label": the ONE annotation that means the label is what is missing. A failed
+# checkout / emit_review_status.py / timeout / cancel carries no such line and stays a real red (Prism P1 b796fe55bbc1).
+_MISSING_LABEL_MSG = "CI-sensitive changes require the ci-reviewed label."
+
+
+def rollup_failed_jobs(annotations: Optional[list]) -> Optional[frozenset]:
+    """The jobs the aggregator run says failed, from its ``N job(s) failed: ...`` annotation, or None (unreadable)."""
+    for a in annotations or []:
+        m = _ROLLUP_FAILED_RE.match(str((a or {}).get("message") or "").strip())
+        if m:
+            return frozenset(x.strip() for x in m.group(1).split(",") if x.strip())
+    return None
+
+
+def missing_label_only(annotations: Optional[list]) -> bool:
+    """True when a failed review-label gate run carries the workflow's explicit missing-label failure."""
+    return any(_MISSING_LABEL_MSG in str((a or {}).get("message") or "") for a in annotations or [])
+
+
+def _label_gate_red_only(run: dict, annotations: Optional[list]) -> bool:
+    """One failing check run's verdict: is it red ONLY because ``ci-reviewed`` is missing?"""
+    name, concl = str(run.get("name") or ""), str(run.get("conclusion") or "").lower()
+    if concl != "failure":   # cancelled / timed_out / action_required: never evidence of a missing label
+        return False
+    if _LABEL_GATE_RE.match(name):
+        return missing_label_only(annotations)
+    if _REQUIRED_ROLLUP_RE.match(name):
+        return rollup_failed_jobs(annotations) == frozenset({_LABEL_JOB})
+    return False
+
+
+def label_pending(health: Optional[dict]) -> bool:
+    """True when the PR has no ``ci-reviewed`` label, a review-label gate is among the reds, and EVERY failing check
+    run was verified (``label_only``, one bool per run of ``failing``) to be red only for the missing label: each gate
+    run carries the workflow's missing-label annotation and each aggregator run says it failed on ``review-labels``
+    alone (Prism P1 c585adb654b0, 7d6845520733, b796fe55bbc1). Unreadable annotations count as not verified."""
+    health = health or {}
+    names = [str(n) for n in health.get("failing") or [] if n]
+    verdicts = list(health.get("label_only") or [])
+    if REVIEW_LABEL in [str(x).strip().lower() for x in health.get("labels") or []]:
+        return False
+    if not names or len(verdicts) != len(names) or not any(_LABEL_GATE_RE.match(n) for n in names):
+        return False
+    return all(v is True for v in verdicts)
+
+
 def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
-    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, unknown)."""
+    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown)."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
-    names = list(health.get("failing") or [])
+    names = [] if label_pending(health) else list(health.get("failing") or [])
     urls = list(health.get("failing_urls") or [])
     failing = [f"{n} <{u}>" if u else str(n)
                for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
@@ -341,7 +398,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
     if not isinstance(pr, dict) or not pr.get("state"):
         return None
     out = {"state": "merged" if pr.get("merged_at") else str(pr["state"]),
-           "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": []}
+           "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": [],
+           "labels": [str((x or {}).get("name") or "") for x in pr.get("labels") or [] if isinstance(x, dict)]}
     sha = (pr.get("head") or {}).get("sha")
     if out["state"] == "open" and sha:
         runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
@@ -352,7 +410,20 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         out["failing"] = [str(r.get("name") or "?") for r in red]
         # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
         out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
+        if red and REVIEW_LABEL not in [x.strip().lower() for x in out["labels"]] and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) \
+                and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in out["failing"]):
+            # only when label_pending could hold: verify EVERY failing run's own annotations (unreadable -> False)
+            out["label_only"] = [_label_gate_red_only(r, _run_annotations(repo, r)) for r in red]
     return out
+
+
+def _run_annotations(repo: str, run: dict) -> Optional[list]:
+    try:
+        rid = int(run.get("id"))
+    except (TypeError, ValueError):
+        return None
+    data = _gh_json(f"repos/{repo}/check-runs/{rid}/annotations?per_page=100")
+    return data if isinstance(data, list) else None
 
 
 def default_pr_health() -> Optional[PrHealthFn]:
