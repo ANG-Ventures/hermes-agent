@@ -189,6 +189,18 @@ class TestSystemdWriters:
             gw.systemd_install(non_interactive=True)
         assert legacy_units == []
 
+    def test_install_exits_nonzero_when_legacy_units_remain(self, systemd_unit, homes, monkeypatch, capsys):
+        # Prism 19071f3898ec (#1766 @ca89c470): removal reports leftovers in its return value. A zero return
+        # here let `install --start-now` / setup start the new unit next to the legacy gateway's bot token.
+        left = Path("/etc/systemd/system/hermes.service")
+        monkeypatch.setattr(gw, "has_legacy_hermes_units", lambda: True)
+        monkeypatch.setattr(gw, "remove_legacy_hermes_units", lambda interactive=True, dry_run=False: (0, [left]))
+        systemd_unit.path.unlink()
+        with pytest.raises(SystemExit) as exc:
+            gw.systemd_install(non_interactive=True)
+        assert exc.value.code not in (0, None)
+        assert str(left) in capsys.readouterr().out
+
     def test_install_can_defer_legacy_unit_removal(self, systemd_unit, homes, legacy_units):
         # The migration's preparatory install can still be rolled back, so it removes nothing.
         systemd_unit.path.unlink()
