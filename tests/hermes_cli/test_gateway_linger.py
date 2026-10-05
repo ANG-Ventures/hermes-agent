@@ -10,6 +10,13 @@ import hermes_cli.gateway as gateway
 pytestmark = pytest.mark.platforms("linux")
 
 
+@pytest.fixture(autouse=True)
+def _admit_test_home(monkeypatch):
+    """The hermetic HERMES_HOME is a temp dir outside the account tree; systemd_install's home admission
+    (covered in test_gateway_service_owner.py) would refuse it before the linger step these tests pin."""
+    monkeypatch.setattr(gateway, "_native_service_homes", lambda: {gateway.get_hermes_home().resolve()})
+
+
 def _stub_linger_file(monkeypatch, tmp_path, *, exists: bool) -> None:
     """Point the ``/var/lib/systemd/linger/<user>`` probe at a real file under tmp_path.
 

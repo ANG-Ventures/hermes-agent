@@ -1228,27 +1228,45 @@ def _systemctl_show(properties: tuple[str, ...], *, system: bool) -> dict[str, s
 
 
 def _unit_environment_value(unit_path: Path, name: str) -> str | None:
-    """Value of one ``Environment="NAME=…"`` directive in the unit file at *unit_path*, with
-    systemd's ``\\"``/``\\\\``/``%%`` quoting undone; None when the file or the key is absent."""
-    try:
-        text = unit_path.read_text(encoding="utf-8-sig")
-    except OSError:
+    """Effective value of ``NAME`` in the ``[Service]`` environment of the unit file at *unit_path*, read with
+    systemd's grammar (``hermes_cli.gateway_unit_parse``, the parser shared with the fleet lint), drop-ins
+    included (a drop-in that repins ``HERMES_HOME`` decides the owner); None when the file is unreadable or
+    the variable is not set."""
+    from hermes_cli.gateway_unit_parse import environment_of, manager_home_for_unit, unit_texts
+    texts = unit_texts(unit_path)
+    if texts is None:
         return None
-    for line in text.splitlines():
-        body = line.strip()
-        if not body.startswith("Environment="):
-            continue
-        body = body[len("Environment=") :].strip()
-        if body.startswith('"') and body.endswith('"'):
-            body = body[1:-1].replace('\\"', '"').replace("\\\\", "\\").replace("%%", "%")
-        if body.startswith(f"{name}="):
-            return body.split("=", 1)[1].strip() or None
-    return None
+    return environment_of(texts, manager_home_for_unit(unit_path)).get(name, "").strip() or None
 
 
 def _hermes_home_pinned_by_unit(unit_path: Path) -> str | None:
     """``HERMES_HOME`` pinned by the unit file at *unit_path*, or None when absent/unreadable."""
     return _unit_environment_value(unit_path, "HERMES_HOME")
+
+
+def _service_home_for_unit(unit_path: Path, system: bool) -> Path:
+    """The ``HERMES_HOME`` this process acts for when it touches the unit at *unit_path*.
+
+    User scope: its own home. System scope: an EXPLICIT home (``HERMES_HOME`` / ``-p``) remapped to the
+    unit's ``User=`` account, the way ``generate_systemd_unit`` pins it (root's ``/root/.hermes[/profiles/x]``
+    becomes ``/home/alice/.hermes[/profiles/x]``); with no explicit home (``sudo`` strips it, HOME=/root) the
+    unit's own pinned home, which is the only thing that names the install being operated on. Pure: nothing
+    here adopts the unit's home into ``os.environ``, so an ownership check on this value compares the
+    caller with the unit, never the unit with itself."""
+    if not system:
+        return get_hermes_home()
+    explicit = _explicit_hermes_home()
+    if explicit is None:
+        pinned = _hermes_home_pinned_by_unit(unit_path) if unit_path.exists() else None
+        return Path(pinned).expanduser() if pinned else get_hermes_home()
+    user = _read_systemd_user_from_unit(unit_path)
+    if not user:
+        return explicit
+    try:
+        home_dir = _system_service_identity(run_as_user=user)[2]
+    except ValueError:  # unknown User=: generate_systemd_unit would refuse the same way
+        return explicit
+    return Path(_hermes_home_for_target_user(home_dir))
 
 
 def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
@@ -1258,16 +1276,39 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
 
 def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
     """Adopt a system-scope unit's ``HERMES_HOME``: under ``sudo`` it is stripped and HOME=/root, so
-    get_hermes_home() would pick the wrong profile for runtime-status/PID reads."""
+    get_hermes_home() would pick the wrong profile for runtime-status/PID reads.
+
+    Only the unit's OWNER adopts: a process with no explicit home (``sudo`` strips it), or one whose
+    explicit home, remapped to the unit's ``User=`` the way the generator pins it, is the pinned home. A
+    caller that named a DIFFERENT home (a scratch E2E home whose service name collided) keeps its own:
+    adopting the unit's home into its environment made the next ownership check compare the unit with
+    itself (Prism on #1740), and a refusal must leave ``os.environ`` as it found it.
+    """
     if not system:
         return
+    explicit = os.environ.get("HERMES_HOME", "").strip()
+    unit_path = get_systemd_unit_path(system=True)
+    if explicit and unit_path.exists():
+        from hermes_cli.gateway_service_owner import foreign_pinned_home
+        if foreign_pinned_home(unit_path, _service_home_for_unit(unit_path, system=True)) is not None:
+            return
     # On-disk unit first; ``systemctl show`` for units that only exist in the manager.
     unit_home = (_hermes_home_from_systemd_unit_file(system=True) or "").strip()
     if not unit_home:
         env_line = _systemctl_show(("Environment",), system=True).get("Environment", "")
         unit_home = _parse_kv_pairs(env_line.split()).get("HERMES_HOME", "").strip()
-    if unit_home and os.environ.get("HERMES_HOME", "").strip() != unit_home:
+    if unit_home and explicit != unit_home:
         os.environ["HERMES_HOME"] = unit_home
+
+
+def _explicit_hermes_home() -> Path | None:
+    """The caller's own HERMES_HOME, read BEFORE the unit sync above can replace it; None when unset.
+
+    The sync exists for the sudo-stripped case (HERMES_HOME unset, HOME=/root). A caller that named its
+    home keeps it for ownership checks: adopting the unit's home first makes the check compare the unit
+    with itself, so a colliding service name could rewrite another install's unit.
+    """
+    return get_hermes_home() if os.environ.get("HERMES_HOME", "").strip() else None
 
 
 def _read_systemd_unit_properties(
@@ -2647,21 +2688,36 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
         print("Skipped. Run again with: hermes gateway migrate-legacy")
         return 0, [p for _, p, _ in legacy]
 
+    # THE chokepoint: a legacy unit is a gateway definition too. One pinning another home (or a kanban
+    # worker's process) is left alone; the refusal is reported in `remaining`, not raised, so the
+    # caller's install goes on with the other units.
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused, assert_may_mutate
+
     removed = 0
     remaining: list[Path] = []
 
     def _remove_units(units: list[tuple[str, Path]], *, system: bool) -> None:
         nonlocal removed
-        for name, path in units:
+        attempted = False
+        for name, unit_path in units:
+            # Per item, in the loop that removes it: a refused unit is never stopped, disabled or unlinked.
+            try:
+                assert_may_mutate(unit_path, "remove the legacy unit", _service_home_for_unit(unit_path, system))
+            except ServiceMutationRefused:
+                remaining.append(unit_path)
+                continue
+            attempted = True
             try:
                 _run_systemctl(["stop", name], system=system, check=False, timeout=90)
                 _run_systemctl(["disable", name], system=system, check=False, timeout=30)
-                path.unlink(missing_ok=True)
-                print(f"  ✓ Removed {path}")
+                unit_path.unlink(missing_ok=True)
+                print(f"  ✓ Removed {unit_path}")
                 removed += 1
             except (OSError, RuntimeError) as e:
-                print(f"  ⚠ Could not remove {path}: {e}")
-                remaining.append(path)
+                print(f"  ⚠ Could not remove {unit_path}: {e}")
+                remaining.append(unit_path)
+        if not attempted:  # every unit refused: the manager is not touched at all
+            return
         with contextlib.suppress(RuntimeError):
             _run_systemctl(["daemon-reload"], system=system, check=False, timeout=30)
 
@@ -2758,12 +2814,14 @@ def _system_service_identity(run_as_user: str | None = None) -> tuple[str, str, 
 
 
 def _read_systemd_user_from_unit(unit_path: Path) -> str | None:
-    if not unit_path.exists():
-        return None
-    for line in unit_path.read_text(encoding="utf-8-sig").splitlines():
-        if line.startswith("User="):
-            return line.split("=", 1)[1].strip() or None
-    return None
+    """The effective ``[Service] User=`` of the unit (fragment, then drop-ins; the last assignment wins), or None."""
+    from hermes_cli.gateway_unit_parse import unit_assignments, unit_texts
+    texts = unit_texts(unit_path) if unit_path.exists() else None
+    user = None
+    for section, key, val in (a for t in texts or [] for a in unit_assignments(t)):
+        if section == "Service" and key == "User":
+            user = val or None
+    return user
 
 
 def _default_system_service_user() -> str | None:
@@ -3530,16 +3588,28 @@ def _refuse_foreign_service_overwrite(existing_path: Path, kind: str, *, force: 
     return True
 
 
-def _retire_hermes_replace_dropin(system: bool = False) -> bool:
-    """Remove only the legacy ``--replace`` drop-in written by Hermes."""
+def _hermes_replace_dropin(system: bool = False) -> Path | None:
+    """The legacy ``--replace`` drop-in written by Hermes, or None when there is none."""
     unit_path = get_systemd_unit_path(system=system)
     dropin = unit_path.parent / f"{unit_path.name}.d" / "20-replace.conf"
     try:
         text = dropin.read_text(encoding="utf-8-sig")
     except OSError:
-        return False
+        return None
     if not all(token in text for token in ("Added to end the gateway respawn storm", "--replace", "ExecStart=")):
+        return None
+    return dropin
+
+
+def _retire_hermes_replace_dropin(system: bool = False) -> bool:
+    """Remove only the legacy ``--replace`` drop-in written by Hermes. Callers hold the chokepoint's
+    permission for the unit (``assert_may_mutate``); the drop-in is part of that unit's definition."""
+    dropin = _hermes_replace_dropin(system=system)
+    if dropin is None:
         return False
+    from hermes_cli.gateway_service_owner import assert_may_mutate
+    assert_may_mutate(get_systemd_unit_path(system=system), "retire the gateway unit's --replace drop-in",
+                      _service_home_for_unit(get_systemd_unit_path(system=system), system))
     dropin.unlink()
     return True
 
@@ -3554,6 +3624,14 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     if not unit_path.exists():
         return False
 
+    # Runs on every gateway boot: a scratch-home gateway whose name collided with the host's unit rewrote
+    # it (t_8749a807). THE chokepoint runs first, on the caller's own home, before systemd_unit_is_current
+    # adopts the unit's home into os.environ: a refusal leaves the environment exactly as it found it.
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused, assert_may_mutate
+    try:
+        assert_may_mutate(unit_path, "rewrite the gateway unit", _service_home_for_unit(unit_path, system))
+    except ServiceMutationRefused:
+        return False
     # systemd_unit_is_current is the HERMES_HOME-sync chokepoint; its env mutation persists for the regenerate below.
     current = systemd_unit_is_current(system=system)
     if _retire_hermes_replace_dropin(system=system):
@@ -3745,37 +3823,60 @@ def systemd_install(
     run_as_user: str | None = None,
     enable_on_startup: bool = True,
     non_interactive: bool = False,
+    force_unit_path: bool = False,
 ):
     if system:
         _require_root_for_system_service("install")
-
-    # Offer to remove legacy units first: alongside the new unit they flap-fight for the bot token.
-    if has_legacy_hermes_units():
-        print()
-        print_legacy_unit_warning()
-        print()
-        if non_interactive or prompt_yes_no("Remove the legacy unit(s) before installing?", True):
-            remove_legacy_hermes_units(interactive=False)
-            print()
-
     unit_path = get_systemd_unit_path(system=system)
+    # THE chokepoint, first, before any removal, sync or write: the kill switch (setup, migrate and
+    # ensure_gateway_service call this writer without going through `gateway install`), an existing unit
+    # pinning another home, and the home admission (a scratch home such as /srv/ci/... never gets a persistent
+    # host service). Checked on the caller's own home: the system-unit sync below replaces it. Raises
+    # SystemExit(1): a refusal that returned normally made callers START the other home's service.
+    from hermes_cli.gateway_service_owner import assert_may_mutate
+    pinned_home = _service_home_for_unit(unit_path, system)
+    if system and run_as_user:
+        try:
+            pinned_home = Path(_hermes_home_for_target_user(_system_service_identity(run_as_user)[2]))
+        except ValueError:
+            # Unknown account: not a foreign home. generate_systemd_unit refuses it below with the real error.
+            pass
+    assert_may_mutate(unit_path, "install the gateway unit", pinned_home, install=True,
+                      force_unit_path=force_unit_path, admit_home=_explicit_hermes_home() or get_hermes_home())
+
+    def offer_legacy_unit_removal() -> None:
+        # Legacy units flap-fight the new unit for the bot token. Called only once every refusal below has
+        # passed: removing them for an install that then refuses leaves the host with no gateway.
+        if has_legacy_hermes_units():
+            print()
+            print_legacy_unit_warning()
+            print()
+            if non_interactive or prompt_yes_no("Remove the legacy unit(s) before installing?", True):
+                remove_legacy_hermes_units(interactive=False)
+                print()
+
     scope_label = _service_scope_label(system)
     sudo, scope_flag, user_flag = _systemd_cli_bits(system)
 
-    # Existing system units already pin HERMES_HOME; adopt it before any regenerate.
-    if unit_path.exists():
+    # Existing system units already pin HERMES_HOME; adopt it before any regenerate (sudo strips the
+    # caller's). --force-unit-path repoints the unit at the caller's home, so adopting the old one would
+    # regenerate it unchanged. The chokepoint above already proved the unit is this home's to adopt.
+    if unit_path.exists() and not force_unit_path:
         _sync_hermes_home_from_systemd_unit(system=system)
 
-    if unit_path.exists() and not force:
+    # --force-unit-path repoints the unit at this home, so it writes rather than refreshing in place.
+    if unit_path.exists() and not (force or force_unit_path):
         if not systemd_unit_is_current(system=system):
             if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
-                return
+                sys.exit(1)  # a normal return let callers START the protected unit / migrate past it
+            offer_legacy_unit_removal()
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:
                 _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
             print(f"✓ {scope_label.capitalize()} service definition updated")
         else:
+            offer_legacy_unit_removal()
             print(f"Service already installed at: {unit_path}")
             print("Use --force to reinstall")
             # An existing, current unit may still be DISABLED (a host whose unit predates
@@ -3799,9 +3900,10 @@ def systemd_install(
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     new_unit = generate_systemd_unit(system=system, run_as_user=run_as_user)
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
-        return
+        sys.exit(1)
     if unit_path.exists() and _refuse_foreign_service_overwrite(unit_path, "systemd unit", force=force):
-        return
+        sys.exit(1)
+    offer_legacy_unit_removal()
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)
     unit_path.write_text(new_unit, encoding="utf-8")
@@ -3849,21 +3951,31 @@ def _systemd_scope_preamble(
 
 def _systemd_unit_belongs_to_current_home(system: bool = False) -> bool:
     """False (with a warning) when the installed unit pins a HERMES_HOME other than this process's: the
-    service name then resolved to ANOTHER install's gateway, and stop/disable/unlink would take it down."""
-    _sync_hermes_home_from_systemd_unit(system=system)  # sudo strips HERMES_HOME; adopt the unit's first
-    unit_home = _hermes_home_from_systemd_unit_file(system=system)
-    if unit_home is None or Path(unit_home).expanduser().resolve() == get_hermes_home().resolve():
-        return True
-    print_warning(
-        f"Refusing to remove {get_systemd_unit_path(system=system)}: it runs HERMES_HOME={unit_home}, "
-        f"but this process has HERMES_HOME={get_hermes_home()}"
-    )
-    return False
+    service name then resolved to ANOTHER install's gateway, and stop/disable/unlink would take it down.
+    ``uninstall.py`` shares it; ``systemd_uninstall`` calls the chokepoint itself."""
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused
+    try:
+        _assert_may_remove_systemd_unit(system)
+    except ServiceMutationRefused:
+        return False
+    return True
+
+
+def _assert_may_remove_systemd_unit(system: bool) -> None:
+    """THE chokepoint for removing this scope's unit, on the caller's own home and BEFORE the sudo-stripped
+    adoption of the unit's home (a refusal leaves ``os.environ`` untouched); then adopt for the reads below."""
+    from hermes_cli.gateway_service_owner import assert_may_mutate
+    unit_path = get_systemd_unit_path(system=system)
+    assert_may_mutate(unit_path, "remove", _service_home_for_unit(unit_path, system))
+    _sync_hermes_home_from_systemd_unit(system=system)  # sudo strips HERMES_HOME; adopt the unit's
 
 
 def systemd_uninstall(system: bool = False):
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused
     system = _systemd_scope_preamble("uninstall", system, require_installed=False)
-    if not _systemd_unit_belongs_to_current_home(system):
+    try:
+        _assert_may_remove_systemd_unit(system)
+    except ServiceMutationRefused:
         return
     _run_systemctl(["stop", get_service_name()], system=system, check=False, timeout=90)
     _run_systemctl(["disable", get_service_name()], system=system, check=False, timeout=30)
@@ -5595,6 +5707,7 @@ def _install_systemd_from_cli(args, *, force: bool, system: bool, run_as_user) -
     systemd_install(
         force=force, system=system, run_as_user=run_as_user,
         enable_on_startup=start_on_login, non_interactive=non_interactive,
+        force_unit_path=getattr(args, "force_unit_path", False),
     )
     if start_now:
         systemd_start(system=system)
@@ -5615,12 +5728,20 @@ def _cmd_install(args):
     if _service_mgmt_blocked():
         _no_backend_exit("install", "termux")
     backend = _service_backend()
-    if backend == "systemd":
-        if refuses_container_user_scope_install(system):
+    force_unit_path = getattr(args, "force_unit_path", False)
+    if backend == "systemd" and refuses_container_user_scope_install(system):
+        sys.exit(1)
+    if backend in ("systemd", "launchd"):
+        # Friendly front-door message; the writers below enforce the invariant themselves (assert_may_mutate).
+        from hermes_cli.gateway_service_owner import refuse_foreign_home_install, service_writes_disabled
+        if service_writes_disabled("install the gateway service") or refuse_foreign_home_install(
+                get_hermes_home(), force_unit_path):
             sys.exit(1)
+    if backend == "systemd":
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
-        launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
+        launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
+                        force_unit_path=force_unit_path)
     elif backend == "windows":
         _gw_windows().install(
             force=force,

@@ -549,6 +549,12 @@ def refresh_launchd_plist_if_needed() -> bool:
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
         return False
+    # Every gateway boot refreshes: THE chokepoint, first (t_8749a807).
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused, assert_may_mutate
+    try:
+        assert_may_mutate(plist_path, "rewrite the gateway plist")
+    except ServiceMutationRefused:
+        return False
 
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
@@ -612,14 +618,19 @@ def refresh_launchd_plist_if_needed() -> bool:
     return True
 
 
-def launchd_install(force: bool = False, *, start_now: bool = True):
+def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False):
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
     # loading it. A gateway that launchd already runs is still reloaded; this install did not start it.
+    # THE chokepoint, first: the kill switch (setup, migrate and ensure_gateway_service call this writer
+    # without going through `gateway install`), a plist pinning another home, the home admission.
+    from hermes_cli.gateway_service_owner import assert_may_mutate
+    assert_may_mutate(plist_path, "install the gateway plist", install=True, force_unit_path=force_unit_path)
     load = start_now or _gw()._launchctl_label_supervising_process(label)
 
-    if plist_path.exists() and not force:
+    # --force-unit-path repoints the plist at this home, so it writes rather than refreshing in place.
+    if plist_path.exists() and not (force or force_unit_path):
         if _gw().launchd_plist_is_current():
             print(f"Service already installed at: {plist_path}")
             print("Use --force to reinstall")
@@ -628,7 +639,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
             # A protected (foreign) plist is refused here, before the "outdated" repair path, so the
             # operator never sees a "could not be reloaded ... --force" hint for a definition we protect.
             if _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist"):
-                return
+                sys.exit(1)  # a normal return let callers START the protected plist / migrate past it
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
             if _gw().refresh_launchd_plist_if_needed():
                 print("✓ Service definition updated")
@@ -646,9 +657,9 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return
+        sys.exit(1)
     if plist_path.exists() and _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist", force=force):
-        return
+        sys.exit(1)
     print(f"Installing launchd service to: {plist_path}")
     _gw()._prepare_service_launcher()
     plist_path.write_text(new_plist, encoding="utf-8")
@@ -685,6 +696,12 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
 
 def launchd_uninstall():
     plist_path = _gw().get_launchd_plist_path()
+    # THE chokepoint: a plist pinning another home is another install's gateway; bootout would take it down.
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused, assert_may_mutate
+    try:
+        assert_may_mutate(plist_path, "remove the gateway plist")
+    except ServiceMutationRefused:
+        return
     # Captured: uninstalling an already-unloaded job is fine — don't print Boot-out failed: 3.
     subprocess.run(
         ["launchctl", "bootout", f"{_launchd_domain()}/{get_launchd_label()}"],
@@ -701,6 +718,9 @@ def launchd_start():
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
+        # Regenerating a missing plist is an implicit install: THE chokepoint, with install's admission.
+        from hermes_cli.gateway_service_owner import assert_may_mutate
+        assert_may_mutate(plist_path, "regenerate the gateway plist", install=True)
         new_plist = _gw().generate_launchd_plist()
         if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
             sys.exit(1)

@@ -344,14 +344,27 @@ def _systemd_service_user(home: Path, services: list[tuple[str, bool]]) -> Optio
 
 
 def _service_op(kind: str, system: bool, verb: str, home: Path, *, run_as_user: Optional[str] = None) -> None:
-    """``stop`` / ``uninstall`` / ``start`` / ``restart`` / ``install`` / ``enable`` on ``home``'s service."""
+    """``stop`` / ``uninstall`` / ``start`` / ``restart`` / ``install`` / ``enable`` on ``home``'s service.
+
+    A refused step (``ServiceMutationRefused``, a ``sys.exit`` in a backend) is a ``SystemExit``; it is
+    re-raised as ``RuntimeError`` for EVERY verb, never only ``install``: apply's compensator catches
+    ``Exception``, so a refused ``start`` after the removals escaped it and left the host with no gateway."""
+    try:
+        _service_op_unguarded(kind, system, verb, home, run_as_user=run_as_user)
+    except SystemExit as exc:
+        raise RuntimeError(f"gateway service {verb} for {home} was refused") from exc
+
+
+def _service_op_unguarded(kind: str, system: bool, verb: str, home: Path, *, run_as_user: Optional[str] = None) -> None:
     if kind == "s6":
         return _s6_slot_op(verb, home)
     from hermes_cli import gateway as gw
     with _home_env(home):
         if verb == "install":
             if kind == "launchd":
-                gw.launchd_install()
+                # Written, not loaded: the migration installs the default BEFORE the secondaries are
+                # removed, so loading here (RunAtLoad) would start it against their still-live bot tokens.
+                gw.launchd_install(start_now=False)
             elif kind == "windows":
                 # Non-interactive: the migration already asked; prompting here would hang a
                 # supervised/`--yes` run on a console that has no operator.
@@ -889,12 +902,43 @@ def _wait_for_served(default_home: Path, expected: set[str], timeout: float) -> 
     return served
 
 
+def _install_default_before_removal(
+    plan: MigrationPlan, target: Optional[tuple[str, bool]], *, run_as_user: Optional[str] = None,
+) -> bool:
+    """Write (do not start) the default's service definition BEFORE any secondary is removed, when the
+    default has none yet. The installer is the step that can still be refused (another home's definition,
+    an unadmitted home, the worker kill switch); taken after the removals, that refusal left the host with no
+    service-managed gateway. The ``install`` verb never starts (systemd: enable only; launchd: written,
+    not loaded), so nothing fights the still-running secondaries. Returns True when it installed."""
+    if plan.default.service is not None or target is None or target[0] not in ("systemd", "launchd"):
+        return False
+    kind, system = target
+    _service_op(kind, system, "install", plan.default_home, run_as_user=run_as_user)
+    print(f"  ✓ default: gateway service definition written via {kind} (not started yet)")
+    return True
+
+
+def _undo_default_preinstall(
+    target: Optional[tuple[str, bool]], home: Path, definition: Optional[Path], had_definition: bool,
+) -> Optional[Path]:
+    """Remove (disable + unlink) a default definition that a failed preinstall wrote; one that existed before
+    is never touched. Returns the definition when it is still on disk afterwards, else None."""
+    if target is None or definition is None or had_definition or not definition.exists():
+        return None
+    try:
+        _service_op(*target, "uninstall", home)
+    except Exception as exc:
+        print(f"  ⚠ could not remove the default's half-installed service definition ({exc})")
+    return definition if definition.exists() else None
+
+
 def _restart_default(
     plan_default: ProfileGateway,
     target: Optional[tuple[str, bool]],
     default_home: Path,
     *,
     run_as_user: Optional[str] = None,
+    preinstalled: bool = False,
 ) -> str:
     """Bring the default gateway up on the new flag value; returns a one-line description.
 
@@ -908,7 +952,8 @@ def _restart_default(
         return f"restarted the default gateway via {kind}"
     if target is not None:
         kind, system = target
-        _service_op(kind, system, "install", default_home, run_as_user=run_as_user)
+        if not preinstalled:
+            _service_op(kind, system, "install", default_home, run_as_user=run_as_user)
         _service_op(kind, system, "start", default_home)
         return f"installed and started the default gateway via {kind}"
     verb = "restarted" if plan_default.pid is not None else "started"
@@ -980,6 +1025,49 @@ def _preflight_apply(plan: MigrationPlan, target: Optional[tuple[str, bool]], ru
                 pwd.getpwnam(run_as_user)
             except KeyError:
                 return f"default: the recorded service user '{run_as_user}' does not exist on this host"
+    if target is not None:
+        return _service_mutation_blocker(plan, target)
+    return None
+
+
+def _definition_path(kind: str, system: bool, home: Path) -> Optional[Path]:
+    from hermes_cli import gateway as gw
+    with _home_env(home):
+        if kind == "launchd":
+            return gw.get_launchd_plist_path()
+        if kind == "systemd":
+            return gw.get_systemd_unit_path(system=system)
+    return None
+
+
+def _service_mutation_blocker(plan: MigrationPlan, target: tuple[str, bool]) -> Optional[str]:
+    """Ask THE chokepoint (``gateway_service_owner.mutation_blocker``) about EVERY service definition the apply
+    will touch, BEFORE anything is removed: the default's install (or restart-in-place) and each secondary's
+    removal. The writers/removers raise the same refusals later; learning one there, after the secondaries'
+    services are gone, left the host with no service-managed gateway (Prism on #1740)."""
+    from hermes_cli.gateway_service_owner import mutation_blocker
+    kind, system = target
+    if kind not in ("systemd", "launchd"):
+        return None
+    path = _definition_path(kind, system, plan.default_home)
+    if path is None:
+        return None
+    with _home_env(plan.default_home):
+        reason = mutation_blocker(path, "install the default's gateway service", plan.default_home,
+                                  install=plan.default.service is None, quiet=True)
+    if reason is not None:
+        hint = (" Install it with `hermes gateway install --force-unit-path` first if this home is meant to own one."
+                if "outside this account" in reason else " Resolve that service first.")
+        return f"default: the gateway service write would be refused ({reason}).{hint}"
+    for p in plan.standalone_secondaries:
+        for s_kind, s_system in p.services:
+            s_path = _definition_path(s_kind, s_system, p.home)
+            if s_path is None:
+                continue
+            with _home_env(p.home):
+                reason = mutation_blocker(s_path, "remove the secondary's gateway service", p.home, quiet=True)
+            if reason is not None:
+                return f"{p.name}: removing its gateway service would be refused ({reason})"
     return None
 
 
@@ -1034,6 +1122,12 @@ def apply_migration(plan: MigrationPlan, *, served_wait: float = _SERVED_WAIT_SE
     if plan.already_multiplexed:
         print("✓ Already multiplexed — nothing to do.")
         return True
+    # Before resume and preflight alike: the default's reinstall (and the compensator's) refuses under the
+    # worker kill switch, so starting or resuming here would remove the secondaries' services and put
+    # nothing back. A worker never changes the host's gateway services.
+    from hermes_cli.gateway_service_owner import service_writes_disabled
+    if service_writes_disabled("migrate the gateway services"):
+        return False
     target, run_as_user = _resume_target(plan)
     manifest = plan.manifest
     if manifest is not None:
@@ -1066,8 +1160,31 @@ def apply_migration(plan: MigrationPlan, *, served_wait: float = _SERVED_WAIT_SE
     try:
         _write_multiplex_flag(plan.default_home, True)
         print(f"  ✓ default: gateway.multiplex_profiles: true ({plan.default_home / 'config.yaml'})")
+        # ORDER: the default's definition is written (not started) BEFORE anything is removed, so a refused
+        # write is learned while every secondary still has its service; removal is the last destructive step.
+        definition = _definition_path(*target, plan.default_home) if target is not None else None
+        had_definition = definition is not None and definition.exists()
+        try:
+            preinstalled = _install_default_before_removal(plan, target, run_as_user=run_as_user)
+        except Exception as exc:
+            # Nothing destructive has happened: every secondary still runs under its own service. Undo every
+            # write: the flag, AND a definition the install wrote (and maybe enabled) before a later step raised;
+            # left behind, it boots the default standalone next to the secondaries on their bot tokens.
+            leftover = _undo_default_preinstall(target, plan.default_home, definition, had_definition)
+            _write_multiplex_flag(plan.default_home, plan.multiplex_flag_on)
+            if leftover is not None:
+                _print([f"✗ Migration failed before removing anything: the default's gateway service could not be "
+                        f"installed ({exc}), and the definition it wrote could not be removed: {leftover}.",
+                        f"  Manifest kept at {_manifest_path(plan.default_home)}; remove that definition, then "
+                        f"re-run {MIGRATE_COMMAND}."])
+                return False
+            _manifest_path(plan.default_home).unlink(missing_ok=True)
+            _print([f"✗ Migration refused before removing anything: the default's gateway service could not be "
+                    f"installed ({exc}).", "  Every per-profile gateway is untouched; fix the refusal and re-run "
+                    f"{MIGRATE_COMMAND}."])
+            return False
         _remove_secondary_gateways(plan)  # on resume: whatever an apply killed mid-removal left installed
-        print(f"  ✓ {_restart_default(plan.default, target, plan.default_home, run_as_user=run_as_user)}")
+        print(f"  ✓ {_restart_default(plan.default, target, plan.default_home, run_as_user=run_as_user, preinstalled=preinstalled)}")
     except Exception as exc:
         _print([f"  ✗ migration failed ({exc})",
                 "  ↩ Restoring one host gateway so this host is not left without one..."])

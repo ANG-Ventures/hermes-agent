@@ -591,15 +591,15 @@ def test_explicit_migrate_with_no_standalone_secondaries_still_flips_flag_and_re
 
 
 def test_failed_default_bringup_compensates_to_one_detached_gateway(fleet, monkeypatch, capsys):
-    """#110850: the last step (install/start the default) is the one that can fail after the
-    destructive ones. It must not leave the flag on with no gateway anywhere. The compensator can
-    no longer rebuild the fleet (the flipped host lock refuses it), and the recorded service
-    manager is the very thing that just failed — so it falls back to ONE detached gateway."""
+    """#110850: the last step (start the default) is the one that can fail after the destructive ones.
+    It must not leave the flag on with no gateway anywhere. The compensator can no longer rebuild the
+    fleet (the flipped host lock refuses it), and the recorded service manager is the very thing that
+    just failed — so it falls back to ONE detached gateway."""
     real_op = gm._service_op
 
     def _refusing(kind, system, verb, home, *, run_as_user=None):
-        if verb == "install" and _name(home) == "default":
-            raise ValueError("Refusing to install the gateway system service as root; pass --run-as-user root")
+        if verb in ("start", "restart") and _name(home) == "default":
+            raise ValueError(f"systemctl {verb} failed: unit not found")
         real_op(kind, system, verb, home, run_as_user=run_as_user)
 
     monkeypatch.setattr(gm, "_service_op", _refusing)
@@ -617,17 +617,87 @@ def test_failed_default_bringup_compensates_to_one_detached_gateway(fleet, monke
     assert not after.blocked and after.standalone_secondaries == []
 
 
+def test_refused_default_install_aborts_before_any_removal(fleet, monkeypatch, capsys):
+    """t_8749a807 (Prism on #1740, premature removal): the default's service definition is WRITTEN before
+    any secondary is removed, so an install the writers refuse (another home's unit, an unadmitted home, the
+    worker kill switch, a root refusal) is learned while every per-profile gateway still has its service.
+    Nothing is removed, the flag is put back, no manifest is left behind, and no compensation runs."""
+    real_op = gm._service_op
+
+    def _refusing(kind, system, verb, home, *, run_as_user=None):
+        if verb == "install" and _name(home) == "default":
+            raise RuntimeError(f"gateway service install for {home} was refused")  # what _service_op raises on SystemExit
+        real_op(kind, system, verb, home, run_as_user=run_as_user)
+
+    monkeypatch.setattr(gm, "_service_op", _refusing)
+    before = dict(fleet.services)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "refused before removing anything" in out
+    assert "Restoring one host gateway" not in out
+    assert fleet.services == before, "every secondary keeps its service"
+    assert [op for op in fleet.ops if op[1] in ("stop", "uninstall")] == []
+    assert _config_flag(fleet.root) is False
+    assert not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def _failing_after_write(fleet, monkeypatch, *, uninstall_fails=False):
+    """The default's install writes (and enables) its definition, then a later step raises."""
+    from hermes_cli import gateway as gw
+    unit = gw.get_systemd_unit_path(system=False)
+    monkeypatch.setattr(gm, "_definition_path", lambda kind, system, home: unit if _name(home) == "default" else None)
+    real_op = gm._service_op
+
+    def _op(kind, system, verb, home, *, run_as_user=None):
+        if _name(home) == "default" and verb == "install":
+            real_op(kind, system, verb, home, run_as_user=run_as_user)
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            unit.write_text("[Service]\nExecStart=/x\n", encoding="utf-8")
+            raise RuntimeError("systemctl enable failed after the unit was written")
+        if _name(home) == "default" and verb == "uninstall":
+            if uninstall_fails:
+                raise RuntimeError("uninstall refused")
+            unit.unlink(missing_ok=True)
+        real_op(kind, system, verb, home, run_as_user=run_as_user)
+
+    monkeypatch.setattr(gm, "_service_op", _op)
+    return unit
+
+
+def test_failed_preinstall_removes_the_definition_it_wrote(fleet, monkeypatch, capsys):
+    """Prism 49c77d8aa2ac (#1740 @89400941): a default install that fails AFTER writing (and enabling) its
+    definition must not leave it behind: at the next boot it would run standalone next to the untouched
+    secondaries on their bot tokens. The definition is uninstalled, then flag and manifest are rolled back."""
+    unit = _failing_after_write(fleet, monkeypatch)
+    before = dict(fleet.services)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "refused before removing anything" in out
+    assert not unit.exists()
+    assert ("default", "uninstall") in fleet.ops
+    assert ("default", "systemd", False) not in fleet.enabled
+    assert fleet.services == before
+    assert _config_flag(fleet.root) is False
+    assert not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_failed_preinstall_rollback_failure_keeps_the_manifest(fleet, monkeypatch, capsys):
+    """Same failure, and the definition cannot be removed: recovery information stays on disk."""
+    unit = _failing_after_write(fleet, monkeypatch, uninstall_fails=True)
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert unit.exists()
+    assert "could not be removed" in out
+    assert (fleet.root / gm.MANIFEST_NAME).exists()
+    assert [op for op in fleet.ops if op[0] != "default" and op[1] in ("stop", "uninstall")] == []
+
+
 def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(fleet, monkeypatch, capsys):
     """Flag flipped, secondaries gone, default never came up (the process died mid-apply): the re-run
     must finish the migration from the manifest — with the recorded User= — instead of reporting
     'already multiplexed' over a fleet with no gateway at all."""
     fleet.services["coder"] = ("systemd", True)
     monkeypatch.setattr(gm, "_systemd_service_user", lambda home, services: "root" if _name(home) == "coder" else None)
-    with pytest.MonkeyPatch.context() as dying:
-        dying.setattr(gm, "_restart_default", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
-        with pytest.raises(KeyboardInterrupt):
-            gm.apply_migration(gm.build_migration_plan(), served_wait=0.1)
-    assert _config_flag(fleet.root) is True and "coder" not in fleet.services and "default" not in fleet.services
     installs = []
     real_op = gm._service_op
 
@@ -637,9 +707,18 @@ def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(flee
         real_op(kind, system, verb, home, run_as_user=run_as_user)
 
     monkeypatch.setattr(gm, "_service_op", _recording)
+    with pytest.MonkeyPatch.context() as dying:
+        dying.setattr(gm, "_restart_default", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            gm.apply_migration(gm.build_migration_plan(), served_wait=0.1)
+    # The default's unit (with the recorded User=) was written BEFORE the secondaries were removed.
+    assert _config_flag(fleet.root) is True and "coder" not in fleet.services
+    assert installs == [("default", "systemd", True, "root")]
+    assert fleet.services["default"] == ("systemd", True)
     plan = gm.build_migration_plan()
     assert plan.interrupted and not plan.already_multiplexed
     assert gm.apply_migration(plan, served_wait=5.0) is True
+    # The resume restarts the unit the interrupted apply already wrote; it does not install a second time.
     assert installs == [("default", "systemd", True, "root")]
     assert "serves 3 profiles" in capsys.readouterr().out
 
@@ -804,6 +883,41 @@ def test_known_bringup_refusal_is_rejected_before_any_secondary_is_touched(fleet
     out = capsys.readouterr().out
     assert "before changing anything" in out and "--run-as-user root" in out
     assert fleet.ops == [] and _config_flag(fleet.root) is None and not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_default_install_the_writer_would_refuse_is_rejected_before_any_secondary_is_touched(fleet, monkeypatch, capsys):
+    """Prism P0 on #1740: the default's install runs only after every secondary's service is removed, and
+    systemd_install/launchd_install now exit for a home outside the account tree. The preflight asks the
+    same admission question first, so nothing is removed and the host keeps its gateways."""
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gm, "_preflight_apply", _real_preflight)
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {fleet.root.parent.parent / "elsewhere"})
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "before changing anything" in out and "would be refused" in out
+    assert fleet.ops == [] and _config_flag(fleet.root) is None and not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_default_unit_path_pinning_another_home_is_rejected_before_any_secondary_is_touched(fleet, monkeypatch, capsys):
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gm, "_preflight_apply", _real_preflight)
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {fleet.root.resolve()})
+    with gm._home_env(fleet.root):
+        unit = gw.get_systemd_unit_path(system=False)
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text('[Service]\nEnvironment="HERMES_HOME=/srv/other-install"\n', encoding="utf-8")
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "before changing anything" in out and "/srv/other-install" in out
+    assert fleet.ops == [] and not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_admitted_default_still_migrates_with_the_real_preflight(fleet, monkeypatch):
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gm, "_preflight_apply", _real_preflight)
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {fleet.root.resolve()})
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is True
+    assert ("default", "install") in fleet.ops
 
 
 def test_unknown_default_system_principal_blocks_the_update_hook(fleet, tmp_path, monkeypatch, capsys):
@@ -988,3 +1102,18 @@ def test_standalone_profile_is_listed_left_alone_and_not_a_fold_target(fleet):
     assert payload["standalone_by_config"] == list(plan.standalone_by_config)
     assert "ops" not in [p["profile"] for p in payload["profiles"]]
     assert any("ops" in line for line in gm.format_plan(plan, dry_run=True))
+
+
+def test_a_refused_step_after_removal_reaches_the_compensator(monkeypatch):
+    """Prism P1 b55e7a3ef445 (#1740): only `install` turned a SystemExit into RuntimeError, so a refused
+    `start` after the removals escaped apply's `except Exception` compensator. Every verb converts now."""
+    from hermes_cli.gateway_service_owner import ServiceMutationRefused
+
+    def _refused(*a, **k):
+        raise ServiceMutationRefused("pins another home")
+
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gw, "_service_call", _refused)
+    for verb in ("start", "restart", "stop", "uninstall"):
+        with pytest.raises(RuntimeError, match=f"gateway service {verb} for .* was refused"):
+            _REAL_SERVICE_OP("systemd", False, verb, Path("/nonexistent/hermes"))

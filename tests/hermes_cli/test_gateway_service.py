@@ -2018,6 +2018,8 @@ class TestDockerAwareGateway:
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_container", lambda: True)
+        # The sandbox HERMES_HOME is a scratch home, which `gateway install` refuses by design.
+        monkeypatch.setattr("hermes_cli.gateway_service_owner.home_may_install_service", lambda home: True)
         calls = []
         monkeypatch.setattr(
             gateway_cli,
@@ -2214,6 +2216,12 @@ class TestMigrateLegacyCommand:
 
 class TestSystemdInstallOffersLegacyRemoval:
     """Verify that systemd_install prompts to remove legacy units first."""
+
+    @pytest.fixture(autouse=True)
+    def _admit_test_home(self, monkeypatch):
+        # The per-test HERMES_HOME is a temp dir outside the account tree; home admission is covered
+        # in test_gateway_service_owner.py, the legacy-unit flow is what these tests pin.
+        monkeypatch.setattr(gateway_cli, "_native_service_homes", lambda: {gateway_cli.get_hermes_home().resolve()})
 
     def test_install_offers_removal_when_legacy_detected(
         self, tmp_path, monkeypatch, capsys
