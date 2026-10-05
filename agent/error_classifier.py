@@ -86,6 +86,11 @@ class FailoverReason(enum.Enum):
     model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
     incomplete_response = "incomplete_response"  # Codex/Responses turn stuck emitting reasoning only (no answer, no tool call) after replay + nudge — hand to a different provider
     format_error = "format_error"        # 400 bad request — abort or strip + retry
+    # OUR relay/bridge refused the request's SHAPE for this lane (claude-bpx tui
+    # ``tui_tools_unsupported`` / ``tui_images_unsupported``, relay ``mode_not_allowed``):
+    # deterministic for the lane, never Anthropic's answer. Fail over to the next hop,
+    # never retry in place (t_1ed37625).
+    lane_incapable = "lane_incapable"
     # Malformed CONVERSATION structure (a message array WE built: unanswered tool_use, stray
     # tool_result, forbidden role adjacency, tool_calls not followed by tool messages).
     # Deterministic on EVERY provider, so non-retryable AND non-failover: the chain would re-send
@@ -1082,6 +1087,13 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     if _is_safeguard_refusal(c.error_code, c.body):
         return _v(_R.content_policy_blocked, retryable=False, should_fallback=False,
                   error_context={"error_code": SAFEGUARD_REFUSAL_ERROR_CODE})
+    # Our bridge/relay refusing the request SHAPE for this lane (400 tui_tools_unsupported /
+    # tui_images_unsupported, relay mode_not_allowed). Before status classification so it
+    # never reads as an unclassified Anthropic 400: the lane is incapable, the next hop may
+    # not be. error_context carries the code for the banner (t_1ed37625).
+    _lane_code = _lane_incapable_code(c)
+    if _lane_code:
+        return _v(_R.lane_incapable, **_ABORT_FALLBACK, error_context={"error_code": _lane_code})
     # Safety refusal before status classification so a 400 block isn't downgraded
     # to format_error and a status-less block isn't left retryable (#18028).
     if any(p in msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
@@ -1803,6 +1815,16 @@ def is_safeguard_refusal(classified) -> bool:
     """Whether a ClassifiedError is a bridge safeguard refusal (never switch model)."""
     ctx = getattr(classified, "error_context", None) or {}
     return ctx.get("error_code") == SAFEGUARD_REFUSAL_ERROR_CODE
+
+
+def _lane_incapable_code(c: "_Ctx") -> Optional[str]:
+    """The bridge/relay lane-incapable machine code on this error, else None.
+
+    Same two body shapes as :func:`_is_safeguard_refusal` (HTTP envelope and the unwrapped
+    error object); the extracted ``c.error_code`` is checked first (t_1ed37625)."""
+    from agent.fallback_capability import body_lane_incapable_code, lane_incapable_code
+
+    return lane_incapable_code(c.error_code) or body_lane_incapable_code(c.body, c.msg)
 
 
 def _extract_error_code(body: dict) -> str:

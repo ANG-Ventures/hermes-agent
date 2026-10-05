@@ -2718,6 +2718,7 @@ _FALLBACK_ANNOUNCE_LABELS = {
     "payload_too_large": "payload too large",
     "image_too_large": "image too large",
     "format_error": "bad request",
+    "lane_incapable": "lane cannot serve this request",
 }
 
 
@@ -3252,6 +3253,7 @@ _FALLBACK_REASON_LABELS = {
     FailoverReason.provider_policy_blocked: "provider policy blocked the request",
     FailoverReason.content_policy_blocked: "content policy blocked the request",
     FailoverReason.format_error: "request format rejected",
+    FailoverReason.lane_incapable: "lane cannot serve the request shape",
     FailoverReason.role_alternation: "adjacent same-role messages rejected",
     FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
     FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
@@ -3717,6 +3719,17 @@ def try_activate_fallback(
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
         if fb_provider in quota_skipped:
             logger.debug("Fallback skip: %s is quota-exhausted per the usage registry", fb_provider)
+            continue
+        # A lane that declares it cannot serve this request's SHAPE (tools[] on an
+        # interactive bridge with hostTools off, a native image part on a Phase 1
+        # tui face) would only answer 400 and cost a banner plus a round-trip
+        # (2026-10-05 13:27 / 14:16: two dead hops per tool turn). One INFO line,
+        # no ledger row, no HTTP call; the chain order is untouched (t_1ed37625).
+        from agent.fallback_capability import lane_incapable_shape, stamped_request_shape
+
+        _incapable = lane_incapable_shape(fb_provider, stamped_request_shape(agent))
+        if _incapable:
+            logger.info("skipped %s: lane_incapable(%s)", fb_provider, _incapable)
             continue
         # A relay deploy-drain refuses EVERY model on the failing provider, so a
         # same-provider entry (a MODEL fallback, e.g. fable -> opus on claude-bpr)

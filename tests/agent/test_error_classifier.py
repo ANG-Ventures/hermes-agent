@@ -66,6 +66,7 @@ class TestFailoverReason:
             "context_overflow", "body_too_large", "payload_too_large", "image_too_large",
             "image_corrupt",
             "model_not_found", "endpoint_not_found", "format_error",
+            "lane_incapable",  # t_1ed37625: our bridge/relay refused the request shape
             "malformed_conversation",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
