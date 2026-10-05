@@ -3441,17 +3441,25 @@ def _service_definition_is_hermes_generated(installed: str, kind: str) -> bool:
     if kind == "launchd plist":
         m = re.search(r"<key>ProgramArguments</key>\s*<array>\s*<string>(.*?)</string>", text, flags=re.S)
         return bool(m) and m.group(1).strip() == "/usr/bin/osascript"
-    m = re.search(r"^ExecStart=\s*(.*)$", text, flags=re.M)
-    if not m:
+    lines = re.findall(r"^ExecStart=\s*(.*)$", text, flags=re.M)
+    if not lines:
         return False
-    # A quoted executable may contain spaces (a checkout under "/home/ace/Hermes Project/").
-    argv = re.findall(r'"([^"]*)"|(\S+)', m.group(1))
-    args = [quoted or bare for quoted, bare in argv]
-    if not args:
+    # Every ExecStart= must be ours: systemd runs them all (oneshot) or the last one wins (simple), and a
+    # foreign line in either position means someone other than this CLI shaped the unit.
+    for line in lines:
+        # A quoted executable may contain spaces (a checkout under "/home/ace/Hermes Project/").
+        argv = re.findall(r'"([^"]*)"|(\S+)', line)
+        args = [quoted or bare for quoted, bare in argv]
+        if not args:
+            return False
+        # systemd executable prefixes (`-`, `@`, `:`, `+`, `!`, `!!`) are not part of the path.
+        args[0] = args[0].lstrip("-@:+!")
+        if args[0].endswith(("/.hermes/bin/hermes", "/.hermes/bin/hermes.cmd")):
+            continue
+        if args[1:3] == ["-I", "-c"] and "import hermes_bootstrap" in " ".join(args[3:4]):
+            continue
         return False
-    if args[0].endswith(("/.hermes/bin/hermes", "/.hermes/bin/hermes.cmd")):
-        return True
-    return args[1:3] == ["-I", "-c"] and "import hermes_bootstrap" in " ".join(args[3:4])
+    return True
 
 
 def _refuse_foreign_service_overwrite(existing_path: Path, kind: str, *, force: bool = False) -> bool:
@@ -3729,6 +3737,8 @@ def systemd_install(
 
     if unit_path.exists() and not force:
         if not systemd_unit_is_current(system=system):
+            if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
+                return
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:

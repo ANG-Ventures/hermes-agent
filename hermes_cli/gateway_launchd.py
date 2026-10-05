@@ -625,6 +625,10 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
             print("Use --force to reinstall")
             return
         if load:
+            # A protected (foreign) plist is refused here, before the "outdated" repair path, so the
+            # operator never sees a "could not be reloaded ... --force" hint for a definition we protect.
+            if _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist"):
+                return
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
             if _gw().refresh_launchd_plist_if_needed():
                 print("✓ Service definition updated")
