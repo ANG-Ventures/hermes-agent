@@ -94,6 +94,10 @@ jobs:
       # Unknown names, API errors, and "no previous run" all fail LOUD (#alerts).
       - name: Route (page gate; known-red -> #logs unless green->red transition)
         id: route
+        # Bounded and non-fatal (Prism P1 cc0510af974c / 8c9d210ef980): a stalled or failing
+        # history lookup must never stop the POST below, which then defaults to #alerts.
+        timeout-minutes: 4
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -211,21 +215,71 @@ jobs:
               PR_NUM="$(sed -nE 's#^.*\(\#([0-9]+)\)$#\1#p' <<< "$WF_SUBJECT")"
             fi
           fi
-          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
-          sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
-            local jobs failed id name ann got items=""
-            jobs="$(api "actions/runs/$1/jobs?filter=latest&per_page=100")" || return 1
-            failed="$(jq -r '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"' <<< "$jobs")" || return 1
+          # Every GitHub call is bounded and the whole walk has a budget; past it api() fails,
+          # which pages (#alerts) with time left in the 10-minute job for the POST.
+          ROUTE_DEADLINE=$((SECONDS + ${ROUTE_BUDGET_S:-150}))
+          api() { [ "$SECONDS" -lt "$ROUTE_DEADLINE" ] || return 1; curl -fsS --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          run_jobs() {  # run id -> {"jobs": [every job]}, following pages; rc!=0 on an API error or an incomplete list
+            # A run can carry > 100 jobs. One page would drop a failed job (missed page) or a job
+            # that passed (main looks still red): Prism P1 30c28a402d93 / 8adcbc19fb8b, 2026-10-04.
+            local page=1 resp total acc='[]'
+            while :; do
+              resp="$(api "actions/runs/$1/jobs?filter=latest&per_page=100&page=$page")" || return 1
+              total="$(jq -er '.total_count | numbers' <<< "$resp")" || return 1
+              # Accumulator on stdin, not argv: one 100-job page is ~240 KB, over Linux's 128 KiB
+              # per-argument limit (Prism P2, run 37243401496 measured 244 KB).
+              acc="$(printf '%s\n%s' "$acc" "$resp" | jq -cs '.[0] + .[1].jobs')" || return 1
+              [ "$(jq length <<< "$acc")" -ge "$total" ] && break
+              # A short page before total_count, or more than 1000 jobs: incomplete, so fail (page).
+              { [ "$(jq '.jobs | length' <<< "$resp")" -gt 0 ] && [ "$page" -lt 10 ]; } || return 1
+              page=$((page + 1))
+            done
+            jq -c '{jobs: .}' <<< "$acc"
+          }
+          # The aggregate jobs (Tests complete, All required checks pass) fail whenever another
+          # job fails. A gate step there ("Fail on skipped or failed ...", "Evaluate job results")
+          # is derivative, and dropped, only when one of ITS prerequisite jobs failed or timed
+          # out; a gate that failed on a skipped/missing job is a new fault and
+          # stays an item (Prism P1 891d36986f43). Any OTHER failed step (Tests complete runs the
+          # quarantine lint + evidence gate) is independent and stays an item (Prism P1 "Retain
+          # independent failures inside Tests complete", 6117082a). An aggregate job that timed
+          # out with no independent failed step is a stepless item (Prism P1 b0cbda43048e).
+          # Use: `. as $r | .jobs[] | ... agg_items($r.jobs)`; each item is [job, step].
+          AGG_JQ='def bad: . == "failure" or . == "timed_out";
+            def aggregate: .name | test("Tests complete|All required checks");
+            def derivative($all; $s): (.name | sub("Tests complete$"; "")) as $p
+              # only failed/timed_out prerequisites, which are items themselves; a cancelled one
+              # is not an item, so its gate step stays one (Prism P1 8a4efca8c2ad)
+              | [$all[] | select(.conclusion | bad) | .name] as $down
+              | if $s == "Fail on skipped or failed e2e-upgrade shards" then any($down[]; startswith($p + "e2e-upgrade"))
+                elif $s == "Fail on skipped or failed required tests" then
+                  any($down[]; . == $p + "Generate slices" or startswith($p + "Run tests ") or . == $p + "e2e")
+                elif $s == "Evaluate job results" then any($down[]; test("All required checks") | not)
+                else false end;
+            def agg_items($all): . as $a
+              | [.steps[]? | select(.conclusion | bad) | .name | select(. as $s | $a | derivative($all; $s) | not)
+                | [$a.name, .]]
+              | if length == 0 and $a.conclusion == "timed_out" then [[$a.name, ""]] else . end;'
+          sig_of() {  # run id [nodes] -> signature on stdout ("nodes": one full pytest node id per line); rc!=0 on any API error
+            local jobs failed id name ann got items="" nodes=""
+            jobs="$(run_jobs "$1")" || return 1
+            failed="$(jq -r "$AGG_JQ"'
+              . as $r | .jobs[] | select(.conclusion | bad)
+              | if aggregate then (agg_items($r.jobs)[] | "-\t" + (if .[1] == "" then .[0] else "\(.[0]) / \(.[1])" end))
+                else "\(.id)\t\(.name)" end' <<< "$jobs")" || return 1
             while IFS=$'\t' read -r id name; do
               [ -n "$id" ] || continue
+              if [ "$id" = - ]; then items+="$name"$'\n'; continue; fi
               got="$(api "check-runs/$id/annotations?per_page=100" < /dev/null)" || return 1
               ann="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
               if [ -n "$ann" ]; then
+                nodes+="$ann"$'\n'
                 items+="$ann"$'\n'
               elif ! grep -qE 'Tests complete|All required checks' <<< "$name"; then
                 items+="$(sed -E 's# slice [0-9]+/[0-9]+$##' <<< "$name")"$'\n'
               fi
             done <<< "$failed"
+            if [ "${2:-}" = nodes ]; then grep -v '^$' <<< "$nodes" | sort -u || true; return 0; fi
             printf '%s' "$(grep -v '^$' <<< "$items" | sort -u | paste -sd ';' - | sed 's/;/; /g')"
           }
           if [ -n "$PR_NUM" ]; then
@@ -301,6 +355,129 @@ jobs:
               fi
             fi
           fi
+          # MAIN STILL RED (t_30d3de38). A red default-branch push is a standing
+          # condition, not a new fault, when EVERY failed job/step was already red on
+          # main: walking back through the previous completed push runs of this
+          # workflow on the default branch (newest first, up to 10), each item's
+          # latest run in which it actually RAN failed. A job or step that did not
+          # run (path-classified CI skips it) proves nothing, so the walk goes past
+          # it. Order is commit order (created_at), not completion order: a run for
+          # an OLDER commit that finishes after this one says nothing about main now
+          # (2026-10-04 05:35Z: 00702292's green, done 05:32, re-paged a red main).
+          # Such a red goes to #logs (ci-fail-known, which falls back to #alerts
+          # if that POST fails). On 2026-10-04 the e2e-upgrade jobs (no pytest
+          # annotation, so the fold above cannot see them) paged 6 times in 4 h for
+          # one red main. Names are exact ("job / step", no slice stripping): a new
+          # failing job or step pages. A first red, a step that passed in between,
+          # startup_failure and any API error all page.
+          STILL_RED_RUN=""; STILL_SIG=""
+          WF_CREATED="$(f .created_at)"
+          if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = push ] && [ "$WF_CONCLUSION" = failure ] \
+             && [ -n "$WF_ID" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; then
+            # Items = [job, step] of each failed step ([job, ""] if no step failed, e.g. a job
+            # timeout). timed_out counts as failed (Prism P1 f-ac6b7f1a201ac052). A failed job
+            # whose name is not unique in the run cannot be matched by name, so the jq errors
+            # and the red pages (Prism P1 f-96b4792f11201e3e).
+            # A failed step whose name repeats in its job cannot be matched by name either: the jq
+            # errors and the red pages (Prism P1 "Ambiguous steps", 6117082a). An aggregate job
+            # adds only its independent failed steps (AGG_JQ agg_items).
+            ITEMS="$(run_jobs "$WF_RUN_ID" | jq -c "$AGG_JQ"'
+              . as $r | (.jobs | group_by(.name) | map(select(length > 1) | .[0].name)) as $dup
+              | [.jobs[] | select(.conclusion | bad)
+                | if (.name | IN($dup[])) then error("ambiguous job name: \(.name)") else . end
+                | . as $j | [.steps[]?.name] as $names
+                | if aggregate then agg_items($r.jobs)[]
+                  else ([.steps[]? | select(.conclusion | bad) | [$j.name, .name]]
+                    | if length == 0 then [[$j.name, ""]] else . end)[] end
+                | . as [$jn, $sn] | if $sn != "" and ([$names[] | select(. == $sn)] | length) > 1
+                  then error("ambiguous step name: \($jn) / \($sn)") else . end] | unique')" || ITEMS=error
+            BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
+            PREVS="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}" \
+              | jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
+                # created_at has 1 s precision: another run created in the same second cannot be
+                # ordered against this one, so page instead of dropping it (Prism P1 569d6f572e69).
+                if $created != "" and any(.workflow_runs[]; .id != $id and .created_at == $created)
+                then error("a main run shares created_at \($created)") else . end
+                | [.workflow_runs[] | select(.id != $id)
+                  | select($created == "" or .created_at < $created)]
+                # two earlier runs created in the same second cannot be ordered either: an older
+                # red could be walked before a newer green (Prism P1 d12fe5a4bf6d)
+                | if (group_by(.created_at) | any(length > 1)) then error("two main runs share a created_at") else . end
+                | sort_by(.created_at) | reverse | .[:10][] | .id')" || PREVS=error
+            # A job/step match cannot tell two tests apart: every pytest node id this run failed
+            # must also have failed in the FIRST walked run that shows a failed item red, the
+            # latest execution of that step (Prism P1 5515ab6c4f85, 13f5bb458e0c). Node ids are
+            # compared whole, one per line, never re-split from the "; " signature (Prism P1
+            # 702860bc5678: a parameter id can contain "; ").
+            NODES="$(sig_of "$WF_RUN_ID" nodes)" || ITEMS=error
+            if [ "$ITEMS" = error ] || [ "$PREVS" = error ] || [ "$ITEMS" = "[]" ]; then
+              echo "::warning::main-still-red: cannot read this run's failed jobs or main's history; paging"
+            else
+              LEFT="$ITEMS"; COVER=""
+              for prev in $PREVS; do
+                # Every completed run counts, whatever its overall conclusion: a CANCELLED run
+                # whose step passed is still proof main recovered (Prism P1 daaf469b6e2e /
+                # eb4c30f2ca3e, 2026-10-04). The per-item check below decides what each run shows.
+                # Per item in a prior run: red (that step failed), green (it ran and passed:
+                # main went green, so this is a new red), unknown (job or step did not run,
+                # e.g. path-classified CI skipped it; look further back). A stepless item
+                # [job, ""] is red only if that job also failed with no failed step there; a job
+                # that failed on a named step is a different fault (Prism P1 f-abb7efb339835ba6).
+                # A job name, or a step name within the job, that is not unique in the prior run
+                # cannot be matched: page (Prism P1 f-96b4792f11201e3e, "Ambiguous steps").
+                ST="$(run_jobs "$prev" | jq -c --argjson items "$LEFT" "$AGG_JQ"'
+                  . as $r | [$items[] as [$j, $s]
+                    | [$r.jobs[] | select(.name == $j)] as $same | ($same | first) as $job
+                    | if ($same | length) > 1 then "ambiguous"
+                      elif $job == null then "unknown"
+                      elif $s == "" then
+                        (if ($job.conclusion // "") == "success" then "green"
+                         elif ($job.conclusion // "" | bad) | not then "unknown"
+                         elif [$job.steps[]? | select(.conclusion | bad)] == [] then "red"
+                         else "differs" end)
+                      else [$job.steps[]? | select(.name == $s)] as $sts | ($sts | first) as $st
+                        | if ($sts | length) > 1 then "ambiguous"
+                          elif $st == null then "unknown"
+                          # an aggregate gate that failed there only because a prerequisite did
+                          # is not the same fault as one that fails on its own now
+                          elif ($st.conclusion // "" | bad) and ($job | aggregate) and ($job | derivative($r.jobs; $s)) then "differs"
+                          elif ($st.conclusion // "" | bad) then "red"
+                          elif $st.conclusion == "success" then "green" else "unknown" end
+                      end]')" || { LEFT=error; break; }
+                if jq -e 'index("green")' <<< "$ST" > /dev/null; then
+                  LEFT=green; echo "page: a failed job/step passed on main in run $prev"; break
+                fi
+                if jq -e 'index("differs")' <<< "$ST" > /dev/null; then
+                  LEFT=green; echo "page: a failed job/step failed for a different reason in run $prev (a different fault)"; break
+                fi
+                if jq -e 'index("ambiguous")' <<< "$ST" > /dev/null; then
+                  LEFT=green; echo "page: a failed job or step name is not unique in run $prev"; break
+                fi
+                NEXT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] != "red") | .value]' <<< "$LEFT")"
+                if [ "$NEXT" != "$LEFT" ] && [ -n "$NODES" ]; then
+                  PNODES="$(sig_of "$prev" nodes)" || { LEFT=error; break; }
+                  MISS="$(comm -23 <(printf '%s\n' "$NODES") <(printf '%s\n' "$PNODES") | grep -v '^$' || true)"
+                  if [ -n "$MISS" ]; then
+                    LEFT=green; echo "page: test(s) not failed in run $prev, main's latest red: $(tr '\n' ' ' <<< "$MISS")"; break
+                  fi
+                  NODES=""
+                fi
+                [ "$NEXT" != "$LEFT" ] && COVER="${COVER:+$COVER,}$prev"
+                LEFT="$NEXT"
+                [ "$LEFT" = "[]" ] && break
+              done
+              case "$LEFT" in
+                "[]")
+                  STILL_RED_RUN="$COVER"
+                  STILL_SIG="$(jq -r 'map(if .[1] == "" then .[0] else "\(.[0]) / \(.[1])" end) | join("; ")' <<< "$ITEMS")"
+                  ROUTE=logs; CARD="main-still-red (run $COVER)"
+                  echo "main-still-red: run(s) $COVER already failed '$STILL_SIG' -> #logs" ;;
+                error) echo "::warning::main-still-red: cannot read a prior run's jobs; paging" ;;
+                green) ;;
+                *) echo "page: no earlier main run in the last 10 proves $LEFT was already red" ;;
+              esac
+            fi
+          fi
           # MERGED-ANYWAY (t_4e93bc97). A stacked queue merges PR A together with a
           # later group B that contains it, so A can land while A's own group run
           # is red (hermes-agent#1652, 2026-10-03: run 37099128739 red on a uv
@@ -359,6 +536,9 @@ jobs:
             [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
           elif [ -n "$FOLD_RUN" ]; then
             SUMMARY="main red on an already-red test (also failed run $FOLD_RUN): $SIG"
+            [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
+          elif [ -n "$STILL_RED_RUN" ]; then
+            SUMMARY="main still red on the same failure as run(s) $STILL_RED_RUN: $STILL_SIG"
             [ "${#SUMMARY}" -gt 400 ] && SUMMARY="${SUMMARY:0:400}..."
           fi
           echo "pr=$PR_NUM" >> "$GITHUB_OUTPUT"
