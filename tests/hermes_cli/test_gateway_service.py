@@ -523,6 +523,7 @@ class TestLaunchdServiceRecovery:
         be delegated to a detached helper instead."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -598,6 +599,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -649,6 +651,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -701,6 +704,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
