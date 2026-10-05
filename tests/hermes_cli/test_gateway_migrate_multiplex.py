@@ -692,6 +692,43 @@ def test_failed_preinstall_rollback_failure_keeps_the_manifest(fleet, monkeypatc
     assert [op for op in fleet.ops if op[0] != "default" and op[1] in ("stop", "uninstall")] == []
 
 
+def test_migration_install_never_removes_legacy_units(fleet, monkeypatch):
+    """Prism 0f20e9a5c8b1 (#1740 @63c6f83d): the preparatory install runs before anything is committed, so
+    systemd_install must not stop and unlink legacy units there (a later failure left no gateway at all)."""
+    from hermes_cli import gateway as gw
+    seen = []
+    monkeypatch.setattr(gw, "systemd_install", lambda **kw: seen.append(kw.get("remove_legacy_units", True)))
+    _REAL_SERVICE_OP("systemd", False, "install", fleet.root)
+    assert seen == [False]
+
+
+@pytest.mark.parametrize("install_fails", [False, True])
+def test_legacy_units_are_removed_only_after_the_default_is_installed(fleet, monkeypatch, install_fails):
+    """The deferred cleanup runs once the default's definition is in place, before it starts; a failed
+    preinstall (rolled back, every secondary untouched) never reaches it."""
+    from hermes_cli import gateway as gw
+    removed = []
+    monkeypatch.setattr(gw, "has_legacy_hermes_units", lambda: True)
+    monkeypatch.setattr(gw, "remove_legacy_hermes_units",
+                        lambda interactive=True, dry_run=False: removed.append(list(fleet.ops)) or (1, []))
+    if install_fails:
+        real_op = gm._service_op
+
+        def _op(kind, system, verb, home, *, run_as_user=None):
+            if _name(home) == "default" and verb == "install":
+                raise RuntimeError("launcher preparation failed")
+            real_op(kind, system, verb, home, run_as_user=run_as_user)
+        monkeypatch.setattr(gm, "_service_op", _op)
+    gm.apply_migration(gm.build_migration_plan(), served_wait=0.1)
+    if install_fails:
+        assert removed == []
+        return
+    assert len(removed) == 1
+    ops_then = removed[0]
+    assert ("default", "install") in ops_then and ("default", "start") not in ops_then
+    assert ("default", "start") in fleet.ops
+
+
 def test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited(fleet, monkeypatch, capsys):
     """Flag flipped, secondaries gone, default never came up (the process died mid-apply): the re-run
     must finish the migration from the manifest — with the recorded User= — instead of reporting

@@ -3824,6 +3824,7 @@ def systemd_install(
     enable_on_startup: bool = True,
     non_interactive: bool = False,
     force_unit_path: bool = False,
+    remove_legacy_units: bool = True,
 ):
     if system:
         _require_root_for_system_service("install")
@@ -3847,6 +3848,10 @@ def systemd_install(
     def offer_legacy_unit_removal() -> None:
         # Legacy units flap-fight the new unit for the bot token. Called only once every refusal below has
         # passed: removing them for an install that then refuses leaves the host with no gateway.
+        # remove_legacy_units=False: the caller (a migration's preparatory install) removes them itself once
+        # its whole install has succeeded; deleted here, a later failure left the host with no gateway.
+        if not remove_legacy_units:
+            return
         if has_legacy_hermes_units():
             print()
             print_legacy_unit_warning()
@@ -3869,12 +3874,12 @@ def systemd_install(
         if not systemd_unit_is_current(system=system):
             if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
                 sys.exit(1)  # a normal return let callers START the protected unit / migrate past it
-            offer_legacy_unit_removal()
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:
                 _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
             print(f"✓ {scope_label.capitalize()} service definition updated")
+            offer_legacy_unit_removal()  # after the repair succeeded, never before a step that can still raise
         else:
             offer_legacy_unit_removal()
             print(f"Service already installed at: {unit_path}")
@@ -3903,7 +3908,6 @@ def systemd_install(
         sys.exit(1)
     if unit_path.exists() and _refuse_foreign_service_overwrite(unit_path, "systemd unit", force=force):
         sys.exit(1)
-    offer_legacy_unit_removal()
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)
     unit_path.write_text(new_unit, encoding="utf-8")
@@ -3911,6 +3915,9 @@ def systemd_install(
     _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
     if enable_on_startup:
         _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+    # Only once the new unit is written and enabled: a launcher/write/enable failure after the legacy units were
+    # stopped and unlinked left the host with no gateway at all (Prism 0f20e9a5c8b1).
+    offer_legacy_unit_removal()
 
     print()
     print(f"✓ {scope_label.capitalize()} service {'installed and enabled' if enable_on_startup else 'installed'}!")

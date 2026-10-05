@@ -169,6 +169,33 @@ class TestSystemdWriters:
         assert legacy_units == [False]
         assert systemd_unit.path.exists()
 
+    @pytest.mark.parametrize("failing_step", ["launcher", "enable"])
+    def test_install_failing_after_admission_removes_no_legacy_units(
+            self, systemd_unit, homes, legacy_units, monkeypatch, failing_step):
+        # Prism 0f20e9a5c8b1 (#1740 @63c6f83d): legacy units were stopped and unlinked BEFORE the launcher
+        # preparation, the write and the enable; any of those failing left the host with no gateway at all.
+        systemd_unit.path.unlink()
+        if failing_step == "launcher":
+            def _boom(system=False, run_as_user=None):
+                raise RuntimeError("launcher preparation failed")
+            monkeypatch.setattr(gw, "_prepare_service_launcher", _boom)
+        else:
+            def _systemctl(args, **kw):
+                if args[0] == "enable":
+                    raise RuntimeError("systemctl enable failed")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            monkeypatch.setattr(gw, "_run_systemctl", _systemctl)
+        with pytest.raises(RuntimeError):
+            gw.systemd_install(non_interactive=True)
+        assert legacy_units == []
+
+    def test_install_can_defer_legacy_unit_removal(self, systemd_unit, homes, legacy_units):
+        # The migration's preparatory install can still be rolled back, so it removes nothing.
+        systemd_unit.path.unlink()
+        gw.systemd_install(non_interactive=True, remove_legacy_units=False)
+        assert legacy_units == []
+        assert systemd_unit.path.exists()
+
     def test_worker_kill_switch_blocks_direct_install(self, systemd_unit, homes, monkeypatch):
         # ensure_gateway_service / setup wizard / migrate call systemd_install without _cmd_install.
         systemd_unit.path.unlink()
