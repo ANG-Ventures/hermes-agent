@@ -603,6 +603,27 @@ def _attempt_seats(raw: Any) -> Optional[list]:
     return seats or None
 
 
+def _request_ids(raw: Any) -> Optional[list]:
+    """``x-pool-empty-content-request-ids: req_a,req_b,req_c`` -> the upstream
+    request ids of each billed empty attempt (at most 8), else None."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    ids = [t.strip() for t in raw.split(",") if t.strip()]
+    ids = [t for t in ids if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", t)][:8]
+    return ids or None
+
+
+def _prompt_tokens(usage: Any) -> Optional[int]:
+    """Billed prompt size of one response: input + cache read + cache write
+    (Anthropic usage fields), else None when none of them is an int."""
+    if usage is None:
+        return None
+    parts = [getattr(usage, f, None) for f in (
+        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+    parts = [p for p in parts if isinstance(p, int) and not isinstance(p, bool)]
+    return sum(parts) if parts else None
+
+
 def stash_response_failure(agent: Any, site: str, response: Any = None, *,
                            detail: Optional[str] = None,
                            elapsed_s: Optional[float] = None,
@@ -639,6 +660,10 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
             # #193): "gave_up" / "1" and, when sent, the seats it tried in order.
             "relay_retry": (ph.get("x-pool-empty-content-retried") or "").strip().lower() or None,
             "relay_attempts": _attempt_seats(ph.get("x-pool-empty-content-attempts")),
+            # t_c706fd1e: each billed empty attempt's upstream request id
+            # (claude-pool x-pool-empty-content-request-ids) and the prompt size.
+            "relay_request_ids": _request_ids(ph.get("x-pool-empty-content-request-ids")),
+            "prompt_tokens": _prompt_tokens(usage),
         }
         agent._pending_fallback_error = {
             "at": time.monotonic(),
@@ -1151,6 +1176,11 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                 row["seat"] = fl["served_by"]
             if fl.get("route_id") and not row.get("route_id"):
                 row["route_id"] = fl["route_id"]
+            # t_c706fd1e: ledger columns, so the billed ladder is queryable.
+            if fl.get("relay_request_ids") and not row.get("request_ids"):
+                row["request_ids"] = ",".join(fl["relay_request_ids"])
+            if isinstance(fl.get("prompt_tokens"), int):
+                row.setdefault("prompt_tokens", fl["prompt_tokens"])
         # t_b2e9ef12: name what a no-status / rejected-response call died of.
         if pending:
             row.setdefault("exc_name", pending.get("exc"))

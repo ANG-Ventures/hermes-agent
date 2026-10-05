@@ -1072,6 +1072,13 @@ def invalid_response_cause(row: Mapping[str, Any]) -> str:
     return f"{head} ({', '.join(parts)})" if parts else head
 
 
+def _prompt_size(tokens: Any) -> str:
+    """`` prompt 321k tok`` for a known billed prompt size, else ``""``."""
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
+        return ""
+    return f" prompt {round(tokens / 1000)}k tok" if tokens >= 1000 else f" prompt {tokens} tok"
+
+
 def _relay_empty_chain(row: Mapping[str, Any], seat_names: bool) -> Optional[str]:
     """``empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23) —
     relay retried, gave up`` when the pooled relay already ran its own
@@ -1081,9 +1088,16 @@ def _relay_empty_chain(row: Mapping[str, Any], seat_names: bool) -> Optional[str
     if fl.get("relay_retry") != "gave_up":
         return None
     seats = [str(x) for x in (fl.get("relay_attempts") or ()) if x]
+    rids = [str(x) for x in (fl.get("relay_request_ids") or ()) if x]
+    prompt = _prompt_size(fl.get("prompt_tokens"))
     if seats:
         names = ", ".join(seats) if seat_names else ", ".join("a sub" for _ in seats)
-        return f"empty reply from Anthropic ×{len(seats)} ({names}) — relay retried, gave up"
+        if rids:
+            # t_c706fd1e: one short id per billed attempt, greppable in the
+            # relay log and the subs ledger (upstream_request_id).
+            names += "; " + ", ".join(f"req_…{r[-6:]}" for r in rids)
+        return (f"empty reply from Anthropic ×{len(seats)} ({names}){prompt}"
+                " — relay retried, gave up")
     seat = row.get("seat") or fl.get("served_by")
     where = f" (last on {seat if seat_names else 'a sub'})" if seat and seat != "unknown" else ""
     return f"empty reply from Anthropic{where} — relay retried, gave up"
