@@ -213,6 +213,17 @@ def test_all_warm_picks_least_projected_and_rereads_the_ledger(sig):
     assert p.take("alpha").name == "ace-media"
 
 
+def test_first_hot_sample_is_not_preferred_over_a_warm_rung(sig):
+    """A host on its first hot sample is still admitted (streak 1) but never
+    ranks as cool: a warm rung of lower priority wins."""
+    fleet = Fleet()
+    fleet.set("ace-ai", 0.95)     # priority 1, hot (streak 1)
+    fleet.set("ace-media", 0.75)  # priority 2, warm
+    p = _plan(fleet, sig)
+    assert p.slots["ace-ai"] == 4
+    assert p.take("alpha").name == "ace-media"
+
+
 # -- I-8 / F-6 / AC-7: projected() -------------------------------------------
 
 def _res(units, cpu, ramp, stamps, host="ace-ai", consumer="kanban"):
@@ -446,3 +457,28 @@ def test_e2e_read_signal_false_ignores_pressure_and_ledger(board):
     builder.record_placements([("t_x", "ace-ai")])
     assert not (board / "var" / "placement").exists()
     assert not (board / "var" / kwp.TARGET_STATE_FILE).exists()
+
+
+def test_standalone_daemon_writes_the_kanban_ledger(board, monkeypatch):
+    """The systemd daemon path publishes reservations like the gateway loop."""
+    import threading
+
+    from hermes_cli import config as _config
+    from hermes_cli import kanban_load_gate as klg
+
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None, **kw: None)
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (146.0, 90.0))
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kw):
+        res = kb.DispatchResult()
+        res.placed.append(("t_x", "ace-media"))
+        return res
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=lambda _r: stop.set(),
+                   load_gate=klg.LoadGate({}, ncpu=32))
+    led = json.loads((board / "var" / "placement" / "host-reservations.kanban.json")
+                     .read_text(encoding="utf-8-sig"))
+    assert led["hosts"]["ace-media"]["busy_units"] == 1

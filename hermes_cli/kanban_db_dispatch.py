@@ -6363,6 +6363,10 @@ def run_daemon(
                     failure_limit=failure_limit,
                     **gate_kwargs,
                 )
+            if gate_ticks is not None:
+                # Placement 1b: publish kanban's reservations (no-op when
+                # kanban.placement.read_signal is false).
+                gate_ticks.record_placements(list(getattr(res, "placed", None) or []))
             if load_gate is not None:
                 # The Studio gate books LOCAL spawns only (RC-2).
                 load_gate.finish_tick(_local_spawn_count(res), logger=_kb._log)

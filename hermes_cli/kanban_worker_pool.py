@@ -652,8 +652,12 @@ class SpilloverPlan:
             free = [n for n, h in self.hosts.items()
                     if self.slots.get(n, 0) > 0 and assignee in h.profiles]
             if free:
-                cool = [n for n in free if (self.detail.get(n) or {}).get("band") != BAND_WARM]
-                name = cool[0] if cool else self._warm_pick(free)
+                # Only an OK rung is cool. Warm rungs, then hot-but-not-yet-
+                # streaked rungs, are picked by projected load (RC7).
+                bands = {n: (self.detail.get(n) or {}).get("band") for n in free}
+                cool = [n for n in free if bands[n] == BAND_OK]
+                warm = [n for n in free if bands[n] == BAND_WARM]
+                name = cool[0] if cool else self._warm_pick(warm or free)
                 self.slots[name] -= 1
                 self.taken[name] = self.taken.get(name, 0) + 1
                 return self.hosts[name]
