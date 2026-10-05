@@ -356,7 +356,7 @@ def test_probe_reads_pressure_in_the_same_round_trip():
 
     s = kwp.probe_host(HOSTS[0], runner=runner, pressure_path="/var/lib/placement/host-pressure.json")
     assert len(calls) == 1
-    assert calls[0][-1] == ("cat /proc/loadavg; nproc; date +%s; "
+    assert calls[0][-1] == ("cat /proc/loadavg; getconf _NPROCESSORS_ONLN; date +%s; "
                             "cat /var/lib/placement/host-pressure.json 2>/dev/null; true")
     assert (s.load1, s.ncpu, s.remote_now) == (3.1, 24, 1791200100.0)
     assert json.loads(s.pressure_text)["load_ratio"] == 0.5
@@ -393,7 +393,7 @@ def _ssh(fleet: Fleet):
     """A fake ``ssh`` runner answering the real probe command from the fixture."""
     def runner(argv, **kw):
         host = argv[-2].split("@", 1)[1]
-        assert argv[-1].startswith("cat /proc/loadavg; nproc; date +%s; cat ")
+        assert argv[-1].startswith("cat /proc/loadavg; getconf _NPROCESSORS_ONLN; date +%s; cat ")
         out = f"{fleet.load1[host]:.2f} 1.00 1.00 1/100 1\n24\n{int(fleet.now[host])}\n{fleet.text[host]}\n"
         return SimpleNamespace(returncode=0, stdout=out)
     return runner

@@ -186,10 +186,36 @@ def test_probe_host_one_ssh_call_parses_or_fails_closed():
     assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
     argv, timeout = calls[0]
     assert len(calls) == 1 and timeout == 8
-    assert "ConnectTimeout=4" in argv and argv[-1] == "cat /proc/loadavg; nproc"
+    assert "ConnectTimeout=4" in argv and argv[-1] == "cat /proc/loadavg; getconf _NPROCESSORS_ONLN"
     assert argv[-2] == "kanbanw@ace-ai"
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(255, "")) is None
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(0, "garbage")) is None
+
+
+def _cgroup_ssh(argv, **kw):
+    """A cgroup-quota'd Linux host (t_2dc3be98): ``nproc`` honours the probing
+    user's CPUQuota (8) while the host has 24 online cores. The fake answers
+    each core-count command the way the real host did as kanbanw."""
+    cmd = argv[-1]
+    load = "12.00 9.00 7.00 1/900 99"  # ordinary ace-ai load1, under 0.8 x 24
+    if "; getconf _NPROCESSORS_ONLN" in cmd:
+        ncpu = "24"
+    elif "; nproc" in cmd:
+        ncpu = "8"
+    else:
+        raise AssertionError(f"unexpected probe command: {cmd!r}")
+    tail = "\n1791200100\n{}" if "date +%s" in cmd else ""
+    return _Proc(0, f"{load}\n{ncpu}{tail}\n")
+
+
+def test_probe_reports_online_cores_not_cgroup_quota():
+    """KWLB D-3: ncpu = cores. With the quota'd count the v0.1 refuse line was
+    0.8 x 8 = 6.4 load1, so an ordinary load1 of 7-16 refused ace-ai."""
+    assert kwp.probe_host(_host(), runner=_cgroup_ssh) == (12.0, 24)
+    s = kwp.probe_host(_host(), runner=_cgroup_ssh, pressure_path="/var/lib/placement/host-pressure.json")
+    assert s.ncpu == 24
+    p = kwp.plan([_host(slots=4)], {"ace-ai": 1}, probe=lambda h: kwp.probe_host(h, runner=_cgroup_ssh))
+    assert p.budget == 3  # the quota'd ncpu=8 put the line at 6.4 and refused this host
 
 
 def test_plan_threshold_is_capacity_times_ncpu():
