@@ -33,6 +33,7 @@ _CAUSE_TEXT = {
     "refusal": "content_policy_blocked",
     "auth": "OAuth access token has been revoked",
     "provider_invalid_response": None,
+    "lane_incapable": "interactive mode on this box serves tool-less turns only; tools[] must be empty (52 tools)",
     "unclassified": "weird thing",
 }
 _CAUSE_RE = re.compile(r"[a-zA-Z]{3,}")

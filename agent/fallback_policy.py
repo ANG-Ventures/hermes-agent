@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 # ── §4.1 vocabulary (identical to Phase 1 fallback_events.TRIGGER_CLASSES) ──
 TRIGGER_CLASSES = (
     "conn", "pool_pressure", "quota_model", "quota_seat", "rate_upstream",
-    "refusal", "auth", "provider_invalid_response", "unclassified",
+    "refusal", "auth", "provider_invalid_response", "lane_incapable", "unclassified",
 )
+LANE_INCAPABLE_CLASS = "lane_incapable"
 INVALID_RESPONSE_CLASS = "provider_invalid_response"
 # Classes the sticky writer arms (one clock: _sticky.until_epoch).
 STICKY_CLASSES = frozenset({"conn", "pool_pressure", "quota_seat", "quota_model"})
@@ -1053,6 +1054,36 @@ def _pool_context(row: Mapping[str, Any]) -> str:
 BOX_CAPACITY_CAUSE = "relay box at session capacity"
 BOX_STARTUP_CAUSE = "relay session startup timed out"
 
+# Our bridge/relay refused the request SHAPE for the lane (t_1ed37625). The
+# banner names OUR hop as the source: these codes are never Anthropic's.
+LANE_INCAPABLE_CAUSE = "lane cannot serve this request shape"
+LANE_INCAPABLE_NOT_ANTHROPIC = "ours, not Anthropic"
+
+
+def _lane_incapable_cause(row: Mapping[str, Any]) -> str:
+    """``lane cannot serve tools`` / ``... images`` from the body's machine code
+    (``row["lane_code"]``); the generic shape wording without one."""
+    from agent.fallback_capability import LANE_INCAPABLE_CODES
+
+    code = str(row.get("lane_code") or "").strip().lower()
+    if code == "mode_not_allowed":
+        return "lane closed to this delivery mode"
+    shape = LANE_INCAPABLE_CODES.get(code) if code else None
+    return f"lane cannot serve {shape}" if shape else LANE_INCAPABLE_CAUSE
+
+
+def _lane_incapable_body(row: Mapping[str, Any], seat: str) -> str:
+    """``lane cannot serve tools — 400 tui_tools_unsupported at the bridge (ours,
+    not Anthropic) on sub-vps-24``. The relay's own ``mode_not_allowed`` is
+    ``at the relay``; a bridge ``tui_*`` code is ``at the bridge``."""
+    code = str(row.get("lane_code") or "").strip().lower()
+    st = row.get("http_status") or "error"
+    where = "at the relay" if code == "mode_not_allowed" else "at the bridge"
+    answered = f"{st} {code}" if code else f"{st}"
+    seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
+    return (f"{_lane_incapable_cause(row)} — {answered} {where} "
+            f"({LANE_INCAPABLE_NOT_ANTHROPIC}){seat_seg}")
+
 
 def invalid_response_cause(row: Mapping[str, Any]) -> str:
     """``empty response (stop_reason=tool_use, 0 content blocks, 462 out)``
@@ -1121,6 +1152,8 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
     if cls == INVALID_RESPONSE_CLASS:
         return invalid_response_cause(row)
+    if cls == LANE_INCAPABLE_CLASS:
+        return _lane_incapable_cause(row)
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
     if cls == "conn":
         if "reset" in t:
@@ -1288,6 +1321,11 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
     if relay_conn_without_evidence(row):
         return f"{prefix}{_relay_conn_cause(row, tz)}, {window}", ()
     seat = _seat_token(row, seat_names)
+    if row.get("trigger_class") == LANE_INCAPABLE_CLASS:
+        # The relay's hop header says bridge->upstream for a bridge 400 it
+        # passed through; the body code says the bridge/relay itself refused
+        # the shape. Name our hop, never "(Anthropic 400)" (t_1ed37625).
+        return f"{prefix}{_lane_incapable_body(row, seat)}, {window}", ()
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
     if _is_pool_wide_relay_busy(row, hop, cause):

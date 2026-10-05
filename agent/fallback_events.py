@@ -34,8 +34,12 @@ logger = logging.getLogger(__name__)
 
 TRIGGER_CLASSES = (
     "conn", "pool_pressure", "quota_model", "quota_seat", "rate_upstream",
-    "refusal", "auth", "provider_invalid_response", "unclassified",
+    "refusal", "auth", "provider_invalid_response", "lane_incapable", "unclassified",
 )
+# OUR bridge/relay refused the request SHAPE for this lane (400
+# tui_tools_unsupported / tui_images_unsupported, relay mode_not_allowed):
+# named from the body's machine code, never from Anthropic text (t_1ed37625).
+LANE_INCAPABLE_CLASS = "lane_incapable"
 # A billed response the loop rejected (empty content / invalid shape), named
 # from the floor evidence ``stash_response_failure`` stashed (t_d35beb85).
 INVALID_RESPONSE_CLASS = "provider_invalid_response"
@@ -236,6 +240,13 @@ def classify_trigger(*, text: Optional[str] = None,
                 return s, "relay_stream"
             if s != "upstream_passthrough":
                 return "unclassified", "relay_stream"
+    # A bridge machine code in the body is the lane refusing the request shape:
+    # it beats the text table, whose rows describe upstream/relay capacity
+    # (t_1ed37625: "tools[] must be empty (52 tools)" rendered "unclassified").
+    from agent.fallback_capability import body_lane_incapable_code
+
+    if body_lane_incapable_code(body) or reason == LANE_INCAPABLE_CLASS:
+        return LANE_INCAPABLE_CLASS, "relay_code"
     cls = classify_text(text, http_status=http_status, exc_name=exc_name,
                         reason=reason)
     if (cls == "unclassified" and isinstance(floor, dict) and floor.get("site")
@@ -1133,6 +1144,17 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             r_seat = served_by_seat(headers)
         if r_seat and (not row.get("seat") or row.get("seat") == "unknown"):
             row["seat"] = r_seat
+        if trigger_class == LANE_INCAPABLE_CLASS:
+            # The body's machine code is the evidence the banner renders from, and
+            # the hop is OURS: the relay stamps bridge->upstream on a bridge 400 it
+            # passed through, but the bridge (tui_*) or the relay (mode_not_allowed)
+            # refused the shape itself (t_1ed37625).
+            from agent.fallback_capability import body_lane_incapable_code
+
+            code = body_lane_incapable_code(body)
+            if code:
+                row["lane_code"] = code
+                row["hop"] = "relay" if code == "mode_not_allowed" else "relay→bridge"
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:

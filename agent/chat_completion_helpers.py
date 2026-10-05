@@ -2718,6 +2718,7 @@ _FALLBACK_ANNOUNCE_LABELS = {
     "payload_too_large": "payload too large",
     "image_too_large": "image too large",
     "format_error": "bad request",
+    "lane_incapable": "lane cannot serve this request",
 }
 
 
@@ -3252,6 +3253,7 @@ _FALLBACK_REASON_LABELS = {
     FailoverReason.provider_policy_blocked: "provider policy blocked the request",
     FailoverReason.content_policy_blocked: "content policy blocked the request",
     FailoverReason.format_error: "request format rejected",
+    FailoverReason.lane_incapable: "lane cannot serve the request shape",
     FailoverReason.role_alternation: "adjacent same-role messages rejected",
     FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
     FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
