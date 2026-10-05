@@ -3775,7 +3775,7 @@ def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optio
         if plan.pins_only:
             return "local_full"  # admitting band: the pool takes pins only
         if plan.budget <= 0:
-            return "pool_full"
+            return plan.full_reason()
     return None
 
 
@@ -4832,7 +4832,7 @@ def _dispatch_once_locked(
             if spillover is not None:
                 result.placement_waits[row["id"]] = (
                     _route_wait(route, route_arg, False, spillover)
-                    or ("pin_host_full" if route == "pin" else "pool_full")
+                    or ("pin_host_full" if route == "pin" else spillover.full_reason())
                 )
             ready_scan_complete = False
             break

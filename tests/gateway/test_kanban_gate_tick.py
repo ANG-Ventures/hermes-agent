@@ -56,7 +56,8 @@ def tick(tmp_path, monkeypatch):
     for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_DISPATCH_IN_GATEWAY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    cfg = {"kanban": {"dispatch_interval_seconds": 2, "auto_decompose": False}}
+    cfg = {"kanban": {"dispatch_interval_seconds": 2, "auto_decompose": False,
+                      "placement": {"read_signal": False}}}  # KWLB v0.1 contract
     monkeypatch.setattr(config, "load_config", lambda: cfg)
     monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda value: value)
     kb.init_db()

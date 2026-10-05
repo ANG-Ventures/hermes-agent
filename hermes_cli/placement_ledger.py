@@ -167,18 +167,16 @@ def _locked(path: Path, wait_s: float = LOCK_WAIT_SECONDS):
         fh.close()
 
 
-def update(directory: Path, consumer: str,
-           fn: Callable[[Mapping], Mapping]) -> dict:
-    """flock'd read-modify-write of one consumer's file; ``fn(old) -> new``.
-    The rename is atomic, so a reader never sees a torn file."""
-    path = ledger_path(directory, consumer)
+def update_json(path: Path, fn: Callable[[Mapping], Mapping]) -> dict:
+    """flock'd read-modify-write of one JSON file; ``fn(old) -> new``. The
+    rename is atomic, so a reader never sees a torn file."""
+    path = Path(path)
     with _locked(path):
         try:
             old = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             old = {}
         new = dict(fn(old if isinstance(old, dict) else {}))
-        new["consumer"] = consumer
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -190,6 +188,17 @@ def update(directory: Path, consumer: str,
                 os.unlink(tmp)
             raise
     return new
+
+
+def update(directory: Path, consumer: str,
+           fn: Callable[[Mapping], Mapping]) -> dict:
+    """Read-modify-write of one consumer's ledger file (its name is its identity)."""
+    def stamp(old: Mapping) -> Mapping:
+        new = dict(fn(old))
+        new["consumer"] = consumer
+        return new
+
+    return update_json(ledger_path(directory, consumer), stamp)
 
 
 def carry_placed_at(prev: Iterable[float], carried: int, fresh: int, now: float,
