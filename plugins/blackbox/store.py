@@ -1462,6 +1462,9 @@ _FALLBACK_EVENT_COLUMNS = (
     "bound_box_free", "warm_box_free",
     # t_b2e9ef12: what a no-status / rejected-response failover died of.
     "exc_name", "socket_cause", "floor_site",
+    # t_c706fd1e: the billed attempts behind the failover (upstream request
+    # ids, comma-joined), their prompt size, and the failing call's wall time.
+    "request_ids", "prompt_tokens", "elapsed_s",
 )
 # Additive columns on fallback_events (Phase 2 + warm-seat P3); migrated per column.
 _FALLBACK_EVENT_PHASE2_COLUMNS = (
@@ -1474,6 +1477,7 @@ _FALLBACK_EVENT_PHASE2_COLUMNS = (
     ("warm_refusal_arm", "INT"), ("warm_gate", "TEXT"),
     ("bound_box_free", "INT"), ("warm_box_free", "INT"),
     ("exc_name", "TEXT"), ("socket_cause", "TEXT"), ("floor_site", "TEXT"),
+    ("request_ids", "TEXT"), ("prompt_tokens", "INT"), ("elapsed_s", "REAL"),
 )
 FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused", "sticky_resume")
 
