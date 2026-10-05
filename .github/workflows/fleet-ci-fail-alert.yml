@@ -226,7 +226,9 @@ jobs:
             while :; do
               resp="$(api "actions/runs/$1/jobs?filter=latest&per_page=100&page=$page")" || return 1
               total="$(jq -er '.total_count | numbers' <<< "$resp")" || return 1
-              acc="$(jq -c --argjson acc "$acc" '$acc + .jobs' <<< "$resp")" || return 1
+              # Accumulator on stdin, not argv: one 100-job page is ~240 KB, over Linux's 128 KiB
+              # per-argument limit (Prism P2, run 37243401496 measured 244 KB).
+              acc="$(printf '%s\n%s' "$acc" "$resp" | jq -cs '.[0] + .[1].jobs')" || return 1
               [ "$(jq length <<< "$acc")" -ge "$total" ] && break
               # A short page before total_count, or more than 1000 jobs: incomplete, so fail (page).
               { [ "$(jq '.jobs | length' <<< "$resp")" -gt 0 ] && [ "$page" -lt 10 ]; } || return 1
@@ -234,12 +236,24 @@ jobs:
             done
             jq -c '{jobs: .}' <<< "$acc"
           }
+          # The aggregate jobs (Tests complete, All required checks pass) fail whenever another
+          # job fails, so their "Fail on skipped or failed ..." / "Evaluate job results" steps are
+          # derivative and are dropped. Any OTHER failed step in them (Tests complete runs the
+          # quarantine lint + evidence gate) is an independent fault and stays an item (Prism P1
+          # "Retain independent failures inside Tests complete", 6117082a).
+          AGG_JQ='def bad: . == "failure" or . == "timed_out";
+            def aggregate: .name | test("Tests complete|All required checks");
+            def independent_failed_steps: [.steps[]? | select(.conclusion | bad) | .name
+              | select(test("^Fail on skipped or failed |^Evaluate job results$") | not)];'
           sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
             local jobs failed id name ann got items=""
             jobs="$(run_jobs "$1")" || return 1
-            failed="$(jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "\(.id)\t\(.name)"' <<< "$jobs")" || return 1
+            failed="$(jq -r "$AGG_JQ"'
+              .jobs[] | select(.conclusion | bad)
+              | if aggregate then "-\t\(.name) / \(independent_failed_steps[])" else "\(.id)\t\(.name)" end' <<< "$jobs")" || return 1
             while IFS=$'\t' read -r id name; do
               [ -n "$id" ] || continue
+              if [ "$id" = - ]; then items+="$name"$'\n'; continue; fi
               got="$(api "check-runs/$id/annotations?per_page=100" < /dev/null)" || return 1
               ann="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
               if [ -n "$ann" ]; then
@@ -346,14 +360,19 @@ jobs:
             # timeout). timed_out counts as failed (Prism P1 f-ac6b7f1a201ac052). A failed job
             # whose name is not unique in the run cannot be matched by name, so the jq errors
             # and the red pages (Prism P1 f-96b4792f11201e3e).
-            ITEMS="$(run_jobs "$WF_RUN_ID" | jq -c '
-              def bad: . == "failure" or . == "timed_out";
+            # A failed step whose name repeats in its job cannot be matched by name either: the jq
+            # errors and the red pages (Prism P1 "Ambiguous steps", 6117082a). An aggregate job
+            # adds only its independent failed steps (AGG_JQ), never a stepless item.
+            ITEMS="$(run_jobs "$WF_RUN_ID" | jq -c "$AGG_JQ"'
               (.jobs | group_by(.name) | map(select(length > 1) | .[0].name)) as $dup
               | [.jobs[] | select(.conclusion | bad)
-                | select(.name | test("Tests complete|All required checks") | not)
                 | if (.name | IN($dup[])) then error("ambiguous job name: \(.name)") else . end
-                | . as $j | ([.steps[]? | select(.conclusion | bad) | [$j.name, .name]]
-                  | if length == 0 then [[$j.name, ""]] else . end)[]] | unique')" || ITEMS=error
+                | . as $j | [.steps[]?.name] as $names
+                | if aggregate then (independent_failed_steps[] | [$j.name, .])
+                  else ([.steps[]? | select(.conclusion | bad) | [$j.name, .name]]
+                    | if length == 0 then [[$j.name, ""]] else . end)[] end
+                | . as [$jn, $sn] | if $sn != "" and ([$names[] | select(. == $sn)] | length) > 1
+                  then error("ambiguous step name: \($jn) / \($sn)") else . end] | unique')" || ITEMS=error
             BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
             PREVS="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}" \
               | jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
@@ -373,8 +392,8 @@ jobs:
                 # e.g. path-classified CI skipped it; look further back). A stepless item
                 # [job, ""] is red only if that job also failed with no failed step there; a job
                 # that failed on a named step is a different fault (Prism P1 f-abb7efb339835ba6).
-                # A job name that is not unique in the prior run cannot be matched: page
-                # (Prism P1 f-96b4792f11201e3e).
+                # A job name, or a step name within the job, that is not unique in the prior run
+                # cannot be matched: page (Prism P1 f-96b4792f11201e3e, "Ambiguous steps").
                 ST="$(run_jobs "$prev" | jq -c --argjson items "$LEFT" '
                   def bad: . == "failure" or . == "timed_out";
                   . as $r | [$items[] as [$j, $s]
@@ -386,8 +405,9 @@ jobs:
                          elif ($job.conclusion // "" | bad) | not then "unknown"
                          elif [$job.steps[]? | select(.conclusion | bad)] == [] then "red"
                          else "differs" end)
-                      else ([$job.steps[]? | select(.name == $s)] | first) as $st
-                        | if $st == null then "unknown"
+                      else [$job.steps[]? | select(.name == $s)] as $sts | ($sts | first) as $st
+                        | if ($sts | length) > 1 then "ambiguous"
+                          elif $st == null then "unknown"
                           elif ($st.conclusion // "" | bad) then "red"
                           elif $st.conclusion == "success" then "green" else "unknown" end
                       end]')" || { LEFT=error; break; }
@@ -398,7 +418,7 @@ jobs:
                   LEFT=green; echo "page: a job that failed with no failed step failed on a named step in run $prev (a different fault)"; break
                 fi
                 if jq -e 'index("ambiguous")' <<< "$ST" > /dev/null; then
-                  LEFT=green; echo "page: a failed job name is not unique in run $prev"; break
+                  LEFT=green; echo "page: a failed job or step name is not unique in run $prev"; break
                 fi
                 NEXT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] != "red") | .value]' <<< "$LEFT")"
                 [ "$NEXT" != "$LEFT" ] && COVER="${COVER:+$COVER,}$prev"

@@ -1051,3 +1051,71 @@ def test_main_red_duplicate_job_name_in_the_prior_run_pages(tmp_path):
     api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)])
     got = _main_route(tmp_path, api)
     assert got["route"] == "alerts" and "not unique" in got["_stdout"], got["_stdout"]
+
+
+# --- Prism round 5 on 6117082a (t_1a8e095b) ------------------------------------------------------
+# "Ambiguous steps" (:389): two steps with one name in a job cannot be told apart by name. A failed
+# step name that repeats in this run's job, or in the prior run's job, pages.
+def test_main_red_duplicate_failed_step_name_in_this_run_pages(tmp_path):
+    current = {"jobs": [{"id": 700, "name": E2E, "conclusion": "failure",
+                         "steps": [{"name": E2E_STEP, "conclusion": "failure"},
+                                   {"name": E2E_STEP, "conclusion": "failure"}]}]}
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_duplicate_step_name_in_the_prior_run_pages(tmp_path):
+    # prior: first "Test" failed, the second (if: always()) passed; now the second fails too
+    prior = {"jobs": [{"id": 700, "name": E2E, "conclusion": "failure",
+                       "steps": [{"name": E2E_STEP, "conclusion": "failure"},
+                                 {"name": E2E_STEP, "conclusion": "success"}]}]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "not unique" in got["_stdout"], got["_stdout"]
+
+
+# "Retain independent failures inside Tests complete" (:352): the aggregate job's own quarantine
+# lint + evidence gate is an independent check. Its failure next to a known red pages; its
+# derivative "Fail on skipped or failed ..." step alone does not add an item.
+TC = "Python tests / Tests complete"
+QLINT = "Quarantine list lint + evidence gate"
+
+
+def _tc(qlint):
+    return (TC, "failure", {QLINT: qlint, "Fail on skipped or failed required tests": "failure"})
+
+
+def test_main_red_new_quarantine_gate_failure_in_tests_complete_pages(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("failure"))
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("success"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_derivative_tests_complete_failure_is_not_an_item(tmp_path):
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("success"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+
+
+def test_fold_blocked_by_a_quarantine_gate_failure_in_tests_complete(tmp_path):
+    # sig_of feeds the queue dedupe and the already-red fold: the independent step enters SIG.
+    api = _other_pr_queue_api()
+    tc = next(j for j in api["actions/runs/42/jobs"]["jobs"] if j["name"] == TC)
+    tc["steps"] = [{"name": QLINT, "conclusion": "failure"},
+                   {"name": "Fail on skipped or failed required tests", "conclusion": "failure"}]
+    got = _queue_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert f"{TC} / {QLINT}" in got["summary"]
+
+
+# Prism P2 "Argument Limit" (:229): a 100-job page is ~240 KB (run 37243401496), over Linux's
+# 128 KiB per-argument cap, so the jobs accumulator must not ride on argv. Big pages still route.
+def test_main_red_large_jobs_pages_do_not_ride_on_argv(tmp_path):
+    def fat(i):
+        return (f"filler {i}", "success", {f"step {k} " + "x" * 200: "success" for k in range(12)})
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
