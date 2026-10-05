@@ -594,6 +594,8 @@ def _load_script(name: str):
 
 
 class TestChokepointLint:
+    # Prism round 2 on #1740 @89400941 (c6776f3de251, e5692f755175, 38bb870fd733, feae905b4db1, c716b92b913e):
+    # each shape below is an unguarded mutation the previous checker accepted.
     """``scripts/check_service_definition_writers.py`` (CI lint): every service-definition write/remove in
     the gateway modules is DOMINATED by ``assert_may_mutate`` — the call precedes the mutation on the same
     path, unconditionally. A call that is merely present (unreachable, conditional, or after the write)
@@ -610,7 +612,7 @@ class TestChokepointLint:
 
         def _scan(body: str) -> list[str]:
             f = tmp_path / "hermes_cli" / "gateway_launchd.py"
-            f.write_text(body, encoding="utf-8")
+            f.write_text(_IMPORT + body, encoding="utf-8")  # the chokepoint must be the owner module's binding
             return guard.scan_file(f)
         return _scan
 
@@ -669,11 +671,12 @@ class TestChokepointLint:
             "def install(unit_path):\n    home = assert_may_mutate(unit_path, 'x', install=True)\n"
             "    if unit_path.exists():\n        with lock():\n            unit_path.write_text('b')\n"
             "    def _later():\n        unit_path.unlink()\n    _later()\n") == []
+        # Per-item admission in the SAME loop body as the item's removal is dominated.
         assert scan(
-            "def remove_legacy(units):\n    for name, path, sys_ in units:\n        try:\n"
-            "            assert_may_mutate(path, 'remove')\n        except ServiceMutationRefused:\n            continue\n"
-            "    def _remove_units(units):\n        for name, unit_path in units:\n            unit_path.unlink()\n"
-            "    _remove_units(units)\n") == []
+            "def remove_legacy(units):\n    def _remove_units(units):\n        for name, unit_path in units:\n"
+            "            try:\n                assert_may_mutate(unit_path, 'remove')\n"
+            "            except ServiceMutationRefused:\n                continue\n"
+            "            unit_path.unlink()\n    _remove_units(units)\n") == []
         # ...and the same loop with the admission AFTER the removal is still a hole.
         assert len(scan(
             "def remove_legacy(units):\n    def _remove_units(units):\n        for name, unit_path in units:\n"
@@ -700,16 +703,19 @@ class TestSpecifierHome:
     """Prism P1 b548fb4f89f3 (#1740): ``%h`` is the SERVICE MANAGER's home, never the caller's ``HOME``."""
 
     def test_user_unit_percent_h_uses_the_account_home_not_a_scratch_home(self, tmp_path, monkeypatch):
-        alice, scratch = tmp_path / "home" / "alice", tmp_path / "srv" / "scratch"
+        import os
+        import pwd
+        account = pwd.getpwuid(os.getuid()).pw_dir
+        scratch = tmp_path / "srv" / "scratch"
         monkeypatch.setenv("HOME", str(scratch))
-        monkeypatch.setenv("HERMES_REAL_HOME", str(alice))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(scratch))  # caller-controlled: must not steer %h either
         monkeypatch.setattr(Path, "home", staticmethod(lambda: scratch))
         unit = tmp_path / "user" / "hermes-gateway.service"
         unit.parent.mkdir()
         unit.write_text('[Service]\nEnvironment="HERMES_HOME=%h/.hermes"\n', encoding="utf-8")
-        assert gw._hermes_home_pinned_by_unit(unit) == f"{alice}/.hermes"
+        assert gw._hermes_home_pinned_by_unit(unit) == f"{account}/.hermes"
         from hermes_cli.gateway_service_owner import pinned_home
-        assert pinned_home(unit) == f"{alice}/.hermes"
+        assert pinned_home(unit) == f"{account}/.hermes"
 
     def test_system_unit_percent_h_is_the_system_manager_home(self, monkeypatch):
         import pwd
@@ -743,3 +749,75 @@ class TestUnknownServiceUser:
         with pytest.raises(_Stop):
             gw.systemd_install(system=True, run_as_user="nosuchuser-xyz", non_interactive=True)
         assert seen["pinned"] == gw._service_home_for_unit(tmp_path / "u.service", True)
+
+
+_IMPORT = "from hermes_cli.gateway_service_owner import assert_may_mutate\n"
+
+
+@pytest.mark.parametrize("src", [
+    # c6776f3de251 / e5692f755175: an admission loop that `continue`s past refusals, then removes EVERY unit.
+    "def remove_legacy(units):\n    for name, path, sys_ in units:\n        try:\n"
+    "            assert_may_mutate(path, 'remove')\n        except ServiceMutationRefused:\n            continue\n"
+    "    def _remove_units(units):\n        for name, unit_path in units:\n            unit_path.unlink()\n"
+    "    _remove_units(units)\n",
+    # ...and a loop that may run zero times dominates nothing after it.
+    "def f(unit_path, items):\n    for i in items:\n        assert_may_mutate(unit_path, 'x')\n    unit_path.unlink()\n",
+    # 38bb870fd733: calling an async / generator helper runs none of its body.
+    "async def _check(unit_path):\n    assert_may_mutate(unit_path, 'x')\n"
+    "def remove(unit_path):\n    _check(unit_path)\n    unit_path.unlink()\n",
+    "def _check(unit_path):\n    assert_may_mutate(unit_path, 'x')\n    yield\n"
+    "def remove(unit_path):\n    _check(unit_path)\n    unit_path.unlink()\n",
+    # feae905b4db1: an attribute call never resolves to the same-file guarded helper / the chokepoint.
+    "def check(unit_path):\n    assert_may_mutate(unit_path, 'x')\n"
+    "def remove(obj, unit_path):\n    obj.check(unit_path)\n    unit_path.unlink()\n",
+    "def remove(obj, unit_path):\n    obj.assert_may_mutate(unit_path)\n    unit_path.unlink()\n",
+    # c716b92b913e: a `finally: return` swallows the refusal the handler re-raised.
+    "def _check(unit_path):\n    try:\n        assert_may_mutate(unit_path, 'x')\n    except Exception:\n        raise\n"
+    "    finally:\n        return\n"
+    "def write(unit_path):\n    _check(unit_path)\n    unit_path.write_text('b')\n",
+], ids=["admission-loop-then-remove-all", "zero-trip-loop", "async-helper", "generator-helper",
+        "attribute-helper", "attribute-chokepoint", "finally-return"])
+def test_chokepoint_lint_rejects_round2_bypasses(tmp_path, src):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "csdw", Path(__file__).resolve().parents[2] / "scripts" / "check_service_definition_writers.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert len(mod._Scanner(_IMPORT + src, "x.py").problems()) == 1
+
+
+def test_chokepoint_lint_requires_the_real_binding(tmp_path):
+    """A local name ``assert_may_mutate`` that is not the owner module's import guards nothing."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "csdw", Path(__file__).resolve().parents[2] / "scripts" / "check_service_definition_writers.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    body = "def w(unit_path):\n    assert_may_mutate(unit_path, 'x')\n    unit_path.unlink()\n"
+    assert mod._Scanner(_IMPORT + body, "x.py").problems() == []
+    assert len(mod._Scanner("def assert_may_mutate(*a):\n    pass\n" + body, "x.py").problems()) == 1
+    assert len(mod._Scanner(body, "x.py").problems()) == 1
+
+
+def test_percent_h_ignores_the_callers_home_variables(tmp_path, monkeypatch):
+    """Prism P1 168c0ec5a75d: with HERMES_REAL_HOME unset and HOME=/srv/scratch, %h is still the account's
+    passwd home (the user manager of this uid), never the caller's HOME."""
+    import pwd
+    import os
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "srv-scratch"))
+    unit = tmp_path / "user" / "hermes-gateway.service"
+    unit.parent.mkdir()
+    unit.write_text('[Service]\nEnvironment="HERMES_HOME=%h/.hermes"\n', encoding="utf-8")
+    assert gw._hermes_home_pinned_by_unit(unit) == pwd.getpwuid(os.getuid()).pw_dir + "/.hermes"
+
+
+def test_quoted_environment_file_is_ignored_like_systemd(tmp_path):
+    """Prism 3f8c219b4168 (false): systemd passes EnvironmentFile='s raw rvalue to path_simplify_and_warn
+    (PATH_CHECK_ABSOLUTE, load-fragment.c config_parse_unit_env_file) without unquoting, so a quoted path is
+    not absolute and the directive is IGNORED; the file never overrides the fragment. The parser agrees."""
+    env_file = tmp_path / "gw.env"
+    env_file.write_text("HERMES_HOME=/srv/b\n", encoding="utf-8")
+    unit = tmp_path / "u.service"
+    unit.write_text(f'[Service]\nEnvironment=HERMES_HOME=/srv/a\nEnvironmentFile="{env_file}"\n', encoding="utf-8")
+    assert gw._hermes_home_pinned_by_unit(unit) == "/srv/a"

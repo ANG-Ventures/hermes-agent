@@ -195,16 +195,17 @@ def manager_home_for_unit(unit_path: Path) -> str:
     """What systemd expands ``%h`` to for the unit at *unit_path*: the home of the user running the service
     manager. System manager: root's home (``User=`` does not change it). User manager: the ACCOUNT home, never
     the caller's ``HOME`` - a scratch process with ``HOME=/srv/scratch`` read another account's
-    ``HERMES_HOME=%h/.hermes`` as its own scratch home and passed the ownership check (Prism on #1740)."""
+    ``HERMES_HOME=%h/.hermes`` as its own scratch home and passed the ownership check (Prism on #1740).
+    Both come from the passwd database by uid (``systemctl --user`` reaches the manager of this process's
+    uid), never from ``HOME`` / ``HERMES_REAL_HOME``, which the caller controls."""
     import pwd
-    from hermes_constants import get_real_home
     path = str(unit_path)
-    if any(path == d or path.startswith(d + "/") for d in _SYSTEM_UNIT_DIRS):
-        try:
-            return pwd.getpwuid(0).pw_dir
-        except KeyError:
-            return "/root"
-    return get_real_home()
+    uid = 0 if any(path == d or path.startswith(d + "/") for d in _SYSTEM_UNIT_DIRS) else os.getuid()
+    try:
+        return pwd.getpwuid(uid).pw_dir
+    except KeyError:
+        # No passwd entry: no home systemd could expand %h to; a value no caller's home can equal.
+        return "/nonexistent" if uid else "/root"
 
 
 def _spec(v: str, account_home: str | None) -> str:

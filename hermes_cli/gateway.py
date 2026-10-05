@@ -2692,22 +2692,19 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
     # worker's process) is left alone; the refusal is reported in `remaining`, not raised, so the
     # caller's install goes on with the other units.
     from hermes_cli.gateway_service_owner import ServiceMutationRefused, assert_may_mutate
-    admitted, refused = [], []
-    for name, path, is_system in legacy:
-        try:
-            assert_may_mutate(path, "remove the legacy unit", _service_home_for_unit(path, is_system))
-        except ServiceMutationRefused:
-            refused.append(path)
-            continue
-        admitted.append((name, path, is_system))
-    legacy = admitted
 
     removed = 0
-    remaining: list[Path] = list(refused)
+    remaining: list[Path] = []
 
     def _remove_units(units: list[tuple[str, Path]], *, system: bool) -> None:
         nonlocal removed
         for name, path in units:
+            # Per item, in the loop that removes it: a refused unit is never stopped, disabled or unlinked.
+            try:
+                assert_may_mutate(path, "remove the legacy unit", _service_home_for_unit(path, system))
+            except ServiceMutationRefused:
+                remaining.append(path)
+                continue
             try:
                 _run_systemctl(["stop", name], system=system, check=False, timeout=90)
                 _run_systemctl(["disable", name], system=system, check=False, timeout=30)

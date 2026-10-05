@@ -18,10 +18,16 @@ STATEMENT among the siblings that PRECEDE it at some level. A chokepoint stateme
   * a call to a same-file function that is GUARDED FROM ENTRY: its own top-level body reaches a chokepoint
     statement with nothing but docstring / imports / assignments / ``pass`` / plain expressions before it
     (no ``if``/``return``/``try`` that could skip it);
-  * ``try:`` whose FIRST statement is a chokepoint statement and whose every ``except`` handler ends in
-    ``return`` / ``raise`` / ``continue`` / ``break`` (a refusal leaves the path, never falls through);
-  * ``for``/``while`` whose FIRST body statement is a chokepoint statement (per-item admission: an item the
-    chokepoint refuses never reaches the removal that follows the loop).
+  * ``try:`` whose FIRST statement is a chokepoint statement, whose every ``except`` handler ends in
+    ``return`` / ``raise`` / ``continue`` / ``break`` (a refusal leaves the path, never falls through), and
+    whose ``finally`` cannot ``return`` / ``break`` / ``continue`` (that would swallow the refusal).
+
+A loop is never a chokepoint for what follows it: it may run zero times, and a refused item that
+``continue``s leaves the loop's later items, and every statement after the loop, undominated. Per-item
+admission therefore sits in the SAME loop body as the item's mutation. Only a direct call resolves: the
+chokepoint is the name ``assert_may_mutate`` imported from ``hermes_cli.gateway_service_owner``, and a guarded
+helper is a module-level, plain (not ``async``, not generator) ``def`` called by its bare name; ``obj.name()``
+never matches, since the attribute may resolve to anything.
 
 Suppress a true false positive with ``# service-owner: ok — <why>`` on the mutator's line.
 
@@ -39,6 +45,7 @@ DEFAULT_FILES = ("hermes_cli/gateway.py", "hermes_cli/gateway_launchd.py")
 MUTATORS = {"write_text", "write_bytes", "unlink"}
 DEFINITION_RE = re.compile(r"\b(unit_path|plist_path|dropin|unit|plist)\b")
 CHOKEPOINT = "assert_may_mutate"
+CHOKEPOINT_MODULE = "hermes_cli.gateway_service_owner"
 SUPPRESS = "# service-owner: ok"
 
 _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -50,10 +57,20 @@ _BLOCK_FIELDS = ("body", "orelse", "finalbody")
 
 
 def _callee_name(node: ast.AST) -> str | None:
+    """Bare-name callee only: ``obj.check()`` may resolve to any object's method, so it never matches."""
     if not isinstance(node, ast.Call):
         return None
-    f = node.func
-    return f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+    return node.func.id if isinstance(node.func, ast.Name) else None
+
+
+def _own_nodes(stmts: list[ast.stmt]):
+    """Every node under *stmts* except the bodies of nested function/class definitions."""
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            stack.extend(ast.iter_child_nodes(node))
 
 
 def _stmt_call(stmt: ast.stmt) -> str | None:
@@ -68,7 +85,13 @@ class _Scanner:
         self.src, self.rel = src, rel
         self.lines = src.splitlines()
         tree = ast.parse(src)
-        self.functions = {n.name: n for n in ast.walk(tree) if isinstance(n, _FUNCS)}
+        # Calling an async or generator function runs none of its body, so neither can guard its caller.
+        self.functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)
+                          and not any(isinstance(x, (ast.Yield, ast.YieldFrom)) for x in _own_nodes(n.body))}
+        self.chokepoint_bound = CHOKEPOINT not in self.functions and any(
+            isinstance(n, ast.ImportFrom) and n.module == CHOKEPOINT_MODULE
+            and any(a.name == CHOKEPOINT and a.asname in (None, CHOKEPOINT) for a in n.names)
+            for n in ast.walk(tree))
         self._guarded: dict[str, bool] = {}
         # statement -> (its block, index in that block, statement owning the block or None at module level)
         self.place: dict[ast.stmt, tuple[list[ast.stmt], int, ast.stmt | None]] = {}
@@ -110,12 +133,11 @@ class _Scanner:
     def is_chokepoint(self, stmt: ast.stmt, seen: frozenset[str] = frozenset()) -> bool:
         call = _stmt_call(stmt)
         if call is not None:
-            return call == CHOKEPOINT or self.guarded_from_entry(call, seen)
+            return (call == CHOKEPOINT and self.chokepoint_bound) or self.guarded_from_entry(call, seen)
         if isinstance(stmt, ast.Try):
             return bool(stmt.body) and self.is_chokepoint(stmt.body[0], seen) and all(
-                h.body and isinstance(h.body[-1], _EXITS) for h in stmt.handlers)
-        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-            return bool(stmt.body) and self.is_chokepoint(stmt.body[0], seen)
+                h.body and isinstance(h.body[-1], _EXITS) for h in stmt.handlers) and not any(
+                isinstance(n, (ast.Return, ast.Break, ast.Continue)) for n in _own_nodes(stmt.finalbody))
         return False
 
     # -- dominance ---------------------------------------------------------------------------------
