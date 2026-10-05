@@ -483,12 +483,25 @@
     "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/gateway/test_telegram_intake_sentinel.py",
-      "tests/fork_canaries/test_fork_canary_telegram_intake_sentinel.py"
+      "tests/fork_canaries/test_fork_canary_telegram_intake_sentinel.py",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_before_group_zero_on_connect",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_on_rebuilt_app_after_failed_initialize",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_before_group_zero_handler_runs",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_handler_raises",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_filters_the_update_out"
+    ],
+    "call_site": "plugins/platforms/telegram/adapter.py::TelegramAdapter._register_handlers",
+    "call_site_tests": [
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_before_group_zero_on_connect",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_on_rebuilt_app_after_failed_initialize",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_before_group_zero_handler_runs",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_handler_raises",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_filters_the_update_out"
     ],
     "paths": [
       "plugins/platforms/telegram/adapter.py"
     ],
-    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler — gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the registration priority and the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not.",
+    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler — gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not. The registration priority is driven through the real PTB Application (call_site_tests).",
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
