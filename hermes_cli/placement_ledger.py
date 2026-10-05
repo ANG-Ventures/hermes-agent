@@ -150,7 +150,7 @@ def projected(host: str, load1: float, reservations: Iterable[Reservation], *,
 @contextlib.contextmanager
 def _locked(path: Path, wait_s: float = LOCK_WAIT_SECONDS):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path.with_name(path.name + ".lock"), "a")  # noqa: SIM115 - closed in finally
+    fh = open(path.with_name(path.name + ".lock"), "a", encoding="utf-8")  # noqa: SIM115 - closed in finally
     try:
         if fcntl is not None:
             deadline = time.monotonic() + wait_s
