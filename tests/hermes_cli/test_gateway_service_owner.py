@@ -158,7 +158,8 @@ class TestSystemdWriters:
         hand_managed = ("ExecStart=/opt/v/venv/bin/python -m hermes_cli.main gateway run --replace\n"
                         f'Environment="HERMES_HOME={homes.real}"\n')
         systemd_unit.path.write_text(hand_managed, encoding="utf-8")
-        gw.systemd_install(non_interactive=True)
+        with pytest.raises(SystemExit):  # refused, and non-zero so no caller starts the protected unit
+            gw.systemd_install(non_interactive=True)
         assert legacy_units == []
         assert systemd_unit.path.read_text(encoding="utf-8") == hand_managed
 
