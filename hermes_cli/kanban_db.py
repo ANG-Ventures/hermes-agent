@@ -3920,6 +3920,12 @@ def _actor_profiles(actor: MutationActor) -> frozenset[str]:
     return frozenset({actor.profile} if actor.profile else ())
 
 
+# What sent an operator send-back back (request_changes ``operator_kind``).
+OPERATOR_KIND_HUMAN = "human"
+OPERATOR_KIND_MACHINE = "machine"
+OPERATOR_KINDS: tuple[str, ...] = (OPERATOR_KIND_HUMAN, OPERATOR_KIND_MACHINE)
+
+
 def _valid_operator_reason(reason: str) -> bool:
     who, sep, why = reason.partition(":")
     return bool(sep and who.strip() and why.strip())
@@ -7150,6 +7156,10 @@ def _validate_comment_provenance(
     return run_id, session_ref
 
 
+# Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
+_CLAIMED_AUTHOR_MAX = 200
+
+
 def add_comment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7158,6 +7168,7 @@ def add_comment(
     *,
     run_id: Optional[int] = None,
     session_ref: Optional[str] = None,
+    claimed_author: Optional[str] = None,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -7165,11 +7176,22 @@ def add_comment(
     ``hermes_cli.kanban_identity.resolve_comment_provenance``), never from
     caller-supplied tool args or comment text — the same rule ``author`` already
     follows.
+
+    ``claimed_author`` is an author label the caller asked for but was not
+    allowed to use (``kanban comment --author`` without the operator token).
+    It is recorded on the ``commented`` event and the journal only; every
+    reader of ``task_comments.author`` keeps seeing the real author.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if claimed_author is not None:
+        if not isinstance(claimed_author, str) or not claimed_author.strip():
+            raise ValueError("claimed_author must be a non-empty string")
+        if len(claimed_author) > _CLAIMED_AUTHOR_MAX:
+            raise ValueError(f"claimed_author longer than {_CLAIMED_AUTHOR_MAX} chars")
+        claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
     if _is_delegated_child():
@@ -7182,12 +7204,15 @@ def add_comment(
         conn.execute("PRAGMA query_only=OFF")
         try:
             return _add_comment_txn(
-                conn, task_id, author, body, run_id, session_ref, now
+                conn, task_id, author, body, run_id, session_ref, now,
+                claimed_author,
             )
         finally:
             conn.execute("PRAGMA query_only=ON")
             _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
-    return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now)
+    return _add_comment_txn(
+        conn, task_id, author, body, run_id, session_ref, now, claimed_author
+    )
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7209,6 +7234,7 @@ def _add_comment_txn(
     run_id: Optional[int],
     session_ref: Optional[str],
     now: int,
+    claimed_author: Optional[str] = None,
 ) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -7233,6 +7259,7 @@ def _add_comment_txn(
                 # Non-secret fingerprint only, so the event log stays
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
+                **({"claimed_author": claimed_author} if claimed_author else {}),
             },
             run_id=run_id,
         )
@@ -7256,6 +7283,7 @@ def _add_comment_txn(
                     "session_ref": session_ref,
                     "created_at": now,
                     "comment_id": int(cur.lastrowid or 0),
+                    **({"claimed_author": claimed_author} if claimed_author else {}),
                 },
                 actor=author.strip(),
                 run_id=run_id,
@@ -12843,6 +12871,7 @@ def request_changes(
     coverage: Optional[str] = None,
     session_ref: Optional[str] = None,
     operator: Optional[str] = None,
+    operator_kind: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -12880,12 +12909,25 @@ def request_changes(
     ``operator_override`` event on the closed run. A non-operator caller or a
     reason without ``who: why`` is refused before anything is written. The
     coverage gate is unchanged for every call without it.
+
+    ``operator_kind`` (:data:`OPERATOR_KINDS`, default ``human``) says what
+    sent an operator send-back back: ``machine`` for automation (the
+    hermes-home merge pass's Prism HOLD-FR). It is recorded on the
+    ``changes_requested`` event as ``operator_kind`` so a landing gate keys on
+    a FIELD, not on the operator string, to tell a human CHANGES REQUESTED
+    (holds a landing) from a machine send-back (never holds; t_86ca5b3d).
+    Without ``operator`` it is refused.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
     # Same normalization as the home-guard actor, so its dedupe matches.
     operator_reason = (str(operator).strip() or None) if operator else None
+    kind = str(operator_kind).strip().lower() if operator_kind is not None else None
+    if kind is not None and kind not in OPERATOR_KINDS:
+        return False, f"operator_kind must be one of {', '.join(OPERATOR_KINDS)}"
+    if kind is not None and operator_reason is None:
+        return False, "operator_kind needs --operator \"<who: why>\""
     if operator_reason is not None:
         refusal = _operator_send_back_refusal(task_id, operator_reason)
         if refusal is not None:
@@ -13012,7 +13054,8 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
-                **({"operator": operator_reason} if operator_reason else {}),
+                **({"operator": operator_reason,
+                    "operator_kind": kind or OPERATOR_KIND_HUMAN} if operator_reason else {}),
             },
             run_id=run_id,
         )

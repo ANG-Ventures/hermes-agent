@@ -128,6 +128,47 @@ def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
     assert kwp.load_pool(tmp_path, kanban_cfg={})[0] == []
 
 
+def _studio_registered(fleet: Path, policy_hosts=None):
+    """The QA t_1302fe6c repro: mac-studio carries the kanban-worker role and
+    sits FIRST in the sidecar priority, while the placement policy says
+    ``targets: false``."""
+    roles = {"schema": 1, "hosts": {
+        h: {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}
+        for h in ("mac-studio", "ace-ai", "ace-media")}}
+    side = {"schema": 1, "ssh_user": "kanbanw", "capacity_pct": 0.8,
+            "priority": ["mac-studio", "ace-ai", "ace-media"], "profiles": ["alpha"],
+            "hosts": {h: {"enabled": True, "absence": "optional"}
+                      for h in ("mac-studio", "ace-ai", "ace-media")}}
+    _write_pool(fleet, roles=roles, sidecar=side)
+    if policy_hosts is not None:
+        (fleet / "placement-policy.json").write_text(
+            json.dumps({"schema": 1, "hosts": policy_hosts}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("policy_hosts", [
+    {"mac-studio": {"class": "studio-source", "targets": False},
+     "ace-ai": {"class": "linux-shared"}, "ace-media": {"class": "linux-shared"}},
+    None,  # no policy file: the PRD fallback still names the Studio targets:false
+], ids=["policy-file", "fallback"])
+def test_targets_false_host_is_dropped_and_never_gets_a_slot(tmp_path, policy_hosts):
+    """Placement PRD I-1 / AC-5: a ``targets: false`` host is skipped at
+    runtime even when the pool files register it first."""
+    _studio_registered(tmp_path, policy_hosts)
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai", "ace-media"]
+    assert any("mac-studio" in w and "targets:false" in w for w in cfg.warnings)
+    p = kwp.plan(list(cfg.pool_hosts), {}, probe=lambda h: (0.0, 16), config=cfg)
+    taken = [p.take("alpha") for _ in range(8)]
+    assert [h.name for h in taken] == ["ace-ai"] * 4 + ["ace-media"] * 4
+    assert "mac-studio" not in p.slots
+    assert p.take("alpha", pin="mac-studio") is None and p.refusal == "pin_host_dropped"
+
+
+def test_targets_true_or_absent_keeps_the_host(tmp_path):
+    _studio_registered(tmp_path, {"mac-studio": {"class": "linux-shared", "targets": True}})
+    assert [h.name for h in kwp.read_pool(tmp_path).pool_hosts] == ["mac-studio", "ace-ai", "ace-media"]
+
+
 def test_reader_refuses_coexistence_with_retired_worker_hosts(tmp_path):
     _write_pool(tmp_path)
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={"worker_hosts": [{"name": "x"}]})
@@ -468,6 +509,20 @@ def test_pool_unavailable_pins_are_logged(kanban_home, caplog):
         _tick(conn, spillover=None, spawn_limit=4)
     assert any("wait pool_unavailable" in r.getMessage() for r in caplog.records)
 
+
+
+def test_remote_pin_below_a_prose_host_header_still_waits_without_a_plan(kanban_home):
+    """Prism 56085b64 (Pin Bypass): a ``Host:`` header above a real pin made
+    ``resolve_pin`` return both a pin and an ignored word, and the no-plan
+    branch only recorded ``pool_unavailable`` when nothing was ignored, so
+    the remote pin spawned LOCALLY (breaks I-11)."""
+    _write_pool(kanban_home / "fleet")
+    with kb.connect_closing() as conn:
+        (pinned,) = _make(conn, 1, body="Host: example.com\nhost:ace-ai")
+        (plain,) = _make(conn, 1)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert spawned == [(plain, None)]
+    assert res.placement_waits[pinned] == "pool_unavailable"
 
 
 # -- Apollo review r1 (PR #1730) -------------------------------------------

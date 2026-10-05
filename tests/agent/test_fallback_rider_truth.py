@@ -248,6 +248,42 @@ def test_live_2118_empty_reply_line(_home, monkeypatch):
         assert banned not in text, (banned, text)
 
 
+def test_gave_up_line_and_row_carry_request_ids_and_prompt(_home, monkeypatch):
+    """t_c706fd1e: the 10-05 14:09 ladder (sub-vps-8 x2 + sub-vps-15, ~342k
+    prompt). The banner names each billed attempt's request id and the prompt
+    size; the fallback_events row stores both plus the elapsed time."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    usage = type("U", (), {"output_tokens": 243, "input_tokens": 2,
+                           "cache_read_input_tokens": 16008,
+                           "cache_creation_input_tokens": 326348})()
+    rids = "req_011CfjmrBqPSu3XPnAWyFRQW,req_011CfjmsQRi8Scuyg1ioPky7,req_011CfjmtY76qe92qW4bgDwDP"
+    resp = type("R", (), {"content": [], "stop_reason": "tool_use", "usage": usage,
+                          "pool_headers": {
+                              "x-pool-served-by": "sub-vps-15",
+                              "x-pool-route-id": "1aaf70a13df541858a26076c149a60a0",
+                              "x-pool-empty-content-retried": "gave_up",
+                              "x-pool-empty-content-attempts": "sub-vps-8,sub-vps-8,sub-vps-15",
+                              "x-pool-empty-content-request-ids": rids,
+                          }})()
+    fbe.stash_response_failure(a, "invalid_response", resp, elapsed_s=47.4, repeat=True)
+    assert try_activate_fallback(a) is True
+    row = _rows(_home)[0]
+    text = row["notice_text"]
+    assert " — empty reply from Anthropic ×3 (sub-vps-8, sub-vps-8, sub-vps-15; req_…" in text, text
+    for rid in rids.split(","):
+        assert f"req_…{rid[-6:]}" in text, (rid, text)
+    assert " prompt 342k tok — relay retried, gave up" in text, text
+    assert row["request_ids"] == rids
+    assert row["prompt_tokens"] == 2 + 16008 + 326348
+    assert row["elapsed_s"] == 47.4
+    assert row["trigger_class"] == "provider_invalid_response"
+
+
 def test_live_2125_seat_timeout_line(_home, monkeypatch):
     from agent.chat_completion_helpers import try_activate_fallback
     from agent.error_classifier import FailoverReason

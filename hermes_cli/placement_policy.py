@@ -9,7 +9,8 @@ kanban adapter needs (Phase 1b, t_1e4b9684):
 * ``classes.<class>.kanban`` warm/hot ``load_ratio`` + ``hot_streak`` /
   ``clear_streak`` (F-5);
 * ``consumers.<c>`` ``cpu_est_prior`` / ``ramp_s`` / ``ttl_s`` (I-8, RC5);
-* ``hosts.<h>`` ``class`` and ``max_slots.<c>`` (I-7 clamp).
+* ``hosts.<h>`` ``class`` and ``max_slots.<c>`` (I-7 clamp);
+* ``hosts.<h>.targets`` (I-1: ``false`` = never a placement target).
 
 Until the file is promoted to schema 1 (Phase 1a), ``_FALLBACK`` carries the
 PRD §5.3 numbers (each one lifted from the code named in the Phase 0 draft).
@@ -44,6 +45,7 @@ _FALLBACK: Dict[str, Any] = {
         "ace-ai": {"class": "linux-shared", "max_slots": {"kanban": 4, "ci": 8, "prism": 12}},
         "ace-media": {"class": "linux-shared", "max_slots": {"kanban": 4, "ci": 8, "prism": 2}},
         "ci-box": {"class": "linux-shared"},
+        "mac-studio": {"class": "studio-source", "targets": False},
     },
 }
 DEFAULT_CLASS = "linux-shared"
@@ -94,6 +96,11 @@ class PlacementPolicy:
 
     def host_class(self, host: str) -> str:
         return str(self._pick("hosts", host, "class") or DEFAULT_CLASS)
+
+    def targets(self, host: str) -> bool:
+        """False iff the policy row says ``targets: false`` (I-1). Any other
+        value, or no row, is a target."""
+        return self._pick("hosts", host, "targets") is not False
 
     def kanban_band(self, host: str) -> KanbanBand:
         cls = self.host_class(host)

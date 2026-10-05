@@ -2658,7 +2658,14 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    author, claimed = _comment_author(args.author)
+    if claimed is not None:
+        print(
+            f"kanban: --author {claimed!r} needs the operator token "
+            f"({kb.OPERATOR_TOKEN_ENV}); commenting as {author!r}, "
+            "the requested author is kept as claimed_author",
+            file=sys.stderr,
+        )
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
         if run_id is None:
@@ -2667,10 +2674,33 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             run_id = _operator_review_run_id(conn, args.task_id)
         kb.add_comment(
             conn, args.task_id, author, body,
-            run_id=run_id, session_ref=session_ref,
+            run_id=run_id, session_ref=session_ref, claimed_author=claimed,
         )
     print(f"Comment added to {args.task_id}")
     return 0
+
+
+def _comment_author(requested: Optional[str]) -> tuple[str, Optional[str]]:
+    """``(author, claimed_author)`` for a CLI comment.
+
+    ``env -u HERMES_KANBAN_TASK hermes kanban comment --author human:apollo``
+    wrote an operator-labelled comment from any worker shell (Prism gate spec
+    §8b). ``--author`` may now never raise a caller above its own identity: it
+    is honoured for an operator-profile caller (``RULING_AUTHORS``, already the
+    label every reader trusts, so a chosen label grants nothing; fleet crons run
+    there and deliberately pick NON-operator labels such as ``land-autopilot``),
+    or with the operator token (the same gate as ``--operator``/``--takeover``).
+    Any other caller writes as itself; the requested label survives only as
+    ``claimed_author`` on the ``commented`` event, for forensics.
+    """
+    from hermes_cli.kanban_worker_policy import RULING_AUTHORS
+
+    caller = _profile_author()
+    want = (requested or "").strip()
+    if (not want or want == caller or caller.strip().lower() in RULING_AUTHORS
+            or kb._operator_token_state() == "ok"):
+        return want or caller, None
+    return caller, want
 
 
 def _cmd_attach(args: argparse.Namespace) -> int:
@@ -3552,6 +3582,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             reason=reason,
             expected_run_id=held_run,
             operator=operator,
+            operator_kind=getattr(args, "operator_kind", None),
             # The coverage comment is written inside the transition's
             # transaction, so a refused send-back rolls it back. ``claimer``
             # authors it; on a parked card it also opens the review run.

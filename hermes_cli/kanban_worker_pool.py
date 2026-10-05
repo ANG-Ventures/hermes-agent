@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from hermes_cli import placement_ledger as _ledger
+from hermes_cli import placement_policy as _policy
 
 ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
@@ -251,6 +252,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     warnings: List[str] = []
     hosts: List[PoolHost] = []
     disabled: List[str] = []
+    policy = _policy.load(fleet_dir)
     for i, hid in enumerate(prio):
         row = rows.get(hid)
         if row is None:
@@ -258,6 +260,11 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             continue
         if not row["enabled"]:
             disabled.append(hid)
+            continue
+        if not policy.targets(hid):
+            # Placement PRD I-1: the runtime assertion, not only the lint.
+            warnings.append(f"kanban pool: {hid} is targets:false in placement-policy.json "
+                            "(never a placement target; host dropped)")
             continue
         if hid not in with_role:
             warnings.append(f"kanban pool: {hid} is enabled but has no {ROLE} role (host dropped)")
@@ -534,14 +541,20 @@ def advance_streak(prev: Optional[Mapping], at: Optional[float], band: str, *,
                    hot_streak: int, clear_streak: int, now: float,
                    discard_after_s: float) -> dict:
     """One sample's step of the per-host hysteresis (F-5). A repeated ``at``
-    is a no-op; UNKNOWN resets; state older than ``discard_after_s`` is
-    discarded first."""
+    is a no-op; state older than ``discard_after_s`` is discarded first.
+
+    UNKNOWN neither builds nor erases a streak (I-3, F-5 addendum t_36840c8a):
+    the state is kept as-is, ``updated`` included, so an earned hot verdict
+    still needs ``clear_streak`` fresh non-hot samples and a host that stays
+    UNKNOWN past ``discard_after_s`` starts over. ``plan()`` refuses the
+    UNKNOWN tick itself."""
     st = dict(prev) if isinstance(prev, Mapping) else {}
     updated = st.get("updated")
     if not isinstance(updated, (int, float)) or now - float(updated) > discard_after_s:
         st = {}
     if band == BAND_UNKNOWN or at is None:
-        return {"at": None, "hot": False, "hot_run": 0, "clear_run": 0, "updated": now}
+        return {"at": st.get("at"), "hot": bool(st.get("hot")), "hot_run": int(st.get("hot_run") or 0),
+                "clear_run": int(st.get("clear_run") or 0), "updated": st.get("updated")}
     if st.get("at") == at:
         return st
     hot, hot_run, clear_run = bool(st.get("hot")), int(st.get("hot_run") or 0), int(st.get("clear_run") or 0)
