@@ -806,6 +806,41 @@ def test_known_bringup_refusal_is_rejected_before_any_secondary_is_touched(fleet
     assert fleet.ops == [] and _config_flag(fleet.root) is None and not (fleet.root / gm.MANIFEST_NAME).exists()
 
 
+def test_default_install_the_writer_would_refuse_is_rejected_before_any_secondary_is_touched(fleet, monkeypatch, capsys):
+    """Prism P0 on #1740: the default's install runs only after every secondary's service is removed, and
+    systemd_install/launchd_install now exit for a home outside the account tree. The preflight asks the
+    same admission question first, so nothing is removed and the host keeps its gateways."""
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gm, "_preflight_apply", _real_preflight)
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {fleet.root.parent.parent / "elsewhere"})
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "before changing anything" in out and "would be refused" in out
+    assert fleet.ops == [] and _config_flag(fleet.root) is None and not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_default_unit_path_pinning_another_home_is_rejected_before_any_secondary_is_touched(fleet, monkeypatch, capsys):
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gm, "_preflight_apply", _real_preflight)
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {fleet.root.resolve()})
+    with gm._home_env(fleet.root):
+        unit = gw.get_systemd_unit_path(system=False)
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text('[Service]\nEnvironment="HERMES_HOME=/srv/other-install"\n', encoding="utf-8")
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
+    out = capsys.readouterr().out
+    assert "before changing anything" in out and "/srv/other-install" in out
+    assert fleet.ops == [] and not (fleet.root / gm.MANIFEST_NAME).exists()
+
+
+def test_admitted_default_still_migrates_with_the_real_preflight(fleet, monkeypatch):
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gm, "_preflight_apply", _real_preflight)
+    monkeypatch.setattr(gw, "_native_service_homes", lambda: {fleet.root.resolve()})
+    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is True
+    assert ("default", "install") in fleet.ops
+
+
 def test_unknown_default_system_principal_blocks_the_update_hook(fleet, tmp_path, monkeypatch, capsys):
     """Mirror of the unknown-secondary case: the default's system unit names a User= this host cannot
     resolve while both secondaries are known root system units. Folding INTO an unidentifiable

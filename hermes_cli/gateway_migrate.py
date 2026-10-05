@@ -985,6 +985,31 @@ def _preflight_apply(plan: MigrationPlan, target: Optional[tuple[str, bool]], ru
                 pwd.getpwnam(run_as_user)
             except KeyError:
                 return f"default: the recorded service user '{run_as_user}' does not exist on this host"
+    if plan.default.service is None and target is not None:
+        return _default_install_admission_blocker(plan.default_home, target)
+    return None
+
+
+def _default_install_admission_blocker(default_home: Path, target: tuple[str, bool]) -> Optional[str]:
+    """The refusal ``systemd_install``/``launchd_install`` would raise for the default's install, found
+    before any secondary is removed. Those writers exit for a home outside the account's Hermes tree and
+    for a same-named definition pinning another home; the apply only installs the default AFTER every
+    secondary's service is gone, so learning it there leaves the host with no service-managed gateway."""
+    kind, system = target
+    if kind not in ("systemd", "launchd"):
+        return None
+    from hermes_cli import gateway as gw
+    from hermes_cli.gateway_service_owner import foreign_pinned_home, home_may_install_service
+    with _home_env(default_home):
+        if not home_may_install_service(default_home):
+            return (f"default: a gateway service for HERMES_HOME={default_home} would be refused (outside this "
+                    "account's Hermes tree and not a registered profile); install it with "
+                    "`hermes gateway install --force-unit-path` first if this home is meant to own one")
+        path = gw.get_launchd_plist_path() if kind == "launchd" else gw.get_systemd_unit_path(system=system)
+        other = foreign_pinned_home(path, default_home) if path.exists() else None
+    if other is not None:
+        return (f"default: {path} already runs HERMES_HOME={other}, so installing the default's gateway "
+                "there would be refused; resolve that service first")
     return None
 
 

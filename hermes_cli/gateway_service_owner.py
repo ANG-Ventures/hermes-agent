@@ -52,13 +52,24 @@ def _resolve(raw: str | Path) -> Path | None:
         return None
 
 
-def definition_belongs_to_home(definition_path: Path, home: Path, action: str) -> bool:
-    """False (with a warning) when the existing definition pins a ``HERMES_HOME`` other than *home*.
+def foreign_pinned_home(definition_path: Path, home: Path) -> str | None:
+    """The ``HERMES_HOME`` the definition at *definition_path* pins when that is not *home*, else None.
 
     A definition with no pinned home (hand-written, pre-pinning) is not claimed by anyone else.
     """
     raw = pinned_home(definition_path)
     if raw is None or _resolve(raw) == _resolve(home):
+        return None
+    return raw
+
+
+def definition_belongs_to_home(definition_path: Path, home: Path, action: str) -> bool:
+    """False (with a warning) when the existing definition pins a ``HERMES_HOME`` other than *home*.
+
+    A definition with no pinned home (hand-written, pre-pinning) is not claimed by anyone else.
+    """
+    raw = foreign_pinned_home(definition_path, home)
+    if raw is None:
         return True
     print(f"✗ Refusing to {action} {definition_path}: it runs HERMES_HOME={raw}, "
           f"but this process has HERMES_HOME={home}.")
