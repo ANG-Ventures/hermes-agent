@@ -1221,6 +1221,7 @@ hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body 
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
+hermes kanban diagnostics --placement [--json]         # read-only pool view: band, streak, projected() per host + the rung take() would pick
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
