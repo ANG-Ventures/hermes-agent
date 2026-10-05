@@ -361,8 +361,12 @@ class SessionFtsSetupMixin:
         A busy write lock is waited out on the caller's write budget (default
         ``_WRITE_PATIENCE_S``), like ``_execute_write``: the writer connection's busy
         timeout is only 1 s, and the usual holder is a sibling writer detaching the
-        same corrupt index — giving up after 1 s cost that turn's canonical write."""
-        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+        same corrupt index — giving up after 1 s cost that turn's canonical write.
+
+        A handle that already failed open (``_fts_stale``) detaches again: a sibling whose open read
+        the breadcrumb before this handle committed it still runs CREATE TRIGGER IF NOT EXISTS,
+        re-arming the triggers over the corrupt index, and this handle's next write fails on them."""
+        if not (self._fts_enabled or self._fts_stale) or not self._is_fts_write_corruption_error(exc):
             return False
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
@@ -379,6 +383,14 @@ class SessionFtsSetupMixin:
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        if self._fts_stale and not self._conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                            f"AND name IN ({','.join('?' for _ in _FTS_TRIGGERS + _FTS_CJK_TRIGGERS)}) LIMIT 1",
+                            _FTS_TRIGGERS + _FTS_CJK_TRIGGERS,
+                        ).fetchone():
+                            # Nothing re-armed: the error is not ours to detach, and a retry would loop.
+                            self._conn.rollback()
+                            return False
                         self._conn.execute(
                             "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
