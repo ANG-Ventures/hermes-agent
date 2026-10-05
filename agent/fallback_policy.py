@@ -1078,10 +1078,13 @@ def _lane_incapable_body(row: Mapping[str, Any], seat: str) -> str:
     ``at the relay``; a bridge ``tui_*`` code is ``at the bridge``."""
     code = str(row.get("lane_code") or "").strip().lower()
     st = row.get("http_status") or "error"
+    if not code:
+        # No machine code on the row: the hop is whatever the relay stated (or
+        # unknown), rendered by the shared segment like every other class.
+        return f"{_lane_incapable_cause(row)} {_hop_segment(normalize_hop(row.get('hop')), seat, st)}"
     where = "at the relay" if code == "mode_not_allowed" else "at the bridge"
-    answered = f"{st} {code}" if code else f"{st}"
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
-    return (f"{_lane_incapable_cause(row)} — {answered} {where} "
+    return (f"{_lane_incapable_cause(row)} — {st} {code} {where} "
             f"({LANE_INCAPABLE_NOT_ANTHROPIC}){seat_seg}")
 
 
