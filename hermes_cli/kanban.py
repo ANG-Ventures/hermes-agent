@@ -3524,6 +3524,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             reason=reason,
             expected_run_id=held_run,
             operator=operator,
+            operator_kind=getattr(args, "operator_kind", None),
             # The coverage comment is written inside the transition's
             # transaction, so a refused send-back rolls it back. ``claimer``
             # authors it; on a parked card it also opens the review run.

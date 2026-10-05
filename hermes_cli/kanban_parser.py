@@ -680,6 +680,10 @@ _SPECS = [
              help="Concrete changes required; first post a current-run review_coverage JSON comment"),
         _arg("--coverage",
              help="Review coverage JSON; records a run-attributed comment before transition (human CLI)"),
+        _arg("--operator-kind", dest="operator_kind", choices=list(kb.OPERATOR_KINDS), default=None,
+             help="With --operator: who sent it back, recorded on the changes_requested event "
+                  "(default human; automation passes machine so landing gates never treat it as a "
+                  "human CHANGES REQUESTED)"),
         # ``--operator "<who: why>"`` comes from the home-guard loop in build_parser;
         # on request-changes it is also the operator send-back (coverage waived).
     ], help="Reviewer verdict: return the active review run to its implementer"),

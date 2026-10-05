@@ -3920,6 +3920,12 @@ def _actor_profiles(actor: MutationActor) -> frozenset[str]:
     return frozenset({actor.profile} if actor.profile else ())
 
 
+# What sent an operator send-back back (request_changes ``operator_kind``).
+OPERATOR_KIND_HUMAN = "human"
+OPERATOR_KIND_MACHINE = "machine"
+OPERATOR_KINDS: tuple[str, ...] = (OPERATOR_KIND_HUMAN, OPERATOR_KIND_MACHINE)
+
+
 def _valid_operator_reason(reason: str) -> bool:
     who, sep, why = reason.partition(":")
     return bool(sep and who.strip() and why.strip())
@@ -12843,6 +12849,7 @@ def request_changes(
     coverage: Optional[str] = None,
     session_ref: Optional[str] = None,
     operator: Optional[str] = None,
+    operator_kind: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -12880,12 +12887,25 @@ def request_changes(
     ``operator_override`` event on the closed run. A non-operator caller or a
     reason without ``who: why`` is refused before anything is written. The
     coverage gate is unchanged for every call without it.
+
+    ``operator_kind`` (:data:`OPERATOR_KINDS`, default ``human``) says what
+    sent an operator send-back back: ``machine`` for automation (the
+    hermes-home merge pass's Prism HOLD-FR). It is recorded on the
+    ``changes_requested`` event as ``operator_kind`` so a landing gate keys on
+    a FIELD, not on the operator string, to tell a human CHANGES REQUESTED
+    (holds a landing) from a machine send-back (never holds; t_86ca5b3d).
+    Without ``operator`` it is refused.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
     # Same normalization as the home-guard actor, so its dedupe matches.
     operator_reason = (str(operator).strip() or None) if operator else None
+    kind = str(operator_kind).strip().lower() if operator_kind is not None else None
+    if kind is not None and kind not in OPERATOR_KINDS:
+        return False, f"operator_kind must be one of {', '.join(OPERATOR_KINDS)}"
+    if kind is not None and operator_reason is None:
+        return False, "operator_kind needs --operator \"<who: why>\""
     if operator_reason is not None:
         refusal = _operator_send_back_refusal(task_id, operator_reason)
         if refusal is not None:
@@ -13012,7 +13032,8 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
-                **({"operator": operator_reason} if operator_reason else {}),
+                **({"operator": operator_reason,
+                    "operator_kind": kind or OPERATOR_KIND_HUMAN} if operator_reason else {}),
             },
             run_id=run_id,
         )
