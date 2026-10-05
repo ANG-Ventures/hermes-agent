@@ -290,6 +290,26 @@ def test_pairing_probe_reuses_live_profile_roots_until_the_profile_set_moves(wat
     assert sorted(live_calls) == ["play", "work", "work"]
 
 
+def test_ledger_written_in_the_newest_ledgers_mtime_tick_still_broadcasts(watcher_home):
+    """Linux stamps mtimes from a coarse clock, so two ledgers written back to back share one
+    mtime. The second one must still broadcast: newest-mtime alone stays put and misses it."""
+    home, events = watcher_home
+    for name in ("work", "play"):
+        (home / "profiles" / name / "platforms" / "pairing").mkdir(parents=True)
+        (home / "profiles" / name / "config.yaml").write_text("{}\n", encoding="utf-8")
+    first = home / "profiles" / "work" / "platforms" / "pairing" / "telegram-pending.json"
+    first.write_text("{}", encoding="utf-8")
+    server._broadcast_watched_changes(now=0.0)
+
+    second = home / "profiles" / "play" / "platforms" / "pairing" / "discord-approved.json"
+    second.write_text("{}", encoding="utf-8")
+    st = first.stat()
+    os.utime(second, ns=(st.st_atime_ns, st.st_mtime_ns))  # same tick, deterministically
+    server._broadcast_watched_changes(now=10.0)
+
+    assert events == [("pairing.changed", {})]
+
+
 def test_rate_limit_churn_does_not_broadcast_pairing_changed(watcher_home):
     """_rate_limits.json moves on every unauthorized DM, including ones that
     produce no new row — signalling on it would refetch for nothing."""
