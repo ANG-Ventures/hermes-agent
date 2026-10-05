@@ -22,7 +22,7 @@ Verdicts:
 
 Lint (D2b, `scripts/hermes_parity/lint_manifest.py::lint_call_sites`): an entry that sets
 `call_site` must list `call_site_tests` (nodeids that drive it), each also in `tests` so the
-collection lint covers it. The footer (row 22), restart-policy (row 9) and discord free-response (row 18) entries declare `call_site`. Each presence-only
+collection lint covers it. The footer (row 22), cron script-timeout (row 6), relay-pool affinity (row 7), restart-policy (row 9) and discord free-response (row 18) entries declare `call_site`. Each presence-only
 row below has a child card of t_96049446. That card adds the e2e tests AND the `call_site` /
 `call_site_tests` fields, after which the lint holds the line.
 
@@ -32,7 +32,7 @@ row below has a child card of t_96049446. That card adds the e2e tests AND the `
 | 2 | systemd restart exits 0, launchd 75 | `GatewayRunner.stop(restart=, service_restart=)` | `tests/gateway/test_gateway_shutdown.py::test_gateway_stop_systemd_service_restart_exits_cleanly` (asserts `_exit_code == 0`) | covered (darwin variant: see entry `coverage_gap`) |
 | 3 | hygiene compaction announces in-chat | gateway hygiene path in the turn → `_emit_compaction_announce` | `tests/gateway/test_session_hygiene.py::test_hygiene_msgcount_announces_limit_not_count` (drives the gateway, asserts the delivered 🗜️ text) | covered |
 | 4 | messaging + moa toolsets present | `toolsets.py` data | `tests/agent/test_fork_custom_toolsets.py` | n/a |
-| 6 | cron per-job reasoning + script timeout | `cron/scheduler.py::_job_script_kwargs` → `_run_job_script(timeout_seconds=…)` on the `script` path | monitor path only: `tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling` (not registered). `script` path: `test_cron_workdir.py` swallows `**_fork_kwargs` without asserting them; `TestRunJobScript` asserts output only | **presence-only** |
+| 6 | cron per-job reasoning + script timeout | `cron/scheduler.py::_job_script_kwargs` → `_run_job_script(timeout_seconds=, job_name=, job_id=)` on the `script` path (`run_one_job` → `_run_job_script_with_claim_heartbeat`) and the monitor path | `tests/cron/test_cron_script_kwargs_isolated.py` (per-kwarg wiring via `run_one_job` + visible effect via a real script: per-job timeout kill, `PHASE=cron_script_timeout job=` name, drain-kill re-queue by job id; each red under its own mutation) + `tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling` | covered (`call_site` declared, lint-enforced) |
 | 7 | relay-pool session affinity + lane headers | `agent/chat_completion_helpers.py::_build_anthropic_kwargs` (merges `_pool_affinity_headers` into the request, ~L2190) | `tests/agent/test_pool_affinity_call_site.py` (real `AIAgent._build_api_kwargs` on `anthropic_messages`; wiring + wire test per header, non-pool scope; t_67fc3115) | covered |
 | 8 | restart failure count codec | `gateway/fork_ext/restart_codec.py` (pure codec + goldens) | golden + codec tests | n/a |
 | 9 | restart policy, config bridge, initiator breadcrumb | `gateway/run.py::_bridge_config_to_env` (startup, calls `_bridge_agent_config_to_env`, ~L2178/2220) | `tests/gateway/test_restart_config_bridge_call_site.py`: `test_wiring[<key>]` + `test_effect[<key>]` for each of the 7 fork-only keys (drives the real startup function, reads the live reader, regresses to the stale preset with the call dropped); `test_restart_breadcrumb_frozen_contract_is_consumed` replaces the source-text check | covered |
