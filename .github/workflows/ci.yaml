@@ -67,6 +67,9 @@ name: CI
 #     installer run on a PR only when the diff touches _INSTALL_PATHS.
 #     merge_group forces them on and push:main runs everything, so a PR run is
 #     never the only gate (t_e8c5045e).
+#   * e2e + the desktop suites: path-gated the same way on a PR, forced on for
+#     merge_group like install/update, so the queue runs the same required jobs
+#     as push:main (t_07377d12).
 
 on:
   workflow_dispatch:
@@ -196,11 +199,14 @@ jobs:
         # `desktop` (apps/desktop/** changed) is ANDed with the repo var here, so
         # every Electron-app job reads one output. A release run forces it on.
         #
-        # The install/update lanes (e2e_upgrade -> e2e-upgrade shards + the
-        # Windows install + update E2E legs; bootstrap -> Bootstrap installer)
-        # are path-gated on pull_request only. merge_group forces them on, and
-        # push has an empty diff (every lane on): a PR run is never the only
-        # gate (t_e8c5045e).
+        # The slow lanes (e2e -> Linux e2e + Windows E2E; e2e_upgrade ->
+        # e2e-upgrade shards + the Windows install + update E2E legs; the desktop
+        # suites; bootstrap -> Bootstrap installer) are path-gated on
+        # pull_request only. merge_group forces them on, and push has an empty
+        # diff (every lane on): the merge candidate runs every required job push
+        # runs, so main cannot go red on a job the queue skipped (t_e8c5045e,
+        # t_07377d12: a3fb14ead merged with `Python tests / e2e` skipped and
+        # failed it on push). `desktop` is still ANDed with CI_DESKTOP_JOBS below.
         id: gate-lanes
         env:
           RELEASE: ${{ inputs.release }}
@@ -210,10 +216,16 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os
+          # The path-gated slow lanes (scripts/ci/classify_changes.py _E2E_LANES) plus
+          # bootstrap and desktop. Their path lists are deliberate under-approximations.
+          MERGE_GROUP_FORCED = ('e2e', 'e2e_upgrade', 'e2e_desktop_core', 'e2e_desktop_update',
+                                'desktop', 'bootstrap')
           values = json.loads(os.environ['CLASSIFIED'])
           release = os.environ['RELEASE'] == 'true'
           if os.environ['EVENT_NAME'] == 'merge_group':
-              values.update(e2e_upgrade='true', bootstrap='true')
+              # Every lane push:main runs (empty diff = all on) must also run on the
+              # merge candidate, or a red only push can see lands on main (t_07377d12).
+              values.update({lane: 'true' for lane in MERGE_GROUP_FORCED})
           if not release and os.environ['DESKTOP_JOBS'] != 'on':
               values['desktop'] = 'false'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:

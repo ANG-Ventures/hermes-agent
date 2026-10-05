@@ -57,7 +57,10 @@ def _task_id(rec: dict) -> str:
 
 def _run_one_card(board: Board, tid: str) -> None:
     board.dispatch()
-    pid = board.task(tid)["worker_pid"]
+    # The run row keeps the pid; tasks.worker_pid is cleared once a fast worker has already
+    # finished, which is a pass, not a missing worker (main a3fb14ead, e2e job 111882290285).
+    runs = board.runs(tid)
+    pid = board.task(tid)["worker_pid"] or (runs[-1]["worker_pid"] if runs else None)
     assert pid, board.diag(tid)
     board.wait_worker_exit(tid, int(pid))
 
