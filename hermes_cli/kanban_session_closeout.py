@@ -60,12 +60,18 @@ _RETRACT = re.compile(r"\bCORRECTION\b|\bretract(?:ed|ion|s)?\b|\bFALSE-DONE\b",
 # "live-verified". A bare mention ("please attach live proof", "where is the native proof?") is not proof.
 _PROOF = re.compile(r"live-evidence:\s*yes\b|\b(?:live|native)[ -]proof\s*:\s*\S|\bGATE-PROVEN\b|\blive-verified\b",
                     re.I)
+# A declaration whose value is an absence ("live proof: none", "native proof: n/a") is not proof.
+_ABSENT_VALUE = re.compile(r"\b(?:live|native)[ -]proof\s*:\s*(?:none|n/?a|nil|null|false|no|tbd|unavailable|"
+                           r"pending|missing|unknown|-+)(?![\w/])", re.I)
 # A proof mention on a line that also negates it ("no live proof", "native proof failed") is not proof.
 _NEGATED = re.compile(r"\b(?:no|not|without|missing|failed|fails|pending|unproven|cannot|can't|blocked|todo|"
                       r"please|need|needs|attach|collect)\b|\?", re.I)
 _CLOSE_ON = re.compile(r"close-on:\s*([^\n]{1,200})", re.I)
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 _CLOSE_RECORD = re.compile(r"SUPERSED|\bCLOSED:|\bclosed\b", re.I)
+# A line that negates or conditions the closure ("do not mark #42 closed until …") records nothing.
+_CLOSE_NEGATED = re.compile(r"\b(?:not|don't|do not|never|until|unless|if|once|when|before|should|will|would|"
+                            r"pending|todo)\b|\?", re.I)
 _DOC_PATH = re.compile(
     r"(?<![\w/.-])((?:skills-shared|skills|plans|docs)/[\w./@+-]+?\.(?:md|html)"
     r"|(?:AI|Engineering|Runbooks)/[^\n`'\"|*<>]{1,160}?\.md)"
@@ -192,9 +198,10 @@ def state_dbs(root: Path) -> list[tuple[str, Path]]:
     return [(n, p) for n, p in out if p.is_file() and p.stat().st_size > 0]
 
 
-def session_rows(root: Path, sids: list[str]) -> list[dict]:
-    """The session rows for ``sids`` from whichever profile owns them, tagged with that profile."""
-    rows, seen = [], set()
+def session_rows(root: Path, sids: list[str]) -> tuple[list[dict], list[str]]:
+    """The session rows for ``sids`` from whichever profile owns them, tagged with that profile,
+    plus the state.dbs that could not be read (their sessions' cost is unknown, not absent)."""
+    rows, seen, unreadable = [], set(), []
     for name, path in state_dbs(root):
         try:
             with _ro(path) as conn:
@@ -202,13 +209,14 @@ def session_rows(root: Path, sids: list[str]) -> list[dict]:
                 found = conn.execute(
                     "SELECT id, started_at, ended_at, chat_id, estimated_cost_usd FROM sessions "
                     f"WHERE id IN ({_ph(len(sids))})", sids).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            unreadable.append(f"{name}: {exc}")
             continue
         for r in found:
             if r["id"] not in seen:
                 seen.add(r["id"])
                 rows.append({**dict(r), "profile": name})
-    return rows
+    return rows, unreadable
 
 
 def turns_dbs(root: Path) -> list[tuple[str, Path]]:
@@ -217,7 +225,8 @@ def turns_dbs(root: Path) -> list[tuple[str, Path]]:
     if profiles.is_dir():
         for p in sorted(profiles.iterdir()):
             out.append((p.name, p / "blackbox" / "turns.db"))
-    return [(n, p) for n, p in out if p.is_file() and p.stat().st_size > 0]
+    # A zero-byte ledger stays in: its query fails and it is reported unreadable, never a silent $0.
+    return [(n, p) for n, p in out if p.is_file()]
 
 
 # turns, known $, in, out, cache read, cache write, unpriced turns (cost_usd NULL / status unknown),
@@ -351,11 +360,13 @@ def card_prs(card: dict) -> list[tuple[str, int]]:
             md = json.loads(run.get("metadata") or "null")
         except (TypeError, ValueError):
             md = None
-        for text in _opr.recorded_pr_refs(md):   # pr_url[s], pr, own_prs, survivor refs/claims
+        refs = list(_opr.recorded_pr_refs(md))   # pr_url[s], pr, own_prs, survivor refs/claims
+        # Per run: structured metadata is authoritative for the run that supplied it; a run without
+        # it (request_review / --summary handoff) contributes its summary prose.
+        for text in refs or [run.get("summary") or ""]:
             add(text)
-    if not found:   # prose fallback: the result AND every run summary (request_review/--summary handoffs)
-        for text in [card.get("result") or ""] + [r.get("summary") or "" for r in card["runs"]]:
-            add(text)
+    if not found:   # prose fallback: the card result
+        add(card.get("result") or "")
     return found
 
 
@@ -366,7 +377,7 @@ def _md_live_evidence(raw) -> bool:
     except (TypeError, ValueError):
         return False
     v = md.get("live_evidence") if isinstance(md, dict) else None
-    return isinstance(v, str) and v.strip().lower().startswith("yes")
+    return isinstance(v, str) and re.fullmatch(r"yes(?:\s*:.*)?", v.strip(), re.I | re.S) is not None
 
 
 def is_fleet(repo: str) -> bool:
@@ -381,7 +392,8 @@ def close_recorded(card: dict, repo: str, number: int) -> bool:
             [x.get("body") or "" for x in card["comments"]]
     pat = re.compile(rf"(?<![\w./-]){re.escape(repo)}#{number}\b|(?<![\w./-])#{number}\b"
                      rf"|github\.com/{re.escape(repo)}/pull/{number}\b", re.I)
-    return any(pat.search(ln) and _CLOSE_RECORD.search(ln) for t in texts for ln in t.splitlines())
+    return any(pat.search(ln) and _CLOSE_RECORD.search(ln) and not _CLOSE_NEGATED.search(ln)
+               for t in texts for ln in t.splitlines())
 
 
 def wave_of(card: dict) -> tuple[str, int, str]:
@@ -485,9 +497,11 @@ def build(root: Path, sids: list[str], *, pr_query: Optional[PrQuery] = None, ne
 
     # per-card outcome flags
     for c in cards:
-        texts = [x.get("body") or "" for x in c["comments"]] + [r.get("summary") or "" for r in c["runs"]]
+        texts = [c.get("result") or ""] + [x.get("body") or "" for x in c["comments"]] + \
+                [r.get("summary") or "" for r in c["runs"]]
         c["proof"] = any(_md_live_evidence(r.get("metadata")) for r in c["runs"]) or any(
-            _PROOF.search(ln) and not _NEGATED.search(ln) for t in texts for ln in t.splitlines())
+            _PROOF.search(ln) and not _NEGATED.search(ln) and not _ABSENT_VALUE.search(ln)
+            for t in texts for ln in t.splitlines())
         c["retracted"] = any(_RETRACT.search(x.get("body") or "") for x in c["comments"])
         c["prs"] = [(r, states.get(r)) for r in pr_map[c["id"]]]
 
@@ -542,9 +556,10 @@ def build(root: Path, sids: list[str], *, pr_query: Optional[PrQuery] = None, ne
         doc_rows.append({"path": p, "exists": exists, "cards": sorted(cs)})
 
     # cost
-    sess = session_rows(root, sids)
+    sess, sess_unreadable = session_rows(root, sids)
     cost = {"sessions": [{"id": s["id"], "state_db_usd": s.get("estimated_cost_usd"),
                           "profile": s["profile"], "session_turns": session_turn_cost(root, s)} for s in sess],
+            "session_unreadable": sess_unreadable,
             "workers": worker_cost(root, ids)}
 
     # open remainder
@@ -686,6 +701,9 @@ def render(r: dict) -> str:
         own = f"UNKNOWN — ledger unreadable ({st['unreadable']})" if st["unreadable"] else _tok(st["row"])
         L.append(f"- Session `{s['id']}` ({s['profile']} profile) state.db estimate {_money(s['state_db_usd'])}; "
                  f"its own turns (turn_id prefix): {own}")
+    if r["cost"].get("session_unreadable"):
+        L.append(f"- Session cost INCOMPLETE — unreadable state.db: {'; '.join(r['cost']['session_unreadable'])} "
+                 "(any session stored there is missing above)")
     w = r["cost"]["workers"]
     inc = f" — INCOMPLETE, unreadable ledgers: {'; '.join(w['unreadable'])}" if w["unreadable"] else ""
     L.append(f"- Worker turns on this session's cards (chat_id = card id, every profile): {_tok(w['total'])}{inc}")

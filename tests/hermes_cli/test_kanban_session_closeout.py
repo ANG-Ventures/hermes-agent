@@ -325,3 +325,42 @@ def test_prism_r2_unreadable_ledgers_are_reported_not_zero(root):
     r = _build(root)
     assert r["cost"]["workers"]["unreadable"] and r["cost"]["workers"]["unreadable"][0].startswith("daedalus:")
     assert "INCOMPLETE, unreadable ledgers" in sc.render(r)
+
+
+def test_prism_r3_result_proof_negated_close_strict_yes_absent_values_and_per_run_summaries(root):
+    d = _conn(root)
+    res = _card(d, "r6 A: proof in result", status="done", result="ANG-Ventures/a#1 merged. live-evidence: yes")
+    none = _card(d, "r6 B: absent proof", status="done", result="ANG-Ventures/a#2 merged")
+    kb.add_comment(d, none, "w", "live proof: none")
+    yday = _card(d, "r6 C: yesterday", status="done", result="ANG-Ventures/a#3 merged",
+                 run_md={"live_evidence": "yesterday: failed; evidence pending"})
+    neg = _card(d, "r6 D: negated close", status="done", result="ANG-Ventures/a#42 see notes")
+    kb.add_comment(d, neg, "w", "Do not mark #42 closed until the replacement lands")
+    multi = _card(d, "r6 E: two runs", status="review", run_md={"pr_url": "https://github.com/ANG-Ventures/a/pull/5"})
+    d.execute("INSERT INTO task_runs(task_id, profile, status, started_at, summary) VALUES (?,?,?,?,?)",
+              (multi, "w", "done", 2, "handed off ANG-Ventures/a#6 for review"))
+    d.commit(); d.close()
+    states = {("ANG-Ventures/a", 1): "MERGED", ("ANG-Ventures/a", 2): "MERGED", ("ANG-Ventures/a", 3): "MERGED",
+              ("ANG-Ventures/a", 42): "CLOSED", ("ANG-Ventures/a", 5): "MERGED", ("ANG-Ventures/a", 6): "OPEN"}
+    r = sc.build(root, [SID], pr_query=lambda repo, n: states.get((repo, n)))
+    by = {c["id"]: c for c in r["cards"]}
+    assert by[res]["proof"]
+    assert not by[none]["proof"]
+    assert not by[yday]["proof"]
+    assert {ref for ref, _ in by[multi]["prs"]} == {("ANG-Ventures/a", 5), ("ANG-Ventures/a", 6)}
+    gates = {g["row"]: g for g in r["gates"]}
+    assert "ANG-Ventures/a#42" in gates["6b'"]["evidence"]
+    assert "ANG-Ventures/a#6" in gates["6b"]["evidence"]
+
+
+def test_prism_r3_empty_turns_ledger_and_unreadable_state_db_are_reported(root):
+    _fixture(root)
+    empty = root / "profiles" / "argus" / "blackbox" / "turns.db"
+    empty.parent.mkdir(parents=True)
+    empty.write_bytes(b"")
+    bad = root / "profiles" / "argus" / "state.db"
+    bad.write_bytes(b"not a sqlite database at all, just bytes" * 10)
+    r = _build(root)
+    assert any(u.startswith("argus:") for u in r["cost"]["workers"]["unreadable"])
+    assert any(u.startswith("argus:") for u in r["cost"]["session_unreadable"])
+    assert "Session cost INCOMPLETE" in sc.render(r)
