@@ -482,3 +482,30 @@ def test_standalone_daemon_writes_the_kanban_ledger(board, monkeypatch):
     led = json.loads((board / "var" / "placement" / "host-reservations.kanban.json")
                      .read_text(encoding="utf-8-sig"))
     assert led["hosts"]["ace-media"]["busy_units"] == 1
+
+
+def test_one_shot_pool_plan_seeds_remote_by_host_for_the_ledger(monkeypatch):
+    """A one-shot `kanban dispatch` skips build(); record_placements() keys the kanban
+    ledger off builder._remote_by_host, so the plan must seed it or running remote
+    workers' reservations are dropped until the next gateway tick (Prism 2febc7f296e1)."""
+    import gateway.kanban_gate_tick as gt
+    from hermes_cli import kanban_ops
+
+    class _B:
+        _remote_by_host = {}
+        plan_calls = []
+
+        def _ledger(self, boards):
+            return {"default": (1, {"ace-ai": 2})}
+
+        def plan_pool(self, boards, remote_by_host):
+            self.plan_calls.append(dict(remote_by_host))
+            return "PLAN"
+
+    b = _B()
+    monkeypatch.setattr(gt, "live_boards", lambda: ["default"])
+    monkeypatch.setattr(gt, "running_split", lambda ledger: (1, {"ace-ai": 2}))
+    monkeypatch.setattr(gt, "standalone_builder", lambda gate, cfg: b)
+    assert kanban_ops._one_shot_pool_plan(object(), {"kanban": {}}) == "PLAN"
+    assert b._remote_by_host == {"ace-ai": 2}
+    assert b.plan_calls == [{"ace-ai": 2}]

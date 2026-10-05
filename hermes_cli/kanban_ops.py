@@ -75,6 +75,11 @@ def _one_shot_pool_plan(gate, config, builders=None):
             builders.append(builder)
         boards = live_boards()
         _local, remote_by_host = running_split(builder._ledger(boards))
+        # A one-shot plan skips build(); record_placements() keys the kanban
+        # ledger off _remote_by_host, so seed it here or the running remote
+        # workers' reservations and ramp stamps are dropped until the next
+        # gateway tick (Prism 2febc7f296e1 on #1764).
+        builder._remote_by_host = dict(remote_by_host)
         return builder.plan_pool(boards, remote_by_host)
     except Exception as exc:
         print(f"warning: kanban pool plan failed, remote pins wait: {exc}", file=sys.stderr)
