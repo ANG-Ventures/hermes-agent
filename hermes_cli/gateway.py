@@ -2666,6 +2666,19 @@ def print_legacy_unit_warning() -> None:
     print_info("    hermes gateway migrate-legacy")
 
 
+def _legacy_unit_stopped(name: str, system: bool) -> bool:
+    """Stop a legacy unit; True only when it is confirmed not running. A non-zero ``stop`` (e.g. a unit the
+    manager never loaded) counts only if ``is-active`` then reports ``inactive``/``failed``; a timeout never
+    does (Prism 0466e3e9cee8)."""
+    try:
+        if _run_systemctl(["stop", name], system=system, check=False, timeout=90).returncode == 0:
+            return True
+        state = _run_systemctl(["is-active", name], system=system, check=False, timeout=10, **_CAPTURE_TEXT)
+    except subprocess.TimeoutExpired:
+        return False
+    return (state.stdout or "").strip() in ("inactive", "failed")
+
+
 def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) -> tuple[int, list[Path]]:
     """Stop, disable, and remove legacy gateway units. ``interactive=False`` skips the prompt; ``dry_run``
     only lists. Returns ``(removed_count, remaining_paths)`` (remaining: e.g. system-scope when not root)."""
@@ -2708,17 +2721,22 @@ def remove_legacy_hermes_units(interactive: bool = True, dry_run: bool = False) 
                 continue
             attempted = True
             try:
-                _run_systemctl(["stop", name], system=system, check=False, timeout=90)
+                # A unit whose stop failed is still running: keep its definition and report it, so the
+                # caller's leftover guard (LegacyUnitsRemain) refuses to start a gateway next to it.
+                if not _legacy_unit_stopped(name, system):
+                    print(f"  ⚠ Could not stop {name}; left {unit_path} in place")
+                    remaining.append(unit_path)
+                    continue
                 _run_systemctl(["disable", name], system=system, check=False, timeout=30)
                 unit_path.unlink(missing_ok=True)
                 print(f"  ✓ Removed {unit_path}")
                 removed += 1
-            except (OSError, RuntimeError) as e:
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
                 print(f"  ⚠ Could not remove {unit_path}: {e}")
                 remaining.append(unit_path)
         if not attempted:  # every unit refused: the manager is not touched at all
             return
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
             _run_systemctl(["daemon-reload"], system=system, check=False, timeout=30)
 
     user_units = [(n, p) for n, p, is_sys in legacy if not is_sys]
