@@ -520,6 +520,8 @@ def _r10_api() -> dict:
     api = {f"actions/workflows/{wid}/runs?status=failure": {"workflow_runs": listed},
            f"actions/workflows/{wid}/runs?event=merge_group": {
                "workflow_runs": [r for r in listed if r["event"] == "merge_group"]}}
+    # main's own push history, real created_at (the main-red streak walks it in commit order)
+    api["runs?branch=main&event=push"] = {"workflow_runs": [r for r in R10["runs"] if r["event"] == "push"]}
     for rid, jobs in R10["jobs"].items():
         api[f"actions/runs/{rid}/jobs"] = {"jobs": jobs}
     for cid, msgs in R10["annotations"].items():
@@ -553,25 +555,22 @@ def test_replay_2026_09_28_folds_already_red_tests_to_logs(tmp_path):
     api = _r10_api()
     routes = {int(rid): _replay(tmp_path, int(rid), api) for _ts, rid, _pr in R10["pages"]}
     paged = sorted(rid for rid, g in routes.items() if g["route"] == "alerts")
-    # Still paging, each a DIFFERENT fault or one the fold cannot prove is repeated:
-    #   36475808846 main 9d81866f  Windows-only job (job-name signature)
-    #   36476853851 main aa9e59a3  slice 13: all tests passed, pytest exited non-zero
-    #   36477241100 PR #1453       first red of test_no_new_source_proxy_asserts
-    #   36477804956 main 51e9b286  slice 3: segfault in test_usageless_response_accounting
-    #   36496636054 main ebf35a80  kanban test red but NOT annotated (no quarantine list on base)
-    assert paged == [36475808846, 36476853851, 36477241100, 36477804956, 36496636054]
-    folded = {rid: g for rid, g in routes.items() if g["route"] == "logs"}
-    assert len(folded) == 10 and len(routes) == 15
-    for rid, g in folded.items():
-        assert g["card"].startswith("already-red (run "), (rid, g)
+    # 15 pages then; 3 now (t_54478fb0 main-red streak for the main pushes):
+    #   36477241100 PR #1453       first red of test_no_new_source_proxy_asserts (queue ejection)
+    #   36477804956 main 51e9b286  2nd consecutive "Python tests / Run tests" red (after 36476853851)
+    #   36490159001 main 553943bd  2nd consecutive red of the kanban test (after main 36480232265)
+    assert paged == [36477241100, 36477804956, 36490159001]
+    # main first reds -> #logs: 9d81866f Windows-only, aa9e59a3 slice 13, ebf35a80 (main went green at 22:48)
+    for rid in (36475808846, 36476853851, 36496636054):
+        assert routes[rid]["route"] == "logs" and routes[rid]["card"] == "first-red", (rid, routes[rid])
+    # 71546f7d: the 3rd consecutive kanban red on main
+    assert routes[36494384491]["card"] == "main-still-red (run 36490159001)"
+    folded = {rid: g for rid, g in routes.items() if g["card"].startswith("already-red (run ")}
+    assert len(folded) == 8 and len(routes) == 15
     # every ejection after the first proxy-asserts page folds, naming the PR
     ejected = {g["pr"] for g in folded.values() if g["pr"]}
     assert ejected == {"1426", "1453", "1458", "1459", "1463", "1464"}
     assert routes[36489068867]["summary"].startswith("PR #1463 ejected on an already-red test (also failed run ")
-    # main 553943bd failed only the kanban test, already red on PR #1426's queue run; 71546f7d then on 553943bd
-    for rid, anchor in ((36490159001, 36489800880), (36494384491, 36490159001)):
-        assert routes[rid]["route"] == "logs" and routes[rid]["card"] == f"already-red (run {anchor})"
-        assert routes[rid]["summary"].startswith(f"main red on an already-red test (also failed run {anchor})")
     # PR #1453's 23:14 run failed both tests: two different runs cover them, both named
     assert routes[36496092766]["card"].count(",") == 1
 
@@ -744,11 +743,11 @@ def test_probe_prior_lookup_is_scoped_to_default_branch(tmp_path):
 
 
 
-# --- main still red (t_30d3de38) -----------------------------------------------
-# 2026-10-04: the e2e-upgrade jobs (no pytest annotation, so the fold cannot see
-# them) failed on main 6 times in 4 h and paged 6 times. A default-branch push red
-# whose every failed job/step was already red in its latest earlier main run that
-# RAN it goes to #logs. Path-classified skips are walked past; a pass pages.
+# --- main-red streak (t_54478fb0, Apollo ruling B; was main still red, t_30d3de38) ---------------
+# Only the 2nd consecutive red of a job/step pages. A first red (10-04/05: 3 one-run slice reds
+# paged and cleared on the next run) and a 3rd+ red (10-04: e2e-upgrade paged 6 times in 4 h)
+# go to #logs; so does a 2nd red that started >= BACKSTOP_S after the first completed
+# (main-red-summary.py's backstop pages it). Path-classified skips are walked past.
 E2E = "Python tests / e2e-upgrade (core/test_upgrade_path)"
 E2E_STEP = "Run upgrade e2e tests (core/test_upgrade_path)"
 
@@ -804,30 +803,50 @@ def _main_route(tmp_path, api, env_extra=None) -> dict:
     return got
 
 
-def test_main_red_already_red_on_previous_main_run_goes_to_logs(tmp_path):
-    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]))
-    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
-    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+def _timed(jobs, started, completed):
+    for j in jobs["jobs"]:
+        j.update(started_at=started, completed_at=completed)
+    return jobs
+
+
+def test_main_red_second_consecutive_red_pages(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e()),
+                                           (40, "2026-10-04T03:00:00Z", "success", green)]))
+    assert got["route"] == "alerts" and got["card"] == "", got["_stdout"]
+    assert got["summary"] == f"red on 2 consecutive main runs (also run 41): {E2E} / {E2E_STEP}"
     # commit order: only runs created before this one are asked for
     assert "created=%3C%3D2026-10-04T05:00:00Z" in got["_curl"]
 
 
-def test_main_red_after_the_step_passed_on_main_pages(tmp_path):
+def test_main_red_third_red_goes_to_logs(tmp_path):
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e()),
+                                           (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())]))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+
+
+def test_main_red_after_the_step_passed_on_main_is_a_first_red(tmp_path):
     green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
     api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
-    assert "passed on main in run 41" in got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
+    assert got["summary"] == f"first red on main; a 2nd consecutive red pages: {E2E} / {E2E_STEP}"
 
 
 def test_main_red_walks_past_runs_that_skipped_the_job(tmp_path):
     # path-classified CI: a green run that never ran e2e-upgrade proves nothing
     skipped = _main_jobs((E2E, "skipped", {}))
     api = _main_api([(41, "2026-10-04T04:00:00Z", "success", skipped),
-                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e()),
+                     (39, "2026-10-04T02:30:00Z", "success", skipped),
+                     (38, "2026-10-04T02:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+    api["runs?branch=main&event=push"]["workflow_runs"].pop()     # 38 gone: 40 was the first red
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "(also run 40)" in got["summary"], got["_stdout"]
 
 
 def test_main_red_ignores_a_later_created_run(tmp_path):
@@ -836,7 +855,41 @@ def test_main_red_ignores_a_later_created_run(tmp_path):
     green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
     api = _main_api([(43, "2026-10-04T06:00:00Z", "success", green),
                      (41, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
-    assert _main_route(tmp_path, api)["route"] == "logs"
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+
+
+# persistence backstop handoff: main-red-summary.py pages a 2nd red that comes >= 60 min late
+# the window is between the two RUNS' created_at (this run 05:00:00Z), the value main-red-summary compares
+def _late_api(prior_created):
+    api = _main_api([(41, prior_created, "failure", _red_e2e())])
+    api["actions/runs/41"] = {"id": 41, "created_at": prior_created}
+    return api
+
+
+def test_main_red_second_red_inside_the_backstop_window_pages(tmp_path):
+    got = _main_route(tmp_path, _late_api("2026-10-04T04:00:01Z"))
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+
+
+def test_main_red_second_red_at_or_after_the_backstop_window_goes_to_logs(tmp_path):
+    got = _main_route(tmp_path, _late_api("2026-10-04T04:00:00Z"))
+    assert got["route"] == "logs" and got["card"] == "main-red-backstop (run 41)", got["_stdout"]
+    # an unreadable run time cannot prove the backstop owns it: page
+    api = _late_api("2026-10-04T04:00:00Z")
+    del api["actions/runs/41"]
+    assert _main_route(tmp_path, api)["route"] == "alerts"
+
+
+def test_main_red_slices_are_one_item_and_the_window_spans_them(tmp_path):
+    # 10-05 04:27Z: slice 10/16 red; a test moves slices as they are re-cut, so slice N/M is not an identity
+    s10, s3 = "Python tests / Run tests slice 10/16", "Python tests / Run tests slice 3/16"
+    prior = _timed(_main_jobs((s3, "failure", {"Run tests": "failure"}), (s10, "success", {"Run tests": "success"})),
+                   "2026-10-04T04:01:00Z", "2026-10-04T04:10:00Z")
+    cur = _timed(_main_jobs((s10, "failure", {"Run tests": "failure"})), "2026-10-04T04:20:00Z", "2026-10-04T04:30:00Z")
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=cur))
+    assert got["route"] == "alerts", got["_stdout"]
+    assert got["summary"] == "red on 2 consecutive main runs (also run 41): Python tests / Run tests / Run tests"
 
 
 def test_main_red_with_a_new_failing_step_pages(tmp_path):
@@ -848,12 +901,12 @@ def test_main_red_with_a_new_failing_step_pages(tmp_path):
     assert got["route"] == "alerts", got["_stdout"]
 
 
-def test_main_red_with_no_proof_in_history_pages(tmp_path):
-    # the first red of an episode: no earlier run failed the step
+def test_main_red_with_no_history_is_a_first_red(tmp_path):
     got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "success",
                                             _main_jobs((E2E, "skipped", {})))]))
-    assert got["route"] == "alerts", got["_stdout"]
-    assert _main_route(tmp_path, _main_api([]))["route"] == "alerts"
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
+    got = _main_route(tmp_path, _main_api([]))
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
 def test_main_still_red_api_errors_page(tmp_path):
@@ -896,20 +949,25 @@ def _filler(n):
     return [(f"filler {i}", "success", {"run": "success"}) for i in range(n)]
 
 
-def test_main_red_new_failed_job_past_the_first_jobs_page_pages(tmp_path):
-    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *_filler(120),
-                         ("Lint (ruff + ty) / ruff", "failure", {"ruff": "failure"}))
-    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
-    assert got["route"] == "alerts", got["_stdout"]
+def test_main_red_second_red_past_the_first_jobs_page_pages(tmp_path):
+    # e2e is a 3rd red (#logs); ruff, on page 2 of this run's jobs, is a 2nd red and must page
+    ruff = "Lint (ruff + ty) / ruff"
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *_filler(120), (ruff, "failure", {"ruff": "failure"}))
+    p41 = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (ruff, "failure", {"ruff": "failure"}))
+    p40 = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (ruff, "success", {"ruff": "success"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", p41),
+                                           (40, "2026-10-04T03:00:00Z", "failure", p40)], current=current))
+    assert got["route"] == "alerts" and got["summary"].endswith(f"{ruff} / ruff"), got["_stdout"]
     assert "page=2" in got["_curl"]
 
 
-def test_main_red_prior_pass_past_the_first_jobs_page_pages(tmp_path):
+def test_main_red_prior_pass_past_the_first_jobs_page_is_seen(tmp_path):
+    # read only page 1 and 41 looks like it skipped e2e: 40's red would make this a 2nd red (page)
     green_late = _main_jobs(*_filler(120), (E2E, "success", {E2E_STEP: "success"}))
     api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green_late),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
-    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
 def test_main_red_jobs_list_shorter_than_total_count_pages(tmp_path):
@@ -933,13 +991,13 @@ def test_fold_blocked_by_an_extra_red_job_past_the_first_jobs_page(tmp_path):
 
 
 # --- cancelled runs are evidence too (Prism P1 daaf469b6e2e / eb4c30f2ca3e, 2026-10-04) ----------
-def test_main_red_step_passed_in_a_cancelled_run_pages(tmp_path):
-    # older run red, next run passed e2e but was cancelled on another job, now red again
+def test_main_red_step_passed_in_a_cancelled_run_is_a_recovery(tmp_path):
+    # older run red, next run passed e2e but was cancelled on another job, now red again: a first red
     passed = _main_jobs((E2E, "success", {E2E_STEP: "success"}), ("Lint (ruff + ty) / ruff", "cancelled", {}))
     api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", passed),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
-    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
 def test_main_red_cancelled_run_that_never_finished_the_job_is_walked_past(tmp_path):
@@ -947,7 +1005,7 @@ def test_main_red_cancelled_run_that_never_finished_the_job_is_walked_past(tmp_p
     api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
-    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+    assert got["route"] == "alerts" and "(also run 40)" in got["summary"], got["_stdout"]
 
 
 # --- a stalled or failing route never stops the page (Prism P1 cc0510af974c / 8c9d210ef980) ------
@@ -975,12 +1033,12 @@ def test_main_still_red_spent_budget_pages(tmp_path):
 
 # --- a step that passed inside a cancelled / timed-out JOB is a recovery (Prism P1 cb7d09e76216) --
 @pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
-def test_main_red_step_passed_in_a_cancelled_job_pages(tmp_path, conclusion):
+def test_main_red_step_passed_in_a_cancelled_job_is_a_recovery(tmp_path, conclusion):
     passed = _main_jobs((E2E, conclusion, {E2E_STEP: "success", "later step": conclusion}))
     api = _main_api([(41, "2026-10-04T04:00:00Z", conclusion, passed),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
-    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
 def test_main_red_cancelled_job_that_never_reached_the_step_is_walked_past(tmp_path):
@@ -988,25 +1046,27 @@ def test_main_red_cancelled_job_that_never_reached_the_step_is_walked_past(tmp_p
     api = _main_api([(41, "2026-10-04T04:00:00Z", "cancelled", cut),
                      (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
     got = _main_route(tmp_path, api)
-    assert got["route"] == "logs" and got["card"] == "main-still-red (run 40)", got["_stdout"]
+    assert got["route"] == "alerts" and "(also run 40)" in got["summary"], got["_stdout"]
 
 
 # --- Prism round 4 on e9718495 (t_1a8e095b) ------------------------------------------------------
 # f-abb7efb339835ba6: a job that failed with NO failed step (job timeout, runner lost) is a stepless
 # item [job, ""]. It is the same fault only if the earlier run's job ALSO failed with no failed step;
 # an earlier failure on a named step is a different fault and must page.
-def test_main_red_stepless_failure_after_a_named_step_failure_pages(tmp_path):
+def test_main_red_stepless_failure_after_a_named_step_failure_is_a_first_red(tmp_path):
     hang = _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "cancelled"}))
-    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=hang)
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e()),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())], current=hang)
     got = _main_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
-    assert got["summary"] == "" and "different fault" in got["_stdout"], got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
-def test_main_red_stepless_failure_after_a_stepless_failure_goes_to_logs(tmp_path):
+def test_main_red_stepless_failure_after_a_stepless_failure_is_the_same_fault(tmp_path):
     hang = _main_jobs((E2E, "failure", {"Set up job": "success", E2E_STEP: "cancelled"}))
-    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", hang)], current=hang)
-    got = _main_route(tmp_path, api)
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", hang)], current=hang))
+    assert got["route"] == "alerts" and got["summary"] == f"red on 2 consecutive main runs (also run 41): {E2E}"
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", hang),
+                                           (40, "2026-10-04T03:00:00Z", "failure", hang)], current=hang))
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
     assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E}"
 
@@ -1025,7 +1085,7 @@ def test_main_red_prior_timed_out_step_is_red_evidence(tmp_path):
     api = _main_api([(41, "2026-10-04T04:00:00Z", "timed_out", timed)],
                     current=_main_jobs((E2E, "timed_out", {E2E_STEP: "timed_out"})))
     got = _main_route(tmp_path, api)
-    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
 
 def test_fold_blocked_by_an_extra_timed_out_job(tmp_path):
@@ -1086,18 +1146,24 @@ def _tc(qlint):
     return (TC, "failure", {QLINT: qlint, "Fail on skipped or failed e2e-upgrade shards": "failure"})
 
 
-def test_main_red_new_quarantine_gate_failure_in_tests_complete_pages(tmp_path):
-    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("failure"))
+def test_main_red_quarantine_gate_failure_in_tests_complete_is_its_own_item(tmp_path):
+    # e2e is a 3rd red; the quarantine gate failed now and in 41 but passed in 40: its 2nd red pages
     prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("success"))
-    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
-    assert got["route"] == "alerts" and "passed on main in run 41" in got["_stdout"], got["_stdout"]
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("failure"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", current),
+                                           (40, "2026-10-04T03:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts" and got["summary"].endswith(f"{TC} / {QLINT}"), got["_stdout"]
+    # first red of the gate next to a 3rd e2e red: nothing pages yet
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior),
+                                           (40, "2026-10-04T03:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
 
 
 def test_main_red_derivative_tests_complete_failure_is_not_an_item(tmp_path):
     current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), _tc("success"))
     got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())], current=current))
-    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
-    assert got["summary"] == f"main still red on the same failure as run(s) 41: {E2E} / {E2E_STEP}"
+    assert got["route"] == "alerts", got["_stdout"]
+    assert got["summary"] == f"red on 2 consecutive main runs (also run 41): {E2E} / {E2E_STEP}"
 
 
 def test_fold_blocked_by_a_quarantine_gate_failure_in_tests_complete(tmp_path):
@@ -1118,7 +1184,8 @@ def test_main_red_large_jobs_pages_do_not_ride_on_argv(tmp_path):
         return (f"filler {i}", "success", {f"step {k} " + "x" * 200: "success" for k in range(12)})
     current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
     prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), *[fat(i) for i in range(120)])
-    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior),
+                                           (40, "2026-10-04T03:00:00Z", "failure", prior)], current=current))
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
 
 
@@ -1160,24 +1227,25 @@ SLICE = "Python tests / Run tests slice 12/16"
 QTEST2 = "tests/tools/test_other.py::test_new_regression"
 
 
-def test_main_red_new_test_in_an_already_red_slice_pages(tmp_path):
+def test_main_red_new_test_in_an_already_red_slice_is_a_first_red(tmp_path):
     red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
     prior = {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]}
     api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
     api["check-runs/700/annotations"] = _ann(QTEST2)
     api["check-runs/800/annotations"] = _ann(QTEST)
     got = _main_route(tmp_path, api)
-    assert got["route"] == "alerts" and QTEST2 in got["_stdout"], got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
+    assert "different tests failed in run 41" in got["_stdout"]
 
 
-def test_main_red_same_test_in_an_already_red_slice_goes_to_logs(tmp_path):
+def test_main_red_same_test_twice_in_a_slice_pages(tmp_path):
     red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
     prior = {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]}
     api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
     api["check-runs/700/annotations"] = _ann(QTEST)
     api["check-runs/800/annotations"] = _ann(QTEST)
     got = _main_route(tmp_path, api)
-    assert got["route"] == "logs", got["_stdout"]
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
 
 # 891d36986f43 "missing-work gate failures": a Tests complete gate step that failed while none of
@@ -1192,21 +1260,23 @@ def test_main_red_gate_failing_on_skipped_shards_next_to_a_known_red_pages(tmp_p
     assert got["route"] == "alerts", got["_stdout"]
 
 
-def test_main_red_gate_failing_on_skipped_shards_twice_goes_to_logs(tmp_path):
+def test_main_red_gate_failing_on_skipped_shards_three_times_goes_to_logs(tmp_path):
     jobs = _main_jobs(RUFF, (E2E, "skipped", {}),
                       (TC, "failure", {QLINT: "success", "Fail on skipped or failed e2e-upgrade shards": "failure"}))
-    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", jobs)], current=jobs))
-    assert got["route"] == "logs", got["_stdout"]
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", jobs),
+                                           (40, "2026-10-04T03:00:00Z", "failure", jobs)], current=jobs))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
 
 
-def test_main_red_skip_gate_now_vs_derivative_gate_before_pages(tmp_path):
+def test_main_red_skip_gate_now_vs_derivative_gate_before_is_a_first_red(tmp_path):
     # the gate failed before only because e2e-upgrade failed; now it fails on a skip: different fault
     current = _main_jobs((E2E, "skipped", {}),
                          (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure"}))
     prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
                        (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure"}))
-    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
-    assert got["route"] == "alerts" and "different fault" in got["_stdout"], got["_stdout"]
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior),
+                                           (40, "2026-10-04T03:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
 # --- Prism round 2 on 1c0d16a5 (t_1a8e095b) ------------------------------------------------------
@@ -1245,20 +1315,29 @@ def _slice_red(prior_tests, current_tests, *, older=None):
 
 # 13f5bb458e0c: the node check is against the step's LATEST execution, not any older run. Run 41
 # passed A (failed B in the same step); an older run failing A proves nothing about main now.
-def test_main_red_test_that_passed_in_the_latest_red_run_pages(tmp_path):
+def test_main_red_test_that_passed_in_the_latest_red_run_is_a_first_red(tmp_path):
     a, b = "tests/x.py::test_a", "tests/x.py::test_b"
     got = _main_route(tmp_path, _slice_red([b], [a], older=[a]))
-    assert got["route"] == "alerts" and a in got["_stdout"], got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
+
+
+# a 3rd red of the same test, and a 2nd red of it whose run before was a DIFFERENT test (a first red then)
+def test_main_red_slice_streak_compares_tests_at_every_step(tmp_path):
+    a, b = "tests/x.py::test_a", "tests/x.py::test_b"
+    got = _main_route(tmp_path, _slice_red([a], [a], older=[a]))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+    got = _main_route(tmp_path, _slice_red([a], [a], older=[b]))
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
 
 # 702860bc5678: node ids are compared whole; a parameter id with "; " must not collapse two tests.
 def test_main_red_semicolon_parameter_ids_are_not_truncated(tmp_path):
     got = _main_route(tmp_path, _slice_red(["tests/x.py::test_case[a; c]"], ["tests/x.py::test_case[a; b]"]))
-    assert got["route"] == "alerts", got["_stdout"]
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
 
 
-def test_main_red_same_semicolon_parameter_id_goes_to_logs(tmp_path):
+def test_main_red_same_semicolon_parameter_id_is_the_same_test(tmp_path):
     t = "tests/x.py::test_case[a; b]"
     got = _main_route(tmp_path, _slice_red([t], [t]))
-    assert got["route"] == "logs", got["_stdout"]
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
