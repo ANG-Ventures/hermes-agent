@@ -192,43 +192,5 @@ async def test_new_polling_generation_resets_the_sentinel(caplog):
     assert _gap_records(caplog) == []
 
 
-def test_handlers_are_registered_from_a_single_site():
-    """Structural guard: the sentinel cannot be wired on only one path.
-
-    Handler registration used to be duplicated between initial connect and the
-    rebuild-on-retry path, so a new handler had to be remembered twice. Both
-    paths now call _register_handlers, and the intake sentinel must be in a
-    group that runs strictly before the functional handlers.
-    """
-    import inspect
-
-    from plugins.platforms.telegram import adapter as tg_adapter
-
-    source = inspect.getsource(tg_adapter.TelegramAdapter)
-    # Exactly one place constructs the handler set.
-    assert source.count("def _register_handlers") == 1
-    assert source.count("self._register_handlers(self._app)") == 2, (
-        "both the initial-connect and rebuild-on-retry paths must share the "
-        "single registration site"
-    )
-
-    registrar = inspect.getsource(tg_adapter.TelegramAdapter._register_handlers)
-    # Strip docstring AND comments: both *discuss* block=False, and a guard that
-    # greps prose would match its own explanation.
-    import io
-    import tokenize
-    code_only = "".join(
-        tok.string for tok in tokenize.generate_tokens(io.StringIO(registrar).readline)
-        if tok.type not in (tokenize.COMMENT,)
-        and not (tok.type == tokenize.STRING and tok.string.startswith(('"""', "'''")))
-    )
-    assert "TypeHandler" in code_only
-    assert "group=-1" in code_only, "the sentinel must observe before handling"
-    # The sentinel must be BLOCKING. block=False defers the callback to
-    # Application.create_task, which (a) never runs when the app isn't running
-    # and (b) allows out-of-order observation — which for a sequential-id gap
-    # detector manufactures false alarms. A separate group already guarantees
-    # it cannot consume the update.
-    assert "block=False" not in code_only, (
-        "the sentinel must observe in order; block=False defers it to a task"
-    )
+# Registration and group -1 priority are driven through the real PTB Application in
+# tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py (no source reading).

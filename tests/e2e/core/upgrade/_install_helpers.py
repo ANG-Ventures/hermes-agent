@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tests.e2e.core.upgrade import _helpers as H
+from tests.e2e.environ_snapshot import environ_snapshot
 
 OFFICIAL_HTTPS = "https://github.com/NousResearch/hermes-agent.git"
 OFFICIAL_SSH = "git@github.com:NousResearch/hermes-agent.git"
@@ -38,7 +39,7 @@ def real_uv() -> str | None:
 
 def git(*args: str, cwd: Path, check: bool = True, env: dict | None = None) -> str:
     cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                        env=env or {**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                        env=env or {**environ_snapshot(), "GIT_TERMINAL_PROMPT": "0"})
     if check and cp.returncode != 0:
         raise AssertionError(f"git {args} failed in {cwd}: {cp.stderr}")
     return cp.stdout.strip()
@@ -72,7 +73,7 @@ def publish_commit(origin: Path, scratch: Path, message: str, files: dict[str, s
     work = scratch / f"publish-{hashlib.sha1(message.encode()).hexdigest()[:8]}"
     if work.exists():
         shutil.rmtree(work)
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "e2e", "GIT_AUTHOR_EMAIL": "e2e@example.invalid",
+    env = {**environ_snapshot(), "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "e2e", "GIT_AUTHOR_EMAIL": "e2e@example.invalid",
            "GIT_COMMITTER_NAME": "e2e", "GIT_COMMITTER_EMAIL": "e2e@example.invalid"}
     git("clone", "-q", "--shared", "--no-checkout", "-b", "main", str(origin), str(work), cwd=scratch, env=env)
     git("reset", "-q", "main", cwd=work, env=env)

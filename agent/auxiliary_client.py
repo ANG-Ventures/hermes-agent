@@ -1693,8 +1693,16 @@ class _CodexStreamGuard:
     def finish(self) -> None:
         """Owner ``finally``: stop the watchdog and release FDs a stranger-thread timeout only shut down."""
         self.stream_finished.set()
-        if self._timer is not None:
-            self._timer.cancel()
+        # cancel() cannot stop a callback already running; join it so the owner returns only after
+        # the stranger thread is done (else it sets timeout_release_pending after the check below and
+        # the FD release is skipped). Loop: a fire racing stream_finished may have re-armed _timer.
+        timer = self._timer
+        while timer is not None:
+            timer.cancel()
+            timer.join(5.0)
+            if self._timer is timer:
+                break
+            timer = self._timer
         # Gated on timeout_release_pending, NOT timed_out: after a hard-cancel the shared
         # client must stay usable for other sessions.
         if self.timeout_release_pending.is_set():
@@ -7224,20 +7232,8 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
     return converted
 
 
-_PROFILE_REASONING_KEYS = {
-    "reasoning", "reasoning_effort", "thinking", "thinking_config", "thinkingconfig",
-    "thinking_budget", "thinkingbudget", "enable_thinking", "think", "verbosity",
-}
-
-
-def _contains_profile_reasoning_fields(value: Any) -> bool:
-    """Return whether a profile payload contains a reasoning wire control (recursive)."""
-    if not isinstance(value, dict):
-        return False
-    return any(
-        str(key).strip().lower() in _PROFILE_REASONING_KEYS or _contains_profile_reasoning_fields(nested)
-        for key, nested in value.items()
-    )
+from agent.reasoning_effort import REASONING_CONTROL_KEYS as _PROFILE_REASONING_KEYS
+from agent.reasoning_effort import has_reasoning_control as _contains_profile_reasoning_fields
 
 
 _NOUS_PROVIDER_NAMES = frozenset({"nous", "nous-portal", "nousresearch"})
@@ -7356,12 +7352,26 @@ def _project_provider_profile(
             )
             reasoning_extra = reasoning_extra or {}
             top_level = top_level or {}
-            handles_reasoning = (
-                type(profile).build_api_kwargs_extras is not ProviderProfile.build_api_kwargs_extras
-                or _contains_profile_reasoning_fields(body)
+            # Did the profile's own projections put a reasoning control on the wire? Judged on
+            # the emitted dicts alone — a hook override that only adds unrelated options, or
+            # returns nothing for this model, has NOT handled reasoning.
+            emitted_control = (
+                _contains_profile_reasoning_fields(body)
                 or _contains_profile_reasoning_fields(reasoning_extra)
                 or _contains_profile_reasoning_fields(top_level)
             )
+            handles_reasoning = (
+                type(profile).build_api_kwargs_extras is not ProviderProfile.build_api_kwargs_extras
+                or emitted_control
+            )
+            # Same capability flag as the main transport: the declared top-level knob, clamped
+            # (with notice) onto the profile's per-model vocabulary, for aux calls too.
+            if getattr(profile, "supports_reasoning_effort", False) and not emitted_control:
+                from agent.reasoning_effort import profile_route_for, resolve_route_effort
+                effort = resolve_route_effort(reasoning_config, profile_route_for(profile, model))
+                if effort is not None:
+                    top_level = {**top_level, "reasoning_effort": effort}
+                handles_reasoning = True
     except Exception as exc:
         logger.debug("_build_call_kwargs: provider profile projection failed for %s: %s", provider, exc)
     return _ProfileProjection(body, reasoning_extra, top_level, handles_reasoning, messages_wire)

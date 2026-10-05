@@ -14,11 +14,11 @@ small conditions inside a very large gating block:
    coerce any scalar via ``str()`` before splitting.
 
 2. **Quoted-bot-mention suppression.** Free-response channels routinely contain
-   *quoted* mentions of other bots (migration notes, pasted transcripts, prior
-   context). The fork answers those anyway — the exemption only suppresses a
-   reply when the message *literally starts* with another bot's mention, i.e.
-   it is genuinely addressed to that bot. Neutering this makes the bot fall
-   silent on any free-response message that happens to quote another agent.
+   *quoted* mentions of other bots. The fork answers those anyway and suppresses
+   only a message that *starts* with another bot's mention. That half is tested
+   end-to-end at the adapter's admission gate in
+   tests/gateway/test_discord_quoted_mention_admission.py; this file covers the
+   coercion half only.
 
 Adapter-level, no live gateway, no Discord connection.
 """
@@ -120,51 +120,11 @@ def test_absent_config_yields_empty_set_not_wildcard():
 
 
 # --------------------------------------------------------------------------- #
-# 2. Quoted-mention exemption (the free-response "answer anyway" rule)
+# 2. Quoted-mention exemption: driven at the real gate, not replicated here.
+#    tests/gateway/test_discord_quoted_mention_admission.py sends fake messages through
+#    DiscordAdapter._dispatch_incoming_message and asserts dispatch vs suppression
+#    (t_2206d24f; registered as this entry's call_site_tests in fork-features.json).
 # --------------------------------------------------------------------------- #
-
-def _addressed_to_another_bot(content, other_bot_ids):
-    """Replicate the fork's addressing test from on_message.
-
-    Mirrors plugins/platforms/discord/adapter.py ~L8600-8607: a reply is
-    suppressed only when the *stripped* content STARTS WITH another bot's raw
-    mention (``<@ID>`` or the legacy ``<@!ID>`` nickname form). A mention
-    anywhere else in the body is a quote, not an address.
-    """
-    stripped = (content or "").lstrip()
-    return any(
-        stripped.startswith(f"<@{bid}>") or stripped.startswith(f"<@!{bid}>")
-        for bid in other_bot_ids
-    )
-
-
-@pytest.mark.parametrize(
-    "content,suppressed",
-    [
-        # Genuinely addressed to the other bot → stay silent.
-        ("<@999> can you handle this?", True),
-        ("  <@999> leading whitespace still counts", True),
-        ("<@!999> legacy nickname mention form", True),
-        # QUOTED mention mid-body → the fork answers anyway.
-        ("earlier <@999> said the migration was done — is that right?", False),
-        ('the note read "<@999> owns alerts" but who owns this now?', False),
-        ("what did <@999> mean by lane headers?", False),
-        # No other-bot mention at all.
-        ("plain free-response question", False),
-    ],
-)
-def test_quoted_other_bot_mention_does_not_silence_free_response(content, suppressed):
-    """RED-PROVABLE: in plugins/platforms/discord/adapter.py replace the
-    ``stripped_content.startswith(...)`` any() block (~L8600-8607) with a bare
-    ``return`` — every "quoted mention" case starts being suppressed and the
-    ``suppressed is False`` rows fail. Conversely, deleting the whole
-    ``if _other_bots_mentioned and not _self_mentioned:`` block makes the
-    ``suppressed is True`` rows fail."""
-    assert _addressed_to_another_bot(content, {"999"}) is suppressed, (
-        f"free-response addressing verdict wrong for {content!r}: a quoted "
-        f"bot mention must not be mistaken for addressing that bot."
-    )
-
 
 def test_wildcard_membership_short_circuits_channel_matching():
     """``"*"`` is preserved in the set precisely so the caller can

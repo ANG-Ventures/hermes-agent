@@ -168,6 +168,10 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     (".worktrees",),                # review/verifier worktrees (argus, per-task)
     ("var", "ramscratch-stage-*"),  # RAM-disk evacuation staging copies
     ("var", "subvps-stage"),        # sub-VPS rsync staging mount (restic-covered)
+    # 2026-10-04: rotated every few minutes by their writers, so a multi-hour full walk lists
+    # files that are gone by the time the zip reaches them. Both are rebuilt from durable state:
+    ("var", "subs-portal", "site", "shards"),  # subs.ace bake output (rebuilt from ledger.db)
+    ("var", "pin-surfaces"),        # pin-factory witness captures (rewritten every gateway boot)
 )
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
@@ -687,12 +691,14 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
 
 def _write_zip_entries(
     zf: zipfile.ZipFile, files_to_add: List[Tuple[Path, Path]], out_path: Path,
-    *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
+    *, on_db_failure, on_error, on_progress, track_bytes: bool, on_vanished=None) -> int:
     """Add every ``(abs_path, rel_path)`` to *zf*, WAL-safe for ``*.db``; return bytes archived.
 
     ``on_db_failure(rel_path)`` runs when a SQLite snapshot fails (may raise to abort);
     ``on_error(rel_path, exc)`` records a read failure; ``on_progress(i)`` fires every 500 files;
-    ``track_bytes`` stats plain files for the size total.
+    ``track_bytes`` stats plain files for the size total. ``on_vanished(rel_path)``, when given,
+    takes a plain file that no longer exists (deleted after the scan listed it) instead of
+    ``on_error``: nothing is missing from the archive that still exists on disk.
     """
     total_bytes = 0
     for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
@@ -704,7 +710,13 @@ def _write_zip_entries(
                     continue
                 total_bytes += size
             else:
-                _write_zip_file(zf, abs_path, str(rel_path))
+                try:
+                    _write_zip_file(zf, abs_path, str(rel_path))
+                except FileNotFoundError:
+                    if on_vanished is None or abs_path.exists():
+                        raise
+                    on_vanished(rel_path)
+                    continue
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
         except (PermissionError, OSError, ValueError) as exc:
@@ -921,6 +933,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     logger.info("backup phase=archive status=started files=%d", file_count)
     print(f"Backing up {file_count} files ...")
     errors = []
+    vanished: list[str] = []  # listed by the scan, deleted before the write reached them
     worktree_bundles: list[tuple[str, int]] = []  # (arcname, unpushed commit count)
     t0 = time.monotonic()
 
@@ -933,7 +946,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
-            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
+            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
+            on_vanished=lambda rel: vanished.append(str(rel)))
         # External memory-provider state never includes ``.db`` files in practice, so no
         # SQLite snapshot is needed; _write_zip_file still drops a failed partial member.
         for abs_path, arcname in external_to_add:
@@ -972,8 +986,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
 
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
-    logger.info("backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d bytes=%d",
-                elapsed * 1000, file_count, len(errors), zip_size)
+    logger.info("backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d vanished=%d bytes=%d",
+                elapsed * 1000, file_count, len(errors), len(vanished), zip_size)
     print(f"\nBackup {'incomplete' if errors else 'complete'}: {out_path}\n"
           f"  Files:       {file_count}\n"
           f"  Original:    {_format_size(total_bytes)}\n"
@@ -998,6 +1012,9 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
               "(not portable):\n" + "\n".join(f"    {p}" for p in sorted(skipped_external)[:10]))
     if skipped_dirs:
         print("\n  Excluded directories:\n" + "\n".join(f"    {d}/" for d in sorted(skipped_dirs)))
+    if vanished:
+        _print_capped(f"\n  WARN: {len(vanished)} file(s) were deleted after the scan listed them "
+                      "(not archived, not an error):", vanished, "  ")
     if errors:
         _print_capped(f"\n  Archive kept, but {len(errors)} file(s) could not be added:", errors, "  ")
     else:

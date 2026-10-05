@@ -148,6 +148,9 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
             def cancel(self):
                 pass
 
+            def join(self, timeout=None):
+                pass
+
         with (
             patch("agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.3),
             patch("agent.auxiliary_client._evict_cached_client_instance"),

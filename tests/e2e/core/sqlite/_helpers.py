@@ -36,6 +36,7 @@ from pathlib import Path
 
 from hermes_cli.sqlite_runtime import is_sqlite_wal_reset_vulnerable
 from tests.conformance.persistence._harness import REPO_ROOT, kill9_and_reap, wait_for
+from tests.e2e.environ_snapshot import environ_snapshot
 
 ROLES = Path(__file__).with_name("_roles.py")
 DEFAULT_SEED = 20260923
@@ -73,7 +74,7 @@ def episode_seed(label: str) -> int:
 
 def child_env(home: Path, hermes_home: Path) -> dict:
     """Probe hygiene: private HOME/HERMES_HOME, no provider credentials, repo importable."""
-    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    env = {k: v for k, v in environ_snapshot().items() if not k.endswith("_API_KEY")}
     env.update({
         "HOME": str(home),
         "HERMES_HOME": str(hermes_home),

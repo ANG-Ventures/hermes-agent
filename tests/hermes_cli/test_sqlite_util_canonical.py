@@ -60,6 +60,41 @@ def test_open_db_closes_the_half_open_connection_when_initialize_raises(monkeypa
         opened[0].execute("SELECT 1")
 
 
+
+def test_open_db_default_retries_a_transient_lock_on_the_wal_pragma(monkeypatch, tmp_path):
+    """Racing first openers of a fresh DB can get ``database is locked`` from ``PRAGMA journal_mode=WAL``
+    regardless of busy_timeout. Every store calls ``open_db`` with the default, so the default must
+    retry it (two cron replicas claiming one fire died on it in CI); other errors still raise at once."""
+    import hermes_state_wal
+
+    real_apply = hermes_state_wal.apply_wal_with_fallback
+    attempts = []
+
+    def flaky(conn, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return real_apply(conn, **kwargs)
+
+    monkeypatch.setattr(hermes_state_wal, "apply_wal_with_fallback", flaky)
+    monkeypatch.setattr(sqlite_util.time, "sleep", lambda _s: None)
+    conn = sqlite_util.open_db(tmp_path / "race.db", db_label="race.db")
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+    assert len(attempts) == 3
+
+    def broken(conn, **kwargs):
+        attempts.append(1)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    attempts.clear()
+    monkeypatch.setattr(hermes_state_wal, "apply_wal_with_fallback", broken)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        sqlite_util.open_db(tmp_path / "other.db", db_label="other.db")
+    assert len(attempts) == 1
+
 # Every store that opens its own SQLite file (path -> module attribute holding the opener).
 _STORE_OPENERS = (
     ("agent.verification_evidence", "_connect"),

@@ -28,30 +28,6 @@ import sys
 import pytest
 
 
-@pytest.fixture
-def hermes_env(tmp_path, monkeypatch):
-    """Isolate HERMES_HOME for each test so jobs/scripts/snapshots don't leak."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / "scripts").mkdir()
-    (home / "cron").mkdir()
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    # Reload modules that cache get_hermes_home() at import time.
-    import importlib
-    import hermes_constants
-    importlib.reload(hermes_constants)
-    import cron.jobs
-    importlib.reload(cron.jobs)
-    import cron.monitor
-    importlib.reload(cron.monitor)
-    import cron.scheduler
-    importlib.reload(cron.scheduler)
-
-    return home
-
-
 def _write_script(home, name: str, body: str) -> str:
     path = home / "scripts" / name
     path.write_text(body, encoding="utf-8")

@@ -31,6 +31,7 @@ import pytest
 from tests.e2e.core.providers._catalog_helpers import Known, gate, known_gate
 from tests.fakes.providers.catalog_fake import CatalogFake
 from tests.fakes.providers.catalog_oauth import NOUS_INVOKE_SCOPE, OAuthFake, make_jwt
+from tests.e2e.environ_snapshot import environ_snapshot
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX harness")
 
@@ -84,7 +85,7 @@ class Home:
         return json.loads(self.auth_path.read_text(encoding="utf-8"))
 
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_SUFFIXES)}
         env.update({
             "HOME": str(self.home), "HERMES_HOME": str(self.hermes_home), "PYTHONPATH": str(REPO_ROOT),

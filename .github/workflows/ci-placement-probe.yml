@@ -106,6 +106,7 @@ jobs:
             scripts/ci_overflow_request.py
             scripts/run_tests_parallel.py
             scripts/ci/list_os_marked_tests.py
+            scripts/ci/flake_quarantine.py
           if-no-files-found: error
           retention-days: 1
 
