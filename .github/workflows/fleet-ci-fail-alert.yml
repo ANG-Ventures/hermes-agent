@@ -219,8 +219,10 @@ jobs:
           # which pages (#alerts) with time left in the 10-minute job for the POST. --retry 2: the
           # jobs list of a 90-job run 502s intermittently (2026-10-05, run 37197359967), and the
           # streak walk reads more runs than the old one; a transient 5xx must not page.
+          # `timeout` hard-caps each call (75 s): --max-time bounds one attempt, not curl's sleep before a
+          # retry, which an old curl takes from Retry-After (Prism P1 d27c81521ab7).
           ROUTE_DEADLINE=$((SECONDS + ${ROUTE_BUDGET_S:-150}))
-          api() { [ "$SECONDS" -lt "$ROUTE_DEADLINE" ] || return 1; curl -fsS --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          api() { [ "$SECONDS" -lt "$ROUTE_DEADLINE" ] || return 1; timeout "${API_CALL_S:-75}" curl -fsS --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
           run_jobs() {  # run id -> {"jobs": [every job]}, following pages; rc!=0 on an API error or an incomplete list
             [ -n "${JOBS_CACHE:-}" ] && [ -s "$JOBS_CACHE/$1" ] && { cat "$JOBS_CACHE/$1"; return 0; }
             # A run can carry > 100 jobs. One page would drop a failed job (missed page) or a job
@@ -432,10 +434,21 @@ jobs:
               # completed before R did: overlapping runs and later re-runs of an older commit are not
               # seen; Prism P1 31122e0a54bf / 358db3d855b2 / 805a46df2012). Otherwise this red is the
               # 2nd that pages.
-              paired() {  # R, older -> rc 0 when R's notifier paged the R+older pair
+              # R created >= BACKSTOP_S after the older red: R's notifier logged the pair as the
+              # backstop's (LATE below), so it never paged it; the backstop owns the streak and this
+              # red is LATE too, never a fresh page (Prism P1 f9a5572f1892).
+              paired() {  # R, older -> rc 0 R's notifier paged the R+older pair, 1 it did not, 3 it left it to the backstop
                 [ "$(meta "$1" conclusion)" = failure ] || return 1
                 local ru ou; ru="$(meta "$1" updated_at)"; ou="$(meta "$2" updated_at)"
-                ! [[ "$ou" > "$ru" ]]
+                ! [[ "$ou" > "$ru" ]] || return 1
+                late "$1" "$2" && return 3
+                return 0
+              }
+              late() {  # newer run, older run -> rc 0 when newer was created >= BACKSTOP_S after older
+                local t1 t0
+                t1="$(jq -rn --arg c "$(meta "$1" created_at)" '$c | fromdateiso8601')" || return 1
+                t0="$(jq -rn --arg c "$(meta "$2" created_at)" '$c | fromdateiso8601')" || return 1
+                [ $((t1 - t0)) -ge "$BACKSTOP_S" ]
               }
               classify() {  # run id, items JSON -> one state per item; rc!=0 on an API error
                 run_jobs "$1" | jq -c --argjson items "$2" "$AGG_JQ"'
@@ -470,7 +483,11 @@ jobs:
                 p="$(sig_of "$1" nodes "$2")" || return 2
                 [ -z "$(comm -23 <(printf '%s\n' "$c") <(printf '%s\n' "$p") | grep -v '^$' || true)" ] || return 1
               }
-              tests_item() { jq -e '.[0] | test("Run tests")' <<< "$1" > /dev/null; }
+              # Node ids describe the TEST step only: another step of a slice job (an upload, a checkout)
+              # fails for its own reason, so a repeat of it is the same fault whatever the tests did
+              # (Prism P1 1bc892158064). Test step = "Run tests ..." / "Slice verdict ...", or stepless.
+              TEST_ITEM_JQ='(.[0] | test("Run tests")) and (.[1] == "" or (.[1] | test("^(Run tests|Slice verdict)")))'
+              tests_item() { jq -e "$TEST_ITEM_JQ" <<< "$1" > /dev/null; }
               # STREAK (t_54478fb0, Apollo ruling B). Page only the SECOND consecutive red of an
               # item (job / step): its latest earlier execution on main was red (run R) and the
               # execution before R was not. A first red (a one-run flake until it repeats) and a
@@ -493,13 +510,13 @@ jobs:
                 fi
                 HIT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] == "red") | .value]' <<< "$LEFT")"
                 if [ -n "$NODES" ]; then
-                  for TJ in $(jq -r '.[] | select(.[0] | test("Run tests")) | .[0] | @base64' <<< "$HIT"); do
+                  for TJ in $(jq -r ".[] | select($TEST_ITEM_JQ) | .[0] | @base64" <<< "$HIT" | sort -u); do
                     TJ="$(base64 -d <<< "$TJ")"
                     if same_tests "$prev" "$TJ"; then rc=0; else rc=$?; fi
                     [ "$rc" = 2 ] && { BAD="cannot read the tests of run $prev"; break 2; }
                     if [ "$rc" = 1 ]; then
                       echo "different tests failed in run $prev: $TJ is a new fault"
-                      ST="$(jq -c --argjson l "$LEFT" --arg j "$TJ" '[to_entries[] | if .value == "red" and $l[.key][0] == $j then "differs" else .value end]' <<< "$ST")"
+                      ST="$(jq -c --argjson l "$LEFT" --arg j "$TJ" "[to_entries[] | if .value == \"red\" and \$l[.key][0] == \$j and (\$l[.key] | $TEST_ITEM_JQ) then \"differs\" else .value end]" <<< "$ST")"
                     fi
                   done
                   HIT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] == "red") | .value]' <<< "$LEFT")"
@@ -525,8 +542,8 @@ jobs:
                   S1="$(classify "$older" "[$IT]" | jq -r '.[0]')" || { BAD="cannot read run $older"; break; }
                   case "$S1" in
                     red)
-                      paired "$R" "$older" && KIND=old
-                      if [ "$KIND" = old ] && tests_item "$IT"; then
+                      if paired "$R" "$older"; then KIND=old; else [ "$?" = 3 ] && KIND=late; fi
+                      if [ "$KIND" != second ] && tests_item "$IT"; then
                         # R's own tests vs older: R paged only if ITS failures repeated older's
                         # (Prism P1 21a041362289), not this run's
                         if same_tests "$older" "$(jq -r '.[0]' <<< "$IT")" "$R"; then rc=0; else rc=$?; fi
@@ -542,6 +559,9 @@ jobs:
                 [ -n "$BAD" ] && break
                 if [ "$KIND" = old ]; then
                   OLD="$(jq -c --argjson i "$IT" '. + [$i]' <<< "$OLD")"; continue
+                fi
+                if [ "$KIND" = late ]; then
+                  LATE="$(jq -c --argjson i "$IT" '. + [$i]' <<< "$LATE")"; continue
                 fi
                 # the window is between the two RUNS (created_at), so every item of one run pair gets
                 # the same answer here and in main-red-summary.py: one fault never pages from both
@@ -674,6 +694,10 @@ jobs:
           # A replay is labelled and gets its own delivery id, so the receiver's
           # idempotency does not drop it when the original run already paged.
           DELIVERY="ci-fail-${WF_RUN_ID}"
+          # #logs gets its own id: the receiver dedupes ids across ALL routes for an hour, so a re-run
+          # that promotes a logged red to #alerts would be dropped as a duplicate (Prism P1
+          # c171f8cb6512). Each route keeps its own re-run idempotency (t_101c01be).
+          [ "${ROUTE:-alerts}" = logs ] && DELIVERY="${DELIVERY}-known"
           # Merge-queue ejection: PR + failing tests on the page's first line (t_70f92e0b).
           if [ -n "${SUMMARY:-}" ]; then
             WF_NAME="${WF_NAME} — ${SUMMARY}"

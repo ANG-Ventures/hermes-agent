@@ -565,8 +565,10 @@ def test_replay_2026_09_28_folds_already_red_tests_to_logs(tmp_path):
     # main first reds -> #logs: 9d81866f Windows-only, aa9e59a3 slice 13, ebf35a80 (main went green at 22:48)
     for rid in (36475808846, 36476853851, 36496636054):
         assert routes[rid]["route"] == "logs" and routes[rid]["card"] == "first-red", (rid, routes[rid])
-    # 71546f7d: the 3rd consecutive kanban red on main
-    assert routes[36494384491]["card"] == "main-still-red (run 36490159001)"
+    # 71546f7d: the 3rd consecutive kanban red on main. 36490159001 never paged the pair (it was late), so
+    # this is not "still red after a page": the backstop owns the streak (Prism P1 f9a5572f1892)
+    assert routes[36494384491]["route"] == "logs"
+    assert routes[36494384491]["card"] == "main-red-backstop (run 36490159001)"
     folded = {rid: g for rid, g in routes.items() if g["card"].startswith("already-red (run ")}
     assert len(folded) == 8 and len(routes) == 15
     # every ejection after the first proxy-asserts page folds, naming the PR
@@ -1380,3 +1382,112 @@ def test_main_red_same_semicolon_parameter_id_is_the_same_test(tmp_path):
     got = _main_route(tmp_path, _slice_red([t], [t]))
     assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
+
+
+# --- Prism round 3 (t_54478fb0, Apollo 11:55) -----------------------------------------------------
+# 1bc892158064: node ids describe the test step only. An upload step red in two consecutive runs is
+# the same fault even though the two runs failed different tests.
+UPLOAD = "Upload per-file junit + slice manifest"
+VERDICT = "Slice verdict (flake quarantine, base-ref list)"
+
+
+def test_main_red_repeated_non_test_step_in_a_slice_job_pages_whatever_the_tests(tmp_path):
+    a, b = "tests/x.py::test_a", "tests/x.py::test_b"
+    red = _main_jobs((SLICE, "failure", {VERDICT: "failure", UPLOAD: "failure"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure",
+                      {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]})], current=red)
+    api["check-runs/700/annotations"] = _ann(a)
+    api["check-runs/800/annotations"] = _ann(b)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+    assert got["summary"] == f"red on 2 consecutive main runs (also run 41): Python tests / Run tests / {UPLOAD}"
+
+
+def test_main_red_test_step_with_different_tests_is_still_a_new_fault(tmp_path):
+    # the scoping above must not turn the test step itself into a job-name match
+    a, b = "tests/x.py::test_a", "tests/x.py::test_b"
+    red = _main_jobs((SLICE, "failure", {VERDICT: "failure"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure",
+                      {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]})], current=red)
+    api["check-runs/700/annotations"] = _ann(a)
+    api["check-runs/800/annotations"] = _ann(b)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "logs" and got["card"] == "first-red", got["_stdout"]
+
+
+# f9a5572f1892: O -> R -> this run, R created >= BACKSTOP_S after O. R's notifier logged the pair as
+# the backstop's, so it paged nothing; this red is the backstop's too (main-red-summary pages the
+# streak once), never "main still red after a page". Same key (repo, workflow, job, step) on both sides.
+def test_main_red_pair_left_to_the_backstop_is_not_treated_as_paged(tmp_path):
+    api = _main_api([(41, "2026-10-04T04:30:00Z", "failure", _red_e2e()),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api, env_extra=HOUR)
+    assert got["route"] == "logs" and got["card"] == "main-red-backstop (run 41)", got["_stdout"]
+    # control: R inside the window of O paged the pair, so this one is a 3rd red
+    api["runs?branch=main&event=push"]["workflow_runs"][1]["created_at"] = "2026-10-04T03:30:01Z"
+    got = _main_route(tmp_path, api, env_extra=HOUR)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+# c171f8cb6512: a re-run can promote a logged red of the same run to #alerts. The receiver dedupes
+# X-GitHub-Delivery across routes for an hour, so the two routes need distinct ids.
+_FAKE_CURL_DELIVERY = r"""#!/usr/bin/env bash
+out=""; url=""; d=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift ;; -H) case "$2" in "X-GitHub-Delivery: "*) d="${2#X-GitHub-Delivery: }" ;; esac; shift ;;
+    https://*) url="$1" ;; esac; shift
+done
+echo "$url $d" >> "$FAKE_CURL_LOG"; : > "$out"; printf '200'
+"""
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+def test_logs_and_alerts_posts_of_one_run_use_distinct_delivery_ids(tmp_path):
+    steps = _workflow()["jobs"]["notify-on-failure"]["steps"]
+    post = next(s for s in steps if s.get("name", "").startswith("Sign and POST"))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(_FAKE_CURL_DELIVERY)
+    (bindir / "curl").chmod(0o755)
+    log = tmp_path / "post.log"
+    ids = {}
+    for route in ("logs", "alerts", "alerts"):
+        log.write_text("")
+        env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "FAKE_CURL_LOG": str(log),
+               "ROUTE": route, "CARD": "first-red", "CI_FAIL_WEBHOOK_SECRET": "s",
+               "WEBHOOK_URL": "https://hooks.example/webhooks/ci-fail", "WF_NAME": "CI", "WF_BRANCH": "main",
+               "WF_SHA": "abc", "WF_RUN_ID": "42", "WF_URL": "https://x/42", "WF_ACTOR": "k", "REPO": "o/r",
+               "WF_EVENT": "push", "EVENT_NAME": "workflow_run", "GITHUB_RUN_ID": "7"}
+        proc = subprocess.run(["bash", _script(tmp_path, post["run"])], env=env, capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        url, delivery = log.read_text().split()
+        ids.setdefault(route, set()).add(delivery)
+    assert ids["logs"] == {"ci-fail-42-known"} and ids["alerts"] == {"ci-fail-42"}  # a re-run on one route still dedupes
+
+
+# d27c81521ab7: curl's sleep before a retry (Retry-After) is not under --max-time; each call is hard-capped.
+_FAKE_CURL_HANG = r"""#!/usr/bin/env bash
+echo "$*" >> "$FAKE_CURL_LOG"; sleep 30
+"""
+
+
+def test_main_red_a_hung_api_call_is_cut_and_pages(tmp_path):
+    got_t0 = __import__("time").monotonic()
+    step = _route_step()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(_FAKE_CURL_HANG)
+    (bindir / "curl").chmod(0o755)
+    out = tmp_path / "out"
+    out.write_text("")
+    run = {"name": "CI", "workflow_id": 7, "id": 42, "head_sha": "abc", "conclusion": "failure",
+           "head_branch": "main", "event": "push", "created_at": "2026-10-04T05:00:00Z",
+           "html_url": "https://x/42", "actor": {"login": "Kyzcreig"}}
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(tmp_path / "log"), "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run",
+           "DEFAULT_BRANCH": "main", "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run),
+           "KNOWN_RED": step["env"]["KNOWN_RED"], "API_CALL_S": "1"}
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=25)
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    assert got["route"] == "alerts", proc.stdout
+    assert __import__("time").monotonic() - got_t0 < 25
