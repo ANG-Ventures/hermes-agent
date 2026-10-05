@@ -1362,6 +1362,13 @@ def test_main_red_slice_streak_compares_tests_at_every_step(tmp_path):
     assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
 
+# Prism P1 21a041362289: older failed A, R failed A+B (R logged: B was new), now A: R never paged, so page
+def test_main_red_r_paged_only_if_its_own_tests_repeated_older(tmp_path):
+    a, b = "tests/x.py::test_a", "tests/x.py::test_b"
+    got = _main_route(tmp_path, _slice_red([a, b], [a], older=[a]))
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+
+
 # 702860bc5678: node ids are compared whole; a parameter id with "; " must not collapse two tests.
 def test_main_red_semicolon_parameter_ids_are_not_truncated(tmp_path):
     got = _main_route(tmp_path, _slice_red(["tests/x.py::test_case[a; c]"], ["tests/x.py::test_case[a; b]"]))

@@ -463,9 +463,9 @@ jobs:
               # every pytest node id this run failed also failed there (Prism P1 5515ab6c4f85;
               # ids compared whole, one per line: Prism P1 702860bc5678). Else: a different fault.
               # scoped to ONE item (Prism P1 11312fe7c5f9): another job's new test must not reset it
-              same_tests() {  # run id, item job -> rc 0 same tests, 1 different, 2 API error
+              same_tests() {  # run id, item job [, base run] -> rc 0 base's tests all failed in run too, 1 not, 2 API error
                 local c p
-                c="$(sig_of "$WF_RUN_ID" nodes "$2")" || return 2
+                c="$(sig_of "${3:-$WF_RUN_ID}" nodes "$2")" || return 2
                 [ -z "$c" ] && return 0
                 p="$(sig_of "$1" nodes "$2")" || return 2
                 [ -z "$(comm -23 <(printf '%s\n' "$c") <(printf '%s\n' "$p") | grep -v '^$' || true)" ] || return 1
@@ -527,7 +527,9 @@ jobs:
                     red)
                       paired "$R" "$older" && KIND=old
                       if [ "$KIND" = old ] && tests_item "$IT"; then
-                        if same_tests "$older" "$(jq -r '.[0]' <<< "$IT")"; then rc=0; else rc=$?; fi
+                        # R's own tests vs older: R paged only if ITS failures repeated older's
+                        # (Prism P1 21a041362289), not this run's
+                        if same_tests "$older" "$(jq -r '.[0]' <<< "$IT")" "$R"; then rc=0; else rc=$?; fi
                         [ "$rc" = 2 ] && { BAD="cannot read the tests of run $older"; break; }
                         [ "$rc" = 1 ] && KIND=second
                       fi
