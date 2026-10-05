@@ -326,96 +326,119 @@ def test_pr_red_or_dirty_pure():
 
 
 _GATE, _ROLLUP = "Review label gate / Review label gate", "All required checks pass"
+# The real annotations on hermes-agent#1770 @ 5422e9c36 (2026-10-05): gate run 111871305156, aggregator 111884312146.
+_GATE_ANN = [{"annotation_level": "failure", "message": "Process completed with exit code 1."},
+             {"annotation_level": "failure",
+              "message": "CI-sensitive changes require the ci-reviewed label. Add the label and re-run this check."}]
+_ROLLUP_ANN = [{"annotation_level": "failure", "message": "Process completed with exit code 1."},
+               {"annotation_level": "failure", "message": "1 job(s) failed: review-labels"},
+               {"annotation_level": "failure",
+                "message": "review-labels concluded 'failure'; expected 'success' or 'skipped'"}]
 
 
-_ONLY_LABELS = frozenset({"review-labels"})
-
-
-@pytest.mark.parametrize(("failing", "labels", "mss", "want"), [
-    # t_9479baf8: the CI-sensitive review-label gate alone (+ the aggregator it fails), no label yet -> label pending
-    ([_GATE, _ROLLUP], [], "blocked", None),
-    ([_GATE], ["bug"], "blocked", None),
-    # a real red next to the gate still wakes, and names every red check
-    ([_GATE, _ROLLUP, "tests / pytest"], [], "blocked", f"red: {_GATE}, {_ROLLUP}, tests / pytest"),
+@pytest.mark.parametrize(("failing", "label_only", "labels", "mss", "want"), [
+    # t_9479baf8: gate + aggregator, each verified red only for the missing label -> label pending, no wake
+    ([_GATE, _ROLLUP], [True, True], [], "blocked", None),
+    ([_GATE], [True], ["bug"], "blocked", None),
+    # a run that did not verify (other failure reason, unreadable annotations) still wakes
+    ([_GATE, _ROLLUP], [True, False], [], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    ([_GATE, _ROLLUP], [False, True], [], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    ([_GATE, _ROLLUP], None, [], "blocked", f"red: {_GATE}, {_ROLLUP}"),          # never verified
+    ([_GATE, _ROLLUP, _ROLLUP], [True, True], [], "blocked",                      # a verdict missing per run
+     f"red: {_GATE}, {_ROLLUP}, {_ROLLUP}"),
     # labelled and STILL red: the gate re-ran after the label and failed -> a real red
-    ([_GATE, _ROLLUP], ["ci-reviewed"], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    ([_GATE, _ROLLUP], [True, True], ["ci-reviewed"], "blocked", f"red: {_GATE}, {_ROLLUP}"),
     # the aggregator alone is not the label gate
-    ([_ROLLUP], [], "blocked", f"red: {_ROLLUP}"),
+    ([_ROLLUP], [True], [], "blocked", f"red: {_ROLLUP}"),
     # label pending never hides a merge conflict
-    ([_GATE, _ROLLUP], [], "dirty", "dirty (merge conflict)"),
+    ([_GATE, _ROLLUP], [True, True], [], "dirty", "dirty (merge conflict)"),
 ])
-def test_review_label_gate_is_label_pending_not_red(failing, labels, mss, want):
-    health = {"state": "open", "mergeable_state": mss, "failing": failing, "labels": labels,
-              "rollup_failed_jobs": _ONLY_LABELS}
+def test_review_label_gate_is_label_pending_not_red(failing, label_only, labels, mss, want):
+    health = {"state": "open", "mergeable_state": mss, "failing": failing, "labels": labels, "label_only": label_only}
     assert ow.pr_is_red_or_dirty(health) == want
-    assert ow.label_pending(health) is (want in (None, "dirty (merge conflict)"))
-
-
-@pytest.mark.parametrize("jobs", [
-    None,                                         # aggregator annotations unreadable: fail closed, wake
-    frozenset({"review-labels", "tests"}),        # a real job failure the rollup names
-    frozenset({"tests"}),                         # Prism P1 c585adb654b0: tests SKIPPED although detect says python
-])
-def test_rollup_failing_for_another_reason_still_wakes(jobs):
-    health = {"state": "open", "mergeable_state": "blocked", "failing": [_GATE, _ROLLUP], "labels": [],
-              "rollup_failed_jobs": jobs}
-    assert ow.label_pending(health) is False
-    assert ow.pr_is_red_or_dirty(health) == f"red: {_GATE}, {_ROLLUP}"
 
 
 def test_rollup_failed_jobs_parses_evaluate_needs_annotation():
-    # the real annotations on hermes-agent#1770's failing aggregator run 111884312146 (2026-10-05 17:06Z)
-    ann = [{"annotation_level": "failure", "message": "Process completed with exit code 1."},
-           {"annotation_level": "failure", "message": "1 job(s) failed: review-labels"},
-           {"annotation_level": "failure", "message": "review-labels concluded 'failure'; expected 'success' or 'skipped'"}]
-    assert ow.rollup_failed_jobs(ann) == frozenset({"review-labels"})
+    assert ow.rollup_failed_jobs(_ROLLUP_ANN) == frozenset({"review-labels"})
     assert ow.rollup_failed_jobs([{"message": "2 job(s) failed: lint, tests"}]) == frozenset({"lint", "tests"})
     assert ow.rollup_failed_jobs([{"message": "Process completed with exit code 1."}]) is None
     assert ow.rollup_failed_jobs(None) is None
 
 
-@pytest.mark.parametrize(("ann", "want"), [
-    ([{"message": "1 job(s) failed: review-labels"}], None),
-    ([{"message": "1 job(s) failed: tests"}], f"red: {_GATE}, {_ROLLUP}"),
-    (None, f"red: {_GATE}, {_ROLLUP}"),
+@pytest.mark.parametrize(("run", "ann", "want"), [
+    ({"name": _GATE, "conclusion": "failure"}, _GATE_ANN, True),
+    # Prism P1 b796fe55bbc1: checkout / emit_review_status.py failure, timeout, cancel -> not the missing label
+    ({"name": _GATE, "conclusion": "failure"}, [{"message": "Process completed with exit code 1."}], False),
+    ({"name": _GATE, "conclusion": "timed_out"}, _GATE_ANN, False),
+    ({"name": _GATE, "conclusion": "cancelled"}, None, False),
+    ({"name": _GATE, "conclusion": "failure"}, None, False),
+    ({"name": _ROLLUP, "conclusion": "failure"}, _ROLLUP_ANN, True),
+    # Prism P1 c585adb654b0: the aggregator failed on a skipped required job / a real job
+    ({"name": _ROLLUP, "conclusion": "failure"}, [{"message": "1 job(s) failed: tests"}], False),
+    ({"name": _ROLLUP, "conclusion": "failure"}, [{"message": "2 job(s) failed: review-labels, tests"}], False),
+    ({"name": _ROLLUP, "conclusion": "failure"}, None, False),
+    ({"name": "tests / pytest", "conclusion": "failure"}, _GATE_ANN, False),
 ])
-def test_query_pr_health_reads_the_rollup_annotation(monkeypatch, ann, want):
+def test_label_gate_red_only_per_run(run, ann, want):
+    assert ow._label_gate_red_only(run, ann) is want
+
+
+def _fake_1770(monkeypatch, runs, anns, labels=(), calls=None):
     sha = "5422e9c36d2e5b3b26e62c0bd11ffa3086256619"
 
     def fake(path):
+        if calls is not None:
+            calls.append(path)
         if path == "repos/ANG-Ventures/hermes-agent/pulls/1770":
             return {"state": "open", "merged_at": None, "mergeable_state": "blocked", "head": {"sha": sha},
-                    "labels": []}
+                    "labels": [{"name": x} for x in labels]}
         if path.startswith(f"repos/ANG-Ventures/hermes-agent/commits/{sha}/check-runs"):
-            rows = [{"id": 1, "name": _GATE, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}},
-                    {"id": 2, "name": _ROLLUP, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}}]
+            rows = [dict(r, status="completed", check_suite={"id": 9}) for r in runs]
             return {"check_runs": rows if path.endswith("&page=1") else []}
-        if path == "repos/ANG-Ventures/hermes-agent/check-runs/2/annotations?per_page=100":
-            return ann
+        for rid, ann in anns.items():
+            if path == f"repos/ANG-Ventures/hermes-agent/check-runs/{rid}/annotations?per_page=100":
+                return ann
         raise AssertionError(path)
     monkeypatch.setattr(ow, "_gh_json", fake)
-    assert ow.pr_is_red_or_dirty(ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)) == want
+    return ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)
 
 
-def test_query_pr_health_carries_labels(monkeypatch):
-    sha = "5422e9c36d2e5b3b26e62c0bd11ffa3086256619"
-
-    def fake(path):
-        if path == "repos/ANG-Ventures/hermes-agent/pulls/1770":
-            return {"state": "open", "merged_at": None, "mergeable_state": "blocked", "head": {"sha": sha},
-                    "labels": [{"name": "fleet"}]}
-        if path.startswith(f"repos/ANG-Ventures/hermes-agent/commits/{sha}/check-runs"):
-            rows = [{"id": 1, "name": _GATE, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}},
-                    {"id": 2, "name": _ROLLUP, "status": "completed", "conclusion": "failure", "check_suite": {"id": 9}}]
-            return {"check_runs": rows if path.endswith("&page=1") else []}
-        if path == "repos/ANG-Ventures/hermes-agent/check-runs/2/annotations?per_page=100":
-            return [{"message": "1 job(s) failed: review-labels"}]
-        raise AssertionError(path)
-    monkeypatch.setattr(ow, "_gh_json", fake)
-    health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)
+def test_query_pr_health_1770_is_label_pending(monkeypatch):
+    """The #1770 handback 2026-10-05: gate + aggregator red on the missing label -> no 'cannot land' wake."""
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 2, "name": _ROLLUP, "conclusion": "failure"}],
+                        {1: _GATE_ANN, 2: _ROLLUP_ANN}, labels=["fleet"])
     assert health["labels"] == ["fleet"]
-    assert sorted(health["failing"]) == sorted([_GATE, _ROLLUP])
-    assert ow.pr_is_red_or_dirty(health) is None   # the #1770 handback 2026-10-05 17:04Z: no 'cannot land' wake
+    assert health["label_only"] == [True, True]
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_query_pr_health_checks_every_rollup(monkeypatch):
+    """Prism P1 7d6845520733: two aggregator runs (different workflow prefixes); the second failed on skipped tests."""
+    other = "Other CI / All required checks pass"
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 2, "name": _ROLLUP, "conclusion": "failure"},
+                                      {"id": 3, "name": other, "conclusion": "failure"}],
+                        {1: _GATE_ANN, 2: _ROLLUP_ANN, 3: [{"message": "1 job(s) failed: tests"}]})
+    assert sorted(health["failing"]) == sorted([_GATE, _ROLLUP, other])
+    assert ow.pr_is_red_or_dirty(health) is not None
+
+
+@pytest.mark.parametrize("gate_ann", [None, [{"message": "Process completed with exit code 1."}]])
+def test_query_pr_health_gate_failed_for_another_reason_wakes(monkeypatch, gate_ann):
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 2, "name": _ROLLUP, "conclusion": "failure"}],
+                        {1: gate_ann, 2: _ROLLUP_ANN})
+    assert ow.pr_is_red_or_dirty(health) == f"red: {_GATE}, {_ROLLUP}"
+
+
+def test_query_pr_health_reads_no_annotations_for_a_code_red(monkeypatch):
+    calls = []
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 4, "name": "tests / pytest", "conclusion": "failure"}], {}, calls=calls)
+    assert not [c for c in calls if "/annotations" in c]
+    assert "label_only" not in health
+    assert ow.pr_is_red_or_dirty(health) is not None
 
 
 # --- cancelled duplicate check runs (t_65e5d76f) ------------------------------
