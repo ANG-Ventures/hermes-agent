@@ -38,6 +38,7 @@ import hermes_yaml as yaml
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
 from tests.e2e.core.upgrade.handoff._nshost import NamespaceHost
+from tests.e2e.environ_snapshot import environ_snapshot
 
 TRACEBACK = I.TRACEBACK
 UPDATE_TIMEOUT = 1500
@@ -193,7 +194,7 @@ def stage_n1(root: Path) -> Install:
         base_python = tomllib.load(fh)["project"]["requires-python"]
     no_cfg = root / "uv-config"
     no_cfg.mkdir(exist_ok=True)
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    uv_env = {k: v for k, v in environ_snapshot().items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(checkout / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([I.real_uv(), "sync", "-q", "--locked", "--extra", "all", "--managed-python", "--python",
                          base_python], cwd=str(checkout), env=uv_env, capture_output=True, text=True, timeout=1800)

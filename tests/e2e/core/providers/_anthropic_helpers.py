@@ -29,6 +29,7 @@ import hermes_yaml as yaml
 
 from tests.fakes.providers.anthropic_messages import MODEL_ID, AnthropicMessagesServer, Response, Responder
 from tests.fakes.providers.oauth_token_server import TLSInterceptProxy, make_test_ca
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TAG_VAR = "ANTHROPIC_E2E_TAG"
@@ -57,7 +58,7 @@ class Rig:
         fixture = self.hermes_home.resolve()
         assert fixture != real_root and fixture.parent != real_root / "profiles", (
             f"fixture HERMES_HOME {fixture} is the real install's live home")
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if (k in _PASSTHROUGH_ENV or k.startswith("LC_")) and not k.endswith(_SECRET_ENV_SUFFIXES)}
         loopback = "127.0.0.1,localhost"
         env.update({

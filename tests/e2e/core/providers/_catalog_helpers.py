@@ -33,6 +33,7 @@ import hermes_yaml as yaml
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core._pm_dependencies import select_test_dependencies
 from tests.fakes.providers.catalog_fake import USAGE_IN, USAGE_OUT, CatalogFake, Recorded
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 # Hard bound per child. A row that talks to its vendor host instead of the fake ends on its own:
@@ -171,7 +172,7 @@ def discover_catalog() -> list[Row]:
     global _CATALOG
     if _CATALOG is None:
         with tempfile.TemporaryDirectory(prefix="catalog-discover-") as d:
-            env = {k: v for k, v in os.environ.items() if k in _PASSTHROUGH}
+            env = {k: v for k, v in environ_snapshot().items() if k in _PASSTHROUGH}
             env.update(HOME=d, HERMES_HOME=str(Path(d) / ".hermes"), PYTHONPATH=str(REPO_ROOT))
             proc = subprocess.run([sys.executable, "-c", _DISCOVER], env=env, capture_output=True,
                                   text=True, timeout=120, cwd=str(REPO_ROOT))
@@ -192,7 +193,7 @@ def decoy_keys(catalog: list[Row]) -> dict[str, str]:
 
 
 def hermetic_env(home: Path, extra: dict[str, str]) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items()
+    env = {k: v for k, v in environ_snapshot().items()
            if (k in _PASSTHROUGH or k.startswith("LC_")) and not k.endswith(_SECRET_SUFFIXES)}
     env.update({
         "HOME": str(home), "HERMES_HOME": str(home / ".hermes"), "PYTHONPATH": str(REPO_ROOT),
