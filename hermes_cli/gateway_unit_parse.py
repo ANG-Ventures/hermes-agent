@@ -201,7 +201,8 @@ def _is_system_unit(unit_path: Path) -> bool:
 
 
 def _user_lookup_dirs(fragment_dir: str) -> list[str]:
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or (f"/run/user/{uid}" if uid is not None else "/nonexistent")
     # The fragment's own directory is the user config dir systemd --user reads ($XDG_CONFIG_HOME/systemd/user,
     # resolved by the caller against the account home); the rest are the fixed user search path.
     return [fragment_dir + ".control", f"{runtime}/systemd/user.control", f"{runtime}/systemd/transient",
@@ -283,8 +284,11 @@ def manager_home_for_unit(unit_path: Path) -> str:
     ``HERMES_HOME=%h/.hermes`` as its own scratch home and passed the ownership check (Prism on #1740).
     Both come from the passwd database by uid (``systemctl --user`` reaches the manager of this process's
     uid), never from ``HOME`` / ``HERMES_REAL_HOME``, which the caller controls."""
+    if not hasattr(os, "getuid"):
+        # No passwd/uid (Windows): no systemd manager exists to expand %h; a value no caller's home can equal.
+        return "/nonexistent"
     import pwd
-    uid = 0 if _is_system_unit(unit_path) else os.getuid()
+    uid = 0 if _is_system_unit(unit_path) else os.getuid()  # windows-footgun: ok — hasattr(os, "getuid") above
     try:
         return pwd.getpwuid(uid).pw_dir
     except KeyError:
