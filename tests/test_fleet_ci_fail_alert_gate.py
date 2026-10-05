@@ -1208,3 +1208,57 @@ def test_main_red_skip_gate_now_vs_derivative_gate_before_pages(tmp_path):
     got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
     assert got["route"] == "alerts" and "different fault" in got["_stdout"], got["_stdout"]
 
+
+# --- Prism round 2 on 1c0d16a5 (t_1a8e095b) ------------------------------------------------------
+# d12fe5a4bf6d: two EARLIER main runs created in the same second cannot be ordered either.
+def test_main_red_tied_predecessors_page(tmp_path):
+    green = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "success", green),
+                     (40, "2026-10-04T04:00:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+# 8a4efca8c2ad: a CANCELLED prerequisite is not an item, so the gate step that points at it stays one.
+def test_main_red_cancelled_slice_next_to_a_known_red_pages(tmp_path):
+    gate = "Fail on skipped or failed required tests"
+    current = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (SLICE, "cancelled", {"Run tests": "cancelled"}),
+                         (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure", gate: "failure"}))
+    prior = _main_jobs((E2E, "failure", {E2E_STEP: "failure"}),
+                       (TC, "failure", {"Fail on skipped or failed e2e-upgrade shards": "failure", gate: "success"}))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=current))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def _slice_red(prior_tests, current_tests, *, older=None):
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}))
+    hist = [(41, "2026-10-04T04:00:00Z", "failure", {"jobs": [dict(j, id=j["id"] + 100) for j in red["jobs"]]})]
+    if older is not None:
+        hist.append((40, "2026-10-04T03:00:00Z", "failure", {"jobs": [dict(j, id=j["id"] + 200) for j in red["jobs"]]}))
+    api = _main_api(hist, current=red)
+    api["check-runs/700/annotations"] = _ann(*current_tests)
+    api["check-runs/800/annotations"] = _ann(*prior_tests)
+    if older is not None:
+        api["check-runs/900/annotations"] = _ann(*older)
+    return api
+
+
+# 13f5bb458e0c: the node check is against the step's LATEST execution, not any older run. Run 41
+# passed A (failed B in the same step); an older run failing A proves nothing about main now.
+def test_main_red_test_that_passed_in_the_latest_red_run_pages(tmp_path):
+    a, b = "tests/x.py::test_a", "tests/x.py::test_b"
+    got = _main_route(tmp_path, _slice_red([b], [a], older=[a]))
+    assert got["route"] == "alerts" and a in got["_stdout"], got["_stdout"]
+
+
+# 702860bc5678: node ids are compared whole; a parameter id with "; " must not collapse two tests.
+def test_main_red_semicolon_parameter_ids_are_not_truncated(tmp_path):
+    got = _main_route(tmp_path, _slice_red(["tests/x.py::test_case[a; c]"], ["tests/x.py::test_case[a; b]"]))
+    assert got["route"] == "alerts", got["_stdout"]
+
+
+def test_main_red_same_semicolon_parameter_id_goes_to_logs(tmp_path):
+    t = "tests/x.py::test_case[a; b]"
+    got = _main_route(tmp_path, _slice_red([t], [t]))
+    assert got["route"] == "logs", got["_stdout"]
+

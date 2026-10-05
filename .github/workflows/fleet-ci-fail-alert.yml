@@ -238,8 +238,8 @@ jobs:
           }
           # The aggregate jobs (Tests complete, All required checks pass) fail whenever another
           # job fails. A gate step there ("Fail on skipped or failed ...", "Evaluate job results")
-          # is derivative, and dropped, only when one of ITS prerequisite jobs stopped (failed,
-          # timed out, cancelled); a gate that failed on a skipped/missing job is a new fault and
+          # is derivative, and dropped, only when one of ITS prerequisite jobs failed or timed
+          # out; a gate that failed on a skipped/missing job is a new fault and
           # stays an item (Prism P1 891d36986f43). Any OTHER failed step (Tests complete runs the
           # quarantine lint + evidence gate) is independent and stays an item (Prism P1 "Retain
           # independent failures inside Tests complete", 6117082a). An aggregate job that timed
@@ -248,7 +248,9 @@ jobs:
           AGG_JQ='def bad: . == "failure" or . == "timed_out";
             def aggregate: .name | test("Tests complete|All required checks");
             def derivative($all; $s): (.name | sub("Tests complete$"; "")) as $p
-              | [$all[] | select(.conclusion | bad or . == "cancelled") | .name] as $down
+              # only failed/timed_out prerequisites, which are items themselves; a cancelled one
+              # is not an item, so its gate step stays one (Prism P1 8a4efca8c2ad)
+              | [$all[] | select(.conclusion | bad) | .name] as $down
               | if $s == "Fail on skipped or failed e2e-upgrade shards" then any($down[]; startswith($p + "e2e-upgrade"))
                 elif $s == "Fail on skipped or failed required tests" then
                   any($down[]; . == $p + "Generate slices" or startswith($p + "Run tests ") or . == $p + "e2e")
@@ -258,8 +260,8 @@ jobs:
               | [.steps[]? | select(.conclusion | bad) | .name | select(. as $s | $a | derivative($all; $s) | not)
                 | [$a.name, .]]
               | if length == 0 and $a.conclusion == "timed_out" then [[$a.name, ""]] else . end;'
-          sig_of() {  # run id -> signature on stdout; rc!=0 on any API error
-            local jobs failed id name ann got items=""
+          sig_of() {  # run id [nodes] -> signature on stdout ("nodes": one full pytest node id per line); rc!=0 on any API error
+            local jobs failed id name ann got items="" nodes=""
             jobs="$(run_jobs "$1")" || return 1
             failed="$(jq -r "$AGG_JQ"'
               . as $r | .jobs[] | select(.conclusion | bad)
@@ -271,11 +273,13 @@ jobs:
               got="$(api "check-runs/$id/annotations?per_page=100" < /dev/null)" || return 1
               ann="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
               if [ -n "$ann" ]; then
+                nodes+="$ann"$'\n'
                 items+="$ann"$'\n'
               elif ! grep -qE 'Tests complete|All required checks' <<< "$name"; then
                 items+="$(sed -E 's# slice [0-9]+/[0-9]+$##' <<< "$name")"$'\n'
               fi
             done <<< "$failed"
+            if [ "${2:-}" = nodes ]; then grep -v '^$' <<< "$nodes" | sort -u || true; return 0; fi
             printf '%s' "$(grep -v '^$' <<< "$items" | sort -u | paste -sd ';' - | sed 's/;/; /g')"
           }
           if [ -n "$PR_NUM" ]; then
@@ -396,20 +400,21 @@ jobs:
                 then error("a main run shares created_at \($created)") else . end
                 | [.workflow_runs[] | select(.id != $id)
                   | select($created == "" or .created_at < $created)]
+                # two earlier runs created in the same second cannot be ordered either: an older
+                # red could be walked before a newer green (Prism P1 d12fe5a4bf6d)
+                | if (group_by(.created_at) | any(length > 1)) then error("two main runs share a created_at") else . end
                 | sort_by(.created_at) | reverse | .[:10][] | .id')" || PREVS=error
             # A job/step match cannot tell two tests apart: every pytest node id this run failed
-            # (SIG, from the fold above) must also have failed in a walked prior run, or a new
-            # test in an already-red slice would go to #logs (Prism P1 5515ab6c4f85).
-            NODES="$( [ -n "$SIG" ] && sed 's/; /\n/g' <<< "$SIG" | grep '::' | sort -u || true)"
-            if [ "$ITEMS" = error ] || [ "$PREVS" = error ] || [ "$ITEMS" = "[]" ] || [ -z "$SIG" ]; then
+            # must also have failed in the FIRST walked run that shows a failed item red, the
+            # latest execution of that step (Prism P1 5515ab6c4f85, 13f5bb458e0c). Node ids are
+            # compared whole, one per line, never re-split from the "; " signature (Prism P1
+            # 702860bc5678: a parameter id can contain "; ").
+            NODES="$(sig_of "$WF_RUN_ID" nodes)" || ITEMS=error
+            if [ "$ITEMS" = error ] || [ "$PREVS" = error ] || [ "$ITEMS" = "[]" ]; then
               echo "::warning::main-still-red: cannot read this run's failed jobs or main's history; paging"
             else
               LEFT="$ITEMS"; COVER=""
               for prev in $PREVS; do
-                if [ -n "$NODES" ]; then
-                  PSIG="$(sig_of "$prev")" || { LEFT=error; break; }
-                  NODES="$(comm -23 <(printf '%s\n' "$NODES") <(sed 's/; /\n/g' <<< "$PSIG" | sort -u) | grep -v '^$' || true)"
-                fi
                 # Every completed run counts, whatever its overall conclusion: a CANCELLED run
                 # whose step passed is still proof main recovered (Prism P1 daaf469b6e2e /
                 # eb4c30f2ca3e, 2026-10-04). The per-item check below decides what each run shows.
@@ -449,13 +454,18 @@ jobs:
                   LEFT=green; echo "page: a failed job or step name is not unique in run $prev"; break
                 fi
                 NEXT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] != "red") | .value]' <<< "$LEFT")"
+                if [ "$NEXT" != "$LEFT" ] && [ -n "$NODES" ]; then
+                  PNODES="$(sig_of "$prev" nodes)" || { LEFT=error; break; }
+                  MISS="$(comm -23 <(printf '%s\n' "$NODES") <(printf '%s\n' "$PNODES") | grep -v '^$' || true)"
+                  if [ -n "$MISS" ]; then
+                    LEFT=green; echo "page: test(s) not failed in run $prev, main's latest red: $(tr '\n' ' ' <<< "$MISS")"; break
+                  fi
+                  NODES=""
+                fi
                 [ "$NEXT" != "$LEFT" ] && COVER="${COVER:+$COVER,}$prev"
                 LEFT="$NEXT"
-                [ "$LEFT" = "[]" ] && [ -z "$NODES" ] && break
+                [ "$LEFT" = "[]" ] && break
               done
-              if [ "$LEFT" = "[]" ] && [ -n "$NODES" ]; then
-                LEFT=green; echo "page: test(s) not failed in the last 10 main runs: $(tr '\n' ' ' <<< "$NODES")"
-              fi
               case "$LEFT" in
                 "[]")
                   STILL_RED_RUN="$COVER"
