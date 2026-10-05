@@ -79,6 +79,21 @@ def test_second_card_on_a_running_pr_is_refused_with_owner_named(kanban_home, he
         assert detail["pr"] == "ang-ventures/hermes-agent#1624"
 
 
+def test_owner_is_the_older_card_when_both_were_created_in_the_same_second(
+        kanban_home, head_at, monkeypatch):
+    """Ids are random hex: a same-second tie must fall back to insertion order, not id."""
+    ids = iter(["t_ffffffff", "t_00000000"])  # the helper's id sorts first
+    monkeypatch.setattr(kb, "_new_task_id", lambda: next(ids))
+    with kb.connect() as conn:
+        owner = _run_owner(conn)
+        helper = kb.create_task(conn, title=f"fix red slice on {PR}", assignee="daedalus-fable")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at = 1000")
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, helper, detail=detail) == kpo.GUARD_REASON
+        assert f"owner {owner}" in detail["hold"]
+
+
 def test_rebase_helper_is_refused_at_birth_naming_the_owner(kanban_home, head_at):
     with kb.connect() as conn:
         owner = _run_owner(conn)
