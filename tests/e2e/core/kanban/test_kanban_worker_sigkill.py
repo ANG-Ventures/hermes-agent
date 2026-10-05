@@ -124,7 +124,7 @@ def _drive(board: Board, director: Director) -> Scenario:
     sc.claim_run = board.runs(tid)[-1]
     wait_until(lambda: int(time.time()) > int(sc.after_claim["claim_expires"]), 5, "operator claim to expire")
     board.dispatch(*TICK)  # reclaims the expired claim, spawns attempt 3
-    w3 = board.task(tid)["worker_pid"]
+    w3 = board.run_pid(tid)
     assert w3, board.diag(tid)
     board.wait_worker_exit(tid, int(w3))
     wait_until(lambda: board.task(tid)["status"] == "done", 30, f"card done\n{board.diag(tid)}")
