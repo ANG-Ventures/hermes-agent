@@ -2434,8 +2434,18 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
     from hermes_cli import kanban_load_gate as _klg
     from hermes_cli import kanban_placement_diag as kpd
 
-    kcfg = (config or {}).get("kanban") if isinstance(config, dict) else None
-    rep = kpd.compute(kb.kanban_home(), kanban_cfg=kcfg if isinstance(kcfg, dict) else {},
+    # The pool block, streaks and ledger are published under the shared kanban
+    # root by ITS dispatcher; rebuild the plan with that root's config, not the
+    # invoking profile's (a `-p x` read_signal/worker_hosts must not leak in).
+    from hermes_cli.config_effective import load_user_config_effective
+
+    root = kb.kanban_home()
+    try:
+        root_cfg = load_user_config_effective(root / "config.yaml")
+    except Exception:
+        root_cfg = config
+    kcfg = (root_cfg or {}).get("kanban") if isinstance(root_cfg, dict) else None
+    rep = kpd.compute(root, kanban_cfg=kcfg if isinstance(kcfg, dict) else {},
                       gate_state=_klg.read_state())
     if getattr(args, "json", False):
         _print_json(rep)

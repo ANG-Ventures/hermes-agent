@@ -116,3 +116,52 @@ def test_cli_flag_is_wired(root, monkeypatch, capsys):
     assert kcli._cmd_diagnostics(args) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["rung"]["host"] == "ace-media"
+
+
+def test_host_dropped_from_pool_since_last_tick_is_not_eligible(root):
+    gate = _gate(**{"ace-ai": _row(10.0, "warm"), "ace-media": _row(12.0, "warm"),
+                    "old-box": _row(1.0, "ok")})
+    rep = kpd.compute(root, kanban_cfg={}, gate_state=gate, now=NOW, assignee="alpha")
+    assert rep["hosts"]["old-box"]["enabled"] is False
+    assert rep["hosts"]["ace-ai"]["enabled"] is True
+    assert rep["rung"]["host"] == "ace-media"  # old-box is not a pool host
+
+
+def test_one_ledger_read_feeds_totals_pick_and_why(root, monkeypatch):
+    from hermes_cli import placement_ledger as pl
+
+    real, calls = pl.read_all, []
+
+    def counted(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pl, "read_all", counted)
+    gate = _gate(**{"ace-ai": _row(10.0, "warm"), "ace-media": _row(12.0, "warm")})
+    rep = kpd.compute(root, kanban_cfg={}, gate_state=gate, now=NOW, assignee="alpha")
+    assert len(calls) == 1
+    assert rep["rung"]["host"] == "ace-media"
+
+
+def test_cli_uses_the_shared_roots_config_not_the_invoking_profile(root, monkeypatch, capsys):
+    import argparse
+
+    from hermes_cli import kanban as kcli
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_load_gate as klg
+    from hermes_cli.kanban_parser import build_parser
+
+    (root / "config.yaml").write_text("kanban:\n  placement:\n    read_signal: true\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "kanban_home", lambda: root)
+    monkeypatch.setattr(klg, "read_state", lambda *a, **k: _gate(
+        **{"ace-ai": _row(10.0, "warm"), "ace-media": _row(12.0, "warm")}))
+    # The invoking profile says v0.1 and carries a retired worker_hosts key.
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {
+        "placement": {"read_signal": False}, "worker_hosts": ["x"]}})
+    monkeypatch.setattr(kpd.time, "time", lambda: NOW)
+    top = argparse.ArgumentParser()
+    build_parser(top.add_subparsers(dest="cmd"))
+    assert kcli._cmd_diagnostics(top.parse_args(["kanban", "diagnostics", "--placement", "--json"])) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["read_signal"] is True and out["pool_refused"] is None
+    assert out["rung"]["host"] == "ace-media"

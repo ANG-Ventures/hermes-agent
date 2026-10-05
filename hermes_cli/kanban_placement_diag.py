@@ -54,6 +54,7 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
     reservations = pledger.read_all(pledger.ledger_dir(root), policy, now=now)
     cost = _num(gate_state.get("cost"))
 
+    in_pool = {h.name for h in pool.pool_hosts}
     names = list(dict.fromkeys([*(h.name for h in pool.pool_hosts), *pool.disabled, *tick_hosts]))
     hosts: Dict[str, dict] = {}
     for name in names:
@@ -71,7 +72,9 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
         kb = policy.kanban_band(name)
         st = _map(streaks.get(name))
         hosts[name] = {
-            "enabled": name not in pool.disabled,
+            # Eligible only when the CURRENT pool places on it: a host the
+            # last tick saw but the pool files have since dropped is not.
+            "enabled": name in in_pool,
             "band": d.get("band") or kwp.BAND_UNKNOWN,
             "hot": bool(d.get("hot")),
             "pressure": d.get("pressure"),
@@ -88,7 +91,7 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
     if assignee is None:
         assignee = pool.profiles[0] if pool.profiles else None
     rung = pick_rung(pool, block, tick_hosts, policy=policy, root=root, signal_on=signal_on,
-                     cost=cost, now=now, assignee=assignee)
+                     cost=cost, now=now, assignee=assignee, reservations=reservations)
     return {
         "read_signal": signal_on,
         "policy_source": policy.source,
@@ -105,8 +108,11 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
 
 
 def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, policy, root: Path,
-              signal_on: bool, cost: Optional[float], now: float, assignee: Optional[str]) -> dict:
-    """``take()``'s pick for ``assignee`` on the last tick's plan, never persisted."""
+              signal_on: bool, cost: Optional[float], now: float, assignee: Optional[str],
+              reservations: List[pledger.Reservation]) -> dict:
+    """``take()``'s pick for ``assignee`` on the last tick's plan, never persisted.
+    ``reservations`` is the report's ONE ledger read: the host totals, the
+    pick and its explanation all use it."""
     if pool.refused is not None:
         return {"host": None, "why": f"pool refused: {pool.refused}", "assignee": assignee}
     if not block.get("planned"):
@@ -121,7 +127,8 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
     signal = None
     if signal_on:
         signal = kwp.TargetSignal(policy=policy, state_path=root / "var" / kwp.TARGET_STATE_FILE,
-                                  ledger_dir=pledger.ledger_dir(root), cpu_est=cost, clock=lambda: now)
+                                  ledger_dir=pledger.ledger_dir(root), cpu_est=cost, clock=lambda: now,
+                                  reservations=list(reservations))
     plan = kwp._finish_plan(hosts, slots, detail, pool.disabled, block.get("planned_at"), pool, signal)
     free = [n for n, h in plan.hosts.items() if slots.get(n, 0) > 0 and assignee in h.profiles]
     chosen = plan.take(assignee)  # in-memory plan only: nothing is written
@@ -137,7 +144,7 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
         if cool:
             why = f"band ok: first cool host in priority order (free: {', '.join(free)})"
         else:
-            res = pledger.read_all(pledger.ledger_dir(root), policy, now=now)
+            res = reservations
             pool_set = warm or free
             projs = ", ".join(
                 f"{n}={pledger.projected(n, float(_num(detail[n].get('load1')) or 0.0), res, now=now):.2f}"
