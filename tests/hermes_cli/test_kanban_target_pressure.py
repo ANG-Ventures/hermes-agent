@@ -100,6 +100,44 @@ def test_stale_pressure_is_unknown_not_hot(sig):
     assert _plan(fleet, sig).slots["ace-ai"] == 4
 
 
+def test_non_finite_pressure_is_unknown():
+    """JSON NaN/Infinity (Python's decoder accepts them) never reads as a band."""
+    for doc in ('{"at": %r, "load_ratio": NaN}' % T0, '{"at": Infinity, "load_ratio": 0.1}',
+                '{"at": NaN, "load_ratio": 0.1}', '{"at": %r, "load_ratio": Infinity}' % T0):
+        assert kwp.read_pressure(T0, doc, stale_after_s=120, warm=0.7, hot=0.8)[0] is None, doc
+    assert kwp.read_pressure(float("nan"), _pressure("a", T0, 0.1),
+                             stale_after_s=120, warm=0.7, hot=0.8)[0] is None
+
+
+def test_non_finite_ledger_row_does_not_hide_other_consumers(tmp_path):
+    (tmp_path / "host-reservations.ci.json").write_text(
+        '{"consumer":"ci","at":%r,"ttl_s":900,"hosts":{"ace-ai":{"busy_units":NaN,"cpu_est":Infinity}}}' % T0,
+        encoding="utf-8")
+    pl.update(tmp_path, "kanban", lambda old: {
+        "at": T0, "ttl_s": 180,
+        "hosts": {"ace-ai": {"busy_units": 1, "cpu_est": 2.0, "ramp_s": 600, "placed_at": [T0]}}})
+    res = pl.read_all(tmp_path, POLICY, now=T0)
+    assert pl.projected("ace-ai", 10.0, res, now=T0) == pytest.approx(12.0)
+
+
+def test_two_planners_on_one_root_do_not_lose_a_sample(sig):
+    """Planner B read the state before planner A committed: B still advances
+    from A's committed step, so two consecutive hot samples reach hot."""
+    fleet = Fleet()
+    fleet.set("ace-ai", 0.95)
+    stale_view = kwp._load_state(sig.state_path)        # B's early read (empty)
+    _plan(fleet, sig)                                     # A commits hot_run=1
+    fleet.set("ace-ai", 0.95)
+    real = kwp._load_state
+    kwp._load_state = lambda path: stale_view            # B planned from the old view
+    try:
+        p = _plan(fleet, sig)
+    finally:
+        kwp._load_state = real
+    assert p.slots["ace-ai"] == 0
+    assert json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]["hot"] is True
+
+
 # -- F-5 / AC-11: hysteresis advances in plan(), take() only reads ------------
 
 def test_two_takes_on_one_hot_probe_still_admit(sig):

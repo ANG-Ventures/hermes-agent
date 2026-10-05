@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -57,9 +58,11 @@ def ledger_path(directory: Path, consumer: str) -> Path:
 
 
 def _num(value) -> Optional[float]:
+    """A finite number, else None: JSON's NaN/Infinity never reach int() or a sum."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    v = float(value)
+    return v if math.isfinite(v) else None
 
 
 @dataclass(frozen=True)

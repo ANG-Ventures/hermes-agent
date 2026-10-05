@@ -193,11 +193,13 @@ class GateTickBuilder:
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         gate.pool = plan.snapshot()
         if signal is not None:
+            # WARNING (one per message per 5 min): a host with no sampler reads
+            # UNKNOWN and takes nothing; that must be visible, not info noise.
             for name, d in plan.detail.items():
                 if d.get("pressure"):
-                    logger.info("kanban pool: %s refused: %s", name, d["pressure"])
+                    self._log(logger.warning, f"kanban pool: {name} refused: {d['pressure']}")
             if plan.budget <= 0:
-                logger.info("kanban pool: %s", plan.full_reason())
+                self._log(logger.warning, f"kanban pool: {plan.full_reason()}")
         return plan
 
     def record_placements(self, placed) -> None:

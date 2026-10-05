@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import subprocess
 import time
@@ -502,14 +503,16 @@ def read_pressure(remote_now: Optional[float], text: str, *, stale_after_s: floa
         return None, "pressure unparseable"
     if not isinstance(doc, dict):
         return None, "pressure unparseable"
+    if not math.isfinite(remote_now):
+        return None, "pressure unknown (no remote clock)"
     at = doc.get("at")
-    if isinstance(at, bool) or not isinstance(at, (int, float)):
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
         return None, "pressure has no at"
     age = remote_now - float(at)
     if age > stale_after_s:
         return None, f"pressure unknown (stale {age:.0f}s)"
     ratio = doc.get("load_ratio")
-    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio):
         return None, "pressure has no load_ratio"
     band = BAND_HOT if ratio >= hot else BAND_WARM if ratio >= warm else BAND_OK
     return (float(at), band), ""
@@ -745,60 +748,68 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     policy = signal.policy
     now = signal.clock()
     discard_after = policy.stale_after_s * 3
-    states = _load_state(signal.state_path)
-    changed: Dict[str, dict] = {}
-    slots: Dict[str, int] = {}
-    detail: Dict[str, dict] = {}
-    for h in sorted(hosts, key=lambda x: x.priority):
+    ordered = sorted(hosts, key=lambda x: x.priority)
+    # Pass 1: probe. samples[name] = (at, band) for every host probed this tick.
+    probed: Dict[str, dict] = {}
+    samples: Dict[str, Tuple[Optional[float], str]] = {}
+    for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
         free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
-        probed = free > 0
-        sample = probe(h) if probed else None
-        load1: Optional[float] = None
-        ncpu: Optional[int] = None
-        band: Optional[str] = None
-        why = ""
-        at: Optional[float] = None
+        sample = probe(h) if free > 0 else None
+        row = {"running": running, "free": free, "load1": None, "ncpu": None,
+               "band": None, "why": "", "probed": free > 0}
         if isinstance(sample, HostSample):
-            load1, ncpu = sample.load1, sample.ncpu
+            row["load1"], row["ncpu"] = sample.load1, sample.ncpu
             kb = policy.kanban_band(h.name)
-            got, why = read_pressure(sample.remote_now, sample.pressure_text,
-                                     stale_after_s=policy.stale_after_s, warm=kb.warm, hot=kb.hot)
-            if got is None:
-                band = BAND_UNKNOWN
-            else:
-                at, band = got
+            got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
+                                            stale_after_s=policy.stale_after_s, warm=kb.warm, hot=kb.hot)
+            at, row["band"] = (None, BAND_UNKNOWN) if got is None else got
+            samples[h.name] = (at, row["band"])
         elif sample is not None:  # a v0.1-shape probe: no pressure read
-            load1, ncpu = sample
-            band, why = BAND_UNKNOWN, "pressure not probed"
-        elif probed:
-            band, why = BAND_UNKNOWN, "host unreachable"
-        st = states.get(h.name)
-        if band is not None:
-            kb = policy.kanban_band(h.name)
-            st = advance_streak(st, at, band, hot_streak=kb.hot_streak, clear_streak=kb.clear_streak,
-                                now=now, discard_after_s=discard_after)
-            changed[h.name] = st
+            row["load1"], row["ncpu"] = sample
+            row["band"], row["why"] = BAND_UNKNOWN, "pressure not probed"
+            samples[h.name] = (None, BAND_UNKNOWN)
+        elif free > 0:
+            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable"
+            samples[h.name] = (None, BAND_UNKNOWN)
+        probed[h.name] = row
+
+    # Pass 2: advance every streak against the COMMITTED state, under the
+    # state file's lock, so two planners on one root never lose a sample.
+    def advance(old: Mapping) -> Mapping:
+        hs = old.get("hosts") if isinstance(old.get("hosts"), dict) else {}
+        out = dict(hs)
+        for name, (at, band) in samples.items():
+            kb = policy.kanban_band(name)
+            out[name] = advance_streak(hs.get(name), at, band, hot_streak=kb.hot_streak,
+                                       clear_streak=kb.clear_streak, now=now,
+                                       discard_after_s=discard_after)
+        return {"hosts": out, "updated": now}
+
+    try:
+        committed = _ledger.update_json(signal.state_path, advance).get("hosts") or {}
+    except Exception as exc:  # unsaved state: decide on this tick's step from what is on disk
+        _log.warning("kanban pool: target state not saved: %s", exc)
+        committed = advance({"hosts": _load_state(signal.state_path)})["hosts"]
+
+    slots: Dict[str, int] = {}
+    detail: Dict[str, dict] = {}
+    for h in ordered:
+        r = probed[h.name]
+        band, why, free = r["band"], r["why"], r["free"]
+        st = committed.get(h.name)
         hot = bool(isinstance(st, Mapping) and st.get("hot")) and band not in (None, BAND_UNKNOWN)
         if band == BAND_UNKNOWN:
             free = 0
         elif hot:
             free = 0
-            why = f"band hot (streak {kb.hot_streak}, {band} now)"
+            why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
         slots[h.name] = free
         detail[h.name] = {
-            "slots": h.slots, "running": running, "load1": load1, "ncpu": ncpu,
+            "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
             "state": h.state, "enabled": h.enabled,
-            "reachable": (band not in (None, BAND_UNKNOWN)) if probed else None,
+            "reachable": (band not in (None, BAND_UNKNOWN)) if r["probed"] else None,
             "band": band, "hot": hot,
             **({"pressure": why} if why else {}),
         }
-    if changed:
-        try:
-            def merge(old: Mapping) -> Mapping:
-                hs = old.get("hosts") if isinstance(old.get("hosts"), dict) else {}
-                return {"hosts": {**hs, **changed}, "updated": now}
-            _ledger.update_json(signal.state_path, merge)
-        except Exception as exc:  # state is advisory across restarts; never block a tick
-            _log.warning("kanban pool: target state not saved: %s", exc)
     return _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
