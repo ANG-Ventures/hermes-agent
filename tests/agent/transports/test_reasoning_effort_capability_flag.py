@@ -120,6 +120,43 @@ class TestCapabilityFlag:
         kw = _kw(Headers(name="hdr", supports_reasoning_effort=True), "three-level-model", {"enabled": True, "effort": "xhigh"})
         assert kw["reasoning_effort"] == "high" and kw["extra_headers"] == {"X-Thing": "1"}
 
+    def test_profile_schema_named_reasoning_is_data_not_a_control(self):
+        """Prism r2 P1: a PROFILE hook that emits a structured-output schema with a property
+        named ``reasoning`` (top-level ``response_format`` or ``extra_body.guided_json``) has not
+        put a reasoning control on the wire; the user's explicit effort is still emitted."""
+        schema = {"type": "json_schema", "json_schema": {"schema": {"properties": {"reasoning": {"type": "string"}, "verbosity": {"type": "integer"}}}}}
+
+        class TopLevelSchema(_Proxy):
+            def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+                return {}, {"response_format": schema}
+
+        class GuidedSchema(_Proxy):
+            def build_extra_body(self, **context):
+                return {"guided_json": {"properties": {"reasoning": {"type": "string"}}}}
+
+        kw = _kw(TopLevelSchema(name="rf", supports_reasoning_effort=True), "gpt-6-astra", {"enabled": True, "effort": "high"})
+        assert kw["reasoning_effort"] == "high" and kw["response_format"] == schema
+        kw = _kw(GuidedSchema(name="gj", supports_reasoning_effort=True), "gpt-6-astra", {"enabled": True, "effort": "high"})
+        assert kw["reasoning_effort"] == "high"
+        assert kw["extra_body"]["guided_json"]["properties"]["reasoning"] == {"type": "string"}
+
+    def test_profile_control_under_extra_body_wins(self):
+        """The one nesting that IS a control location: ``extra_body.thinking`` from a kwargs hook."""
+        class Thinking(_Proxy):
+            def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+                return {}, {"extra_body": {"thinking": {"type": "enabled"}}}
+
+        kw = _kw(Thinking(name="th", supports_reasoning_effort=True), "gpt-6-astra", {"enabled": True, "effort": "high"})
+        assert "reasoning_effort" not in kw
+
+    def test_profile_own_top_level_reasoning_effort_wins(self):
+        class Own(_Proxy):
+            def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+                return {}, {"reasoning_effort": "custom-tier"}
+
+        kw = _kw(Own(name="own-top", supports_reasoning_effort=True), "gpt-6-astra", {"enabled": True, "effort": "high"})
+        assert kw["reasoning_effort"] == "custom-tier"
+
     def test_request_override_beats_the_generic_field(self):
         kw = _kw(_proxy(), "gpt-6-astra", {"enabled": True, "effort": "high"}, request_overrides={"reasoning_effort": "low"})
         assert kw["reasoning_effort"] == "low"
@@ -228,6 +265,23 @@ class TestAuxiliaryPath:
         # explicit disable is honoured the same way (no 'none' level on this route → omitted, no fallback)
         kw = _build_call_kwargs("aux-hdr", "three-level-model", MSGS, reasoning_config={"enabled": False}, base_url="http://127.0.0.1:9/v1")
         assert "reasoning_effort" not in kw and "reasoning" not in (kw.get("extra_body") or {})
+
+    def test_aux_profile_schema_named_reasoning_is_data_not_a_control(self, monkeypatch):
+        """Prism r2 P1, aux projection: a profile-emitted response_format schema whose property is
+        named ``reasoning`` must not suppress the user's effort on auxiliary calls either."""
+        import providers
+        from agent.auxiliary_client import _build_call_kwargs
+
+        schema = {"type": "json_schema", "json_schema": {"schema": {"properties": {"reasoning": {"type": "string"}}}}}
+
+        class Schema(_Proxy):
+            def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+                return {}, {"response_format": schema}
+
+        prof = Schema(name="aux-schema", base_url="http://127.0.0.1:9/v1", supports_reasoning_effort=True)
+        monkeypatch.setattr(providers, "get_provider_profile", lambda name: prof if name == "aux-schema" else None)
+        kw = _build_call_kwargs("aux-schema", "gpt-6-astra", MSGS, reasoning_config={"enabled": True, "effort": "high"}, base_url="http://127.0.0.1:9/v1")
+        assert kw["reasoning_effort"] == "high" and kw["response_format"] == schema
 
 
 class TestNoProviderNameGate:

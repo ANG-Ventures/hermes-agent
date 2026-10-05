@@ -299,14 +299,23 @@ REASONING_CONTROL_KEYS: frozenset[str] = frozenset({
 })
 
 
+def _has_top_level_control(value: object) -> bool:
+    return isinstance(value, dict) and any(str(key).strip().lower() in REASONING_CONTROL_KEYS for key in value)
+
+
 def has_reasoning_control(value: object) -> bool:
-    """Whether a request payload (recursively) already carries a reasoning wire control."""
+    """Whether a profile projection already carries a reasoning wire control.
+
+    Only the places a control can physically sit are inspected: the projection's own
+    top-level keys (``extra_body``-bound dicts carry ``reasoning``/``thinking``/...; kwargs
+    dicts carry ``reasoning_effort``) and, for a kwargs dict, the top-level keys of a nested
+    ``extra_body``. Nothing else is descended into: a ``response_format``/``guided_json``
+    schema, a tool definition or any other request data may legitimately name a property
+    ``reasoning`` or ``verbosity``, and that is data, not a control (Prism r1/r2 P1).
+    """
     if not isinstance(value, dict):
         return False
-    return any(
-        str(key).strip().lower() in REASONING_CONTROL_KEYS or has_reasoning_control(nested)
-        for key, nested in value.items()
-    )
+    return _has_top_level_control(value) or _has_top_level_control(value.get("extra_body"))
 
 
 def clamp_reasoning_config(reasoning_config: Optional[dict], supported: Sequence[str] = OPENAI_COMPAT_WIRE_EFFORTS) -> Optional[dict]:
