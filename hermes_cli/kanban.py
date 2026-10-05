@@ -2442,8 +2442,8 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
     root = kb.kanban_home()
     try:
         root_cfg = load_user_config_effective(root / "config.yaml")
-    except Exception:
-        root_cfg = config
+    except Exception as exc:  # never substitute the invoking profile's config
+        return _err(f"diagnostics --placement: cannot read {root / 'config.yaml'}: {exc}")
     kcfg = (root_cfg or {}).get("kanban") if isinstance(root_cfg, dict) else None
     rep = kpd.compute(root, kanban_cfg=kcfg if isinstance(kcfg, dict) else {},
                       gate_state=_klg.read_state())

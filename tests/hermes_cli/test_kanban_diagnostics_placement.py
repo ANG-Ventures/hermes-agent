@@ -165,3 +165,43 @@ def test_cli_uses_the_shared_roots_config_not_the_invoking_profile(root, monkeyp
     out = json.loads(capsys.readouterr().out)
     assert out["read_signal"] is True and out["pool_refused"] is None
     assert out["rung"]["host"] == "ace-media"
+
+
+def test_draining_or_shrunk_host_gets_no_stale_slots(root):
+    gate = _gate(**{"ace-ai": _row(10.0, "warm"), "ace-media": _row(12.0, "warm")})
+    roles = json.loads((root / "fleet" / "fleet-roles.json").read_text())
+    roles["hosts"]["ace-media"]["state"] = "draining"
+    _write(root / "fleet" / "fleet-roles.json", roles)
+    rep = kpd.compute(root, kanban_cfg={}, gate_state=gate, now=NOW, assignee="alpha")
+    assert rep["hosts"]["ace-media"]["enabled"] is False
+    assert rep["rung"]["host"] == "ace-ai"
+
+    roles["hosts"]["ace-media"]["state"] = "active"
+    roles["hosts"]["ace-ai"]["roles"]["kanban-worker"]["slots"] = 1
+    _write(root / "fleet" / "fleet-roles.json", roles)
+    busy = _row(1.0, "ok")
+    busy["running"] = 1  # 1 running against the new 1-slot cap: no room
+    gate = _gate(**{"ace-ai": busy, "ace-media": _row(12.0, "warm")})
+    rep = kpd.compute(root, kanban_cfg={}, gate_state=gate, now=NOW, assignee="alpha")
+    assert rep["rung"]["host"] == "ace-media"
+
+
+def test_cli_root_config_error_is_reported_not_replaced(root, monkeypatch, capsys):
+    import argparse
+
+    from hermes_cli import config_effective
+    from hermes_cli import kanban as kcli
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_parser import build_parser
+
+    def boom(*a, **k):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(kb, "kanban_home", lambda: root)
+    monkeypatch.setattr(config_effective, "load_user_config_effective", boom)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    top = argparse.ArgumentParser()
+    build_parser(top.add_subparsers(dest="cmd"))
+    rc = kcli._cmd_diagnostics(top.parse_args(["kanban", "diagnostics", "--placement", "--json"]))
+    cap = capsys.readouterr()
+    assert rc != 0 and cap.out == "" and "unreadable" in cap.err

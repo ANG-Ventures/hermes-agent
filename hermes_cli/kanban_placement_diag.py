@@ -54,7 +54,8 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
     reservations = pledger.read_all(pledger.ledger_dir(root), policy, now=now)
     cost = _num(gate_state.get("cost"))
 
-    in_pool = {h.name for h in pool.pool_hosts}
+    # Eligible = the CURRENT pool places on it: enabled, in priority, active.
+    in_pool = {h.name for h in pool.pool_hosts if h.state == "active"}
     names = list(dict.fromkeys([*(h.name for h in pool.pool_hosts), *pool.disabled, *tick_hosts]))
     hosts: Dict[str, dict] = {}
     for name in names:
@@ -121,7 +122,17 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
     if assignee is None:
         return {"host": None, "assignee": None, "why": "no pool profile to place"}
     hosts = list(pool.pool_hosts)
-    slots = {h.name: int(_num(_map(tick_hosts.get(h.name)).get("free")) or 0) for h in hosts}
+    # The tick's free count, bounded by what plan() would grant NOW: a host
+    # since marked draining gets 0, a lowered slot count caps it (h.slots -
+    # the tick's running count).
+    def _free_now(h: kwp.PoolHost) -> int:
+        row = _map(tick_hosts.get(h.name))
+        if h.state != "active":
+            return 0
+        running = int(_num(row.get("running")) or 0)
+        return max(0, min(int(_num(row.get("free")) or 0), h.slots - running))
+
+    slots = {h.name: _free_now(h) for h in hosts}
     detail = {h.name: {k: v for k, v in _map(tick_hosts.get(h.name)).items() if k != "free"}
               for h in hosts}
     signal = None
