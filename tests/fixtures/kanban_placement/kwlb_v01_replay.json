@@ -1,0 +1,15 @@
+{
+  "_doc": "KWLB v0.1 replay fixture (t_1e4b9684). Each tick: running_by_host, the probe answer per host ([load1, ncpu] or null = ssh failed), the band, and the take() calls the dispatcher makes. The golden file next to it was produced by the v0.1 planner BEFORE the Phase 1b change; with kanban.placement.read_signal=false the planner must reproduce it byte for byte.",
+  "ticks": [
+    {"running": {}, "probe": {"ace-ai": [3.0, 24], "ace-media": [4.0, 32]}, "band": "spilling",
+     "takes": [["alpha", null], ["alpha", null], ["alpha", "ace-media"], ["beta", null]]},
+    {"running": {"ace-ai": 2}, "probe": {"ace-ai": [19.2, 24], "ace-media": [10.0, 32]}, "band": "paused",
+     "takes": [["alpha", null], ["alpha", "ace-ai"], ["alpha", null]]},
+    {"running": {"ace-ai": 4, "ace-media": 1}, "probe": {"ace-ai": [1.0, 24], "ace-media": [25.6, 32]}, "band": "spilling",
+     "takes": [["alpha", null], ["alpha", "ci-box"], ["alpha", "nope"]]},
+    {"running": {}, "probe": {"ace-ai": null, "ace-media": [2.0, 32]}, "band": "spilling",
+     "takes": [["alpha", "ace-ai"], ["alpha", null], ["alpha", null]]},
+    {"running": {"ace-media": 4}, "probe": {"ace-ai": [19.1, 24], "ace-media": [0.0, 32]}, "band": "admitting",
+     "takes": [["alpha", null], ["alpha", "ace-ai"], ["alpha", "ace-ai"]]}
+  ]
+}

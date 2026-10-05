@@ -3755,6 +3755,7 @@ class GatewayKanbanWatchersMixin:
             if _tick.remote_plan is not None:
                 load_gate.pool = _tick.remote_plan.snapshot()
                 logger.info("%s", format_tick_line(load_gate, _tick, _tick_spawned, _placed))
+            _gate_ticks.record_placements(_placed)
             _finish_gate_tick(_tick_spawned)
             return out
 

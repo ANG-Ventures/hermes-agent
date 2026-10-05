@@ -17,6 +17,8 @@ from typing import Callable, Dict, Optional, Tuple
 
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
+from hermes_cli import placement_ledger as pledger
+from hermes_cli import placement_policy as ppolicy
 
 logger = logging.getLogger("gateway.kanban_watchers")
 
@@ -74,6 +76,12 @@ def running_split(ledger: Dict[str, Tuple[int, Dict[str, int]]]
     return local, by_host
 
 
+def read_signal_enabled(kanban_cfg) -> bool:
+    """``kanban.placement.read_signal`` (default true): false = KWLB v0.1."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, dict) else None
+    return not (isinstance(pl, dict) and pl.get("read_signal", True) is False)
+
+
 def any_remote_pin(boards, connect, known_hosts=()) -> bool:
     """A ready card on any board pins a KNOWN pool host (``host:<id>``)."""
     for b in boards:
@@ -109,10 +117,29 @@ class GateTickBuilder:
         self._connect = connect
         self._probe = probe
         self._log = _Every5Min()
+        self._remote_by_host: Dict[str, int] = {}
+        self._signal: Optional[kwp.TargetSignal] = None
+
+    def _root(self):
+        return self._fleet_dir().parent
+
+    def target_signal(self, cfg) -> Optional[kwp.TargetSignal]:
+        """The Phase 1b pressure reader, or None (read_signal false)."""
+        if not read_signal_enabled(cfg):
+            return None
+        root = self._root()
+        cost = getattr(self.gate, "cost", None)
+        return kwp.TargetSignal(
+            policy=ppolicy.load(self._fleet_dir()),
+            state_path=root / "var" / kwp.TARGET_STATE_FILE,
+            ledger_dir=pledger.ledger_dir(root),
+            cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+        )
 
     def build(self, boards) -> GateTick:
         gate = self.gate
         running_local, remote_by_host = running_split(self._ledger(boards))
+        self._remote_by_host = dict(remote_by_host)
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
             # Enabled gate, load1 unreadable on a host that has the sampler:
@@ -154,12 +181,56 @@ class GateTickBuilder:
         if not pool.pool_hosts and not pool.disabled:
             gate.pool = {"planned": False, "reason": "no_hosts"}
             return None
-        plan = kwp.plan(list(pool.pool_hosts), remote_by_host,
-                        probe=self._probe or kwp.probe_host,
-                        disabled=pool.disabled, config=pool)
+        signal = self.target_signal(cfg)
+        probe = self._probe or kwp.probe_host
+        if signal is not None and probe is kwp.probe_host:
+            path = signal.policy.pressure_path
+
+            def probe(h, _path=path):
+                return kwp.probe_host(h, pressure_path=_path)
+        plan = kwp.plan(list(pool.pool_hosts), remote_by_host, probe=probe,
+                        disabled=pool.disabled, config=pool, signal=signal)
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         gate.pool = plan.snapshot()
+        if signal is not None:
+            # WARNING (one per message per 5 min): a host with no sampler reads
+            # UNKNOWN and takes nothing; that must be visible, not info noise.
+            for name, d in plan.detail.items():
+                if d.get("pressure"):
+                    self._log(logger.warning, f"kanban pool: {name} refused: {d['pressure']}")
+            if plan.budget <= 0:
+                self._log(logger.warning, f"kanban pool: {plan.full_reason()}")
         return plan
+
+    def record_placements(self, placed) -> None:
+        """Write kanban's reservations (running remote + this tick's placements)
+        to ``host-reservations.kanban.json``, TTL from the policy (I-4). Runs every
+        tick with read_signal on, so a live gateway keeps its key fresh."""
+        cfg = self._kanban_cfg() or {}
+        if not read_signal_enabled(cfg):
+            return
+        try:
+            root = self._root()
+            policy = ppolicy.load(self._fleet_dir())
+            fresh: Dict[str, int] = {}
+            for _task, host in placed or ():
+                fresh[host] = fresh.get(host, 0) + 1
+            # remote_by_host was counted BEFORE this tick's spawns.
+            cost = getattr(self.gate, "cost", None)
+            cpu = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0 \
+                else float(policy.consumer("kanban", "cpu_est_prior") or 0.0)
+            ramp = float(policy.consumer("kanban", "ramp_s") or 0.0)
+            ttl = float(policy.consumer("kanban", "ttl_s") or 180.0)
+            now = time.time()
+
+            def write(old):
+                return {"at": now, "ttl_s": ttl,
+                        "hosts": pledger.kanban_rows(old, self._remote_by_host, fresh,
+                                                     cpu_est=cpu, ramp_s=ramp, now=now)}
+
+            pledger.update(pledger.ledger_dir(root), "kanban", write)
+        except Exception as exc:
+            self._log(logger.warning, f"kanban pool: ledger_write_failed: {exc}")
 
 
 def standalone_builder(load_gate, kanban_cfg: Callable) -> GateTickBuilder:

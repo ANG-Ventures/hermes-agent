@@ -2335,6 +2335,13 @@ DEFAULT_CONFIG = {
         # retired: set next to a kanban-worker role, the pool places nothing.
         # See kanban_worker_pool.py.
         "worker_pool": {"enabled": True},
+        # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
+        # also reads each host's host-pressure.json (same ssh round-trip), a
+        # host turns hot after 2 hot samples and clears after 3 (state in
+        # <root>/var/kanban-target-state.json), warm hosts are picked last by
+        # projected load, and kanban's placements are written to
+        # <root>/var/placement/host-reservations.kanban.json. false = KWLB v0.1.
+        "placement": {"read_signal": True},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,

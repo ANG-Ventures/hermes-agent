@@ -3775,7 +3775,7 @@ def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optio
         if plan.pins_only:
             return "local_full"  # admitting band: the pool takes pins only
         if plan.budget <= 0:
-            return "pool_full"
+            return plan.full_reason()
     return None
 
 
@@ -4832,7 +4832,7 @@ def _dispatch_once_locked(
             if spillover is not None:
                 result.placement_waits[row["id"]] = (
                     _route_wait(route, route_arg, False, spillover)
-                    or ("pin_host_full" if route == "pin" else "pool_full")
+                    or ("pin_host_full" if route == "pin" else spillover.full_reason())
                 )
             ready_scan_complete = False
             break
@@ -6363,6 +6363,10 @@ def run_daemon(
                     failure_limit=failure_limit,
                     **gate_kwargs,
                 )
+            if gate_ticks is not None:
+                # Placement 1b: publish kanban's reservations (no-op when
+                # kanban.placement.read_signal is false).
+                gate_ticks.record_placements(list(getattr(res, "placed", None) or []))
             if load_gate is not None:
                 # The Studio gate books LOCAL spawns only (RC-2).
                 load_gate.finish_tick(_local_spawn_count(res), logger=_kb._log)

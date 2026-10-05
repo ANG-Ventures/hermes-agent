@@ -58,7 +58,7 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
-def _one_shot_pool_plan(gate, config):
+def _one_shot_pool_plan(gate, config, builders=None):
     """The gateway's ONE pool plan for a one-shot dispatch (KWLB), or None.
 
     None (no gate, refused pool, nothing to plan) keeps remote pins waiting
@@ -71,8 +71,15 @@ def _one_shot_pool_plan(gate, config):
 
         kcfg = (config or {}).get("kanban") if isinstance(config, dict) else None
         builder = standalone_builder(gate, lambda: kcfg if isinstance(kcfg, dict) else {})
+        if builders is not None:
+            builders.append(builder)
         boards = live_boards()
         _local, remote_by_host = running_split(builder._ledger(boards))
+        # A one-shot plan skips build(); record_placements() keys the kanban
+        # ledger off _remote_by_host, so seed it here or the running remote
+        # workers' reservations and ramp stamps are dropped until the next
+        # gateway tick (Prism 2febc7f296e1 on #1764).
+        builder._remote_by_host = dict(remote_by_host)
         return builder.plan_pool(boards, remote_by_host)
     except Exception as exc:
         print(f"warning: kanban pool plan failed, remote pins wait: {exc}", file=sys.stderr)
@@ -245,6 +252,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # skip it; `dispatch --max 128` at load1 66 (pause_above 64) spawned
         # 33 workers and took the Studio to load1 243 (t_689b81b7).
         gate = _one_shot_load_gate(conn, args, _cfg, additive)
+        _pool_builders: list = []
         res = kbd.dispatch_once(
             conn,
             dry_run=args.dry_run,
@@ -255,10 +263,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
             spawn_paused=gate["spawn_paused"],
             spawn_limit=gate["spawn_limit"],
-            spillover=_one_shot_pool_plan(gate.get("gate"), _cfg),
+            spillover=_one_shot_pool_plan(gate.get("gate"), _cfg, _pool_builders),
             # --max is additive across local AND remote spawns (total budget).
             max_new=additive,
         )
+        if not args.dry_run:
+            for _b in _pool_builders:  # placement 1b: publish kanban's reservations
+                _b.record_placements(list(res.placed or []))
         if gate["override"] is not None and not args.dry_run and res.spawned:
             # Attribute any load episode to the override on every card it
             # spawned (the overview reads task_events).

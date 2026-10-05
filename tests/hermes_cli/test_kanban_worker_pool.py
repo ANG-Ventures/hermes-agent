@@ -44,6 +44,11 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+# KWLB v0.1 contract: the Phase 1b pressure reader off (its tests live in
+# test_kanban_target_pressure.py).
+V01 = {"placement": {"read_signal": False}}
+
+
 def _host(name="ace-ai", slots=2, priority=0, profiles=("alpha",), state="active"):
     return kwp.PoolHost(name=name, ssh_host=name, ssh_user=kwp.SSH_USER, slots=slots,
                         capacity_pct=0.8, absence="required", profiles=tuple(profiles),
@@ -540,7 +545,7 @@ def test_daemon_places_through_the_gateway_plan(kanban_home, monkeypatch):
     from hermes_cli import kanban_load_gate as klg
 
     _write_pool(kanban_home / "fleet")
-    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": V01})
     monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (146.0, 90.0))
     captured: dict = {}
@@ -566,7 +571,7 @@ def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeyp
     from hermes_cli import kanban_load_gate as klg
 
     _write_pool(kanban_home / "fleet")
-    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": V01})
     monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (1.0, 1.0))
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.1, None))
@@ -672,7 +677,7 @@ def test_cli_passes_max_as_the_total_cap(kanban_home, monkeypatch):
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_load_gate as klg
 
-    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": V01})
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (1.0, 1.0))
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.1, None))
     captured: dict = {}
