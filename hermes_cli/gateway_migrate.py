@@ -371,7 +371,11 @@ def _service_op_unguarded(kind: str, system: bool, verb: str, home: Path, *, run
                 from hermes_cli import gateway_windows as gww
                 gww.install(start_now=True, start_on_login=True)
             else:
-                gw.systemd_install(system=system, run_as_user=run_as_user, non_interactive=True)
+                # Never removes legacy units: this install can still be rolled back (the default's preinstall
+                # runs before any removal), and systemd_install stops + unlinks them before its own steps that
+                # can still fail. _restart_default removes them once the install has succeeded.
+                gw.systemd_install(system=system, run_as_user=run_as_user, non_interactive=True,
+                                   remove_legacy_units=False)
             return
         if verb == "enable":
             # Boot enablement only: the migration's uninstall of every secondary destroys their
@@ -932,6 +936,17 @@ def _undo_default_preinstall(
     return definition if definition.exists() else None
 
 
+def _remove_legacy_units_after_install(kind: str, system: bool, home: Path) -> None:
+    """The legacy-unit cleanup the migration's install defers (``remove_legacy_units=False``): run once the
+    default's definition is installed, right before it starts and would flap-fight them for the bot token."""
+    if kind != "systemd":
+        return
+    from hermes_cli import gateway as gw
+    with _home_env(home):
+        if gw.has_legacy_hermes_units():
+            gw.remove_legacy_hermes_units(interactive=False)
+
+
 def _restart_default(
     plan_default: ProfileGateway,
     target: Optional[tuple[str, bool]],
@@ -954,6 +969,7 @@ def _restart_default(
         kind, system = target
         if not preinstalled:
             _service_op(kind, system, "install", default_home, run_as_user=run_as_user)
+        _remove_legacy_units_after_install(kind, system, default_home)
         _service_op(kind, system, "start", default_home)
         return f"installed and started the default gateway via {kind}"
     verb = "restarted" if plan_default.pid is not None else "started"
